@@ -1,0 +1,220 @@
+{
+  "id": "US-9.2",
+  "title": "Orchestrator State Version History",
+  "epic": {
+    "id": "epic_9",
+    "name": "Orchestrator State"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "view the history of previous state versions for a project",
+    "so_that": "I can debug orchestration issues, roll back to a previous checkpoint, or understand how orchestration state evolved over time"
+  },
+  "rationale": "State version history provides observability into orchestrator behavior over time. When an orchestrator session produces unexpected results or corruption, the history allows inspection of what state changes led to the current situation. It also enables a form of manual rollback: an orchestrator can read a previous version's state_data and save it as the current state. The history is derived from the audit_log entries created by US-9.1, providing a consistent, immutable record without requiring a separate versioned table.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-9.2.1",
+      "description": "GET /api/v1/orchestrator/state/:project_id/history returns a list of previous state versions, ordered by version descending (most recent first). Each entry includes version, state_data, the actor who saved it, and the timestamp.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.2",
+      "description": "The history endpoint supports optional state_key query parameter to filter history for a specific state key. Defaults to 'main' if not provided.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.3",
+      "description": "The history endpoint supports pagination via page and page_size query parameters. Default page_size is 25, maximum is 100.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.4",
+      "description": "Each history entry includes: version (integer), state_data (the state_data at that version from the audit log's new_state), saved_by (actor label from audit log), saved_at (inserted_at from audit log).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.5",
+      "description": "Only orchestrator and superadmin roles can access the history endpoint. Agent and user roles receive 403 Forbidden.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.6",
+      "description": "Tenant isolation is enforced: history for projects in other tenants returns 404.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.7",
+      "description": "GET /api/v1/orchestrator/state/:project_id/history returns an empty list (not 404) if the project exists but no state has ever been saved.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.2.8",
+      "description": "History entries are derived from the audit_log table (entity_type='orchestrator_state', action='saved') ensuring the history is immutable and consistent with the audit trail.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-9.2.1",
+      "name": "View state history after multiple saves",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})",
+        "Save state 3 times via PUT /api/v1/orchestrator/state/:project_id (versions 0->1, 1->2, 2->3)"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id/history"
+      ],
+      "expected_results": [
+        "Response 200 with list of 3 history entries",
+        "Entries ordered by version descending: 3, 2, 1",
+        "Each entry includes version, state_data (the state at that version), saved_by, saved_at",
+        "state_data matches what was saved in each PUT request"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.2",
+      "name": "Filter history by state_key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})",
+        "Save state with state_key='main' twice (versions 1, 2)",
+        "Save state with state_key='backup' once (version 1)"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id/history?state_key=main",
+        "GET /api/v1/orchestrator/state/:project_id/history?state_key=backup"
+      ],
+      "expected_results": [
+        "First request returns 2 entries (both for state_key=main)",
+        "Second request returns 1 entry (for state_key=backup)",
+        "Entries are correctly filtered by state_key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.3",
+      "name": "History pagination",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "Save state 5 times (versions 1 through 5)"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id/history?page=1&page_size=2",
+        "GET /api/v1/orchestrator/state/:project_id/history?page=2&page_size=2",
+        "GET /api/v1/orchestrator/state/:project_id/history?page=3&page_size=2"
+      ],
+      "expected_results": [
+        "Page 1 returns versions 5, 4",
+        "Page 2 returns versions 3, 2",
+        "Page 3 returns version 1",
+        "Response includes pagination metadata"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.4",
+      "name": "Non-orchestrator roles cannot access history",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id/history with agent API key",
+        "GET /api/v1/orchestrator/state/:project_id/history with user API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.5",
+      "name": "Tenant isolation: cross-tenant history returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:project, %{tenant_id: tenant_a.id})",
+        "Save state for project in tenant A",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_a_id/history with tenant B orchestrator key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "No state history from tenant A is exposed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.6",
+      "name": "Empty history for project with no saved state",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "No orchestrator_state records for this project"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id/history"
+      ],
+      "expected_results": [
+        "Response 200 with empty list (not 404)",
+        "Pagination metadata shows total_count=0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.2.7",
+      "name": "History entries match audit log records",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "Save state 3 times via context function"
+      ],
+      "steps": [
+        "Query audit_log directly for entity_type='orchestrator_state', entity matching project+state_key",
+        "Call Loopctl.OrchestratorState.get_state_history/3",
+        "Compare the two result sets"
+      ],
+      "expected_results": [
+        "History entries exactly correspond to audit_log entries",
+        "Each history entry's state_data matches the audit_log new_state.state_data",
+        "Each history entry's version matches the audit_log new_state.version",
+        "Timestamps match"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add get_state_history/3 to the Loopctl.OrchestratorState context module. It queries the audit_log table for entity_type='orchestrator_state' entries matching the project_id and state_key.",
+    "The history is read-only and derived from audit_log. No separate state_versions table is needed.",
+    "Query pattern: SELECT new_state->'version', new_state->'state_data', actor_label, inserted_at FROM audit_log WHERE entity_type='orchestrator_state' AND entity_id=:state_id AND action='saved' ORDER BY inserted_at DESC.",
+    "The entity_id in audit_log should reference the orchestrator_state record's id. When saving state in US-9.1, the audit_log entry must capture enough data to reconstruct the history (state_data, version, state_key).",
+    "Controller at LoopctlWeb.OrchestratorStateController with history action.",
+    "Route: GET /api/v1/orchestrator/state/:project_id/history. RequireRole plug set to [:orchestrator, :superadmin].",
+    "Validate that the project_id exists and belongs to the tenant before querying history.",
+    "Consider indexing audit_log on (entity_type, entity_id) for efficient history queries."
+  ],
+  "dependencies": [
+    "US-9.1"
+  ],
+  "estimated_hours": 3
+}

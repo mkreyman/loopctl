@@ -1,0 +1,206 @@
+{
+  "id": "US-2.2",
+  "title": "API key schema with SHA-256 hashing, key_prefix, role enum, and Cloak encryption",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement an ApiKey schema with SHA-256 hashed key storage, a key_prefix for identification, a role enum (superadmin, user, orchestrator, agent), expiration, revocation, and Cloak encryption for any sensitive fields at rest",
+    "so_that": "the system has secure, non-reversible API key storage where raw keys are only visible once at creation, keys are identifiable by prefix without exposure, and access control is role-based"
+  },
+  "rationale": "API keys are the sole authentication mechanism for loopctl. Security requires that raw keys are never stored - only their SHA-256 hash. The key_prefix (first 8 chars) allows users to identify which key is which without seeing the full key. Role assignment per key enables the two-tier trust model where agents and orchestrators have different write permissions. Cloak encryption adds defense-in-depth for any sensitive metadata.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.2.1",
+      "description": "A Loopctl.Auth.ApiKey schema exists with fields: id, tenant_id, name, key_hash, key_prefix (8 chars), role (enum), agent_id, last_used_at, expires_at, revoked_at, inserted_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.2",
+      "description": "Raw API keys are generated with a 'lc_' prefix followed by 40 random URL-safe base64 characters (total ~43 chars)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.3",
+      "description": "The key_hash field stores the SHA-256 hash of the raw key; the raw key is never persisted to the database",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.4",
+      "description": "The key_prefix field stores the first 8 characters of the raw key (e.g., 'lc_a3Bf9') for identification",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.5",
+      "description": "The role enum supports four values: :superadmin, :user, :orchestrator, :agent",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.6",
+      "description": "A Loopctl.Auth context module provides: generate_api_key/1 (returns {raw_key, %ApiKey{}}), verify_api_key/1 (hashes input and looks up by key_hash), revoke_api_key/1",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.7",
+      "description": "verify_api_key/1 rejects keys that are revoked (revoked_at not nil) or expired (expires_at < now)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.8",
+      "description": "verify_api_key/1 updates last_used_at timestamp on successful verification",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.9",
+      "description": "tenant_id is NULL for superadmin keys and required for all other roles",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.2.10",
+      "description": "The api_keys table has a unique index on key_hash and an index on tenant_id",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.2.1",
+      "name": "Generate API key returns raw key and persisted record",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant"
+      ],
+      "steps": [
+        "Call Auth.generate_api_key(%{tenant_id: tenant.id, name: \"test-key\", role: :user})"
+      ],
+      "expected_results": [
+        "Returns {:ok, {raw_key, %ApiKey{}}}",
+        "raw_key starts with 'lc_'",
+        "raw_key is ~43 characters long",
+        "ApiKey.key_prefix matches the first 8 chars of raw_key",
+        "ApiKey.key_hash is a SHA-256 hex digest (64 chars)",
+        "The raw_key is NOT stored in any field of the ApiKey record"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.2",
+      "name": "Verify API key with valid raw key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Auth.generate_api_key returns {raw_key, api_key}"
+      ],
+      "steps": [
+        "Call Auth.verify_api_key(raw_key)"
+      ],
+      "expected_results": [
+        "Returns {:ok, %ApiKey{}} with the matching record",
+        "The returned ApiKey has the correct tenant_id and role",
+        "last_used_at is updated to approximately now"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.3",
+      "name": "Verify API key rejects revoked key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{revoked_at: ~U[2026-01-01 00:00:00Z]}) with known raw_key"
+      ],
+      "steps": [
+        "Call Auth.verify_api_key(raw_key)"
+      ],
+      "expected_results": [
+        "Returns {:error, :unauthorized}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.4",
+      "name": "Verify API key rejects expired key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{expires_at: ~U[2025-01-01 00:00:00Z]}) with known raw_key"
+      ],
+      "steps": [
+        "Call Auth.verify_api_key(raw_key)"
+      ],
+      "expected_results": [
+        "Returns {:error, :unauthorized}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.5",
+      "name": "Verify API key rejects unknown key",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Auth.verify_api_key(\"lc_totally_invalid_key_that_does_not_exist\")"
+      ],
+      "expected_results": [
+        "Returns {:error, :unauthorized}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.6",
+      "name": "Revoke API key sets revoked_at",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key) as api_key"
+      ],
+      "steps": [
+        "Call Auth.revoke_api_key(api_key)"
+      ],
+      "expected_results": [
+        "Returns {:ok, %ApiKey{}} with revoked_at set to approximately now",
+        "Subsequent verify_api_key with the raw key returns {:error, :unauthorized}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.7",
+      "name": "Superadmin key has nil tenant_id",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "Call Auth.generate_api_key(%{name: \"superadmin-key\", role: :superadmin, tenant_id: nil})"
+      ],
+      "expected_results": [
+        "Returns {:ok, {raw_key, %ApiKey{tenant_id: nil, role: :superadmin}}}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.8",
+      "name": "Non-superadmin key requires tenant_id",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Auth.generate_api_key(%{name: \"no-tenant\", role: :user, tenant_id: nil})"
+      ],
+      "expected_results": [
+        "Returns {:error, %Ecto.Changeset{}} with error on tenant_id"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Key generation: raw = \"lc_\" <> :crypto.strong_rand_bytes(30) |> Base.url_encode64(padding: false)",
+    "Hashing: :crypto.hash(:sha256, raw_key) |> Base.encode16(case: :lower)",
+    "key_prefix: String.slice(raw_key, 0, 8)",
+    "The api_keys table needs RLS enabled with tenant_id policy, but superadmin keys (tenant_id IS NULL) need a special policy clause",
+    "Consider a separate changeset for creation (with key_hash, key_prefix) vs. update (only name, revoked_at, etc.)",
+    "The verify_api_key/1 function must be constant-time safe — use Plug.Crypto.secure_compare for hash comparison if applicable, though hash lookup by index is inherently timing-safe",
+    "Preload the tenant association on verify_api_key for use in the auth pipeline"
+  ],
+  "dependencies": [
+    "US-2.1"
+  ],
+  "estimated_hours": 6
+}

@@ -1,0 +1,215 @@
+{
+  "id": "US-4.2",
+  "title": "Agent Listing and Detail",
+  "epic": {
+    "id": "epic_4",
+    "name": "Agents"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "list all registered agents and view individual agent details",
+    "so_that": "I can see which agents are available, their types, their activity status, and when they were last seen"
+  },
+  "rationale": "The orchestrator needs visibility into the agent pool to make intelligent assignment decisions and detect potential issues. Listing agents with their status and last_seen_at allows the orchestrator to route work to active implementers and avoid assigning to stale or deactivated agents. Filtering by agent_type lets the orchestrator quickly find just implementers or just other orchestrators. This is a read-only capability for orchestrator and higher roles.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-4.2.1",
+      "description": "GET /api/v1/agents returns a paginated list of all agents in the tenant. Each entry includes id, name, agent_type, status, last_seen_at, metadata, inserted_at, and updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.2",
+      "description": "GET /api/v1/agents supports filtering by agent_type query parameter (e.g., ?agent_type=implementer). Returns only agents matching the specified type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.3",
+      "description": "GET /api/v1/agents supports filtering by status query parameter (e.g., ?status=active). Returns only agents matching the specified status.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.4",
+      "description": "GET /api/v1/agents/:id returns the full agent detail including all fields. Returns 404 if the agent does not exist or belongs to a different tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.5",
+      "description": "Both endpoints require orchestrator or user role. Agent-role API keys receive 403 Forbidden.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.6",
+      "description": "Tenant isolation is enforced: agents from other tenants are never visible. Cross-tenant GET requests return 404 for detail and empty list for index.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.7",
+      "description": "GET /api/v1/agents supports pagination via page and page_size query parameters. Default page_size is 25, maximum is 100.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.2.8",
+      "description": "The list endpoint returns agents sorted by name ascending by default. Supports sort_by query parameter with values: name, agent_type, status, last_seen_at, inserted_at.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-4.2.1",
+      "name": "List all agents in tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\", agent_type: :implementer, status: :active})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-2\", agent_type: :implementer, status: :idle})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"orch-main\", agent_type: :orchestrator, status: :active})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "GET /api/v1/agents with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response 200 with list of 3 agents",
+        "Each agent includes id, name, agent_type, status, last_seen_at, metadata",
+        "Agents sorted by name: orch-main, worker-1, worker-2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.2",
+      "name": "Filter agents by type",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\", agent_type: :implementer})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-2\", agent_type: :implementer})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"orch-main\", agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/agents?agent_type=implementer",
+        "GET /api/v1/agents?agent_type=orchestrator"
+      ],
+      "expected_results": [
+        "First request returns 2 agents (worker-1, worker-2)",
+        "Second request returns 1 agent (orch-main)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.3",
+      "name": "Get agent detail",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\", agent_type: :implementer, status: :active, metadata: %{capabilities: [\"elixir\", \"phoenix\"]}})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/agents/:agent_id with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response 200 with full agent detail",
+        "Includes all fields: id, name, agent_type, status, last_seen_at, metadata with capabilities, inserted_at, updated_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.4",
+      "name": "Agent-role key cannot list agents",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "GET /api/v1/agents with agent API key",
+        "GET /api/v1/agents/:agent_id with agent API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.5",
+      "name": "Tenant isolation: agents from other tenants not visible",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:agent, %{tenant_id: tenant_a.id, name: \"worker-a\"})",
+        "fixture(:agent, %{tenant_id: tenant_b.id, name: \"worker-b\"})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/agents with tenant A orchestrator key",
+        "GET /api/v1/agents/:agent_b_id with tenant A orchestrator key"
+      ],
+      "expected_results": [
+        "List returns only worker-a (not worker-b)",
+        "Detail for agent_b returns 404 Not Found"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.6",
+      "name": "Pagination works correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "Create 5 agents: worker-1 through worker-5",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/agents?page=1&page_size=2",
+        "GET /api/v1/agents?page=2&page_size=2",
+        "GET /api/v1/agents?page=3&page_size=2"
+      ],
+      "expected_results": [
+        "Page 1 returns 2 agents",
+        "Page 2 returns 2 agents (different from page 1)",
+        "Page 3 returns 1 agent",
+        "Response includes pagination metadata (total_count, page, page_size, total_pages)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.2.7",
+      "name": "Filter by status",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"active-1\", status: :active})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"idle-1\", status: :idle})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"deactivated-1\", status: :deactivated})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/agents?status=active",
+        "GET /api/v1/agents?status=idle"
+      ],
+      "expected_results": [
+        "First request returns only active-1",
+        "Second request returns only idle-1"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add list_agents/2 and get_agent/2 functions to the Loopctl.Agents context module.",
+    "list_agents/2 accepts a keyword list of filters: agent_type, status, page, page_size, sort_by.",
+    "Use Ecto.Query composable query pattern: start with base query, pipe through optional filter functions.",
+    "Pagination: use offset/limit with total_count in response metadata. Consider Scrivener or a simple custom implementation.",
+    "Controller at LoopctlWeb.AgentController with index and show actions.",
+    "Routes: GET /api/v1/agents and GET /api/v1/agents/:id. RequireRole plug set to [:orchestrator, :user, :superadmin].",
+    "RLS ensures tenant isolation at the database level. Application-level scoping by tenant_id is defense in depth."
+  ],
+  "dependencies": [
+    "US-4.1"
+  ],
+  "estimated_hours": 3
+}

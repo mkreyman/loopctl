@@ -1,0 +1,182 @@
+{
+  "id": "US-2.7",
+  "title": "Rate limiting per API key and per tenant using ETS counters",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "medium",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement rate limiting using ETS counters that enforces per-API-key and per-tenant request limits, configurable via tenant settings, with standard rate limit headers in responses",
+    "so_that": "the system is protected from abuse, runaway agents, and resource exhaustion, with per-tenant configurability and clear signaling to clients when limits are approached or exceeded"
+  },
+  "rationale": "Without rate limiting, a single misbehaving agent could overwhelm the system and degrade service for all tenants. ETS-based counters are fast (in-memory, no external dependency), suitable for a single-node deployment, and reset naturally with application restarts. Per-tenant configuration allows premium tenants to have higher limits. Rate limit headers follow the IETF standard so agents can self-throttle.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.7.1",
+      "description": "A LoopctlWeb.Plugs.RateLimiter plug tracks request counts per API key per minute using an ETS table",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.2",
+      "description": "The default rate limit is 300 requests per minute per API key (configurable via tenant settings rate_limit_requests_per_minute)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.3",
+      "description": "When the rate limit is exceeded, the plug halts the connection with 429 Too Many Requests and a JSON error body",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.4",
+      "description": "Every response includes rate limit headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset (Unix timestamp of window reset)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.5",
+      "description": "A per-tenant aggregate limit exists (sum of all API key requests) that is 3x the per-key limit by default",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.6",
+      "description": "Superadmin keys are exempt from rate limiting",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.7",
+      "description": "The ETS table is owned by a GenServer that handles periodic cleanup of expired window counters (every minute)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.8",
+      "description": "Rate limit counters use :ets.update_counter for atomic, lock-free increments",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.7.1",
+      "name": "Request within rate limit succeeds with headers",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send a single authenticated request"
+      ],
+      "expected_results": [
+        "Response status is 200 (not 429)",
+        "Response has X-RateLimit-Limit header = 300",
+        "Response has X-RateLimit-Remaining header = 299",
+        "Response has X-RateLimit-Reset header with a future Unix timestamp"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.7.2",
+      "name": "Request exceeding rate limit returns 429",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{\"rate_limit_requests_per_minute\" => 3}}) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send 3 authenticated requests (within limit)",
+        "Send a 4th request"
+      ],
+      "expected_results": [
+        "First 3 requests succeed",
+        "4th request returns 429 with JSON error body",
+        "429 response includes Retry-After header"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.7.3",
+      "name": "Rate limit resets after window expires",
+      "type": "unit",
+      "preconditions": [
+        "Rate limiter module is available"
+      ],
+      "steps": [
+        "Increment counter to the limit",
+        "Simulate window expiration (manipulate ETS timestamps or mock time)",
+        "Attempt another request"
+      ],
+      "expected_results": [
+        "After window reset, the request succeeds",
+        "Counter is reset to 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.7.4",
+      "name": "Superadmin key bypasses rate limiting",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{role: :superadmin, tenant_id: nil}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send many requests rapidly with the superadmin key"
+      ],
+      "expected_results": [
+        "No requests return 429",
+        "No rate limit headers are present (or they show unlimited)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.7.5",
+      "name": "Tenant-level custom rate limit is respected",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{\"rate_limit_requests_per_minute\" => 5}}) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send 5 requests (within limit)",
+        "Send a 6th request"
+      ],
+      "expected_results": [
+        "First 5 requests have X-RateLimit-Limit = 5",
+        "6th request returns 429"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.7.6",
+      "name": "ETS cleanup removes expired windows",
+      "type": "unit",
+      "preconditions": [
+        "Rate limiter GenServer is running"
+      ],
+      "steps": [
+        "Insert expired window entries into the ETS table",
+        "Trigger the cleanup function",
+        "Check the ETS table"
+      ],
+      "expected_results": [
+        "Expired entries are removed",
+        "Current (non-expired) entries are preserved"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "ETS table options: :set, :public, read_concurrency: true, write_concurrency: true",
+    "Key format in ETS: {api_key_id, window_timestamp} -> count",
+    "Window timestamp: div(System.system_time(:second), 60) — 1-minute windows",
+    ":ets.update_counter(table, key, {2, 1}, {key, 0}) for atomic increment with default",
+    "GenServer sends itself a periodic message every 60 seconds to clean expired windows",
+    "The RateLimiter plug should be the LAST plug in the auth pipeline (after RequireAuth), so unauthenticated requests don't consume rate limit budget",
+    "Consider using :atomics instead of ETS for even better performance (Erlang/OTP 21+)",
+    "Test note: rate limit tests may need to reset ETS state between tests to avoid pollution"
+  ],
+  "dependencies": [
+    "US-2.3"
+  ],
+  "estimated_hours": 4
+}

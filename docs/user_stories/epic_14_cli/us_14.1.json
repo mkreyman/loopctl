@@ -1,0 +1,219 @@
+{
+  "id": "US-14.1",
+  "title": "CLI Scaffold and Config Management",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "install and configure the loopctl CLI escript binary with server URL, API key, and output format preferences",
+    "so_that": "all subsequent CLI commands can authenticate with the loopctl server without repeating credentials on every invocation"
+  },
+  "rationale": "The CLI is the primary interface for both human developers and AI agents to interact with loopctl. A well-structured scaffold with config management, environment variable overrides, and multiple output formats (json default for agents, human and csv for humans) is the foundation that every other CLI command depends on. This story establishes the escript build, the config file layout, the HTTP client setup, and the command routing infrastructure.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.1.1",
+      "description": "The project compiles to an escript binary named 'loopctl' via mix escript.build",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.2",
+      "description": "Config is stored at ~/.loopctl/config.json with keys: server, api_key, format. The directory and file are created automatically on first config set",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.3",
+      "description": "Environment variables LOOPCTL_SERVER, LOOPCTL_API_KEY, and LOOPCTL_FORMAT override config file values when set",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.4",
+      "description": "'loopctl config set <key> <value>' writes a key-value pair to the config file",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.5",
+      "description": "'loopctl config get <key>' reads and prints a single config value",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.6",
+      "description": "'loopctl config show' prints the full resolved configuration (file + env overrides)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.7",
+      "description": "Default output format is 'json' (agent-first). Supports --format json, --format human, and --format csv as global flags on any command",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.8",
+      "description": "Uses Req as the HTTP client for all API communication, with configurable base URL from the server config value",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.9",
+      "description": "'loopctl' with no arguments or 'loopctl --help' prints usage information listing all available top-level commands",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.1.10",
+      "description": "All commands that require server communication fail with a clear error message if server and api_key are not configured (either via config file or environment variables)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.1.1",
+      "name": "Config set creates config file and directory",
+      "type": "integration",
+      "preconditions": [
+        "No existing config file at the test config path",
+        "Test uses a temporary directory instead of ~/.loopctl"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.Config.set('server', 'https://loopctl.example.com', config_path: tmp_path)",
+        "Read the config file from the temporary path"
+      ],
+      "expected_results": [
+        "Config file is created at tmp_path/config.json",
+        "File contains valid JSON with {\"server\": \"https://loopctl.example.com\"}",
+        "Function returns :ok"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.2",
+      "name": "Config get retrieves stored value",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with {\"server\": \"https://loopctl.example.com\", \"api_key\": \"lc_test123\", \"format\": \"json\"}"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.Config.get('server', config_path: tmp_path)",
+        "Call Loopctl.CLI.Config.get('api_key', config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "First call returns {:ok, \"https://loopctl.example.com\"}",
+        "Second call returns {:ok, \"lc_test123\"}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.3",
+      "name": "Environment variables override config file values",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with {\"server\": \"https://file.example.com\", \"api_key\": \"lc_file\"}",
+        "Environment variable LOOPCTL_SERVER set to 'https://env.example.com'",
+        "Environment variable LOOPCTL_API_KEY set to 'lc_env'"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.Config.resolve(config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Resolved config has server='https://env.example.com' (from env)",
+        "Resolved config has api_key='lc_env' (from env)",
+        "Environment values take precedence over file values"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.4",
+      "name": "Config show displays resolved configuration",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with {\"server\": \"https://loopctl.example.com\", \"format\": \"json\"}"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ConfigCommand.run(['show'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output contains the server URL",
+        "Output contains the format value",
+        "Output indicates which values come from env overrides (if any)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.5",
+      "name": "Global --format flag is parsed and propagated",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.Parser.parse(['status', '--format', 'human', '--project', 'my-proj'])"
+      ],
+      "expected_results": [
+        "Parsed result has format: 'human'",
+        "Parsed result has command: 'status'",
+        "Parsed result has options containing project: 'my-proj'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.6",
+      "name": "Missing config produces clear error for server commands",
+      "type": "integration",
+      "preconditions": [
+        "No config file exists",
+        "No LOOPCTL_SERVER or LOOPCTL_API_KEY environment variables set"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.Main.run(['status', '--project', 'test'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} where message indicates server and api_key must be configured",
+        "No HTTP request is attempted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.7",
+      "name": "Help text is displayed for no arguments",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.Main.run([])"
+      ],
+      "expected_results": [
+        "Output contains usage information",
+        "Output lists available commands: config, auth, tenant, keys, project, import, export, status, next, blocked, agent, claim, start, report, unclaim, verify, reject, pending, state, history, audit, changes, webhook, admin"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.1.8",
+      "name": "HTTP client is configured with base URL and auth header",
+      "type": "unit",
+      "preconditions": [
+        "Config resolved with server='https://loopctl.example.com' and api_key='lc_test123'"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.HTTP.build_client(config)"
+      ],
+      "expected_results": [
+        "Returns a Req.Request struct with base_url set to 'https://loopctl.example.com/api/v1'",
+        "Request has Authorization header set to 'Bearer lc_test123'",
+        "Request has Content-Type header set to 'application/json'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Configure escript in mix.exs with main_module: Loopctl.CLI.Main and escript name: :loopctl",
+    "Use a command router pattern: Loopctl.CLI.Main.main/1 dispatches to command-specific modules based on the first argument(s)",
+    "Config module should accept an optional config_path parameter to enable testing without touching ~/.loopctl",
+    "Use Jason for JSON parsing/encoding of the config file",
+    "Req client should be built once per command invocation and passed through to API-calling functions",
+    "Output formatting should be handled by a Loopctl.CLI.Formatter module with format/2 that accepts data and format type (:json, :human, :csv)",
+    "The escript needs to include all dependencies (Req, Jason, etc.) — verify with mix escript.build that all deps are bundled",
+    "Global flags (--format, --help) should be extracted before dispatching to command modules"
+  ],
+  "dependencies": [
+    "US-1.1"
+  ],
+  "estimated_hours": 8
+}

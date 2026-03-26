@@ -1,0 +1,229 @@
+{
+  "id": "US-6.3",
+  "title": "Epic dependencies with directed edges and cycle detection",
+  "epic": {
+    "id": "epic_6",
+    "name": "Work Breakdown"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create and remove directed dependency edges between epics (epic A depends_on epic B), list all epic dependencies for a project, and have the system reject dependency additions that would create cycles",
+    "so_that": "the orchestrator can determine which epics must complete before others can begin, and the dependency graph remains a valid DAG (directed acyclic graph)"
+  },
+  "rationale": "Epic dependencies define the sequencing constraints for project work. Without cycle detection, a circular dependency (A depends on B depends on C depends on A) would create an unsatisfiable constraint that blocks all dependent epics forever. The directed edge model (A depends_on B means B must complete before A) is simple, explicit, and enables topological sorting for scheduling.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-6.3.1",
+      "description": "A Loopctl.WorkBreakdown.EpicDependency schema exists with fields: id, tenant_id, epic_id (the dependent), depends_on_epic_id (the prerequisite), inserted_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.2",
+      "description": "POST /api/v1/epic_dependencies (role: user) creates a dependency edge; requires epic_id and depends_on_epic_id",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.3",
+      "description": "Creating a dependency that would form a cycle returns 422 with error message 'Cycle detected in dependency graph'",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.4",
+      "description": "Creating a self-dependency (epic_id == depends_on_epic_id) returns 422 with error message",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.5",
+      "description": "Creating a duplicate dependency (same epic_id + depends_on_epic_id) returns 409 Conflict",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.6",
+      "description": "Both epics must belong to the same project; cross-project dependencies are rejected with 422",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.7",
+      "description": "DELETE /api/v1/epic_dependencies/:id (role: user) removes a dependency edge",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.8",
+      "description": "GET /api/v1/projects/:id/epic_dependencies (role: agent+) returns all epic dependency edges for a project",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.9",
+      "description": "All operations are scoped to the current tenant via RLS and application-level checks",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.3.10",
+      "description": "RLS policy is enabled on the epic_dependencies table enforcing tenant isolation",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-6.3.1",
+      "name": "Create valid epic dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2}) as epic_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epic_dependencies with body {\"epic_id\": \"<epic_b.id>\", \"depends_on_epic_id\": \"<epic_a.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has the dependency edge with both epic IDs",
+        "Dependency exists in database with correct tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.2",
+      "name": "Reject direct cycle (A depends on B, B depends on A)",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_b.id, depends_on_epic_id: epic_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epic_dependencies with body {\"epic_id\": \"<epic_a.id>\", \"depends_on_epic_id\": \"<epic_b.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message contains 'Cycle detected in dependency graph'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.3",
+      "name": "Reject transitive cycle (A→B→C→A)",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_c",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_b.id, depends_on_epic_id: epic_a.id})",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_c.id, depends_on_epic_id: epic_b.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epic_dependencies with body {\"epic_id\": \"<epic_a.id>\", \"depends_on_epic_id\": \"<epic_c.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message contains 'Cycle detected in dependency graph'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.4",
+      "name": "Reject self-dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epic_dependencies with body {\"epic_id\": \"<epic.id>\", \"depends_on_epic_id\": \"<epic.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates self-dependency is not allowed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.5",
+      "name": "Reject cross-project epic dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_a",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_b",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project_a.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project_b.id}) as epic_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epic_dependencies with body {\"epic_id\": \"<epic_b.id>\", \"depends_on_epic_id\": \"<epic_a.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates epics must belong to the same project"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.6",
+      "name": "Delete epic dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_b.id, depends_on_epic_id: epic_a.id}) as dep",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/epic_dependencies/<dep.id>"
+      ],
+      "expected_results": [
+        "Response status is 200 or 204",
+        "Dependency no longer exists in database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.7",
+      "name": "List epic dependencies for project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_b.id, depends_on_epic_id: epic_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/epic_dependencies"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response contains the dependency edge with epic_id and depends_on_epic_id"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Cycle detection algorithm: BFS/DFS from the proposed depends_on_epic_id following existing edges to see if we can reach epic_id. If yes, adding the edge would create a cycle.",
+    "Composite unique index: create unique_index(:epic_dependencies, [:epic_id, :depends_on_epic_id]) to prevent duplicates",
+    "Foreign keys: epic_id and depends_on_epic_id both reference epics(id)",
+    "The cycle detection must load all existing edges for the project and check the new edge against them — this is O(V+E) which is fine for expected graph sizes (<100 epics)",
+    "Consider implementing cycle detection in a dedicated Loopctl.WorkBreakdown.Graph module that can be reused for story dependencies",
+    "When an epic is deleted (US-6.1), cascade delete its dependency edges too"
+  ],
+  "dependencies": [
+    "US-6.1"
+  ],
+  "estimated_hours": 4
+}

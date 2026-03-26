@@ -1,0 +1,243 @@
+{
+  "id": "US-10.3",
+  "title": "Webhook Delivery via Oban",
+  "epic": {
+    "id": "epic_10",
+    "name": "Webhooks"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "have pending webhook events delivered to subscriber URLs via an Oban background worker with exponential backoff retry",
+    "so_that": "webhook delivery is reliable, non-blocking, and automatically retries transient failures without impacting the main request path"
+  },
+  "rationale": "Webhook delivery must not block the API request that triggered the event. An Oban worker processes pending webhook_events asynchronously, making HTTP POST requests to the subscriber URL. Exponential backoff (1m, 5m, 25m, 2h, 10h) ensures transient failures are retried without overwhelming a down endpoint, while a max of 6 attempts prevents indefinite retries against permanently broken URLs.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-10.3.1",
+      "description": "An Oban worker (Loopctl.Workers.WebhookDeliveryWorker) processes webhook_event records with status='pending'. The worker is enqueued after the transaction that creates the webhook_event commits.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.2",
+      "description": "The worker makes an HTTP POST request to the webhook URL with the event payload as the JSON body. Content-Type is application/json.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.3",
+      "description": "On successful delivery (HTTP 2xx response), the webhook_event status is updated to 'delivered', delivered_at is set, and the webhook's consecutive_failures is reset to 0.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.4",
+      "description": "On failed delivery (non-2xx response, timeout, or connection error), the webhook_event attempts counter is incremented, last_attempt_at is updated, and error is set to a descriptive message (HTTP status code + body snippet, or connection error description).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.5",
+      "description": "Retry schedule uses exponential backoff: attempt 1 at +1m, attempt 2 at +5m, attempt 3 at +25m, attempt 4 at +2h, attempt 5 at +10h. Maximum 6 total attempts.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.6",
+      "description": "After all retry attempts are exhausted, the webhook_event status is set to 'exhausted'. The webhook's consecutive_failures is incremented.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.7",
+      "description": "The HTTP request has a timeout of 10 seconds. Requests exceeding the timeout are treated as failures.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.8",
+      "description": "The Oban worker runs in a dedicated 'webhooks' queue with configurable concurrency (default 10).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.9",
+      "description": "The worker does not process events for inactive webhooks (active=false). If the webhook was deactivated between event creation and delivery, the event is marked as 'failed' with error='webhook_deactivated'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.3.10",
+      "description": "Webhook delivery payload includes a unique delivery ID, event type, timestamp, and the event-specific data. Example: {id: uuid, event: 'story.status_changed', timestamp: ISO8601, data: {...}}.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-10.3.1",
+      "name": "successful delivery updates event status",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, payload: %{event: 'story.status_changed'}})",
+        "HTTP mock returns 200 OK for POST to https://example.com/hooks"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1 with the webhook_event job"
+      ],
+      "expected_results": [
+        "HTTP POST was made to https://example.com/hooks with JSON payload",
+        "webhook_event status is 'delivered'",
+        "webhook_event delivered_at is set",
+        "webhook consecutive_failures is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.2",
+      "name": "failed delivery increments attempts and retries",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, attempts: 0})",
+        "HTTP mock returns 500 Internal Server Error"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1 with the webhook_event job"
+      ],
+      "expected_results": [
+        "webhook_event attempts is 1",
+        "webhook_event last_attempt_at is set",
+        "webhook_event error contains '500' or server error description",
+        "webhook_event status is still 'pending' (not exhausted yet)",
+        "Worker returns {:snooze, 60} to schedule retry in 1 minute"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.3",
+      "name": "exhausted after max attempts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true, consecutive_failures: 5})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, attempts: 5})",
+        "HTTP mock returns 500 Internal Server Error"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1 with the webhook_event job (6th attempt)"
+      ],
+      "expected_results": [
+        "webhook_event status is 'exhausted'",
+        "webhook_event attempts is 6",
+        "webhook consecutive_failures is 6",
+        "Worker returns :ok (no more retries)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.4",
+      "name": "timeout treated as failure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://slow.example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending})",
+        "HTTP mock simulates timeout (no response within 10 seconds)"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1"
+      ],
+      "expected_results": [
+        "webhook_event error contains 'timeout' or similar description",
+        "webhook_event attempts is incremented",
+        "Treated same as a failed delivery with retry scheduling"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.5",
+      "name": "deactivated webhook events skipped",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: false})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending})"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1"
+      ],
+      "expected_results": [
+        "No HTTP request is made",
+        "webhook_event status is 'failed'",
+        "webhook_event error is 'webhook_deactivated'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.6",
+      "name": "exponential backoff schedule is correct",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call WebhookDeliveryWorker.backoff_seconds/1 with attempt numbers 1 through 5"
+      ],
+      "expected_results": [
+        "Attempt 1 returns 60 (1 minute)",
+        "Attempt 2 returns 300 (5 minutes)",
+        "Attempt 3 returns 1500 (25 minutes)",
+        "Attempt 4 returns 7200 (2 hours)",
+        "Attempt 5 returns 36000 (10 hours)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.7",
+      "name": "successful delivery resets consecutive_failures",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: true, consecutive_failures: 5})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending})",
+        "HTTP mock returns 200 OK"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1"
+      ],
+      "expected_results": [
+        "webhook_event status is 'delivered'",
+        "webhook consecutive_failures is reset to 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.3.8",
+      "name": "delivery payload includes correct structure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, event_type: 'story.status_changed', payload: %{story_id: story_id, old_status: 'pending', new_status: 'assigned'}})",
+        "HTTP mock captures the request body"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1"
+      ],
+      "expected_results": [
+        "Request body is valid JSON",
+        "Body includes 'id' (delivery ID), 'event' (event_type), 'timestamp' (ISO8601), and 'data' (event payload)",
+        "Content-Type header is 'application/json'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create Loopctl.Workers.WebhookDeliveryWorker as an Oban worker module. Queue: 'webhooks', max_attempts: 1 (we handle retry logic manually via snooze).",
+    "Use Req for HTTP delivery. Configure a 10-second receive_timeout.",
+    "Oban.insert/1 or Oban.insert_all/1 in the same Ecto.Multi as the event creation (Oban supports transactional job insertion).",
+    "Backoff schedule as a lookup list: [60, 300, 1500, 7200, 36000]. Index by (attempts - 1).",
+    "Worker flow: load webhook_event -> load webhook -> check active -> make HTTP POST -> update event status -> update webhook consecutive_failures.",
+    "Use Req.Test or Mox to mock HTTP requests in tests. Never make real HTTP calls in test.",
+    "Oban queue configuration in config: queues: [webhooks: 10].",
+    "Consider using Oban.Pro's SmartEngine if available, otherwise standard Oban retry with manual snooze scheduling."
+  ],
+  "dependencies": [
+    "US-10.2"
+  ],
+  "estimated_hours": 6
+}

@@ -1,0 +1,228 @@
+{
+  "id": "US-14.4",
+  "title": "Project and Import/Export CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "create and manage projects, and import/export user story JSON structures via the CLI",
+    "so_that": "I can bootstrap projects from existing user story files and export project data for backup or migration"
+  },
+  "rationale": "Project creation and import/export are the core setup operations for loopctl. The CLI import command is particularly important because it reads the epic_*/us_*.json directory structure that teams already use for user story files, assembles the import payload, and sends it to the server in a single transaction. Export provides round-trip fidelity for backup, migration, or editing workflows. These commands bridge the gap between local file-based story management and the loopctl server.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.4.1",
+      "description": "'loopctl project create NAME --repo URL' calls POST /api/v1/projects and displays the created project",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.2",
+      "description": "'loopctl project list' calls GET /api/v1/projects and displays all projects with id, name, slug, repo_url, and status",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.3",
+      "description": "'loopctl project info PROJECT' calls GET /api/v1/projects/:id and displays the project detail including epic/story counts and progress summary",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.4",
+      "description": "'loopctl project archive PROJECT' calls DELETE /api/v1/projects/:id (soft archive) and confirms the project was archived",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.5",
+      "description": "'loopctl import PATH --project PROJECT' recursively reads all epic_*/us_*.json files from the specified directory path, assembles the import payload with epics, stories, and dependencies, and calls POST /api/v1/projects/:id/import",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.6",
+      "description": "The import command validates the JSON structure of each story file before sending and reports per-file parsing errors clearly",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.7",
+      "description": "The import command resolves cross-epic story dependencies (e.g., story '14.1' depends on story '1.1') by matching story numbers across all loaded files",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.8",
+      "description": "'loopctl export --project PROJECT' calls GET /api/v1/projects/:id/export and outputs the full project JSON to stdout by default",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.9",
+      "description": "'loopctl export --project PROJECT --dir PATH' writes the exported data as a directory structure with epic_*/us_*.json files matching the import format",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.4.10",
+      "description": "All project and import/export commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.4.1",
+      "name": "Project create sends correct payload",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects POST /api/v1/projects with {name: 'my-project', repo_url: 'https://github.com/org/repo'} and returns 201"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ProjectCommand.run(['create', 'my-project', '--repo', 'https://github.com/org/repo'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with correct name and repo_url",
+        "Output includes the created project id, name, and slug"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.2",
+      "name": "Import reads directory structure and assembles payload",
+      "type": "integration",
+      "preconditions": [
+        "Temporary directory with structure: epic_1_foundation/us_1.1.json, epic_1_foundation/us_1.2.json, epic_2_auth/us_2.1.json",
+        "Each JSON file contains valid story data with id, title, dependencies, etc.",
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects POST /api/v1/projects/:id/import and returns 200 with summary"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ImportCommand.run([tmp_story_dir, '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request payload contains 2 epics extracted from directory names",
+        "Epic 1 contains 2 stories, Epic 2 contains 1 story",
+        "Story data includes title, acceptance_criteria, estimated_hours from the JSON files",
+        "Output displays import summary: N epics, M stories created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.3",
+      "name": "Import resolves cross-epic dependencies",
+      "type": "integration",
+      "preconditions": [
+        "Temporary directory with epic_1_foundation/us_1.1.json and epic_14_cli/us_14.1.json",
+        "us_14.1.json has dependencies: ['US-1.1']",
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects POST /api/v1/projects/:id/import and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ImportCommand.run([tmp_story_dir, '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request payload includes story dependency: story 14.1 depends_on_stories includes reference to story 1.1",
+        "Dependencies are resolved by story number across epics"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.4",
+      "name": "Import reports invalid JSON files clearly",
+      "type": "integration",
+      "preconditions": [
+        "Temporary directory with epic_1_foundation/us_1.1.json containing invalid JSON"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ImportCommand.run([tmp_story_dir, '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} identifying the file with invalid JSON",
+        "Error message includes the file path and parse error details",
+        "No API call is made"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.5",
+      "name": "Export to stdout outputs valid JSON",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/projects/:id/export with project data containing epics and stories"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ExportCommand.run(['--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output is valid JSON parseable by Jason.decode!/1",
+        "JSON contains epics array with nested stories"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.6",
+      "name": "Export to directory writes epic_*/us_*.json files",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/projects/:id/export with 2 epics, 3 stories total",
+        "Temporary output directory"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ExportCommand.run(['--project', project_id, '--dir', tmp_output_dir], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Directory structure created: epic_1_*/us_*.json files for each story",
+        "Each story JSON file contains the full story data",
+        "Output confirms N files written to the directory"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.7",
+      "name": "Project list displays projects in table format",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/projects with a list of 2 projects"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ProjectCommand.run(['list', '--format', 'human'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output contains a table with columns: ID, Name, Repo, Status",
+        "Table shows 2 rows"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.4.8",
+      "name": "Project archive sends DELETE and confirms",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects DELETE /api/v1/projects/:id and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ProjectCommand.run(['archive', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "DELETE request is sent to /api/v1/projects/:id",
+        "Output confirms the project was archived"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "The import command should use File.ls!/1 and Path.wildcard/1 to find epic_* directories and us_*.json files within them",
+    "Epic metadata (number, title, phase) should be extracted from the directory name pattern and from the story files' epic fields",
+    "Story number extraction: parse the 'id' field (e.g., 'US-14.1') to get the story number '14.1' for the API payload",
+    "Cross-epic dependency resolution: build a map of story_number -> story_data across all files, then resolve 'dependencies' arrays to story numbers",
+    "Export --dir should sanitize epic titles for directory names (lowercase, underscores, no special chars)",
+    "The PROJECT argument should accept either a project UUID or slug — try UUID first, then look up by slug via the list endpoint",
+    "Import should handle both flat JSON file input (single file with full payload) and directory structure input (epic_*/us_*.json)"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-12.1"
+  ],
+  "estimated_hours": 6
+}

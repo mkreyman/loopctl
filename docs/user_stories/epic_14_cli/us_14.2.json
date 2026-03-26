@@ -1,0 +1,204 @@
+{
+  "id": "US-14.2",
+  "title": "Auth and Tenant CLI Commands",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "log in to a loopctl server, view my identity, and manage my tenant registration and settings via the CLI",
+    "so_that": "I can set up and configure my loopctl tenant without needing to make raw API calls"
+  },
+  "rationale": "Authentication and tenant management are the first actions any user performs after installing the CLI. The auth login command stores credentials, whoami confirms identity, and tenant commands handle self-service signup and settings management. These are prerequisites for all other CLI workflows since every command beyond config requires valid authentication.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.2.1",
+      "description": "'loopctl auth login --server URL --key KEY' validates the credentials by calling GET /api/v1/tenants/me and stores them in the config file on success",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.2",
+      "description": "'loopctl auth login' fails with a clear error if the server URL is unreachable or the API key is invalid (401 response)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.3",
+      "description": "'loopctl auth whoami' calls GET /api/v1/tenants/me and displays the tenant name, role, and key prefix (first 8 chars of the API key)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.4",
+      "description": "'loopctl tenant register --name NAME --email EMAIL' calls POST /api/v1/tenants/register and displays the returned tenant info and raw API key",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.5",
+      "description": "'loopctl tenant register' prompts a warning that the raw API key is only shown once and should be saved immediately",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.6",
+      "description": "'loopctl tenant info' calls GET /api/v1/tenants/me and displays the full tenant profile including settings",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.7",
+      "description": "'loopctl tenant update --setting key=value' calls PATCH /api/v1/tenants/me with the settings update payload",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.8",
+      "description": "All auth and tenant commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.9",
+      "description": "The tenant register command does not require prior authentication (it is the bootstrap flow for new tenants)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.2.10",
+      "description": "After successful tenant register, the CLI offers to automatically configure the returned API key and server URL in the config file",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.2.1",
+      "name": "Auth login stores credentials on successful validation",
+      "type": "integration",
+      "preconditions": [
+        "Req.Test mock configured to return 200 for GET /api/v1/tenants/me with tenant data",
+        "Temporary config path"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AuthCommand.run(['login', '--server', 'https://loopctl.example.com', '--key', 'lc_testkey123'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Config file at tmp_path contains server='https://loopctl.example.com' and api_key='lc_testkey123'",
+        "Output confirms successful login with tenant name from the API response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.2",
+      "name": "Auth login fails with invalid API key",
+      "type": "integration",
+      "preconditions": [
+        "Req.Test mock configured to return 401 for GET /api/v1/tenants/me"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AuthCommand.run(['login', '--server', 'https://loopctl.example.com', '--key', 'lc_invalid'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating invalid API key",
+        "Config file is not modified",
+        "No credentials are stored"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.3",
+      "name": "Auth whoami displays tenant identity",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/tenants/me with {name: 'My Tenant', slug: 'my-tenant'}"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AuthCommand.run(['whoami'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes tenant name 'My Tenant'",
+        "Output includes key prefix (first 8 chars of configured api_key)",
+        "Output includes the role associated with the API key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.4",
+      "name": "Tenant register creates tenant and returns API key",
+      "type": "integration",
+      "preconditions": [
+        "Req.Test mock returns 201 for POST /api/v1/tenants/register with tenant data and raw_api_key"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.TenantCommand.run(['register', '--name', 'New Tenant', '--email', 'admin@example.com'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes the returned tenant name and slug",
+        "Output includes the raw API key",
+        "Output includes a warning that the API key is only shown once"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.5",
+      "name": "Tenant info displays full tenant profile",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/tenants/me with full tenant profile including settings"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.TenantCommand.run(['info'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes tenant name, slug, email, status",
+        "Output includes tenant settings (max_concurrent_agents, max_projects, etc.)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.6",
+      "name": "Tenant update sends settings patch",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects PATCH /api/v1/tenants/me with settings payload and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.TenantCommand.run(['update', '--setting', 'max_concurrent_agents=20'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "PATCH request is sent with body containing {settings: {max_concurrent_agents: 20}}",
+        "Output confirms the setting was updated"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.2.7",
+      "name": "Tenant register does not require prior authentication",
+      "type": "integration",
+      "preconditions": [
+        "No config file exists (no stored credentials)",
+        "Req.Test mock returns 201 for POST /api/v1/tenants/register"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.TenantCommand.run(['register', '--name', 'Brand New', '--email', 'new@example.com', '--server', 'https://loopctl.example.com'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Command succeeds without requiring existing authentication",
+        "The --server flag is used for the registration request",
+        "Output includes the returned API key and tenant info"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Auth login should validate credentials by making a test API call before storing them — never store untested credentials",
+    "The whoami command should extract the key prefix from the locally stored API key (first 8 chars), not from the server response",
+    "Tenant register is unique: it needs a --server flag since no config exists yet. Accept server from --server flag or LOOPCTL_SERVER env var",
+    "Use Req.Test for mocking HTTP responses in tests — configure the test adapter via Req.Test.expect/3",
+    "Settings parsing for 'key=value' format should handle integer values (auto-parse numeric strings) and boolean values ('true'/'false')",
+    "All commands should delegate to a shared HTTP module for consistent error handling and response parsing"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-2.5"
+  ],
+  "estimated_hours": 4
+}

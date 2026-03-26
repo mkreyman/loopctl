@@ -1,0 +1,176 @@
+{
+  "id": "US-1.7",
+  "title": "Deployment configuration for beelink self-hosted runner",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "medium",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "create a deployment configuration targeting the beelink self-hosted server, including a deploy script, systemd service unit, nginx reverse proxy config, and runtime configuration",
+    "so_that": "the application can be continuously deployed from GitHub Actions to a self-hosted environment with zero-downtime restarts, TLS termination, and proper process management"
+  },
+  "rationale": "loopctl is initially deployed to a beelink home server before moving to cloud hosting. A robust deploy script with systemd integration ensures the app auto-restarts on crash, logs are captured via journald, and nginx handles TLS termination and reverse proxying. This follows the same deployment pattern as the open_brain project on the same server.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.7.1",
+      "description": "A bin/deploy.sh script exists that: pulls latest code from master, compiles a Mix release, runs migrations, and restarts the service",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.2",
+      "description": "A systemd service unit file (loopctl.service) exists for running the Phoenix release as a daemon with auto-restart",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.3",
+      "description": "An nginx configuration file exists that reverse-proxies to the Phoenix release on the configured port, with TLS termination for loopctl.local (or configurable domain)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.4",
+      "description": "config/runtime.exs reads all production configuration from environment variables: DATABASE_URL, SECRET_KEY_BASE, PHX_HOST, PORT, CLOAK_KEY",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.5",
+      "description": "A .env.example file documents all required environment variables with placeholder values",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.6",
+      "description": "The deploy script runs mix ecto.migrate as part of deployment before restarting the service",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.7",
+      "description": "The deploy script includes a health check after restart that polls GET /health and fails the deploy if the app does not become healthy within 30 seconds",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.7.8",
+      "description": "Mix release configuration is set up in mix.exs with runtime config and appropriate strip_beams settings",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.7.1",
+      "name": "Deploy script is executable and has valid bash syntax",
+      "type": "unit",
+      "preconditions": [
+        "bin/deploy.sh exists"
+      ],
+      "steps": [
+        "Run bash -n bin/deploy.sh to check syntax",
+        "Check file permissions include executable bit"
+      ],
+      "expected_results": [
+        "Syntax check passes with no errors",
+        "File has executable permission"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.7.2",
+      "name": "Systemd service file is valid",
+      "type": "unit",
+      "preconditions": [
+        "loopctl.service exists"
+      ],
+      "steps": [
+        "Inspect the service file for required directives: ExecStart, Restart, WorkingDirectory, User, EnvironmentFile"
+      ],
+      "expected_results": [
+        "ExecStart points to the release binary",
+        "Restart=on-failure is configured",
+        "WorkingDirectory is set to the app directory",
+        "EnvironmentFile points to the .env file location"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.7.3",
+      "name": "Nginx config has correct proxy pass",
+      "type": "unit",
+      "preconditions": [
+        "nginx/loopctl.conf exists"
+      ],
+      "steps": [
+        "Inspect the nginx config for proxy_pass, upstream, and SSL directives"
+      ],
+      "expected_results": [
+        "proxy_pass points to http://127.0.0.1:<port>",
+        "proxy_set_header Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto are set",
+        "SSL certificate paths are configured (or placeholder comments)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.7.4",
+      "name": "runtime.exs reads DATABASE_URL from environment",
+      "type": "unit",
+      "preconditions": [
+        "config/runtime.exs exists"
+      ],
+      "steps": [
+        "Inspect config/runtime.exs for System.get_env(\"DATABASE_URL\") or System.fetch_env!(\"DATABASE_URL\")"
+      ],
+      "expected_results": [
+        "DATABASE_URL is read from environment in :prod config_env()",
+        "SECRET_KEY_BASE is read from environment",
+        "PHX_HOST and PORT are read from environment",
+        "CLOAK_KEY is read from environment"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.7.5",
+      "name": "Mix release is configured in mix.exs",
+      "type": "unit",
+      "preconditions": [
+        "mix.exs exists"
+      ],
+      "steps": [
+        "Inspect the releases/1 key in the project/0 function"
+      ],
+      "expected_results": [
+        "A :loopctl release is defined",
+        "The release has strip_beams set appropriately"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.7.6",
+      "name": ".env.example documents all required variables",
+      "type": "unit",
+      "preconditions": [
+        ".env.example exists"
+      ],
+      "steps": [
+        "Read .env.example and check for required variable names"
+      ],
+      "expected_results": [
+        "DATABASE_URL is listed with a placeholder",
+        "SECRET_KEY_BASE is listed",
+        "CLOAK_KEY is listed",
+        "PHX_HOST is listed",
+        "PORT is listed"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Follow the same deploy pattern as open_brain on beelink (192.168.86.55)",
+    "Deploy script should be idempotent and safe to run multiple times",
+    "Consider using mix release.init to generate the initial release configuration",
+    "The nginx config should include WebSocket upgrade headers for future Phoenix Channel support",
+    "systemd: After=network.target postgresql.service, Restart=on-failure, RestartSec=5",
+    "The deploy script should set MIX_ENV=prod for compilation and migration",
+    "Health check loop: for i in 1..30; curl -sf http://localhost:$PORT/health && break; sleep 1; done"
+  ],
+  "dependencies": [],
+  "estimated_hours": 4
+}

@@ -1,0 +1,213 @@
+{
+  "id": "US-2.3",
+  "title": "Auth pipeline plugs: ExtractApiKey, ResolveApiKey, SetTenant, RequireAuth",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a chain of Plug modules — ExtractApiKey (reads Bearer token from Authorization header), ResolveApiKey (SHA-256 hash lookup), SetTenant (sets RLS context via SET LOCAL), and RequireAuth (halts unauthenticated requests) — that together form the authentication pipeline",
+    "so_that": "every authenticated API request goes through a consistent pipeline that extracts credentials, verifies them, sets the tenant context for RLS, and rejects unauthorized access"
+  },
+  "rationale": "The auth pipeline is the gateway for every API request. Separating concerns into individual plugs makes each step independently testable and composable. ExtractApiKey is pure header parsing, ResolveApiKey does the cryptographic verification, SetTenant bridges to the RLS layer, and RequireAuth is the final guard. This matches the pipeline described in PRD section 4.2.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.3.1",
+      "description": "LoopctlWeb.Plugs.ExtractApiKey reads the Authorization header, expects 'Bearer <token>' format, and assigns :raw_api_key to conn.assigns",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.2",
+      "description": "ExtractApiKey passes through without error if no Authorization header is present (downstream plugs handle the missing key)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.3",
+      "description": "LoopctlWeb.Plugs.ResolveApiKey takes :raw_api_key from conn.assigns, calls Auth.verify_api_key/1, and on success assigns :current_api_key and :current_tenant to conn.assigns",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.4",
+      "description": "ResolveApiKey skips verification if :raw_api_key is nil (no header was provided)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.5",
+      "description": "LoopctlWeb.Plugs.SetTenant reads :current_api_key from conn.assigns and calls Repo.put_tenant_id/1 with the key's tenant_id to set the RLS context for the current process",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.6",
+      "description": "SetTenant sets RLS bypass mode when the API key role is :superadmin (tenant_id is nil)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.7",
+      "description": "LoopctlWeb.Plugs.RequireAuth halts the connection with 401 JSON error if :current_api_key is not set in conn.assigns",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.8",
+      "description": "The plugs are composed into an :authenticated pipeline in the router that can be applied to API scopes",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.3.9",
+      "description": "Suspended tenants (status != :active) are rejected with 403 at the ResolveApiKey step",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.3.1",
+      "name": "ExtractApiKey extracts Bearer token from header",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Build a conn with Authorization header 'Bearer lc_test_key_123'",
+        "Call ExtractApiKey.call(conn, [])"
+      ],
+      "expected_results": [
+        "conn.assigns.raw_api_key == \"lc_test_key_123\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.2",
+      "name": "ExtractApiKey handles missing Authorization header",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Build a conn without Authorization header",
+        "Call ExtractApiKey.call(conn, [])"
+      ],
+      "expected_results": [
+        "conn.assigns.raw_api_key is nil",
+        "Connection is not halted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.3",
+      "name": "ResolveApiKey resolves valid key and assigns tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, api_key}"
+      ],
+      "steps": [
+        "Build a conn with assigns.raw_api_key = raw_key",
+        "Call ResolveApiKey.call(conn, [])"
+      ],
+      "expected_results": [
+        "conn.assigns.current_api_key is the resolved %ApiKey{}",
+        "conn.assigns.current_tenant is the associated %Tenant{}",
+        "Connection is not halted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.4",
+      "name": "ResolveApiKey rejects suspended tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{status: :suspended}) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Build a conn with assigns.raw_api_key = raw_key",
+        "Call ResolveApiKey.call(conn, [])"
+      ],
+      "expected_results": [
+        "Connection is halted with 403 status",
+        "Response body indicates tenant is suspended"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.5",
+      "name": "SetTenant sets RLS context for tenant-scoped key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id}) as api_key"
+      ],
+      "steps": [
+        "Build a conn with assigns.current_api_key = api_key",
+        "Call SetTenant.call(conn, [])",
+        "Check process dictionary for tenant_id"
+      ],
+      "expected_results": [
+        "Repo.get_tenant_id() returns tenant.id",
+        "RLS queries will be scoped to this tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.6",
+      "name": "RequireAuth halts unauthenticated request",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Build a conn without :current_api_key in assigns",
+        "Call RequireAuth.call(conn, [])"
+      ],
+      "expected_results": [
+        "Connection is halted",
+        "Response status is 401",
+        "Response body is JSON with error message"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.7",
+      "name": "Full pipeline authenticates and sets tenant context",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send a request to an authenticated endpoint with Authorization: Bearer <raw_key>"
+      ],
+      "expected_results": [
+        "Request is not rejected with 401",
+        "The controller has access to conn.assigns.current_api_key and conn.assigns.current_tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.3.8",
+      "name": "Superadmin key sets RLS bypass",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{role: :superadmin, tenant_id: nil}) returns {raw_key, api_key}"
+      ],
+      "steps": [
+        "Build a conn with assigns.current_api_key = superadmin api_key",
+        "Call SetTenant.call(conn, [])"
+      ],
+      "expected_results": [
+        "RLS bypass mode is enabled in the process dictionary",
+        "Subsequent queries can see all tenants' data"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Each plug implements the Plug behaviour with init/1 and call/2",
+    "ExtractApiKey should handle malformed Authorization headers gracefully (not crash)",
+    "ResolveApiKey should preload the tenant association to avoid N+1 in downstream code",
+    "SetTenant bridges the Phoenix request lifecycle to the Ecto/RLS layer via the process dictionary",
+    "The pipeline order in the router: plug ExtractApiKey -> plug ResolveApiKey -> plug SetTenant -> plug RequireAuth",
+    "RequireAuth should use the FallbackController error format for consistency",
+    "Consider a test helper that builds an authenticated conn: build_conn() |> authenticate(api_key)"
+  ],
+  "dependencies": [
+    "US-2.2"
+  ],
+  "estimated_hours": 6
+}

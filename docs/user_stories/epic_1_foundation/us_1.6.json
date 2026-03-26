@@ -1,0 +1,174 @@
+{
+  "id": "US-1.6",
+  "title": "CI/CD GitHub Actions pipeline with lint, test, security, and dialyzer jobs",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "high",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "configure a GitHub Actions CI pipeline with separate jobs for linting (format, credo), testing (compile warnings-as-errors, ExUnit with PostgreSQL), security (sobelow), and static analysis (dialyzer with PLT caching)",
+    "so_that": "every push and PR is automatically validated for code quality, correctness, security, and type safety before merging"
+  },
+  "rationale": "Automated CI is essential for maintaining code quality when AI agents are the primary developers. Agents can produce code that compiles but has subtle issues detectable by Credo, Sobelow, or Dialyzer. Separate jobs allow parallel execution and clear failure attribution. PLT caching is critical for Dialyzer performance (first run can take 10+ minutes).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.6.1",
+      "description": "A .github/workflows/ci.yml file exists and triggers on push to master and on all pull requests",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.2",
+      "description": "The lint job runs: mix format --check-formatted, mix deps.unlock --check-unused, and mix credo --strict",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.3",
+      "description": "The test job runs: mix compile --warnings-as-errors and mix test, with a PostgreSQL 16 service container",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.4",
+      "description": "The security job runs: mix sobelow --config",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.5",
+      "description": "The dialyzer job runs: mix dialyzer, with PLT files cached between runs using actions/cache",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.6",
+      "description": "All jobs use a consistent Elixir/OTP version matrix (Elixir 1.18+, OTP 27+) via erlef/setup-beam action",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.7",
+      "description": "Dependencies and _build are cached between runs using actions/cache keyed on mix.lock hash",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.8",
+      "description": "A deploy job exists that runs only on push to master, after all other jobs pass, on the self-hosted runner (beelink label)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.6.9",
+      "description": "A .sobelow-conf file exists in the project root with appropriate configuration",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.6.1",
+      "name": "CI workflow file is valid YAML",
+      "type": "unit",
+      "preconditions": [
+        ".github/workflows/ci.yml exists"
+      ],
+      "steps": [
+        "Parse the YAML file",
+        "Validate it has on, jobs, and expected job names"
+      ],
+      "expected_results": [
+        "YAML parses without errors",
+        "Jobs include: lint, test, security, dialyzer, deploy"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.6.2",
+      "name": "Lint job checks formatting, unused deps, and credo",
+      "type": "unit",
+      "preconditions": [
+        ".github/workflows/ci.yml exists"
+      ],
+      "steps": [
+        "Inspect the lint job steps"
+      ],
+      "expected_results": [
+        "Job includes steps for mix format --check-formatted",
+        "Job includes steps for mix deps.unlock --check-unused",
+        "Job includes steps for mix credo --strict"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.6.3",
+      "name": "Test job has PostgreSQL service container",
+      "type": "unit",
+      "preconditions": [
+        ".github/workflows/ci.yml exists"
+      ],
+      "steps": [
+        "Inspect the test job services section"
+      ],
+      "expected_results": [
+        "A postgres service is defined with image postgres:16",
+        "Environment variables for POSTGRES_PASSWORD, POSTGRES_USER, POSTGRES_DB are set",
+        "Health check is configured for the postgres service"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.6.4",
+      "name": "Deploy job has correct conditions and runner",
+      "type": "unit",
+      "preconditions": [
+        ".github/workflows/ci.yml exists"
+      ],
+      "steps": [
+        "Inspect the deploy job configuration"
+      ],
+      "expected_results": [
+        "Job has needs: [lint, test, security, dialyzer]",
+        "Job has if condition for push to master branch",
+        "Job runs-on: self-hosted with beelink label"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.6.5",
+      "name": "Dialyzer PLT cache is configured",
+      "type": "unit",
+      "preconditions": [
+        ".github/workflows/ci.yml exists"
+      ],
+      "steps": [
+        "Inspect the dialyzer job for cache action usage"
+      ],
+      "expected_results": [
+        "An actions/cache step caches the PLT directory (typically _build/dev/*.plt or priv/plts/)",
+        "Cache key includes the OTP/Elixir version and mix.lock hash"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.6.6",
+      "name": "mix format passes on current codebase",
+      "type": "integration",
+      "preconditions": [
+        "Project source code exists"
+      ],
+      "steps": [
+        "Run mix format --check-formatted locally"
+      ],
+      "expected_results": [
+        "Command exits with status 0 (all files are formatted)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use erlef/setup-beam@v1 for consistent Elixir/OTP installation",
+    "Cache key pattern: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}",
+    "PLT cache key should include OTP and Elixir versions: ${{ runner.os }}-plt-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}",
+    "PostgreSQL service: image: postgres:16, env: POSTGRES_PASSWORD: postgres, ports: ['5432:5432'], options: --health-cmd pg_isready",
+    "Test job needs MIX_ENV=test and DATABASE_URL pointing to the service container",
+    "The deploy job shell script will be fully defined in US-1.7"
+  ],
+  "dependencies": [],
+  "estimated_hours": 4
+}

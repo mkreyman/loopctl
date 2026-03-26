@@ -1,0 +1,203 @@
+{
+  "id": "US-11.4",
+  "title": "Cross-Tenant Audit Log",
+  "epic": {
+    "id": "epic_11",
+    "name": "Superadmin"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "query the audit log across all tenants from a single endpoint, filterable by tenant, entity type, action, and date range",
+    "so_that": "I can investigate platform-wide incidents, trace cross-tenant issues, and review superadmin actions without switching between tenant contexts"
+  },
+  "rationale": "The standard audit endpoint (US-3.1) is tenant-scoped — each tenant can only see their own audit entries. For platform operations (investigating abuse, auditing superadmin actions, debugging cross-tenant issues), the superadmin needs visibility across all tenants. This endpoint surfaces the same audit data but without tenant-scoping, with an additional tenant_id filter for narrowing results.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-11.4.1",
+      "description": "GET /api/v1/admin/audit returns paginated audit log entries across ALL tenants, including entries with tenant_id=NULL (superadmin actions). Requires superadmin API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.2",
+      "description": "Supports filter by tenant_id to narrow results to a specific tenant's entries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.3",
+      "description": "Supports all filters from the standard audit endpoint: entity_type, entity_id, action, actor_type, actor_id, date range (from/to as ISO8601).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.4",
+      "description": "Each audit entry in the response includes the tenant_id and tenant name/slug for identification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.5",
+      "description": "Results are ordered by inserted_at descending (most recent first). Supports page and page_size parameters.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.6",
+      "description": "Non-superadmin keys receive 403 Forbidden.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.7",
+      "description": "Entries with tenant_id=NULL (superadmin actions performed without impersonation) are included when no tenant_id filter is applied.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.4.8",
+      "description": "Can filter by actor_type='superadmin' to see all actions performed by superadmin keys (both direct and impersonated).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-11.4.1",
+      "name": "cross-tenant audit returns entries from all tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "Audit entries exist for both tenants and for superadmin (tenant_id=NULL)"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns entries from Tenant A, Tenant B, and superadmin (NULL tenant)",
+        "Each entry includes tenant_id and tenant_name (or null for superadmin entries)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.2",
+      "name": "filter by tenant_id",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "Audit entries exist for both tenants"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit?tenant_id=<tenant_a_id> with superadmin API key"
+      ],
+      "expected_results": [
+        "Response includes only Tenant A's audit entries",
+        "No entries from Tenant B or superadmin (NULL) appear"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.3",
+      "name": "filter by actor_type=superadmin shows impersonated actions",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{})",
+        "Audit entries: one from tenant's own user, one from superadmin impersonating this tenant"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit?actor_type=superadmin with superadmin API key"
+      ],
+      "expected_results": [
+        "Response includes only entries where actor_type='superadmin'",
+        "Includes the impersonated action (has tenant_id set but actor_type='superadmin')",
+        "Excludes the tenant's own user action"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.4",
+      "name": "combined filters work correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{})",
+        "Audit entries with various entity_types, actions, and dates"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit?tenant_id=<id>&entity_type=story&action=status_changed&from=2026-01-01T00:00:00Z"
+      ],
+      "expected_results": [
+        "Returns only entries matching ALL filters simultaneously",
+        "Entries are for the specified tenant, entity_type=story, action=status_changed, after Jan 1 2026"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.5",
+      "name": "non-superadmin cannot access cross-tenant audit",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit with user API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.6",
+      "name": "pagination works on cross-tenant audit",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "30 audit log entries across multiple tenants"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit?page=1&page_size=10",
+        "GET /api/v1/admin/audit?page=2&page_size=10"
+      ],
+      "expected_results": [
+        "Page 1 returns 10 entries (most recent first)",
+        "Page 2 returns 10 entries",
+        "Entries are globally ordered by inserted_at descending",
+        "Response includes pagination metadata"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.4.7",
+      "name": "null tenant_id entries included in unfiltered results",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "Audit entry with tenant_id=NULL (e.g., superadmin direct action)"
+      ],
+      "steps": [
+        "GET /api/v1/admin/audit with superadmin API key (no tenant_id filter)"
+      ],
+      "expected_results": [
+        "Response includes the entry with tenant_id=NULL",
+        "tenant_name is null for that entry"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create AdminAuditController with index action. Route: GET /api/v1/admin/audit under the /admin scope.",
+    "This endpoint queries audit_log without tenant_id scoping. The superadmin's NULL tenant context means RLS policies should allow full read access. If RLS blocks NULL tenant reads, add a policy: ALLOW SELECT WHEN current_setting('app.current_tenant_id') IS NULL.",
+    "Join audit_log with tenants on audit_log.tenant_id = tenants.id (LEFT JOIN to include NULL tenant entries). Select tenant.name and tenant.slug alongside the audit entry.",
+    "Reuse the filter parsing logic from AuditController (US-3.1) but add the tenant_id filter parameter.",
+    "Consider creating a shared Audit.list_entries_admin/1 function that skips tenant scoping, alongside the existing tenant-scoped Audit.list_entries/2.",
+    "Performance: ensure the (tenant_id, inserted_at) index on audit_log supports the combined tenant_id + date range queries efficiently. The cross-tenant unfiltered query relies on the inserted_at index alone.",
+    "Response includes tenant context: {tenant_id: uuid|null, tenant_name: string|null, tenant_slug: string|null} alongside the standard audit entry fields."
+  ],
+  "dependencies": [
+    "US-11.1",
+    "US-3.1"
+  ],
+  "estimated_hours": 3
+}

@@ -1,0 +1,237 @@
+{
+  "id": "US-14.8",
+  "title": "Webhook, Audit, and Superadmin CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "manage webhooks, query audit trails, poll the change feed, and perform superadmin operations via the CLI",
+    "so_that": "I can configure event-driven integrations, investigate what happened and when, monitor real-time changes, and administer the platform from the command line"
+  },
+  "rationale": "This story covers the remaining CLI commands that round out the full feature set: webhook management for event-driven orchestration, audit and history queries for debugging and accountability, the change feed for polling-based orchestrators, and superadmin commands for platform administration. Together with the earlier CLI stories, these commands provide complete CLI coverage of every API endpoint in the loopctl server.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.8.1",
+      "description": "'loopctl webhook create --url URL --events EVENT1,EVENT2' calls POST /api/v1/webhooks and displays the created webhook including its signing secret (shown only once)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.2",
+      "description": "'loopctl webhook list' calls GET /api/v1/webhooks and displays all webhooks with id, url, events, active status, and consecutive_failures count",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.3",
+      "description": "'loopctl webhook delete ID' calls DELETE /api/v1/webhooks/:id and confirms deletion",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.4",
+      "description": "'loopctl webhook test ID' calls POST /api/v1/webhooks/:id/test to send a test event and displays the delivery result",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.5",
+      "description": "'loopctl history STORY_NUM' resolves the story number and calls GET /api/v1/stories/:id/history, displaying the full audit trail for that story in chronological order",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.6",
+      "description": "'loopctl audit --project PROJECT --since DATE' calls GET /api/v1/audit with appropriate query parameters and displays audit log entries filtered by project and date range",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.7",
+      "description": "'loopctl changes --project PROJECT --since TIMESTAMP' calls GET /api/v1/changes with the project_id and since parameters, displaying state changes for polling-based orchestrators",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.8",
+      "description": "'loopctl admin tenants' calls GET /api/v1/admin/tenants and lists all tenants with stats (requires superadmin API key)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.9",
+      "description": "'loopctl admin tenant ID' calls GET /api/v1/admin/tenants/:id and displays detailed tenant information",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.10",
+      "description": "'loopctl admin suspend TENANT_ID' and 'loopctl admin activate TENANT_ID' call the respective POST endpoints to change tenant status",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.11",
+      "description": "'loopctl admin stats' calls GET /api/v1/admin/stats and displays system-wide statistics",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.8.12",
+      "description": "'loopctl admin impersonate TENANT_ID -- COMMAND' executes COMMAND with the X-Impersonate-Tenant header set to the specified tenant ID, allowing superadmins to run any CLI command as another tenant",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.8.1",
+      "name": "Webhook create sends correct payload with events list",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and user-role api_key",
+        "Req.Test mock expects POST /api/v1/webhooks with {url: 'https://hooks.example.com/loopctl', events: ['story.status_changed', 'story.verified']} and returns 201 with webhook data including signing_secret"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.WebhookCommand.run(['create', '--url', 'https://hooks.example.com/loopctl', '--events', 'story.status_changed,story.verified'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with url and events array (comma-separated string parsed to array)",
+        "Output includes the webhook ID and signing secret",
+        "Output includes a warning that the signing secret is only shown once"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.2",
+      "name": "Webhook list displays webhooks with status",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and user-role api_key",
+        "Req.Test mock returns 200 for GET /api/v1/webhooks with 2 webhooks"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.WebhookCommand.run(['list', '--format', 'human'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output contains a table with columns: ID, URL, Events, Active, Failures",
+        "Table shows 2 rows with the correct data"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.3",
+      "name": "History command displays story audit trail",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock returns 200 for GET /api/v1/stories/:id/history with 5 audit entries"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.HistoryCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output lists 5 audit entries in chronological order",
+        "Each entry shows timestamp, action, actor, and state change details",
+        "JSON format returns array of audit entry objects"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.4",
+      "name": "Audit command sends correct query parameters",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and user-role api_key",
+        "Req.Test mock expects GET /api/v1/audit?project_id=:id&since=2026-03-01 and returns 200 with audit entries"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AuditCommand.run(['--project', project_id, '--since', '2026-03-01'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "GET request includes project_id and since as query parameters",
+        "Output displays the returned audit entries"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.5",
+      "name": "Changes command sends ISO8601 timestamp",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects GET /api/v1/changes?project_id=:id&since=2026-03-25T10:00:00Z and returns 200 with change entries"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ChangesCommand.run(['--project', project_id, '--since', '2026-03-25T10:00:00Z'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "GET request includes the since parameter as an ISO8601 timestamp",
+        "Output displays the returned change entries with entity type, action, and timestamp"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.6",
+      "name": "Admin tenants lists all tenants",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and superadmin-role api_key",
+        "Req.Test mock returns 200 for GET /api/v1/admin/tenants with 3 tenants including stats"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AdminCommand.run(['tenants'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output lists 3 tenants with name, slug, status, and stats (project count, story count, agent count)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.7",
+      "name": "Admin impersonate executes command as specified tenant",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and superadmin-role api_key",
+        "Req.Test mock expects GET /api/v1/projects with X-Impersonate-Tenant header set to tenant_uuid and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AdminCommand.run(['impersonate', tenant_uuid, '--', 'project', 'list'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "HTTP request includes X-Impersonate-Tenant header with the specified tenant ID",
+        "The 'project list' command is executed with the impersonation context",
+        "Output shows the projects belonging to the impersonated tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.8.8",
+      "name": "Admin suspend and activate change tenant status",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and superadmin-role api_key",
+        "Req.Test mock expects POST /api/v1/admin/tenants/:id/suspend and returns 200",
+        "Req.Test mock expects POST /api/v1/admin/tenants/:id/activate and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AdminCommand.run(['suspend', tenant_uuid], config_path: tmp_path)",
+        "Call Loopctl.CLI.AdminCommand.run(['activate', tenant_uuid], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "First call sends POST to /admin/tenants/:id/suspend and confirms suspension",
+        "Second call sends POST to /admin/tenants/:id/activate and confirms activation"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "The webhook --events flag accepts a comma-separated string that must be parsed into an array before sending to the API",
+    "Valid webhook event types should be documented in the help text: story.status_changed, story.verified, story.rejected, story.auto_reset, epic.completed, artifact.reported, agent.registered, project.imported",
+    "The admin impersonate command must parse the '--' separator to split the admin arguments from the command to execute as the tenant",
+    "Impersonation works by adding the X-Impersonate-Tenant header to the HTTP client, then dispatching the remaining arguments through the normal command router",
+    "The changes command --since parameter should accept both ISO8601 full timestamps and date-only strings (auto-appending T00:00:00Z for dates)",
+    "The history command reuses story number resolution from US-14.6",
+    "Admin commands should check the API key role client-side if possible and warn early if a non-superadmin key is being used",
+    "Webhook test should display the delivery result including HTTP status code and any error message from the target"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-10.1",
+    "US-11.1"
+  ],
+  "estimated_hours": 6
+}

@@ -1,0 +1,264 @@
+{
+  "id": "US-13.1",
+  "title": "Bulk Claim, Verify, and Reject Operations",
+  "epic": {
+    "id": "epic_13",
+    "name": "Bulk Operations"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "claim, verify, or reject multiple stories in a single API call",
+    "so_that": "I can efficiently manage batches of stories without making N individual requests, reducing latency and enabling atomic batch workflows"
+  },
+  "rationale": "When an orchestrator verifies stories after an agent completes a batch of work, or when an agent claims multiple ready stories for parallel implementation, issuing individual requests is slow and creates partial-success failure modes. Bulk endpoints wrap multiple operations in a single all-or-nothing transaction, ensuring either all operations succeed or none do, while returning per-story results for diagnostics.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-13.1.1",
+      "description": "POST /api/v1/stories/bulk/claim accepts a JSON body with {story_ids: [uuid, ...]} and an agent role API key, sets agent_status=assigned on all specified stories within a single database transaction",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.2",
+      "description": "POST /api/v1/stories/bulk/verify accepts a JSON body with {stories: [{story_id, result, summary, findings}]} and an orchestrator role API key, sets verified_status=verified on all specified stories within a single database transaction",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.3",
+      "description": "POST /api/v1/stories/bulk/reject accepts a JSON body with {stories: [{story_id, reason, findings}]} and an orchestrator role API key, sets verified_status=rejected on all specified stories and auto-resets agent_status to pending within a single database transaction",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.4",
+      "description": "All three bulk endpoints use all-or-nothing semantics: if any individual story fails its precondition check, the entire transaction is rolled back and no stories are modified",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.5",
+      "description": "Each bulk endpoint returns a response containing per-story results with story_id and status (success or error with reason), even on rollback, so the caller can identify which story caused the failure",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.6",
+      "description": "Bulk claim validates each story individually: story must have agent_status=pending, all story_dependencies must have verified_status=verified, and all parent epic_dependencies must be satisfied",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.7",
+      "description": "Bulk verify validates each story individually: story must have agent_status=reported_done before it can be verified",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.8",
+      "description": "Bulk reject validates each story individually: story must have agent_status=reported_done before it can be rejected, and each rejection entry must include a non-empty reason",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.9",
+      "description": "All bulk operations create individual audit_log entries for each story affected, recording the actor, previous state, new state, and timestamp",
+      "status": "pending"
+    },
+    {
+      "id": "AC-13.1.10",
+      "description": "All bulk operations fire individual webhook events for each story affected (story.status_changed, story.verified, or story.rejected) if the tenant has webhooks configured",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-13.1.1",
+      "name": "Bulk claim succeeds for multiple ready stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :pending}) x 3",
+        "fixture(:agent, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/claim with {story_ids: [story1.id, story2.id, story3.id]} using agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response body contains results array with 3 entries, each with status: 'success'",
+        "All 3 stories now have agent_status=assigned and assigned_agent_id=agent.id",
+        "3 audit_log entries are created with action='status_changed'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.2",
+      "name": "Bulk claim rolls back when one story fails precondition",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :pending}) as story1",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :assigned}) as story2 (already assigned)",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :pending}) as story3",
+        "fixture(:agent, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/claim with {story_ids: [story1.id, story2.id, story3.id]} using agent API key"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Response body contains per-story results identifying story2 as the failure (already assigned)",
+        "story1 and story3 remain agent_status=pending (transaction rolled back)",
+        "No audit_log entries are created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.3",
+      "name": "Bulk verify succeeds for multiple reported_done stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :reported_done}) x 2",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/verify with {stories: [{story_id: story1.id, result: 'pass', summary: 'All checks pass'}, {story_id: story2.id, result: 'pass', summary: 'Verified'}]} using orchestrator API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response body contains results array with 2 entries, each with status: 'success'",
+        "Both stories now have verified_status=verified",
+        "2 verification_results records are created",
+        "2 audit_log entries are created with action='verified'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.4",
+      "name": "Bulk reject succeeds and auto-resets agent_status",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :reported_done}) x 2",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/reject with {stories: [{story_id: story1.id, reason: 'Missing tests', findings: []}, {story_id: story2.id, reason: 'No migration', findings: []}]} using orchestrator API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Both stories now have verified_status=rejected",
+        "Both stories now have agent_status=pending (auto-reset)",
+        "Both stories have rejection_reason populated",
+        "2 verification_results records are created with result='fail'",
+        "Audit log entries record both the rejection and the auto-reset"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.5",
+      "name": "Bulk verify rejects request from agent role",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{role: :agent})",
+        "fixture(:story, %{agent_status: :reported_done})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/verify with {stories: [{story_id: story.id, result: 'pass', summary: 'ok'}]} using agent API key"
+      ],
+      "expected_results": [
+        "Response status is 403",
+        "Response body contains error indicating insufficient role",
+        "Story verified_status remains unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.6",
+      "name": "Bulk claim respects story dependency constraints",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :pending}) as story1",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :pending}) as story2",
+        "fixture(:story_dependency, %{story_id: story2.id, depends_on_story_id: story1.id})",
+        "fixture(:agent, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/claim with {story_ids: [story1.id, story2.id]} using agent API key"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Per-story results show story2 failed because its dependency (story1) is not verified",
+        "Neither story is claimed (transaction rolled back)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.7",
+      "name": "Bulk reject with missing reason returns validation error",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:story, %{agent_status: :reported_done})",
+        "fixture(:api_key, %{role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/reject with {stories: [{story_id: story.id, reason: '', findings: []}]} using orchestrator API key"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Response body contains validation error indicating reason is required",
+        "Story remains unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-13.1.8",
+      "name": "Bulk operations fire webhook events per story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.verified'], active: true})",
+        "fixture(:epic, %{project_id: project.id})",
+        "fixture(:story, %{epic_id: epic.id, agent_status: :reported_done}) x 2",
+        "fixture(:api_key, %{role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/verify with 2 stories using orchestrator API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "2 webhook_events records are created, one per story, with event_type='story.verified'",
+        "Each webhook_event has the correct story_id in its payload"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use Ecto.Multi to wrap all story updates in a single database transaction for all-or-nothing semantics",
+    "Validate each story individually within the Multi pipeline before any updates; collect all validation errors and return them in the per-story results",
+    "Lock stories with SELECT FOR UPDATE within the transaction to prevent concurrent claim races",
+    "Reuse existing story status transition logic from the single-story endpoints (claim, verify, reject) to ensure consistent validation",
+    "Fire webhook events after the transaction commits, not inside it, to avoid delivering events for rolled-back changes",
+    "Limit batch size to a configurable maximum (default 50) to prevent oversized transactions",
+    "The controller should delegate to a BulkOperations context module that coordinates the Ecto.Multi and returns {:ok, results} | {:error, failed_results}"
+  ],
+  "dependencies": [
+    "US-7.2"
+  ],
+  "estimated_hours": 6
+}

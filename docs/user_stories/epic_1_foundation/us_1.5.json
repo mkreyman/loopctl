@@ -1,0 +1,149 @@
+{
+  "id": "US-1.5",
+  "title": "Health check endpoint (GET /health)",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "medium",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a GET /health endpoint that returns the application health status including database connectivity, Oban status, and application version",
+    "so_that": "monitoring systems, load balancers, and deployment scripts can verify the application is running and its dependencies are healthy"
+  },
+  "rationale": "Health checks are essential for production operations. The beelink deployment script needs to verify the app started successfully after deploys. Nginx upstream health checks prevent routing to a dead backend. Monitoring systems use health endpoints to detect outages. This endpoint must be unauthenticated so external probes can reach it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.5.1",
+      "description": "GET /health returns 200 with JSON body {\"status\": \"ok\", \"version\": \"<app_version>\", \"checks\": {...}} when all checks pass",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.2",
+      "description": "The endpoint is unauthenticated — no API key required",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.3",
+      "description": "The checks object includes \"database\": \"ok\" when a simple SELECT 1 query succeeds against PostgreSQL",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.4",
+      "description": "The checks object includes \"oban\": \"ok\" when Oban is running in the supervision tree",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.5",
+      "description": "If the database check fails, the endpoint returns 503 with {\"status\": \"degraded\", \"checks\": {\"database\": \"error\", ...}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.6",
+      "description": "The version field is read from the application spec (:loopctl, :vsn) or mix.exs project version",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.5.7",
+      "description": "The endpoint responds within 5 seconds even if a dependency check is slow (timeout handling)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.5.1",
+      "name": "Health check returns 200 when all systems are healthy",
+      "type": "integration",
+      "preconditions": [
+        "Application is running",
+        "Database is connected"
+      ],
+      "steps": [
+        "Send GET /health"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response body has status = \"ok\"",
+        "Response body has checks.database = \"ok\"",
+        "Response body has checks.oban = \"ok\"",
+        "Response body has a non-empty version string"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.5.2",
+      "name": "Health check does not require authentication",
+      "type": "integration",
+      "preconditions": [
+        "Application is running"
+      ],
+      "steps": [
+        "Send GET /health without any Authorization header"
+      ],
+      "expected_results": [
+        "Response status is 200 (not 401)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.5.3",
+      "name": "Health check returns 503 when database is unavailable",
+      "type": "unit",
+      "preconditions": [
+        "HealthCheck module is compiled"
+      ],
+      "steps": [
+        "Mock the database check to return {:error, :timeout}",
+        "Call the health check function"
+      ],
+      "expected_results": [
+        "Response status is 503",
+        "Response body has status = \"degraded\"",
+        "Response body has checks.database = \"error\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.5.4",
+      "name": "Health check includes application version",
+      "type": "integration",
+      "preconditions": [
+        "Application is running"
+      ],
+      "steps": [
+        "Send GET /health",
+        "Parse the version field from the response"
+      ],
+      "expected_results": [
+        "Version field is a non-empty string matching semver pattern or mix project version"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.5.5",
+      "name": "Health check responds with correct JSON content type",
+      "type": "integration",
+      "preconditions": [
+        "Application is running"
+      ],
+      "steps": [
+        "Send GET /health",
+        "Check the Content-Type response header"
+      ],
+      "expected_results": [
+        "Content-Type is application/json"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Route should be outside the /api/v1 scope and auth pipeline: get \"/health\", HealthController, :check in the top-level scope",
+    "Database check: Ecto.Adapters.SQL.query(Repo, \"SELECT 1\") wrapped in a try/catch or Task.await with timeout",
+    "Oban check: Process.whereis(Oban) |> is_pid()",
+    "Use a dedicated Loopctl.Health module for the check logic, keep the controller thin",
+    "Consider adding a response_time_ms field for each check for observability"
+  ],
+  "dependencies": [],
+  "estimated_hours": 1
+}

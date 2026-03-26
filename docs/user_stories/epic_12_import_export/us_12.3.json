@@ -1,0 +1,261 @@
+{
+  "id": "US-12.3",
+  "title": "Merge Import (Round-Trip)",
+  "epic": {
+    "id": "epic_12",
+    "name": "Import/Export"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "re-import an updated JSON file into an existing project with a merge flag that creates new stories, updates metadata on existing stories (matched by number), and preserves progress on unchanged stories",
+    "so_that": "I can evolve a project's work breakdown over time — adding new stories, refining descriptions, adjusting estimates — without losing existing progress, agent assignments, or verification results"
+  },
+  "rationale": "Projects evolve. New stories are added mid-sprint, acceptance criteria are refined, and estimates are adjusted. A fresh import would wipe all progress — every agent assignment, every verification result, every artifact report. Merge import solves this by matching stories by their number and intelligently merging: new stories are created, existing stories get metadata updates (but not status resets), and stories missing from the import JSON are flagged for attention without auto-deletion.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-12.3.1",
+      "description": "POST /api/v1/projects/:id/import with query parameter merge=true activates merge import mode. Without merge=true, the endpoint behaves as a fresh import (US-12.1) and rejects if epics/stories already exist.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.2",
+      "description": "Stories are matched by their number field within each epic. If a story number from the import JSON matches an existing story in the same epic, the existing story's metadata is updated (title, description, acceptance_criteria, estimated_hours, metadata). Status fields (agent_status, verified_status) are NOT modified.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.3",
+      "description": "Epics are matched by their number field. If an epic number from the import JSON matches an existing epic in the project, the existing epic's metadata is updated (title, description, phase, position, metadata). Stories within the epic are then merge-processed.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.4",
+      "description": "New stories (numbers not present in the existing project) are created with agent_status=pending and verified_status=unverified. New epics are created with all their stories.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.5",
+      "description": "Existing stories that are NOT present in the import JSON are flagged in the response as 'orphaned' (listed by number and title) but NOT automatically deleted. This prevents accidental data loss.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.6",
+      "description": "Dependencies in the import JSON are processed: new dependencies are created, existing dependencies are preserved. Dependencies that exist in the database but not in the import JSON are NOT removed.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.7",
+      "description": "The entire merge import is executed in a single database transaction. If any step fails, the entire operation is rolled back.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.8",
+      "description": "On success, the response includes a detailed summary: {epics_created: N, epics_updated: N, stories_created: N, stories_updated: N, stories_orphaned: [{number, title}], dependencies_created: N, dependencies_existing: N}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.9",
+      "description": "Preserved fields on existing stories during merge: agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason. These are NEVER modified by merge import.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.10",
+      "description": "Cycle detection runs on the COMBINED dependency graph (existing + new dependencies) to ensure the merge does not introduce cycles.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-12.3.1",
+      "name": "merge creates new stories and updates existing ones",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1', title: 'Original Title', description: 'Original desc', agent_status: :implementing})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON containing epic 1 with stories: 1.1 (title='Updated Title') and 1.2 (new story)"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Response includes stories_updated=1, stories_created=1",
+        "Story 1.1 title is 'Updated Title'",
+        "Story 1.1 agent_status is still 'implementing' (preserved)",
+        "Story 1.2 exists with agent_status='pending' (new)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.2",
+      "name": "merge preserves all status fields on existing stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1', agent_status: :reported_done, verified_status: :verified, assigned_agent_id: agent.id, verified_at: ~U[2026-03-15 10:00:00Z]})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON containing story 1.1 with updated description"
+      ],
+      "expected_results": [
+        "Story 1.1 description is updated",
+        "agent_status is still :reported_done",
+        "verified_status is still :verified",
+        "assigned_agent_id is unchanged",
+        "verified_at is still 2026-03-15 10:00:00Z"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.3",
+      "name": "orphaned stories flagged but not deleted",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1', title: 'Story One'})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.2', title: 'Story Two'})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.3', title: 'Story Three'})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON containing epic 1 with only stories 1.1 and 1.2 (1.3 missing)"
+      ],
+      "expected_results": [
+        "Response includes stories_orphaned: [{number: '1.3', title: 'Story Three'}]",
+        "Story 1.3 still exists in the database (NOT deleted)",
+        "Stories 1.1 and 1.2 are updated"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.4",
+      "name": "merge with new epic creates it with all stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON containing epic 1 (existing) and epic 2 (new) with 3 stories"
+      ],
+      "expected_results": [
+        "Response includes epics_created=1, epics_updated=1",
+        "Epic 2 is created with 3 stories",
+        "Epic 1 is updated (not duplicated)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.5",
+      "name": "merge without merge flag rejects existing data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import (no merge=true) with JSON containing epic 1"
+      ],
+      "expected_results": [
+        "Response is 422 Unprocessable Entity",
+        "Error indicates that epic number 1 already exists. Use merge=true to update."
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.6",
+      "name": "merge detects cycles in combined dependency graph",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1'})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.2'})",
+        "fixture(:story_dependency, %{story: story_1_2, depends_on: story_1_1, tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with new dependency: 1.1 depends on 1.2 (creates cycle with existing 1.2 depends on 1.1)"
+      ],
+      "expected_results": [
+        "Response is 422 Unprocessable Entity",
+        "Error indicates dependency cycle detected",
+        "Nothing is modified (transaction rolled back)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.7",
+      "name": "full round-trip: export, modify, merge import",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id}) with 2 epics, 6 stories, some with progress (implementing, verified)"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export",
+        "Modify the exported JSON: add 1 new story to epic 1, update title of existing story, add new epic 3",
+        "POST /api/v1/projects/:id/import?merge=true with modified JSON"
+      ],
+      "expected_results": [
+        "Merge succeeds",
+        "New story is created with pending status",
+        "Existing story title is updated",
+        "New epic 3 is created with its stories",
+        "All progress on untouched stories is preserved",
+        "Summary reflects: epics_created=1, epics_updated=2, stories_created=N, stories_updated=N"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.8",
+      "name": "merge rollback on failure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1', title: 'Original'})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON that updates story 1.1 title AND includes a new story with invalid data (blank title)"
+      ],
+      "expected_results": [
+        "Response is 422 with validation error",
+        "Story 1.1 title is still 'Original' (update rolled back)",
+        "No new story was created (rolled back)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Extend the Loopctl.Import module with merge_import_project/3 function. The merge flag triggers a different code path from fresh import.",
+    "Merge algorithm: 1) Load existing epics/stories for the project. 2) Build lookup maps by number. 3) For each epic in the import: if exists, update metadata; if new, create. 4) For each story in each epic: if exists, update metadata (excluding status fields); if new, create. 5) Identify orphaned stories (exist in DB but not in import). 6) Process dependencies against combined graph.",
+    "Status fields to preserve (NEVER update during merge): agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason.",
+    "Metadata fields to update during merge: title, description, acceptance_criteria, estimated_hours, metadata (jsonb).",
+    "Orphan detection: after processing all import stories, diff against existing story numbers. Return orphans in the response but do not delete them.",
+    "Cycle detection must operate on the MERGED graph: existing dependencies UNION new dependencies. Load existing deps from DB, combine with import deps, then run cycle detection.",
+    "The merge=true query parameter is checked in the controller. Controller dispatches to import_project/3 or merge_import_project/3 based on the flag.",
+    "Transaction includes: epic upserts, story upserts, new dependency creation, cycle validation, audit logging. All in one Ecto.Multi."
+  ],
+  "dependencies": [
+    "US-12.1",
+    "US-12.2"
+  ],
+  "estimated_hours": 6
+}

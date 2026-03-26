@@ -1,0 +1,181 @@
+{
+  "id": "US-14.3",
+  "title": "API Key Management CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, list, revoke, and rotate API keys via the CLI",
+    "so_that": "I can manage access credentials for my agents, orchestrators, and team members without making raw API calls"
+  },
+  "rationale": "API key management is essential for tenant administrators who need to provision keys for different agents and roles, audit which keys exist, revoke compromised keys, and rotate keys on a schedule. The CLI provides a convenient interface to the key management API endpoints, making it easy to integrate key lifecycle management into scripts and automation workflows.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.3.1",
+      "description": "'loopctl keys create --name NAME --role ROLE' calls POST /api/v1/api_keys and displays the returned key details including the raw API key (shown only once)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.2",
+      "description": "'loopctl keys create' validates that --role is one of: user, orchestrator, agent; rejects invalid roles with a clear error message before making the API call",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.3",
+      "description": "'loopctl keys list' calls GET /api/v1/api_keys and displays all keys with id, name, role, key_prefix, last_used_at, and expires_at (never the full key)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.4",
+      "description": "'loopctl keys revoke KEY_ID' calls DELETE /api/v1/api_keys/:id and confirms the key was revoked",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.5",
+      "description": "'loopctl keys rotate KEY_ID' calls POST /api/v1/api_keys/:id/rotate and displays the new raw API key (shown only once) along with the grace period for the old key",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.6",
+      "description": "All keys commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.7",
+      "description": "The create command includes a prominent warning that the raw API key is only displayed once and must be saved immediately",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.8",
+      "description": "Keys list in human format displays as a formatted table with columns aligned",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.3.9",
+      "description": "All keys commands require an authenticated session with a user-role API key; agent and orchestrator keys receive a 403 error",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.3.1",
+      "name": "Keys create sends correct payload and displays result",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects POST /api/v1/api_keys with {name: 'worker-1', role: 'agent'} and returns 201 with key data including raw_key"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['create', '--name', 'worker-1', '--role', 'agent'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with correct name and role",
+        "Output includes the raw API key from the response",
+        "Output includes a warning about saving the key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.3.2",
+      "name": "Keys create rejects invalid role",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['create', '--name', 'test', '--role', 'superadmin'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating 'superadmin' is not a valid role for key creation",
+        "No HTTP request is made",
+        "Error message lists valid roles: user, orchestrator, agent"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.3.3",
+      "name": "Keys list displays all keys in table format",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/api_keys with a list of 3 keys"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['list', '--format', 'human'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output contains a table with columns: ID, Name, Role, Prefix, Last Used, Expires",
+        "Table shows 3 rows, one per key",
+        "No raw key values are displayed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.3.4",
+      "name": "Keys revoke sends DELETE and confirms",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects DELETE /api/v1/api_keys/:id and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['revoke', 'some-uuid-id'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "DELETE request is sent to /api/v1/api_keys/some-uuid-id",
+        "Output confirms the key was revoked"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.3.5",
+      "name": "Keys rotate displays new key and grace period",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock expects POST /api/v1/api_keys/:id/rotate and returns 200 with new_key and grace_period_until"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['rotate', 'some-uuid-id'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent to /api/v1/api_keys/some-uuid-id/rotate",
+        "Output includes the new raw API key",
+        "Output includes the grace period end time for the old key",
+        "Output includes a warning to save the new key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.3.6",
+      "name": "Keys list in JSON format returns raw JSON array",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/api_keys with a list of keys"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.KeysCommand.run(['list', '--format', 'json'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output is valid JSON that can be parsed by Jason.decode!/1",
+        "JSON contains an array of key objects with id, name, role, key_prefix fields"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Role validation should happen client-side before the API call to give faster feedback; the valid roles for creation are user, orchestrator, and agent (superadmin keys can only be created through other means)",
+    "The raw API key from create and rotate responses should be highlighted or formatted prominently in human output mode",
+    "Keys list should handle pagination if the API supports it, but for v1 a simple single-page list is sufficient",
+    "The revoke command should accept the key UUID, not the key prefix, to avoid ambiguity",
+    "Use Req.Test.expect/3 to mock HTTP responses in tests rather than hitting a real server"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-2.6"
+  ],
+  "estimated_hours": 3
+}

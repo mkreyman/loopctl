@@ -1,0 +1,237 @@
+{
+  "id": "US-4.1",
+  "title": "Agent Schema and Self-Registration",
+  "epic": {
+    "id": "epic_4",
+    "name": "Agents"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI implementation agent",
+    "i_want_to": "self-register with a tenant by providing my name and type via the API",
+    "so_that": "I have a persistent identity within the system that tracks my assignments, activity, and last-seen timestamp"
+  },
+  "rationale": "Agents need a persistent identity so the system can track who claimed which story, when agents were last active, and distinguish between orchestrator and implementer types. Self-registration is the agent-friendly mechanism: an agent with a role=agent API key calls POST /agents/register, and the system creates an agent record linked to that tenant and updates the API key's agent_id. The last_seen_at field is updated on every authenticated API call, providing a passive heartbeat for future stall detection.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-4.1.1",
+      "description": "POST /api/v1/agents/register with a role=agent API key creates an agent record with the provided name (string, required) and agent_type (enum: 'orchestrator' or 'implementer', required). Returns 201 with the created agent record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.2",
+      "description": "The created agent record includes: id (uuid), tenant_id (from API key), name, agent_type, status (defaults to 'active'), last_seen_at (set to now), metadata (jsonb, optional from request, defaults to {}), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.3",
+      "description": "After successful registration, the API key's agent_id field is updated to point to the newly created agent record, linking the key to the agent identity.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.4",
+      "description": "POST /api/v1/agents/register returns 409 Conflict if the API key already has an agent_id set (agent already registered with this key).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.5",
+      "description": "POST /api/v1/agents/register returns 422 if name is missing/blank or agent_type is not one of 'orchestrator' or 'implementer'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.6",
+      "description": "POST /api/v1/agents/register returns 403 if called with a non-agent role API key (user, orchestrator, superadmin).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.7",
+      "description": "Agent names must be unique within a tenant. POST /api/v1/agents/register returns 409 if an agent with the same name already exists in the tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.8",
+      "description": "The last_seen_at field on the agent record is updated to the current UTC timestamp on every authenticated API call made with an API key linked to that agent. This is done in the auth pipeline, not in individual controllers.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.9",
+      "description": "Registration creates an audit_log entry with entity_type='agent', action='registered', new_state containing the agent details, and actor identified as the API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-4.1.10",
+      "description": "The agent record is scoped to tenant_id. RLS policy enforces that agents are only visible within their own tenant.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-4.1.1",
+      "name": "Happy path: agent self-registration as implementer",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with body {name: 'worker-1', agent_type: 'implementer'}",
+        "Assert response 201",
+        "Reload the API key record from database"
+      ],
+      "expected_results": [
+        "Response includes agent with id, name='worker-1', agent_type='implementer', status='active', last_seen_at != nil",
+        "Agent tenant_id matches the API key's tenant_id",
+        "API key's agent_id is now set to the new agent's id",
+        "Audit log entry created with action='registered'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.2",
+      "name": "Happy path: agent self-registration as orchestrator",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with body {name: 'orchestrator-main', agent_type: 'orchestrator', metadata: {capabilities: ['verify', 'review']}}"
+      ],
+      "expected_results": [
+        "Response 201 with agent_type='orchestrator'",
+        "metadata field contains {capabilities: ['verify', 'review']}",
+        "Agent record created in database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.3",
+      "name": "Double registration returns 409",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with body {name: 'worker-2', agent_type: 'implementer'}"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Error message indicates API key is already linked to an agent",
+        "No new agent record created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.4",
+      "name": "Duplicate agent name within tenant returns 409",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\", agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with body {name: 'worker-1', agent_type: 'implementer'}"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Error message indicates agent name already exists in this tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.5",
+      "name": "Non-agent role key cannot register",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with user API key",
+        "POST /api/v1/agents/register with orchestrator API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden",
+        "No agent records created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.6",
+      "name": "Invalid agent_type returns 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with body {name: 'worker-1', agent_type: 'supervisor'}",
+        "POST /api/v1/agents/register with body {name: 'worker-1'} (missing agent_type)",
+        "POST /api/v1/agents/register with body {agent_type: 'implementer'} (missing name)"
+      ],
+      "expected_results": [
+        "All three requests return 422 Unprocessable Entity",
+        "Error messages indicate validation failures for each case"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.7",
+      "name": "last_seen_at updated on subsequent API calls",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, name: \"worker-1\", last_seen_at: ~U[2026-03-25 00:00:00Z]})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "Record current time",
+        "GET /api/v1/projects with agent API key (any authenticated request)",
+        "Reload agent record from database"
+      ],
+      "expected_results": [
+        "Agent's last_seen_at is updated to approximately the current time",
+        "last_seen_at is more recent than the fixture value (2026-03-25)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-4.1.8",
+      "name": "Same agent name allowed across different tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:agent, %{tenant_id: tenant_a.id, name: \"worker-1\"})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent, agent_id: nil})"
+      ],
+      "steps": [
+        "POST /api/v1/agents/register with tenant B key, body {name: 'worker-1', agent_type: 'implementer'}"
+      ],
+      "expected_results": [
+        "Response 201 — name uniqueness is per-tenant, not global",
+        "Both tenants have an agent named 'worker-1'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement Loopctl.Agents context module with register_agent/2 function.",
+    "agents table: id (uuid PK), tenant_id (uuid FK), name (string), agent_type (enum: orchestrator/implementer), status (enum: active/idle/deactivated, default active), last_seen_at (utc_datetime), metadata (jsonb default {}), inserted_at, updated_at.",
+    "Unique index on (tenant_id, name) for per-tenant name uniqueness.",
+    "RLS policy on agents: tenant_id = current_setting('app.current_tenant_id')::uuid.",
+    "Registration uses Ecto.Multi: insert agent + update api_key.agent_id + insert audit_log, all atomic.",
+    "last_seen_at update: add a plug in the auth pipeline (after SetTenant) that does an async update (Task.start or Ecto.Adapters.SQL.query for non-blocking) to avoid adding latency to every request. Alternatively, use a GenServer buffer that flushes periodically.",
+    "Controller at LoopctlWeb.AgentController with register action at POST /api/v1/agents/register.",
+    "The agent_type field determines behavior elsewhere (orchestrator agents can be linked to orchestrator API keys in US-7.2)."
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 4
+}

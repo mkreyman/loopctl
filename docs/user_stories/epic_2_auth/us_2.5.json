@@ -1,0 +1,186 @@
+{
+  "id": "US-2.5",
+  "title": "Self-service tenant registration with initial API key",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a public POST /api/v1/tenants/register endpoint that creates a new tenant and its first user-role API key, returning the raw key exactly once in the response",
+    "so_that": "new tenants can self-onboard without manual intervention, receive their admin API key immediately, and begin using the system"
+  },
+  "rationale": "Self-service registration is essential for an agent-native system. AI orchestrators need to be able to programmatically create tenants and receive API keys without human intervention. The raw key is returned only at registration time - after that, only the key_prefix is visible. This is the standard pattern for API key management (similar to GitHub personal access tokens).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.5.1",
+      "description": "POST /api/v1/tenants/register is a public endpoint (no authentication required)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.2",
+      "description": "Request body requires: name (string), slug (string), email (string). Optional: settings (object)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.3",
+      "description": "On success, creates a tenant with status :active and a user-role API key named 'default'",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.4",
+      "description": "Response includes the full tenant object and the raw API key (this is the ONLY time the raw key is returned)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.5",
+      "description": "Response format: {\"tenant\": {...}, \"api_key\": {\"raw_key\": \"lc_...\", \"key_prefix\": \"lc_a3Bf\", \"role\": \"user\", \"name\": \"default\"}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.6",
+      "description": "The entire operation (tenant creation + API key generation) is wrapped in a database transaction — if either fails, both are rolled back",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.7",
+      "description": "Duplicate slug returns 409 Conflict with a clear error message",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.8",
+      "description": "Invalid input (missing name, bad email, invalid slug) returns 422 with structured validation errors",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.5.9",
+      "description": "Rate limiting is applied to prevent registration abuse (max 5 registrations per IP per hour)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.5.1",
+      "name": "Successful tenant registration",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "POST /api/v1/tenants/register with body {\"name\": \"Test Corp\", \"slug\": \"test-corp\", \"email\": \"admin@test.com\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has tenant.id, tenant.name, tenant.slug, tenant.status = \"active\"",
+        "Response body has api_key.raw_key starting with 'lc_'",
+        "Response body has api_key.key_prefix (8 chars)",
+        "Response body has api_key.role = \"user\"",
+        "Tenant exists in database",
+        "API key exists in database with matching key_hash"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.2",
+      "name": "Registration with duplicate slug",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{slug: \"taken-slug\"})"
+      ],
+      "steps": [
+        "POST /api/v1/tenants/register with body {\"name\": \"Other\", \"slug\": \"taken-slug\", \"email\": \"other@test.com\"}"
+      ],
+      "expected_results": [
+        "Response status is 409",
+        "Response body has error message about slug being taken",
+        "No new tenant or API key is created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.3",
+      "name": "Registration with missing required fields",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "POST /api/v1/tenants/register with body {\"name\": \"Test\"} (missing slug and email)"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Response body has error.details with errors on slug and email"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.4",
+      "name": "Registration is transactional",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "Mock API key generation to fail after tenant creation",
+        "POST /api/v1/tenants/register with valid body"
+      ],
+      "expected_results": [
+        "Response indicates failure",
+        "No tenant is created in the database (transaction rolled back)",
+        "No API key is created in the database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.5",
+      "name": "Registration does not require authentication",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "POST /api/v1/tenants/register without Authorization header"
+      ],
+      "expected_results": [
+        "Response is not 401 (endpoint is public)",
+        "Registration proceeds normally"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.6",
+      "name": "Returned API key can authenticate subsequent requests",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "POST /api/v1/tenants/register and capture raw_key from response",
+        "GET /api/v1/tenants/me with Authorization: Bearer <raw_key>"
+      ],
+      "expected_results": [
+        "Second request returns 200 with the tenant profile",
+        "The returned tenant matches the one created during registration"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.5.7",
+      "name": "Registration with custom settings",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "POST /api/v1/tenants/register with body including settings: {\"timezone\": \"America/New_York\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Tenant settings include the provided timezone value"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use Ecto.Multi for the transactional tenant + API key creation",
+    "The endpoint must be outside the :authenticated pipeline in the router",
+    "Rate limiting on this endpoint can use a simple IP-based ETS counter (or defer to US-2.7)",
+    "The response JSON view should have a special registration_json/1 that includes the raw_key (not used in any other API key view)",
+    "Consider logging registration events to the audit trail with actor_type: 'system'",
+    "GET /api/v1/tenants/me and PATCH /api/v1/tenants/me are referenced here but will be implemented as part of this story since they are simple tenant profile endpoints"
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 4
+}

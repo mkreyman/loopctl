@@ -1,0 +1,227 @@
+{
+  "id": "US-14.6",
+  "title": "Agent Operation CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI implementation agent",
+    "i_want_to": "register myself, claim stories, mark them as in-progress, report completion with artifacts, and unclaim stories via the CLI",
+    "so_that": "I can participate in the development loop by picking up work, reporting my progress, and submitting deliverables through a simple command interface"
+  },
+  "rationale": "Implementation agents are the primary producers of work in the loopctl system. They need a streamlined CLI interface to self-register, claim assigned stories, transition through the implementation workflow (claim -> start -> report), and release stories if they cannot complete them. These commands map directly to the agent status endpoints and are designed for programmatic invocation by AI agents, with JSON as the default output format.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.6.1",
+      "description": "'loopctl agent register --name NAME --type TYPE' calls POST /api/v1/agents/register with the agent name and type (implementer or orchestrator) and displays the returned agent record including the agent ID",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.2",
+      "description": "'loopctl claim STORY_NUM' resolves the story number to a UUID and calls POST /api/v1/stories/:id/claim, displaying the updated story with agent_status=assigned",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.3",
+      "description": "'loopctl start STORY_NUM' resolves the story number to a UUID and calls POST /api/v1/stories/:id/start, displaying the updated story with agent_status=implementing",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.4",
+      "description": "'loopctl report STORY_NUM --artifact JSON' resolves the story number to a UUID and calls POST /api/v1/stories/:id/report with the artifact data, displaying the updated story with agent_status=reported_done",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.5",
+      "description": "'loopctl report STORY_NUM' without --artifact still works, reporting the story as done without artifact data",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.6",
+      "description": "'loopctl unclaim STORY_NUM' resolves the story number to a UUID and calls POST /api/v1/stories/:id/unclaim, displaying the updated story with agent_status=pending and cleared assignment",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.7",
+      "description": "All agent commands require authentication with an agent-role API key; commands fail with a clear error if the API returns 403 due to insufficient role",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.8",
+      "description": "All agent commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.9",
+      "description": "The --artifact flag accepts either inline JSON or a file path prefixed with @ (e.g., --artifact @artifacts.json) that is read and parsed as JSON",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.10",
+      "description": "Agent register validates that --type is one of: implementer, orchestrator; rejects invalid types with a clear error message",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.6.1",
+      "name": "Agent register sends correct payload",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock expects POST /api/v1/agents/register with {name: 'worker-1', agent_type: 'implementer'} and returns 201 with agent record"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.AgentCommand.run(['register', '--name', 'worker-1', '--type', 'implementer'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with correct name and agent_type",
+        "Output includes the agent ID, name, type, and status",
+        "Output in JSON format is a parseable agent object"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.2",
+      "name": "Claim story resolves number and sends claim request",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/claim and returns 200 with updated story"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ClaimCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Story number '2.1' is resolved to a UUID",
+        "POST request is sent to /api/v1/stories/:uuid/claim",
+        "Output shows story with agent_status='assigned'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.3",
+      "name": "Start story transitions to implementing",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/start and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StartCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent to /api/v1/stories/:uuid/start",
+        "Output shows story with agent_status='implementing'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.4",
+      "name": "Report story with inline artifact JSON",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/report with artifact data and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ReportCommand.run(['2.1', '--project', project_id, '--artifact', '{\"artifact_type\":\"commit_diff\",\"path\":\"abc123\",\"exists\":true}'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request includes the parsed artifact JSON in the body",
+        "Output shows story with agent_status='reported_done'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.5",
+      "name": "Report story with artifact from file",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Temporary file containing valid artifact JSON",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/report and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ReportCommand.run(['2.1', '--project', project_id, '--artifact', '@' <> tmp_artifact_path], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Artifact JSON is read from the file path",
+        "POST request includes the file contents as the artifact data",
+        "Output shows story with agent_status='reported_done'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.6",
+      "name": "Unclaim story releases assignment",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/unclaim and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.UnclaimCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent to /api/v1/stories/:uuid/unclaim",
+        "Output shows story with agent_status='pending' and no assigned agent"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.7",
+      "name": "Agent register rejects invalid type",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.AgentCommand.run(['register', '--name', 'test', '--type', 'invalid'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating 'invalid' is not a valid agent type",
+        "Error message lists valid types: implementer, orchestrator",
+        "No HTTP request is made"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.6.8",
+      "name": "Report without artifact succeeds",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and agent-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/report with no artifact and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.ReportCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent without artifact data in the body",
+        "Output shows story with agent_status='reported_done'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "All story-number-based commands (claim, start, report, unclaim) need the same story number resolution logic — extract this into a shared helper in the CLI module",
+    "Story number resolution requires a --project flag to scope the lookup; if only one project exists, auto-detect it",
+    "The @file syntax for --artifact should read the file, parse it as JSON, and fail with a clear error if the file doesn't exist or contains invalid JSON",
+    "The agent register command should store the returned agent_id in the config file for use by subsequent claim/start/report commands",
+    "Consider adding --project to the config file so agents don't need to specify it on every command",
+    "All agent commands should handle common API errors gracefully: 409 (already claimed), 403 (wrong role), 422 (precondition failed)"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-4.1"
+  ],
+  "estimated_hours": 4
+}

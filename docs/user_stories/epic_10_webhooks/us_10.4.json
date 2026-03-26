@@ -1,0 +1,188 @@
+{
+  "id": "US-10.4",
+  "title": "Webhook Signing and Security",
+  "epic": {
+    "id": "epic_10",
+    "name": "Webhooks"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "have all webhook payloads signed with HMAC-SHA256 using my webhook's signing secret so I can verify their authenticity",
+    "so_that": "my receiving endpoint can cryptographically verify that webhook payloads genuinely originated from loopctl and were not tampered with in transit"
+  },
+  "rationale": "Without payload signing, any attacker who discovers a webhook URL can forge events by sending crafted HTTP requests. HMAC-SHA256 signing provides both authentication (only loopctl has the signing secret) and integrity (the payload cannot be modified without invalidating the signature). This is the industry standard approach used by GitHub, Stripe, and other webhook providers.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-10.4.1",
+      "description": "Every webhook delivery request includes an X-Signature-256 header containing the HMAC-SHA256 signature of the raw JSON payload body, computed using the webhook's decrypted signing_secret.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.2",
+      "description": "The signature format is: sha256=<hex-encoded-hmac>. Example: sha256=a1b2c3d4e5f6...",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.3",
+      "description": "The HMAC is computed over the exact raw JSON bytes of the payload body (not a re-encoded version), ensuring byte-for-byte fidelity for verification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.4",
+      "description": "Every webhook delivery request includes an X-Webhook-ID header containing the webhook_event ID (for deduplication by the receiver).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.5",
+      "description": "Every webhook delivery request includes an X-Webhook-Timestamp header containing the Unix timestamp of when the delivery was initiated (for replay attack prevention).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.6",
+      "description": "Payload size is limited to 64KB. Events with payloads exceeding this limit are truncated (large jsonb fields like old_state/new_state are replaced with a reference to the audit log entry ID).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.7",
+      "description": "The signing secret is decrypted from Cloak storage only at the moment of delivery, never cached in plaintext in memory beyond the scope of the delivery function.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.4.8",
+      "description": "A User-Agent header is set on all webhook delivery requests: 'Loopctl-Webhook/1.0'.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-10.4.1",
+      "name": "X-Signature-256 header is present and correct",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, payload: %{event: 'story.verified', data: %{story_id: 'abc'}}})",
+        "HTTP mock captures request headers and body",
+        "Known signing_secret for the webhook"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1",
+        "Capture the X-Signature-256 header from the HTTP request",
+        "Compute expected HMAC-SHA256 of the raw request body using the known signing_secret"
+      ],
+      "expected_results": [
+        "X-Signature-256 header is present",
+        "Header value matches sha256=<expected_hex_hmac>",
+        "Manual HMAC verification using the signing_secret and captured body matches the header value"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.4.2",
+      "name": "signature format is sha256=hex",
+      "type": "unit",
+      "preconditions": [
+        "Known payload: '{\"event\":\"test\"}'",
+        "Known secret: 'test_secret_1234'"
+      ],
+      "steps": [
+        "Call the signing function with payload and secret"
+      ],
+      "expected_results": [
+        "Result starts with 'sha256='",
+        "Remaining string is valid hex (lowercase, even length)",
+        "Full string is 71 characters (7 prefix + 64 hex digits for SHA256)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.4.3",
+      "name": "X-Webhook-ID and X-Webhook-Timestamp headers present",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: true})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending})",
+        "HTTP mock captures request headers"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1"
+      ],
+      "expected_results": [
+        "X-Webhook-ID header is present and matches the webhook_event ID",
+        "X-Webhook-Timestamp header is present and is a valid Unix timestamp",
+        "User-Agent header is 'Loopctl-Webhook/1.0'",
+        "Content-Type header is 'application/json'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.4.4",
+      "name": "payload size limit enforced",
+      "type": "unit",
+      "preconditions": [
+        "A webhook_event with a payload exceeding 64KB (e.g., large old_state/new_state)"
+      ],
+      "steps": [
+        "Call the payload preparation function with the oversized payload"
+      ],
+      "expected_results": [
+        "Payload is truncated to under 64KB",
+        "Large jsonb fields are replaced with a reference (e.g., {truncated: true, audit_log_id: uuid})",
+        "Core event fields (event_type, entity IDs, timestamp) are preserved"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.4.5",
+      "name": "different secrets produce different signatures",
+      "type": "unit",
+      "preconditions": [
+        "Two webhooks with different signing_secrets",
+        "Same payload"
+      ],
+      "steps": [
+        "Compute signature with secret A",
+        "Compute signature with secret B"
+      ],
+      "expected_results": [
+        "The two signatures are different",
+        "Both are valid sha256=hex format"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.4.6",
+      "name": "signature is computed over raw bytes not re-encoded JSON",
+      "type": "unit",
+      "preconditions": [
+        "A specific JSON payload with known byte representation",
+        "Known signing secret"
+      ],
+      "steps": [
+        "Encode payload to JSON bytes",
+        "Compute HMAC-SHA256 of those exact bytes",
+        "Compare with the output of the signing function"
+      ],
+      "expected_results": [
+        "Signatures match exactly",
+        "Re-encoding the payload to JSON (which may reorder keys) and signing produces a DIFFERENT signature, proving raw bytes are used"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Signing function: :crypto.mac(:hmac, :sha256, secret, raw_body) |> Base.encode16(case: :lower). Prefix with 'sha256='.",
+    "The raw JSON body must be the exact bytes sent in the HTTP POST. Encode the payload to JSON ONCE, sign those bytes, then send those same bytes. Do not re-encode.",
+    "Cloak decryption happens when the webhook Ecto schema is loaded (Cloak.Ecto handles this transparently). Ensure the schema field type is Loopctl.Encrypted.Binary.",
+    "Payload truncation: check byte_size(json_body) > 65_536 before signing. If oversized, remove old_state/new_state from data and add truncated: true.",
+    "Headers to set on every delivery: X-Signature-256, X-Webhook-ID, X-Webhook-Timestamp, Content-Type: application/json, User-Agent: Loopctl-Webhook/1.0.",
+    "This story modifies the WebhookDeliveryWorker from US-10.3 to add signing and security headers before making the HTTP request."
+  ],
+  "dependencies": [
+    "US-10.3"
+  ],
+  "estimated_hours": 3
+}

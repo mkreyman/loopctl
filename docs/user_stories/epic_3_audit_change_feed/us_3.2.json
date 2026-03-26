@@ -1,0 +1,235 @@
+{
+  "id": "US-3.2",
+  "title": "Change Feed Polling Endpoint",
+  "epic": {
+    "id": "epic_3",
+    "name": "Audit & Change Feed"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "poll for all state changes since a given timestamp, filterable by project, entity type, and action",
+    "so_that": "I can detect what changed since my last poll cycle and react accordingly without maintaining server-side cursors or WebSocket connections"
+  },
+  "rationale": "Orchestrators need a lightweight, stateless mechanism to discover changes across the entire project. Polling via timestamp is the simplest approach that supports crash recovery — the orchestrator just remembers its last poll timestamp and asks for everything since then. This avoids the complexity of server-side cursor management or WebSocket infrastructure while still enabling near-real-time coordination.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-3.2.1",
+      "description": "GET /api/v1/changes?since=<ISO8601> returns all audit log entries with inserted_at > since timestamp for the authenticated tenant, ordered by inserted_at ascending.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.2",
+      "description": "The since parameter is required. Requests without it return 400 Bad Request with a descriptive error message.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.3",
+      "description": "The endpoint supports optional project_id filter that scopes results to entities belonging to that project (stories, epics, and their related audit entries).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.4",
+      "description": "The endpoint supports optional entity_type filter (e.g., story, epic, project, agent) to narrow results to specific entity types.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.5",
+      "description": "The endpoint supports optional action filter (e.g., status_changed, created, verified, rejected) to narrow results to specific actions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.6",
+      "description": "Results are capped at a configurable maximum (default 1000) per request. If more results exist, the response includes a has_more boolean flag and the last entry's inserted_at as next_since for the next poll.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.7",
+      "description": "The endpoint is accessible to agent role and above (agent, orchestrator, user). All roles can poll the change feed.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.8",
+      "description": "Results are tenant-scoped via RLS. A tenant can only see changes for their own entities.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.9",
+      "description": "The response includes each entry's id, entity_type, entity_id, action, actor_type, actor_label, new_state, metadata, and inserted_at. The old_state field is omitted from the change feed response to reduce payload size (available via full audit endpoint).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.2.10",
+      "description": "Multiple filters can be combined (e.g., since + project_id + entity_type + action).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-3.2.1",
+      "name": "basic polling returns changes since timestamp",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant.id})",
+        "3 audit log entries created at known timestamps (t1, t2, t3 where t1 < t2 < t3)"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<t1> with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns entries at t2 and t3 (entries after t1)",
+        "Entries are ordered by inserted_at ascending",
+        "Each entry includes entity_type, entity_id, action, actor_label, new_state, inserted_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.2",
+      "name": "missing since parameter returns 400",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/changes (no since parameter)"
+      ],
+      "expected_results": [
+        "Response is 400 Bad Request",
+        "Error message indicates since parameter is required"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.3",
+      "name": "project_id filter scopes results correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Project A'})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Project B'})",
+        "Audit entries exist for entities in both projects"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<past_timestamp>&project_id=<project_a_id>"
+      ],
+      "expected_results": [
+        "Response includes only changes related to Project A entities",
+        "No changes from Project B appear in the results"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.4",
+      "name": "entity_type and action filters work together",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "Audit entries with various entity_types (story, epic, project) and actions (created, updated, status_changed)"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<past>&entity_type=story&action=status_changed"
+      ],
+      "expected_results": [
+        "Response includes only entries where entity_type='story' AND action='status_changed'",
+        "Entries with other entity_types or actions are excluded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.5",
+      "name": "result cap and has_more flag",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "More than 1000 audit log entries for the tenant (or override cap to smaller value for test)"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<early_timestamp> (with result cap set to 10 for testing)"
+      ],
+      "expected_results": [
+        "Response includes exactly 10 entries (the cap)",
+        "has_more is true",
+        "next_since contains the inserted_at of the last returned entry",
+        "Using next_since in a subsequent poll returns the remaining entries"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.6",
+      "name": "tenant isolation on change feed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})",
+        "Audit entries exist for both tenants"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<past_timestamp> with Tenant A's API key"
+      ],
+      "expected_results": [
+        "Response includes only Tenant A's changes",
+        "No entries from Tenant B appear"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.7",
+      "name": "agent role can access change feed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "Audit entries exist for the tenant"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=<past_timestamp> with agent API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns change entries for the tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.2.8",
+      "name": "invalid since timestamp returns 400",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=not-a-date",
+        "GET /api/v1/changes?since=2026-13-45T99:99:99Z"
+      ],
+      "expected_results": [
+        "Both requests return 400 Bad Request",
+        "Error message indicates invalid timestamp format"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuses the audit_log table from US-3.1 — no new tables needed. This is a read-only endpoint over existing data.",
+    "Controller: ChangeController with index action. Route: GET /api/v1/changes.",
+    "The project_id filter requires a join through entity relationships — stories belong to epics which belong to projects. Store project_id in audit_log metadata during logging for efficient filtering, or join through entity tables.",
+    "Consider adding a project_id column to audit_log (denormalized) for efficient project-scoped change feed queries. Alternative: store project_id in the metadata jsonb.",
+    "Result cap (default 1000) should be configurable via application config. Response shape: {data: [...], has_more: bool, next_since: ISO8601|null}.",
+    "Omit old_state from the change feed response to reduce payload size. Clients can use GET /audit for full state diffs.",
+    "Index on (tenant_id, inserted_at) from US-3.1 supports the primary query pattern (since > timestamp, scoped by tenant)."
+  ],
+  "dependencies": [
+    "US-3.1"
+  ],
+  "estimated_hours": 4
+}

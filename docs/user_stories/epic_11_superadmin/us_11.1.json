@@ -1,0 +1,238 @@
+{
+  "id": "US-11.1",
+  "title": "Superadmin Tenant Management",
+  "epic": {
+    "id": "epic_11",
+    "name": "Superadmin"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "list, view, update, suspend, and activate tenants via superadmin API endpoints",
+    "so_that": "I can manage the multi-tenant platform, handle abuse or billing issues by suspending tenants, and reactivate them when resolved"
+  },
+  "rationale": "A multi-tenant platform needs administrative controls that operate outside any single tenant's scope. Superadmin endpoints provide the ability to view all tenants, modify their settings or status, and suspend/activate tenants as needed. These operations use a superadmin API key (tenant_id=NULL) that bypasses normal RLS scoping to operate across the entire system.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-11.1.1",
+      "description": "GET /api/v1/admin/tenants returns a paginated list of all tenants with summary stats: id, name, slug, email, status, project_count, story_count, agent_count, api_key_count, inserted_at. Requires superadmin API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.2",
+      "description": "GET /api/v1/admin/tenants/:id returns full tenant detail including settings, all summary stats, and recent activity (last API call timestamp).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.3",
+      "description": "PATCH /api/v1/admin/tenants/:id allows updating tenant fields: name, email, settings (partial merge — provided keys override, unspecified keys preserved), status. Returns updated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.4",
+      "description": "POST /api/v1/admin/tenants/:id/suspend sets tenant status to 'suspended'. Suspended tenants' API keys return 403 on all requests (checked in auth pipeline). Returns updated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.5",
+      "description": "POST /api/v1/admin/tenants/:id/activate sets tenant status to 'active'. Previously suspended tenants regain full access. Returns updated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.6",
+      "description": "All admin/tenants endpoints require a superadmin API key (role=superadmin, tenant_id=NULL). Non-superadmin keys receive 403.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.7",
+      "description": "Suspend and activate actions are recorded in the audit log with actor_type='superadmin', the superadmin's API key ID as actor_id, and the tenant_id of the affected tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.8",
+      "description": "The tenants list supports filtering by status (active, suspended, deactivated) and search by name or slug (case-insensitive partial match).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.9",
+      "description": "Attempting to suspend an already-suspended tenant returns 422 with a descriptive error. Same for activating an already-active tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.1.10",
+      "description": "The auth pipeline checks tenant status after resolving the API key. If the tenant is suspended, return 403 with error message 'Tenant suspended' before processing any request.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-11.1.1",
+      "name": "list tenants with stats",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Tenant A', status: :active})",
+        "fixture(:tenant, %{name: 'Tenant B', status: :suspended})",
+        "fixture(:project, %{tenant_id: tenant_a.id})",
+        "fixture(:agent, %{tenant_id: tenant_a.id})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/tenants with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns both tenants",
+        "Tenant A includes project_count=1, agent_count=1",
+        "Tenant B includes project_count=0, agent_count=0",
+        "Each tenant includes id, name, slug, email, status, inserted_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.2",
+      "name": "get tenant detail with full stats",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Test Tenant'})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/tenants/:tenant_id with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Includes full tenant detail with settings",
+        "Includes project_count, story_count, epic_count, agent_count, api_key_count"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.3",
+      "name": "suspend tenant blocks their API access",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Target Tenant', status: :active})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/admin/tenants/:tenant_id/suspend with superadmin API key",
+        "GET /api/v1/tenants/me with the suspended tenant's user API key"
+      ],
+      "expected_results": [
+        "Suspend response is 200 OK with tenant status='suspended'",
+        "Tenant's own API call returns 403 with error 'Tenant suspended'",
+        "Audit log entry exists with action='tenant_suspended'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.4",
+      "name": "activate tenant restores their API access",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Target Tenant', status: :suspended})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/admin/tenants/:tenant_id/activate with superadmin API key",
+        "GET /api/v1/tenants/me with the reactivated tenant's user API key"
+      ],
+      "expected_results": [
+        "Activate response is 200 OK with tenant status='active'",
+        "Tenant's own API call returns 200 OK (access restored)",
+        "Audit log entry exists with action='tenant_activated'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.5",
+      "name": "non-superadmin cannot access admin endpoints",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/tenants with user API key",
+        "POST /api/v1/admin/tenants/:id/suspend with user API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.6",
+      "name": "update tenant settings with partial merge",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{settings: %{max_webhooks: 10, max_projects: 50}})"
+      ],
+      "steps": [
+        "PATCH /api/v1/admin/tenants/:id with body: {settings: {max_webhooks: 20}}"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Tenant settings.max_webhooks is 20",
+        "Tenant settings.max_projects is still 50 (preserved, not overwritten)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.7",
+      "name": "filter tenants by status",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Active Tenant', status: :active})",
+        "fixture(:tenant, %{name: 'Suspended Tenant', status: :suspended})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/tenants?status=suspended with superadmin API key"
+      ],
+      "expected_results": [
+        "Response includes only the suspended tenant",
+        "Active tenant is not in the results"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.1.8",
+      "name": "suspending already-suspended tenant returns 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{status: :suspended})"
+      ],
+      "steps": [
+        "POST /api/v1/admin/tenants/:id/suspend with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 422 Unprocessable Entity",
+        "Error message indicates tenant is already suspended"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create AdminTenantController with index, show, update, suspend, activate actions.",
+    "Routes: scope /api/v1/admin, pipe_through [:api, :require_superadmin]. All routes under /admin require superadmin role.",
+    "Superadmin API keys have tenant_id=NULL. The auth pipeline must handle this case: bypass RLS (or set a special RLS context that grants cross-tenant access).",
+    "For tenant stats, use subqueries or lateral joins: SELECT t.*, (SELECT count(*) FROM projects WHERE tenant_id = t.id) as project_count, etc.",
+    "Tenant suspension check: add a plug in the auth pipeline after ResolveApiKey that checks tenant.status. If suspended, halt with 403.",
+    "Settings merge on PATCH: Map.merge(existing_settings, provided_settings). Deep merge if needed for nested settings.",
+    "Audit logging for suspend/activate: actor_type='superadmin', tenant_id=affected_tenant.id (not NULL, since the action is about that tenant).",
+    "Search filter: WHERE lower(name) LIKE lower('%query%') OR lower(slug) LIKE lower('%query%')."
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 6
+}

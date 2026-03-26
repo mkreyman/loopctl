@@ -1,0 +1,257 @@
+{
+  "id": "US-7.2",
+  "title": "Orchestrator Verification of Stories",
+  "epic": {
+    "id": "epic_7",
+    "name": "Two-Tier Progress Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "independently verify or reject stories that agents have reported as done",
+    "so_that": "there is a trusted, independent assessment of whether work actually meets specifications"
+  },
+  "rationale": "The verified_status track is the second half of the two-tier trust model. Only orchestrator-role keys can write to verified_status, creating a structural guarantee that agents cannot self-verify. This is the key mechanism that prevents the fabrication problem described in the PRD: agents claiming work is done when it is not. The orchestrator reads agent output, runs checks, and records its independent finding.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-7.2.1",
+      "description": "POST /api/v1/stories/:id/verify with an orchestrator-role API key sets verified_status to 'verified', sets verified_at timestamp, and creates a verification_result record with result='pass'. Request body must include summary (text) and optionally findings (jsonb) and review_type (string).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.2",
+      "description": "POST /api/v1/stories/:id/reject with an orchestrator-role API key sets verified_status to 'rejected', sets rejected_at timestamp, and stores rejection_reason. Request body must include reason (text) and optionally findings (jsonb) and review_type (string). Creates a verification_result record with result='fail'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.3",
+      "description": "Both verify and reject endpoints return 403 Forbidden when called with agent, user, or superadmin role API keys.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.4",
+      "description": "POST /api/v1/stories/:id/verify returns 409 Conflict if the story's agent_status is not 'reported_done'. Orchestrators can only verify stories that agents have actually reported as complete.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.5",
+      "description": "POST /api/v1/stories/:id/reject can be called on stories with agent_status 'reported_done' or verified_status 'verified' (allowing re-rejection after verification if issues are found later).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.6",
+      "description": "Every verify/reject action creates an audit_log entry with entity_type='story', action='verified' or 'rejected', old_state containing the previous verified_status, new_state containing the new verified_status, and the orchestrator agent identified as actor.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.7",
+      "description": "The verification_result record stores orchestrator_agent_id (resolved from the API key), result (pass/fail/partial), summary, findings, and review_type. It is linked to the story via story_id and scoped to tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.8",
+      "description": "All endpoints enforce tenant isolation: an orchestrator in tenant A cannot verify/reject a story belonging to tenant B. Returns 404 to avoid leaking cross-tenant resource existence.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.9",
+      "description": "Verify and reject are atomic: the story status update, verification_result creation, and audit_log entry all succeed or fail together within a single database transaction.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.2.10",
+      "description": "POST /api/v1/stories/:id/reject requires a non-empty 'reason' field in the request body. Returns 422 Unprocessable Entity if reason is missing or blank.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-7.2.1",
+      "name": "Happy path: verify a reported_done story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: \"orchestrator-main\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with body {summary: 'All artifacts present, tests pass', findings: {tests_run: 12, tests_passed: 12}, review_type: 'enhanced_review'}",
+        "Assert response 200 with verified_status=verified, verified_at != nil",
+        "Query verification_results for the story",
+        "Query audit_log for the story"
+      ],
+      "expected_results": [
+        "Story verified_status is 'verified' and verified_at is set",
+        "verification_result record exists with result='pass', correct summary, findings, review_type, and orchestrator_agent_id",
+        "audit_log entry exists with action='verified', old_state={verified_status: 'unverified'}, new_state={verified_status: 'verified'}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.2",
+      "name": "Happy path: reject a reported_done story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'Missing migration file', findings: {missing_artifacts: ['migration']}, review_type: 'artifact_check'}",
+        "Assert response 200 with verified_status=rejected, rejected_at != nil, rejection_reason='Missing migration file'"
+      ],
+      "expected_results": [
+        "Story verified_status is 'rejected', rejected_at and rejection_reason are set",
+        "verification_result record exists with result='fail' and correct summary/findings",
+        "audit_log entry exists with action='rejected'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.3",
+      "name": "Agent-role key cannot verify or reject",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with agent API key",
+        "POST /api/v1/stories/:id/reject with agent API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden",
+        "Story verified_status remains 'unverified'",
+        "No verification_result or audit_log records created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.4",
+      "name": "Cannot verify story that is not reported_done",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Error message indicates story must be in 'reported_done' agent_status to verify",
+        "Story remains unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.5",
+      "name": "Reject without reason returns 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: ''}",
+        "POST /api/v1/stories/:id/reject with body {} (missing reason)",
+        "POST /api/v1/stories/:id/reject with body {reason: '   '} (whitespace-only)"
+      ],
+      "expected_results": [
+        "All three requests return 422 Unprocessable Entity",
+        "Error messages indicate reason is required",
+        "Story remains unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.6",
+      "name": "Tenant isolation: cross-tenant verification returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:story, %{tenant_id: tenant_a.id, agent_status: :reported_done})",
+        "fixture(:agent, %{tenant_id: tenant_b.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator, agent_id: orch_agent_b.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:story_a_id/verify with tenant B orchestrator API key",
+        "POST /api/v1/stories/:story_a_id/reject with tenant B orchestrator API key"
+      ],
+      "expected_results": [
+        "Both requests return 404 Not Found",
+        "Story in tenant A remains unchanged",
+        "No verification_result or audit_log records created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.7",
+      "name": "Atomicity: failure in verification_result creation rolls back story update",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "Mock verification_result insertion to raise an error"
+      ],
+      "steps": [
+        "Call Loopctl.Progress.verify_story/3 with valid params but mocked failure in verification_result insert",
+        "Check story record in database",
+        "Check audit_log for the story"
+      ],
+      "expected_results": [
+        "Story verified_status remains 'unverified' (rolled back)",
+        "No audit_log entry created (rolled back)",
+        "Function returns {:error, ...} tuple"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.8",
+      "name": "Re-reject a previously verified story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :verified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'Found regression after initial verification', review_type: 'manual'}",
+        "Assert response 200"
+      ],
+      "expected_results": [
+        "Story verified_status changes from 'verified' to 'rejected'",
+        "rejected_at and rejection_reason are set",
+        "verification_result record created with result='fail'",
+        "audit_log records the transition from verified to rejected"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement verify_story/3 and reject_story/3 in the Loopctl.Progress context module.",
+    "Use Ecto.Multi for atomic story update + verification_result insert + audit_log insert.",
+    "Orchestrator identity is resolved from the API key's agent_id field (agent_type=orchestrator).",
+    "Controller at LoopctlWeb.StoryVerificationController with verify and reject actions.",
+    "The reject endpoint must trigger auto-reset logic (US-7.3) but that is a separate story — this story just handles the verified_status write and verification_result creation.",
+    "Verification results are immutable — each verify/reject creates a new record, building a history.",
+    "RLS policies must scope verification_results to tenant_id."
+  ],
+  "dependencies": [
+    "US-7.1",
+    "US-4.1"
+  ],
+  "estimated_hours": 6
+}

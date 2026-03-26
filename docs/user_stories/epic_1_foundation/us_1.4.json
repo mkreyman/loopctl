@@ -1,0 +1,189 @@
+{
+  "id": "US-1.4",
+  "title": "FallbackController with error atom to HTTP status mapping",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "high",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a FallbackController that maps Ecto/application error atoms and changesets to consistent JSON error responses with appropriate HTTP status codes",
+    "so_that": "all API endpoints return uniform error payloads that AI agents can reliably parse, and controller actions can use idiomatic with/else pattern matching"
+  },
+  "rationale": "A centralized FallbackController eliminates duplicated error-handling logic across every controller. Consistent error responses are critical for agent consumers who parse responses programmatically. The with-clause pattern (action_fallback) is the standard Phoenix approach and keeps controller actions clean and focused on the happy path.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.4.1",
+      "description": "LoopctlWeb.FallbackController handles {:error, :not_found} and returns 404 with JSON body {\"error\": {\"status\": 404, \"message\": \"Not found\"}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.2",
+      "description": "FallbackController handles {:error, :unauthorized} and returns 401 with JSON body {\"error\": {\"status\": 401, \"message\": \"Unauthorized\"}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.3",
+      "description": "FallbackController handles {:error, :forbidden} and returns 403 with JSON body {\"error\": {\"status\": 403, \"message\": \"Forbidden\"}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.4",
+      "description": "FallbackController handles {:error, %Ecto.Changeset{}} and returns 422 with JSON body containing structured validation errors in the format {\"error\": {\"status\": 422, \"message\": \"Validation failed\", \"details\": {\"field\": [\"error message\"]}}}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.5",
+      "description": "FallbackController handles {:error, :conflict} and returns 409 with appropriate message",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.6",
+      "description": "FallbackController handles {:error, :rate_limited} and returns 429 with appropriate message",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.7",
+      "description": "FallbackController handles {:error, :unprocessable_entity, message} (3-tuple with custom message) and returns 422 with the provided message",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.8",
+      "description": "An ErrorJSON view module renders all error responses as JSON (no HTML error pages)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.4.9",
+      "description": "Unhandled errors (500) return a generic {\"error\": {\"status\": 500, \"message\": \"Internal server error\"}} without leaking stack traces or internal details",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.4.1",
+      "name": "FallbackController renders 404 for :not_found",
+      "type": "unit",
+      "preconditions": [
+        "FallbackController module is compiled"
+      ],
+      "steps": [
+        "Call FallbackController.call(conn, {:error, :not_found})"
+      ],
+      "expected_results": [
+        "Response status is 404",
+        "Response body is JSON with error.status = 404 and error.message = \"Not found\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.2",
+      "name": "FallbackController renders 401 for :unauthorized",
+      "type": "unit",
+      "preconditions": [
+        "FallbackController module is compiled"
+      ],
+      "steps": [
+        "Call FallbackController.call(conn, {:error, :unauthorized})"
+      ],
+      "expected_results": [
+        "Response status is 401",
+        "Response body JSON has error.message = \"Unauthorized\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.3",
+      "name": "FallbackController renders 422 with changeset errors",
+      "type": "unit",
+      "preconditions": [
+        "An invalid Ecto.Changeset is created with errors on :name and :email"
+      ],
+      "steps": [
+        "Create changeset with errors: %Ecto.Changeset{errors: [name: {\"can't be blank\", []}, email: {\"is invalid\", []}], valid?: false}",
+        "Call FallbackController.call(conn, {:error, changeset})"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Response body JSON has error.details.name containing \"can't be blank\"",
+        "Response body JSON has error.details.email containing \"is invalid\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.4",
+      "name": "FallbackController renders 403 for :forbidden",
+      "type": "unit",
+      "preconditions": [
+        "FallbackController module is compiled"
+      ],
+      "steps": [
+        "Call FallbackController.call(conn, {:error, :forbidden})"
+      ],
+      "expected_results": [
+        "Response status is 403",
+        "Response body JSON has error.message = \"Forbidden\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.5",
+      "name": "FallbackController renders 429 for :rate_limited",
+      "type": "unit",
+      "preconditions": [
+        "FallbackController module is compiled"
+      ],
+      "steps": [
+        "Call FallbackController.call(conn, {:error, :rate_limited})"
+      ],
+      "expected_results": [
+        "Response status is 429",
+        "Response body JSON has error.message = \"Too many requests\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.6",
+      "name": "FallbackController renders custom message for 3-tuple",
+      "type": "unit",
+      "preconditions": [
+        "FallbackController module is compiled"
+      ],
+      "steps": [
+        "Call FallbackController.call(conn, {:error, :unprocessable_entity, \"Cycle detected in dependency graph\"})"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Response body JSON has error.message = \"Cycle detected in dependency graph\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.7",
+      "name": "500 errors do not leak internal details",
+      "type": "integration",
+      "preconditions": [
+        "A test controller action that raises an exception exists"
+      ],
+      "steps": [
+        "Send a request to the test endpoint that raises RuntimeError"
+      ],
+      "expected_results": [
+        "Response status is 500",
+        "Response body JSON has error.message = \"Internal server error\"",
+        "No stack trace or internal module names appear in the response"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use action_fallback LoopctlWeb.FallbackController in a base controller or individual controllers",
+    "Changeset error traversal: Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} -> ... end) to produce human-readable messages",
+    "Consider a LoopctlWeb.ErrorHelpers module for changeset → map translation that can be reused",
+    "The ErrorJSON view should handle the render/2 callback for all error templates (404.json, 422.json, 500.json, etc.)",
+    "In production, ensure Phoenix.Endpoint error handler uses ErrorJSON, not ErrorHTML"
+  ],
+  "dependencies": [],
+  "estimated_hours": 3
+}

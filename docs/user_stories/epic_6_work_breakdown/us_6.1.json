@@ -1,0 +1,221 @@
+{
+  "id": "US-6.1",
+  "title": "Epic schema and CRUD with project and tenant scoping",
+  "epic": {
+    "id": "epic_6",
+    "name": "Work Breakdown"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, read, update, list, and delete epics within a project, where each epic has a number, title, description, phase, position, and metadata",
+    "so_that": "I can organize a project's work into logical groups (epics) that map to feature areas or development phases"
+  },
+  "rationale": "Epics are the intermediate grouping between projects and stories. They represent feature areas or phases of development (e.g., 'Foundation', 'Authentication', 'Work Breakdown'). The number field provides a stable human-readable identifier (Epic 1, Epic 2). The phase field enables grouping epics by development phase. Position enables custom ordering within a phase. Epics are scoped to both a project and a tenant.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-6.1.1",
+      "description": "A Loopctl.WorkBreakdown.Epic schema exists with fields: id, tenant_id, project_id, number (integer), title, description, phase, position (integer), metadata (jsonb), inserted_at, updated_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.2",
+      "description": "The Epic schema uses Loopctl.Schema with tenant_id required; number is unique within a project (composite unique index on [project_id, number])",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.3",
+      "description": "POST /api/v1/projects/:project_id/epics (role: user) creates an epic; requires number and title, optional description, phase, position, metadata",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.4",
+      "description": "GET /api/v1/projects/:project_id/epics (role: agent+) lists all epics for a project, ordered by position then number, with story count and completion percentage per epic",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.5",
+      "description": "GET /api/v1/epics/:id (role: agent+) returns a single epic with its stories preloaded",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.6",
+      "description": "PATCH /api/v1/epics/:id (role: user) updates epic fields; number cannot be changed after creation",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.7",
+      "description": "DELETE /api/v1/epics/:id (role: user) deletes the epic and cascades deletion to all child stories",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.8",
+      "description": "GET /api/v1/epics/:id/progress (role: agent+) returns epic-level progress: story count by agent_status and verified_status",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.9",
+      "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.1.10",
+      "description": "RLS policy is enabled on the epics table enforcing tenant isolation at the database level",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-6.1.1",
+      "name": "Create epic with valid attributes",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects/<project.id>/epics with body {\"number\": 1, \"title\": \"Foundation\", \"phase\": \"p0_foundation\", \"position\": 1}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has epic with id, number = 1, title = \"Foundation\", project_id",
+        "Epic exists in database with correct tenant_id and project_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.2",
+      "name": "Reject duplicate epic number within project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects/<project.id>/epics with body {\"number\": 1, \"title\": \"Duplicate\"}"
+      ],
+      "expected_results": [
+        "Response status is 409 or 422 with error on number"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.3",
+      "name": "Allow same epic number in different projects",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_a",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_b",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project_a.id, number: 1})"
+      ],
+      "steps": [
+        "Create epic with number 1 in project_b"
+      ],
+      "expected_results": [
+        "Epic creation succeeds — number uniqueness is per-project"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.4",
+      "name": "List epics returns story counts and completion",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, verified_status: :verified})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, verified_status: :unverified})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/epics"
+      ],
+      "expected_results": [
+        "Response contains epic with story_count = 2 and completion_percentage = 50.0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.5",
+      "name": "Delete epic cascades to stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/epics/<epic.id>"
+      ],
+      "expected_results": [
+        "Response status is 200 or 204",
+        "Epic is deleted from database",
+        "Child stories are also deleted (cascade)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.6",
+      "name": "Epic queries are tenant-scoped",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_a.id}) as project_a",
+        "fixture(:project, %{tenant_id: tenant_b.id}) as project_b",
+        "fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id}) as other_epic",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/epics/<other_epic.id> with tenant_a's key"
+      ],
+      "expected_results": [
+        "Response status is 404 (cannot access another tenant's epic)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.1.7",
+      "name": "Epic progress endpoint returns status breakdown",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, verified_status: :unverified})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :reported_done, verified_status: :verified})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/epics/<epic.id>/progress"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response includes stories_by_agent_status and stories_by_verified_status breakdowns",
+        "Counts match the fixture data"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Phase values are free-form strings, not an enum — allows flexibility for different project structures",
+    "Position defaults to 0 if not specified; used for ordering within a phase",
+    "Cascade delete: use on_delete: :delete_all in the migration foreign key for stories → epics",
+    "Consider a Loopctl.WorkBreakdown context module that handles both epics and stories",
+    "The list endpoint should support optional filtering by phase: ?phase=p0_foundation",
+    "Epic number is an integer (not a string) unlike story numbers which are strings (e.g., '2.1')",
+    "Metadata jsonb defaults to %{} (empty map)"
+  ],
+  "dependencies": [
+    "US-5.1"
+  ],
+  "estimated_hours": 4
+}

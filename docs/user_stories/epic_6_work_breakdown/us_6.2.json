@@ -1,0 +1,247 @@
+{
+  "id": "US-6.2",
+  "title": "Story schema and CRUD with two-tier status model",
+  "epic": {
+    "id": "epic_6",
+    "name": "Work Breakdown"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, read, update, list, and delete stories within an epic, where each story has a number, title, description, acceptance_criteria (jsonb), estimated_hours, agent_status enum, verified_status enum, assignment fields, and metadata",
+    "so_that": "the atomic units of work are tracked with the two-tier trust model where agent-reported status and independently verified status are separate fields"
+  },
+  "rationale": "Stories are the fundamental work unit in loopctl. The two-tier status model (agent_status + verified_status) is the core innovation: implementing agents set agent_status, while orchestrators independently set verified_status. This structural separation makes it impossible for an agent to self-verify. Acceptance criteria stored as jsonb enable structured verification checks. The assignment fields (assigned_agent_id, assigned_at) track which agent is working on what.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-6.2.1",
+      "description": "A Loopctl.WorkBreakdown.Story schema exists with all fields from PRD section 5.1: id, tenant_id, epic_id, number (string), title, description, acceptance_criteria (jsonb), estimated_hours (decimal), agent_status (enum), verified_status (enum), assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason, metadata (jsonb), inserted_at, updated_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.2",
+      "description": "agent_status enum has values: pending, assigned, implementing, reported_done. Default: :pending",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.3",
+      "description": "verified_status enum has values: unverified, verified, rejected. Default: :unverified",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.4",
+      "description": "Story number is unique within an epic (composite unique index on [epic_id, number]); number is a string (e.g., '2.1', '2.2')",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.5",
+      "description": "POST /api/v1/epics/:epic_id/stories (role: user) creates a story; requires number and title, optional description, acceptance_criteria, estimated_hours, metadata",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.6",
+      "description": "GET /api/v1/epics/:epic_id/stories (role: agent+) lists all stories in an epic, with optional filtering by agent_status and verified_status query params",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.7",
+      "description": "GET /api/v1/stories/:id (role: agent+) returns a single story with dependencies, latest artifact reports, and latest verification result preloaded",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.8",
+      "description": "PATCH /api/v1/stories/:id (role: user) updates story metadata fields (title, description, acceptance_criteria, estimated_hours, metadata). Cannot update agent_status or verified_status via this endpoint — dedicated status endpoints handle those.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.9",
+      "description": "DELETE /api/v1/stories/:id (role: user) deletes the story",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.10",
+      "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy. RLS is enabled on the stories table.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-6.2.1",
+      "name": "Create story with valid attributes",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epics/<epic.id>/stories with body {\"number\": \"1.1\", \"title\": \"Phoenix scaffold\", \"estimated_hours\": 8, \"acceptance_criteria\": [{\"id\": \"AC-1\", \"description\": \"App boots\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has story with agent_status = \"pending\" and verified_status = \"unverified\"",
+        "acceptance_criteria is stored as provided jsonb",
+        "Story exists in database with correct tenant_id and epic_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.2",
+      "name": "Reject duplicate story number within epic",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.1\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/epics/<epic.id>/stories with body {\"number\": \"1.1\", \"title\": \"Duplicate\"}"
+      ],
+      "expected_results": [
+        "Response status is 409 or 422 with error on number"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.3",
+      "name": "List stories with status filtering",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/epics/<epic.id>/stories?agent_status=pending"
+      ],
+      "expected_results": [
+        "Only stories with agent_status = pending are returned",
+        "The implementing story is not in the response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.4",
+      "name": "PATCH cannot update agent_status or verified_status",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "PATCH /api/v1/stories/<story.id> with body {\"agent_status\": \"reported_done\", \"verified_status\": \"verified\", \"title\": \"Updated Title\"}"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Title is updated to \"Updated Title\"",
+        "agent_status remains :pending (status field is ignored/filtered)",
+        "verified_status remains :unverified (status field is ignored/filtered)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.5",
+      "name": "Get story includes dependencies and artifacts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/<story.id>"
+      ],
+      "expected_results": [
+        "Response includes story with all fields",
+        "Response includes dependencies array (empty if none)",
+        "Response includes artifacts array (empty if none)",
+        "Response includes latest_verification (null if none)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.6",
+      "name": "Story queries are tenant-scoped via RLS",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_b.id}) as project_b",
+        "fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id}) as epic_b",
+        "fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id}) as other_story",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/<other_story.id> with tenant_a's key"
+      ],
+      "expected_results": [
+        "Response status is 404 (cannot access another tenant's story)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.7",
+      "name": "Story defaults are set correctly",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Create a Story changeset with only required fields (number, title, tenant_id, epic_id)"
+      ],
+      "expected_results": [
+        "agent_status defaults to :pending",
+        "verified_status defaults to :unverified",
+        "metadata defaults to %{}",
+        "acceptance_criteria defaults to [] or nil",
+        "assigned_agent_id is nil"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.8",
+      "name": "Delete story removes it from database",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/stories/<story.id>"
+      ],
+      "expected_results": [
+        "Response status is 200 or 204",
+        "Story no longer exists in the database",
+        "GET /api/v1/stories/<story.id> returns 404"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "agent_status enum: Ecto.Enum with values [:pending, :assigned, :implementing, :reported_done]",
+    "verified_status enum: Ecto.Enum with values [:unverified, :verified, :rejected]",
+    "Story number is a STRING, not an integer — allows formats like '2.1', '2.2', '10.1'",
+    "The PATCH endpoint must use a separate changeset function (update_changeset) that explicitly excludes agent_status and verified_status from cast/3",
+    "acceptance_criteria is stored as jsonb — no validation on its internal structure beyond being valid JSON",
+    "The show endpoint preloads are: dependencies (story_dependencies), artifact_reports (latest N), verification_results (latest)",
+    "estimated_hours uses Decimal type for precision (e.g., 0.5 hours)",
+    "Consider adding a max_stories_per_project limit check from tenant settings"
+  ],
+  "dependencies": [
+    "US-6.1"
+  ],
+  "estimated_hours": 6
+}

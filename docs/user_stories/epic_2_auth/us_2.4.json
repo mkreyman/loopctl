@@ -1,0 +1,184 @@
+{
+  "id": "US-2.4",
+  "title": "Role-based access control with RequireRole plug and role hierarchy",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a RequireRole plug that enforces a role hierarchy (superadmin > user > orchestrator > agent) and rejects requests from API keys with insufficient role permissions",
+    "so_that": "each API endpoint can declare its minimum required role and the system automatically prevents unauthorized access based on the two-tier trust model"
+  },
+  "rationale": "The two-tier trust model is the core security property of loopctl: agents can only write agent_status, orchestrators can only write verified_status, and users manage configuration. The RequireRole plug enforces this at the router level. The role hierarchy means a superadmin can do anything a user can, a user can do anything an orchestrator can, etc. This prevents the need to list every allowed role on every endpoint.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.4.1",
+      "description": "LoopctlWeb.Plugs.RequireRole accepts a :role option specifying the minimum required role level",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.2",
+      "description": "The role hierarchy is: superadmin (level 4) > user (level 3) > orchestrator (level 2) > agent (level 1). Higher levels can access endpoints requiring lower levels.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.3",
+      "description": "RequireRole reads :current_api_key from conn.assigns and compares its role against the required minimum",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.4",
+      "description": "If the API key's role is below the minimum, the plug halts the connection with 403 Forbidden and a JSON error body",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.5",
+      "description": "If the API key's role meets or exceeds the minimum, the plug passes through without halting",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.6",
+      "description": "An :exact_role option is available for endpoints that require exactly one role (e.g., agent-only endpoints like /stories/:id/claim)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.7",
+      "description": "A helper function role_at_least?/2 is available for use in controller actions for fine-grained role checks",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.4.8",
+      "description": "The plug can be used in router pipelines or individual controller plugs: plug RequireRole, role: :user",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.4.1",
+      "name": "Superadmin can access user-level endpoint",
+      "type": "unit",
+      "preconditions": [
+        "conn has assigns.current_api_key with role :superadmin"
+      ],
+      "steps": [
+        "Call RequireRole.call(conn, %{role: :user})"
+      ],
+      "expected_results": [
+        "Connection is not halted",
+        "Request proceeds normally"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.2",
+      "name": "Agent cannot access user-level endpoint",
+      "type": "unit",
+      "preconditions": [
+        "conn has assigns.current_api_key with role :agent"
+      ],
+      "steps": [
+        "Call RequireRole.call(conn, %{role: :user})"
+      ],
+      "expected_results": [
+        "Connection is halted with 403 status",
+        "Response body is JSON with error.message indicating insufficient permissions"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.3",
+      "name": "Orchestrator can access agent-level endpoint",
+      "type": "unit",
+      "preconditions": [
+        "conn has assigns.current_api_key with role :orchestrator"
+      ],
+      "steps": [
+        "Call RequireRole.call(conn, %{role: :agent})"
+      ],
+      "expected_results": [
+        "Connection is not halted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.4",
+      "name": "Agent can access agent-level endpoint",
+      "type": "unit",
+      "preconditions": [
+        "conn has assigns.current_api_key with role :agent"
+      ],
+      "steps": [
+        "Call RequireRole.call(conn, %{role: :agent})"
+      ],
+      "expected_results": [
+        "Connection is not halted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.5",
+      "name": "Exact role check rejects higher roles",
+      "type": "unit",
+      "preconditions": [
+        "conn has assigns.current_api_key with role :user"
+      ],
+      "steps": [
+        "Call RequireRole.call(conn, %{exact_role: :agent})"
+      ],
+      "expected_results": [
+        "Connection is halted with 403 status",
+        "Only :agent role keys can access this endpoint"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.6",
+      "name": "role_at_least?/2 helper function",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call role_at_least?(:superadmin, :user)",
+        "Call role_at_least?(:agent, :orchestrator)",
+        "Call role_at_least?(:orchestrator, :orchestrator)"
+      ],
+      "expected_results": [
+        "First returns true (superadmin >= user)",
+        "Second returns false (agent < orchestrator)",
+        "Third returns true (orchestrator >= orchestrator)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.4.7",
+      "name": "Full integration: agent key rejected from user endpoint",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "A user-level endpoint exists (e.g., POST /api/v1/projects)"
+      ],
+      "steps": [
+        "Send POST /api/v1/projects with Authorization: Bearer <agent_raw_key>"
+      ],
+      "expected_results": [
+        "Response status is 403",
+        "Response body indicates insufficient role"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Role hierarchy as a map: %{superadmin: 4, user: 3, orchestrator: 2, agent: 1}",
+    "The exact_role option is needed for agent-only endpoints (claim, start, report) where orchestrators should NOT be able to act as agents",
+    "Consider implementing the role hierarchy in a separate Loopctl.Auth.Role module for reuse",
+    "The plug should work both as a pipeline plug and as an inline controller plug",
+    "Error message should indicate the required role without revealing the full hierarchy"
+  ],
+  "dependencies": [
+    "US-2.3"
+  ],
+  "estimated_hours": 4
+}

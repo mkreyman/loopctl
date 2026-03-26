@@ -1,0 +1,269 @@
+{
+  "id": "US-7.1",
+  "title": "Agent Status Transitions",
+  "epic": {
+    "id": "epic_7",
+    "name": "Two-Tier Progress Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI implementation agent",
+    "i_want_to": "transition story status through claim, start, report, and unclaim endpoints",
+    "so_that": "the orchestrator and other agents can see accurate, real-time progress of my implementation work"
+  },
+  "rationale": "The agent_status track is one half of the two-tier trust model that is loopctl's core innovation. Agents must be able to self-report their progress through well-defined state transitions (pending -> assigned -> implementing -> reported_done), but they must NOT be able to mark work as verified. Each transition must validate the current state to prevent invalid jumps and must be recorded in the audit log for full traceability.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-7.1.1",
+      "description": "POST /api/v1/stories/:id/claim with an agent-role API key sets agent_status from 'pending' to 'assigned', sets assigned_agent_id to the calling agent's ID, and sets assigned_at timestamp. Returns 200 with updated story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.2",
+      "description": "POST /api/v1/stories/:id/claim returns 409 Conflict if the story's agent_status is not 'pending' (already claimed by another agent or in progress).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.3",
+      "description": "POST /api/v1/stories/:id/start with an agent-role API key sets agent_status from 'assigned' to 'implementing'. Returns 403 if the calling agent is not the assigned agent. Returns 409 if agent_status is not 'assigned'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.4",
+      "description": "POST /api/v1/stories/:id/report with an agent-role API key sets agent_status from 'implementing' to 'reported_done' and sets reported_done_at timestamp. Returns 403 if the calling agent is not the assigned agent. Returns 409 if agent_status is not 'implementing'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.5",
+      "description": "POST /api/v1/stories/:id/unclaim with an agent-role API key resets agent_status to 'pending', clears assigned_agent_id and assigned_at. Returns 403 if the calling agent is not the assigned agent (unless agent_status is 'pending'). Works from any agent_status except 'pending'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.6",
+      "description": "All four endpoints return 403 Forbidden when called with a non-agent role API key (user, orchestrator, or superadmin).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.7",
+      "description": "Every status transition creates an audit_log entry with entity_type='story', action='status_changed', old_state containing the previous agent_status, new_state containing the new agent_status, and the actor identified as the calling agent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.8",
+      "description": "All endpoints enforce tenant isolation: an agent in tenant A cannot claim/start/report/unclaim a story belonging to tenant B. Returns 404 (not 403) to avoid leaking existence of cross-tenant resources.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.9",
+      "description": "POST /api/v1/stories/:id/report optionally accepts an artifact report in the request body (artifact_type, path, exists, details) and creates an artifact_report record atomically with the status transition.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.10",
+      "description": "All endpoints return 404 when the story ID does not exist or does not belong to the calling agent's tenant.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-7.1.1",
+      "name": "Happy path: full agent lifecycle claim -> start -> report",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with agent API key",
+        "Assert response 200 with agent_status=assigned, assigned_agent_id=agent.id, assigned_at != nil",
+        "POST /api/v1/stories/:id/start with same agent API key",
+        "Assert response 200 with agent_status=implementing",
+        "POST /api/v1/stories/:id/report with same agent API key",
+        "Assert response 200 with agent_status=reported_done, reported_done_at != nil",
+        "Verify 3 audit_log entries created with action=status_changed"
+      ],
+      "expected_results": [
+        "Story transitions through pending -> assigned -> implementing -> reported_done",
+        "Each transition is recorded in audit_log with correct old/new states",
+        "assigned_at and reported_done_at timestamps are set"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.2",
+      "name": "Claim conflict: story already assigned",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :assigned, assigned_agent_id: other_agent.id})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: \"agent-2\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with agent-2 API key"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Response body contains error message indicating story is already assigned",
+        "Story agent_status remains 'assigned' with original assigned_agent_id unchanged",
+        "No audit_log entry created for the failed transition"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.3",
+      "name": "Invalid state transitions return 409",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/start (skip claim, story is pending)",
+        "Assert 409 Conflict",
+        "POST /api/v1/stories/:id/report (skip claim+start, story is pending)",
+        "Assert 409 Conflict"
+      ],
+      "expected_results": [
+        "Both requests return 409 Conflict",
+        "Error messages indicate the required current state for each transition",
+        "Story agent_status remains 'pending'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.4",
+      "name": "Non-agent role keys are rejected with 403",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with orchestrator API key",
+        "POST /api/v1/stories/:id/claim with user API key",
+        "POST /api/v1/stories/:id/start with orchestrator API key",
+        "POST /api/v1/stories/:id/report with user API key"
+      ],
+      "expected_results": [
+        "All four requests return 403 Forbidden",
+        "Story agent_status remains 'pending'",
+        "No audit_log entries created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.5",
+      "name": "Tenant isolation: cross-tenant claim returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:story, %{tenant_id: tenant_a.id, agent_status: :pending})",
+        "fixture(:agent, %{tenant_id: tenant_b.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent, agent_id: agent_b.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:story_a_id/claim with tenant B agent API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found (not 403, to avoid leaking resource existence)",
+        "Story in tenant A remains unchanged",
+        "No audit_log entry created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.6",
+      "name": "Unclaim resets story to pending",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/unclaim with agent API key",
+        "Assert response 200",
+        "Verify story agent_status is 'pending'",
+        "Verify assigned_agent_id is nil",
+        "Verify assigned_at is nil"
+      ],
+      "expected_results": [
+        "Story is reset to pending state",
+        "assigned_agent_id and assigned_at are cleared",
+        "Audit log entry records the unclaim with old_state=implementing, new_state=pending"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.7",
+      "name": "Wrong agent cannot start or report on another agent's story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: \"agent-1\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: \"agent-2\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :assigned, assigned_agent_id: agent_1.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent_2.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/start with agent-2 API key",
+        "POST /api/v1/stories/:id/report with agent-2 API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden",
+        "Error message indicates the story is assigned to a different agent",
+        "Story remains in 'assigned' state with agent-1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.8",
+      "name": "Report with optional artifact creates artifact_report atomically",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/report with body containing artifact: {artifact_type: 'commit_diff', path: 'abc123', exists: true, details: {files_changed: 5}}",
+        "Assert response 200 with agent_status=reported_done",
+        "GET /api/v1/stories/:id/artifacts",
+        "Assert artifact_report exists with correct type, path, exists, details"
+      ],
+      "expected_results": [
+        "Story transitions to reported_done",
+        "Artifact report is created with reported_by='agent' and correct reporter_agent_id",
+        "Both operations succeed or fail atomically (wrapped in transaction)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement as Loopctl.Progress context module with claim_story/2, start_story/2, report_story/2, unclaim_story/2 functions.",
+    "Each function must validate current agent_status before transitioning. Use Ecto.Multi for atomic status change + audit log insertion.",
+    "Agent identity is resolved from the API key's agent_id field. The auth pipeline must set the agent in conn.assigns.",
+    "Return 404 (not 403) for cross-tenant resource access to avoid information leakage.",
+    "The report endpoint should accept an optional 'artifact' key in the request body and create an artifact_report record within the same Ecto.Multi transaction.",
+    "All status transition endpoints should be idempotent-safe: if already in the target state by the same agent, return 200 rather than 409.",
+    "Controller at LoopctlWeb.StoryStatusController, routes nested under /api/v1/stories/:id/."
+  ],
+  "dependencies": [
+    "US-6.2",
+    "US-4.1"
+  ],
+  "estimated_hours": 8
+}

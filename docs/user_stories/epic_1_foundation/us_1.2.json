@@ -1,0 +1,188 @@
+{
+  "id": "US-1.2",
+  "title": "Base schema macro with tenant_id, timestamps, and soft delete support",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "high",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "define a base schema macro that automatically includes tenant_id, inserted_at/updated_at timestamps, and optional soft delete support (deleted_at field with query filtering)",
+    "so_that": "every schema in the system has consistent multi-tenant scoping, timestamp tracking, and soft delete behavior without duplicating boilerplate across dozens of modules"
+  },
+  "rationale": "loopctl is multi-tenant from day one and every table must include tenant_id for RLS enforcement. A base schema macro ensures no developer (human or AI) can accidentally create a schema without tenant scoping. Soft delete via deleted_at preserves audit trails while allowing logical removal. Centralizing this in a macro eliminates inconsistency risk across 15+ schemas.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.2.1",
+      "description": "A Loopctl.Schema module exists that provides a `use Loopctl.Schema` macro for Ecto schemas",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.2",
+      "description": "The macro sets @primary_key {:id, :binary_id, autogenerate: true} and @foreign_key_type :binary_id on all schemas that use it",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.3",
+      "description": "The macro defines a tenant_id field of type :binary_id that is required (validated in changeset) for all tenant-scoped schemas",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.4",
+      "description": "The macro sets @timestamps_opts [type: :utc_datetime_usec] for microsecond-precision UTC timestamps",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.5",
+      "description": "When the soft_delete: true option is passed, the macro adds a deleted_at field of type :utc_datetime_usec defaulting to nil",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.6",
+      "description": "A Loopctl.Schema.soft_delete_changeset/1 function marks a record as deleted by setting deleted_at to the current UTC time",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.7",
+      "description": "A Loopctl.Schema.not_deleted/1 query helper filters out records where deleted_at is not nil",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.8",
+      "description": "Schemas can opt out of tenant_id by passing tenant_scoped: false (for the tenants table itself and superadmin-only tables)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.2.9",
+      "description": "The macro is documented with @moduledoc explaining usage patterns and options",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.2.1",
+      "name": "Schema using base macro has binary_id primary key",
+      "type": "unit",
+      "preconditions": [
+        "A test schema module uses Loopctl.Schema"
+      ],
+      "steps": [
+        "Define a test schema with `use Loopctl.Schema`",
+        "Check the __schema__(:primary_key) and field type"
+      ],
+      "expected_results": [
+        "Primary key is :id with type :binary_id",
+        "Foreign key type is :binary_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.2",
+      "name": "Tenant-scoped schema requires tenant_id in changeset",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with use Loopctl.Schema is defined"
+      ],
+      "steps": [
+        "Create a changeset without tenant_id",
+        "Validate the changeset"
+      ],
+      "expected_results": [
+        "Changeset is invalid with error on tenant_id: \"can't be blank\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.3",
+      "name": "Soft delete sets deleted_at timestamp",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with use Loopctl.Schema, soft_delete: true is defined"
+      ],
+      "steps": [
+        "Create a valid record",
+        "Apply soft_delete_changeset/1 to the record"
+      ],
+      "expected_results": [
+        "The changeset sets deleted_at to a non-nil UTC datetime",
+        "The deleted_at value is close to DateTime.utc_now()"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.4",
+      "name": "not_deleted/1 query excludes soft-deleted records",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:test_schema, %{deleted_at: nil})",
+        "fixture(:test_schema, %{deleted_at: ~U[2026-01-01 00:00:00Z]})"
+      ],
+      "steps": [
+        "Query TestSchema |> Loopctl.Schema.not_deleted() |> Repo.all()"
+      ],
+      "expected_results": [
+        "Only the non-deleted record is returned",
+        "The soft-deleted record is excluded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.5",
+      "name": "Timestamps use utc_datetime_usec",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with use Loopctl.Schema is defined"
+      ],
+      "steps": [
+        "Insert a record via Repo",
+        "Inspect inserted_at and updated_at fields"
+      ],
+      "expected_results": [
+        "Both fields are DateTime structs with microsecond precision",
+        "Both fields are in UTC timezone"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.6",
+      "name": "Non-tenant-scoped schema omits tenant_id",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with use Loopctl.Schema, tenant_scoped: false is defined"
+      ],
+      "steps": [
+        "Check __schema__(:fields) of the test schema"
+      ],
+      "expected_results": [
+        "tenant_id is not in the list of fields"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.2.7",
+      "name": "Schema without soft_delete option has no deleted_at field",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with use Loopctl.Schema (no soft_delete option) is defined"
+      ],
+      "steps": [
+        "Check __schema__(:fields) of the test schema"
+      ],
+      "expected_results": [
+        "deleted_at is not in the list of fields"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use __using__/1 macro with keyword options: tenant_scoped (default true), soft_delete (default false)",
+    "tenant_id should be belongs_to :tenant, Loopctl.Tenants.Tenant, type: :binary_id — but the Tenant schema may not exist yet; use a plain field for now and add the association later",
+    "Consider providing a base_changeset/2 function that validates tenant_id presence, which downstream schemas can pipe into",
+    "The not_deleted/1 helper should use Ecto.Query: where(query, [r], is_nil(r.deleted_at))",
+    "Ensure the macro works with both schema/2 and embedded_schema/1 patterns if needed"
+  ],
+  "dependencies": [],
+  "estimated_hours": 3
+}

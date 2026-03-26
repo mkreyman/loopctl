@@ -1,0 +1,221 @@
+{
+  "id": "US-14.7",
+  "title": "Orchestrator CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "verify stories, reject stories with reasons, list pending verifications, and save/load orchestrator state via the CLI",
+    "so_that": "I can perform my orchestration duties — verifying deliverables, rejecting inadequate work, and checkpointing my state for crash recovery — through a simple command interface"
+  },
+  "rationale": "The orchestrator is the trust layer in loopctl's two-tier model. It needs CLI commands to record verification results (pass/fail/partial), reject stories with actionable reasons that auto-reset agent_status, query for stories awaiting verification, and persist its own state for session recovery. These commands are the orchestrator's primary interface for writing to the verified_status track and maintaining crash resilience.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.7.1",
+      "description": "'loopctl verify STORY_NUM --result RESULT --summary TEXT' resolves the story number and calls POST /api/v1/stories/:id/verify with the result (pass, fail, or partial), summary text, and optional findings",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.2",
+      "description": "'loopctl reject STORY_NUM --reason TEXT' resolves the story number and calls POST /api/v1/stories/:id/reject with the rejection reason, displaying the updated story with verified_status=rejected and agent_status auto-reset to pending",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.3",
+      "description": "'loopctl pending --project PROJECT' queries for stories with agent_status=reported_done and verified_status=unverified, displaying the list of stories awaiting orchestrator verification",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.4",
+      "description": "'loopctl state save --project PROJECT --data JSON' calls PUT /api/v1/orchestrator/state/:project_id with the state data, supporting optimistic locking via the version field",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.5",
+      "description": "'loopctl state load --project PROJECT' calls GET /api/v1/orchestrator/state/:project_id and displays the stored state data and current version number",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.6",
+      "description": "The verify command validates that --result is one of: pass, fail, partial; rejects invalid values with a clear error before making the API call",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.7",
+      "description": "The reject command requires a non-empty --reason flag; fails with an error if reason is missing or empty",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.8",
+      "description": "The state save command accepts --data as either inline JSON or a file path prefixed with @ (e.g., --data @state.json)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.9",
+      "description": "All orchestrator commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.7.10",
+      "description": "The verify command optionally accepts --findings JSON for structured findings data to include in the verification result",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.7.1",
+      "name": "Verify story sends correct payload",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/verify with {result: 'pass', summary: 'All tests passing'} and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.VerifyCommand.run(['2.1', '--result', 'pass', '--summary', 'All tests passing', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with result='pass' and summary text",
+        "Output shows story with verified_status='verified'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.2",
+      "name": "Reject story sends reason and shows auto-reset",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Req.Test mock for story number resolution returns story UUID",
+        "Req.Test mock expects POST /api/v1/stories/:id/reject with {reason: 'Missing migration file'} and returns 200 with story showing verified_status=rejected, agent_status=pending"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.RejectCommand.run(['2.1', '--reason', 'Missing migration file', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "POST request is sent with the rejection reason",
+        "Output shows story with verified_status='rejected'",
+        "Output shows agent_status='pending' (auto-reset)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.3",
+      "name": "Pending command lists stories awaiting verification",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Req.Test mock returns 200 for stories query filtered by agent_status=reported_done, verified_status=unverified, with 3 stories"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.PendingCommand.run(['--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output lists 3 stories awaiting verification",
+        "Each story shows number, title, agent that reported it, and reported_done_at timestamp",
+        "JSON format returns array of story objects"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.4",
+      "name": "State save sends state data with version",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Req.Test mock expects PUT /api/v1/orchestrator/state/:project_id with {state_key: 'main', state_data: {...}, version: 1} and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StateCommand.run(['save', '--project', project_id, '--data', '{\"current_phase\":\"p1\",\"active_agents\":3}'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "PUT request is sent with state_data containing the parsed JSON",
+        "Output confirms state was saved with the new version number"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.5",
+      "name": "State load retrieves stored state",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Req.Test mock returns 200 for GET /api/v1/orchestrator/state/:project_id with {state_key: 'main', state_data: {current_phase: 'p1'}, version: 3}"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StateCommand.run(['load', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes the state_data JSON",
+        "Output includes the version number (3)",
+        "JSON format returns the full state object for agent consumption"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.6",
+      "name": "Verify rejects invalid result value",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.VerifyCommand.run(['2.1', '--result', 'maybe', '--summary', 'not sure', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating 'maybe' is not a valid result",
+        "Error message lists valid values: pass, fail, partial",
+        "No HTTP request is made"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.7",
+      "name": "Reject requires non-empty reason",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.RejectCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating --reason is required",
+        "No HTTP request is made"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.7.8",
+      "name": "State save reads data from file with @ prefix",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and orchestrator-role api_key",
+        "Temporary file containing valid state JSON",
+        "Req.Test mock expects PUT /api/v1/orchestrator/state/:project_id and returns 200"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StateCommand.run(['save', '--project', project_id, '--data', '@' <> tmp_state_path], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "State JSON is read from the file",
+        "PUT request includes the file contents as state_data",
+        "Output confirms state was saved"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "The verify and reject commands share the story number resolution logic from US-14.6 — reuse the shared helper",
+    "The pending command may need to make a filtered query to the stories list endpoint with query parameters for agent_status and verified_status, or use a dedicated endpoint if one exists",
+    "State save should include optimistic locking: first load the current version, then save with version+1. If the server returns a version conflict (409), inform the user",
+    "The --data @file syntax should work identically to the --artifact @file syntax from US-14.6 — extract the file-reading logic into a shared utility",
+    "The verify --findings flag should accept the same inline JSON or @file syntax",
+    "Consider adding a --state-key flag to state save/load (default: 'main') for orchestrators that maintain multiple state namespaces"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-9.1"
+  ],
+  "estimated_hours": 4
+}

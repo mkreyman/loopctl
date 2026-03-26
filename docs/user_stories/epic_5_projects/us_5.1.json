@@ -1,0 +1,231 @@
+{
+  "id": "US-5.1",
+  "title": "Project schema and CRUD with tenant scoping",
+  "epic": {
+    "id": "epic_5",
+    "name": "Projects"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, read, update, list, and archive projects within my tenant, where each project has a name, slug, repo_url, description, tech_stack, status, and metadata",
+    "so_that": "I can track multiple codebases under my tenant, each with its own work breakdown, progress, and agent assignments"
+  },
+  "rationale": "Projects are the primary organizational unit for work tracking. Each project represents a codebase being developed by AI agents. The slug enables URL-friendly references in the CLI. The metadata jsonb field allows extensibility without schema changes. Archiving (soft delete via status change) preserves data for audit trails while removing active projects from default listings.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-5.1.1",
+      "description": "A Loopctl.Projects.Project schema exists with fields: id, tenant_id, name, slug, repo_url, description, tech_stack, status (enum: active, archived), metadata (jsonb), inserted_at, updated_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.2",
+      "description": "The Project schema uses Loopctl.Schema with tenant_id required; slug is unique within a tenant (composite unique index on [tenant_id, slug])",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.3",
+      "description": "POST /api/v1/projects (role: user) creates a project; requires name and slug, optional repo_url, description, tech_stack, metadata",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.4",
+      "description": "GET /api/v1/projects (role: agent+) lists all active projects for the current tenant with pagination support (offset/limit query params)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.5",
+      "description": "GET /api/v1/projects/:id (role: agent+) returns a single project with epic count and story count aggregates",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.6",
+      "description": "PATCH /api/v1/projects/:id (role: user) updates project fields; slug cannot be changed after creation",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.7",
+      "description": "DELETE /api/v1/projects/:id (role: user) archives the project by setting status to :archived; does not delete the database record",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.8",
+      "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.9",
+      "description": "Project count per tenant is limited by the max_projects tenant setting (default 50); creating beyond the limit returns 422",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.1.10",
+      "description": "RLS policy is enabled on the projects table enforcing tenant isolation at the database level",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-5.1.1",
+      "name": "Create project with valid attributes",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects with body {\"name\": \"loopctl\", \"slug\": \"loopctl\", \"repo_url\": \"https://github.com/mkreyman/loopctl\", \"tech_stack\": \"elixir/phoenix\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has project with id, name, slug, status = \"active\"",
+        "Project exists in database with correct tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.2",
+      "name": "Reject duplicate slug within same tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id, slug: \"my-project\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects with body {\"name\": \"Other\", \"slug\": \"my-project\"}"
+      ],
+      "expected_results": [
+        "Response status is 409 or 422 with error on slug"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.3",
+      "name": "Allow same slug in different tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_a.id, slug: \"shared-slug\"})"
+      ],
+      "steps": [
+        "Create project with slug \"shared-slug\" in tenant_b context"
+      ],
+      "expected_results": [
+        "Project creation succeeds — slug uniqueness is per-tenant, not global"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.4",
+      "name": "List projects returns only current tenant's projects",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_a.id})",
+        "fixture(:project, %{tenant_id: tenant_b.id})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects with Authorization: Bearer <raw_key>"
+      ],
+      "expected_results": [
+        "Response contains only tenant_a's project",
+        "Tenant_b's project is not visible"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.5",
+      "name": "Archive project changes status to archived",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id, status: :active}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/projects/<project.id>"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Project status is now :archived",
+        "Project record still exists in database",
+        "Archived project is excluded from GET /api/v1/projects listing by default"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.6",
+      "name": "Agent can read but not create projects",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects succeeds",
+        "POST /api/v1/projects with valid body fails"
+      ],
+      "expected_results": [
+        "GET returns 200 with projects",
+        "POST returns 403 (agent role insufficient for user-level endpoint)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.7",
+      "name": "Get project includes epic and story counts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>"
+      ],
+      "expected_results": [
+        "Response includes epic_count and story_count aggregates",
+        "Counts reflect actual data in the database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.1.8",
+      "name": "Project count limit is enforced",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{\"max_projects\" => 1}}) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects with valid body"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates project limit reached"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Project status enum: Ecto.Enum with values [:active, :archived]",
+    "Slug validation: same rules as tenant slug (lowercase alphanumeric + hyphens, 2-63 chars)",
+    "Composite unique index: create unique_index(:projects, [:tenant_id, :slug])",
+    "The list endpoint should default to status=active unless ?include_archived=true is passed",
+    "Epic/story counts in show endpoint can use subqueries or preloads with count aggregates",
+    "Consider a Loopctl.Projects context module with: create_project/2, get_project/1, list_projects/1, update_project/2, archive_project/1",
+    "The context functions should accept tenant_id as a parameter (not rely on process dictionary) for explicit scoping at the application level"
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 4
+}

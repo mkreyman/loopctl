@@ -1,0 +1,238 @@
+{
+  "id": "US-10.1",
+  "title": "Webhook Subscription Management",
+  "epic": {
+    "id": "epic_10",
+    "name": "Webhooks"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, list, update, and delete webhook subscriptions that specify a delivery URL and a list of event types to listen for",
+    "so_that": "my external systems can receive real-time push notifications when state changes occur in loopctl without needing to poll"
+  },
+  "rationale": "While polling via the change feed (US-3.2) works for orchestrators running tight loops, external integrations (CI/CD systems, dashboards, notification services) benefit from push-based delivery. Webhook subscriptions give tenants fine-grained control over which events get delivered where, with per-webhook signing secrets for security and optional project-scoping for multi-project tenants.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-10.1.1",
+      "description": "A webhooks table exists with columns: id (uuid PK), tenant_id (uuid FK), url (string, required), signing_secret_encrypted (binary, Cloak AES-256-GCM), events ({:array, :string}, required, non-empty), project_id (uuid FK, nullable — NULL means all projects), active (boolean, default true), consecutive_failures (integer, default 0), last_delivery_at (utc_datetime, nullable), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.2",
+      "description": "POST /api/v1/webhooks creates a webhook subscription. Request body: url (required, must be valid HTTPS URL), events (required, non-empty array of valid event type strings), project_id (optional). A signing_secret is auto-generated, encrypted via Cloak, and the raw secret is returned ONCE in the creation response.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.3",
+      "description": "GET /api/v1/webhooks lists all webhook subscriptions for the authenticated tenant. Returns id, url, events, project_id, active, consecutive_failures, last_delivery_at, inserted_at. Does NOT return signing_secret.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.4",
+      "description": "PATCH /api/v1/webhooks/:id updates a webhook. Updatable fields: url, events, project_id, active. Signing secret is NOT updatable (must delete and recreate to get a new secret).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.5",
+      "description": "DELETE /api/v1/webhooks/:id deletes a webhook and all its pending webhook_events.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.6",
+      "description": "A tenant cannot create more webhooks than their max_webhooks setting (default 10). Attempting to exceed the limit returns 422 with a descriptive error.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.7",
+      "description": "The events field validates against the known event types: story.status_changed, story.verified, story.rejected, story.auto_reset, epic.completed, artifact.reported, agent.registered, project.imported. Unknown event types are rejected with 422.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.8",
+      "description": "All webhook CRUD operations require the user role. Agent and orchestrator roles receive 403.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.9",
+      "description": "Webhooks are tenant-scoped via RLS. A tenant can only manage their own webhooks.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.10",
+      "description": "The signing_secret is generated as a cryptographically random 32-byte hex string and stored encrypted using Cloak's Ecto type.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-10.1.1",
+      "name": "create webhook with valid data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks with body: {url: 'https://example.com/hooks', events: ['story.status_changed', 'story.verified']}"
+      ],
+      "expected_results": [
+        "Response is 201 Created",
+        "Response includes id, url, events, active=true, and signing_secret (raw string)",
+        "signing_secret is a 64-character hex string (32 bytes)",
+        "Webhook record exists in database with signing_secret_encrypted (not plaintext)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.2",
+      "name": "create webhook with invalid event type returns 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks with body: {url: 'https://example.com/hooks', events: ['invalid.event']}"
+      ],
+      "expected_results": [
+        "Response is 422 Unprocessable Entity",
+        "Error message indicates invalid event type"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.3",
+      "name": "max webhook limit enforced",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{max_webhooks: 2}})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "2 webhooks already created for this tenant"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks with valid body"
+      ],
+      "expected_results": [
+        "Response is 422 Unprocessable Entity",
+        "Error message indicates max webhook limit reached"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.4",
+      "name": "list webhooks does not expose signing secret",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "GET /api/v1/webhooks with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns array of webhook objects",
+        "No webhook object contains signing_secret or signing_secret_encrypted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.5",
+      "name": "update webhook fields",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://old.example.com/hooks', events: ['story.verified']})"
+      ],
+      "steps": [
+        "PATCH /api/v1/webhooks/:id with body: {url: 'https://new.example.com/hooks', events: ['story.verified', 'story.rejected'], active: false}"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "url updated to https://new.example.com/hooks",
+        "events updated to include both event types",
+        "active is false",
+        "signing_secret is NOT returned in the response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.6",
+      "name": "delete webhook cascades to pending events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, status: :pending})"
+      ],
+      "steps": [
+        "DELETE /api/v1/webhooks/:id with user API key"
+      ],
+      "expected_results": [
+        "Response is 204 No Content",
+        "Webhook record no longer exists in database",
+        "Associated pending webhook_events are also deleted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.7",
+      "name": "tenant isolation — cannot access other tenant's webhooks",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant_b.id})"
+      ],
+      "steps": [
+        "GET /api/v1/webhooks with Tenant A's API key",
+        "PATCH /api/v1/webhooks/<tenant_b_webhook_id> with Tenant A's API key",
+        "DELETE /api/v1/webhooks/<tenant_b_webhook_id> with Tenant A's API key"
+      ],
+      "expected_results": [
+        "GET returns empty list (no Tenant B webhooks visible)",
+        "PATCH returns 404 Not Found",
+        "DELETE returns 404 Not Found"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.1.8",
+      "name": "agent and orchestrator roles cannot manage webhooks",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks with agent API key",
+        "POST /api/v1/webhooks with orchestrator API key"
+      ],
+      "expected_results": [
+        "Both requests return 403 Forbidden"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create migration for webhooks table. RLS policies: INSERT/SELECT/UPDATE/DELETE scoped by tenant_id.",
+    "Use Cloak.Ecto.Encrypted.Binary for signing_secret_encrypted. Configure Cloak vault in application config.",
+    "Signing secret generation: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower).",
+    "Known event types should be defined as a module attribute or constant list for validation reuse across webhooks and webhook_events.",
+    "Loopctl.Webhooks context module: create_webhook/2, list_webhooks/1, get_webhook!/2, update_webhook/2, delete_webhook/1.",
+    "WebhookController with create, index, show, update, delete actions. Routes under /api/v1/webhooks.",
+    "URL validation: require https:// scheme (reject http:// in production, allow in dev/test). Validate URL format with URI.parse.",
+    "The signing_secret is only returned in the POST creation response. All other endpoints omit it. Use a separate JSON view/serializer for creation vs. list/show."
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 6
+}

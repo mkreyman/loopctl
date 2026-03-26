@@ -1,0 +1,242 @@
+{
+  "id": "US-10.5",
+  "title": "Webhook Test Delivery and Auto-Disable",
+  "epic": {
+    "id": "epic_10",
+    "name": "Webhooks"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "send a test event to a webhook and have webhooks auto-disabled after too many consecutive failures, with visibility into recent delivery attempts",
+    "so_that": "I can verify my webhook endpoint works before relying on it, broken webhooks stop wasting delivery resources, and I can diagnose delivery issues"
+  },
+  "rationale": "Without a test endpoint, tenants must trigger a real state change to verify their webhook is configured correctly — an error-prone and inconvenient workflow. Auto-disable prevents wasted Oban worker time on permanently broken endpoints (e.g., decommissioned servers). The deliveries listing gives tenants visibility into what was delivered, what failed, and why, enabling self-service debugging.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-10.5.1",
+      "description": "POST /api/v1/webhooks/:id/test creates a webhook_event with event_type='webhook.test' and immediately enqueues it for delivery via the Oban worker. The test payload includes {event: 'webhook.test', data: {message: 'This is a test event', webhook_id: id}, timestamp: ISO8601}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.2",
+      "description": "The test endpoint returns 200 OK with the created webhook_event ID. Delivery happens asynchronously — the response does not wait for delivery to complete.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.3",
+      "description": "Test events follow the same signing and delivery path as real events (HMAC-SHA256 signature, same headers, same retry logic).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.4",
+      "description": "When a webhook's consecutive_failures reaches the tenant's webhook_max_consecutive_failures setting (default 10), the webhook is automatically set to active=false.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.5",
+      "description": "Auto-disable is checked after each failed delivery exhaustion. The check uses the tenant's configurable threshold, not a hardcoded value.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.6",
+      "description": "When a webhook is auto-disabled, an audit log entry is created with action='webhook_auto_disabled', including the consecutive_failures count and the last error message.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.7",
+      "description": "GET /api/v1/webhooks/:id/deliveries returns recent webhook_event records for the specified webhook, ordered by inserted_at descending. Includes: id, event_type, status, attempts, delivered_at, error, inserted_at. Default page size 25, max 100.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.8",
+      "description": "A manually re-activated webhook (PATCH active=true) resets consecutive_failures to 0.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.9",
+      "description": "All three endpoints (test, deliveries, PATCH for reactivation) require the user role. Tenant-scoped via RLS.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.5.10",
+      "description": "The test endpoint works even if the webhook is currently inactive (active=false), allowing tenants to test before reactivating.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-10.5.1",
+      "name": "test endpoint creates and enqueues test event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://example.com/hooks', active: true})"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks/:id/test with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Response includes the created webhook_event ID",
+        "webhook_event record exists with event_type='webhook.test' and status='pending'",
+        "An Oban job is enqueued for the WebhookDeliveryWorker"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.2",
+      "name": "test event is signed like real events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: true})",
+        "HTTP mock captures request headers"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks/:id/test",
+        "Execute the enqueued Oban job",
+        "Inspect the captured HTTP request"
+      ],
+      "expected_results": [
+        "X-Signature-256 header is present",
+        "Signature is valid HMAC-SHA256 of the payload using the webhook's signing secret",
+        "X-Webhook-ID and X-Webhook-Timestamp headers are present"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.3",
+      "name": "auto-disable after consecutive failures threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{webhook_max_consecutive_failures: 3}})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: true, consecutive_failures: 2})",
+        "fixture(:webhook_event, %{webhook_id: webhook.id, tenant_id: tenant.id, status: :pending, attempts: 5})",
+        "HTTP mock returns 500 for all attempts"
+      ],
+      "steps": [
+        "Execute WebhookDeliveryWorker.perform/1 (6th attempt, exhausts retries)",
+        "Reload webhook from database"
+      ],
+      "expected_results": [
+        "webhook_event status is 'exhausted'",
+        "webhook consecutive_failures is 3 (matches threshold)",
+        "webhook active is false (auto-disabled)",
+        "Audit log entry exists with action='webhook_auto_disabled'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.4",
+      "name": "auto-disable respects tenant-specific threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{webhook_max_consecutive_failures: 20}})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: true, consecutive_failures: 9})"
+      ],
+      "steps": [
+        "Simulate exhausted delivery (consecutive_failures becomes 10)"
+      ],
+      "expected_results": [
+        "webhook is still active (threshold is 20, not the default 10)",
+        "consecutive_failures is 10"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.5",
+      "name": "deliveries endpoint returns recent delivery attempts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id})",
+        "5 webhook_event records for the webhook with mixed statuses (delivered, failed, exhausted, pending)"
+      ],
+      "steps": [
+        "GET /api/v1/webhooks/:id/deliveries with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns 5 delivery records ordered by inserted_at descending",
+        "Each record includes id, event_type, status, attempts, delivered_at, error, inserted_at",
+        "Payload field is NOT included in the deliveries list (to reduce response size)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.6",
+      "name": "reactivation resets consecutive_failures",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: false, consecutive_failures: 10})"
+      ],
+      "steps": [
+        "PATCH /api/v1/webhooks/:id with body: {active: true}"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "webhook active is true",
+        "webhook consecutive_failures is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.7",
+      "name": "test endpoint works on inactive webhook",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant.id, active: false})"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks/:id/test with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "webhook_event is created with event_type='webhook.test'",
+        "Oban job is enqueued (test events bypass the active check)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.5.8",
+      "name": "tenant isolation on deliveries endpoint",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:webhook, %{tenant_id: tenant_b.id})",
+        "webhook_events exist for Tenant B's webhook"
+      ],
+      "steps": [
+        "GET /api/v1/webhooks/<tenant_b_webhook_id>/deliveries with Tenant A's API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found (webhook not visible to Tenant A via RLS)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "POST /api/v1/webhooks/:id/test route in WebhookController. Creates a webhook_event and inserts an Oban job in one transaction.",
+    "GET /api/v1/webhooks/:id/deliveries route in WebhookController (or a nested WebhookDeliveryController). Queries webhook_events for the webhook.",
+    "Auto-disable logic lives in the WebhookDeliveryWorker after exhaustion: load tenant settings, compare consecutive_failures >= threshold, update webhook active=false if exceeded.",
+    "When PATCH sets active=true and the webhook's current consecutive_failures > 0, the update changeset should also reset consecutive_failures to 0.",
+    "Test events should bypass the normal active check in the delivery worker. Add a flag in the worker args or check event_type='webhook.test'.",
+    "The deliveries endpoint should exclude the full payload from the list response for performance. Include a link or note that full payload is available via the audit log.",
+    "Add webhook_max_consecutive_failures to the tenant settings schema with a default of 10."
+  ],
+  "dependencies": [
+    "US-10.3"
+  ],
+  "estimated_hours": 4
+}

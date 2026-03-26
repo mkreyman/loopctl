@@ -1,0 +1,254 @@
+{
+  "id": "US-9.1",
+  "title": "Orchestrator State Save/Restore with Optimistic Locking",
+  "epic": {
+    "id": "epic_9",
+    "name": "Orchestrator State"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "save and restore my orchestration state with optimistic locking to prevent conflicting writes",
+    "so_that": "I can resume orchestration after session interruptions, crashes, or handoffs without losing progress or corrupting state"
+  },
+  "rationale": "Orchestrator state persistence is what makes the 'resume anywhere' principle possible. When an orchestrator session crashes or times out, the next session can load the saved state and continue from where the last one left off. Optimistic locking via a version field prevents two concurrent orchestrator sessions from silently overwriting each other's state — the second writer gets a 409 Conflict and must re-read before writing. The state is keyed by project_id + state_key, allowing multiple named state slots per project (e.g., 'main', 'backup', 'experiment-1').",
+  "acceptance_criteria": [
+    {
+      "id": "AC-9.1.1",
+      "description": "PUT /api/v1/orchestrator/state/:project_id with an orchestrator-role API key upserts an orchestrator_state record. Request body must include state_key (string), state_data (jsonb), and version (integer). Returns 200 with the saved state including the incremented version.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.2",
+      "description": "When no orchestrator_state record exists for the given project_id + state_key, a new record is created with version=1. The request must include version=0 (or omit version) to indicate a new state.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.3",
+      "description": "When an orchestrator_state record already exists, the update succeeds only if the provided version matches the current version in the database. The version is then incremented by 1. Returns 409 Conflict if version does not match.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.4",
+      "description": "GET /api/v1/orchestrator/state/:project_id with an orchestrator-role API key returns the orchestrator_state record. Supports optional state_key query parameter; defaults to 'main' if not provided.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.5",
+      "description": "GET /api/v1/orchestrator/state/:project_id returns 404 if no state exists for the given project_id + state_key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.6",
+      "description": "Both endpoints return 403 Forbidden when called with non-orchestrator role API keys (agent, user). Only orchestrator and superadmin roles can access state endpoints.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.7",
+      "description": "The state_data field accepts arbitrary JSON of any structure. The system stores and retrieves it without modification or validation beyond JSON validity.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.8",
+      "description": "PUT /api/v1/orchestrator/state/:project_id returns 422 if state_key is missing/blank or state_data is not valid JSON.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.9",
+      "description": "Tenant isolation is enforced: orchestrators cannot read or write state for projects belonging to other tenants. Cross-tenant requests return 404 for the project.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-9.1.10",
+      "description": "Each state save creates an audit_log entry with entity_type='orchestrator_state', action='saved', old_state containing the previous version and state_data (if update), new_state containing the new version and state_data.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-9.1.1",
+      "name": "Happy path: create new state",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id, name: \"my-project\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "PUT /api/v1/orchestrator/state/:project_id with body {state_key: 'main', state_data: {current_epic: 3, completed_stories: ['1.1', '1.2', '2.1'], next_action: 'assign_3.1'}, version: 0}",
+        "Assert response 200"
+      ],
+      "expected_results": [
+        "Response includes state_key='main', state_data with full JSON, version=1",
+        "orchestrator_state record created in database with tenant_id, project_id, version=1",
+        "Audit log entry created with action='saved'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.2",
+      "name": "Happy path: update existing state with correct version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: project.id, state_key: \"main\", state_data: %{current_epic: 3}, version: 5})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "PUT /api/v1/orchestrator/state/:project_id with body {state_key: 'main', state_data: {current_epic: 4, completed_stories: ['3.1', '3.2']}, version: 5}",
+        "Assert response 200"
+      ],
+      "expected_results": [
+        "Response includes version=6 (incremented from 5)",
+        "state_data is fully replaced with the new data",
+        "Audit log entry includes old_state with version 5 and new_state with version 6"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.3",
+      "name": "Optimistic lock conflict returns 409",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: project.id, state_key: \"main\", state_data: %{}, version: 3})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "PUT /api/v1/orchestrator/state/:project_id with body {state_key: 'main', state_data: {update: true}, version: 2} (stale version)"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Error message indicates version mismatch: expected 3, got 2",
+        "State in database remains unchanged at version 3",
+        "No audit log entry created for the failed write"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.4",
+      "name": "Retrieve state by project and state_key",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: project.id, state_key: \"main\", state_data: %{epic: 5}, version: 10})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: project.id, state_key: \"backup\", state_data: %{epic: 4}, version: 8})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_id?state_key=main",
+        "GET /api/v1/orchestrator/state/:project_id?state_key=backup",
+        "GET /api/v1/orchestrator/state/:project_id (no state_key, defaults to 'main')"
+      ],
+      "expected_results": [
+        "First request returns state with epic=5, version=10",
+        "Second request returns state with epic=4, version=8",
+        "Third request returns same as first (default state_key='main')"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.5",
+      "name": "Non-orchestrator role keys are rejected",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "PUT /api/v1/orchestrator/state/:project_id with agent API key",
+        "GET /api/v1/orchestrator/state/:project_id with agent API key",
+        "PUT /api/v1/orchestrator/state/:project_id with user API key",
+        "GET /api/v1/orchestrator/state/:project_id with user API key"
+      ],
+      "expected_results": [
+        "All four requests return 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.6",
+      "name": "Tenant isolation: cross-tenant state access returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:project, %{tenant_id: tenant_a.id})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant_a.id, project_id: project_a.id, state_key: \"main\"})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/orchestrator/state/:project_a_id with tenant B orchestrator key",
+        "PUT /api/v1/orchestrator/state/:project_a_id with tenant B orchestrator key"
+      ],
+      "expected_results": [
+        "Both requests return 404 Not Found (project not visible to tenant B)",
+        "State in tenant A remains unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.7",
+      "name": "Large state_data payload is stored and retrieved faithfully",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "Prepare a large state_data JSON with nested structures, arrays of 100+ items, mixed types"
+      ],
+      "steps": [
+        "Call Loopctl.OrchestratorState.save_state/3 with the large payload",
+        "Call Loopctl.OrchestratorState.get_state/3 and compare"
+      ],
+      "expected_results": [
+        "state_data is stored and retrieved with full fidelity",
+        "No truncation, no type coercion, all nested structures preserved"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-9.1.8",
+      "name": "Concurrent optimistic lock: two writers, one wins",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:orchestrator_state, %{tenant_id: tenant.id, project_id: project.id, state_key: \"main\", version: 1})"
+      ],
+      "steps": [
+        "Spawn two concurrent tasks both calling save_state with version=1",
+        "Wait for both to complete"
+      ],
+      "expected_results": [
+        "Exactly one task succeeds with version=2",
+        "The other task returns {:error, :version_conflict}",
+        "Database has version=2 with the winning writer's state_data",
+        "Only one audit_log entry created"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement Loopctl.OrchestratorState context module with save_state/3 and get_state/3 functions.",
+    "orchestrator_state table: id (uuid PK), tenant_id (uuid FK), project_id (uuid FK), state_key (string), state_data (jsonb), version (integer default 0), inserted_at, updated_at.",
+    "Unique index on (tenant_id, project_id, state_key) for upsert behavior.",
+    "Optimistic locking: use Ecto's optimistic_lock/3 or implement manually with WHERE version = :expected_version in the UPDATE. If zero rows updated, return version conflict error.",
+    "For upsert (new record): use ON CONFLICT (tenant_id, project_id, state_key) DO UPDATE with version check. Or check existence first and route to insert vs update.",
+    "RLS policy on orchestrator_state: tenant_id = current_setting('app.current_tenant_id')::uuid.",
+    "Controller at LoopctlWeb.OrchestratorStateController with save and show actions.",
+    "Routes: PUT /api/v1/orchestrator/state/:project_id and GET /api/v1/orchestrator/state/:project_id. RequireRole plug set to [:orchestrator, :superadmin].",
+    "The project_id in the URL must be validated as an existing project within the tenant before any state operations."
+  ],
+  "dependencies": [
+    "US-2.4",
+    "US-5.1"
+  ],
+  "estimated_hours": 6
+}

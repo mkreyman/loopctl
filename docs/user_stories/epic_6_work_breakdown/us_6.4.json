@@ -1,0 +1,234 @@
+{
+  "id": "US-6.4",
+  "title": "Story dependencies with directed edges and cycle detection",
+  "epic": {
+    "id": "epic_6",
+    "name": "Work Breakdown"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create and remove directed dependency edges between stories (story A depends_on story B), list story dependencies within an epic, and have the system reject cycles",
+    "so_that": "the orchestrator can determine which stories must be verified before others can be assigned, ensuring work proceeds in the correct order"
+  },
+  "rationale": "Story dependencies are finer-grained than epic dependencies and control the actual work sequencing. A story can only be assigned to an agent once all its dependency stories have been verified. This ensures implementation builds on verified foundations rather than unverified claims. The cycle detection reuses the same graph algorithm as epic dependencies.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-6.4.1",
+      "description": "A Loopctl.WorkBreakdown.StoryDependency schema exists with fields: id, tenant_id, story_id (the dependent), depends_on_story_id (the prerequisite), inserted_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.2",
+      "description": "POST /api/v1/story_dependencies (role: user) creates a dependency edge; requires story_id and depends_on_story_id",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.3",
+      "description": "Creating a dependency that would form a cycle returns 422 with error message 'Cycle detected in dependency graph'",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.4",
+      "description": "Creating a self-dependency (story_id == depends_on_story_id) returns 422",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.5",
+      "description": "Creating a duplicate dependency returns 409 Conflict",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.6",
+      "description": "Story dependencies can cross epic boundaries within the same project (story in epic 2 depends on story in epic 1)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.7",
+      "description": "Both stories must belong to the same project (determined via their parent epics); cross-project dependencies are rejected",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.8",
+      "description": "DELETE /api/v1/story_dependencies/:id (role: user) removes a dependency edge",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.9",
+      "description": "GET /api/v1/epics/:id/story_dependencies (role: agent+) returns all story dependency edges for stories within an epic (and cross-epic deps involving those stories)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.4.10",
+      "description": "All operations are scoped to the current tenant via RLS and application-level checks. RLS is enabled on the story_dependencies table.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-6.4.1",
+      "name": "Create valid story dependency within same epic",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.1\"}) as story_a",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.2\"}) as story_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_b.id>\", \"depends_on_story_id\": \"<story_a.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Dependency exists in database with correct tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.2",
+      "name": "Create cross-epic story dependency within same project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1}) as epic_1",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2}) as epic_2",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_1.id, number: \"1.1\"}) as story_1_1",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_2.id, number: \"2.1\"}) as story_2_1",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_2_1.id>\", \"depends_on_story_id\": \"<story_1_1.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Cross-epic dependency is created successfully"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.3",
+      "name": "Reject cycle in story dependencies",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_a",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_b",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: story_b.id, depends_on_story_id: story_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_a.id>\", \"depends_on_story_id\": \"<story_b.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message contains 'Cycle detected in dependency graph'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.4",
+      "name": "Reject self-dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story.id>\", \"depends_on_story_id\": \"<story.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates self-dependency is not allowed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.5",
+      "name": "Reject cross-project story dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_a",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_b",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project_a.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project_b.id}) as epic_b",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_a.id}) as story_a",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_b.id}) as story_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_b.id>\", \"depends_on_story_id\": \"<story_a.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates stories must belong to the same project"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.6",
+      "name": "Delete story dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_a",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_b",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: story_b.id, depends_on_story_id: story_a.id}) as dep",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/story_dependencies/<dep.id>"
+      ],
+      "expected_results": [
+        "Response status is 200 or 204",
+        "Dependency no longer exists in database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.7",
+      "name": "List story dependencies for epic includes cross-epic deps",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1}) as epic_1",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2}) as epic_2",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_1.id}) as story_1",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_2.id}) as story_2",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: story_2.id, depends_on_story_id: story_1.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/epics/<epic_2.id>/story_dependencies"
+      ],
+      "expected_results": [
+        "Response includes the cross-epic dependency (story_2 depends on story_1)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse the same cycle detection algorithm from US-6.3 (Loopctl.WorkBreakdown.Graph module)",
+    "Composite unique index: create unique_index(:story_dependencies, [:story_id, :depends_on_story_id])",
+    "To check same-project constraint: join story -> epic -> project for both stories and compare project_ids",
+    "Cross-epic dependencies are explicitly allowed — a story in Epic 3 can depend on a story in Epic 1",
+    "When a story is deleted (US-6.2), cascade delete its dependency edges (both directions)",
+    "The list endpoint for an epic should return deps where either story_id or depends_on_story_id belongs to a story in that epic"
+  ],
+  "dependencies": [
+    "US-6.2"
+  ],
+  "estimated_hours": 4
+}

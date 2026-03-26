@@ -1,0 +1,210 @@
+{
+  "id": "US-2.6",
+  "title": "API key management: create, list, revoke, and rotate",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create additional API keys with specific roles, list existing keys (showing prefix and metadata only), revoke keys, and rotate keys (generating a new key with a grace period on the old one)",
+    "so_that": "I can provision separate API keys for different agents and orchestrators, manage their lifecycle, and rotate credentials without downtime"
+  },
+  "rationale": "A tenant needs multiple API keys: one for each agent, one for the orchestrator, and user-level keys for administration. Key rotation is critical for security hygiene — the rotate endpoint creates a new key and keeps the old one valid for a grace period so agents can transition without downtime. Listing keys must never expose the raw key or hash, only the prefix.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.6.1",
+      "description": "POST /api/v1/api_keys (role: user) creates a new API key with specified name and role; returns the raw key once in the response",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.2",
+      "description": "The create endpoint accepts: name (required), role (required, one of: user, orchestrator, agent), expires_at (optional), agent_id (optional, for agent-role keys)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.3",
+      "description": "Users cannot create superadmin keys; attempting to do so returns 403",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.4",
+      "description": "GET /api/v1/api_keys (role: user) lists all API keys for the current tenant, showing: id, name, key_prefix, role, last_used_at, expires_at, revoked_at, inserted_at. Never exposes key_hash or raw key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.5",
+      "description": "DELETE /api/v1/api_keys/:id (role: user) revokes an API key by setting revoked_at to the current time; does not delete the database record",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.6",
+      "description": "POST /api/v1/api_keys/:id/rotate (role: user) creates a new key with the same name/role and sets expires_at on the old key to now + grace_period (default 24 hours, configurable in request body)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.7",
+      "description": "The rotate response includes both the new raw key and the old key's updated expiration time",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.8",
+      "description": "All endpoints are scoped to the current tenant — a user cannot see or manage keys from another tenant",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.6.9",
+      "description": "API key count per tenant is limited by the max_api_keys tenant setting (default 100); creating beyond the limit returns 422",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.6.1",
+      "name": "Create API key with valid attributes",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/api_keys with Authorization: Bearer <raw_key> and body {\"name\": \"agent-1\", \"role\": \"agent\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has api_key.raw_key starting with 'lc_'",
+        "Response body has api_key.key_prefix, api_key.role = \"agent\"",
+        "New key exists in database with correct tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.2",
+      "name": "List API keys shows prefix only",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, name: \"agent-1\"})"
+      ],
+      "steps": [
+        "GET /api/v1/api_keys with Authorization: Bearer <raw_key>"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response body has a list of API keys",
+        "Each key has key_prefix but no key_hash or raw_key field",
+        "Both keys for this tenant are listed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.3",
+      "name": "Revoke API key sets revoked_at",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {admin_key, _}",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {_, agent_api_key}"
+      ],
+      "steps": [
+        "DELETE /api/v1/api_keys/<agent_api_key.id> with Authorization: Bearer <admin_key>"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "The agent API key now has revoked_at set",
+        "The agent raw key can no longer authenticate"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.4",
+      "name": "Rotate API key creates new key and sets grace period",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {admin_key, _}",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, name: \"worker\"}) returns {_, old_key}"
+      ],
+      "steps": [
+        "POST /api/v1/api_keys/<old_key.id>/rotate with Authorization: Bearer <admin_key> and body {\"grace_period_hours\": 12}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has new_key.raw_key (different from old key)",
+        "Response body has old_key_expires_at approximately 12 hours from now",
+        "The old key still works during the grace period",
+        "The new key works immediately",
+        "New key has the same name and role as the old key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.5",
+      "name": "Cannot create superadmin key via tenant endpoint",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/api_keys with body {\"name\": \"hacker\", \"role\": \"superadmin\"}"
+      ],
+      "expected_results": [
+        "Response status is 403",
+        "No superadmin key is created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.6",
+      "name": "Cannot see another tenant's keys",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user}) returns {key_a, _}",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})"
+      ],
+      "steps": [
+        "GET /api/v1/api_keys with Authorization: Bearer <key_a>"
+      ],
+      "expected_results": [
+        "Only keys belonging to tenant_a are returned",
+        "Tenant_b's keys are not visible"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.6.7",
+      "name": "Key creation respects max_api_keys limit",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{\"max_api_keys\" => 2}}) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/api_keys with body {\"name\": \"third\", \"role\": \"agent\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates API key limit reached"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "The create endpoint must use the JSON view that includes raw_key — same pattern as registration",
+    "Rotation is essentially: create new key + update old key's expires_at in a transaction",
+    "The list endpoint should exclude revoked keys by default, with an optional ?include_revoked=true query param",
+    "Tenant scoping is enforced both by application (WHERE tenant_id) and RLS",
+    "Consider adding pagination to the list endpoint (offset/limit) for tenants with many keys"
+  ],
+  "dependencies": [
+    "US-2.4"
+  ],
+  "estimated_hours": 6
+}

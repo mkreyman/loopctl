@@ -1,0 +1,193 @@
+{
+  "id": "US-1.1",
+  "title": "Phoenix API-only project scaffold with PostgreSQL, binary UUIDs, Oban, Req, Cloak",
+  "epic": {
+    "id": "epic_1",
+    "name": "Foundation & Infrastructure"
+  },
+  "priority": "high",
+  "phase": "foundation",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "scaffold a Phoenix API-only project with PostgreSQL, binary UUIDs as the default primary key type, Oban for background jobs, Req for HTTP client, and Cloak for field-level encryption",
+    "so_that": "all downstream epics build on a consistent, production-ready foundation with the correct libraries pre-configured and no LiveView overhead"
+  },
+  "rationale": "loopctl is an agent-native REST API with no human UI. The scaffold must enforce API-only mode from the start to prevent accidental LiveView dependencies. Binary UUIDs prevent sequential ID guessing, Oban handles webhook delivery and cleanup jobs, Req is the HTTP client for outbound calls, and Cloak provides AES-256-GCM encryption for secrets at rest.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-1.1.1",
+      "description": "Phoenix project is generated with --no-html --no-live --no-mailer --no-dashboard flags; no LiveView, HTML, or mailer dependencies exist in mix.exs",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.2",
+      "description": "PostgreSQL is configured as the database adapter in config/dev.exs, config/test.exs, and config/runtime.exs with database name loopctl_dev / loopctl_test",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.3",
+      "description": "Ecto migration generator defaults to binary_id (UUIDv4) for primary keys and foreign keys project-wide via config :loopctl, Loopctl.Repo, migration_primary_key: [type: :binary_id]",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.4",
+      "description": "Oban is added to mix.exs, configured in config files with a PostgreSQL queue backend, and started in the application supervision tree",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.5",
+      "description": "Req is added to mix.exs as the HTTP client dependency",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.6",
+      "description": "Cloak and Cloak.Ecto are added to mix.exs; a Loopctl.Vault module is defined with AES-256-GCM cipher configuration; the encryption key is sourced from a runtime environment variable (CLOAK_KEY)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.7",
+      "description": "The application starts successfully with mix phx.server and responds to HTTP requests on the configured port",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.8",
+      "description": "mix test runs with zero failures on a fresh clone after mix setup",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.9",
+      "description": "The router mounts a /api/v1 scope with the :api pipeline (JSON accepts, no CSRF)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.10",
+      "description": "Jason is configured as the JSON library for both Phoenix and Ecto",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-1.1.1",
+      "name": "Application boots without errors",
+      "type": "integration",
+      "preconditions": [
+        "Database is created and migrated"
+      ],
+      "steps": [
+        "Start the application with Application.ensure_all_started(:loopctl)"
+      ],
+      "expected_results": [
+        "Application starts with {:ok, _} tuple",
+        "No error logs are emitted during startup"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.2",
+      "name": "Oban is running in the supervision tree",
+      "type": "integration",
+      "preconditions": [
+        "Application is started"
+      ],
+      "steps": [
+        "Check that Oban process is alive via Process.whereis(Oban)"
+      ],
+      "expected_results": [
+        "Oban process is running and alive"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.3",
+      "name": "Repo generates binary UUIDs for primary keys",
+      "type": "unit",
+      "preconditions": [
+        "A test schema with a primary key is defined"
+      ],
+      "steps": [
+        "Insert a record via Repo.insert/1",
+        "Inspect the id field of the returned struct"
+      ],
+      "expected_results": [
+        "The id is a valid UUID string (matches UUID format regex)",
+        "The id is not a sequential integer"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.4",
+      "name": "Cloak Vault encrypts and decrypts a value",
+      "type": "unit",
+      "preconditions": [
+        "CLOAK_KEY environment variable is set",
+        "Loopctl.Vault is started"
+      ],
+      "steps": [
+        "Call Loopctl.Vault.encrypt(\"test_secret\")",
+        "Call Loopctl.Vault.decrypt/1 on the result"
+      ],
+      "expected_results": [
+        "Encrypted value is a binary different from \"test_secret\"",
+        "Decrypted value equals \"test_secret\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.5",
+      "name": "API pipeline returns JSON content type",
+      "type": "integration",
+      "preconditions": [
+        "Application is running"
+      ],
+      "steps": [
+        "Send GET request to /api/v1 (or any mounted route)"
+      ],
+      "expected_results": [
+        "Response content-type header is application/json"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.6",
+      "name": "No LiveView or HTML dependencies present",
+      "type": "unit",
+      "preconditions": [
+        "Project is compiled"
+      ],
+      "steps": [
+        "Check mix.exs for phoenix_live_view, phoenix_html, phoenix_live_dashboard dependencies",
+        "Check for any *_html.ex or *_live.ex modules in lib/"
+      ],
+      "expected_results": [
+        "No LiveView, HTML, or Dashboard dependencies exist in mix.exs",
+        "No HTML or LiveView modules exist in the lib/ directory"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.1.7",
+      "name": "Req is available as an HTTP client",
+      "type": "unit",
+      "preconditions": [
+        "Dependencies are compiled"
+      ],
+      "steps": [
+        "Call Code.ensure_loaded?(Req)"
+      ],
+      "expected_results": [
+        "Returns true, confirming Req module is available"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Generate with: mix phx.new loopctl --no-html --no-live --no-mailer --no-dashboard --binary-id",
+    "Set config :loopctl, Loopctl.Repo, migration_primary_key: [type: :binary_id], migration_foreign_key: [type: :binary_id] in config/config.exs",
+    "Oban config: queues: [default: 10, webhooks: 5, cleanup: 2] — adjust as needed in later epics",
+    "Cloak key should be 32-byte base64-encoded, generated via :crypto.strong_rand_bytes(32) |> Base.encode64()",
+    "Loopctl.Vault must be added to the application supervision tree before Repo",
+    "Ensure config/test.exs sets Oban to testing mode: config :loopctl, Oban, testing: :inline"
+  ],
+  "dependencies": [],
+  "estimated_hours": 8
+}

@@ -1,0 +1,198 @@
+{
+  "id": "US-7.3",
+  "title": "Auto-Reset on Rejection",
+  "epic": {
+    "id": "epic_7",
+    "name": "Two-Tier Progress Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "have stories automatically reset to pending when I reject them",
+    "so_that": "rejected work is immediately available for re-assignment without manual intervention, creating a self-correcting feedback loop"
+  },
+  "rationale": "Auto-reset is the mechanism that closes the two-tier trust loop. When an orchestrator rejects a story, the agent_status automatically resets to 'pending' and the assigned_agent_id is cleared, making the story immediately available in the 'ready' queue for a new (or the same) agent to claim. This is configurable per tenant (auto_reset_on_rejection setting) because some teams may want manual re-assignment. A webhook event is emitted so external systems can react to auto-resets.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-7.3.1",
+      "description": "When POST /api/v1/stories/:id/reject succeeds and tenant setting auto_reset_on_rejection is true (default), the story's agent_status is automatically reset to 'pending', assigned_agent_id is cleared, and assigned_at is cleared.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.2",
+      "description": "When auto_reset_on_rejection is false in tenant settings, the reject endpoint sets verified_status to 'rejected' but does NOT reset agent_status. The story remains in its current agent_status (e.g., reported_done) with the agent still assigned.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.3",
+      "description": "The auto-reset creates a separate audit_log entry with action='auto_reset', old_state containing the previous agent_status and assigned_agent_id, new_state containing agent_status='pending' and assigned_agent_id=nil, and actor_type='system'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.4",
+      "description": "The auto-reset emits a 'story.auto_reset' webhook event containing story_id, the rejection reason, the previous agent_status, and the previous assigned_agent_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.5",
+      "description": "The rejection itself emits a 'story.rejected' webhook event containing story_id, orchestrator_id, reason, and findings. This fires before the auto_reset event.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.6",
+      "description": "The entire rejection + auto-reset is atomic: if the auto-reset fails, the rejection is also rolled back.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.7",
+      "description": "After auto-reset, the story appears in the GET /stories/ready endpoint results (assuming all dependencies are still verified).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.3.8",
+      "description": "The auto-reset also clears reported_done_at timestamp, since the story is no longer in reported_done state.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-7.3.1",
+      "name": "Rejection triggers auto-reset when tenant setting is true",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: true}})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: \"worker-1\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: \"orch-main\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, assigned_agent_id: impl_agent.id, reported_done_at: ~U[2026-03-25 10:00:00Z]})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'Missing test coverage'}",
+        "Assert response 200",
+        "Reload story from database",
+        "Query audit_log for the story"
+      ],
+      "expected_results": [
+        "Story verified_status is 'rejected', rejected_at is set, rejection_reason is 'Missing test coverage'",
+        "Story agent_status is 'pending', assigned_agent_id is nil, assigned_at is nil, reported_done_at is nil",
+        "Two audit_log entries: one for 'rejected' action, one for 'auto_reset' action with actor_type='system'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.3.2",
+      "name": "Rejection does NOT auto-reset when tenant setting is false",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: false}})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: \"worker-1\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, assigned_agent_id: impl_agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'Incomplete implementation'}",
+        "Assert response 200",
+        "Reload story from database"
+      ],
+      "expected_results": [
+        "Story verified_status is 'rejected'",
+        "Story agent_status remains 'reported_done' (NOT reset to pending)",
+        "Story assigned_agent_id remains set to impl_agent.id",
+        "Only one audit_log entry: 'rejected' action (no 'auto_reset' entry)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.3.3",
+      "name": "Auto-reset emits story.auto_reset webhook event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: true}})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"story.rejected\", \"story.auto_reset\"], active: true})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, assigned_agent_id: impl_agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'Failed artifact check'}",
+        "Query webhook_events table for this story"
+      ],
+      "expected_results": [
+        "Two webhook_events created: one with event_type='story.rejected', one with event_type='story.auto_reset'",
+        "story.auto_reset payload contains story_id, reason, previous agent_status, previous assigned_agent_id",
+        "story.rejected event has earlier inserted_at than story.auto_reset event"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.3.4",
+      "name": "Auto-reset story appears in ready queue",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: true}})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "Story has no unverified dependencies",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with orchestrator key",
+        "GET /api/v1/stories/ready with agent key"
+      ],
+      "expected_results": [
+        "The rejected story appears in the ready stories list",
+        "Story has agent_status='pending' and is available for claiming"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.3.5",
+      "name": "Atomicity: auto-reset failure rolls back rejection",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: true}})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "Mock the auto-reset step in Ecto.Multi to return an error"
+      ],
+      "steps": [
+        "Call Loopctl.Progress.reject_story/3 with valid params but mocked auto-reset failure",
+        "Reload story from database"
+      ],
+      "expected_results": [
+        "Story verified_status remains 'unverified' (rejection rolled back)",
+        "Story agent_status remains 'reported_done' (not reset)",
+        "No audit_log entries created (all rolled back)",
+        "Function returns {:error, :auto_reset, ...} tuple"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.3.6",
+      "name": "Default tenant settings enable auto-reset",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{}}) — empty settings, rely on defaults"
+      ],
+      "steps": [
+        "Call Loopctl.Tenants.get_setting(tenant, :auto_reset_on_rejection)"
+      ],
+      "expected_results": [
+        "Returns true (the default value when not explicitly configured)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Integrate auto-reset into the reject_story/3 function in Loopctl.Progress as an additional Ecto.Multi step, conditioned on the tenant's auto_reset_on_rejection setting.",
+    "Use Loopctl.Tenants.get_setting/2 with fallback chain: tenant.settings[key] -> default. Default for auto_reset_on_rejection is true.",
+    "Webhook events should be enqueued (not delivered inline) via Oban within the same transaction. Use Oban.insert/2 within Ecto.Multi.",
+    "The auto_reset audit_log entry must have actor_type='system' to distinguish it from agent-initiated unclaims.",
+    "Ensure reported_done_at is cleared alongside assigned_agent_id and assigned_at during auto-reset.",
+    "This story modifies the reject path implemented in US-7.2 — it adds the conditional auto-reset step to the existing Ecto.Multi chain."
+  ],
+  "dependencies": [
+    "US-7.2"
+  ],
+  "estimated_hours": 3
+}

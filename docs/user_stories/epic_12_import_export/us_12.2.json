@@ -1,0 +1,227 @@
+{
+  "id": "US-12.2",
+  "title": "Project Export to JSON",
+  "epic": {
+    "id": "epic_12",
+    "name": "Import/Export"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "export a complete project as a JSON document that includes all epics, stories with full fields, and dependency edges",
+    "so_that": "I can snapshot the project state for backup, migration to another loopctl instance, or feeding into analysis tools"
+  },
+  "rationale": "Export is the complement to import (US-12.1). Together they enable round-trip fidelity: export a project, modify the JSON, re-import. Export also serves as a backup mechanism and a way to share project structures between tenants or instances. The export format matches the import format exactly, so the output of export can be directly used as input to import.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-12.2.1",
+      "description": "GET /api/v1/projects/:id/export returns a JSON document containing the complete project structure: project metadata, epics (with all fields), stories (with all fields including agent_status, verified_status, assigned_agent_id, timestamps), and story_dependencies (as story number pairs).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.2",
+      "description": "The export format matches the import format (US-12.1) for round-trip fidelity. An export can be directly POSTed to import on the same or different project/tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.3",
+      "description": "Stories include all fields: number, title, description, acceptance_criteria, estimated_hours, agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason, metadata.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.4",
+      "description": "Dependencies are expressed as story number pairs (e.g., {story: '2.1', depends_on: '1.3'}) rather than UUIDs, for portability across instances.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.5",
+      "description": "The response includes an export_metadata object: {exported_at: ISO8601, loopctl_version: string, project_id: uuid, tenant_id: uuid}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.6",
+      "description": "Epic dependencies are included in the export as epic number pairs, similar to story dependencies.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.7",
+      "description": "The endpoint is accessible to agent role and above (agent, orchestrator, user). Tenant-scoped via RLS.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.8",
+      "description": "Returns 404 if the project does not exist or does not belong to the authenticated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.2.9",
+      "description": "The export includes epics ordered by number, stories within each epic ordered by number, and dependencies ordered consistently for deterministic output.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-12.2.1",
+      "name": "export returns complete project structure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Test Project'})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant.id, number: 1, title: 'Epic 1'})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant.id, number: '1.1', title: 'Story 1.1', agent_status: :implementing})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant.id, number: '1.2', title: 'Story 1.2', agent_status: :pending})",
+        "fixture(:story_dependency, %{story_id: story_1_2.id, depends_on_story_id: story_1_1.id, tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "JSON includes project name 'Test Project'",
+        "JSON includes 1 epic with number=1",
+        "Epic contains 2 stories ordered by number",
+        "Story 1.1 includes agent_status='implementing'",
+        "story_dependencies includes {story: '1.2', depends_on: '1.1'}",
+        "export_metadata includes exported_at and loopctl_version"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.2",
+      "name": "round-trip fidelity — export then import",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id}) with 2 epics, 5 stories, 3 dependencies",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Target Project'})"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:source_id/export",
+        "POST /api/v1/projects/:target_id/import with the export response body"
+      ],
+      "expected_results": [
+        "Import succeeds with 201",
+        "Target project has the same number of epics, stories, and dependencies as source",
+        "Story numbers, titles, and descriptions match between source and target",
+        "Dependencies are correctly recreated in the target project"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.3",
+      "name": "export includes all story fields",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :reported_done, verified_status: :rejected, rejection_reason: 'Missing tests', metadata: %{priority: 'high'}})"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export"
+      ],
+      "expected_results": [
+        "Story in export includes agent_status='reported_done'",
+        "Story includes verified_status='rejected'",
+        "Story includes rejection_reason='Missing tests'",
+        "Story includes metadata with priority='high'",
+        "Story includes timestamp fields (assigned_at, reported_done_at, rejected_at)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.4",
+      "name": "tenant isolation on export",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant_b.id})"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<tenant_b_project_id>/export with Tenant A's API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.5",
+      "name": "agent role can export",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "fixture(:project, %{tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export with agent API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns the project export JSON"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.6",
+      "name": "export with no epics or stories returns valid empty structure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id}) — no epics or stories"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "epics is an empty array []",
+        "story_dependencies is an empty array []",
+        "export_metadata is present"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.2.7",
+      "name": "export ordering is deterministic",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id}) with 3 epics and multiple stories"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:id/export (first call)",
+        "GET /api/v1/projects/:id/export (second call)"
+      ],
+      "expected_results": [
+        "Both responses produce identical JSON (same ordering of epics, stories, dependencies)",
+        "Epics are ordered by number ascending",
+        "Stories within each epic are ordered by number ascending"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create Loopctl.Export module with export_project/1 that loads the project with all associations and serializes to the import-compatible JSON format.",
+    "Use Ecto preloads: Repo.preload(project, [epics: [stories: []], epic_dependencies: [], story_dependencies: []]). Order by number.",
+    "Dependencies must be expressed as story numbers (not IDs). Build a story_id -> story_number map from the loaded data and convert dependency edges.",
+    "Export JSON schema: {export_metadata: {...}, project: {name, slug, ...}, epics: [{number, title, ..., stories: [{number, title, ...}]}], story_dependencies: [{story, depends_on}], epic_dependencies: [{epic, depends_on}]}.",
+    "Controller: add export action to ProjectController or create ExportController. Route: GET /api/v1/projects/:id/export.",
+    "The loopctl_version in export_metadata should come from Mix.Project.config()[:version] or an Application config value.",
+    "For large projects (1000+ stories), consider streaming the JSON response or setting appropriate timeouts. For v1, a simple Jason.encode! should suffice.",
+    "Ensure the export format is documented (in the export_metadata or a separate schema doc) so consumers know the structure."
+  ],
+  "dependencies": [
+    "US-6.4"
+  ],
+  "estimated_hours": 4
+}

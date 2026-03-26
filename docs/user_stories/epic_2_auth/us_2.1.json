@@ -1,0 +1,207 @@
+{
+  "id": "US-2.1",
+  "title": "Tenant schema and context with name, slug, email, settings, and status",
+  "epic": {
+    "id": "epic_2",
+    "name": "Tenants & Authentication"
+  },
+  "priority": "high",
+  "phase": "auth",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "implement a Tenant schema with name, slug, email, settings (jsonb), and status enum, along with a Tenants context module providing CRUD operations",
+    "so_that": "the system has an organizational unit for multi-tenant isolation and every downstream entity can be scoped to a tenant"
+  },
+  "rationale": "Tenants are the root of the multi-tenancy hierarchy. Every API key, project, agent, and piece of data belongs to a tenant. The tenant schema must exist before any other tenant-scoped entity can be created. The settings jsonb field provides tenant-level configuration (rate limits, max projects, etc.) that governs system behavior per-tenant without schema migrations.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-2.1.1",
+      "description": "A Loopctl.Tenants.Tenant schema exists with fields: id (binary_id), name (string), slug (string), email (string), settings (map/jsonb), status (enum: active, suspended, deactivated), inserted_at, updated_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.2",
+      "description": "The Tenant schema does NOT use tenant_id (it is the root entity, not tenant-scoped) — uses Loopctl.Schema with tenant_scoped: false",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.3",
+      "description": "The slug field is unique, validated as URL-safe (lowercase alphanumeric + hyphens), between 2-63 characters",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.4",
+      "description": "The email field is validated with a basic email format check",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.5",
+      "description": "The settings field defaults to an empty map %{} and is validated as a map (not a list or scalar)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.6",
+      "description": "The status field defaults to :active on creation",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.7",
+      "description": "A Loopctl.Tenants context module provides: create_tenant/1, get_tenant/1, get_tenant_by_slug/1, update_tenant/2, list_tenants/0 (for superadmin), and suspend_tenant/1, activate_tenant/1",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.8",
+      "description": "A get_tenant_settings/2 function returns a specific setting value with fallback to a default when the key is not set in the tenant's settings",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.9",
+      "description": "The tenants table has a unique index on slug and an index on status",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.1.10",
+      "description": "The tenants table is NOT subject to RLS policies (it has no tenant_id column)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-2.1.1",
+      "name": "Create tenant with valid attributes",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Tenants.create_tenant(%{name: \"Acme Corp\", slug: \"acme-corp\", email: \"admin@acme.com\"})"
+      ],
+      "expected_results": [
+        "Returns {:ok, %Tenant{}} with status :active",
+        "Tenant has a binary UUID id",
+        "settings is an empty map %{}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.2",
+      "name": "Reject duplicate slug",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{slug: \"acme-corp\"})"
+      ],
+      "steps": [
+        "Call Tenants.create_tenant(%{name: \"Other Corp\", slug: \"acme-corp\", email: \"other@example.com\"})"
+      ],
+      "expected_results": [
+        "Returns {:error, %Ecto.Changeset{}} with error on slug: \"has already been taken\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.3",
+      "name": "Reject invalid slug format",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Attempt to create a tenant with slug \"INVALID SLUG!\"",
+        "Attempt to create a tenant with slug \"a\" (too short)",
+        "Attempt to create a tenant with slug containing spaces"
+      ],
+      "expected_results": [
+        "All attempts return {:error, %Ecto.Changeset{}} with validation error on slug"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.4",
+      "name": "Get tenant by slug",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{slug: \"test-tenant\"})"
+      ],
+      "steps": [
+        "Call Tenants.get_tenant_by_slug(\"test-tenant\")"
+      ],
+      "expected_results": [
+        "Returns {:ok, %Tenant{slug: \"test-tenant\"}}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.5",
+      "name": "Suspend and activate tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{status: :active}) as tenant"
+      ],
+      "steps": [
+        "Call Tenants.suspend_tenant(tenant)",
+        "Verify status is :suspended",
+        "Call Tenants.activate_tenant(tenant)",
+        "Verify status is :active"
+      ],
+      "expected_results": [
+        "suspend_tenant returns {:ok, %Tenant{status: :suspended}}",
+        "activate_tenant returns {:ok, %Tenant{status: :active}}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.6",
+      "name": "Get tenant settings with fallback",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{\"max_projects\" => 10}}) as tenant"
+      ],
+      "steps": [
+        "Call Tenants.get_tenant_settings(tenant, \"max_projects\", 50)",
+        "Call Tenants.get_tenant_settings(tenant, \"nonexistent_key\", 42)"
+      ],
+      "expected_results": [
+        "First call returns 10 (tenant override)",
+        "Second call returns 42 (fallback default)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.7",
+      "name": "Reject invalid email format",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Tenants.create_tenant(%{name: \"Test\", slug: \"test\", email: \"not-an-email\"})"
+      ],
+      "expected_results": [
+        "Returns {:error, %Ecto.Changeset{}} with validation error on email"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.1.8",
+      "name": "Update tenant settings",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{}}) as tenant"
+      ],
+      "steps": [
+        "Call Tenants.update_tenant(tenant, %{settings: %{\"rate_limit_requests_per_minute\" => 500}})"
+      ],
+      "expected_results": [
+        "Returns {:ok, %Tenant{}} with updated settings",
+        "Settings now contain the rate_limit_requests_per_minute key with value 500"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Tenant status enum: Ecto.Enum with values [:active, :suspended, :deactivated]",
+    "Slug validation regex: ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/ (starts and ends with alphanumeric)",
+    "Settings field should use :map type in Ecto schema, stored as jsonb in PostgreSQL",
+    "Default settings values from PRD section 5.3: max_concurrent_agents: 10, max_projects: 50, etc.",
+    "The tenants table should NOT have RLS enabled since it is the root entity and needs to be queryable by the auth pipeline before tenant context is set"
+  ],
+  "dependencies": [
+    "US-1.2",
+    "US-1.3"
+  ],
+  "estimated_hours": 4
+}

@@ -1,0 +1,252 @@
+{
+  "id": "US-3.1",
+  "title": "Immutable Audit Log",
+  "epic": {
+    "id": "epic_3",
+    "name": "Audit & Change Feed"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "have every mutation recorded in an immutable, append-only audit log with full before/after state snapshots",
+    "so_that": "there is a tamper-proof record of who changed what and when, enabling forensic investigation and compliance auditing"
+  },
+  "rationale": "In an agent-driven system where AI agents self-report progress, an immutable audit trail is critical for trust and accountability. Without it, there is no way to reconstruct what actually happened or detect discrepancies between claimed and actual work. The audit log also serves as the foundation for the change feed (US-3.2) and story history (US-3.3) features.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-3.1.1",
+      "description": "An audit_log table exists with columns: id (uuid PK), tenant_id (uuid FK, nullable for superadmin), entity_type (string), entity_id (uuid), action (string), actor_type (string), actor_id (uuid), actor_label (string), old_state (jsonb), new_state (jsonb), metadata (jsonb), inserted_at (utc_datetime). No updated_at column.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.2",
+      "description": "The audit_log table has NO UPDATE or DELETE RLS policies — only INSERT and SELECT. A database-level trigger or rule prevents UPDATE and DELETE operations on the table entirely.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.3",
+      "description": "An Audit context module (Loopctl.Audit) provides a create_log_entry/1 function that inserts a new audit log entry. No update or delete functions exist in the module.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.4",
+      "description": "Every mutation across tenant-scoped entities (projects, epics, stories, agents, artifact_reports, verification_results, orchestrator_state, webhooks, api_keys) records an audit log entry in the same Ecto.Multi transaction as the mutation, capturing entity_type, entity_id, action, actor details, and old_state/new_state.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.5",
+      "description": "GET /api/v1/audit returns paginated audit log entries for the authenticated tenant, supporting filters: entity_type, entity_id, action, actor_type, actor_id, date range (from/to as ISO8601).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.6",
+      "description": "The audit endpoint requires role user or higher (user, orchestrator with read). Agent role keys cannot access the audit endpoint directly.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.7",
+      "description": "Audit log entries are tenant-scoped via RLS. A tenant can only read their own audit log entries. Entries with tenant_id=NULL are only visible to superadmin.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.8",
+      "description": "The old_state field captures the entity's state before the mutation (NULL for create actions). The new_state field captures the entity's state after the mutation (NULL for delete actions).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.9",
+      "description": "Audit log entries include a composite index on (tenant_id, entity_type, entity_id) and an index on (tenant_id, inserted_at) for efficient querying by entity and date range.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.10",
+      "description": "The Ecto schema for audit_log has no changeset function that allows updates. The schema module only exposes a create_changeset/1 function.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-3.1.1",
+      "name": "audit log entry created on story status change",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant.id})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with agent API key",
+        "Query audit_log for entity_type='story', entity_id=story.id"
+      ],
+      "expected_results": [
+        "Audit log entry exists with action='status_changed'",
+        "old_state contains agent_status='pending'",
+        "new_state contains agent_status='assigned'",
+        "actor_type is 'api_key'",
+        "actor_id matches the API key ID",
+        "tenant_id matches the tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.2",
+      "name": "audit log is append-only — updates rejected",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:audit_log_entry, %{tenant_id: tenant.id, entity_type: 'project', action: 'created'})"
+      ],
+      "steps": [
+        "Attempt to update the audit log entry via Ecto.Repo.update",
+        "Attempt to delete the audit log entry via Ecto.Repo.delete"
+      ],
+      "expected_results": [
+        "Update operation raises an error or is rejected by database rule",
+        "Delete operation raises an error or is rejected by database rule",
+        "Original entry remains unchanged in the database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.3",
+      "name": "GET /audit returns filtered audit entries",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "Multiple audit log entries with different entity_types and actions"
+      ],
+      "steps": [
+        "GET /api/v1/audit?entity_type=story&action=status_changed with user API key",
+        "GET /api/v1/audit?from=2026-01-01T00:00:00Z&to=2026-12-31T23:59:59Z",
+        "GET /api/v1/audit?entity_id=<specific_entity_id>"
+      ],
+      "expected_results": [
+        "Response returns only entries matching entity_type=story AND action=status_changed",
+        "Date range filter returns only entries within the specified range",
+        "entity_id filter returns only entries for that specific entity",
+        "All responses return 200 with JSON array of audit entries"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.4",
+      "name": "tenant isolation — cannot read other tenant's audit log",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})",
+        "Audit log entries exist for both tenants"
+      ],
+      "steps": [
+        "GET /api/v1/audit with Tenant A's API key",
+        "GET /api/v1/audit with Tenant B's API key"
+      ],
+      "expected_results": [
+        "Tenant A sees only Tenant A's audit entries",
+        "Tenant B sees only Tenant B's audit entries",
+        "Neither tenant sees the other's entries"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.5",
+      "name": "audit log captures old_state and new_state correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Original Name'})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "PATCH /api/v1/projects/:id with {name: 'Updated Name'} using user API key",
+        "Query audit_log for entity_type='project', entity_id=project.id, action='updated'"
+      ],
+      "expected_results": [
+        "old_state includes name='Original Name'",
+        "new_state includes name='Updated Name'",
+        "Both old_state and new_state are valid JSON objects"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.6",
+      "name": "audit log entry created for entity creation with null old_state",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/projects with valid project data using user API key",
+        "Query audit_log for entity_type='project', action='created'"
+      ],
+      "expected_results": [
+        "Audit log entry exists with action='created'",
+        "old_state is NULL",
+        "new_state contains the created project's data",
+        "inserted_at is set to current time"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.7",
+      "name": "agent role cannot access audit endpoint",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "GET /api/v1/audit with agent API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden",
+        "Error message indicates insufficient permissions"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.1.8",
+      "name": "audit log pagination",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "25 audit log entries exist for the tenant"
+      ],
+      "steps": [
+        "GET /api/v1/audit?page=1&page_size=10",
+        "GET /api/v1/audit?page=2&page_size=10",
+        "GET /api/v1/audit?page=3&page_size=10"
+      ],
+      "expected_results": [
+        "Page 1 returns 10 entries",
+        "Page 2 returns 10 entries",
+        "Page 3 returns 5 entries",
+        "Entries are ordered by inserted_at descending (most recent first)",
+        "Response includes pagination metadata (total, page, page_size)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create migration with audit_log table — no updated_at column. Add database-level rules (CREATE RULE or trigger) to prevent UPDATE and DELETE.",
+    "RLS policies: INSERT allowed for all authenticated roles, SELECT restricted by tenant_id. No UPDATE or DELETE policies.",
+    "Add composite index on (tenant_id, entity_type, entity_id) and index on (tenant_id, inserted_at) for query performance.",
+    "Loopctl.Audit context module: create_log_entry/1, list_entries/2 (with filters), get_entry!/1. No update/delete functions.",
+    "AuditLog schema: create_changeset/1 only. No update changeset.",
+    "Helper function Loopctl.Audit.log_in_multi/3 to add an audit log insert step to any Ecto.Multi pipeline.",
+    "Controller: AuditController with index action. Filters parsed from query params: entity_type, entity_id, action, actor_type, actor_id, from, to.",
+    "Route: GET /api/v1/audit, guarded by RequireRole plug for :user role minimum."
+  ],
+  "dependencies": [
+    "US-1.2"
+  ],
+  "estimated_hours": 6
+}

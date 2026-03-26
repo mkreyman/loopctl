@@ -1,0 +1,247 @@
+{
+  "id": "US-8.1",
+  "title": "Artifact Report Submission and Listing",
+  "epic": {
+    "id": "epic_8",
+    "name": "Artifacts & Verification"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI implementation agent",
+    "i_want_to": "submit artifact reports for stories I have implemented and list all artifact reports for a story",
+    "so_that": "the orchestrator has a structured inventory of what was produced and can verify each artifact independently"
+  },
+  "rationale": "Artifact reports are the evidence trail that connects agent claims to tangible deliverables. Without them, an orchestrator has no structured way to check whether a story actually produced the required files, migrations, tests, and routes. The free-form artifact_type field provides maximum flexibility for different tech stacks and project conventions. Both agents and orchestrators can submit artifact reports, since orchestrators may discover artifacts during verification that agents missed.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-8.1.1",
+      "description": "POST /api/v1/stories/:id/artifacts with an agent or orchestrator role API key creates an artifact_report record. Request body must include artifact_type (string) and path (string). Optional fields: exists (boolean, defaults to true) and details (jsonb).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.2",
+      "description": "The artifact_report record stores: tenant_id, story_id, reported_by (enum: 'agent' or 'orchestrator', derived from API key role), reporter_agent_id (resolved from API key's agent_id), artifact_type, path, exists, details, and inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.3",
+      "description": "GET /api/v1/stories/:id/artifacts returns a list of all artifact_reports for the story, ordered by inserted_at ascending. Available to agent, orchestrator, and user roles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.4",
+      "description": "The artifact_type field is free-form string, not an enum. Common values include 'commit_diff', 'migration', 'schema', 'context', 'live_view', 'test', 'route', 'config', 'seed', but any string is accepted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.5",
+      "description": "POST /api/v1/stories/:id/artifacts returns 422 if artifact_type or path is missing or blank.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.6",
+      "description": "POST /api/v1/stories/:id/artifacts returns 403 if called with a user-role API key. Only agent and orchestrator roles can submit artifacts.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.7",
+      "description": "All endpoints enforce tenant isolation: artifact reports are scoped to tenant_id via RLS. Cross-tenant requests return 404 for the story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.8",
+      "description": "Multiple artifact reports can be submitted for the same story. There is no uniqueness constraint on artifact_type + path per story (agents may re-report after corrections).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.9",
+      "description": "Creating an artifact report generates an audit_log entry with entity_type='artifact_report', action='created', and the artifact details in new_state.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.1.10",
+      "description": "The details field accepts arbitrary JSON. If provided, it is stored as-is. If not provided, it defaults to an empty object {}.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-8.1.1",
+      "name": "Agent submits artifact report successfully",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/artifacts with body {artifact_type: 'migration', path: 'priv/repo/migrations/20260326_create_users.exs', exists: true, details: {columns: ['id', 'name', 'email']}}",
+        "Assert response 201 with artifact_report data"
+      ],
+      "expected_results": [
+        "Response includes id, story_id, artifact_type='migration', path, exists=true, details with columns",
+        "reported_by is 'agent'",
+        "reporter_agent_id matches the calling agent",
+        "Audit log entry created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.2",
+      "name": "Orchestrator submits artifact report",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/artifacts with body {artifact_type: 'test', path: 'test/loopctl/accounts_test.exs', exists: true, details: {test_count: 8, all_passing: true}}"
+      ],
+      "expected_results": [
+        "Response 201 with reported_by='orchestrator'",
+        "reporter_agent_id matches the orchestrator agent"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.3",
+      "name": "List artifacts for a story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:artifact_report, %{tenant_id: tenant.id, story_id: story.id, artifact_type: 'migration'})",
+        "fixture(:artifact_report, %{tenant_id: tenant.id, story_id: story.id, artifact_type: 'schema'})",
+        "fixture(:artifact_report, %{tenant_id: tenant.id, story_id: story.id, artifact_type: 'test'})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:id/artifacts"
+      ],
+      "expected_results": [
+        "Response 200 with list of 3 artifact reports",
+        "Reports are ordered by inserted_at ascending",
+        "Each report includes all fields: id, artifact_type, path, exists, details, reported_by, reporter_agent_id, inserted_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.4",
+      "name": "Missing required fields return 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/artifacts with body {artifact_type: 'migration'} (missing path)",
+        "POST /api/v1/stories/:id/artifacts with body {path: 'some/path'} (missing artifact_type)",
+        "POST /api/v1/stories/:id/artifacts with body {artifact_type: '', path: ''} (blank values)"
+      ],
+      "expected_results": [
+        "All three requests return 422 Unprocessable Entity",
+        "Error messages indicate which required field(s) are missing"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.5",
+      "name": "User-role key cannot submit artifacts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/artifacts with user API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden",
+        "No artifact_report created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.6",
+      "name": "Tenant isolation: cross-tenant artifact access returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:story, %{tenant_id: tenant_a.id})",
+        "fixture(:artifact_report, %{tenant_id: tenant_a.id, story_id: story_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent, agent_id: agent_b.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:story_a_id/artifacts with tenant B agent key",
+        "GET /api/v1/stories/:story_a_id/artifacts with tenant B agent key"
+      ],
+      "expected_results": [
+        "Both requests return 404 Not Found",
+        "No artifact_report created in either tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.7",
+      "name": "Multiple artifact reports for same story and type are allowed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/artifacts with {artifact_type: 'test', path: 'test/v1.exs', exists: true}",
+        "POST /api/v1/stories/:id/artifacts with {artifact_type: 'test', path: 'test/v2.exs', exists: true}",
+        "POST /api/v1/stories/:id/artifacts with {artifact_type: 'test', path: 'test/v1.exs', exists: true, details: {updated: true}}",
+        "GET /api/v1/stories/:id/artifacts"
+      ],
+      "expected_results": [
+        "All three POST requests return 201",
+        "GET returns 3 artifact reports (duplicates allowed)",
+        "Reports are ordered chronologically"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.1.8",
+      "name": "Free-form artifact_type accepts any string",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "Create artifact_report with artifact_type='custom_check'",
+        "Create artifact_report with artifact_type='docker_compose'",
+        "Create artifact_report with artifact_type='github_action'"
+      ],
+      "expected_results": [
+        "All three records created successfully",
+        "No validation error on non-standard artifact_type values"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement Loopctl.Artifacts context module with create_artifact_report/2 and list_artifact_reports/2.",
+    "artifact_reports table: id (uuid PK), tenant_id (uuid FK), story_id (uuid FK), reported_by (enum: agent/orchestrator), reporter_agent_id (uuid FK), artifact_type (string), path (string), exists (boolean default true), details (jsonb default {}), inserted_at (utc_datetime).",
+    "RLS policy on artifact_reports: tenant_id = current_setting('app.current_tenant_id')::uuid.",
+    "Controller at LoopctlWeb.ArtifactController with create and index actions, nested under /api/v1/stories/:story_id/.",
+    "The reported_by field is derived from the API key role, not sent by the client. Agent keys set reported_by='agent', orchestrator keys set reported_by='orchestrator'.",
+    "This is an append-only table — no update or delete endpoints for artifact reports."
+  ],
+  "dependencies": [
+    "US-7.1"
+  ],
+  "estimated_hours": 6
+}

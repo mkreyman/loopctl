@@ -1,0 +1,249 @@
+{
+  "id": "US-6.5",
+  "title": "Dependency graph queries: ready stories, blocked stories, and full project graph",
+  "epic": {
+    "id": "epic_6",
+    "name": "Work Breakdown"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "query for stories that are ready to be assigned (all dependencies verified, status pending), stories that are blocked (waiting on unverified dependencies), and the full project dependency graph (all epics and stories with their dependency edges)",
+    "so_that": "I can automatically identify the next assignable work, understand what is blocked and why, and visualize the full project dependency structure for planning"
+  },
+  "rationale": "These are the primary query endpoints that drive orchestrator decision-making. The 'ready' endpoint answers 'what can an agent work on next?' — the most frequently asked question. The 'blocked' endpoint helps diagnose bottlenecks. The full graph endpoint enables orchestrators to plan ahead and optimize agent allocation across parallel work streams. All three must be efficient since orchestrators poll them frequently.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-6.5.1",
+      "description": "GET /api/v1/stories/ready (role: agent+) returns stories where: agent_status = :pending AND (has no dependencies OR all dependency stories have verified_status = :verified)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.2",
+      "description": "The ready endpoint accepts optional query params: project_id (filter to one project), epic_id (filter to one epic)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.3",
+      "description": "GET /api/v1/stories/blocked (role: agent+) returns stories that have at least one dependency with verified_status != :verified, along with the blocking dependency details",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.4",
+      "description": "The blocked endpoint response includes for each story: the story itself and blocking_dependencies array (list of unverified dependency stories with their current agent_status and verified_status)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.5",
+      "description": "GET /api/v1/projects/:id/dependency_graph (role: agent+) returns the full dependency graph: all epics with their stories, epic dependency edges, and story dependency edges",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.6",
+      "description": "The dependency graph response includes: epics (with nested stories and their statuses), epic_dependencies (array of {from, to} edges), story_dependencies (array of {from, to} edges)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.7",
+      "description": "All three endpoints are scoped to the current tenant via RLS and application-level checks",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.8",
+      "description": "The ready and blocked endpoints use efficient SQL queries (JOINs and subqueries) rather than loading all stories and filtering in memory",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.5.9",
+      "description": "The ready endpoint orders results by epic position, then story number, providing a natural priority ordering",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-6.5.1",
+      "name": "Ready stories returns stories with no dependencies",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending}) as story_no_deps",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/ready?project_id=<project.id>"
+      ],
+      "expected_results": [
+        "Response contains story_no_deps (pending with no dependencies = ready)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.2",
+      "name": "Ready stories excludes stories with unverified dependencies",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, verified_status: :unverified}) as dep_story",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending}) as blocked_story",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: blocked_story.id, depends_on_story_id: dep_story.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/ready?project_id=<project.id>"
+      ],
+      "expected_results": [
+        "Response does NOT contain blocked_story",
+        "Response contains dep_story (it has no dependencies itself and is pending)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.3",
+      "name": "Ready stories includes stories whose dependencies are all verified",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, verified_status: :verified}) as verified_dep",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending}) as ready_story",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: ready_story.id, depends_on_story_id: verified_dep.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/ready?project_id=<project.id>"
+      ],
+      "expected_results": [
+        "Response contains ready_story (all deps verified, status pending)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.4",
+      "name": "Ready stories excludes non-pending stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :assigned}) as assigned_story",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing}) as implementing_story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/ready?project_id=<project.id>"
+      ],
+      "expected_results": [
+        "Response does NOT contain assigned_story or implementing_story",
+        "Only pending stories appear in ready results"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.5",
+      "name": "Blocked stories shows blocking dependencies",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing, verified_status: :unverified, number: \"1.1\"}) as blocker",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, number: \"1.2\"}) as blocked",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: blocked.id, depends_on_story_id: blocker.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/blocked?project_id=<project.id>"
+      ],
+      "expected_results": [
+        "Response contains blocked story with blocking_dependencies array",
+        "blocking_dependencies includes blocker story with its current statuses"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.6",
+      "name": "Full dependency graph includes all edges",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1}) as epic_1",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2}) as epic_2",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_2.id, depends_on_epic_id: epic_1.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_1.id}) as story_1",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_2.id}) as story_2",
+        "fixture(:story_dependency, %{tenant_id: tenant.id, story_id: story_2.id, depends_on_story_id: story_1.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/dependency_graph"
+      ],
+      "expected_results": [
+        "Response includes epics array with nested stories",
+        "Response includes epic_dependencies array with the edge",
+        "Response includes story_dependencies array with the edge",
+        "Each story includes its current agent_status and verified_status"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.7",
+      "name": "Ready stories filtered by epic_id",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_1",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_2",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_1.id, agent_status: :pending}) as story_in_1",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_2.id, agent_status: :pending}) as story_in_2",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/stories/ready?epic_id=<epic_1.id>"
+      ],
+      "expected_results": [
+        "Response contains only story_in_1",
+        "story_in_2 is not included (different epic)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.5.8",
+      "name": "Dependency graph is tenant-scoped",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_b.id}) as other_project",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<other_project.id>/dependency_graph with tenant_a's key"
+      ],
+      "expected_results": [
+        "Response status is 404"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Ready stories SQL approach: SELECT stories.* FROM stories LEFT JOIN story_dependencies sd ON sd.story_id = stories.id LEFT JOIN stories dep ON dep.id = sd.depends_on_story_id WHERE stories.agent_status = 'pending' GROUP BY stories.id HAVING COUNT(sd.id) = 0 OR COUNT(CASE WHEN dep.verified_status = 'verified' THEN 1 END) = COUNT(sd.id)",
+    "Alternative: use NOT EXISTS subquery for stories that have any unverified dependency",
+    "Blocked stories: inverse of ready — stories that have at least one dep with verified_status != :verified",
+    "The full graph endpoint may be expensive for large projects; consider caching or lazy loading",
+    "Order ready stories by: epic.position ASC, story.number ASC for natural priority",
+    "The ready endpoint is the most performance-critical query — consider adding database indexes on (agent_status) and (verified_status)",
+    "For the blocked endpoint, include the blocker story's agent_status so the orchestrator knows if it's in progress or still pending"
+  ],
+  "dependencies": [
+    "US-6.4"
+  ],
+  "estimated_hours": 6
+}

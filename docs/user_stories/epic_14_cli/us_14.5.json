@@ -1,0 +1,203 @@
+{
+  "id": "US-14.5",
+  "title": "Status and Progress CLI",
+  "epic": {
+    "id": "epic_14",
+    "name": "CLI (Escript)"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "query project progress, epic progress, story details, ready stories, and blocked stories via the CLI",
+    "so_that": "I can make informed decisions about what work to assign next and identify bottlenecks in the development pipeline"
+  },
+  "rationale": "Status and progress queries are the most frequently used CLI operations for orchestrators and human developers alike. The orchestrator needs to poll for ready stories to assign, check which stories are blocked, and understand overall project progress. These commands translate complex API queries into simple, composable CLI invocations that agents can parse from JSON output and humans can read in table format.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-14.5.1",
+      "description": "'loopctl status --project PROJECT' calls GET /api/v1/projects/:id/progress and displays the project-wide progress summary including total stories, stories by agent_status, stories by verified_status, epic completion counts, and overall verification percentage",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.2",
+      "description": "'loopctl status --epic EPIC_NUM' calls GET /api/v1/epics/:id/progress and displays the epic-level progress with per-story status breakdown",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.3",
+      "description": "'loopctl status STORY_NUM' calls GET /api/v1/stories/:id and displays full story detail including both agent_status and verified_status, assigned agent, timestamps, dependencies, and latest verification result",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.4",
+      "description": "'loopctl next --project PROJECT' calls GET /api/v1/stories/ready?project_id=:id and displays stories that are ready to be claimed (all dependencies verified, agent_status=pending)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.5",
+      "description": "'loopctl blocked --project PROJECT' calls GET /api/v1/stories/blocked?project_id=:id and displays stories that are waiting on unverified dependencies, including which specific dependencies are blocking them",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.6",
+      "description": "All status commands respect the --format flag (json, human, csv)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.7",
+      "description": "The 'next' command in JSON format returns an array of story objects that agents can directly parse and act on",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.8",
+      "description": "Story status command resolves STORY_NUM by matching the story number field (e.g., '14.1') within the project scope, requiring --project if multiple projects exist",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.5.9",
+      "description": "Epic status command resolves EPIC_NUM by matching the epic number field within the project scope, requiring --project if multiple projects exist",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-14.5.1",
+      "name": "Status project displays progress summary",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/projects/:id/progress with {total_stories: 50, agent_status_counts: {pending: 20, assigned: 5, implementing: 10, reported_done: 15}, verified_status_counts: {unverified: 35, verified: 12, rejected: 3}, epics_complete: 2, epics_total: 8}"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StatusCommand.run(['--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes total story count (50)",
+        "Output includes agent status breakdown",
+        "Output includes verified status breakdown",
+        "Output includes epic completion (2/8)",
+        "Output includes verification percentage (24%)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.2",
+      "name": "Status epic displays per-story breakdown",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/epics/:id/progress with epic progress data including per-story statuses"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StatusCommand.run(['--epic', '2', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes the epic title and number",
+        "Output includes each story in the epic with its agent_status and verified_status",
+        "Stories are ordered by story number"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.3",
+      "name": "Status story displays full detail",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/stories/:id with full story data including assigned_agent, dependencies, latest verification"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.StatusCommand.run(['2.1', '--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output includes story number, title, description",
+        "Output includes agent_status and verified_status",
+        "Output includes assigned agent name (if assigned)",
+        "Output includes dependency list with their statuses",
+        "Output includes latest verification result (if any)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.4",
+      "name": "Next command returns ready stories as JSON array",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/stories/ready?project_id=:id with 3 ready stories"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.NextCommand.run(['--project', project_id, '--format', 'json'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output is valid JSON array with 3 story objects",
+        "Each story object includes id, number, title, epic_id",
+        "Stories are ordered by epic position then story number"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.5",
+      "name": "Blocked command shows blocking dependencies",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/stories/blocked?project_id=:id with 2 blocked stories including their blocking dependency details"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.BlockedCommand.run(['--project', project_id, '--format', 'human'], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Output lists 2 blocked stories",
+        "Each blocked story shows which dependencies are not yet verified",
+        "Blocking dependencies show their current agent_status and verified_status"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.6",
+      "name": "Next command with no ready stories returns empty result",
+      "type": "integration",
+      "preconditions": [
+        "Config file exists with valid server and api_key",
+        "Req.Test mock returns 200 for GET /api/v1/stories/ready?project_id=:id with empty array"
+      ],
+      "steps": [
+        "Call Loopctl.CLI.NextCommand.run(['--project', project_id], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "JSON format: output is an empty array []",
+        "Human format: output displays 'No stories are ready for assignment'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-14.5.7",
+      "name": "Status command requires --project flag",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call Loopctl.CLI.StatusCommand.run([], config_path: tmp_path)"
+      ],
+      "expected_results": [
+        "Returns {:error, message} indicating --project, --epic, or story number is required",
+        "No HTTP request is made"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Story number resolution: the CLI takes a human-friendly story number like '2.1' and needs to resolve it to a UUID. This requires querying the stories list filtered by project and number, or using a lookup endpoint",
+    "Epic number resolution: similar to story numbers, take an integer epic number and resolve to UUID via the epics list endpoint filtered by project",
+    "The 'next' command is the primary interface for orchestrator agents to discover assignable work — JSON output must be clean and parseable",
+    "Consider caching the project ID lookup (slug to UUID) within a single command invocation to avoid duplicate requests",
+    "For human format, use box-drawing characters or simple dashes/pipes for table formatting — keep it readable in terminal output",
+    "The blocked command should include enough dependency context that the user can understand what needs to happen to unblock each story"
+  ],
+  "dependencies": [
+    "US-14.1",
+    "US-6.5"
+  ],
+  "estimated_hours": 4
+}

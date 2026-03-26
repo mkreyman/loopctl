@@ -1,0 +1,191 @@
+{
+  "id": "US-3.3",
+  "title": "Story History Shortcut",
+  "epic": {
+    "id": "epic_3",
+    "name": "Audit & Change Feed"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "retrieve the full audit trail for a specific story in a single API call",
+    "so_that": "I can understand the complete lifecycle of a story — every status change, assignment, verification, and rejection — without manually filtering the audit log"
+  },
+  "rationale": "Orchestrators frequently need the full history of a single story to make verification decisions, diagnose stalled work, or understand why a story was rejected. Forcing them to query the generic audit endpoint with entity_type and entity_id filters is cumbersome. A dedicated convenience endpoint reduces API call complexity and makes the most common audit query trivial.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-3.3.1",
+      "description": "GET /api/v1/stories/:id/history returns all audit log entries where entity_type='story' and entity_id=:id, ordered by inserted_at ascending (chronological).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.2",
+      "description": "The response includes full audit entry details: id, action, actor_type, actor_id, actor_label, old_state, new_state, metadata, inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.3",
+      "description": "Returns 404 Not Found if the story ID does not exist or does not belong to the authenticated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.4",
+      "description": "The endpoint is accessible to agent role and above (agent, orchestrator, user).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.5",
+      "description": "Results are tenant-scoped via RLS. A tenant can only view history for their own stories.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.6",
+      "description": "The history also includes audit entries for related entity actions that reference the story (e.g., artifact_report entries where the metadata or entity references this story_id).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.7",
+      "description": "The response is paginated with a default page size of 100. Supports page and page_size query parameters.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.3.8",
+      "description": "The story itself is validated to exist before querying the audit log. If the story exists but has no audit entries, an empty array is returned with 200 OK.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-3.3.1",
+      "name": "returns full chronological history for a story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant.id})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant.id})",
+        "Multiple audit entries for the story: created, status_changed (assigned), status_changed (implementing), status_changed (reported_done), verified"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_id/history with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns all 5 audit entries in chronological order (inserted_at ascending)",
+        "First entry is action='created', last entry is action='verified'",
+        "Each entry includes full audit details (action, actor_label, old_state, new_state, inserted_at)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.3.2",
+      "name": "returns 404 for non-existent story",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/<random_uuid>/history with orchestrator API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "Error message indicates story not found"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.3.3",
+      "name": "tenant isolation — cannot view other tenant's story history",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})",
+        "fixture(:story, %{tenant_id: tenant_b.id})",
+        "Audit entries exist for Tenant B's story"
+      ],
+      "steps": [
+        "GET /api/v1/stories/<tenant_b_story_id>/history with Tenant A's API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found (story not visible to Tenant A due to RLS)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.3.4",
+      "name": "agent role can access story history",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "Audit entries exist for the story"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_id/history with agent API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns the story's audit trail"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.3.5",
+      "name": "empty history for story with no audit entries",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:story, %{tenant_id: tenant.id}) — inserted directly without triggering audit logging"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_id/history with user API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "data is an empty array []"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-3.3.6",
+      "name": "pagination works correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "15 audit log entries exist for the story"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_id/history?page=1&page_size=10",
+        "GET /api/v1/stories/:story_id/history?page=2&page_size=10"
+      ],
+      "expected_results": [
+        "Page 1 returns 10 entries (oldest first)",
+        "Page 2 returns 5 entries",
+        "All entries maintain chronological order across pages",
+        "Response includes pagination metadata"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "This is a convenience endpoint — it queries the same audit_log table as US-3.1 with a pre-applied filter on entity_type='story' and entity_id=:id.",
+    "Route: GET /api/v1/stories/:id/history. Can be added to the existing StoryController or a dedicated StoryHistoryController.",
+    "First validate the story exists (and belongs to the tenant via RLS), then query audit_log. This prevents information leakage about story existence across tenants.",
+    "For related entries (AC-9.3.6), also include audit entries where metadata contains the story_id (e.g., artifact_report and verification_result entries that reference this story). Use a jsonb query or OR clause on entity_id.",
+    "Reuses Loopctl.Audit.list_entries/2 with pre-set filters, or add a dedicated Audit.story_history/2 function.",
+    "Ordering is ascending (chronological) — opposite of the main audit endpoint which is descending (most recent first). This makes the history read like a timeline."
+  ],
+  "dependencies": [
+    "US-3.1",
+    "US-6.2"
+  ],
+  "estimated_hours": 2
+}

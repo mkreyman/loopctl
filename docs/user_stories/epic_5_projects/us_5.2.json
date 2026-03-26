@@ -1,0 +1,207 @@
+{
+  "id": "US-5.2",
+  "title": "Project progress summary with stories by status and verification percentage",
+  "epic": {
+    "id": "epic_5",
+    "name": "Projects"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "query a project's progress summary showing story counts by agent_status and verified_status, epic completion ratios, and overall verification percentage",
+    "so_that": "I can make informed decisions about what work remains, which epics are complete, and how far the project is from full verification"
+  },
+  "rationale": "The progress summary is the primary dashboard endpoint for orchestrators. It provides a single-request overview of the entire project's state without needing to fetch and aggregate individual stories. The verification percentage (stories verified / total stories) is the key metric for determining project completion. Epic-level rollups help orchestrators prioritize which epic to focus on next.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-5.2.1",
+      "description": "GET /api/v1/projects/:id/progress (role: agent+) returns a progress summary JSON object",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.2",
+      "description": "The response includes stories_by_agent_status: {pending: N, assigned: N, implementing: N, reported_done: N}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.3",
+      "description": "The response includes stories_by_verified_status: {unverified: N, verified: N, rejected: N}",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.4",
+      "description": "The response includes total_stories and total_epics counts",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.5",
+      "description": "The response includes verification_percentage: a float (0.0 to 100.0) representing (verified stories / total stories * 100), rounded to 1 decimal",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.6",
+      "description": "The response includes epics_completed: count of epics where ALL stories have verified_status = :verified",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.7",
+      "description": "The response includes estimated_hours_total and estimated_hours_completed (sum of estimated_hours for verified stories)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.8",
+      "description": "The endpoint returns 404 if the project does not exist or belongs to another tenant",
+      "status": "pending"
+    },
+    {
+      "id": "AC-5.2.9",
+      "description": "The query is efficient — uses aggregate SQL (GROUP BY, COUNT) rather than loading all stories into memory",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-5.2.1",
+      "name": "Progress summary with mixed statuses",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, verified_status: :unverified})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing, verified_status: :unverified})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :reported_done, verified_status: :verified, estimated_hours: 4})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/progress with Authorization: Bearer <raw_key>"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "stories_by_agent_status.pending = 1",
+        "stories_by_agent_status.implementing = 1",
+        "stories_by_agent_status.reported_done = 1",
+        "stories_by_verified_status.unverified = 2",
+        "stories_by_verified_status.verified = 1",
+        "total_stories = 3",
+        "verification_percentage = 33.3",
+        "estimated_hours_completed = 4"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.2.2",
+      "name": "Progress summary for empty project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/progress"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "total_stories = 0",
+        "total_epics = 0",
+        "verification_percentage = 0.0",
+        "All status counts are 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.2.3",
+      "name": "Progress summary counts completed epics correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a (all stories verified)",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_a.id, verified_status: :verified})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b (has unverified stories)",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_b.id, verified_status: :unverified})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/progress"
+      ],
+      "expected_results": [
+        "total_epics = 2",
+        "epics_completed = 1 (only epic_a where all stories are verified)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.2.4",
+      "name": "Progress summary scoped to current tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:project, %{tenant_id: tenant_b.id}) as other_project",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<other_project.id>/progress with tenant_a's key"
+      ],
+      "expected_results": [
+        "Response status is 404 (cannot access another tenant's project)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.2.5",
+      "name": "Progress summary for fully verified project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, verified_status: :verified, estimated_hours: 3})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, verified_status: :verified, estimated_hours: 5})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/<project.id>/progress"
+      ],
+      "expected_results": [
+        "verification_percentage = 100.0",
+        "epics_completed = 1",
+        "estimated_hours_total = 8",
+        "estimated_hours_completed = 8"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-5.2.6",
+      "name": "Progress summary returns 404 for nonexistent project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/00000000-0000-0000-0000-000000000000/progress"
+      ],
+      "expected_results": [
+        "Response status is 404"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use aggregate SQL queries for efficiency: SELECT agent_status, COUNT(*) FROM stories WHERE epic_id IN (SELECT id FROM epics WHERE project_id = ?) GROUP BY agent_status",
+    "Epic completion check: an epic is complete when it has at least one story AND all its stories have verified_status = :verified",
+    "Handle division by zero for verification_percentage when total_stories = 0 (return 0.0)",
+    "Consider caching this endpoint since it involves multiple aggregation queries — or use a single complex SQL query with CTEs",
+    "This story depends on US-7.1 (Story schema) being available, since it aggregates story data. If implementing before US-7.1, the context function can be written with the expected schema and tested once stories exist.",
+    "The Loopctl.Projects context should have a get_project_progress/1 function that returns a map of all progress data"
+  ],
+  "dependencies": [
+    "US-5.1",
+    "US-7.1"
+  ],
+  "estimated_hours": 3
+}

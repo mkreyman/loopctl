@@ -1,0 +1,247 @@
+{
+  "id": "US-10.2",
+  "title": "Webhook Event Generation",
+  "epic": {
+    "id": "epic_10",
+    "name": "Webhooks"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "have webhook_event records created automatically in the same database transaction as the state change that triggers them",
+    "so_that": "no events are lost due to process crashes between the state change and event creation, ensuring exactly-once event generation"
+  },
+  "rationale": "Webhook reliability depends on event generation being atomic with the state change. If events are created after the transaction commits (e.g., via a GenServer or async process), a crash between the commit and event creation silently drops the event. By creating webhook_event records inside the same Ecto.Multi transaction, we guarantee that if the state change is persisted, the event is too. Delivery is then handled asynchronously by Oban (US-10.3).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-10.2.1",
+      "description": "A webhook_events table exists with columns: id (uuid PK), tenant_id (uuid FK), webhook_id (uuid FK), event_type (string), payload (jsonb), status (enum: pending, delivered, failed, exhausted), attempts (integer, default 0), last_attempt_at (utc_datetime, nullable), delivered_at (utc_datetime, nullable), error (text, nullable), inserted_at (utc_datetime). RLS scoped by tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.2",
+      "description": "When a story's agent_status changes, a webhook_event with event_type='story.status_changed' is created in the SAME Ecto.Multi transaction for every active webhook subscription that includes this event type and matches the project scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.3",
+      "description": "When a story's verified_status changes to 'verified', a webhook_event with event_type='story.verified' is created transactionally.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.4",
+      "description": "When a story's verified_status changes to 'rejected', a webhook_event with event_type='story.rejected' is created transactionally. If auto-reset triggers, a 'story.auto_reset' event is also created.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.5",
+      "description": "When all stories in an epic reach verified_status='verified', a webhook_event with event_type='epic.completed' is created.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.6",
+      "description": "When a new artifact report is submitted, a webhook_event with event_type='artifact.reported' is created transactionally.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.7",
+      "description": "When a new agent self-registers, a webhook_event with event_type='agent.registered' is created transactionally.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.8",
+      "description": "When a bulk import completes, a webhook_event with event_type='project.imported' is created transactionally.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.9",
+      "description": "Event payloads include relevant data: event_type, entity identifiers, old/new values, actor information, and a timestamp. Payload structure is consistent and documented.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.2.10",
+      "description": "Webhook events are only created for active webhooks (active=true) whose events list includes the event type and whose project_id filter matches (NULL matches all projects).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-10.2.1",
+      "name": "story status change creates webhook events transactionally",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant.id})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.status_changed'], active: true})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with agent API key",
+        "Query webhook_events for webhook_id and event_type='story.status_changed'"
+      ],
+      "expected_results": [
+        "Story agent_status is now 'assigned'",
+        "A webhook_event record exists with status='pending'",
+        "Event payload includes story_id, old_status='pending', new_status='assigned', agent_id",
+        "Both the story update and webhook_event insert are in the same transaction (if story update fails, no event exists)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.2",
+      "name": "story verification creates story.verified event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.verified'], active: true})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with orchestrator API key and verification result"
+      ],
+      "expected_results": [
+        "webhook_event created with event_type='story.verified'",
+        "Payload includes story_id, orchestrator_id, verification summary"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.3",
+      "name": "story rejection creates both rejected and auto_reset events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{auto_reset_on_rejection: true}})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.rejected', 'story.auto_reset'], active: true})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with orchestrator API key, reason, and findings"
+      ],
+      "expected_results": [
+        "Two webhook_events created: one with event_type='story.rejected', one with event_type='story.auto_reset'",
+        "story.rejected payload includes story_id, orchestrator_id, reason, findings",
+        "story.auto_reset payload includes story_id and reason='rejected'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.4",
+      "name": "inactive webhooks do not receive events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.status_changed'], active: false})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with agent API key",
+        "Query webhook_events for the inactive webhook"
+      ],
+      "expected_results": [
+        "No webhook_event records exist for the inactive webhook"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.5",
+      "name": "project-scoped webhook only receives events for that project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Project A'})",
+        "fixture(:project, %{tenant_id: tenant.id, name: 'Project B'})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.status_changed'], project_id: project_a.id, active: true})",
+        "fixture(:story, %{tenant_id: tenant.id, epic belonging to project_a})",
+        "fixture(:story, %{tenant_id: tenant.id, epic belonging to project_b})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:project_a_story_id/claim",
+        "POST /api/v1/stories/:project_b_story_id/claim"
+      ],
+      "expected_results": [
+        "webhook_event exists for the Project A story",
+        "No webhook_event exists for the Project B story"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.6",
+      "name": "webhook with unsubscribed event type does not receive events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.verified'], active: true})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim (triggers story.status_changed event)"
+      ],
+      "expected_results": [
+        "No webhook_event created (webhook subscribes to story.verified, not story.status_changed)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.7",
+      "name": "multiple webhooks receive the same event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://a.example.com', events: ['story.status_changed'], active: true})",
+        "fixture(:webhook, %{tenant_id: tenant.id, url: 'https://b.example.com', events: ['story.status_changed'], active: true})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim"
+      ],
+      "expected_results": [
+        "Two webhook_event records created, one for each webhook",
+        "Both have event_type='story.status_changed' and status='pending'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-10.2.8",
+      "name": "event generation is atomic with state change",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.status_changed'], active: true})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :pending})"
+      ],
+      "steps": [
+        "Execute the Ecto.Multi that claims a story but force a rollback (e.g., by adding a failing step after the webhook event insert)",
+        "Query both stories and webhook_events tables"
+      ],
+      "expected_results": [
+        "Story agent_status is still 'pending' (unchanged)",
+        "No webhook_event records exist (rolled back with the transaction)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create migration for webhook_events table with RLS policies (INSERT, SELECT scoped by tenant_id).",
+    "Create a Loopctl.Webhooks.EventGenerator module with a generate_events/3 function that accepts (multi, event_type, payload) and appends webhook_event inserts to the Ecto.Multi.",
+    "The generator must query active webhooks matching the event_type and project scope, then insert one webhook_event per matching webhook.",
+    "Integrate EventGenerator.generate_events into every Ecto.Multi pipeline that produces auditable state changes: Stories context (claim, start, report, verify, reject), Artifacts context, Agents context (register), Import context.",
+    "After the transaction commits, enqueue Oban jobs for each pending webhook_event. This can be done via an Ecto.Multi after-commit callback or an Oban insert_all in the multi (Oban jobs are transactional when inserted in the same multi).",
+    "Payload schema examples: story.status_changed: {event: 'story.status_changed', story_id, project_id, epic_id, old_status, new_status, agent_id, timestamp}.",
+    "The epic.completed event requires checking if all stories in the epic are verified after each story verification. This check runs inside the verify transaction.",
+    "Consider a helper function that wraps the common pattern: update entity + create audit log + generate webhook events, all in one Ecto.Multi."
+  ],
+  "dependencies": [
+    "US-10.1",
+    "US-3.1"
+  ],
+  "estimated_hours": 6
+}

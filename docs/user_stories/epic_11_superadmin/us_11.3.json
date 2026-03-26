@@ -1,0 +1,182 @@
+{
+  "id": "US-11.3",
+  "title": "System-Wide Stats",
+  "epic": {
+    "id": "epic_11",
+    "name": "Superadmin"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "view system-wide aggregate statistics across all tenants in a single API call",
+    "so_that": "I can monitor platform health, understand usage patterns, and identify capacity needs without querying each tenant individually"
+  },
+  "rationale": "Platform operators need a bird's-eye view of system usage for capacity planning, monitoring, and business metrics. Querying each tenant individually is impractical at scale. A single aggregate stats endpoint provides immediate visibility into total tenants, projects, stories, agents, and story status distribution across the entire platform.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-11.3.1",
+      "description": "GET /api/v1/admin/stats returns a JSON object with system-wide aggregate statistics. Requires superadmin API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.2",
+      "description": "The response includes total counts: total_tenants, total_projects, total_stories, total_epics, total_agents, total_api_keys.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.3",
+      "description": "The response includes tenant status breakdown: tenants_active, tenants_suspended, tenants_deactivated.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.4",
+      "description": "The response includes story status aggregates: stories_by_agent_status (pending, assigned, implementing, reported_done counts) and stories_by_verified_status (unverified, verified, rejected counts).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.5",
+      "description": "The response includes active_stories count (stories with agent_status='implementing').",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.6",
+      "description": "The response includes active_agents count (agents with status='active' and last_seen_at within the last 24 hours).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.7",
+      "description": "The stats query bypasses RLS to aggregate across all tenants. This is inherent to superadmin's NULL tenant_id context.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.3.8",
+      "description": "Non-superadmin keys receive 403 Forbidden.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-11.3.1",
+      "name": "stats returns correct aggregate counts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Tenant A', status: :active})",
+        "fixture(:tenant, %{name: 'Tenant B', status: :active})",
+        "fixture(:tenant, %{name: 'Tenant C', status: :suspended})",
+        "fixture(:project, %{tenant_id: tenant_a.id})",
+        "fixture(:project, %{tenant_id: tenant_b.id})",
+        "fixture(:epic, %{tenant_id: tenant_a.id, project_id: project_a.id})",
+        "fixture(:story, %{tenant_id: tenant_a.id, epic_id: epic.id, agent_status: :pending})",
+        "fixture(:story, %{tenant_id: tenant_a.id, epic_id: epic.id, agent_status: :implementing})",
+        "fixture(:agent, %{tenant_id: tenant_a.id, status: :active})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/stats with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "total_tenants is 3",
+        "tenants_active is 2, tenants_suspended is 1",
+        "total_projects is 2",
+        "total_stories is 2",
+        "active_stories is 1 (implementing)",
+        "stories_by_agent_status.pending is 1, stories_by_agent_status.implementing is 1",
+        "total_agents is 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.3.2",
+      "name": "non-superadmin cannot access stats",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/stats with user API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.3.3",
+      "name": "stories_by_verified_status breakdown is correct",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{})",
+        "fixture(:epic, %{tenant_id: tenant.id})",
+        "fixture(:story, %{tenant_id: tenant.id, verified_status: :unverified})",
+        "fixture(:story, %{tenant_id: tenant.id, verified_status: :verified})",
+        "fixture(:story, %{tenant_id: tenant.id, verified_status: :verified})",
+        "fixture(:story, %{tenant_id: tenant.id, verified_status: :rejected})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/stats with superadmin API key"
+      ],
+      "expected_results": [
+        "stories_by_verified_status.unverified is 1",
+        "stories_by_verified_status.verified is 2",
+        "stories_by_verified_status.rejected is 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.3.4",
+      "name": "active_agents counts only recently seen agents",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{})",
+        "fixture(:agent, %{tenant_id: tenant.id, status: :active, last_seen_at: DateTime.utc_now()})",
+        "fixture(:agent, %{tenant_id: tenant.id, status: :active, last_seen_at: DateTime.add(DateTime.utc_now(), -48 * 3600, :second)})"
+      ],
+      "steps": [
+        "GET /api/v1/admin/stats with superadmin API key"
+      ],
+      "expected_results": [
+        "total_agents is 2",
+        "active_agents is 1 (only the agent seen within last 24 hours)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.3.5",
+      "name": "stats with empty system",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "No tenants, projects, stories, or agents exist"
+      ],
+      "steps": [
+        "GET /api/v1/admin/stats with superadmin API key"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "All counts are 0",
+        "stories_by_agent_status has all statuses at 0",
+        "stories_by_verified_status has all statuses at 0"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create AdminStatsController with show action. Route: GET /api/v1/admin/stats.",
+    "Use a single optimized query or a few targeted queries to gather all stats. Avoid N+1 by not iterating tenants.",
+    "Example SQL pattern: SELECT count(*) as total, count(*) FILTER (WHERE status = 'active') as active FROM tenants.",
+    "For cross-tenant queries, the superadmin's NULL tenant_id means RLS policies with tenant_id checks will not restrict the query. Ensure RLS policies allow NULL tenant_id superadmin to SELECT across all rows, or bypass RLS for superadmin connections.",
+    "Story status aggregates can use GROUP BY with count: SELECT agent_status, count(*) FROM stories GROUP BY agent_status.",
+    "active_agents query: WHERE status = 'active' AND last_seen_at > NOW() - INTERVAL '24 hours'.",
+    "Response is a flat JSON object (not paginated) since it's a single aggregate record.",
+    "Consider caching stats for a short TTL (e.g., 60 seconds) if the queries become expensive at scale."
+  ],
+  "dependencies": [
+    "US-11.1"
+  ],
+  "estimated_hours": 3
+}

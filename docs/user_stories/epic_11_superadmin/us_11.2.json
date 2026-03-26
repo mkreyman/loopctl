@@ -1,0 +1,213 @@
+{
+  "id": "US-11.2",
+  "title": "Superadmin Impersonation",
+  "epic": {
+    "id": "epic_11",
+    "name": "Superadmin"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "execute any API request as if I were a specific tenant by adding an X-Impersonate-Tenant header to my superadmin-authenticated request",
+    "so_that": "I can debug tenant-specific issues, verify their data, and perform administrative actions on their behalf without needing to know their API key"
+  },
+  "rationale": "When investigating tenant issues (missing data, broken webhooks, permission problems), the superadmin needs to see exactly what the tenant sees. Impersonation sets the RLS context to the target tenant, making every query and mutation behave as if the tenant themselves made the request. This is vastly more useful than read-only cross-tenant access because it allows the superadmin to fix issues directly. All impersonated actions are logged with superadmin attribution for accountability.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-11.2.1",
+      "description": "When a request includes a valid superadmin API key AND an X-Impersonate-Tenant header with a valid tenant ID, the auth pipeline sets the RLS context to the impersonated tenant. All subsequent query scoping uses the impersonated tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.2",
+      "description": "The X-Impersonate-Tenant header is ONLY honored when the authenticated API key has role=superadmin. For any other role, the header is silently ignored (not an error).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.3",
+      "description": "All mutations performed during impersonation are recorded in the audit log with actor_type='superadmin', actor_id=superadmin_api_key_id, actor_label='superadmin:impersonating:<tenant_slug>', and the impersonated tenant_id as the audit entry's tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.4",
+      "description": "Impersonation works with ALL tenant-scoped endpoints: projects, epics, stories, agents, webhooks, api_keys, orchestrator state, audit, change feed.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.5",
+      "description": "The impersonated request operates with the superadmin's effective role capabilities. The superadmin can perform any action that any role could perform (user, orchestrator, or agent actions).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.6",
+      "description": "If X-Impersonate-Tenant references a non-existent tenant ID, the request returns 404 with error 'Tenant not found'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.7",
+      "description": "Impersonation works with suspended tenants — the superadmin can impersonate a suspended tenant to inspect or fix their data. The tenant suspension check is bypassed during impersonation.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.8",
+      "description": "The conn.assigns includes both the original superadmin context and the impersonated tenant context, so controllers can distinguish impersonated requests from direct tenant requests.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-11.2.9",
+      "description": "Impersonation metadata (impersonated_by, impersonated_at) is included in the audit log entry's metadata jsonb field.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-11.2.1",
+      "name": "impersonation sets RLS to target tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Target Tenant'})",
+        "fixture(:project, %{tenant_id: target_tenant.id, name: 'Tenant Project'})"
+      ],
+      "steps": [
+        "GET /api/v1/projects with superadmin API key and X-Impersonate-Tenant: target_tenant.id"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns the target tenant's project ('Tenant Project')",
+        "Does not return projects from other tenants"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.2",
+      "name": "impersonation mutations logged with superadmin attribution",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Target Tenant'})"
+      ],
+      "steps": [
+        "POST /api/v1/projects with superadmin API key, X-Impersonate-Tenant: target_tenant.id, and valid project body"
+      ],
+      "expected_results": [
+        "Project is created with tenant_id=target_tenant.id",
+        "Audit log entry has actor_type='superadmin'",
+        "Audit log entry has tenant_id=target_tenant.id",
+        "Audit log entry actor_label contains 'impersonating'",
+        "Audit log entry metadata includes impersonated_by and impersonated_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.3",
+      "name": "non-superadmin impersonation header is ignored",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant_b.id})"
+      ],
+      "steps": [
+        "GET /api/v1/projects with Tenant A's user API key and X-Impersonate-Tenant: tenant_b.id"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Returns only Tenant A's projects (not Tenant B's)",
+        "Header is silently ignored — no error"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.4",
+      "name": "impersonation with non-existent tenant returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})"
+      ],
+      "steps": [
+        "GET /api/v1/projects with superadmin API key and X-Impersonate-Tenant: <random_uuid>"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "Error message is 'Tenant not found'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.5",
+      "name": "impersonation works with suspended tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{name: 'Suspended Tenant', status: :suspended})",
+        "fixture(:project, %{tenant_id: suspended_tenant.id})"
+      ],
+      "steps": [
+        "GET /api/v1/projects with superadmin API key and X-Impersonate-Tenant: suspended_tenant.id"
+      ],
+      "expected_results": [
+        "Response is 200 OK (suspension bypass for superadmin impersonation)",
+        "Returns the suspended tenant's projects"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.6",
+      "name": "superadmin can perform agent-level actions via impersonation",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:api_key, %{tenant_id: nil, role: :superadmin})",
+        "fixture(:tenant, %{})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with superadmin API key and X-Impersonate-Tenant: tenant.id"
+      ],
+      "expected_results": [
+        "Response is 200 OK",
+        "Story agent_status is 'assigned'",
+        "Action logged with superadmin attribution"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-11.2.7",
+      "name": "conn.assigns distinguishes impersonated context",
+      "type": "unit",
+      "preconditions": [
+        "Authenticated conn with superadmin API key",
+        "X-Impersonate-Tenant header set to a valid tenant ID"
+      ],
+      "steps": [
+        "Run the impersonation plug on the conn",
+        "Inspect conn.assigns"
+      ],
+      "expected_results": [
+        "conn.assigns.current_tenant is the impersonated tenant",
+        "conn.assigns.impersonating is true",
+        "conn.assigns.superadmin_api_key is the original superadmin API key",
+        "conn.assigns.impersonated_tenant_id is the target tenant ID"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create a new plug: Loopctl.Plugs.Impersonate. This plug runs AFTER authentication and BEFORE role checks.",
+    "Plug logic: if conn.assigns.api_key.role == :superadmin AND X-Impersonate-Tenant header is present, look up the tenant, set RLS context to impersonated tenant, update conn.assigns.",
+    "The RLS SET command must be re-issued with the impersonated tenant_id: SET app.current_tenant_id = 'impersonated_tenant_id'.",
+    "Superadmin effective role during impersonation: the role check plugs should treat superadmin as having all capabilities (user + orchestrator + agent).",
+    "Audit logging integration: modify the audit helper to check conn.assigns.impersonating and include superadmin attribution when true.",
+    "Bypass tenant suspension check: the suspension plug should check if conn.assigns.impersonating is true and skip the check if so.",
+    "Security consideration: impersonation only works with superadmin keys. The header is completely ignored for all other roles — no error, no hint.",
+    "The X-Impersonate-Tenant header accepts a UUID (tenant ID), not a slug, to avoid ambiguity."
+  ],
+  "dependencies": [
+    "US-11.1"
+  ],
+  "estimated_hours": 6
+}

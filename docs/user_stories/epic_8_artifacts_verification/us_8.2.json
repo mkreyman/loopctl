@@ -1,0 +1,224 @@
+{
+  "id": "US-8.2",
+  "title": "Verification Results Recording and Listing",
+  "epic": {
+    "id": "epic_8",
+    "name": "Artifacts & Verification"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "record structured verification results when I verify or reject a story and list the full verification history",
+    "so_that": "there is a detailed, immutable audit trail of every verification attempt including findings, review types, and pass/fail/partial outcomes"
+  },
+  "rationale": "Verification results are the permanent record of the orchestrator's independent assessment. Unlike the verified_status field on a story (which shows only the current state), verification_results capture every assessment over time. This history is critical for understanding why a story was rejected, what was found during review, and how many verification cycles a story went through before passing. The findings jsonb field allows rich structured data (missing files, failing tests, code quality issues) that goes far beyond a simple pass/fail.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-8.2.1",
+      "description": "POST /api/v1/stories/:id/verify (from US-7.2) creates a verification_result record with result='pass', the provided summary, findings (jsonb), and review_type. The orchestrator_agent_id is resolved from the API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.2",
+      "description": "POST /api/v1/stories/:id/reject (from US-7.2) creates a verification_result record with result='fail', the rejection reason as summary, findings (jsonb), and review_type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.3",
+      "description": "Orchestrators can also POST /api/v1/stories/:id/verify with result='partial' for stories that partially meet criteria. This sets verified_status to 'verified' but the verification_result records result='partial' for nuanced tracking.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.4",
+      "description": "GET /api/v1/stories/:id/verifications returns a list of all verification_result records for the story, ordered by inserted_at descending (most recent first). Available to orchestrator and user roles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.5",
+      "description": "Each verification_result record includes: id, tenant_id, story_id, orchestrator_agent_id, result (pass/fail/partial), summary (text), findings (jsonb), review_type (string), and inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.6",
+      "description": "Verification results are immutable — no update or delete endpoints exist. Each verify or reject creates a new record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.7",
+      "description": "GET /api/v1/stories/:id/verifications returns 403 for agent-role API keys. Agents cannot see verification details (only the verified_status on the story).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.8",
+      "description": "All endpoints enforce tenant isolation via RLS. Cross-tenant requests return 404.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.9",
+      "description": "The findings field accepts arbitrary JSON structures. Common patterns include {missing_artifacts: [...], failing_tests: [...], code_issues: [...]} but any valid JSON is accepted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.10",
+      "description": "The review_type field is free-form string. Common values include 'enhanced_review', 'artifact_check', 'manual', 'automated', but any string is accepted.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-8.2.1",
+      "name": "Verify creates verification_result with pass",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with body {summary: 'All 8 acceptance criteria met', findings: {criteria_checked: 8, criteria_passed: 8, artifacts_found: ['migration', 'schema', 'test']}, review_type: 'enhanced_review'}",
+        "GET /api/v1/stories/:id/verifications"
+      ],
+      "expected_results": [
+        "Verify returns 200 with story verified_status=verified",
+        "GET verifications returns list with 1 record",
+        "Record has result='pass', correct summary, findings jsonb with criteria data, review_type='enhanced_review', orchestrator_agent_id matching the orch agent"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.2",
+      "name": "Reject creates verification_result with fail",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with body {reason: 'No migration file found', findings: {missing_artifacts: ['migration'], checked_paths: ['priv/repo/migrations/']}, review_type: 'artifact_check'}"
+      ],
+      "expected_results": [
+        "Response 200 with verified_status=rejected",
+        "verification_result created with result='fail', summary matching reason, correct findings and review_type"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.3",
+      "name": "Verification history accumulates across multiple verify/reject cycles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\", settings: %{auto_reset_on_rejection: false}})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with reason 'Missing tests'",
+        "Manually reset story verified_status to unverified for re-check",
+        "POST /api/v1/stories/:id/reject with reason 'Tests present but 2 failing'",
+        "Manually reset story verified_status to unverified for re-check",
+        "POST /api/v1/stories/:id/verify with summary 'All tests passing'",
+        "GET /api/v1/stories/:id/verifications"
+      ],
+      "expected_results": [
+        "GET returns 3 verification_result records",
+        "Records ordered by inserted_at descending: pass, fail, fail",
+        "Each record has distinct summary and inserted_at",
+        "Full history preserved despite story's verified_status only reflecting latest state"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.4",
+      "name": "Agent-role key cannot list verification results",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:verification_result, %{tenant_id: tenant.id, story_id: story.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:id/verifications with agent API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.5",
+      "name": "Tenant isolation: cross-tenant verification listing returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Tenant A\"})",
+        "fixture(:tenant, %{name: \"Tenant B\"})",
+        "fixture(:story, %{tenant_id: tenant_a.id})",
+        "fixture(:verification_result, %{tenant_id: tenant_a.id, story_id: story_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_a_id/verifications with tenant B orchestrator key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "No verification results from tenant A are exposed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.6",
+      "name": "Partial verification result",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify with body {summary: '6 of 8 criteria met, deferring 2 non-critical', result: 'partial', findings: {criteria_passed: 6, criteria_deferred: 2}, review_type: 'enhanced_review'}",
+        "GET /api/v1/stories/:id/verifications"
+      ],
+      "expected_results": [
+        "Story verified_status set to 'verified'",
+        "verification_result record has result='partial' (not 'pass')",
+        "Findings include the partial assessment details"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-8.2.7",
+      "name": "Rich findings jsonb is stored and retrieved correctly",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id})"
+      ],
+      "steps": [
+        "Create verification_result with deeply nested findings: {categories: [{name: 'tests', items: [{file: 'test.exs', status: 'pass'}, {file: 'test2.exs', status: 'fail', error: 'assertion failed'}]}, {name: 'artifacts', items: [{type: 'migration', exists: true}]}]}",
+        "Retrieve the verification_result and inspect findings"
+      ],
+      "expected_results": [
+        "Findings jsonb is stored and retrieved with full fidelity",
+        "Nested structures, arrays, and mixed types are preserved"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement Loopctl.Verifications context module with create_verification_result/2 and list_verification_results/2.",
+    "verification_results table: id (uuid PK), tenant_id (uuid FK), story_id (uuid FK), orchestrator_agent_id (uuid FK), result (enum: pass/fail/partial), summary (text), findings (jsonb default {}), review_type (string), inserted_at (utc_datetime).",
+    "RLS policy on verification_results: tenant_id = current_setting('app.current_tenant_id')::uuid.",
+    "The creation of verification_result records is already done within the verify/reject Ecto.Multi in US-7.2. This story adds the listing endpoint and ensures the schema/context module is complete.",
+    "Controller at LoopctlWeb.VerificationController with index action, nested under /api/v1/stories/:story_id/verifications.",
+    "No update or delete — this is an append-only table for audit integrity.",
+    "Agent-role keys are explicitly denied access to verification results to maintain the trust boundary."
+  ],
+  "dependencies": [
+    "US-7.2"
+  ],
+  "estimated_hours": 4
+}
