@@ -5,9 +5,11 @@
 /.fetch
 erl_crash.dump
 *.ez
+/loopctl
 /loopctl-*.tar
 /tmp/
 /priv/plts/*.plt
 /priv/plts/*.plt.hash
 /.elixir_ls/
 .env
+deploy/certs/

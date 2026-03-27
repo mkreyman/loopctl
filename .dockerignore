@@ -1,0 +1,42 @@
+# Version control
+.git
+.gitignore
+
+# Build artifacts
+_build/
+deps/
+cover/
+doc/
+
+# Environment and secrets
+.env
+*.secret
+
+# Editor and IDE
+.elixir_ls/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Deployment scripts (not needed in build context)
+deploy/
+
+# Tests (not needed in release)
+test/
+
+# Documentation
+docs/
+skills/
+*.md
+
+# Miscellaneous
+tmp/
+priv/plts/
+erl_crash.dump
+*.ez
+loopctl-*.tar

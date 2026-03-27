@@ -1,0 +1,10 @@
+[Unit]
+Description=loopctl database backup to Synology NAS
+After=docker.service
+
+[Service]
+Type=oneshot
+User=mkreyman
+ExecStart=/home/mkreyman/workspace/loopctl/deploy/backup.sh
+StandardOutput=journal
+StandardError=journal

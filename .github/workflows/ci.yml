@@ -194,6 +194,4 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: Deploy to beelink
-        run: |
-          cd /opt/loopctl
-          bash bin/deploy.sh
+        run: bash $HOME/workspace/loopctl/deploy/deploy.sh

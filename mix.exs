@@ -46,7 +46,8 @@ defmodule Loopctl.MixProject do
       loopctl: [
         include_executables_for: [:unix],
         strip_beams: [keep: ["Docs"]],
-        applications: [runtime_tools: :permanent]
+        applications: [runtime_tools: :permanent],
+        overlays: "rel/overlays"
       ]
     ]
   end
