@@ -10,13 +10,16 @@ defmodule Loopctl.Fixtures do
   """
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Auth
   alias Loopctl.Tenants.Tenant
 
   @doc """
   Builds a data map for the given type without database insertion.
   Useful for changeset tests and unit tests that don't need persistence.
   """
-  def build(:tenant, attrs \\ %{}) do
+  def build(type, attrs \\ %{})
+
+  def build(:tenant, attrs) do
     Map.merge(
       %{
         name: "Test Tenant #{System.unique_integer([:positive])}",
@@ -29,9 +32,22 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  def build(:api_key, attrs) do
+    Map.merge(
+      %{
+        name: "test-key-#{System.unique_integer([:positive])}",
+        role: :user
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   @doc """
   Inserts a record into the database, auto-creating any required dependencies.
   Returns the inserted struct.
+
+  For `:api_key`, returns `{raw_key, %ApiKey{}}` since the raw key
+  is needed for authentication in tests.
   """
   def fixture(type, attrs \\ %{})
 
@@ -41,6 +57,30 @@ defmodule Loopctl.Fixtures do
     %Tenant{}
     |> Tenant.create_changeset(data)
     |> AdminRepo.insert!()
+  end
+
+  def fixture(:api_key, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided (unless superadmin)
+    {tenant_id, attrs} =
+      case {Map.get(attrs, :tenant_id), Map.get(attrs, :role, :user)} do
+        {nil, :superadmin} ->
+          {nil, attrs}
+
+        {nil, _role} ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        {tid, _role} ->
+          {tid, attrs}
+      end
+
+    data = build(:api_key, attrs)
+    data = Map.put(data, :tenant_id, tenant_id)
+
+    {:ok, {raw_key, api_key}} = Auth.generate_api_key(data)
+    {raw_key, api_key}
   end
 
   @doc """
