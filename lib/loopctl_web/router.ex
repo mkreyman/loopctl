@@ -49,6 +49,10 @@ defmodule LoopctlWeb.Router do
     # Change feed
     get "/changes", ChangeController, :index
 
+    # Dependency graph queries (must be before stories/:id to avoid matching "ready"/"blocked")
+    get "/stories/ready", DependencyGraphController, :ready
+    get "/stories/blocked", DependencyGraphController, :blocked
+
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
@@ -56,5 +60,37 @@ defmodule LoopctlWeb.Router do
     post "/agents/register", AgentController, :register
     get "/agents", AgentController, :index
     get "/agents/:id", AgentController, :show
+
+    # Project management
+    resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
+    get "/projects/:id/progress", ProjectController, :progress
+
+    # Epic management
+    get "/projects/:project_id/epics", EpicController, :index
+    post "/projects/:project_id/epics", EpicController, :create
+    get "/epics/:id", EpicController, :show
+    patch "/epics/:id", EpicController, :update
+    delete "/epics/:id", EpicController, :delete
+    get "/epics/:id/progress", EpicController, :progress
+
+    # Story management
+    get "/epics/:epic_id/stories", StoryController, :index
+    post "/epics/:epic_id/stories", StoryController, :create
+    get "/stories/:id", StoryController, :show
+    patch "/stories/:id", StoryController, :update
+    delete "/stories/:id", StoryController, :delete
+
+    # Dependency graph
+    get "/projects/:id/dependency_graph", DependencyGraphController, :graph
+
+    # Epic dependencies
+    post "/epic_dependencies", EpicDependencyController, :create
+    delete "/epic_dependencies/:id", EpicDependencyController, :delete
+    get "/projects/:id/epic_dependencies", EpicDependencyController, :index
+
+    # Story dependencies
+    post "/story_dependencies", StoryDependencyController, :create
+    delete "/story_dependencies/:id", StoryDependencyController, :delete
+    get "/epics/:id/story_dependencies", StoryDependencyController, :index
   end
 end
