@@ -63,6 +63,16 @@
       "id": "AC-8.2.10",
       "description": "The review_type field is free-form string. Common values include 'enhanced_review', 'artifact_check', 'manual', 'automated', but any string is accepted.",
       "status": "pending"
+    },
+    {
+      "id": "AC-8.2.11",
+      "description": "Each verification_result record includes an `iteration` integer field (1-indexed). The first verification attempt for a story is iteration=1. If the story is rejected and re-submitted, the next verification is iteration=2, etc. This tracks the review-fix cycle count for evaluator calibration.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-8.2.12",
+      "description": "The story endpoint GET /stories/:id includes `iteration_count` (the max iteration number from verification_results) in the response. Stories with high iteration counts signal weak acceptance criteria or unclear requirements.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -206,11 +216,37 @@
         "Nested structures, arrays, and mixed types are preserved"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-8.2.8",
+      "name": "Story verified on third attempt tracks iteration count",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/reject with reason 'Missing tests'",
+        "Reset story to reported_done/unverified for re-verification",
+        "POST /api/v1/stories/:id/reject with reason 'Tests present but failing'",
+        "Reset story to reported_done/unverified for re-verification",
+        "POST /api/v1/stories/:id/verify with summary 'All tests passing'",
+        "GET /api/v1/stories/:id/verifications",
+        "GET /api/v1/stories/:id"
+      ],
+      "expected_results": [
+        "verification_results has entries with iteration=1 (fail), iteration=2 (fail), iteration=3 (pass)",
+        "Story response shows iteration_count=3",
+        "Iteration numbers are assigned sequentially per story regardless of result"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
     "Implement Loopctl.Verifications context module with create_verification_result/2 and list_verification_results/2.",
-    "verification_results table: id (uuid PK), tenant_id (uuid FK), story_id (uuid FK), orchestrator_agent_id (uuid FK), result (enum: pass/fail/partial), summary (text), findings (jsonb default {}), review_type (string), inserted_at (utc_datetime).",
+    "verification_results table: id (uuid PK), tenant_id (uuid FK), story_id (uuid FK), orchestrator_agent_id (uuid FK), result (enum: pass/fail/partial), summary (text), findings (jsonb default {}), review_type (string), iteration (integer, 1-indexed attempt number), inserted_at (utc_datetime).",
     "RLS policy on verification_results: tenant_id = current_setting('app.current_tenant_id')::uuid.",
     "The creation of verification_result records is already done within the verify/reject Ecto.Multi in US-7.2. This story adds the listing endpoint and ensures the schema/context module is complete.",
     "Controller at LoopctlWeb.VerificationController with index action, nested under /api/v1/stories/:story_id/verifications.",

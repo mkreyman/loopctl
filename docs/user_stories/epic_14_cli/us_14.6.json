@@ -9,7 +9,7 @@
   "phase": "core",
   "story": {
     "as_a": "AI implementation agent",
-    "i_want_to": "register myself, claim stories, mark them as in-progress, report completion with artifacts, and unclaim stories via the CLI",
+    "i_want_to": "register myself, contract stories, claim stories, mark them as in-progress, report completion with artifacts, and unclaim stories via the CLI",
     "so_that": "I can participate in the development loop by picking up work, reporting my progress, and submitting deliverables through a simple command interface"
   },
   "rationale": "Implementation agents are the primary producers of work in the loopctl system. They need a streamlined CLI interface to self-register, claim assigned stories, transition through the implementation workflow (claim -> start -> report), and release stories if they cannot complete them. These commands map directly to the agent status endpoints and are designed for programmatic invocation by AI agents, with JSON as the default output format.",
@@ -17,6 +17,11 @@
     {
       "id": "AC-14.6.1",
       "description": "'loopctl agent register --name NAME --type TYPE' calls POST /api/v1/agents/register with the agent name and type (implementer or orchestrator) and displays the returned agent record including the agent ID",
+      "status": "pending"
+    },
+    {
+      "id": "AC-14.6.1a",
+      "description": "'loopctl contract STORY_NUM' fetches the story details from the API, displays the title and acceptance criteria to stdout, then automatically posts the contract acknowledgment (POST /api/v1/stories/:id/contract with correct story_title and ac_count). Displays the updated story with agent_status=contracted.",
       "status": "pending"
     },
     {

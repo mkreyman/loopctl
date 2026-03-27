@@ -21,7 +21,12 @@
     },
     {
       "id": "AC-6.2.2",
-      "description": "agent_status enum has values: pending, assigned, implementing, reported_done. Default: :pending",
+      "description": "agent_status enum has values: pending, contracted, assigned, implementing, reported_done. Default: :pending",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.2a",
+      "description": "The agent_status enum includes `contracted` — set when an implementation agent acknowledges the story's acceptance criteria via POST /stories/:id/contract. The contract step requires the agent to echo back the AC count and story title, confirming it read the story.",
       "status": "pending"
     },
     {
@@ -296,7 +301,7 @@
     }
   ],
   "technical_notes": [
-    "agent_status enum: Ecto.Enum with values [:pending, :assigned, :implementing, :reported_done]",
+    "agent_status enum: Ecto.Enum with values [:pending, :contracted, :assigned, :implementing, :reported_done]",
     "verified_status enum: Ecto.Enum with values [:unverified, :verified, :rejected]",
     "Story number is a STRING, not an integer — allows formats like '2.1', '2.2', '10.1'",
     "The PATCH endpoint must use a separate changeset function (update_changeset) that explicitly excludes agent_status and verified_status from cast/3",

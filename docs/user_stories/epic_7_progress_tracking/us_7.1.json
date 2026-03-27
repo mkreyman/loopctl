@@ -9,19 +9,29 @@
   "phase": "core",
   "story": {
     "as_a": "AI implementation agent",
-    "i_want_to": "transition story status through claim, start, report, and unclaim endpoints",
+    "i_want_to": "transition story status through contract, claim, start, report, and unclaim endpoints",
     "so_that": "the orchestrator and other agents can see accurate, real-time progress of my implementation work"
   },
-  "rationale": "The agent_status track is one half of the two-tier trust model that is loopctl's core innovation. Agents must be able to self-report their progress through well-defined state transitions (pending -> assigned -> implementing -> reported_done), but they must NOT be able to mark work as verified. Each transition must validate the current state to prevent invalid jumps and must be recorded in the audit log for full traceability.",
+  "rationale": "The agent_status track is one half of the two-tier trust model that is loopctl's core innovation. Agents must be able to self-report their progress through well-defined state transitions (pending -> contracted -> assigned -> implementing -> reported_done), but they must NOT be able to mark work as verified. The contracted step ensures agents have read and acknowledged the story's acceptance criteria before claiming it. Each transition must validate the current state to prevent invalid jumps and must be recorded in the audit log for full traceability.",
   "acceptance_criteria": [
     {
+      "id": "AC-7.1.0a",
+      "description": "POST /api/v1/stories/:id/contract sets agent_status from 'pending' to 'contracted'. The request body MUST include {story_title: string, ac_count: integer} matching the actual story. This is a lightweight verification that the agent read the story before claiming it. Returns 422 if title or AC count don't match.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.0b",
+      "description": "POST /api/v1/stories/:id/claim now requires agent_status='contracted' (was 'pending'). An agent must contract before claiming.",
+      "status": "pending"
+    },
+    {
       "id": "AC-7.1.1",
-      "description": "POST /api/v1/stories/:id/claim with an agent-role API key sets agent_status from 'pending' to 'assigned', sets assigned_agent_id to the calling agent's ID, and sets assigned_at timestamp. Returns 200 with updated story.",
+      "description": "POST /api/v1/stories/:id/claim with an agent-role API key sets agent_status from 'contracted' to 'assigned', sets assigned_agent_id to the calling agent's ID, and sets assigned_at timestamp. Returns 200 with updated story.",
       "status": "pending"
     },
     {
       "id": "AC-7.1.2",
-      "description": "POST /api/v1/stories/:id/claim returns 409 Conflict if the story's agent_status is not 'pending' (already claimed by another agent or in progress).",
+      "description": "POST /api/v1/stories/:id/claim returns 409 Conflict if the story's agent_status is not 'contracted' (not yet contracted, already claimed by another agent, or in progress).",
       "status": "pending"
     },
     {
@@ -66,7 +76,7 @@
     },
     {
       "id": "AC-7.1.11",
-      "description": "The claim endpoint MUST use pessimistic locking (SELECT FOR UPDATE or equivalent atomic UPDATE...WHERE agent_status = 'pending' RETURNING *) to prevent race conditions when multiple agents try to claim the same story simultaneously. Only one agent can succeed; others receive 409 Conflict.",
+      "description": "The claim endpoint MUST use pessimistic locking (SELECT FOR UPDATE or equivalent atomic UPDATE...WHERE agent_status = 'contracted' RETURNING *) to prevent race conditions when multiple agents try to claim the same story simultaneously. Only one agent can succeed; others receive 409 Conflict.",
       "status": "pending"
     },
     {
@@ -77,8 +87,52 @@
   ],
   "test_cases": [
     {
-      "id": "TC-7.1.1",
-      "name": "Happy path: full agent lifecycle claim -> start -> report",
+      "id": "TC-7.1.0a",
+      "name": "Agent contracts a story with correct title and AC count",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, title: \"Phoenix scaffold\", acceptance_criteria: [%{id: \"AC-1\", description: \"App boots\"}, %{id: \"AC-2\", description: \"Tests pass\"}]})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/contract with body {\"story_title\": \"Phoenix scaffold\", \"ac_count\": 2}"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Story agent_status is 'contracted'",
+        "Audit log entry created with action=status_changed, old_state=pending, new_state=contracted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.0b",
+      "name": "Agent contracts with wrong AC count returns 422",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending, title: \"Phoenix scaffold\", acceptance_criteria: [%{id: \"AC-1\", description: \"App boots\"}, %{id: \"AC-2\", description: \"Tests pass\"}]})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/contract with body {\"story_title\": \"Phoenix scaffold\", \"ac_count\": 5}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Story agent_status remains 'pending'",
+        "Error message indicates AC count mismatch"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.0c",
+      "name": "Agent tries to claim without contracting returns 409",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant, %{name: \"Test Tenant\"})",
@@ -89,16 +143,40 @@
         "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
       ],
       "steps": [
+        "POST /api/v1/stories/:id/claim with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 409 Conflict",
+        "Error message indicates agent_status must be 'contracted'",
+        "Story agent_status remains 'pending'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.1",
+      "name": "Happy path: full agent lifecycle contract -> claim -> start -> report",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/contract with body {story_title: story.title, ac_count: length(story.acceptance_criteria)}",
+        "Assert response 200 with agent_status=contracted",
         "POST /api/v1/stories/:id/claim with agent API key",
         "Assert response 200 with agent_status=assigned, assigned_agent_id=agent.id, assigned_at != nil",
         "POST /api/v1/stories/:id/start with same agent API key",
         "Assert response 200 with agent_status=implementing",
         "POST /api/v1/stories/:id/report with same agent API key",
         "Assert response 200 with agent_status=reported_done, reported_done_at != nil",
-        "Verify 3 audit_log entries created with action=status_changed"
+        "Verify 4 audit_log entries created with action=status_changed"
       ],
       "expected_results": [
-        "Story transitions through pending -> assigned -> implementing -> reported_done",
+        "Story transitions through pending -> contracted -> assigned -> implementing -> reported_done",
         "Each transition is recorded in audit_log with correct old/new states",
         "assigned_at and reported_done_at timestamps are set"
       ],
@@ -267,7 +345,7 @@
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "story = fixture(:story, tenant: tenant, agent_status: :pending)",
+        "story = fixture(:story, tenant: tenant, agent_status: :contracted)",
         "agent_a = fixture(:agent, tenant: tenant)",
         "agent_b = fixture(:agent, tenant: tenant)",
         "Configure Ecto.Adapters.SQL.Sandbox.allow/3 for each spawned Task process to grant sandbox access. Alternatively, use Sandbox :shared mode for this specific test (with async: false for this test only)."
@@ -284,7 +362,7 @@
     }
   ],
   "technical_notes": [
-    "Implement as Loopctl.Progress context module with claim_story/2, start_story/2, report_story/2, unclaim_story/2 functions.",
+    "Implement as Loopctl.Progress context module with contract_story/2, claim_story/2, start_story/2, report_story/2, unclaim_story/2 functions.",
     "Each function must validate current agent_status before transitioning. Use Ecto.Multi for atomic status change + audit log insertion.",
     "Agent identity is resolved from the API key's agent_id field. The auth pipeline must set the agent in conn.assigns.",
     "Return 404 (not 403) for cross-tenant resource access to avoid information leakage.",

@@ -115,7 +115,7 @@ Four roles, three tenant-scoped and one app-wide:
 Every story has two independent status tracks:
 
 ```
-agent_status:     pending → assigned → implementing → reported_done
+agent_status:     pending → contracted → assigned → implementing → reported_done
 verified_status:  unverified → verified → rejected → unverified (auto-reset on rejection)
 ```
 
@@ -123,6 +123,8 @@ verified_status:  unverified → verified → rejected → unverified (auto-rese
 - **Only `orchestrator` role keys** can write to `verified_status`
 - When `verified_status` is set to `rejected`, `agent_status` auto-resets to `pending`
 - Every status transition is recorded in the audit trail with timestamp, actor, and previous state
+- The `contracted` step requires the agent to acknowledge the story's acceptance criteria before being assigned. This prevents the pattern where agents claim stories without reading requirements.
+- Iteration count tracks review-fix cycles per story. High iteration counts signal evaluation prompt calibration opportunities.
 
 ### 4.5 Change Feed (Dual Mode)
 
@@ -238,7 +240,7 @@ The atomic unit of work.
 | description | text | |
 | acceptance_criteria | jsonb | Structured criteria from user story |
 | estimated_hours | decimal | Optional |
-| agent_status | enum | `pending`, `assigned`, `implementing`, `reported_done` |
+| agent_status | enum | `pending`, `contracted`, `assigned`, `implementing`, `reported_done` |
 | verified_status | enum | `unverified`, `verified`, `rejected` |
 | assigned_agent_id | uuid | FK → agents, NULL if unassigned |
 | assigned_at | utc_datetime | |
@@ -307,6 +309,7 @@ The orchestrator's independent assessment of a story.
 | summary | text | Human-readable summary |
 | findings | jsonb | Structured findings (issues found, artifacts missing, etc.) |
 | review_type | string | "enhanced_review", "artifact_check", "manual", etc. |
+| iteration | integer | 1-indexed attempt number for this story |
 | inserted_at | utc_datetime | |
 
 #### orchestrator_state
@@ -466,7 +469,8 @@ All endpoints are under `/api/v1/`. All request and response bodies are JSON. Au
 
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
-| POST | /stories/:id/claim | agent | Set agent_status=assigned, assign agent. Fails if already assigned. |
+| POST | /stories/:id/contract | agent | Set agent_status=contracted. Agent must echo story_title + ac_count to prove it read the story. |
+| POST | /stories/:id/claim | agent | Set agent_status=assigned, assign agent. Requires agent_status=contracted. |
 | POST | /stories/:id/start | agent | Set agent_status=implementing. Must be assigned to this agent. |
 | POST | /stories/:id/report | agent | Set agent_status=reported_done. Optionally include artifact report. |
 | POST | /stories/:id/unclaim | agent | Release assignment. Resets to pending. |
@@ -629,7 +633,8 @@ loopctl blocked --project <project>                     # Blocked stories
 #### Agent Operations (role: agent)
 ```bash
 loopctl agent register --name <name> --type <type>     # Self-register
-loopctl claim <story_number>                            # Claim a story
+loopctl contract <story_number>                         # Read & acknowledge story ACs
+loopctl claim <story_number>                            # Claim a story (requires contracted)
 loopctl start <story_number>                            # Mark as implementing
 loopctl report <story_number> --artifact <json>         # Report done + artifact
 loopctl unclaim <story_number>                          # Release assignment
