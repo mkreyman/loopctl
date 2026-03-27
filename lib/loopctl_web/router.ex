@@ -60,5 +60,13 @@ defmodule LoopctlWeb.Router do
     # Project management
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
+
+    # Epic management
+    get "/projects/:project_id/epics", EpicController, :index
+    post "/projects/:project_id/epics", EpicController, :create
+    get "/epics/:id", EpicController, :show
+    patch "/epics/:id", EpicController, :update
+    delete "/epics/:id", EpicController, :delete
+    get "/epics/:id/progress", EpicController, :progress
   end
 end

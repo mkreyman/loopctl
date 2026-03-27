@@ -15,6 +15,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Auth
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.WorkBreakdown.Epic
 
   @doc """
   Builds a data map for the given type without database insertion.
@@ -73,6 +74,22 @@ defmodule Loopctl.Fixtures do
         repo_url: "https://github.com/example/project-#{seq}",
         description: "A test project",
         tech_stack: "elixir/phoenix",
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:epic, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        number: seq,
+        title: "Epic #{seq}",
+        description: "Test epic description",
+        phase: "p0_foundation",
+        position: 0,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -159,6 +176,40 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Project{tenant_id: tenant_id}
       |> Project.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:epic, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    # Auto-create project if not provided
+    {project_id, attrs} =
+      case Map.get(attrs, :project_id) do
+        nil ->
+          project = fixture(:project, %{tenant_id: tenant_id})
+          {project.id, Map.put(attrs, :project_id, project.id)}
+
+        pid ->
+          {pid, attrs}
+      end
+
+    data = build(:epic, attrs)
+
+    changeset =
+      %Epic{tenant_id: tenant_id, project_id: project_id}
+      |> Epic.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
