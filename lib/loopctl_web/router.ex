@@ -56,5 +56,9 @@ defmodule LoopctlWeb.Router do
     post "/agents/register", AgentController, :register
     get "/agents", AgentController, :index
     get "/agents/:id", AgentController, :show
+
+    # Project management
+    resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
+    get "/projects/:id/progress", ProjectController, :progress
   end
 end

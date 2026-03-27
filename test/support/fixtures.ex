@@ -13,6 +13,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Agents.Agent
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
+  alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
 
   @doc """
@@ -56,6 +57,22 @@ defmodule Loopctl.Fixtures do
       %{
         name: "agent-#{System.unique_integer([:positive])}",
         agent_type: :implementer,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:project, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        name: "Test Project #{seq}",
+        slug: "test-project-#{seq}",
+        repo_url: "https://github.com/example/project-#{seq}",
+        description: "A test project",
+        tech_stack: "elixir/phoenix",
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -119,6 +136,29 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Agent{tenant_id: tenant_id}
       |> Agent.register_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:project, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:project, attrs)
+
+    changeset =
+      %Project{tenant_id: tenant_id}
+      |> Project.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
