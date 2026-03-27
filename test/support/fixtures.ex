@@ -18,6 +18,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.Webhooks.Webhook
+  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
@@ -159,6 +161,29 @@ defmodule Loopctl.Fixtures do
         findings: %{},
         review_type: "enhanced_review",
         iteration: 1
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:webhook, attrs) do
+    Map.merge(
+      %{
+        url: "https://example.com/hooks/#{System.unique_integer([:positive])}",
+        events: ["story.status_changed"],
+        active: true
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:webhook_event, attrs) do
+    Map.merge(
+      %{
+        event_type: "story.status_changed",
+        payload: %{"event" => "story.status_changed", "data" => %{}},
+        status: :pending,
+        attempts: 0
       },
       Enum.into(attrs, %{})
     )
@@ -453,6 +478,90 @@ defmodule Loopctl.Fixtures do
       |> VerificationResult.create_changeset(data)
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:webhook, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:webhook, attrs)
+    raw_secret = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+
+    changeset =
+      %Webhook{
+        tenant_id: tenant_id,
+        signing_secret_encrypted: raw_secret
+      }
+      |> Webhook.create_changeset(data)
+
+    webhook = AdminRepo.insert!(changeset)
+
+    # Apply overrides for active and consecutive_failures
+    active = Map.get(attrs, :active, true)
+    consecutive_failures = Map.get(attrs, :consecutive_failures, 0)
+
+    if active != true or consecutive_failures != 0 do
+      webhook
+      |> Ecto.Changeset.change(%{active: active, consecutive_failures: consecutive_failures})
+      |> AdminRepo.update!()
+    else
+      webhook
+    end
+  end
+
+  def fixture(:webhook_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {webhook_id, attrs} =
+      case Map.get(attrs, :webhook_id) do
+        nil ->
+          webhook = fixture(:webhook, %{tenant_id: tenant_id})
+          {webhook.id, Map.put(attrs, :webhook_id, webhook.id)}
+
+        wid ->
+          {wid, attrs}
+      end
+
+    data = build(:webhook_event, attrs)
+    status = Map.get(data, :status, :pending)
+    attempts = Map.get(data, :attempts, 0)
+
+    changeset =
+      %WebhookEvent{
+        tenant_id: tenant_id,
+        webhook_id: webhook_id
+      }
+      |> WebhookEvent.create_changeset(data)
+
+    event = AdminRepo.insert!(changeset)
+
+    # Apply status/attempts overrides
+    if status != :pending or attempts != 0 do
+      event
+      |> Ecto.Changeset.change(%{status: status, attempts: attempts})
+      |> AdminRepo.update!()
+    else
+      event
+    end
   end
 
   def fixture(:api_key, attrs) do
