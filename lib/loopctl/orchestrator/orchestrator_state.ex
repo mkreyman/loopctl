@@ -68,7 +68,6 @@ defmodule Loopctl.Orchestrator.OrchestratorState do
     |> cast(attrs, [:state_data])
     |> validate_required([:state_data])
     |> validate_state_data()
-    |> optimistic_lock(:version)
   end
 
   defp validate_state_data(changeset) do
