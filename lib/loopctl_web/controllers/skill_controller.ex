@@ -20,7 +20,7 @@ defmodule LoopctlWeb.SkillController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:create, :update, :delete, :create_version]
+       [role: :user] when action in [:create, :update, :delete, :create_version, :import_skills]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
@@ -170,6 +170,20 @@ defmodule LoopctlWeb.SkillController do
           {:error, :not_found} -> {:error, :not_found}
         end
     end
+  end
+
+  @doc "POST /api/v1/skills/import"
+  def import_skills(conn, %{"skills" => skills_data}) when is_list(skills_data) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    {:ok, summary} = Skills.import_skills(tenant_id, skills_data, audit_opts)
+    json(conn, summary)
+  end
+
+  def import_skills(_conn, _params) do
+    {:error, :bad_request, "Request body must contain a 'skills' array"}
   end
 
   @doc "GET /api/v1/skills/:id/stats"

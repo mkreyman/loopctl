@@ -400,6 +400,62 @@ defmodule Loopctl.Skills do
     end
   end
 
+  # ===================================================================
+  # Skill Import
+  # ===================================================================
+
+  @doc """
+  Bulk imports skills from an array of skill objects.
+
+  Implements create-or-update (idempotent) logic: if a skill with the
+  same name exists within the tenant, it creates a new version instead
+  of a new skill.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `skills_data` -- list of maps with `name`, `prompt_text`, optional `description`, `project_id`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, summary}` with counts of created, updated, and errored skills
+  """
+  @spec import_skills(Ecto.UUID.t(), [map()], keyword()) :: {:ok, map()}
+  def import_skills(tenant_id, skills_data, opts \\ []) when is_list(skills_data) do
+    results =
+      Enum.map(skills_data, fn skill_data ->
+        import_single_skill(tenant_id, skill_data, opts)
+      end)
+
+    summary = %{
+      "total" => length(results),
+      "created" => Enum.count(results, &(&1 == :created)),
+      "updated" => Enum.count(results, &(&1 == :updated)),
+      "errored" => Enum.count(results, &(&1 == :errored))
+    }
+
+    {:ok, summary}
+  end
+
+  defp import_single_skill(tenant_id, skill_data, opts) do
+    name = Map.get(skill_data, "name") || Map.get(skill_data, :name)
+
+    case get_skill_by_name(tenant_id, name) do
+      {:ok, existing_skill} ->
+        case create_version(tenant_id, existing_skill.id, skill_data, opts) do
+          {:ok, _} -> :updated
+          {:error, _} -> :errored
+        end
+
+      {:error, :not_found} ->
+        case create_skill(tenant_id, skill_data, opts) do
+          {:ok, _} -> :created
+          {:error, _} -> :errored
+        end
+    end
+  end
+
   # --- Private helpers ---
 
   defp apply_skill_filters(query, opts) do

@@ -135,6 +135,7 @@ defmodule LoopctlWeb.Router do
     post "/skills/:id/versions", SkillController, :create_version
     get "/skills/:id/versions", SkillController, :list_versions
     get "/skills/:id/versions/:version", SkillController, :get_version
+    post "/skills/import", SkillController, :import_skills
     get "/skills/:id/stats", SkillController, :stats
     get "/skills/:id/versions/:version/results", SkillController, :version_results
 
