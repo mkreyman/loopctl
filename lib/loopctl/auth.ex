@@ -85,9 +85,11 @@ defmodule Loopctl.Auth do
         {:error, :unauthorized}
 
       api_key ->
-        # Update last_used_at asynchronously (fire-and-forget)
-        Task.start(fn -> update_last_used(api_key) end)
-        {:ok, api_key}
+        # Update last_used_at (best-effort, don't fail verification on touch error)
+        case update_last_used(api_key) do
+          {:ok, updated} -> {:ok, updated}
+          _error -> {:ok, api_key}
+        end
     end
   end
 

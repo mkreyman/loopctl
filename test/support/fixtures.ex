@@ -53,10 +53,21 @@ defmodule Loopctl.Fixtures do
 
   def fixture(:tenant, attrs) do
     data = build(:tenant, attrs)
+    status = Map.get(data, :status, :active)
 
-    %Tenant{}
-    |> Tenant.create_changeset(data)
-    |> AdminRepo.insert!()
+    tenant =
+      %Tenant{}
+      |> Tenant.create_changeset(data)
+      |> AdminRepo.insert!()
+
+    # Apply non-active status after creation (create always defaults to :active)
+    if status != :active do
+      tenant
+      |> Tenant.status_changeset(status)
+      |> AdminRepo.update!()
+    else
+      tenant
+    end
   end
 
   def fixture(:api_key, attrs) do
