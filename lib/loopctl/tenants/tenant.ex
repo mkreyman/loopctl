@@ -1,20 +1,92 @@
 defmodule Loopctl.Tenants.Tenant do
   @moduledoc """
-  Minimal tenant schema placeholder.
+  Schema for the `tenants` table — the root organizational unit.
 
-  The full Tenant schema with validations and context functions
-  will be implemented in Epic 2 (Tenant Management). This module
-  exists so that `belongs_to :tenant, Loopctl.Tenants.Tenant`
-  compiles in the base schema macro.
+  Tenants are NOT tenant-scoped (they have no `tenant_id` column).
+  All downstream entities belong to a tenant via `tenant_id` foreign keys.
+
+  ## Fields
+
+  - `name` — display name
+  - `slug` — URL-safe unique identifier (lowercase alphanumeric + hyphens)
+  - `email` — contact email for the tenant
+  - `settings` — jsonb map for tenant-level configuration
+  - `status` — `:active`, `:suspended`, or `:deactivated`
   """
 
   use Loopctl.Schema, tenant_scoped: false
 
+  @type t :: %__MODULE__{}
+
+  @statuses [:active, :suspended, :deactivated]
+  @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
+  @email_format ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
   schema "tenants" do
     field :name, :string
     field :slug, :string
-    field :status, :string, default: "active"
+    field :email, :string
+    field :settings, :map, default: %{}
+    field :status, Ecto.Enum, values: @statuses, default: :active
 
     timestamps()
+  end
+
+  @doc """
+  Changeset for creating a new tenant.
+  """
+  @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def create_changeset(tenant \\ %__MODULE__{}, attrs) do
+    tenant
+    |> cast(attrs, [:name, :slug, :email, :settings])
+    |> validate_required([:name, :slug, :email])
+    |> validate_slug()
+    |> validate_email()
+    |> validate_settings()
+    |> unique_constraint(:slug)
+  end
+
+  @doc """
+  Changeset for updating an existing tenant.
+  """
+  @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def update_changeset(tenant, attrs) do
+    tenant
+    |> cast(attrs, [:name, :slug, :email, :settings])
+    |> validate_slug()
+    |> validate_email()
+    |> validate_settings()
+    |> unique_constraint(:slug)
+  end
+
+  @doc """
+  Changeset for status transitions (suspend, activate, deactivate).
+  """
+  @spec status_changeset(%__MODULE__{}, atom()) :: Ecto.Changeset.t()
+  def status_changeset(tenant, status) when status in @statuses do
+    change(tenant, status: status)
+  end
+
+  defp validate_slug(changeset) do
+    changeset
+    |> validate_format(:slug, @slug_format,
+      message:
+        "must be lowercase alphanumeric with hyphens, starting and ending with alphanumeric"
+    )
+    |> validate_length(:slug, min: 2, max: 63)
+  end
+
+  defp validate_email(changeset) do
+    validate_format(changeset, :email, @email_format, message: "must be a valid email address")
+  end
+
+  defp validate_settings(changeset) do
+    validate_change(changeset, :settings, fn :settings, value ->
+      if is_map(value) and not is_struct(value) do
+        []
+      else
+        [settings: "must be a map"]
+      end
+    end)
   end
 end

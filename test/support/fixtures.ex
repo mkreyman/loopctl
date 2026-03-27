@@ -9,6 +9,7 @@ defmodule Loopctl.Fixtures do
   separate tenants via `fixture(:tenant)`.
   """
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Tenants.Tenant
 
   @doc """
@@ -18,10 +19,11 @@ defmodule Loopctl.Fixtures do
   def build(:tenant, attrs \\ %{}) do
     Map.merge(
       %{
-        id: Ecto.UUID.generate(),
         name: "Test Tenant #{System.unique_integer([:positive])}",
         slug: "test-tenant-#{System.unique_integer([:positive])}",
-        status: "active"
+        email: "test-#{System.unique_integer([:positive])}@example.com",
+        settings: %{},
+        status: :active
       },
       Enum.into(attrs, %{})
     )
@@ -37,9 +39,8 @@ defmodule Loopctl.Fixtures do
     data = build(:tenant, attrs)
 
     %Tenant{}
-    |> Ecto.Changeset.cast(data, [:id, :name, :slug, :status])
-    |> Ecto.Changeset.validate_required([:name, :slug, :status])
-    |> Loopctl.Repo.insert!()
+    |> Tenant.create_changeset(data)
+    |> AdminRepo.insert!()
   end
 
   @doc """
