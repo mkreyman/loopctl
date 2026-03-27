@@ -48,8 +48,15 @@ if config_env() == :prod do
     # ssl: true,
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
-    # For machines with several cores, consider starting multiple pools of `pool_size`
-    # pool_count: 4,
+    socket_options: maybe_ipv6
+
+  # AdminRepo — same database, different role with BYPASSRLS in production
+  admin_database_url =
+    System.get_env("ADMIN_DATABASE_URL") || database_url
+
+  config :loopctl, Loopctl.AdminRepo,
+    url: admin_database_url,
+    pool_size: String.to_integer(System.get_env("ADMIN_POOL_SIZE") || "3"),
     socket_options: maybe_ipv6
 
   # The secret key base is used to sign/encrypt cookies and other secrets.

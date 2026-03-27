@@ -10,6 +10,16 @@ config :loopctl, Loopctl.Repo,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
 
+# AdminRepo — same credentials in dev (BYPASSRLS role in production)
+config :loopctl, Loopctl.AdminRepo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "loopctl_dev",
+  stacktrace: true,
+  show_sensitive_data_on_connection_error: true,
+  pool_size: 3
+
 # For development, we disable any cache and enable
 # debugging and code reloading.
 #

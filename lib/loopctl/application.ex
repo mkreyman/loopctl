@@ -11,6 +11,7 @@ defmodule Loopctl.Application do
       LoopctlWeb.Telemetry,
       Loopctl.Vault,
       Loopctl.Repo,
+      Loopctl.AdminRepo,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Oban, Application.fetch_env!(:loopctl, Oban)},

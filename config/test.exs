@@ -13,6 +13,15 @@ config :loopctl, Loopctl.Repo,
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
 
+# AdminRepo — same database, sandbox mode for tests
+config :loopctl, Loopctl.AdminRepo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
+  pool: Ecto.Adapters.SQL.Sandbox,
+  pool_size: System.schedulers_online() * 2
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :loopctl, LoopctlWeb.Endpoint,
@@ -46,3 +55,7 @@ config :phoenix,
 
 # DI: Use mock health checker in tests
 config :loopctl, :health_checker, Loopctl.MockHealthChecker
+
+# RLS: Switch to non-superuser role within transactions so RLS is enforced
+# The loopctl_app role must exist and have access to all tables.
+config :loopctl, :rls_role, "loopctl_app"

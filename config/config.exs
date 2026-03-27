@@ -11,6 +11,12 @@ config :loopctl,
   ecto_repos: [Loopctl.Repo],
   generators: [timestamp_type: :utc_datetime, binary_id: true]
 
+# AdminRepo shares the same database but uses a role with BYPASSRLS in production.
+# In dev/test, it uses the same credentials as Repo.
+config :loopctl, Loopctl.AdminRepo,
+  migration_primary_key: [type: :binary_id],
+  migration_foreign_key: [type: :binary_id]
+
 # Ecto migration defaults — binary UUIDs for all primary and foreign keys
 config :loopctl, Loopctl.Repo,
   migration_primary_key: [type: :binary_id],

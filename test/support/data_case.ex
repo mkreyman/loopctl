@@ -40,10 +40,16 @@ defmodule Loopctl.DataCase do
 
   @doc """
   Sets up the sandbox based on the test tags.
+  Configures both Repo and AdminRepo for test isolation.
   """
   def setup_sandbox(tags) do
     pid = Sandbox.start_owner!(Loopctl.Repo, shared: not tags[:async])
-    on_exit(fn -> Sandbox.stop_owner(pid) end)
+    admin_pid = Sandbox.start_owner!(Loopctl.AdminRepo, shared: not tags[:async])
+
+    on_exit(fn ->
+      Sandbox.stop_owner(pid)
+      Sandbox.stop_owner(admin_pid)
+    end)
   end
 
   @doc """
