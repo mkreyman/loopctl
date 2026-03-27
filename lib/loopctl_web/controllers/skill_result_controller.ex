@@ -8,6 +8,7 @@ defmodule LoopctlWeb.SkillResultController do
   use LoopctlWeb, :controller
 
   alias Loopctl.Skills
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -17,8 +18,9 @@ defmodule LoopctlWeb.SkillResultController do
   def create(conn, params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
-    case Skills.create_skill_result(tenant_id, params) do
+    case Skills.create_skill_result(tenant_id, params, audit_opts) do
       {:ok, result} ->
         conn
         |> put_status(:created)

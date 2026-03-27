@@ -15,6 +15,11 @@ defmodule Loopctl.CLI.Commands.AdminTest do
             ]
           })
 
+        {"GET", "/api/v1/tenants/me"} ->
+          Req.Test.json(conn, %{
+            "tenant" => %{"id" => "t-1", "name" => "Tenant A", "status" => "active"}
+          })
+
         {"GET", "/api/v1/admin/tenants/" <> _id} ->
           Req.Test.json(conn, %{
             "tenant" => %{"id" => "t-1", "name" => "Tenant A", "status" => "active"}
@@ -74,6 +79,39 @@ defmodule Loopctl.CLI.Commands.AdminTest do
     test "shows system stats" do
       output = capture_io(fn -> Admin.run("admin", ["stats"], []) end)
       assert output =~ "185"
+    end
+  end
+
+  describe "admin impersonate" do
+    test "makes GET request with impersonate header" do
+      output =
+        capture_io(fn ->
+          Admin.run("admin", ["impersonate", "t-other", "get", "/api/v1/tenants/me"], [])
+        end)
+
+      assert output =~ "Tenant A"
+    end
+
+    test "makes POST request with impersonate header" do
+      output =
+        capture_io(fn ->
+          Admin.run(
+            "admin",
+            ["impersonate", "t-other", "post", "/api/v1/admin/tenants/t-1/suspend", "{}"],
+            []
+          )
+        end)
+
+      assert output =~ "t-1"
+    end
+
+    test "shows usage without subcommand" do
+      output =
+        capture_io(:stderr, fn ->
+          Admin.run("admin", ["impersonate", "t-1"], [])
+        end)
+
+      assert output =~ "Usage:"
     end
   end
 

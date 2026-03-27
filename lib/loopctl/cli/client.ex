@@ -76,6 +76,7 @@ defmodule Loopctl.CLI.Client do
     api_key = resolve_opt(opts, :api_key, &Config.api_key/0)
     params = Keyword.get(opts, :params)
     json = Keyword.get(opts, :json)
+    extra_headers = Keyword.get(opts, :headers, [])
 
     if is_nil(server) or server == "" do
       {:error, :no_server_configured}
@@ -84,7 +85,7 @@ defmodule Loopctl.CLI.Client do
 
       req_opts =
         [method: method, url: url]
-        |> maybe_add_auth(api_key)
+        |> maybe_add_auth(api_key, extra_headers)
         |> maybe_add_json(json)
         |> maybe_add_params(params)
         |> maybe_add_plug(plug)
@@ -111,10 +112,17 @@ defmodule Loopctl.CLI.Client do
     server <> path
   end
 
-  defp maybe_add_auth(opts, nil), do: opts
+  defp maybe_add_auth(opts, nil, extra_headers) do
+    if extra_headers == [] do
+      opts
+    else
+      Keyword.put(opts, :headers, extra_headers)
+    end
+  end
 
-  defp maybe_add_auth(opts, api_key) do
-    Keyword.put(opts, :headers, [{"authorization", "Bearer #{api_key}"}])
+  defp maybe_add_auth(opts, api_key, extra_headers) do
+    headers = [{"authorization", "Bearer #{api_key}"} | extra_headers]
+    Keyword.put(opts, :headers, headers)
   end
 
   defp maybe_add_json(opts, nil), do: opts

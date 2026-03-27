@@ -25,7 +25,7 @@ defmodule Loopctl.Skills.SkillResult do
 
     field :metrics, :map, default: %{}
 
-    timestamps()
+    timestamps(updated_at: false)
   end
 
   @doc """
@@ -38,5 +38,9 @@ defmodule Loopctl.Skills.SkillResult do
   def create_changeset(result \\ %__MODULE__{}, attrs) do
     result
     |> cast(attrs, [:metrics])
+    |> validate_required([:skill_version_id, :verification_result_id, :story_id])
+    |> foreign_key_constraint(:skill_version_id)
+    |> foreign_key_constraint(:verification_result_id)
+    |> foreign_key_constraint(:story_id)
   end
 end

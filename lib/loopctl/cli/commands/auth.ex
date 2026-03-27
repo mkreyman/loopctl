@@ -32,13 +32,27 @@ defmodule Loopctl.CLI.Commands.Auth do
     server = Map.get(parsed, "server")
     key = Map.get(parsed, "key")
 
-    if server do
-      Config.set("server", server)
-      if key, do: Config.set("api_key", key)
-
-      Output.success("Credentials saved. Server: #{server}")
-    else
+    if is_nil(server) do
       Output.error("Missing --server. Usage: loopctl auth login --server <url> --key <key>")
+    else
+      validate_and_save_credentials(server, key)
+    end
+  end
+
+  defp validate_and_save_credentials(server, key) do
+    case Client.get("/api/v1/tenants/me", server: server, api_key: key) do
+      {:ok, _body} ->
+        Config.set("server", server)
+        if key, do: Config.set("api_key", key)
+        Output.success("Credentials saved. Server: #{server}")
+
+      {:error, {status, body}} ->
+        Output.error(
+          "Login failed (#{status}): #{inspect(body)}. Check your server URL and API key."
+        )
+
+      {:error, reason} ->
+        Output.error("Login failed: #{inspect(reason)}. Check your server URL and API key.")
     end
   end
 

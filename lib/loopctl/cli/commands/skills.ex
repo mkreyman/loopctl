@@ -224,15 +224,43 @@ defmodule Loopctl.CLI.Commands.Skills do
   end
 
   defp parse_skill_file(file) do
-    name = file |> Path.basename(".md") |> String.replace("_", "-")
+    default_name = file |> Path.basename(".md") |> String.replace("_", "-")
 
     case File.read(file) do
       {:ok, content} ->
-        [%{"name" => name, "prompt_text" => content, "description" => "Imported from #{file}"}]
+        {frontmatter, prompt_text} = parse_frontmatter(content)
+
+        name = Map.get(frontmatter, "name", default_name)
+        description = Map.get(frontmatter, "description", "Imported from #{file}")
+
+        [%{"name" => name, "prompt_text" => prompt_text, "description" => description}]
 
       _ ->
         []
     end
+  end
+
+  # Parses YAML-like frontmatter delimited by "---" lines.
+  # Returns {%{key => value}, body_after_frontmatter}.
+  defp parse_frontmatter(content) do
+    case String.split(content, ~r/^---\s*$/m, parts: 3) do
+      ["", frontmatter_str, body] ->
+        {parse_frontmatter_pairs(frontmatter_str), String.trim_leading(body)}
+
+      _ ->
+        {%{}, content}
+    end
+  end
+
+  defp parse_frontmatter_pairs(str) do
+    str
+    |> String.split("\n")
+    |> Enum.reduce(%{}, fn line, acc ->
+      case String.split(line, ":", parts: 2) do
+        [key, value] -> Map.put(acc, String.trim(key), String.trim(value))
+        _ -> acc
+      end
+    end)
   end
 
   defp handle_error(:no_server_configured) do

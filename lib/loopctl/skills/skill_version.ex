@@ -28,7 +28,7 @@ defmodule Loopctl.Skills.SkillVersion do
     field :created_by, :string
     field :metadata, :map, default: %{}
 
-    timestamps()
+    timestamps(updated_at: false)
   end
 
   @doc """

@@ -26,7 +26,7 @@ defmodule Loopctl.Skills.SkillImportTest do
       assert summary["total"] == 2
       assert summary["created"] == 2
       assert summary["updated"] == 0
-      assert summary["errored"] == 0
+      assert summary["unchanged"] == 0
     end
 
     test "updates existing skills with new version (idempotent)" do
@@ -38,7 +38,7 @@ defmodule Loopctl.Skills.SkillImportTest do
         "prompt_text" => "v1 prompt"
       })
 
-      # Import with same name -- should create v2
+      # Import with same name and different prompt -- should create v2
       skills_data = [
         %{
           "name" => "loopctl:review",
@@ -55,6 +55,29 @@ defmodule Loopctl.Skills.SkillImportTest do
       # Verify the skill now has version 2
       {:ok, skill} = Skills.get_skill_by_name(tenant.id, "loopctl:review")
       assert skill.current_version == 2
+    end
+
+    test "skips unchanged skills (identical prompt_text)" do
+      tenant = fixture(:tenant)
+
+      Skills.create_skill(tenant.id, %{
+        "name" => "loopctl:review",
+        "prompt_text" => "same prompt"
+      })
+
+      # Import with identical prompt -- should be unchanged
+      skills_data = [
+        %{"name" => "loopctl:review", "prompt_text" => "same prompt"}
+      ]
+
+      {:ok, summary} = Skills.import_skills(tenant.id, skills_data)
+      assert summary["total"] == 1
+      assert summary["unchanged"] == 1
+      assert summary["updated"] == 0
+
+      # Version should still be 1
+      {:ok, skill} = Skills.get_skill_by_name(tenant.id, "loopctl:review")
+      assert skill.current_version == 1
     end
 
     test "mixes creates and updates" do
@@ -80,6 +103,21 @@ defmodule Loopctl.Skills.SkillImportTest do
 
       {:ok, summary} = Skills.import_skills(tenant.id, [])
       assert summary["total"] == 0
+    end
+
+    test "rolls back all changes on failure" do
+      tenant = fixture(:tenant)
+
+      # Import with a nil name should fail the changeset
+      skills_data = [
+        %{"name" => "good-skill", "prompt_text" => "good"},
+        %{"name" => nil, "prompt_text" => "bad"}
+      ]
+
+      assert {:error, _changeset} = Skills.import_skills(tenant.id, skills_data)
+
+      # First skill should not have been created (transaction rolled back)
+      assert {:error, :not_found} = Skills.get_skill_by_name(tenant.id, "good-skill")
     end
   end
 end

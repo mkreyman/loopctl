@@ -126,6 +126,6 @@ defmodule Loopctl.CLI.Config do
   end
 
   defp home_dir do
-    System.user_home!()
+    Application.get_env(:loopctl, :cli_config_dir, System.user_home!())
   end
 end

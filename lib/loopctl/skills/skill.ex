@@ -48,7 +48,10 @@ defmodule Loopctl.Skills.Skill do
     |> cast(attrs, [:name, :description, :metadata])
     |> validate_required([:name])
     |> validate_length(:name, min: 1, max: 255)
-    |> unique_constraint([:tenant_id, :name])
+    |> unique_constraint([:tenant_id, :name],
+      name: :skills_tenant_project_name_index,
+      message: "has already been taken for this tenant and project"
+    )
   end
 
   @doc """

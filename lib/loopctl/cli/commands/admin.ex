@@ -24,12 +24,13 @@ defmodule Loopctl.CLI.Commands.Admin do
       ["suspend", id] -> suspend_tenant(id, opts)
       ["activate", id] -> activate_tenant(id, opts)
       ["stats"] -> stats(opts)
-      _ -> Output.error("Usage: loopctl admin tenants|tenant|suspend|activate|stats")
+      ["impersonate", tenant_id | rest] -> impersonate(tenant_id, rest, opts)
+      _ -> Output.error("Usage: loopctl admin tenants|tenant|suspend|activate|stats|impersonate")
     end
   end
 
   def run(_command, _args, _opts) do
-    Output.error("Usage: loopctl admin tenants|tenant|suspend|activate|stats")
+    Output.error("Usage: loopctl admin tenants|tenant|suspend|activate|stats|impersonate")
   end
 
   defp list_tenants(opts) do
@@ -72,6 +73,37 @@ defmodule Loopctl.CLI.Commands.Admin do
       {:error, reason} -> handle_error(reason)
     end
   end
+
+  defp impersonate(tenant_id, rest, opts) do
+    # Parse the remaining arguments as: <method> <path> [body_json]
+    case rest do
+      ["get", path | _] ->
+        case Client.get(path, headers: [{"x-impersonate-tenant", tenant_id}]) do
+          {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
+          {:error, reason} -> handle_error(reason)
+        end
+
+      ["post", path | body_rest] ->
+        body = parse_body(body_rest)
+
+        case Client.post(path, body, headers: [{"x-impersonate-tenant", tenant_id}]) do
+          {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
+          {:error, reason} -> handle_error(reason)
+        end
+
+      _ ->
+        Output.error("Usage: loopctl admin impersonate <tenant_id> get|post <path> [json_body]")
+    end
+  end
+
+  defp parse_body([json_str | _]) do
+    case Jason.decode(json_str) do
+      {:ok, body} -> body
+      {:error, _} -> %{}
+    end
+  end
+
+  defp parse_body([]), do: %{}
 
   defp handle_error(:no_server_configured) do
     Output.error("No server configured. Run: loopctl auth login --server <url> --key <key>")
