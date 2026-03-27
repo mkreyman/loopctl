@@ -108,6 +108,7 @@ defmodule LoopctlWeb.Router do
 
     # Orchestrator state
     put "/orchestrator/state/:project_id", OrchestratorStateController, :save
+    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
     get "/orchestrator/state/:project_id", OrchestratorStateController, :show
   end
 end

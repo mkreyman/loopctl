@@ -4,6 +4,7 @@ defmodule LoopctlWeb.OrchestratorStateController do
 
   - `PUT /api/v1/orchestrator/state/:project_id` -- save state (upsert)
   - `GET /api/v1/orchestrator/state/:project_id` -- retrieve state
+  - `GET /api/v1/orchestrator/state/:project_id/history` -- version history
   """
 
   use LoopctlWeb, :controller
@@ -67,6 +68,38 @@ defmodule LoopctlWeb.OrchestratorStateController do
     end
   end
 
+  @doc """
+  GET /api/v1/orchestrator/state/:project_id/history
+
+  Returns version history derived from audit log entries.
+  Supports pagination and state_key filtering.
+  """
+  def history(conn, %{"project_id" => project_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts =
+      []
+      |> maybe_add_opt(:state_key, params["state_key"] || "main")
+      |> maybe_add_opt(:page, parse_int(params["page"]))
+      |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+
+    case Orchestrator.get_state_history(tenant_id, project_id, opts) do
+      {:ok, result} ->
+        json(conn, %{
+          data: result.data,
+          meta: %{
+            page: result.page,
+            page_size: result.page_size,
+            total_count: result.total,
+            total_pages: ceil_div(result.total, result.page_size)
+          }
+        })
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
   # --- Private helpers ---
 
   defp state_json(state) do
@@ -81,4 +114,20 @@ defmodule LoopctlWeb.OrchestratorStateController do
       updated_at: state.updated_at
     }
   end
+
+  defp parse_int(nil), do: nil
+
+  defp parse_int(val) when is_binary(val) do
+    case Integer.parse(val) do
+      {n, _} -> n
+      :error -> nil
+    end
+  end
+
+  defp parse_int(val) when is_integer(val), do: val
+
+  defp maybe_add_opt(opts, _key, nil), do: opts
+  defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
 end

@@ -97,6 +97,80 @@ defmodule Loopctl.Orchestrator do
     end
   end
 
+  @doc """
+  Returns version history for orchestrator state by querying the audit log.
+
+  History entries are derived from audit_log entries with
+  `entity_type="orchestrator_state"` and `action="saved"`.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `project_id` -- the project UUID
+  - `opts` -- keyword list with:
+    - `:state_key` -- filter by state key (default: `"main"`)
+    - `:page` -- page number (default 1)
+    - `:page_size` -- entries per page (default 25, max 100)
+
+  ## Returns
+
+  `{:ok, %{data: [map()], total: integer, page: integer, page_size: integer}}`
+  """
+  @spec get_state_history(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             data: [map()],
+             total: non_neg_integer(),
+             page: pos_integer(),
+             page_size: pos_integer()
+           }}
+          | {:error, :not_found}
+  def get_state_history(tenant_id, project_id, opts \\ []) do
+    with {:ok, _project} <- get_project(tenant_id, project_id) do
+      state_key = Keyword.get(opts, :state_key, "main")
+      page = max(Keyword.get(opts, :page, 1), 1)
+      page_size = opts |> Keyword.get(:page_size, 25) |> max(1) |> min(100)
+      offset = (page - 1) * page_size
+
+      base_query =
+        Loopctl.Audit.AuditLog
+        |> where([a], a.tenant_id == ^tenant_id)
+        |> where([a], a.entity_type == "orchestrator_state")
+        |> where([a], a.action == "saved")
+        |> where(
+          [a],
+          fragment("?->>'state_key' = ?", a.new_state, ^state_key)
+        )
+        |> where(
+          [a],
+          fragment("?->>'project_id' = ?", a.new_state, ^project_id)
+        )
+
+      total = AdminRepo.aggregate(base_query, :count, :id)
+
+      entries =
+        base_query
+        |> order_by([a], desc: a.inserted_at)
+        |> limit(^page_size)
+        |> offset(^offset)
+        |> AdminRepo.all()
+
+      history =
+        Enum.map(entries, fn entry ->
+          new_state = entry.new_state || %{}
+
+          %{
+            version: new_state["version"],
+            state_data: new_state["state_data"],
+            saved_by: entry.actor_label,
+            saved_at: entry.inserted_at
+          }
+        end)
+
+      {:ok, %{data: history, total: total, page: page, page_size: page_size}}
+    end
+  end
+
   # --- Private helpers ---
 
   defp validate_state_key(state_key, tenant_id, project_id, attrs) do

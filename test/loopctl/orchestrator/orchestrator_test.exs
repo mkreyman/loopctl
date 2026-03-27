@@ -270,4 +270,135 @@ defmodule Loopctl.OrchestratorTest do
       assert {:error, :not_found} = Orchestrator.get_state(tenant_b.id, project_a.id, "main")
     end
   end
+
+  describe "get_state_history/3" do
+    test "returns history from audit log entries" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Save state 3 times to create audit entries
+      attrs1 = %{state_key: "main", state_data: %{"step" => 1}, version: 0}
+      assert {:ok, _} = Orchestrator.save_state(tenant.id, project.id, attrs1)
+
+      attrs2 = %{state_key: "main", state_data: %{"step" => 2}, version: 1}
+      assert {:ok, _} = Orchestrator.save_state(tenant.id, project.id, attrs2)
+
+      attrs3 = %{state_key: "main", state_data: %{"step" => 3}, version: 2}
+      assert {:ok, _} = Orchestrator.save_state(tenant.id, project.id, attrs3)
+
+      assert {:ok, %{data: history, total: 3}} =
+               Orchestrator.get_state_history(tenant.id, project.id, state_key: "main")
+
+      assert length(history) == 3
+
+      # Most recent first
+      [h3, h2, h1] = history
+      assert h3.version == 3
+      assert h3.state_data == %{"step" => 3}
+      assert h2.version == 2
+      assert h2.state_data == %{"step" => 2}
+      assert h1.version == 1
+      assert h1.state_data == %{"step" => 1}
+    end
+
+    test "filters by state_key" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Save to "main" twice
+      assert {:ok, _} =
+               Orchestrator.save_state(tenant.id, project.id, %{
+                 state_key: "main",
+                 state_data: %{"m" => 1},
+                 version: 0
+               })
+
+      assert {:ok, _} =
+               Orchestrator.save_state(tenant.id, project.id, %{
+                 state_key: "main",
+                 state_data: %{"m" => 2},
+                 version: 1
+               })
+
+      # Save to "backup" once
+      assert {:ok, _} =
+               Orchestrator.save_state(tenant.id, project.id, %{
+                 state_key: "backup",
+                 state_data: %{"b" => 1},
+                 version: 0
+               })
+
+      assert {:ok, %{data: main_history, total: 2}} =
+               Orchestrator.get_state_history(tenant.id, project.id, state_key: "main")
+
+      assert {:ok, %{data: backup_history, total: 1}} =
+               Orchestrator.get_state_history(tenant.id, project.id, state_key: "backup")
+
+      assert length(main_history) == 2
+      assert length(backup_history) == 1
+    end
+
+    test "returns empty list for project with no state history" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      assert {:ok, %{data: [], total: 0}} =
+               Orchestrator.get_state_history(tenant.id, project.id, state_key: "main")
+    end
+
+    test "returns not_found for non-existent project" do
+      tenant = fixture(:tenant)
+
+      assert {:error, :not_found} =
+               Orchestrator.get_state_history(tenant.id, uuid(), state_key: "main")
+    end
+
+    test "supports pagination" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Save state 5 times
+      for i <- 0..4 do
+        assert {:ok, _} =
+                 Orchestrator.save_state(tenant.id, project.id, %{
+                   state_key: "main",
+                   state_data: %{"step" => i + 1},
+                   version: i
+                 })
+      end
+
+      assert {:ok, %{data: page1, total: 5, page: 1, page_size: 2}} =
+               Orchestrator.get_state_history(tenant.id, project.id,
+                 state_key: "main",
+                 page: 1,
+                 page_size: 2
+               )
+
+      assert length(page1) == 2
+      # Most recent first
+      assert Enum.at(page1, 0).version == 5
+      assert Enum.at(page1, 1).version == 4
+
+      assert {:ok, %{data: page2}} =
+               Orchestrator.get_state_history(tenant.id, project.id,
+                 state_key: "main",
+                 page: 2,
+                 page_size: 2
+               )
+
+      assert length(page2) == 2
+      assert Enum.at(page2, 0).version == 3
+      assert Enum.at(page2, 1).version == 2
+
+      assert {:ok, %{data: page3}} =
+               Orchestrator.get_state_history(tenant.id, project.id,
+                 state_key: "main",
+                 page: 3,
+                 page_size: 2
+               )
+
+      assert length(page3) == 1
+      assert Enum.at(page3, 0).version == 1
+    end
+  end
 end
