@@ -76,6 +76,12 @@ defmodule Loopctl.DataCase do
     Mox.stub(Loopctl.MockClock, :utc_now, fn ->
       DateTime.utc_now()
     end)
+
+    # Default Req.Test stub for webhook delivery -- allows Oban inline mode
+    # to process delivery jobs without test-specific HTTP stub setup.
+    Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+      Req.Test.json(conn, %{"ok" => true})
+    end)
   end
 
   @doc """

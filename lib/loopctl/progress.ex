@@ -19,8 +19,11 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Tenants
+  alias Loopctl.Webhooks.EventGenerator
+  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   # --- Agent Status Transitions (US-7.1) ---
 
@@ -90,6 +93,23 @@ defmodule Loopctl.Progress do
           new_state: %{
             "agent_status" => to_string(updated.agent_status),
             "agent_id" => agent_id
+          }
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.status_changed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.status_changed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
         }
       end)
@@ -166,6 +186,23 @@ defmodule Loopctl.Progress do
           }
         }
       end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.status_changed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.status_changed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
@@ -232,6 +269,23 @@ defmodule Loopctl.Progress do
           new_state: %{
             "agent_status" => to_string(updated.agent_status),
             "agent_id" => agent_id
+          }
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.status_changed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.status_changed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
         }
       end)
@@ -311,6 +365,23 @@ defmodule Loopctl.Progress do
           }
         }
       end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.status_changed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.status_changed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
@@ -376,6 +447,23 @@ defmodule Loopctl.Progress do
             new_state: %{"agent_status" => "pending", "agent_id" => agent_id}
           }
         end)
+        |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "story.status_changed",
+            project_id: updated.project_id,
+            payload: %{
+              "event" => "story.status_changed",
+              "story_id" => updated.id,
+              "project_id" => updated.project_id,
+              "epic_id" => updated.epic_id,
+              "old_status" => to_string(story.agent_status),
+              "new_status" => "pending",
+              "agent_id" => agent_id,
+              "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+            }
+          }
+        end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{story: updated}} -> {:ok, updated}
@@ -431,6 +519,22 @@ defmodule Loopctl.Progress do
         verification_params
       )
       |> audit_verification(tenant_id, "verified", actor_id, actor_label, orchestrator_agent_id)
+      |> EventGenerator.generate_events(:webhook_events_verified, fn %{story: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.verified",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.verified",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "orchestrator_agent_id" => orchestrator_agent_id,
+            "summary" => verification_params.summary,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
       |> maybe_complete_epic(tenant_id, actor_id, actor_label)
 
     unwrap_verification_transaction(multi)
@@ -481,7 +585,24 @@ defmodule Loopctl.Progress do
         end)
         |> insert_verification_result(tenant_id, orchestrator_agent_id, :fail, rejection_params)
         |> audit_verification(tenant_id, "rejected", actor_id, actor_label, orchestrator_agent_id)
-        |> maybe_auto_reset(tenant_id)
+        |> EventGenerator.generate_events(:webhook_events_rejected, fn %{story: updated} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "story.rejected",
+            project_id: updated.project_id,
+            payload: %{
+              "event" => "story.rejected",
+              "story_id" => updated.id,
+              "project_id" => updated.project_id,
+              "epic_id" => updated.epic_id,
+              "orchestrator_agent_id" => orchestrator_agent_id,
+              "reason" => reason,
+              "findings" => rejection_params.findings,
+              "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+            }
+          }
+        end)
+        |> maybe_auto_reset(tenant_id, orchestrator_agent_id)
 
       unwrap_verification_transaction(multi)
     end
@@ -591,8 +712,23 @@ defmodule Loopctl.Progress do
           }
         }
       end)
-
-    # NOTE(Epic 10): Webhook event for story.force_unclaimed deferred to Epic 10.
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.force_unclaimed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.force_unclaimed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(story.agent_status),
+            "new_status" => "pending",
+            "orchestrator_agent_id" => orch_agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
@@ -731,22 +867,36 @@ defmodule Loopctl.Progress do
   defp record_epic_completion(tenant_id, epic_id, story_count, actor_id, actor_label) do
     epic = AdminRepo.get!(Epic, epic_id)
 
-    # NOTE(Epic 10): Webhook event for epic.completed deferred to Epic 10.
-    Audit.create_log_entry(tenant_id, %{
-      entity_type: "epic",
-      entity_id: epic_id,
-      action: "completed",
-      actor_type: "api_key",
-      actor_id: actor_id,
-      actor_label: actor_label,
-      new_state: %{
-        "epic_id" => epic_id,
-        "epic_number" => epic.number,
-        "epic_title" => epic.title,
-        "project_id" => epic.project_id,
-        "story_count" => story_count
-      }
-    })
+    payload = %{
+      "event" => "epic.completed",
+      "epic_id" => epic_id,
+      "epic_number" => epic.number,
+      "epic_title" => epic.title,
+      "project_id" => epic.project_id,
+      "story_count" => story_count,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    }
+
+    with {:ok, _audit} <-
+           Audit.create_log_entry(tenant_id, %{
+             entity_type: "epic",
+             entity_id: epic_id,
+             action: "completed",
+             actor_type: "api_key",
+             actor_id: actor_id,
+             actor_label: actor_label,
+             new_state: %{
+               "epic_id" => epic_id,
+               "epic_number" => epic.number,
+               "epic_title" => epic.title,
+               "project_id" => epic.project_id,
+               "story_count" => story_count
+             }
+           }) do
+      insert_events_with_delivery(tenant_id, "epic.completed", epic.project_id, payload)
+
+      {:ok, :completed}
+    end
   end
 
   defp unwrap_verification_transaction(multi) do
@@ -762,11 +912,11 @@ defmodule Loopctl.Progress do
     end
   end
 
-  defp maybe_auto_reset(multi, tenant_id) do
+  defp maybe_auto_reset(multi, tenant_id, orchestrator_agent_id) do
     Multi.run(multi, :auto_reset, fn _repo, %{lock: old_story, story: rejected_story} ->
       with {:ok, tenant} <- Tenants.get_tenant(tenant_id),
            true <- Tenants.get_tenant_settings(tenant, "auto_reset_on_rejection", true) do
-        perform_auto_reset(rejected_story, old_story, tenant_id)
+        perform_auto_reset(rejected_story, old_story, tenant_id, orchestrator_agent_id)
       else
         false -> {:ok, nil}
         error -> error
@@ -774,7 +924,7 @@ defmodule Loopctl.Progress do
     end)
   end
 
-  defp perform_auto_reset(story, old_story, tenant_id) do
+  defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id) do
     changeset =
       Ecto.Changeset.change(story, %{
         agent_status: :pending,
@@ -800,9 +950,52 @@ defmodule Loopctl.Progress do
                "agent_status" => "pending",
                "assigned_agent_id" => nil
              }
-           }) do
+           }),
+         _events <-
+           generate_auto_reset_events(
+             tenant_id,
+             reset_story,
+             orchestrator_agent_id
+           ) do
       {:ok, reset_story}
     end
+  end
+
+  defp generate_auto_reset_events(tenant_id, story, orchestrator_agent_id) do
+    payload = %{
+      "event" => "story.auto_reset",
+      "story_id" => story.id,
+      "project_id" => story.project_id,
+      "epic_id" => story.epic_id,
+      "reason" => "rejected",
+      "orchestrator_agent_id" => orchestrator_agent_id,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    }
+
+    insert_events_with_delivery(tenant_id, "story.auto_reset", story.project_id, payload)
+  end
+
+  defp insert_events_with_delivery(tenant_id, event_type, project_id, payload) do
+    EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
+    |> Enum.each(fn webhook ->
+      {:ok, event} =
+        %WebhookEvent{
+          tenant_id: tenant_id,
+          webhook_id: webhook.id
+        }
+        |> WebhookEvent.create_changeset(%{
+          event_type: event_type,
+          payload: payload
+        })
+        |> AdminRepo.insert()
+
+      {:ok, _job} =
+        WebhookDeliveryWorker.new(%{
+          webhook_event_id: event.id,
+          tenant_id: tenant_id
+        })
+        |> Oban.insert()
+    end)
   end
 
   defp extract_verification_params(params) do

@@ -20,6 +20,7 @@ defmodule Loopctl.Agents do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Audit
+  alias Loopctl.Webhooks.EventGenerator
 
   @doc """
   Registers a new agent within a tenant.
@@ -70,6 +71,19 @@ defmodule Loopctl.Agents do
             "name" => agent.name,
             "agent_type" => to_string(agent.agent_type),
             "status" => to_string(agent.status)
+          }
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{agent: agent} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "agent.registered",
+          payload: %{
+            "event" => "agent.registered",
+            "agent_id" => agent.id,
+            "agent_name" => agent.name,
+            "agent_type" => to_string(agent.agent_type),
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
         }
       end)
