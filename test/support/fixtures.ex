@@ -18,6 +18,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.Skills.Skill
+  alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Webhooks.Webhook
@@ -220,6 +221,19 @@ defmodule Loopctl.Fixtures do
         prompt_text: "Test prompt text for skill version",
         changelog: "Initial version",
         created_by: "test"
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:skill_result, attrs) do
+    Map.merge(
+      %{
+        metrics: %{
+          "findings_count" => 5,
+          "false_positive_count" => 1,
+          "true_positive_count" => 4
+        }
       },
       Enum.into(attrs, %{})
     )
@@ -741,6 +755,27 @@ defmodule Loopctl.Fixtures do
         version: version
       }
       |> SkillVersion.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:skill_result, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    skill_version_id = Map.fetch!(attrs, :skill_version_id)
+    verification_result_id = Map.fetch!(attrs, :verification_result_id)
+    story_id = Map.fetch!(attrs, :story_id)
+
+    data = build(:skill_result, attrs)
+
+    changeset =
+      %SkillResult{
+        tenant_id: tenant_id,
+        skill_version_id: skill_version_id,
+        verification_result_id: verification_result_id,
+        story_id: story_id
+      }
+      |> SkillResult.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end

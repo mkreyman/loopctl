@@ -135,6 +135,11 @@ defmodule LoopctlWeb.Router do
     post "/skills/:id/versions", SkillController, :create_version
     get "/skills/:id/versions", SkillController, :list_versions
     get "/skills/:id/versions/:version", SkillController, :get_version
+    get "/skills/:id/stats", SkillController, :stats
+    get "/skills/:id/versions/:version/results", SkillController, :version_results
+
+    # Skill results
+    post "/skill_results", SkillResultController, :create
   end
 
   # Superadmin endpoints (Epic 11)

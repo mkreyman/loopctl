@@ -13,6 +13,7 @@ defmodule Loopctl.Skills do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Skills.Skill
+  alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
 
   # ===================================================================
@@ -309,6 +310,93 @@ defmodule Loopctl.Skills do
          ) do
       nil -> {:error, :not_found}
       version -> {:ok, version}
+    end
+  end
+
+  # ===================================================================
+  # Skill Results (Performance Tracking)
+  # ===================================================================
+
+  @doc """
+  Records a skill result linking a verification to a skill version.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `attrs` -- map with `skill_version_id`, `verification_result_id`, `story_id`, `metrics`
+  """
+  @spec create_skill_result(Ecto.UUID.t(), map()) ::
+          {:ok, SkillResult.t()} | {:error, Ecto.Changeset.t()}
+  def create_skill_result(tenant_id, attrs) do
+    skill_version_id =
+      Map.get(attrs, "skill_version_id") || Map.get(attrs, :skill_version_id)
+
+    verification_result_id =
+      Map.get(attrs, "verification_result_id") || Map.get(attrs, :verification_result_id)
+
+    story_id = Map.get(attrs, "story_id") || Map.get(attrs, :story_id)
+
+    changeset =
+      %SkillResult{
+        tenant_id: tenant_id,
+        skill_version_id: skill_version_id,
+        verification_result_id: verification_result_id,
+        story_id: story_id
+      }
+      |> SkillResult.create_changeset(attrs)
+
+    AdminRepo.insert(changeset)
+  end
+
+  @doc """
+  Returns aggregate performance stats for a skill across all versions.
+
+  Groups by version and computes pass/fail/partial counts plus
+  average metrics from the metrics JSONB.
+  """
+  @spec skill_stats(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, list(map())} | {:error, :not_found}
+  def skill_stats(tenant_id, skill_id) do
+    with {:ok, _skill} <- get_skill(tenant_id, skill_id) do
+      stats =
+        SkillResult
+        |> join(:inner, [sr], sv in SkillVersion, on: sr.skill_version_id == sv.id)
+        |> join(:inner, [sr, _sv], vr in Loopctl.Artifacts.VerificationResult,
+          on: sr.verification_result_id == vr.id
+        )
+        |> where([sr, sv, _vr], sv.skill_id == ^skill_id and sr.tenant_id == ^tenant_id)
+        |> group_by([sr, sv, _vr], sv.version)
+        |> select([sr, sv, vr], %{
+          version: sv.version,
+          total_results: count(sr.id),
+          pass_count: count(fragment("CASE WHEN ? = 'pass' THEN 1 END", vr.result)),
+          fail_count: count(fragment("CASE WHEN ? = 'fail' THEN 1 END", vr.result)),
+          partial_count: count(fragment("CASE WHEN ? = 'partial' THEN 1 END", vr.result))
+        })
+        |> order_by([_sr, sv, _vr], asc: sv.version)
+        |> AdminRepo.all()
+
+      {:ok, stats}
+    end
+  end
+
+  @doc """
+  Lists individual results for a specific skill version.
+  """
+  @spec list_version_results(Ecto.UUID.t(), Ecto.UUID.t(), integer(), keyword()) ::
+          {:ok, [SkillResult.t()]} | {:error, :not_found}
+  def list_version_results(tenant_id, skill_id, version_number, _opts \\ []) do
+    with {:ok, version} <- get_version(tenant_id, skill_id, version_number) do
+      results =
+        SkillResult
+        |> where(
+          [sr],
+          sr.skill_version_id == ^version.id and sr.tenant_id == ^tenant_id
+        )
+        |> order_by([sr], desc: sr.inserted_at)
+        |> AdminRepo.all()
+
+      {:ok, results}
     end
   end
 

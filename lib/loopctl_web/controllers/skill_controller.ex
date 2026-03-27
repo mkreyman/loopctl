@@ -23,7 +23,8 @@ defmodule LoopctlWeb.SkillController do
        [role: :user] when action in [:create, :update, :delete, :create_version]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:index, :show, :list_versions, :get_version]
+       [role: :agent]
+       when action in [:index, :show, :list_versions, :get_version, :stats, :version_results]
 
   @doc "POST /api/v1/skills"
   def create(conn, params) do
@@ -171,6 +172,32 @@ defmodule LoopctlWeb.SkillController do
     end
   end
 
+  @doc "GET /api/v1/skills/:id/stats"
+  def stats(conn, %{"id" => skill_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    case Skills.skill_stats(tenant_id, skill_id) do
+      {:ok, stats} -> json(conn, %{data: stats})
+      {:error, :not_found} -> {:error, :not_found}
+    end
+  end
+
+  @doc "GET /api/v1/skills/:id/versions/:version/results"
+  def version_results(conn, %{"id" => skill_id, "version" => version_str}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    case parse_int(version_str) do
+      nil ->
+        {:error, :bad_request, "Invalid version number"}
+
+      version_num ->
+        case Skills.list_version_results(tenant_id, skill_id, version_num) do
+          {:ok, results} -> json(conn, %{data: Enum.map(results, &result_json/1)})
+          {:error, :not_found} -> {:error, :not_found}
+        end
+    end
+  end
+
   # --- Private helpers ---
 
   defp skill_json(skill) do
@@ -207,6 +234,17 @@ defmodule LoopctlWeb.SkillController do
       changelog: version.changelog,
       created_by: version.created_by,
       inserted_at: version.inserted_at
+    }
+  end
+
+  defp result_json(result) do
+    %{
+      id: result.id,
+      skill_version_id: result.skill_version_id,
+      verification_result_id: result.verification_result_id,
+      story_id: result.story_id,
+      metrics: result.metrics,
+      inserted_at: result.inserted_at
     }
   end
 
