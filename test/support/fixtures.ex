@@ -10,6 +10,7 @@ defmodule Loopctl.Fixtures do
   """
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Tenants.Tenant
 
@@ -27,6 +28,23 @@ defmodule Loopctl.Fixtures do
         email: "test-#{System.unique_integer([:positive])}@example.com",
         settings: %{},
         status: :active
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:audit_log, attrs) do
+    Map.merge(
+      %{
+        entity_type: "project",
+        entity_id: Ecto.UUID.generate(),
+        action: "created",
+        actor_type: "api_key",
+        actor_id: Ecto.UUID.generate(),
+        actor_label: "user:test",
+        old_state: nil,
+        new_state: %{"name" => "Test"},
+        metadata: %{}
       },
       Enum.into(attrs, %{})
     )
@@ -92,6 +110,30 @@ defmodule Loopctl.Fixtures do
 
     {:ok, {raw_key, api_key}} = Auth.generate_api_key(data)
     {raw_key, api_key}
+  end
+
+  def fixture(:audit_log, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:audit_log, attrs)
+
+    changeset =
+      data
+      |> AuditLog.create_changeset()
+      |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+
+    AdminRepo.insert!(changeset)
   end
 
   @doc """
