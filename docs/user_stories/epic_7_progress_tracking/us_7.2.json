@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-7.2.3",
-      "description": "Both verify and reject endpoints return 403 Forbidden when called with agent, user, or superadmin role API keys.",
+      "description": "Verification endpoints (verify, reject) require exact_role: :orchestrator. Superadmin can access via impersonation (X-Impersonate-Tenant header per US-11.2). Direct superadmin access without impersonation returns 403.",
       "status": "pending"
     },
     {

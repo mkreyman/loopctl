@@ -259,6 +259,7 @@
     "After the transaction commits, enqueue Oban jobs for each pending webhook_event. This can be done via an Ecto.Multi after-commit callback or an Oban insert_all in the multi (Oban jobs are transactional when inserted in the same multi).",
     "Payload schema examples: story.status_changed: {event: 'story.status_changed', story_id, project_id, epic_id, old_status, new_status, agent_id, timestamp}.",
     "The epic.completed event requires checking if all stories in the epic are verified after each story verification. This check runs inside the verify transaction.",
+    "For bulk operations (US-13.1), querying active webhooks inside Ecto.Multi for each story could result in N * W database queries (N stories * W webhooks). Consider caching active webhook subscriptions in ETS with a short TTL (e.g., 60 seconds) keyed by {tenant_id, project_id}. Invalidate on webhook create/update/delete.",
     "Consider a helper function that wraps the common pattern: update entity + create audit log + generate webhook events, all in one Ecto.Multi.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",

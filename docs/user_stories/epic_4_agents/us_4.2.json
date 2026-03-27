@@ -206,6 +206,7 @@
     "Pagination: use offset/limit with total_count in response metadata. Consider Scrivener or a simple custom implementation.",
     "Controller at LoopctlWeb.AgentController with index and show actions.",
     "Routes: GET /api/v1/agents and GET /api/v1/agents/:id. RequireRole plug set to [:orchestrator, :user, :superadmin].",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}. The change feed endpoint (US-3.2) uses cursor-based pagination (since= timestamp) instead.",
     "RLS ensures tenant isolation at the database level. Application-level scoping by tenant_id is defense in depth.",
     "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",

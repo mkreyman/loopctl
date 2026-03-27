@@ -63,6 +63,16 @@
       "id": "AC-1.1.10",
       "description": "Jason is configured as the JSON library for both Phoenix and Ecto",
       "status": "pending"
+    },
+    {
+      "id": "AC-1.1.11",
+      "description": "Application MUST configure structured JSON logging with Logger backends. Every log entry MUST include tenant_id and request_id metadata when available. Use Logger.metadata/1 to set context in the auth pipeline.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.1.12",
+      "description": "Application MUST define Telemetry events for key operations: API request duration, story status transitions, webhook deliveries, audit log writes. Use :telemetry.execute/3 with measurements and metadata.",
+      "status": "pending"
     }
   ],
   "test_cases": [

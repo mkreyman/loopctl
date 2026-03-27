@@ -237,7 +237,8 @@
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)"
   ],
   "dependencies": [
-    "US-6.4"
+    "US-6.4",
+    "US-3.1"
   ],
   "estimated_hours": 8
 }

@@ -234,6 +234,7 @@
     "Loopctl.Webhooks context module: create_webhook/2, list_webhooks/1, get_webhook!/2, update_webhook/2, delete_webhook/1.",
     "WebhookController with create, index, show, update, delete actions. Routes under /api/v1/webhooks.",
     "URL validation: require https:// scheme (reject http:// in production, allow in dev/test). Validate URL format with URI.parse.",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}. The change feed endpoint (US-3.2) uses cursor-based pagination (since= timestamp) instead.",
     "The signing_secret is only returned in the POST creation response. All other endpoints omit it. Use a separate JSON view/serializer for creation vs. list/show.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",

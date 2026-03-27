@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-3.1.1",
-      "description": "An audit_log table exists with columns: id (uuid PK), tenant_id (uuid FK, nullable for superadmin), entity_type (string), entity_id (uuid), action (string), actor_type (string), actor_id (uuid), actor_label (string), old_state (jsonb), new_state (jsonb), metadata (jsonb), inserted_at (utc_datetime). No updated_at column.",
+      "description": "An audit_log table exists with columns: id (uuid PK), tenant_id (uuid FK, nullable for superadmin), project_id (uuid FK, nullable, indexed), entity_type (string), entity_id (uuid), action (string), actor_type (string), actor_id (uuid), actor_label (string), old_state (jsonb), new_state (jsonb), metadata (jsonb), inserted_at (utc_datetime). No updated_at column.",
       "status": "pending"
     },
     {
@@ -62,6 +62,11 @@
     {
       "id": "AC-3.1.10",
       "description": "The Ecto schema for audit_log has no changeset function that allows updates. The schema module only exposes a create_changeset/1 function.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.11",
+      "description": "The audit_log table MUST include a nullable, indexed project_id column (FK to projects). Context functions that create audit entries for project-scoped entities (stories, epics, dependencies, artifacts, verifications) MUST populate project_id. This enables efficient filtering in the change feed endpoint without heterogeneous joins.",
       "status": "pending"
     }
   ],

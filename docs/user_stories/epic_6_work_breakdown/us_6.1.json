@@ -211,7 +211,7 @@
     },
     {
       "id": "TC-6.1.8",
-      "name": "Mutation creates audit log entry",
+      "name": "Mutation creates audit log entries for epic operations",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
@@ -219,11 +219,15 @@
         "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
       ],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/projects/:project_id/epics with valid params and user API key",
+        "PATCH /api/v1/epics/:id with updated title and user API key",
+        "DELETE /api/v1/epics/:id with user API key"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='epic', entity_id=new_epic.id, action='created', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='epic', entity_id=epic.id, action='updated', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='epic', entity_id=epic.id, action='deleted', actor_type='api_key', actor_id=api_key.id",
+        "All audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
       ],
       "status": "pending"
     }
@@ -235,6 +239,7 @@
     "Consider a Loopctl.WorkBreakdown context module that handles both epics and stories",
     "The list endpoint should support optional filtering by phase: ?phase=p0_foundation",
     "Epic number is an integer (not a string) unlike story numbers which are strings (e.g., '2.1')",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}. The change feed endpoint (US-3.2) uses cursor-based pagination (since= timestamp) instead.",
     "Metadata jsonb defaults to %{} (empty map)",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",

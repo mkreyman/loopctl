@@ -177,18 +177,16 @@
     },
     {
       "id": "TC-2.5.8",
-      "name": "Mutation creates audit log entry",
+      "name": "Registration creates audit log entries for tenant and API key",
       "type": "integration",
-      "preconditions": [
-        "tenant = fixture(:tenant)",
-        "api_key = fixture(:api_key, tenant: tenant, role: :user)"
-      ],
+      "preconditions": [],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/tenants/register with valid params {\"name\": \"Audit Corp\", \"slug\": \"audit-corp\", \"email\": \"admin@audit.com\"}"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='tenant', entity_id=new_tenant.id, action='registered', actor_type='system'",
+        "Audit log entry created with entity_type='api_key', entity_id=new_api_key.id, action='created', actor_type='system'",
+        "Both audit entries are in the same transaction as the tenant and API key creation (no orphaned entities without audit)"
       ],
       "status": "pending"
     }
@@ -196,7 +194,7 @@
   "technical_notes": [
     "Use Ecto.Multi for the transactional tenant + API key creation",
     "The endpoint must be outside the :authenticated pipeline in the router",
-    "Rate limiting on this endpoint can use a simple IP-based ETS counter (or defer to US-2.7)",
+    "Registration rate limiting is IP-based (conn.remote_ip), NOT per-API-key (since registration is unauthenticated). Use a separate ETS counter table (e.g., :registration_rate_limits) with {ip, window_start} keys. This is independent of the per-API-key rate limiting in US-2.7.",
     "The response JSON view should have a special registration_json/1 that includes the raw_key (not used in any other API key view)",
     "Consider logging registration events to the audit trail with actor_type: 'system'",
     "GET /api/v1/tenants/me and PATCH /api/v1/tenants/me are referenced here but will be implemented as part of this story since they are simple tenant profile endpoints",
@@ -207,7 +205,8 @@
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-2.4"
+    "US-2.4",
+    "US-3.1"
   ],
   "estimated_hours": 4
 }

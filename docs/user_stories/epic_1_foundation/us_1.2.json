@@ -194,6 +194,7 @@
     }
   ],
   "technical_notes": [
+    "The base schema macro CANNOT inject fields directly via __using__/1 because Ecto requires fields inside the schema block. Two implementation approaches: (1) Provide a tenant_field() macro that developers call inside their schema block: `schema \"my_table\" do; tenant_field(); field :name, :string; end`. (2) Use @before_compile to modify module attributes. Approach 1 is recommended — it's explicit and follows Ecto conventions.",
     "Use __using__/1 macro with keyword options: tenant_scoped (default true), soft_delete (default false)",
     "tenant_id should be belongs_to :tenant, Loopctl.Tenants.Tenant, type: :binary_id — but the Tenant schema may not exist yet; use a plain field for now and add the association later",
     "Consider providing a base_changeset/2 function that validates tenant_id presence, which downstream schemas can pipe into",

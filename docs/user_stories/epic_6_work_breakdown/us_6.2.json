@@ -68,6 +68,11 @@
       "id": "AC-6.2.11",
       "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.2.12",
+      "description": "Story numbers MUST be unique within a PROJECT (not just within an epic). Add a composite unique index on [tenant_id, project_id, number] where project_id is derived through the epic. This ensures unambiguous dependency references in import/export. The project_id should be denormalized onto the stories table for this constraint.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -236,7 +241,7 @@
     },
     {
       "id": "TC-6.2.9",
-      "name": "Mutation creates audit log entry",
+      "name": "Mutation creates audit log entries for story operations",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
@@ -245,11 +250,15 @@
         "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
       ],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/epics/:epic_id/stories with valid params and user API key",
+        "PATCH /api/v1/stories/:id with updated title and user API key",
+        "DELETE /api/v1/stories/:id with user API key"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='story', entity_id=new_story.id, action='created', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='story', entity_id=story.id, action='updated', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='story', entity_id=story.id, action='deleted', actor_type='api_key', actor_id=api_key.id",
+        "All audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
       ],
       "status": "pending"
     }
@@ -261,7 +270,9 @@
     "The PATCH endpoint must use a separate changeset function (update_changeset) that explicitly excludes agent_status and verified_status from cast/3",
     "acceptance_criteria is stored as jsonb — no validation on its internal structure beyond being valid JSON",
     "The show endpoint preloads are: dependencies (story_dependencies), artifact_reports (latest N), verification_results (latest)",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}. The change feed endpoint (US-3.2) uses cursor-based pagination (since= timestamp) instead.",
     "estimated_hours uses Decimal type for precision (e.g., 0.5 hours)",
+    "Denormalize project_id onto stories table (set programmatically via epic.project_id, never in changeset cast). This enables project-wide uniqueness constraint and simplifies queries that filter by project.",
     "Consider adding a max_stories_per_project limit check from tenant settings",
     "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
@@ -269,7 +280,8 @@
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-6.1"
+    "US-6.1",
+    "US-3.1"
   ],
   "estimated_hours": 6
 }

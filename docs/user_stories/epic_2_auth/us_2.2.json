@@ -196,18 +196,20 @@
     },
     {
       "id": "TC-2.2.9",
-      "name": "Mutation creates audit log entry",
+      "name": "Mutation creates audit log entry for API key operations",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "api_key = fixture(:api_key, tenant: tenant, role: :user)"
       ],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/api_keys with user API key and body {\"name\": \"new-key\", \"role\": \"agent\"}",
+        "DELETE /api/v1/api_keys/:id with user API key to revoke the created key"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='api_key', entity_id=new_api_key.id, action='created', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='api_key', entity_id=revoked_api_key.id, action='revoked', actor_type='api_key', actor_id=api_key.id",
+        "Audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
       ],
       "status": "pending"
     },
@@ -242,10 +244,12 @@
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Initial implementation of tenant/API key creation may skip audit logging. Audit logging for these entities is added retroactively after US-3.1 is implemented. The audit AC is a requirement for the FINAL state, not necessarily the initial commit."
   ],
   "dependencies": [
-    "US-2.1"
+    "US-2.1",
+    "US-3.1"
   ],
   "estimated_hours": 6
 }

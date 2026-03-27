@@ -1,0 +1,161 @@
+{
+  "id": "US-7.4",
+  "title": "Epic Completion Detection and Webhook Event",
+  "epic": {
+    "id": "epic_7",
+    "name": "Progress Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "be notified when all stories in an epic reach verified_status=verified",
+    "so_that": "I know the epic is complete and can unblock dependent epics"
+  },
+  "rationale": "The orchestrator needs to know when an entire epic is complete so it can begin assigning stories from dependent epics. Without this detection, the orchestrator must manually check every story in every epic on each polling cycle. The epic.completed webhook event enables event-driven orchestration.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-7.4.1",
+      "description": "When a story's verified_status is set to 'verified', the system checks if ALL stories in that story's epic now have verified_status=verified.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.2",
+      "description": "If all stories are verified, an 'epic.completed' webhook event is created in the SAME Ecto.Multi transaction as the verification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.3",
+      "description": "The epic.completed event payload includes: epic_id, epic_number, epic_title, project_id, story_count, and total duration (first story assigned_at to last story verified_at).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.4",
+      "description": "Epic completion is detected atomically — no window where the epic appears complete to one query but the event hasn't fired yet.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.5",
+      "description": "If an epic has zero stories, it is never considered 'completed' (edge case guard).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.6",
+      "description": "The detection is idempotent — verifying an already-verified story does not fire a duplicate epic.completed event.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.7",
+      "description": "Epic completion is recorded in the audit log.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.4.8",
+      "description": "Tenant isolation: epic completion detection only considers stories within the same tenant.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-7.4.1",
+      "name": "Epic completion fires when last story verified",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "epic = fixture(:epic, tenant: tenant)",
+        "story_1 = fixture(:story, epic: epic, verified_status: :verified)",
+        "story_2 = fixture(:story, epic: epic, agent_status: :reported_done, verified_status: :unverified)"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/verify for story_2"
+      ],
+      "expected_results": [
+        "epic.completed webhook event created",
+        "Event payload includes correct epic_id and story_count=2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.4.2",
+      "name": "Epic not complete when stories remain unverified",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "epic = fixture(:epic, tenant: tenant)",
+        "story_1 = fixture(:story, epic: epic, verified_status: :verified)",
+        "story_2 = fixture(:story, epic: epic, verified_status: :unverified)"
+      ],
+      "steps": [
+        "Verify story_1 is already verified, check for epic.completed event"
+      ],
+      "expected_results": [
+        "No epic.completed event exists"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.4.3",
+      "name": "No duplicate epic.completed on re-verification",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "epic with all stories already verified",
+        "epic.completed event already exists"
+      ],
+      "steps": [
+        "Re-verify any story in the epic"
+      ],
+      "expected_results": [
+        "No new epic.completed event created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.4.4",
+      "name": "Empty epic is never completed",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "epic = fixture(:epic, tenant: tenant) with no stories"
+      ],
+      "steps": [
+        "Call epic_completed?(tenant, epic.id)"
+      ],
+      "expected_results": [
+        "Returns false"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.4.5",
+      "name": "Cross-tenant isolation in completion check",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "epic_a = fixture(:epic, tenant: tenant_a) with all stories verified"
+      ],
+      "steps": [
+        "Check completion from tenant_b context"
+      ],
+      "expected_results": [
+        "Epic not visible, no completion detected"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement as a private function called within the verify_story/3 Ecto.Multi pipeline in the Progress context",
+    "Query: SELECT COUNT(*) FROM stories WHERE epic_id = ? AND verified_status != 'verified' — if 0, epic is complete",
+    "Guard against empty epics: also check COUNT(*) > 0 for total stories",
+    "Use a unique constraint or conditional insert to prevent duplicate epic.completed events",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+  ],
+  "dependencies": [
+    "US-7.2",
+    "US-10.2"
+  ],
+  "estimated_hours": 4
+}

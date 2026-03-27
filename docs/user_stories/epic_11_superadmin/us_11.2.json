@@ -58,6 +58,11 @@
       "id": "AC-11.2.9",
       "description": "Impersonation metadata (impersonated_by, impersonated_at) is included in the audit log entry's metadata jsonb field.",
       "status": "pending"
+    },
+    {
+      "id": "AC-11.2.10",
+      "description": "SECURITY NOTE: Impersonation intentionally bypasses the two-tier trust model. A superadmin can impersonate a tenant and both claim stories (as agent) and verify them (as orchestrator). This is an administrative override, not a bug. All impersonated actions are audited with actor_type='superadmin' and the impersonation context, providing a complete audit trail of administrative overrides.",
+      "status": "pending"
     }
   ],
   "test_cases": [

@@ -207,13 +207,15 @@
     "The auto_reset audit_log entry must have actor_type='system' to distinguish it from agent-initiated unclaims.",
     "Ensure reported_done_at is cleared alongside assigned_agent_id and assigned_at during auto-reset.",
     "This story modifies the reject path implemented in US-7.2 — it adds the conditional auto-reset step to the existing Ecto.Multi chain.",
+    "The auto_reset webhook event requires the webhook infrastructure from Epic 10. During initial implementation, the webhook event insertion can be conditional (only if webhook tables exist) or the story can be implemented after US-10.2.",
     "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-7.2"
+    "US-7.2",
+    "US-10.2"
   ],
   "estimated_hours": 3
 }

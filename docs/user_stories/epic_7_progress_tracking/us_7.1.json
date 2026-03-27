@@ -41,7 +41,7 @@
     },
     {
       "id": "AC-7.1.6",
-      "description": "All four endpoints return 403 Forbidden when called with a non-agent role API key (user, orchestrator, or superadmin).",
+      "description": "Agent status endpoints (claim, start, report, unclaim) require exact_role: :agent. Superadmin can access these endpoints via impersonation (X-Impersonate-Tenant header per US-11.2), which sets the effective role context. Direct superadmin access without impersonation returns 403.",
       "status": "pending"
     },
     {
@@ -62,6 +62,11 @@
     {
       "id": "AC-7.1.10",
       "description": "All endpoints return 404 when the story ID does not exist or does not belong to the calling agent's tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.1.11",
+      "description": "The claim endpoint MUST use pessimistic locking (SELECT FOR UPDATE or equivalent atomic UPDATE...WHERE agent_status = 'pending' RETURNING *) to prevent race conditions when multiple agents try to claim the same story simultaneously. Only one agent can succeed; others receive 409 Conflict.",
       "status": "pending"
     }
   ],
@@ -248,6 +253,26 @@
         "Story transitions to reported_done",
         "Artifact report is created with reported_by='agent' and correct reporter_agent_id",
         "Both operations succeed or fail atomically (wrapped in transaction)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.1.9",
+      "name": "Concurrent claim race condition prevented",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story = fixture(:story, tenant: tenant, agent_status: :pending)",
+        "agent_a = fixture(:agent, tenant: tenant)",
+        "agent_b = fixture(:agent, tenant: tenant)"
+      ],
+      "steps": [
+        "Simultaneously POST /api/v1/stories/:id/claim from both agent_a and agent_b (use Task.async)"
+      ],
+      "expected_results": [
+        "Exactly one agent succeeds with 200",
+        "The other receives 409 Conflict",
+        "Story is assigned to exactly one agent"
       ],
       "status": "pending"
     }

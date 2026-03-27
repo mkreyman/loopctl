@@ -225,7 +225,7 @@
     },
     {
       "id": "TC-6.4.8",
-      "name": "Mutation creates audit log entry",
+      "name": "Mutation creates audit log entries for story dependency operations",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
@@ -236,11 +236,13 @@
         "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
       ],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_b.id>\", \"depends_on_story_id\": \"<story_a.id>\"} and user API key",
+        "DELETE /api/v1/story_dependencies/:id with user API key"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='story_dependency', entity_id=new_dep.id, action='created', actor_type='api_key', actor_id=api_key.id",
+        "Audit log entry created with entity_type='story_dependency', entity_id=dep.id, action='deleted', actor_type='api_key', actor_id=api_key.id",
+        "All audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
       ],
       "status": "pending"
     },

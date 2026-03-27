@@ -198,18 +198,20 @@
     },
     {
       "id": "TC-2.1.9",
-      "name": "Mutation creates audit log entry",
+      "name": "Mutation creates audit log entry for tenant operations",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "api_key = fixture(:api_key, tenant: tenant, role: :user)"
       ],
       "steps": [
-        "Perform the mutation via API endpoint"
+        "POST /api/v1/tenants/register with valid params to create a tenant",
+        "PATCH /api/v1/tenants/me with user API key to update tenant name"
       ],
       "expected_results": [
-        "Audit log entry created with correct entity_type, entity_id, action, and actor",
-        "Audit entry is in the same transaction (no orphaned entity without audit)"
+        "Audit log entry created with entity_type='tenant', entity_id=new_tenant.id, action='created', actor_type='system' (registration is unauthenticated)",
+        "Audit log entry created with entity_type='tenant', entity_id=tenant.id, action='updated', actor_type='api_key', actor_id=api_key.id",
+        "Audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
       ],
       "status": "pending"
     }
@@ -223,11 +225,13 @@
     "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Initial implementation of tenant/API key creation may skip audit logging. Audit logging for these entities is added retroactively after US-3.1 is implemented. The audit AC is a requirement for the FINAL state, not necessarily the initial commit."
   ],
   "dependencies": [
     "US-1.2",
-    "US-1.3"
+    "US-1.3",
+    "US-3.1"
   ],
   "estimated_hours": 4
 }
