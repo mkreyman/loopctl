@@ -68,6 +68,11 @@
       "id": "AC-7.1.11",
       "description": "The claim endpoint MUST use pessimistic locking (SELECT FOR UPDATE or equivalent atomic UPDATE...WHERE agent_status = 'pending' RETURNING *) to prevent race conditions when multiple agents try to claim the same story simultaneously. Only one agent can succeed; others receive 409 Conflict.",
       "status": "pending"
+    },
+    {
+      "id": "AC-7.1.12",
+      "description": "When a superadmin accesses status endpoints via impersonation (US-11.2), the impersonation MUST set an effective_role on the connection context. The effective_role determines which exact_role checks pass. For example, to claim a story, the superadmin must impersonate with effective_role=agent. The impersonation request includes an optional `X-Effective-Role` header (default: user). Only superadmin keys can set this header; non-superadmin keys ignore it.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -264,7 +269,8 @@
         "tenant = fixture(:tenant)",
         "story = fixture(:story, tenant: tenant, agent_status: :pending)",
         "agent_a = fixture(:agent, tenant: tenant)",
-        "agent_b = fixture(:agent, tenant: tenant)"
+        "agent_b = fixture(:agent, tenant: tenant)",
+        "Configure Ecto.Adapters.SQL.Sandbox.allow/3 for each spawned Task process to grant sandbox access. Alternatively, use Sandbox :shared mode for this specific test (with async: false for this test only)."
       ],
       "steps": [
         "Simultaneously POST /api/v1/stories/:id/claim from both agent_a and agent_b (use Task.async)"

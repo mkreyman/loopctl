@@ -144,7 +144,7 @@
     "Use a dedicated Loopctl.Health module for the check logic, keep the controller thin",
     "Consider adding a response_time_ms field for each check for observability",
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
-    "Database health check MUST be injectable via behaviour-based DI for test mocking. Define a HealthCheck behaviour, mock it in test/support/mocks.ex.",
+    "Health check uses opts-based dependency injection (project DI standard). The health check function accepts a `health_checker:` opt: `check_health(opts \\\\ [])` where opts can include `health_checker: MockHealthChecker`. Default from `Application.get_env(:loopctl, :health_checker, Loopctl.HealthCheck.Default)`. Tests pass mock via opts, NOT via Application.put_env.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"

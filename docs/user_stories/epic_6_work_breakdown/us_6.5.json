@@ -56,7 +56,7 @@
     },
     {
       "id": "AC-6.5.9",
-      "description": "The ready endpoint orders results by epic position, then story number, providing a natural priority ordering",
+      "description": "Ready stories MUST be ordered by natural numeric sort of story number (not lexicographic). Use the sort_key mechanism from US-6.2 AC-6.2.13: order by epic position ASC, then sort_key ASC. This ensures '1.2' sorts before '1.10'.",
       "status": "pending"
     },
     {
@@ -270,6 +270,7 @@
     "Ready query must JOIN epic_dependencies and verify all stories in prerequisite epics have verified_status=verified. Use a subquery: SELECT epic_id FROM epic_dependencies WHERE depends_on_epic_id IN (SELECT id FROM epics WHERE EXISTS (SELECT 1 FROM stories WHERE epic_id = epics.id AND verified_status != 'verified'))",
     "Required indexes for ready query performance: stories(tenant_id, agent_status), stories(tenant_id, verified_status), story_dependencies(story_id), story_dependencies(depends_on_story_id), epic_dependencies(epic_id), epic_dependencies(depends_on_epic_id)",
     "For the blocked endpoint, include the blocker story's agent_status so the orchestrator knows if it's in progress or still pending",
+    "The ready query must also guard against cross-level deadlocks: if epic A depends on epic B, and a story in B has a story_dependency on a story in A, neither story can ever become ready. The ready endpoint should include a `deadlocked` flag or separate endpoint to surface these permanently blocked stories.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"

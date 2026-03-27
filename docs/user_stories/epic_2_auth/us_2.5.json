@@ -63,6 +63,11 @@
       "id": "AC-2.5.10",
       "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
       "status": "pending"
+    },
+    {
+      "id": "AC-2.5.11",
+      "description": "Registration MUST support an idempotent retry mechanism. If a client provides an optional idempotency_key (UUID) in the request, a repeated request with the same idempotency_key within 24 hours returns the same raw API key instead of creating a duplicate tenant. This prevents permanent lockout when the initial response is lost due to network failure.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -202,7 +207,8 @@
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Store idempotency_key and raw API key (encrypted with Cloak) in a short-lived idempotency_cache table. TTL 24 hours. Lookup by idempotency_key before creating tenant."
   ],
   "dependencies": [
     "US-2.4",

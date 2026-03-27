@@ -63,6 +63,11 @@
       "id": "AC-10.2.10",
       "description": "Webhook events are only created for active webhooks (active=true) whose events list includes the event type and whose project_id filter matches (NULL matches all projects).",
       "status": "pending"
+    },
+    {
+      "id": "AC-10.2.11",
+      "description": "An Oban worker (WebhookCleanupWorker) MUST periodically prune webhook_events older than a configurable retention period (default: 30 days, configurable per tenant settings). Events with status 'delivered' or 'exhausted' older than the retention period are hard-deleted. Events with status 'pending' or 'failed' are never pruned (they are still in-flight).",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -264,7 +269,8 @@
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
-    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)"
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "WebhookCleanupWorker runs in the :default queue on a cron schedule (daily at 3 AM). Delete in batches of 1000 to avoid long-running transactions. Add `webhook_event_retention_days` to tenant settings (default: 30)."
   ],
   "dependencies": [
     "US-10.1",

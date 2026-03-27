@@ -68,6 +68,11 @@
       "id": "AC-6.4.11",
       "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.4.12",
+      "description": "Story dependency creation MUST validate cross-level consistency: if the dependent story is in Epic A and the prerequisite story is in Epic B, and Epic B depends on Epic A (via epic_dependencies), this creates a cross-level deadlock and MUST return 422 with a clear error message.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -243,6 +248,29 @@
         "Audit log entry created with entity_type='story_dependency', entity_id=new_dep.id, action='created', actor_type='api_key', actor_id=api_key.id",
         "Audit log entry created with entity_type='story_dependency', entity_id=dep.id, action='deleted', actor_type='api_key', actor_id=api_key.id",
         "All audit entries are in the same transaction as the entity changes (no orphaned entity without audit)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.10",
+      "name": "Cross-level deadlock: story dependency conflicts with epic dependency",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:epic_dependency, %{tenant_id: tenant.id, epic_id: epic_a.id, depends_on_epic_id: epic_b.id})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_a.id, number: \"1.1\"}) as story_s1",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic_b.id, number: \"2.1\"}) as story_s2",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/story_dependencies with body {\"story_id\": \"<story_s2.id>\", \"depends_on_story_id\": \"<story_s1.id>\"}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message identifies the cross-level deadlock: Epic A depends on Epic B but story S2 (in Epic B) would depend on story S1 (in Epic A)"
       ],
       "status": "pending"
     },

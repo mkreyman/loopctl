@@ -63,6 +63,11 @@
       "id": "AC-12.1.10",
       "description": "The endpoint requires the user role. The project must belong to the authenticated tenant (enforced by RLS).",
       "status": "pending"
+    },
+    {
+      "id": "AC-12.1.11",
+      "description": "If the project already contains epics or stories with numbers matching the import payload and merge=true is NOT set, the import MUST return 409 Conflict with a clear error listing the duplicate epic/story numbers. The import is NOT executed — no partial creation. This prevents accidental duplicate imports.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -200,6 +205,28 @@
         "Response is 422 Unprocessable Entity",
         "Error message indicates unresolved dependency reference",
         "Nothing is persisted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.1.9",
+      "name": "duplicate import without merge flag returns 409 Conflict",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1'})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.2'})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import (no merge=true) with JSON containing epic 1 with stories 1.1 and 1.2"
+      ],
+      "expected_results": [
+        "Response is 409 Conflict",
+        "Error lists duplicate story numbers: ['1.1', '1.2']",
+        "No new entities are created (import is NOT executed)"
       ],
       "status": "pending"
     },

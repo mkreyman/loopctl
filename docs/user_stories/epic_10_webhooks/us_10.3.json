@@ -257,7 +257,7 @@
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
-    "Webhook HTTP delivery MUST use a behaviour-based HTTP client (e.g., Loopctl.Webhooks.DeliveryBehaviour) for testability. Real implementation uses Req. Mock defined in test/support/mocks.ex. Tests inject mock via opts, never via Application.put_env.",
+    "Webhook HTTP delivery DI: Oban job args are serialized JSON and cannot contain module references. Use Req.Test for test mocking — configure a test plug that intercepts outbound requests. In production, the worker calls `Req.post/2` directly. In tests, configure `Req.Test.stub(Loopctl.Webhooks.DeliveryReq, fn conn -> ... end)` and pass the Req client name through Application config (not job args). This is config-based DI specifically for Oban workers, which is the ONE exception to the opts-based DI pattern used elsewhere.",
     "Oban worker MUST implement `@impl Oban.Worker` callback with `perform(%Oban.Job{})` function signature."
   ],
   "dependencies": [

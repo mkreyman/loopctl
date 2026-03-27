@@ -53,6 +53,16 @@
       "id": "AC-2.7.8",
       "description": "Rate limit counters use :ets.update_counter for atomic, lock-free increments",
       "status": "pending"
+    },
+    {
+      "id": "AC-2.7.9",
+      "description": "The ETS rate limit table MUST be a :named_table owned by a dedicated GenServer under the application supervision tree. The GenServer MUST use :heir option to transfer table ownership on crash, preventing rate limit state loss during restarts or hot code reload.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-2.7.10",
+      "description": "Rate limiting MUST correctly resolve client IP behind a reverse proxy. When deployed behind nginx (US-1.7), conn.remote_ip is 127.0.0.1 for all requests. The application MUST use the RemoteIp plug (or equivalent) configured with trusted proxy headers (X-Forwarded-For, X-Real-IP) to extract the real client IP.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -174,7 +184,7 @@
     "The RateLimiter plug should be the LAST plug in the auth pipeline (after RequireAuth), so unauthenticated requests don't consume rate limit budget",
     "Consider using :atomics instead of ETS for even better performance (Erlang/OTP 21+)",
     "Test note: rate limit tests may need to reset ETS state between tests to avoid pollution",
-    "Time/clock dependencies MUST be injectable via a Clock behaviour for test determinism. Define Loopctl.Clock behaviour, mock in test/support/mocks.ex.",
+    "Rate limiting uses opts-based dependency injection (matching the project DI standard). Context functions accept a `clock:` opt for time injection in tests: `check_rate(api_key, opts \\\\ [])` where opts can include `clock: MockClock`. Default clock uses `DateTime.utc_now/0`. Mock defined in test/support/mocks.ex.",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"

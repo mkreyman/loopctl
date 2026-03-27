@@ -58,6 +58,11 @@
       "id": "AC-1.4.9",
       "description": "Unhandled errors (500) return a generic {\"error\": {\"status\": 500, \"message\": \"Internal server error\"}} without leaking stack traces or internal details",
       "status": "pending"
+    },
+    {
+      "id": "AC-1.4.10",
+      "description": "FallbackController MUST handle Ecto.CastError and Ecto.Query.CastError (raised when invalid UUID format is passed to GET-by-ID endpoints). These MUST return 404 Not Found with a JSON error body, NOT a 500 crash. This is reachable on every GET endpoint that takes an ID parameter.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -156,6 +161,22 @@
       "expected_results": [
         "Response status is 422",
         "Response body JSON has error.message = \"Cycle detected in dependency graph\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-1.4.8",
+      "name": "FallbackController renders 404 for invalid UUID format",
+      "type": "integration",
+      "preconditions": [
+        "A project exists in the database"
+      ],
+      "steps": [
+        "Send GET /api/v1/projects/not-a-uuid"
+      ],
+      "expected_results": [
+        "Response status is 404, not 500",
+        "Response body is JSON with error.status = 404 and error.message = \"Not found\""
       ],
       "status": "pending"
     },

@@ -73,6 +73,11 @@
       "id": "AC-1.1.12",
       "description": "Application MUST define Telemetry events for key operations: API request duration, story status transitions, webhook deliveries, audit log writes. Use :telemetry.execute/3 with measurements and metadata.",
       "status": "pending"
+    },
+    {
+      "id": "AC-1.1.13",
+      "description": "The application MUST include the RemoteIp plug (or equivalent) in the endpoint pipeline to correctly resolve client IP addresses when deployed behind a reverse proxy (nginx). This is required for IP-based rate limiting on unauthenticated endpoints (registration, health check).",
+      "status": "pending"
     }
   ],
   "test_cases": [

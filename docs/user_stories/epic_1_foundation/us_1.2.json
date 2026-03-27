@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-1.2.3",
-      "description": "The macro defines a tenant_id field of type :binary_id that is required (validated in changeset) for all tenant-scoped schemas",
+      "description": "The base schema macro provides a `tenant_field()` macro that developers MUST call inside their `schema` block to add the tenant_id belongs_to association. The macro CANNOT inject fields automatically via `__using__/1` because Ecto requires fields inside the `schema` block. Usage: `schema \"my_table\" do; tenant_field(); field :name, :string; timestamps(); end`. The tenant_field() macro expands to `belongs_to :tenant, Loopctl.Tenants.Tenant, type: :binary_id` with appropriate foreign key configuration.",
       "status": "pending"
     },
     {

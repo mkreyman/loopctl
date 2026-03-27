@@ -68,6 +68,16 @@
       "id": "AC-3.1.11",
       "description": "The audit_log table MUST include a nullable, indexed project_id column (FK to projects). Context functions that create audit entries for project-scoped entities (stories, epics, dependencies, artifacts, verifications) MUST populate project_id. This enables efficient filtering in the change feed endpoint without heterogeneous joins.",
       "status": "pending"
+    },
+    {
+      "id": "AC-3.1.12",
+      "description": "The audit_log table MUST be created with PostgreSQL range partitioning by inserted_at (monthly partitions). This enables efficient retention management and prevents unbounded table growth. A partition maintenance Oban worker creates new partitions 3 months ahead and optionally archives/drops partitions older than the configured retention period (default: 90 days, configurable per tenant settings).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-3.1.13",
+      "description": "The old_state and new_state JSONB columns SHOULD store only CHANGED fields (diff), not the full entity state. This prevents storage explosion when large JSONB fields (acceptance_criteria, state_data) are present on entities with frequent status changes. Full state can be reconstructed by replaying diffs from creation.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -254,7 +264,8 @@
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Table partitioning: CREATE TABLE audit_log (...) PARTITION BY RANGE (inserted_at). Monthly partitions. Oban worker in :default queue creates partitions and manages retention."
   ],
   "dependencies": [
     "US-1.2",

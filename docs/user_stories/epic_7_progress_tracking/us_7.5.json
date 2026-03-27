@@ -1,0 +1,156 @@
+{
+  "id": "US-7.5",
+  "title": "Orchestrator Force-Unclaim for Unresponsive Agents",
+  "epic": {
+    "id": "epic_7",
+    "name": "Progress Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "force-unclaim a story from an unresponsive agent",
+    "so_that": "stuck stories can be reassigned without manual database intervention"
+  },
+  "rationale": "When an implementation agent crashes mid-work, the story remains in 'assigned' or 'implementing' status with no way to reassign it. The assigned agent is the only one allowed to unclaim (US-7.1 AC-7.1.5). Without a force-unclaim mechanism, a single agent crash can block an entire dependency chain indefinitely. The orchestrator needs an override.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-7.5.1",
+      "description": "POST /api/v1/stories/:id/force-unclaim resets agent_status to 'pending', clears assigned_agent_id, assigned_at. Requires orchestrator role (or superadmin via impersonation).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.2",
+      "description": "Force-unclaim works regardless of current agent_status (assigned, implementing, or reported_done). It is a hard reset.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.3",
+      "description": "The force-unclaim is recorded in the audit log with action='force_unclaimed', including the orchestrator's identity and the previously assigned agent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.4",
+      "description": "A webhook event story.force_unclaimed is emitted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.5",
+      "description": "Force-unclaim on a story that is already pending returns 200 (idempotent), not an error.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.6",
+      "description": "Force-unclaim does NOT reset verified_status. A verified story can be force-unclaimed (returning it to pending agent_status while retaining its verification).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.7",
+      "description": "Agent role keys CANNOT call force-unclaim (returns 403). Only orchestrator and superadmin.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-7.5.8",
+      "description": "Tenant isolation: force-unclaim only works on stories within the authenticated tenant.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-7.5.1",
+      "name": "Orchestrator force-unclaims an implementing story",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story = fixture(:story, tenant: tenant, agent_status: :implementing, assigned_agent_id: agent.id)"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/force-unclaim with orchestrator API key"
+      ],
+      "expected_results": [
+        "200 returned",
+        "story.agent_status = pending",
+        "story.assigned_agent_id = nil",
+        "Audit log entry with action='force_unclaimed'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.5.2",
+      "name": "Force-unclaim on pending story is idempotent",
+      "type": "integration",
+      "preconditions": [
+        "story = fixture(:story, agent_status: :pending)"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/force-unclaim"
+      ],
+      "expected_results": [
+        "200 returned",
+        "story unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.5.3",
+      "name": "Agent key cannot force-unclaim",
+      "type": "integration",
+      "preconditions": [
+        "story = fixture(:story, agent_status: :assigned)"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/force-unclaim with agent API key"
+      ],
+      "expected_results": [
+        "403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.5.4",
+      "name": "Cross-tenant isolation",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a with story",
+        "tenant_b with orchestrator key"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/force-unclaim from tenant_b"
+      ],
+      "expected_results": [
+        "404 Not Found"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.5.5",
+      "name": "Force-unclaim preserves verified_status",
+      "type": "integration",
+      "preconditions": [
+        "story = fixture(:story, agent_status: :reported_done, verified_status: :verified)"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/force-unclaim"
+      ],
+      "expected_results": [
+        "agent_status = pending",
+        "verified_status still = verified"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Endpoint: POST /api/v1/stories/:id/force-unclaim",
+    "Context function: Progress.force_unclaim_story(tenant_id, story_id, orchestrator_agent_id, opts)",
+    "Use Ecto.Multi: update story + audit log + webhook event in same transaction",
+    "Controller MUST use action_fallback LoopctlWeb.FallbackController",
+    "All context functions MUST return {:ok, result} or {:error, reason} tuples",
+    "All test modules MUST use `async: true`",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+  ],
+  "dependencies": [
+    "US-7.1"
+  ],
+  "estimated_hours": 3
+}

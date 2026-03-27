@@ -58,6 +58,16 @@
       "id": "AC-1.3.9",
       "description": "All RLS infrastructure is idempotent — running migrations multiple times does not produce errors",
       "status": "pending"
+    },
+    {
+      "id": "AC-1.3.10",
+      "description": "The application MUST configure two database connection pools: (1) Loopctl.Repo — connects as the standard role with RLS enforced, used for all tenant-scoped requests. (2) Loopctl.AdminRepo — connects as the loopctl_admin role with BYPASSRLS privilege, used ONLY for superadmin cross-tenant queries (US-11.1, US-11.3, US-11.4). Both repos share the same database but use different PostgreSQL roles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-1.3.11",
+      "description": "The auth pipeline MUST route requests to the correct Repo based on the API key role. Superadmin requests (without impersonation) use AdminRepo. Impersonated requests use the standard Repo with SET LOCAL for the target tenant. Non-superadmin requests always use the standard Repo.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -192,7 +202,8 @@
     "IMPORTANT: The Ecto.Repo sandbox (SQL.Sandbox) used in tests already wraps queries in transactions, so SET LOCAL works naturally in test mode",
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Two Ecto Repos: `Loopctl.Repo` (pool_size: 10, RLS enforced) and `Loopctl.AdminRepo` (pool_size: 3, BYPASSRLS). Oban must use the standard Repo. The Ecto sandbox in tests must allow both repos — configure sandbox for both in test_helper.exs."
   ],
   "dependencies": [
     "US-1.1"

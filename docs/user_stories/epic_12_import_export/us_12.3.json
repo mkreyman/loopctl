@@ -68,6 +68,11 @@
       "id": "AC-12.3.11",
       "description": "All story creates and updates during merge import MUST be recorded in the audit log within the same transaction.",
       "status": "pending"
+    },
+    {
+      "id": "AC-12.3.12",
+      "description": "During merge import, for stories matched by number: the following fields are UPDATED from the import payload: title, description, acceptance_criteria, estimated_hours, metadata. The following fields are PRESERVED (never overwritten): agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason. If a field is ABSENT from the import payload (null or missing), it is NOT nulled — the existing value is preserved. This prevents accidental data loss from incomplete exports.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -244,6 +249,27 @@
         "Response is 422 with validation error",
         "Story 1.1 title is still 'Original' (update rolled back)",
         "No new story was created (rolled back)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-12.3.10",
+      "name": "merge import with absent field preserves existing value (no null overwrite)",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant.id})",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: '1.1', title: 'Original Title', acceptance_criteria: 'Original AC', estimated_hours: 5})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:id/import?merge=true with JSON containing story 1.1 with title='Updated Title' but omitting acceptance_criteria and estimated_hours"
+      ],
+      "expected_results": [
+        "Story 1.1 title is 'Updated Title' (updated from payload)",
+        "Story 1.1 acceptance_criteria is still 'Original AC' (preserved, not nulled)",
+        "Story 1.1 estimated_hours is still 5 (preserved, not nulled)"
       ],
       "status": "pending"
     },

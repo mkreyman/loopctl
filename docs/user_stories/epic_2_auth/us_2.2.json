@@ -66,7 +66,7 @@
     },
     {
       "id": "AC-2.2.11",
-      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "description": "Every mutation MUST be recorded in the audit log via Ecto.Multi. NOTE: Audit logging for tenant and API key mutations is implemented AFTER US-3.1 (Audit Log) is complete. The initial implementation of US-2.1/US-2.2 creates the schemas and context functions WITHOUT audit logging. A follow-up commit after US-3.1 adds the Ecto.Multi audit integration. This breaks the circular dependency (US-2.1 \u2192 US-3.1 \u2192 US-2.4 \u2192 US-2.1).",
       "status": "pending"
     }
   ],
@@ -245,11 +245,10 @@
     "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
     "All tests using Mox MUST include `setup :verify_on_exit!`",
     "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
-    "Initial implementation of tenant/API key creation may skip audit logging. Audit logging for these entities is added retroactively after US-3.1 is implemented. The audit AC is a requirement for the FINAL state, not necessarily the initial commit."
+    "Initial implementation of API key creation MUST skip audit logging (US-3.1 does not exist yet). Audit logging for API key mutations is added in a follow-up commit after US-3.1 is complete. This breaks the circular dependency: US-2.1 \u2192 US-3.1 \u2192 US-2.4 \u2192 US-2.1. The audit AC (AC-2.2.11) is a requirement for the FINAL state, not the initial commit."
   ],
   "dependencies": [
-    "US-2.1",
-    "US-3.1"
+    "US-2.1"
   ],
   "estimated_hours": 6
 }

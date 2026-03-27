@@ -63,6 +63,11 @@
       "id": "AC-7.2.10",
       "description": "POST /api/v1/stories/:id/reject requires a non-empty 'reason' field in the request body. Returns 422 Unprocessable Entity if reason is missing or blank.",
       "status": "pending"
+    },
+    {
+      "id": "AC-7.2.11",
+      "description": "The verify and reject endpoints MUST use pessimistic locking (SELECT FOR UPDATE) or optimistic locking (version check) to prevent duplicate verifications when two orchestrators verify the same story simultaneously. Only one verification should succeed; the second should receive 409 Conflict.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -214,6 +219,29 @@
         "Story verified_status remains 'unverified' (rolled back)",
         "No audit_log entry created (rolled back)",
         "Function returns {:error, ...} tuple"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-7.2.9",
+      "name": "Concurrent verify race condition prevented",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: \"Test Tenant\"})",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :reported_done, verified_status: :unverified})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: \"orchestrator-1\"})",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: \"orchestrator-2\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_1.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_2.id})",
+        "Configure Ecto.Adapters.SQL.Sandbox.allow/3 for each spawned Task process or use Sandbox :shared mode (with async: false)"
+      ],
+      "steps": [
+        "Simultaneously POST /api/v1/stories/:id/verify from both orchestrator-1 and orchestrator-2 (use Task.async)"
+      ],
+      "expected_results": [
+        "Exactly one orchestrator succeeds with 200",
+        "The other receives 409 Conflict",
+        "Only one verification_result record is created"
       ],
       "status": "pending"
     },

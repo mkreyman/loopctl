@@ -73,6 +73,16 @@
       "id": "AC-6.2.12",
       "description": "Story numbers MUST be unique within a PROJECT (not just within an epic). Add a composite unique index on [tenant_id, project_id, number] where project_id is derived through the epic. This ensures unambiguous dependency references in import/export. The project_id should be denormalized onto the stories table for this constraint.",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.2.13",
+      "description": "Story numbers MUST sort in natural numeric order, not lexicographic order. '1.2' comes before '1.10'. Implementation: add a `sort_key` integer column computed from the story number (e.g., epic_number * 10000 + story_seq * 10), or use a PostgreSQL natural sort expression (split on '.', cast to integers). All list endpoints that order by story number MUST use this sort.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-6.2.14",
+      "description": "When a story's epic_id is changed (if supported), the denormalized project_id MUST be updated in the same changeset. Add a changeset validation that derives project_id from the epic's project_id. Alternatively, disallow moving stories between epics (require delete + recreate). Specify which approach in implementation.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -236,6 +246,28 @@
         "Response status is 200 or 204",
         "Story no longer exists in the database",
         "GET /api/v1/stories/<story.id> returns 404"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.2.10",
+      "name": "Stories sort in natural numeric order, not lexicographic",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.1\"})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.2\"})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"1.10\"})",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: \"2.1\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/epics/<epic.id>/stories"
+      ],
+      "expected_results": [
+        "Stories are returned in order [1.1, 1.2, 1.10, 2.1], not [1.1, 1.10, 1.2, 2.1]"
       ],
       "status": "pending"
     },

@@ -12,31 +12,26 @@
     "i_want_to": "claim, verify, or reject multiple stories in a single API call",
     "so_that": "I can efficiently manage batches of stories without making N individual requests, reducing latency and enabling atomic batch workflows"
   },
-  "rationale": "When an orchestrator verifies stories after an agent completes a batch of work, or when an agent claims multiple ready stories for parallel implementation, issuing individual requests is slow and creates partial-success failure modes. Bulk endpoints wrap multiple operations in a single all-or-nothing transaction, ensuring either all operations succeed or none do, while returning per-story results for diagnostics.",
+  "rationale": "When an orchestrator verifies stories after an agent completes a batch of work, or when an agent claims multiple ready stories for parallel implementation, issuing individual requests is slow and creates unnecessary latency. Bulk endpoints wrap multiple operations in a single request, processing each story independently with partial-success semantics, while returning per-story results for diagnostics.",
   "acceptance_criteria": [
     {
       "id": "AC-13.1.1",
-      "description": "POST /api/v1/stories/bulk/claim accepts a JSON body with {story_ids: [uuid, ...]} and an agent role API key, sets agent_status=assigned on all specified stories within a single database transaction",
+      "description": "POST /api/v1/stories/bulk/claim accepts a JSON body with {story_ids: [uuid, ...]} and an agent role API key, attempts to set agent_status=assigned on each specified story independently within a single database transaction using savepoints for partial-success isolation",
       "status": "pending"
     },
     {
       "id": "AC-13.1.2",
-      "description": "POST /api/v1/stories/bulk/verify accepts a JSON body with {stories: [{story_id, result, summary, findings}]} and an orchestrator role API key, sets verified_status=verified on all specified stories within a single database transaction",
+      "description": "POST /api/v1/stories/bulk/verify accepts a JSON body with {stories: [{story_id, result, summary, findings}]} and an orchestrator role API key, attempts to set verified_status=verified on each specified story independently within a single database transaction using savepoints for partial-success isolation",
       "status": "pending"
     },
     {
       "id": "AC-13.1.3",
-      "description": "POST /api/v1/stories/bulk/reject accepts a JSON body with {stories: [{story_id, reason, findings}]} and an orchestrator role API key, sets verified_status=rejected on all specified stories and auto-resets agent_status to pending within a single database transaction",
+      "description": "POST /api/v1/stories/bulk/reject accepts a JSON body with {stories: [{story_id, reason, findings}]} and an orchestrator role API key, attempts to set verified_status=rejected on each specified story and auto-reset agent_status to pending independently within a single database transaction using savepoints for partial-success isolation",
       "status": "pending"
     },
     {
       "id": "AC-13.1.4",
-      "description": "All three bulk endpoints use all-or-nothing semantics: if any individual story fails its precondition check, the entire transaction is rolled back and no stories are modified",
-      "status": "pending"
-    },
-    {
-      "id": "AC-13.1.5",
-      "description": "Each bulk endpoint returns a response containing per-story results with story_id and status (success or error with reason), even on rollback, so the caller can identify which story caused the failure",
+      "description": "Bulk operations use PARTIAL-SUCCESS semantics. Each story in the batch is processed independently within the overall transaction. Stories that fail precondition checks are skipped (not rolled back). The response includes per-story results: [{story_id, status: 'success'}, {story_id, status: 'error', reason: '...'}]. The overall HTTP response is 200 if at least one story succeeded, 422 if all failed. Stories that succeed are committed; stories that fail are individually rolled back using Ecto.Multi savepoints.",
       "status": "pending"
     },
     {
@@ -107,10 +102,11 @@
         "POST /api/v1/stories/bulk/claim with {story_ids: [story1.id, story2.id, story3.id]} using agent API key"
       ],
       "expected_results": [
-        "Response status is 422",
-        "Response body contains per-story results identifying story2 as the failure (already assigned)",
-        "story1 and story3 remain agent_status=pending (transaction rolled back)",
-        "No audit_log entries are created"
+        "Response status is 200 (partial success: story1 and story3 succeeded)",
+        "Response body contains per-story results: story1=success, story2=error (already assigned), story3=success",
+        "story1 and story3 have agent_status=assigned (succeeded independently)",
+        "story2 remains agent_status=assigned with original agent (its savepoint rolled back)",
+        "2 audit_log entries created for story1 and story3"
       ],
       "status": "pending"
     },
@@ -200,9 +196,9 @@
         "POST /api/v1/stories/bulk/claim with {story_ids: [story1.id, story2.id]} using agent API key"
       ],
       "expected_results": [
-        "Response status is 422",
-        "Per-story results show story2 failed because its dependency (story1) is not verified",
-        "Neither story is claimed (transaction rolled back)"
+        "Response status is 200 (partial success: story1 succeeded)",
+        "Per-story results show story1=success, story2=error because its dependency (story1) is not yet verified",
+        "story1 is claimed (agent_status=assigned), story2 remains pending (its savepoint rolled back)"
       ],
       "status": "pending"
     },
@@ -270,9 +266,9 @@
     }
   ],
   "technical_notes": [
-    "Use Ecto.Multi to wrap all story updates in a single database transaction for all-or-nothing semantics",
-    "Validate each story individually within the Multi pipeline before any updates; collect all validation errors and return them in the per-story results",
-    "Lock stories with SELECT FOR UPDATE within the transaction to prevent concurrent claim races",
+    "Use Ecto.Multi with named steps per story. On individual story failure, use Multi.run/5 that returns {:error, reason} for that story, causing its savepoint to roll back while other stories proceed. ORDER story locks BY id ASC to prevent deadlocks (adversarial review finding).",
+    "Validate each story individually within the Multi pipeline; collect all validation errors and return them in the per-story results. Stories that pass are committed; stories that fail are individually rolled back via savepoints.",
+    "Lock stories with SELECT FOR UPDATE within the transaction to prevent concurrent claim races. MUST lock in story id ASC order to avoid deadlocks between concurrent bulk operations.",
     "Reuse existing story status transition logic from the single-story endpoints (claim, verify, reject) to ensure consistent validation",
     "Webhook events MUST be created inside the Ecto.Multi transaction for atomicity (consistent with US-10.2 AC-10.2.2). Events are enqueued for delivery after commit via Oban.",
     "Limit batch size to a configurable maximum (default 50) to prevent oversized transactions",
