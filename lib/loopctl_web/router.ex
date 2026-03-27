@@ -56,6 +56,19 @@ defmodule LoopctlWeb.Router do
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
+    # Story status transitions (agent side of two-tier trust model)
+    post "/stories/:id/contract", StoryStatusController, :contract
+    post "/stories/:id/claim", StoryStatusController, :claim
+    post "/stories/:id/start", StoryStatusController, :start
+    post "/stories/:id/report", StoryStatusController, :report
+    post "/stories/:id/unclaim", StoryStatusController, :unclaim
+
+    # Story verification (orchestrator side of two-tier trust model)
+    post "/stories/:id/verify", StoryVerificationController, :verify
+    post "/stories/:id/reject", StoryVerificationController, :reject
+    get "/stories/:story_id/verifications", StoryVerificationController, :index
+    post "/stories/:id/force-unclaim", StoryVerificationController, :force_unclaim
+
     # Agent management
     post "/agents/register", AgentController, :register
     get "/agents", AgentController, :index
