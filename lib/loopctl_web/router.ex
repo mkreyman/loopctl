@@ -5,7 +5,15 @@ defmodule LoopctlWeb.Router do
     plug :accepts, ["json"]
   end
 
-  scope "/api", LoopctlWeb do
+  # Health check — unauthenticated, outside /api/v1
+  scope "/", LoopctlWeb do
+    pipe_through :api
+
+    get "/health", HealthController, :check
+  end
+
+  # API v1 — all authenticated endpoints
+  scope "/api/v1", LoopctlWeb do
     pipe_through :api
   end
 end

@@ -1,0 +1,40 @@
+# Fly.io deployment configuration (placeholder for future cloud deployment)
+# See https://fly.io/docs/reference/configuration/
+#
+# Currently loopctl is deployed to beelink (self-hosted).
+# This file will be configured when migrating to Fly.io.
+
+app = "loopctl"
+primary_region = "ord"
+
+[build]
+  [build.args]
+    MIX_ENV = "prod"
+
+[env]
+  PHX_HOST = "loopctl.fly.dev"
+  PORT = "4000"
+  PHX_SERVER = "true"
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 800
+
+  [[http_service.checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

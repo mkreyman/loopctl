@@ -34,6 +34,9 @@ defmodule LoopctlWeb.Endpoint do
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :loopctl
   end
 
+  # Resolve client IP behind reverse proxy (nginx) for rate limiting
+  plug RemoteIp
+
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 

@@ -10,6 +10,16 @@ config :loopctl, Loopctl.Repo,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
 
+# AdminRepo — same credentials in dev (BYPASSRLS role in production)
+config :loopctl, Loopctl.AdminRepo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "loopctl_dev",
+  stacktrace: true,
+  show_sensitive_data_on_connection_error: true,
+  pool_size: 3
+
 # For development, we disable any cache and enable
 # debugging and code reloading.
 #
@@ -53,7 +63,8 @@ config :loopctl, LoopctlWeb.Endpoint,
 config :loopctl, dev_routes: true
 
 # Do not include metadata nor timestamps in development logs
-config :logger, :default_formatter, format: "[$level] $message\n"
+config :logger, :default_handler,
+  formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
 
 # Set a higher stacktrace during development. Avoid configuring such
 # in production as building large stacktraces may be expensive.

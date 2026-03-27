@@ -1,0 +1,10 @@
+[
+  verbose: false,
+  private: false,
+  skip: true,
+  router: "lib/loopctl_web/router.ex",
+  exit: "low",
+  format: "txt",
+  ignore: ["SQL.Query"],
+  ignore_files: []
+]

@@ -10,6 +10,7 @@ defmodule Loopctl.MixProject do
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      releases: releases(),
       listeners: [Phoenix.CodeReloader],
       dialyzer: [
         plt_add_apps: [:mix, :ex_unit, :ecto, :ecto_sql],
@@ -29,6 +30,16 @@ defmodule Loopctl.MixProject do
   def cli do
     [
       preferred_envs: [precommit: :test]
+    ]
+  end
+
+  defp releases do
+    [
+      loopctl: [
+        include_executables_for: [:unix],
+        strip_beams: [keep: ["Docs"]],
+        applications: [runtime_tools: :permanent]
+      ]
     ]
   end
 
@@ -58,6 +69,9 @@ defmodule Loopctl.MixProject do
       # Encryption at rest (webhook signing secrets, API key idempotency cache)
       {:cloak, "~> 1.1"},
       {:cloak_ecto, "~> 1.3"},
+
+      # Structured JSON logging
+      {:logger_json, "~> 7.0"},
 
       # Rate limiting
       {:hammer, "~> 6.2"},

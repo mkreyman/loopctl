@@ -28,11 +28,15 @@ defmodule LoopctlWeb.ConnCase do
       import Plug.Conn
       import Phoenix.ConnTest
       import LoopctlWeb.ConnCase
+      import Loopctl.Fixtures
+      import Mox
     end
   end
 
   setup tags do
     Loopctl.DataCase.setup_sandbox(tags)
+    Mox.set_mox_from_context(tags)
+    Loopctl.DataCase.stub_all_defaults()
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
 end
