@@ -1,0 +1,250 @@
+{
+  "id": "US-15.2",
+  "title": "Skill Performance Tracking",
+  "epic": {
+    "id": "epic_15",
+    "name": "Skill Versioning & Performance Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI orchestrator agent",
+    "i_want_to": "record which skill version was used for each verification and query aggregate performance statistics across skill versions",
+    "so_that": "I can compare the effectiveness of different prompt versions (false positive rate, findings count, iteration count) and data-drive prompt improvements"
+  },
+  "rationale": "Without performance data tied to specific skill versions, prompt iteration is guesswork. By linking each verification result to the skill version that produced it and tracking metrics (findings count, false positive count, true positive count, review duration, iteration), loopctl enables quantitative comparison: 'Version 3 of the review prompt reduced false positives by 40% compared to version 2.' This is the foundation for automated prompt optimization in v2.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-15.2.1",
+      "description": "A Loopctl.Skills.SkillResult schema exists with fields: id, tenant_id, skill_version_id (FK to skill_versions), verification_result_id (FK to verification_results), story_id (FK to stories), metrics (jsonb), inserted_at. No updated_at — results are immutable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.2",
+      "description": "POST /api/v1/skill_results (role: orchestrator) creates a skill_result record linking a verification_result to a skill_version. Required: skill_version_id, verification_result_id, story_id. Optional: metrics (jsonb with keys like findings_count, false_positive_count, true_positive_count, review_duration_ms, iteration).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.3",
+      "description": "The metrics jsonb field is validated for expected keys but accepts additional keys for extensibility. Standard keys: findings_count (integer), false_positive_count (integer), true_positive_count (integer), review_duration_ms (integer), iteration (integer).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.4",
+      "description": "GET /api/v1/skills/:id/stats (role: user+) returns aggregate performance statistics grouped by version number. For each version: avg_findings, avg_false_positives, false_positive_rate (false_positive_count / findings_count), stories_reviewed (count of distinct story_ids), avg_iterations, total_results.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.5",
+      "description": "GET /api/v1/skills/:id/versions/:version/results (role: user+) lists individual skill_result records for a specific version with page-based pagination. Each result includes the linked story_id, verification_result_id, metrics, and inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.6",
+      "description": "The skill_version_id and verification_result_id foreign keys are validated — creating a skill_result with non-existent IDs returns 422.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.7",
+      "description": "Skill results are immutable — no update or delete endpoints exist. Each result is a permanent record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.8",
+      "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy. RLS policy is enabled on the skill_results table.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.9",
+      "description": "Agent-role API keys can read skill results (GET only). Only orchestrator-role keys can write skill results (POST).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.2.10",
+      "description": "Every skill_result creation is recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-15.2.1",
+      "name": "Create skill result linking verification to skill version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "fixture(:skill_version, %{tenant_id: tenant.id, skill_id: skill.id, version: 1}) as sv",
+        "fixture(:story, %{tenant_id: tenant.id}) as story",
+        "fixture(:verification_result, %{tenant_id: tenant.id, story_id: story.id}) as vr",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skill_results with body {\"skill_version_id\": sv.id, \"verification_result_id\": vr.id, \"story_id\": story.id, \"metrics\": {\"findings_count\": 5, \"false_positive_count\": 1, \"true_positive_count\": 4, \"review_duration_ms\": 12500, \"iteration\": 1}}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has skill_result with correct skill_version_id, verification_result_id, story_id, and metrics",
+        "Audit log entry created for skill_result creation"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.2",
+      "name": "Query aggregate stats grouped by version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, current_version: 2}) as skill",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 1}) as sv1",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 2}) as sv2",
+        "3 skill_results for sv1 with varying metrics",
+        "2 skill_results for sv2 with varying metrics",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/stats"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response contains stats for version 1 and version 2",
+        "Each version entry includes avg_findings, avg_false_positives, false_positive_rate, stories_reviewed, avg_iterations, total_results",
+        "Stats are mathematically correct against the fixture data"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.3",
+      "name": "Compare performance across versions",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, current_version: 2}) as skill",
+        "Version 1 results: findings_count avg 10, false_positive_count avg 4",
+        "Version 2 results: findings_count avg 8, false_positive_count avg 1"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/stats"
+      ],
+      "expected_results": [
+        "Version 1 shows false_positive_rate = 0.4 (4/10)",
+        "Version 2 shows false_positive_rate = 0.125 (1/8)",
+        "Data supports conclusion that version 2 is more accurate"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.4",
+      "name": "Tenant isolation on skill results",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:skill, %{tenant_id: tenant_a.id}) as skill_a",
+        "fixture(:skill_result, %{tenant_id: tenant_a.id}) as result_a",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_a_id/stats with tenant_b API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "Tenant A's skill and results are not visible to Tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.5",
+      "name": "User role cannot create skill results",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill_version, %{tenant_id: tenant.id}) as sv",
+        "fixture(:verification_result, %{tenant_id: tenant.id}) as vr",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skill_results with valid body using user API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden (only orchestrator can write results)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.6",
+      "name": "Reject skill result with non-existent skill_version_id",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:verification_result, %{tenant_id: tenant.id}) as vr",
+        "fixture(:story, %{tenant_id: tenant.id}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skill_results with body {\"skill_version_id\": \"00000000-0000-0000-0000-000000000000\", \"verification_result_id\": vr.id, \"story_id\": story.id, \"metrics\": {}}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error indicates invalid skill_version_id reference"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.7",
+      "name": "List individual results for a specific version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 1}) as sv",
+        "3 skill_results linked to sv with different stories",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/versions/1/results"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response contains 3 skill_result records with story_id, verification_result_id, metrics, inserted_at",
+        "Pagination metadata is included"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.2.8",
+      "name": "Skill results are immutable",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill_result, %{tenant_id: tenant.id}) as result",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Attempt PATCH /api/v1/skill_results/:id with updated metrics",
+        "Attempt DELETE /api/v1/skill_results/:id"
+      ],
+      "expected_results": [
+        "Both return 405 Method Not Allowed or route does not exist (404)",
+        "Original result record is unchanged"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Implement Loopctl.Skills context functions: create_skill_result/2, get_skill_stats/2, list_version_results/3.",
+    "skill_results table: id (uuid PK), tenant_id (uuid FK), skill_version_id (uuid FK), verification_result_id (uuid FK), story_id (uuid FK), metrics (jsonb default {}), inserted_at (utc_datetime). No updated_at — append-only.",
+    "RLS policy on skill_results: tenant_id = current_setting('app.current_tenant_id')::uuid.",
+    "Stats query: GROUP BY skill_versions.version, aggregate with AVG, COUNT(DISTINCT story_id), and computed false_positive_rate. Use a JOIN from skill_results to skill_versions to group by version number.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
+  ],
+  "dependencies": [
+    "US-15.1",
+    "US-8.2"
+  ],
+  "estimated_hours": 4
+}

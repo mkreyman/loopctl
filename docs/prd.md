@@ -378,6 +378,50 @@ Outbound event queue, processed by Oban.
 | error | text | Last error message |
 | inserted_at | utc_datetime | |
 
+#### skills
+Versioned orchestrator prompts, review instructions, and agent skill definitions.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| id | uuid | PK |
+| tenant_id | uuid | FK → tenants |
+| project_id | uuid | FK → projects, nullable (null = tenant-wide, not project-specific) |
+| name | string | Namespaced identifier, e.g. "loopctl:review", "loopctl:verify-artifacts" |
+| description | text | What this skill does |
+| current_version | integer | Points to latest version number |
+| status | enum | `active`, `archived` |
+| metadata | jsonb | Extensible (tags, category, etc.) |
+| inserted_at | utc_datetime | |
+| updated_at | utc_datetime | |
+
+#### skill_versions
+Immutable snapshots of skill prompt text. Each prompt change creates a new version.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| id | uuid | PK |
+| tenant_id | uuid | FK → tenants |
+| skill_id | uuid | FK → skills |
+| version | integer | 1-indexed, auto-incremented per skill |
+| prompt_text | text | The full skill prompt/instructions |
+| changelog | text | What changed from previous version |
+| created_by | string | Actor label (agent name, "user", etc.) |
+| metadata | jsonb | Extensible |
+| inserted_at | utc_datetime | Immutable — no updated_at |
+
+#### skill_results
+Links verification results to the skill version that produced them, enabling performance comparison across versions.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| id | uuid | PK |
+| tenant_id | uuid | FK → tenants |
+| skill_version_id | uuid | FK → skill_versions |
+| verification_result_id | uuid | FK → verification_results |
+| story_id | uuid | FK → stories |
+| metrics | jsonb | findings_count, false_positive_count, true_positive_count, review_duration_ms, iteration |
+| inserted_at | utc_datetime | Immutable — no updated_at |
+
 ### 5.2 Webhook Event Types
 
 | Event | Trigger | Payload includes |
@@ -565,6 +609,23 @@ All superadmin endpoints require a superadmin API key.
 | POST | /stories/bulk/verify | orchestrator | Verify multiple stories at once |
 | POST | /stories/bulk/reject | orchestrator | Reject multiple stories at once |
 
+### 6.16 Skills
+
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| POST | /skills | user | Create skill (creates v1 with prompt_text) |
+| GET | /skills | agent+ | List skills (filterable by project_id, name pattern, status) |
+| GET | /skills/:id | agent+ | Get skill with current version prompt_text |
+| PATCH | /skills/:id | user | Update metadata, description, status (NOT prompt — that's a new version) |
+| DELETE | /skills/:id | user | Archive skill (soft delete) |
+| POST | /skills/:id/versions | user | Create new version (increments version, stores prompt_text + changelog) |
+| GET | /skills/:id/versions | agent+ | List all versions with metadata (prompt_text omitted for brevity) |
+| GET | /skills/:id/versions/:version | agent+ | Get specific version with full prompt_text |
+| POST | /skills/import | user | Bulk import from array of skill objects (create-or-update with idempotency) |
+| POST | /skill_results | orchestrator | Record a skill result linking verification to skill version |
+| GET | /skills/:id/stats | user+ | Aggregate performance stats across versions |
+| GET | /skills/:id/versions/:version/results | user+ | List individual results for a version |
+
 ---
 
 ## 7. CLI Specification
@@ -662,6 +723,19 @@ loopctl webhook create --url <url> --events <list>     # Create webhook
 loopctl webhook list                                    # List webhooks
 loopctl webhook delete <id>                             # Delete webhook
 loopctl webhook test <id>                               # Send test event
+```
+
+#### Skills
+```bash
+loopctl skill list                                    # List all skills
+loopctl skill get <name>                              # Show current version prompt
+loopctl skill get <name> --version <N>                # Show specific version
+loopctl skill create --name <name> --file <path>      # Create from file
+loopctl skill update <name> --file <path>             # New version from file
+loopctl skill stats <name>                            # Performance stats by version
+loopctl skill history <name>                          # Version history
+loopctl skill import <directory> --project <project>  # Bulk import directory of SKILL.md files
+loopctl skill archive <name>                          # Archive skill
 ```
 
 #### Superadmin
@@ -814,6 +888,11 @@ These features are explicitly out of scope for v1 but the architecture should no
 - Linear/Jira: two-way sync of story status
 - Slack: notifications channel
 - **Architecture enabler:** webhook system provides the event stream; plugins would be separate Oban workers that consume events and call external APIs
+
+### 11.6 Automated Skill Optimization
+- Autoresearch-style generate-evaluate-mutate optimization loop using the performance data collected by skill_results
+- Given a skill and its historical performance metrics (false positive rate, findings accuracy, iteration count), automatically generate prompt variants, evaluate them against a test corpus, and select the best-performing version
+- **Architecture enabler:** skill_versions stores prompt snapshots with immutable history; skill_results links every verification to the exact prompt version that produced it, providing the training data needed for automated optimization
 
 ---
 
@@ -1064,6 +1143,7 @@ These features are explicitly out of scope for v1 but the architecture should no
 |------|-----------|
 | **Agent** | An AI coding agent that implements features (e.g., Claude Code sub-agent) |
 | **Orchestrator** | An AI agent that coordinates work, verifies deliverables, and manages the development loop (e.g., a Claude Code skill) |
+| **Skill** | A versioned prompt or instruction set used by the orchestrator or review agents. Skills are stored in loopctl with version history and performance tracking. |
 | **Story** | The atomic unit of work, typically a user story with acceptance criteria |
 | **Epic** | A group of related stories |
 | **Artifact** | A file, commit, or code element produced by implementing a story |

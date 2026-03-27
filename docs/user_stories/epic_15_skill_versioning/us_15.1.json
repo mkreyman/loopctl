@@ -1,0 +1,269 @@
+{
+  "id": "US-15.1",
+  "title": "Skill Schema and CRUD with Tenant Scoping",
+  "epic": {
+    "id": "epic_15",
+    "name": "Skill Versioning & Performance Tracking"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "create, read, update, list, and archive versioned skills (orchestrator prompts and instructions) within my tenant, where each skill has a namespaced name, description, status, and an immutable version history of prompt texts",
+    "so_that": "I can manage the review prompts, verification checklists, and agent instructions that drive the orchestration loop, with full version history for every change"
+  },
+  "rationale": "Skills are the prompts and instructions that orchestrators and review agents use during the development loop. Currently these live as untracked files with no version history or performance data. Storing them as versioned entities in loopctl enables data-driven prompt iteration — you can see which version of a review prompt produced the best results. The two-table design (skills + skill_versions) separates mutable metadata from immutable prompt snapshots, ensuring every prompt change is permanently recorded.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-15.1.1",
+      "description": "A Loopctl.Skills.Skill schema exists with fields: id, tenant_id, project_id (nullable — null means tenant-wide), name, description, current_version (integer), status (enum: active, archived), metadata (jsonb), inserted_at, updated_at",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.2",
+      "description": "A Loopctl.Skills.SkillVersion schema exists with fields: id, tenant_id, skill_id, version (integer, 1-indexed), prompt_text (text), changelog (text), created_by (string), metadata (jsonb), inserted_at. No updated_at — skill versions are immutable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.3",
+      "description": "POST /api/v1/skills (role: user) creates a skill and its initial version (v1) in a single transaction. Requires name and prompt_text. Optional: project_id, description, changelog, created_by, metadata. Returns the skill with embedded current version.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.4",
+      "description": "GET /api/v1/skills (role: agent+) lists all active skills for the current tenant with page-based pagination. Filterable by project_id, name pattern (ILIKE), and status. Each skill includes current_version number but NOT the full prompt_text (for brevity).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.5",
+      "description": "GET /api/v1/skills/:id (role: agent+) returns a single skill with the full prompt_text of the current version embedded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.6",
+      "description": "PATCH /api/v1/skills/:id (role: user) updates skill metadata, description, and status. It does NOT update prompt_text — changing the prompt requires creating a new version via POST /api/v1/skills/:id/versions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.7",
+      "description": "DELETE /api/v1/skills/:id (role: user) archives the skill by setting status to :archived. Does not delete the database record or any version history.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.8",
+      "description": "POST /api/v1/skills/:id/versions (role: user) creates a new skill version. Auto-increments the version number (previous max + 1) and updates the skill's current_version field in the same transaction. Requires prompt_text. Optional: changelog, created_by, metadata.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.9",
+      "description": "GET /api/v1/skills/:id/versions (role: agent+) lists all versions for a skill ordered by version descending. Returns version number, changelog, created_by, metadata, and inserted_at — but omits prompt_text for brevity.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.10",
+      "description": "GET /api/v1/skills/:id/versions/:version (role: agent+) returns a specific version with the full prompt_text included.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.11",
+      "description": "Skill name is unique within the scope of (tenant_id, project_id). A composite unique index enforces this. Two skills with the same name are allowed if they belong to different projects or if one is tenant-wide (project_id=null) and the other is project-scoped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.12",
+      "description": "Skill versions are immutable — no update or delete endpoints exist for skill_versions. Each prompt change creates a new version record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.13",
+      "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy. RLS policies are enabled on both skills and skill_versions tables.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.1.14",
+      "description": "Every mutation (create skill, update skill, archive skill, create version) is recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-15.1.1",
+      "name": "Create skill with initial version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills with body {\"name\": \"loopctl:review\", \"description\": \"Enhanced code review prompt\", \"project_id\": project.id, \"prompt_text\": \"Review the following code...\", \"changelog\": \"Initial version\", \"created_by\": \"user\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has skill with id, name='loopctl:review', current_version=1, status='active'",
+        "Skill exists in database with correct tenant_id and project_id",
+        "A skill_version record exists with version=1 and the provided prompt_text",
+        "Audit log entry created for skill creation"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.2",
+      "name": "Reject duplicate name within same tenant and project scope",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:skill, %{tenant_id: tenant.id, project_id: project.id, name: \"loopctl:review\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills with body {\"name\": \"loopctl:review\", \"project_id\": project.id, \"prompt_text\": \"Different prompt...\"}"
+      ],
+      "expected_results": [
+        "Response status is 409 or 422 with error on name uniqueness"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.3",
+      "name": "Allow same name in different projects",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_a",
+        "fixture(:project, %{tenant_id: tenant.id}) as project_b",
+        "fixture(:skill, %{tenant_id: tenant.id, project_id: project_a.id, name: \"loopctl:review\"})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills with body {\"name\": \"loopctl:review\", \"project_id\": project_b.id, \"prompt_text\": \"Project B review prompt...\"}"
+      ],
+      "expected_results": [
+        "Response status is 201 — name uniqueness is per tenant+project, not global"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.4",
+      "name": "Create new version increments version number",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, current_version: 1}) as skill",
+        "fixture(:skill_version, %{tenant_id: tenant.id, skill_id: skill.id, version: 1})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/:skill_id/versions with body {\"prompt_text\": \"Updated review prompt v2...\", \"changelog\": \"Added false positive checks\", \"created_by\": \"user\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "New skill_version record has version=2",
+        "Skill record has current_version=2",
+        "Both original v1 and new v2 exist in skill_versions",
+        "Audit log entry created for version creation"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.5",
+      "name": "Concurrent version creation serializes correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, current_version: 1}) as skill",
+        "fixture(:skill_version, %{tenant_id: tenant.id, skill_id: skill.id, version: 1})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Send two concurrent POST /api/v1/skills/:skill_id/versions requests with different prompt_text"
+      ],
+      "expected_results": [
+        "Both succeed with versions 2 and 3 (serialized by database lock)",
+        "OR one succeeds and the other retries and succeeds",
+        "No duplicate version numbers exist for the same skill"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.6",
+      "name": "Tenant isolation: cross-tenant skill access returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:skill, %{tenant_id: tenant_a.id}) as skill_a",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_a_id with tenant_b API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "Tenant A's skill is not visible to Tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.7",
+      "name": "Agent can read but not create or update skills",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/skills succeeds",
+        "GET /api/v1/skills/:id succeeds",
+        "POST /api/v1/skills with valid body fails",
+        "PATCH /api/v1/skills/:id fails",
+        "POST /api/v1/skills/:id/versions fails"
+      ],
+      "expected_results": [
+        "GET requests return 200",
+        "POST and PATCH requests return 403 (agent role insufficient for user-level endpoints)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.1.8",
+      "name": "Skill versions are immutable",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "fixture(:skill_version, %{tenant_id: tenant.id, skill_id: skill.id, version: 1})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Attempt PATCH /api/v1/skills/:id/versions/1 with updated prompt_text",
+        "Attempt DELETE /api/v1/skills/:id/versions/1"
+      ],
+      "expected_results": [
+        "Both return 405 Method Not Allowed or route does not exist (404)",
+        "Original version record is unchanged"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Skill status enum: Ecto.Enum with values [:active, :archived]",
+    "Composite unique index: create unique_index(:skills, [:tenant_id, :project_id, :name], name: :skills_tenant_project_name_index). Use a partial index or coalesce for the nullable project_id to handle null-equality correctly (NULL != NULL in SQL). Consider coalesce(project_id, '00000000-0000-0000-0000-000000000000') in the index expression.",
+    "Version auto-increment: within the Ecto.Multi, SELECT MAX(version) FROM skill_versions WHERE skill_id = ? FOR UPDATE (pessimistic lock to prevent concurrent duplicates), then insert version = max + 1 and UPDATE skills SET current_version = max + 1.",
+    "Schema modules MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "Consider a Loopctl.Skills context module with: create_skill/2, get_skill/2, list_skills/2, update_skill/2, archive_skill/2, create_version/2, list_versions/2, get_version/3",
+    "The list endpoint should default to status=active unless ?include_archived=true is passed",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100). Response includes pagination metadata: {data: [...], meta: {page, page_size, total_count, total_pages}}.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
+  ],
+  "dependencies": [
+    "US-2.4",
+    "US-5.1"
+  ],
+  "estimated_hours": 6
+}

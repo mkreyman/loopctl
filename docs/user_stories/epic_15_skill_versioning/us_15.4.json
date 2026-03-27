@@ -1,0 +1,226 @@
+{
+  "id": "US-15.4",
+  "title": "Skill CLI Commands",
+  "epic": {
+    "id": "epic_15",
+    "name": "Skill Versioning & Performance Tracking"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "manage skills (list, create, update, import, archive, view stats and version history) via the loopctl CLI with support for reading SKILL.md files and multiple output formats",
+    "so_that": "I can manage orchestrator skills from the terminal without crafting raw API calls, and import skill files directly from my local skill directories"
+  },
+  "rationale": "The CLI is the primary interface for developers interacting with loopctl. Skill management commands enable the full lifecycle: create skills from local SKILL.md files, view version history, check performance stats, and archive obsolete skills. The import command bridges local file-based skill development with loopctl's versioned store. JSON-default output ensures agents can also use these commands programmatically.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-15.4.1",
+      "description": "'loopctl skill list' sends GET /api/v1/skills and displays all active skills. Supports --project flag to filter by project, --status flag to include archived. Default output is JSON; --format human shows a table with name, current_version, status, and description (truncated).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.2",
+      "description": "'loopctl skill get <name>' sends GET /api/v1/skills (filtered by name) and displays the skill with its current version prompt_text. Supports --version <N> flag to show a specific version by sending GET /api/v1/skills/:id/versions/:version.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.3",
+      "description": "'loopctl skill create --name <name> --file <path>' reads the file contents as prompt_text and sends POST /api/v1/skills. Supports --project <project> to scope to a project. If the file is a SKILL.md with YAML frontmatter, the name is extracted from frontmatter (overridden by --name if provided), description from frontmatter, and prompt_text from the body after frontmatter.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.4",
+      "description": "'loopctl skill update <name> --file <path>' reads the file contents and sends POST /api/v1/skills/:id/versions to create a new version. Supports --changelog <text> to provide a changelog message.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.5",
+      "description": "'loopctl skill stats <name>' sends GET /api/v1/skills/:id/stats and displays performance statistics by version. --format human shows a table with version, avg_findings, false_positive_rate, stories_reviewed, avg_iterations.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.6",
+      "description": "'loopctl skill history <name>' sends GET /api/v1/skills/:id/versions and displays the version history. --format human shows a table with version, created_by, changelog (truncated), and inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.7",
+      "description": "'loopctl skill import <directory> --project <project>' reads all SKILL.md files from the directory, parses frontmatter to extract name and description, uses file body as prompt_text, and sends POST /api/v1/skills/import. Reports summary: N created, N updated, N unchanged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.8",
+      "description": "'loopctl skill archive <name>' sends DELETE /api/v1/skills/:id (which archives the skill). Prints confirmation message.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.9",
+      "description": "All commands handle API errors gracefully: 401 (not authenticated), 403 (insufficient role), 404 (not found), 422 (validation error) display human-readable error messages and exit with non-zero status code.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.4.10",
+      "description": "SKILL.md frontmatter parsing supports YAML frontmatter delimited by '---' lines. Expected fields: name (string), description (string). Any content after the closing '---' is the prompt_text. Files without frontmatter use the entire content as prompt_text and require --name flag.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-15.4.1",
+      "name": "skill list returns skills in JSON format",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "Server has 2 active skills for the tenant"
+      ],
+      "steps": [
+        "Run: loopctl skill list"
+      ],
+      "expected_results": [
+        "Output is valid JSON",
+        "JSON contains array of 2 skill objects with name, current_version, status",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.2",
+      "name": "skill get displays current version prompt",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "Server has skill 'loopctl:review' with current_version=2"
+      ],
+      "steps": [
+        "Run: loopctl skill get loopctl:review"
+      ],
+      "expected_results": [
+        "Output includes the full prompt_text of version 2",
+        "Output includes skill name, version number, description",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.3",
+      "name": "skill get with --version flag shows specific version",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "Server has skill 'loopctl:review' with versions 1, 2, 3"
+      ],
+      "steps": [
+        "Run: loopctl skill get loopctl:review --version 1"
+      ],
+      "expected_results": [
+        "Output includes the full prompt_text of version 1 (not current version 3)",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.4",
+      "name": "skill create from SKILL.md with frontmatter",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "File /tmp/test_skill.md exists with content: '---\\nname: loopctl:test\\ndescription: Test skill\\n---\\nReview the code for bugs...'"
+      ],
+      "steps": [
+        "Run: loopctl skill create --file /tmp/test_skill.md"
+      ],
+      "expected_results": [
+        "Skill created with name='loopctl:test', description='Test skill'",
+        "prompt_text contains 'Review the code for bugs...' (body after frontmatter)",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.5",
+      "name": "skill import from directory",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "Directory /tmp/skills/ contains 3 SKILL.md files with frontmatter"
+      ],
+      "steps": [
+        "Run: loopctl skill import /tmp/skills/ --project my-project"
+      ],
+      "expected_results": [
+        "Output reports summary: N created, N updated, N unchanged",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.6",
+      "name": "skill stats displays performance by version",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "Server has skill 'loopctl:review' with 2 versions and performance data"
+      ],
+      "steps": [
+        "Run: loopctl skill stats loopctl:review --format human"
+      ],
+      "expected_results": [
+        "Output is a table with columns: version, avg_findings, false_positive_rate, stories_reviewed, avg_iterations",
+        "Both versions are listed with correct aggregate data",
+        "Exit code is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.7",
+      "name": "skill command with invalid name shows error",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "No skill named 'nonexistent:skill' exists"
+      ],
+      "steps": [
+        "Run: loopctl skill get nonexistent:skill"
+      ],
+      "expected_results": [
+        "Output includes error message: 'Skill not found: nonexistent:skill'",
+        "Exit code is non-zero"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.4.8",
+      "name": "skill create without --name and no frontmatter shows error",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid server URL and user API key",
+        "File /tmp/no_frontmatter.md exists with plain text content (no YAML frontmatter)"
+      ],
+      "steps": [
+        "Run: loopctl skill create --file /tmp/no_frontmatter.md"
+      ],
+      "expected_results": [
+        "Output includes error message indicating --name is required when file has no frontmatter",
+        "Exit code is non-zero"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add Loopctl.CLI.SkillCommand module following the pattern of existing CLI command modules (e.g., Loopctl.CLI.ProjectCommand from US-14.2).",
+    "SKILL.md frontmatter parsing: split on '---' delimiter (first occurrence after line 1 is the closing delimiter). Parse the content between delimiters as YAML (use :yamerl or a simple key-value parser for the limited frontmatter fields). Everything after the closing delimiter is prompt_text.",
+    "Directory import: File.ls!/1 to list files, filter for *.md extension, parse each file, assemble the import payload, send POST /api/v1/skills/import.",
+    "Name resolution for get/update/stats/history/archive: the CLI uses the skill name (e.g., 'loopctl:review') as the identifier. Send GET /api/v1/skills?name=<exact_name> to resolve the name to an ID, then use the ID for subsequent requests.",
+    "Output formatting: JSON is default (raw API response). --format human uses a table formatter (same pattern as other CLI commands). Consider extracting a shared table formatter if not already present.",
+    "Error handling: wrap all HTTP calls in a result tuple pattern. Map HTTP status codes to user-friendly messages. Exit with System.halt(1) on errors.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
+  ],
+  "dependencies": [
+    "US-15.1",
+    "US-15.2",
+    "US-14.1"
+  ],
+  "estimated_hours": 4
+}

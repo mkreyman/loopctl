@@ -1,0 +1,222 @@
+{
+  "id": "US-15.3",
+  "title": "Skill Import from SKILL.md Files",
+  "epic": {
+    "id": "epic_15",
+    "name": "Skill Versioning & Performance Tracking"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "platform developer",
+    "i_want_to": "bulk import skills from a directory of SKILL.md files (the format used in ~/.claude/skills/) via a single API call that creates or updates skills with proper versioning",
+    "so_that": "I can bootstrap loopctl's skill library from existing skill files without manually creating each skill, and re-import updated files to create new versions automatically"
+  },
+  "rationale": "Skills often start as SKILL.md files in a developer's local environment (e.g., ~/.claude/skills/loopctl/). Bulk import bridges the gap between file-based skill management and loopctl's versioned skill store. The create-or-update logic with idempotency ensures re-imports are safe — unchanged files produce no new versions, while modified files automatically create new versions with the diff tracked in the changelog.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-15.3.1",
+      "description": "POST /api/v1/skills/import (role: user) accepts a JSON body containing a skills array. Each skill object has: name (required), description (optional), prompt_text (required). Optional: project_id to scope imported skills to a project.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.2",
+      "description": "For each skill in the import payload: if no skill with that name exists in the tenant+project scope, a new skill is created with version 1. If a skill with that name already exists, the prompt_text is compared to the current version — if different, a new version is created; if identical, the skill is skipped (no-op).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.3",
+      "description": "The entire import is executed in a single database transaction (Ecto.Multi). If any part fails (validation error, constraint violation), the entire import is rolled back and nothing is persisted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.4",
+      "description": "On success, the response includes a summary: {skills_created: N, skills_updated: N, skills_unchanged: N, versions_created: N}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.5",
+      "description": "The import is idempotent — importing the same set of files twice with no changes produces {skills_created: 0, skills_updated: 0, skills_unchanged: N, versions_created: 0}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.6",
+      "description": "Duplicate names within the import payload are rejected with a 422 error listing the duplicate names.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.7",
+      "description": "Validation errors include the specific location of the failure (e.g., 'skills[2].name: can't be blank') for easy debugging.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.8",
+      "description": "All entities created or updated by the import are recorded in the audit log via Ecto.Multi in the same transaction. The audit entry includes actor_label indicating bulk import.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.9",
+      "description": "The endpoint enforces tenant isolation via RLS. If a project_id is specified, it must belong to the authenticated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-15.3.10",
+      "description": "When a new version is created during import, the changelog is auto-generated as 'Imported from bulk import' (or includes the description diff if provided).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-15.3.1",
+      "name": "Successful import creates new skills with v1",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"project_id\": project.id, \"skills\": [{\"name\": \"loopctl:review\", \"description\": \"Code review\", \"prompt_text\": \"Review the code...\"}, {\"name\": \"loopctl:verify-artifacts\", \"description\": \"Artifact check\", \"prompt_text\": \"Verify all artifacts...\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body includes skills_created=2, skills_updated=0, skills_unchanged=0, versions_created=2",
+        "Both skills exist in database with current_version=1",
+        "Both have skill_version records with version=1 and correct prompt_text",
+        "Audit log entries created for both skills"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.2",
+      "name": "Re-import with unchanged files is idempotent",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, name: 'loopctl:review', current_version: 1})",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 1, prompt_text: 'Review the code...'})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"skills\": [{\"name\": \"loopctl:review\", \"description\": \"Code review\", \"prompt_text\": \"Review the code...\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response body includes skills_created=0, skills_updated=0, skills_unchanged=1, versions_created=0",
+        "No new skill_version records created",
+        "Skill still has current_version=1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.3",
+      "name": "Re-import with changed prompt creates new version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, name: 'loopctl:review', current_version: 1})",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 1, prompt_text: 'Review the code...'})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"skills\": [{\"name\": \"loopctl:review\", \"description\": \"Code review\", \"prompt_text\": \"Review the code with extra checks...\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body includes skills_created=0, skills_updated=1, skills_unchanged=0, versions_created=1",
+        "Skill now has current_version=2",
+        "New skill_version record with version=2 and updated prompt_text",
+        "Original v1 is preserved unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.4",
+      "name": "Import rolls back on validation error",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"skills\": [{\"name\": \"valid:skill\", \"prompt_text\": \"Valid...\"}, {\"name\": \"\", \"prompt_text\": \"Missing name\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message includes 'skills[1].name: can't be blank'",
+        "No skills or versions were created (entire transaction rolled back)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.5",
+      "name": "Duplicate names in import payload rejected",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"skills\": [{\"name\": \"loopctl:review\", \"prompt_text\": \"V1\"}, {\"name\": \"loopctl:review\", \"prompt_text\": \"V2\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 422",
+        "Error message indicates duplicate name 'loopctl:review' in import payload"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.6",
+      "name": "Agent role cannot import skills",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with valid body using agent API key"
+      ],
+      "expected_results": [
+        "Response is 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-15.3.7",
+      "name": "Mixed import: some new, some updated, some unchanged",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id, name: 'loopctl:review', current_version: 1})",
+        "fixture(:skill_version, %{skill_id: skill.id, version: 1, prompt_text: 'Old review prompt'})",
+        "fixture(:skill, %{tenant_id: tenant.id, name: 'loopctl:verify', current_version: 1})",
+        "fixture(:skill_version, %{skill_id: skill2.id, version: 1, prompt_text: 'Verify prompt'})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/skills/import with body {\"skills\": [{\"name\": \"loopctl:review\", \"prompt_text\": \"New review prompt\"}, {\"name\": \"loopctl:verify\", \"prompt_text\": \"Verify prompt\"}, {\"name\": \"loopctl:plan\", \"prompt_text\": \"Plan prompt\"}]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "skills_created=1 (plan), skills_updated=1 (review), skills_unchanged=1 (verify), versions_created=2 (plan v1 + review v2)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use Ecto.Multi to process all skills in a single transaction. Steps: validate payload -> check for duplicates in payload -> for each skill: lookup existing by (tenant_id, project_id, name) -> compare prompt_text -> create/update/skip -> create audit entries.",
+    "Import context: add import_skills/3 function to Loopctl.Skills context. Accepts (tenant_id, skills_data, actor).",
+    "Idempotency check: compare the prompt_text of the incoming skill against the current version's prompt_text. Use String.trim/1 on both sides to normalize whitespace before comparison.",
+    "The CLI side of import (reading SKILL.md files) is handled in US-15.4. This story is the API endpoint only.",
+    "Controller: add import action to SkillController. Route: POST /api/v1/skills/import.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
+  ],
+  "dependencies": [
+    "US-15.1"
+  ],
+  "estimated_hours": 3
+}
