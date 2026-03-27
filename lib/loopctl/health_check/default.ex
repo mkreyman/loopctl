@@ -39,10 +39,12 @@ defmodule Loopctl.HealthCheck.Default do
   end
 
   defp check_oban do
-    case Process.whereis(Oban) do
-      pid when is_pid(pid) -> {"ok"}
-      nil -> {"error"}
+    case Oban.check_queue(queue: :default) do
+      %{paused: _} -> {"ok"}
+      _ -> {"error"}
     end
+  rescue
+    _ -> {"error"}
   end
 
   defp app_version do
