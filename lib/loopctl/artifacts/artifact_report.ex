@@ -61,6 +61,6 @@ defmodule Loopctl.Artifacts.ArtifactReport do
   def create_changeset(report \\ %__MODULE__{}, attrs) do
     report
     |> cast(attrs, [:artifact_type, :path, :exists, :details])
-    |> validate_required([:artifact_type])
+    |> validate_required([:artifact_type, :path])
   end
 end

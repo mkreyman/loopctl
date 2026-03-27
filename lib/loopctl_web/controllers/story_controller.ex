@@ -11,6 +11,7 @@ defmodule LoopctlWeb.StoryController do
 
   use LoopctlWeb, :controller
 
+  alias Loopctl.Artifacts
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
   alias Loopctl.WorkBreakdown.Stories
@@ -109,13 +110,18 @@ defmodule LoopctlWeb.StoryController do
             %{story_id: dep.story_id, depends_on_story_id: dep.depends_on_story_id}
           end)
 
+        # Fetch artifact reports and verification count for this story
+        {:ok, artifacts_result} = Artifacts.list_artifact_reports(tenant_id, story.id)
+        iteration_count = Artifacts.count_verifications(tenant_id, story.id)
+
         json(conn, %{
           story:
             story_json(story)
             |> Map.merge(%{
               dependencies: deps_for_story,
-              artifacts: [],
-              latest_verification: nil
+              artifacts: artifacts_result.data,
+              latest_verification: nil,
+              iteration_count: iteration_count
             })
         })
 

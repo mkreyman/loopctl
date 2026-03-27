@@ -83,6 +83,50 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert result.orchestrator_agent_id == orch_agent.id
     end
 
+    test "verifies with result=partial", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "Partial pass - minor issues remain",
+          "result" => "partial",
+          "review_type" => "enhanced_review"
+        })
+
+      body = json_response(conn, 200)
+      assert body["story"]["verified_status"] == "verified"
+
+      # Check verification_result has result=partial
+      results =
+        Loopctl.AdminRepo.all(from(v in VerificationResult, where: v.story_id == ^story.id))
+
+      assert [result] = results
+      assert result.result == :partial
+      assert result.summary == "Partial pass - minor issues remain"
+    end
+
+    test "defaults result to pass when not provided", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good"
+        })
+
+      body = json_response(conn, 200)
+      assert body["story"]["verified_status"] == "verified"
+
+      results =
+        Loopctl.AdminRepo.all(from(v in VerificationResult, where: v.story_id == ^story.id))
+
+      assert [result] = results
+      assert result.result == :pass
+    end
+
     test "rejects verify on non-reported_done story (409)", %{conn: conn} do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})

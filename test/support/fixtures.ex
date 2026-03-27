@@ -11,6 +11,8 @@ defmodule Loopctl.Fixtures do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Artifacts.ArtifactReport
+  alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Orchestrator.OrchestratorState
@@ -132,6 +134,31 @@ defmodule Loopctl.Fixtures do
         state_key: "main",
         state_data: %{"current_epic" => 1, "completed_stories" => []},
         version: 1
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:artifact_report, attrs) do
+    Map.merge(
+      %{
+        artifact_type: "schema",
+        path: "lib/loopctl/test.ex",
+        exists: true,
+        details: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:verification_result, attrs) do
+    Map.merge(
+      %{
+        result: :pass,
+        summary: "All checks passed",
+        findings: %{},
+        review_type: "enhanced_review",
+        iteration: 1
       },
       Enum.into(attrs, %{})
     )
@@ -346,6 +373,84 @@ defmodule Loopctl.Fixtures do
         depends_on_story_id: depends_on_story_id
       }
       |> StoryDependency.create_changeset()
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:artifact_report, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {story_id, attrs} =
+      case Map.get(attrs, :story_id) do
+        nil ->
+          story = fixture(:story, %{tenant_id: tenant_id})
+          {story.id, Map.put(attrs, :story_id, story.id)}
+
+        sid ->
+          {sid, attrs}
+      end
+
+    agent_id = Map.get(attrs, :reporter_agent_id)
+    reported_by = Map.get(attrs, :reported_by, :agent)
+
+    data = build(:artifact_report, attrs)
+
+    changeset =
+      %ArtifactReport{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        reported_by: reported_by,
+        reporter_agent_id: agent_id
+      }
+      |> ArtifactReport.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:verification_result, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {story_id, attrs} =
+      case Map.get(attrs, :story_id) do
+        nil ->
+          story = fixture(:story, %{tenant_id: tenant_id})
+          {story.id, Map.put(attrs, :story_id, story.id)}
+
+        sid ->
+          {sid, attrs}
+      end
+
+    orchestrator_agent_id = Map.get(attrs, :orchestrator_agent_id)
+
+    data = build(:verification_result, attrs)
+
+    changeset =
+      %VerificationResult{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        orchestrator_agent_id: orchestrator_agent_id
+      }
+      |> VerificationResult.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
