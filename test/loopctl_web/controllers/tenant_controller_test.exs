@@ -68,6 +68,26 @@ defmodule LoopctlWeb.TenantControllerTest do
       assert body["error"]["details"]["email"]
     end
 
+    test "Multi rollback: duplicate slug creates no orphan tenant", %{conn: conn} do
+      fixture(:tenant, %{slug: "rollback-slug"})
+
+      # Count tenants before the failing registration
+      before_count = Loopctl.AdminRepo.aggregate(Loopctl.Tenants.Tenant, :count, :id)
+
+      params = %{
+        "name" => "Orphan Corp",
+        "slug" => "rollback-slug",
+        "email" => "orphan@test.com"
+      }
+
+      conn = post(conn, ~p"/api/v1/tenants/register", params)
+      assert json_response(conn, 409)
+
+      # Verify no new tenant was created (Multi fully rolled back)
+      after_count = Loopctl.AdminRepo.aggregate(Loopctl.Tenants.Tenant, :count, :id)
+      assert after_count == before_count
+    end
+
     test "does not require authentication", %{conn: conn} do
       params = %{
         "name" => "No Auth Corp",

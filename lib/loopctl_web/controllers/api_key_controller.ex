@@ -121,11 +121,16 @@ defmodule LoopctlWeb.ApiKeyController do
       agent_id: old_key.agent_id
     }
 
-    with {:ok, {raw_key, new_key}} <- Auth.generate_api_key(new_attrs) do
+    Loopctl.AdminRepo.transaction(fn ->
       expires_at = DateTime.add(DateTime.utc_now(), grace_hours * 3600, :second)
-      {:ok, updated_old} = Auth.expire_api_key(old_key, expires_at)
-      {:ok, {raw_key, new_key, updated_old}}
-    end
+
+      with {:ok, {raw_key, new_key}} <- Auth.generate_api_key(new_attrs),
+           {:ok, updated_old} <- Auth.expire_api_key(old_key, expires_at) do
+        {raw_key, new_key, updated_old}
+      else
+        {:error, reason} -> Loopctl.AdminRepo.rollback(reason)
+      end
+    end)
   end
 
   defp creation_json(raw_key, api_key) do

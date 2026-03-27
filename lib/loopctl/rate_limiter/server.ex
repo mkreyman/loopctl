@@ -78,13 +78,19 @@ defmodule Loopctl.RateLimiter.Server do
   @impl true
   def init(_opts) do
     table =
-      :ets.new(@table, [
-        :set,
-        :public,
-        :named_table,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
+      case :ets.whereis(@table) do
+        :undefined ->
+          :ets.new(@table, [
+            :set,
+            :public,
+            :named_table,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+
+        existing ->
+          existing
+      end
 
     schedule_cleanup()
     {:ok, %{table: table}}

@@ -13,7 +13,7 @@ defmodule Loopctl.Auth.IdempotencyCache do
 
   schema "idempotency_cache" do
     field :idempotency_key, :string
-    field :response_data, :binary
+    field :response_data, Loopctl.Vault.Binary
     field :expires_at, :utc_datetime_usec
 
     timestamps(updated_at: false)

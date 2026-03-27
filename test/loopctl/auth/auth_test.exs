@@ -75,6 +75,8 @@ defmodule Loopctl.AuthTest do
       assert verified.role == :user
       # Tenant should be preloaded
       assert verified.tenant.id == tenant.id
+      # last_used_at should be set on verification
+      assert %DateTime{} = verified.last_used_at
     end
 
     test "rejects revoked key" do
