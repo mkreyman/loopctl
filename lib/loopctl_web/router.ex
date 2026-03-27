@@ -80,5 +80,10 @@ defmodule LoopctlWeb.Router do
     post "/epic_dependencies", EpicDependencyController, :create
     delete "/epic_dependencies/:id", EpicDependencyController, :delete
     get "/projects/:id/epic_dependencies", EpicDependencyController, :index
+
+    # Story dependencies
+    post "/story_dependencies", StoryDependencyController, :create
+    delete "/story_dependencies/:id", StoryDependencyController, :delete
+    get "/epics/:id/story_dependencies", StoryDependencyController, :index
   end
 end

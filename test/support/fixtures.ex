@@ -18,6 +18,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.WorkBreakdown.StoryDependency
 
   @doc """
   Builds a data map for the given type without database insertion.
@@ -115,6 +116,10 @@ defmodule Loopctl.Fixtures do
   end
 
   def build(:epic_dependency, attrs) do
+    Enum.into(attrs, %{})
+  end
+
+  def build(:story_dependency, attrs) do
     Enum.into(attrs, %{})
   end
 
@@ -308,6 +313,22 @@ defmodule Loopctl.Fixtures do
       |> EpicDependency.create_changeset(%{
         epic_id: epic_id,
         depends_on_epic_id: depends_on_epic_id
+      })
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:story_dependency, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    story_id = Map.fetch!(attrs, :story_id)
+    depends_on_story_id = Map.fetch!(attrs, :depends_on_story_id)
+
+    changeset =
+      %StoryDependency{tenant_id: tenant_id}
+      |> StoryDependency.create_changeset(%{
+        story_id: story_id,
+        depends_on_story_id: depends_on_story_id
       })
 
     AdminRepo.insert!(changeset)
