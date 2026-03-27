@@ -71,7 +71,8 @@ defmodule Loopctl.CLI.Client do
   # --- Private ---
 
   defp request(method, path, opts) do
-    server = resolve_opt(opts, :server, &Config.server/0)
+    plug = Application.get_env(:loopctl, :cli_req_plug)
+    server = resolve_server(opts, plug)
     api_key = resolve_opt(opts, :api_key, &Config.api_key/0)
     params = Keyword.get(opts, :params)
     json = Keyword.get(opts, :json)
@@ -86,7 +87,7 @@ defmodule Loopctl.CLI.Client do
         |> maybe_add_auth(api_key)
         |> maybe_add_json(json)
         |> maybe_add_params(params)
-        |> maybe_add_plug()
+        |> maybe_add_plug(plug)
 
       case Req.request(req_opts) do
         {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
@@ -122,10 +123,18 @@ defmodule Loopctl.CLI.Client do
   defp maybe_add_params(opts, nil), do: opts
   defp maybe_add_params(opts, params), do: Keyword.put(opts, :params, params)
 
-  defp maybe_add_plug(opts) do
-    case Application.get_env(:loopctl, :cli_req_plug) do
-      nil -> opts
-      plug -> Keyword.put(opts, :plug, plug)
+  defp maybe_add_plug(opts, nil), do: opts
+  defp maybe_add_plug(opts, plug), do: Keyword.put(opts, :plug, plug)
+
+  # When a Req.Test plug is configured, use a canonical localhost URL
+  # so the plug receives a valid request path instead of a garbled URL.
+  defp resolve_server(opts, plug) do
+    case Keyword.fetch(opts, :server) do
+      {:ok, nil} when plug != nil -> nil
+      {:ok, nil} -> nil
+      {:ok, value} -> value
+      :error when plug != nil -> "http://localhost:4000"
+      :error -> Config.server()
     end
   end
 
