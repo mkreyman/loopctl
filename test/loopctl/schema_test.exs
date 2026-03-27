@@ -125,5 +125,85 @@ defmodule Loopctl.SchemaTest do
       # Verify it produces a valid Ecto.Query
       assert %Ecto.Query{} = query
     end
+
+    test "returns only non-deleted records from the database" do
+      alias Loopctl.Repo.RlsTestRecord
+
+      tenant = fixture(:tenant)
+
+      {:ok, _active} =
+        Repo.with_tenant(tenant.id, fn ->
+          %RlsTestRecord{tenant_id: tenant.id}
+          |> RlsTestRecord.changeset(%{name: "active-record"})
+          |> Ecto.Changeset.put_change(:tenant_id, tenant.id)
+          |> Repo.insert!()
+        end)
+
+      {:ok, _deleted} =
+        Repo.with_tenant(tenant.id, fn ->
+          %RlsTestRecord{tenant_id: tenant.id}
+          |> RlsTestRecord.changeset(%{name: "deleted-record"})
+          |> Ecto.Changeset.put_change(:tenant_id, tenant.id)
+          |> Ecto.Changeset.put_change(:deleted_at, ~U[2024-01-01 00:00:00.000000Z])
+          |> Repo.insert!()
+        end)
+
+      {:ok, results} =
+        Repo.with_tenant(tenant.id, fn ->
+          RlsTestRecord
+          |> Loopctl.Schema.not_deleted()
+          |> Repo.all()
+        end)
+
+      assert length(results) == 1
+      assert hd(results).name == "active-record"
+    end
+  end
+
+  describe "tenant_id validation" do
+    test "RlsTestRecord requires tenant_id for database insertion" do
+      alias Loopctl.Repo.RlsTestRecord
+
+      # A record without tenant_id should fail on DB insert due to NOT NULL constraint
+      changeset =
+        %RlsTestRecord{}
+        |> RlsTestRecord.changeset(%{name: "no-tenant"})
+
+      assert changeset.valid?
+
+      assert_raise Postgrex.Error, fn ->
+        Repo.insert!(changeset)
+      end
+    end
+  end
+
+  describe "timestamp precision" do
+    test "timestamps preserve microsecond precision via DB round-trip" do
+      alias Loopctl.Repo.RlsTestRecord
+
+      tenant = fixture(:tenant)
+
+      {:ok, inserted} =
+        Repo.with_tenant(tenant.id, fn ->
+          %RlsTestRecord{tenant_id: tenant.id}
+          |> RlsTestRecord.changeset(%{name: "precision-test"})
+          |> Ecto.Changeset.put_change(:tenant_id, tenant.id)
+          |> Repo.insert!()
+        end)
+
+      {:ok, [fetched]} =
+        Repo.with_tenant(tenant.id, fn ->
+          Repo.all(RlsTestRecord)
+        end)
+
+      # Verify microsecond precision is preserved (not truncated to seconds)
+      assert fetched.inserted_at.microsecond != {0, 0}
+      assert {_usec, 6} = fetched.inserted_at.microsecond
+      assert {_usec, 6} = fetched.updated_at.microsecond
+
+      # Verify round-trip preserves the exact value
+      assert fetched.inserted_at == inserted.inserted_at
+      assert fetched.updated_at == inserted.updated_at
+    end
   end
 end

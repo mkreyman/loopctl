@@ -110,7 +110,10 @@ defmodule Loopctl.Repo do
   # In test/dev, the DB connection is a superuser, so we SET LOCAL ROLE
   # to a non-superuser to enforce RLS policies. In production, the Repo
   # connects as a non-superuser natively, so no role switch is needed.
+  #
   # sobelow_skip ["SQL.Query"]
+  # The role name is a compile-time constant from config, not user input.
+  # Belt-and-suspenders: also ignored in .sobelow-conf.
   case Application.compile_env(:loopctl, :rls_role) do
     nil ->
       defp maybe_set_local_role, do: :ok

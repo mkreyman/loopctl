@@ -32,6 +32,10 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# Use simple formatter in test (override JSON default from config.exs)
+config :logger, :default_handler,
+  formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
+
 # Oban: inline testing mode (jobs execute synchronously in tests)
 config :loopctl, Oban, testing: :inline
 
@@ -44,7 +48,7 @@ config :loopctl, Loopctl.Vault,
     default: {
       Cloak.Ciphers.AES.GCM,
       tag: "AES.GCM.V1",
-      key: Base.decode64!("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleXRlcw=="),
+      key: Base.decode64!("tv9k+u3uqigJly2BdAZTVhtkB5uRBNObattywOn5KCE="),
       iv_length: 12
     }
   ]

@@ -70,6 +70,9 @@ defmodule Loopctl.MixProject do
       {:cloak, "~> 1.1"},
       {:cloak_ecto, "~> 1.3"},
 
+      # Structured JSON logging
+      {:logger_json, "~> 7.0"},
+
       # Rate limiting
       {:hammer, "~> 6.2"},
 

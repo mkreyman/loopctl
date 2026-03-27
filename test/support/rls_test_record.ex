@@ -7,11 +7,12 @@ defmodule Loopctl.Repo.RlsTestRecord do
   so tests can insert records via different tenant contexts and verify isolation.
   """
 
-  use Loopctl.Schema
+  use Loopctl.Schema, soft_delete: true
 
   schema "rls_test_records" do
     tenant_field()
     field :name, :string
+    field :deleted_at, :utc_datetime_usec
 
     timestamps()
   end

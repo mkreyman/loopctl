@@ -9,6 +9,8 @@ defmodule Loopctl.Fixtures do
   separate tenants via `fixture(:tenant)`.
   """
 
+  alias Loopctl.Tenants.Tenant
+
   @doc """
   Builds a data map for the given type without database insertion.
   Useful for changeset tests and unit tests that don't need persistence.
@@ -19,7 +21,7 @@ defmodule Loopctl.Fixtures do
         id: Ecto.UUID.generate(),
         name: "Test Tenant #{System.unique_integer([:positive])}",
         slug: "test-tenant-#{System.unique_integer([:positive])}",
-        status: :active
+        status: "active"
       },
       Enum.into(attrs, %{})
     )
@@ -32,10 +34,12 @@ defmodule Loopctl.Fixtures do
   def fixture(type, attrs \\ %{})
 
   def fixture(:tenant, attrs) do
-    # Tenants table doesn't exist yet in US-1.1/1.2, but this placeholder
-    # ensures the fixture pattern is established. Downstream epics will
-    # fill in the actual Repo.insert! call.
-    build(:tenant, attrs)
+    data = build(:tenant, attrs)
+
+    %Tenant{}
+    |> Ecto.Changeset.cast(data, [:id, :name, :slug, :status])
+    |> Ecto.Changeset.validate_required([:name, :slug, :status])
+    |> Loopctl.Repo.insert!()
   end
 
   @doc """

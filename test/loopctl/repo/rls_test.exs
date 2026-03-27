@@ -197,4 +197,38 @@ defmodule Loopctl.Repo.RlsTest do
       assert Enum.all?(tenant_ids, &(&1 == tenant_a.id))
     end
   end
+
+  describe "process isolation for tenant context" do
+    test "concurrent tasks with different tenant contexts do not leak" do
+      tenant_a = create_tenant("proc-iso-a")
+      tenant_b = create_tenant("proc-iso-b")
+
+      # Each task sets its own tenant and verifies it sees only its own ID
+      task_a =
+        Task.async(fn ->
+          Repo.put_tenant_id(tenant_a.id)
+          # Small sleep to increase chance of interleaving
+          Process.sleep(10)
+          Repo.get_tenant_id()
+        end)
+
+      task_b =
+        Task.async(fn ->
+          Repo.put_tenant_id(tenant_b.id)
+          Process.sleep(10)
+          Repo.get_tenant_id()
+        end)
+
+      result_a = Task.await(task_a)
+      result_b = Task.await(task_b)
+
+      # Each task must see only its own tenant — no cross-contamination
+      assert result_a == tenant_a.id
+      assert result_b == tenant_b.id
+
+      # Parent process should not be affected by child tenant contexts
+      Repo.clear_tenant_id()
+      assert Repo.get_tenant_id() == nil
+    end
+  end
 end

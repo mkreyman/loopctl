@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.ErrorJSONTest do
   use LoopctlWeb.ConnCase, async: true
 
+  setup :verify_on_exit!
+
   test "renders 404" do
     assert LoopctlWeb.ErrorJSON.render("404.json", %{}) ==
              %{error: %{status: 404, message: "Not found"}}

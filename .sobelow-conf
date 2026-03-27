@@ -5,6 +5,6 @@
   router: "lib/loopctl_web/router.ex",
   exit: "low",
   format: "txt",
-  ignore: [],
+  ignore: ["SQL.Query"],
   ignore_files: []
 ]

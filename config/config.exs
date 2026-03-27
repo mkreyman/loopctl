@@ -33,10 +33,10 @@ config :loopctl, LoopctlWeb.Endpoint,
   pubsub_server: Loopctl.PubSub,
   live_view: [signing_salt: "xpgWTdmT"]
 
-# Configure Elixir's Logger — structured JSON logging with tenant context
-config :logger, :default_formatter,
-  format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id, :tenant_id, :remote_ip]
+# Configure Elixir's Logger — structured JSON logging with tenant context.
+# Production uses JSON via LoggerJSON; dev/test override with human-readable format.
+config :logger, :default_handler,
+  formatter: {LoggerJSON.Formatters.Basic, metadata: [:request_id, :tenant_id, :remote_ip]}
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
@@ -55,7 +55,7 @@ config :hammer,
 # Oban background jobs
 config :loopctl, Oban,
   repo: Loopctl.Repo,
-  queues: [default: 10, webhooks: 5]
+  queues: [default: 10, webhooks: 5, cleanup: 2]
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
@@ -64,7 +64,7 @@ config :loopctl, Loopctl.Vault,
     default: {
       Cloak.Ciphers.AES.GCM,
       tag: "AES.GCM.V1",
-      key: Base.decode64!("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleXRlcw=="),
+      key: Base.decode64!("tv9k+u3uqigJly2BdAZTVhtkB5uRBNObattywOn5KCE="),
       iv_length: 12
     }
   ]

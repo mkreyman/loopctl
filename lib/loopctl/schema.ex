@@ -84,7 +84,7 @@ defmodule Loopctl.Schema do
   defmacro __using__(opts) do
     opts = Keyword.merge([tenant_scoped: true, soft_delete: false], opts)
     _tenant_scoped = Keyword.fetch!(opts, :tenant_scoped)
-    _soft_delete = Keyword.fetch!(opts, :soft_delete)
+    soft_delete = Keyword.fetch!(opts, :soft_delete)
 
     quote do
       use Ecto.Schema
@@ -94,7 +94,29 @@ defmodule Loopctl.Schema do
       @foreign_key_type :binary_id
       @timestamps_opts [type: :utc_datetime_usec]
 
+      if unquote(soft_delete) do
+        @loopctl_soft_delete true
+        @before_compile Loopctl.Schema
+      end
+
       import Loopctl.Schema, only: [tenant_field: 0]
+    end
+  end
+
+  @doc false
+  defmacro __before_compile__(env) do
+    if Module.get_attribute(env.module, :loopctl_soft_delete) do
+      fields = Module.get_attribute(env.module, :ecto_fields, [])
+      field_names = Enum.map(fields, &elem(&1, 0))
+
+      unless :deleted_at in field_names do
+        IO.warn(
+          "#{inspect(env.module)} uses `use Loopctl.Schema, soft_delete: true` " <>
+            "but does not define a `deleted_at` field. " <>
+            "Add `field :deleted_at, :utc_datetime_usec` to the schema block.",
+          Macro.Env.stacktrace(env)
+        )
+      end
     end
   end
 
