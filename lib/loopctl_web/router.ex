@@ -49,6 +49,10 @@ defmodule LoopctlWeb.Router do
     # Change feed
     get "/changes", ChangeController, :index
 
+    # Dependency graph queries (must be before stories/:id to avoid matching "ready"/"blocked")
+    get "/stories/ready", DependencyGraphController, :ready
+    get "/stories/blocked", DependencyGraphController, :blocked
+
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
@@ -75,6 +79,9 @@ defmodule LoopctlWeb.Router do
     get "/stories/:id", StoryController, :show
     patch "/stories/:id", StoryController, :update
     delete "/stories/:id", StoryController, :delete
+
+    # Dependency graph
+    get "/projects/:id/dependency_graph", DependencyGraphController, :graph
 
     # Epic dependencies
     post "/epic_dependencies", EpicDependencyController, :create
