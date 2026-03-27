@@ -23,6 +23,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   # --- Agent Status Transitions (US-7.1) ---
 
@@ -866,6 +867,16 @@ defmodule Loopctl.Progress do
   defp record_epic_completion(tenant_id, epic_id, story_count, actor_id, actor_label) do
     epic = AdminRepo.get!(Epic, epic_id)
 
+    payload = %{
+      "event" => "epic.completed",
+      "epic_id" => epic_id,
+      "epic_number" => epic.number,
+      "epic_title" => epic.title,
+      "project_id" => epic.project_id,
+      "story_count" => story_count,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    }
+
     with {:ok, _audit} <-
            Audit.create_log_entry(tenant_id, %{
              entity_type: "epic",
@@ -882,27 +893,7 @@ defmodule Loopctl.Progress do
                "story_count" => story_count
              }
            }) do
-      # Generate webhook events for epic.completed
-      EventGenerator.matching_webhooks(tenant_id, "epic.completed", epic.project_id)
-      |> Enum.each(fn webhook ->
-        %WebhookEvent{
-          tenant_id: tenant_id,
-          webhook_id: webhook.id
-        }
-        |> WebhookEvent.create_changeset(%{
-          event_type: "epic.completed",
-          payload: %{
-            "event" => "epic.completed",
-            "epic_id" => epic_id,
-            "epic_number" => epic.number,
-            "epic_title" => epic.title,
-            "project_id" => epic.project_id,
-            "story_count" => story_count,
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        })
-        |> AdminRepo.insert!()
-      end)
+      insert_events_with_delivery(tenant_id, "epic.completed", epic.project_id, payload)
 
       {:ok, :completed}
     end
@@ -971,25 +962,39 @@ defmodule Loopctl.Progress do
   end
 
   defp generate_auto_reset_events(tenant_id, story, orchestrator_agent_id) do
-    EventGenerator.matching_webhooks(tenant_id, "story.auto_reset", story.project_id)
+    payload = %{
+      "event" => "story.auto_reset",
+      "story_id" => story.id,
+      "project_id" => story.project_id,
+      "epic_id" => story.epic_id,
+      "reason" => "rejected",
+      "orchestrator_agent_id" => orchestrator_agent_id,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    }
+
+    insert_events_with_delivery(tenant_id, "story.auto_reset", story.project_id, payload)
+  end
+
+  defp insert_events_with_delivery(tenant_id, event_type, project_id, payload) do
+    EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
     |> Enum.each(fn webhook ->
-      %WebhookEvent{
-        tenant_id: tenant_id,
-        webhook_id: webhook.id
-      }
-      |> WebhookEvent.create_changeset(%{
-        event_type: "story.auto_reset",
-        payload: %{
-          "event" => "story.auto_reset",
-          "story_id" => story.id,
-          "project_id" => story.project_id,
-          "epic_id" => story.epic_id,
-          "reason" => "rejected",
-          "orchestrator_agent_id" => orchestrator_agent_id,
-          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+      {:ok, event} =
+        %WebhookEvent{
+          tenant_id: tenant_id,
+          webhook_id: webhook.id
         }
-      })
-      |> AdminRepo.insert!()
+        |> WebhookEvent.create_changeset(%{
+          event_type: event_type,
+          payload: payload
+        })
+        |> AdminRepo.insert()
+
+      {:ok, _job} =
+        WebhookDeliveryWorker.new(%{
+          webhook_event_id: event.id,
+          tenant_id: tenant_id
+        })
+        |> Oban.insert()
     end)
   end
 

@@ -401,11 +401,23 @@ defmodule Loopctl.Webhooks do
         Tenants.get_tenant_settings(tenant, "webhook_max_consecutive_failures", 10)
 
       if webhook.consecutive_failures >= threshold do
-        webhook
-        |> Ecto.Changeset.change(%{active: false})
-        |> AdminRepo.update!()
+        do_auto_disable(tenant_id, webhook, threshold)
+      else
+        {:ok, :still_active}
+      end
+    end
+  end
 
-        Audit.create_log_entry(tenant_id, %{
+  defp do_auto_disable(tenant_id, webhook, threshold) do
+    multi =
+      Multi.new()
+      |> Multi.update(
+        :disable_webhook,
+        Ecto.Changeset.change(webhook, %{active: false})
+      )
+      |> Audit.log_in_multi(:audit, fn _changes ->
+        %{
+          tenant_id: tenant_id,
           entity_type: "webhook",
           entity_id: webhook.id,
           action: "webhook_auto_disabled",
@@ -416,12 +428,12 @@ defmodule Loopctl.Webhooks do
             "consecutive_failures" => webhook.consecutive_failures,
             "threshold" => threshold
           }
-        })
+        }
+      end)
 
-        {:ok, :disabled}
-      else
-        {:ok, :still_active}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, _} -> {:ok, :disabled}
+      {:error, _step, reason, _} -> {:error, reason}
     end
   end
 

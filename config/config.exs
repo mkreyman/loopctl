@@ -75,6 +75,10 @@ config :loopctl, Loopctl.Vault,
       key: Base.decode64!("tv9k+u3uqigJly2BdAZTVhtkB5uRBNObattywOn5KCE="),
       iv_length: 12
     }
+  ],
+  retired_ciphers: [
+    # Add previous keys here during key rotation, e.g.:
+    # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
   ]
 
 # Import environment specific config. This must remain at the bottom

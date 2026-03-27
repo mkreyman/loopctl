@@ -17,6 +17,7 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Tenants
   alias Loopctl.Webhooks.WebhookEvent
 
   @default_retention_days 30
@@ -24,29 +25,46 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
 
   @impl Oban.Worker
   def perform(_job) do
-    retention_days =
-      Application.get_env(:loopctl, :webhook_event_retention_days, @default_retention_days)
+    {:ok, tenants} = Tenants.list_tenants()
 
-    cutoff = DateTime.utc_now() |> DateTime.add(-retention_days * 86_400, :second)
+    total_deleted =
+      Enum.reduce(tenants, 0, fn tenant, acc ->
+        retention_days =
+          Tenants.get_tenant_settings(
+            tenant,
+            "webhook_event_retention_days",
+            @default_retention_days
+          )
 
-    deleted_count = delete_in_batches(cutoff)
+        cutoff = DateTime.utc_now() |> DateTime.add(-retention_days * 86_400, :second)
 
-    if deleted_count > 0 do
-      Logger.info(
-        "WebhookCleanupWorker pruned #{deleted_count} webhook events older than #{retention_days} days"
-      )
+        deleted = delete_in_batches(tenant.id, cutoff)
+
+        if deleted > 0 do
+          Logger.info(
+            "WebhookCleanupWorker pruned #{deleted} webhook events for tenant #{tenant.id} " <>
+              "(retention: #{retention_days} days)"
+          )
+        end
+
+        acc + deleted
+      end)
+
+    if total_deleted > 0 do
+      Logger.info("WebhookCleanupWorker total pruned: #{total_deleted} webhook events")
     end
 
     :ok
   end
 
-  defp delete_in_batches(cutoff) do
-    delete_in_batches(cutoff, 0)
+  defp delete_in_batches(tenant_id, cutoff) do
+    delete_in_batches(tenant_id, cutoff, 0)
   end
 
-  defp delete_in_batches(cutoff, total_deleted) do
+  defp delete_in_batches(tenant_id, cutoff, total_deleted) do
     ids =
       WebhookEvent
+      |> where([e], e.tenant_id == ^tenant_id)
       |> where([e], e.status in [:delivered, :exhausted])
       |> where([e], e.inserted_at < ^cutoff)
       |> select([e], e.id)
@@ -63,7 +81,7 @@ defmodule Loopctl.Workers.WebhookCleanupWorker do
           |> where([e], e.id in ^batch_ids)
           |> AdminRepo.delete_all()
 
-        delete_in_batches(cutoff, total_deleted + count)
+        delete_in_batches(tenant_id, cutoff, total_deleted + count)
     end
   end
 end

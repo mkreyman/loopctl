@@ -21,6 +21,10 @@ defmodule Loopctl.Webhooks.EventGenerator do
         project_id: project_id,
         payload: %{...}
       })
+
+  ## TODO
+
+  - Wire `project.imported` events when US-12.1 (Import/Export) is implemented.
   """
 
   import Ecto.Query
@@ -29,6 +33,7 @@ defmodule Loopctl.Webhooks.EventGenerator do
   alias Loopctl.AdminRepo
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @doc """
   Appends webhook event generation steps to an Ecto.Multi pipeline.
@@ -68,6 +73,14 @@ defmodule Loopctl.Webhooks.EventGenerator do
       events =
         Enum.map(webhooks, fn webhook ->
           {:ok, event} = insert_webhook_event(tenant_id, webhook.id, event_type, payload)
+
+          {:ok, _job} =
+            WebhookDeliveryWorker.new(%{
+              webhook_event_id: event.id,
+              tenant_id: tenant_id
+            })
+            |> Oban.insert()
+
           event
         end)
 
