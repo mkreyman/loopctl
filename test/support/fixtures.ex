@@ -13,6 +13,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Agents.Agent
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
+  alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
@@ -395,6 +396,53 @@ defmodule Loopctl.Fixtures do
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:orchestrator_state, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {project_id, attrs} =
+      case Map.get(attrs, :project_id) do
+        nil ->
+          project = fixture(:project, %{tenant_id: tenant_id})
+          {project.id, Map.put(attrs, :project_id, project.id)}
+
+        pid ->
+          {pid, attrs}
+      end
+
+    data = build(:orchestrator_state, attrs)
+
+    changeset =
+      %{
+        state_key: data.state_key,
+        state_data: data.state_data
+      }
+      |> OrchestratorState.create_changeset()
+      |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+      |> Ecto.Changeset.put_change(:project_id, project_id)
+
+    version = Map.get(data, :version, 1)
+
+    state = AdminRepo.insert!(changeset)
+
+    if version != 1 do
+      state
+      |> Ecto.Changeset.change(%{version: version})
+      |> AdminRepo.update!()
+    else
+      state
+    end
   end
 
   @doc """

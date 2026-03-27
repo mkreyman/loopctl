@@ -105,5 +105,9 @@ defmodule LoopctlWeb.Router do
     post "/story_dependencies", StoryDependencyController, :create
     delete "/story_dependencies/:id", StoryDependencyController, :delete
     get "/epics/:id/story_dependencies", StoryDependencyController, :index
+
+    # Orchestrator state
+    put "/orchestrator/state/:project_id", OrchestratorStateController, :save
+    get "/orchestrator/state/:project_id", OrchestratorStateController, :show
   end
 end
