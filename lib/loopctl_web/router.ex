@@ -36,5 +36,9 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+
+    # API key management
+    resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
+    post "/api_keys/:id/rotate", ApiKeyController, :rotate
   end
 end
