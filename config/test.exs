@@ -60,6 +60,9 @@ config :phoenix,
 # DI: Use mock health checker in tests
 config :loopctl, :health_checker, Loopctl.MockHealthChecker
 
+# DI: Use mock rate limiter in tests
+config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
+
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.
 config :loopctl, :rls_role, "loopctl_app"

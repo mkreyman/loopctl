@@ -68,6 +68,10 @@ defmodule Loopctl.DataCase do
          checks: %{database: "ok", oban: "ok"}
        }}
     end)
+
+    Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
+      {:allow, 1}
+    end)
   end
 
   @doc """

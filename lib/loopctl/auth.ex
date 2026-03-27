@@ -23,11 +23,124 @@ defmodule Loopctl.Auth do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Auth.IdempotencyCache
+  alias Loopctl.Tenants.Tenant
 
   @key_prefix "lc_"
   @random_bytes 30
+  @idempotency_ttl_hours 24
+
+  @doc """
+  Registers a new tenant and creates its first user-role API key.
+
+  The entire operation is wrapped in a transaction. If either step fails,
+  both are rolled back. Returns the raw API key only once.
+
+  Supports idempotency: if `idempotency_key` is provided, a repeat request
+  within 24 hours returns the cached response instead of creating a duplicate.
+
+  ## Parameters
+
+  - `attrs` — must include `name`, `slug`, `email`. Optional: `settings`, `idempotency_key`.
+  """
+  @spec register_tenant(map()) ::
+          {:ok, %{tenant: Tenant.t(), raw_key: String.t(), api_key: ApiKey.t()}}
+          | {:error, :conflict}
+          | {:error, Ecto.Changeset.t()}
+  def register_tenant(attrs) do
+    idempotency_key = Map.get(attrs, "idempotency_key") || Map.get(attrs, :idempotency_key)
+
+    if idempotency_key do
+      case check_idempotency(idempotency_key) do
+        {:ok, cached} -> {:ok, cached}
+        :miss -> do_register_tenant(attrs, idempotency_key)
+      end
+    else
+      do_register_tenant(attrs, nil)
+    end
+  end
+
+  defp do_register_tenant(attrs, idempotency_key) do
+    raw_key = generate_raw_key()
+    key_hash = hash_key(raw_key)
+    key_prefix = String.slice(raw_key, 0, 8)
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:tenant, Tenant.create_changeset(attrs))
+      |> Multi.run(:api_key, fn _repo, %{tenant: tenant} ->
+        changeset =
+          %ApiKey{tenant_id: tenant.id}
+          |> ApiKey.create_changeset(%{name: "default", role: :user})
+          |> Ecto.Changeset.put_change(:key_hash, key_hash)
+          |> Ecto.Changeset.put_change(:key_prefix, key_prefix)
+
+        AdminRepo.insert(changeset)
+      end)
+
+    multi =
+      if idempotency_key do
+        Multi.run(multi, :cache, fn _repo, %{tenant: tenant, api_key: api_key} ->
+          cache_idempotency(idempotency_key, %{
+            tenant: tenant,
+            raw_key: raw_key,
+            api_key: api_key
+          })
+        end)
+      else
+        multi
+      end
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{tenant: tenant, api_key: api_key}} ->
+        {:ok, %{tenant: tenant, raw_key: raw_key, api_key: api_key}}
+
+      {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
+        if has_unique_constraint_error?(changeset, :slug) do
+          {:error, :conflict}
+        else
+          {:error, changeset}
+        end
+
+      {:error, :api_key, changeset, _changes} ->
+        {:error, changeset}
+    end
+  end
+
+  defp has_unique_constraint_error?(changeset, field) do
+    Enum.any?(changeset.errors, fn
+      {^field, {_, opts}} -> Keyword.get(opts, :constraint) == :unique
+      _ -> false
+    end)
+  end
+
+  defp check_idempotency(key) do
+    query =
+      from ic in IdempotencyCache,
+        where: ic.idempotency_key == ^key and ic.expires_at > ^DateTime.utc_now()
+
+    case AdminRepo.one(query) do
+      nil ->
+        :miss
+
+      %IdempotencyCache{response_data: data} ->
+        {:ok, :erlang.binary_to_term(data)}
+    end
+  end
+
+  defp cache_idempotency(key, response_data) do
+    expires_at = DateTime.add(DateTime.utc_now(), @idempotency_ttl_hours * 3600, :second)
+
+    %IdempotencyCache{
+      idempotency_key: key,
+      response_data: :erlang.term_to_binary(response_data),
+      expires_at: expires_at
+    }
+    |> AdminRepo.insert()
+  end
 
   @doc """
   Generates a new API key and persists the hashed version.

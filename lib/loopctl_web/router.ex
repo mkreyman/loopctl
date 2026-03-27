@@ -12,6 +12,10 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.RequireAuth
   end
 
+  pipeline :registration_rate_limit do
+    plug LoopctlWeb.Plugs.RegistrationRateLimiter
+  end
+
   # Health check — unauthenticated, outside /api/v1
   scope "/", LoopctlWeb do
     pipe_through :api
@@ -21,11 +25,16 @@ defmodule LoopctlWeb.Router do
 
   # Public API endpoints (no auth required)
   scope "/api/v1", LoopctlWeb do
-    pipe_through :api
+    pipe_through [:api, :registration_rate_limit]
+
+    post "/tenants/register", TenantController, :register
   end
 
   # API v1 — all authenticated endpoints
   scope "/api/v1", LoopctlWeb do
     pipe_through [:api, :authenticated]
+
+    get "/tenants/me", TenantController, :show
+    patch "/tenants/me", TenantController, :update
   end
 end

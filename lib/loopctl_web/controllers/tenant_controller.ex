@@ -1,0 +1,91 @@
+defmodule LoopctlWeb.TenantController do
+  @moduledoc """
+  Controller for tenant registration and tenant profile management.
+
+  - `POST /api/v1/tenants/register` — public, creates tenant + first API key
+  - `GET /api/v1/tenants/me` — authenticated, returns current tenant profile
+  - `PATCH /api/v1/tenants/me` — authenticated, updates current tenant
+  """
+
+  use LoopctlWeb, :controller
+
+  alias Loopctl.Auth
+  alias Loopctl.Tenants
+
+  action_fallback LoopctlWeb.FallbackController
+
+  @doc """
+  POST /api/v1/tenants/register
+
+  Public endpoint. Creates a new tenant and first user-role API key.
+  Returns the raw API key once.
+  """
+  def register(conn, params) do
+    case Auth.register_tenant(params) do
+      {:ok, %{tenant: tenant, raw_key: raw_key, api_key: api_key}} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          tenant: tenant_json(tenant),
+          api_key: %{
+            id: api_key.id,
+            raw_key: raw_key,
+            key_prefix: api_key.key_prefix,
+            role: api_key.role,
+            name: api_key.name
+          }
+        })
+
+      {:error, :conflict} ->
+        {:error, :conflict}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  @doc """
+  GET /api/v1/tenants/me
+
+  Returns the current tenant profile based on the authenticated API key.
+  """
+  def show(conn, _params) do
+    tenant = conn.assigns.current_tenant
+
+    conn
+    |> put_status(:ok)
+    |> json(%{tenant: tenant_json(tenant)})
+  end
+
+  @doc """
+  PATCH /api/v1/tenants/me
+
+  Updates the current tenant profile.
+  """
+  def update(conn, params) do
+    tenant = conn.assigns.current_tenant
+
+    case Tenants.update_tenant(tenant, params) do
+      {:ok, updated} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{tenant: tenant_json(updated)})
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  defp tenant_json(tenant) do
+    %{
+      id: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+      email: tenant.email,
+      settings: tenant.settings,
+      status: tenant.status,
+      inserted_at: tenant.inserted_at,
+      updated_at: tenant.updated_at
+    }
+  end
+end
