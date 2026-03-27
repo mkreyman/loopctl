@@ -120,4 +120,22 @@ defmodule LoopctlWeb.Router do
     post "/webhooks/:id/test", WebhookController, :test
     get "/webhooks/:id/deliveries", WebhookController, :deliveries
   end
+
+  # Superadmin endpoints (Epic 11)
+  scope "/api/v1/admin", LoopctlWeb do
+    pipe_through [:api, :authenticated]
+
+    # Tenant management
+    get "/tenants", AdminTenantController, :index
+    get "/tenants/:id", AdminTenantController, :show
+    patch "/tenants/:id", AdminTenantController, :update
+    post "/tenants/:id/suspend", AdminTenantController, :suspend
+    post "/tenants/:id/activate", AdminTenantController, :activate
+
+    # System-wide stats
+    get "/stats", AdminStatsController, :show
+
+    # Cross-tenant audit log
+    get "/audit", AdminAuditController, :index
+  end
 end
