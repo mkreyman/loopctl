@@ -15,6 +15,7 @@ defmodule Loopctl.Progress do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ArtifactReport
+  alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.WorkBreakdown.Story
 
@@ -356,6 +357,232 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # --- Orchestrator Verification (US-7.2) ---
+
+  @doc """
+  Verifies a story: orchestrator marks it as passing verification.
+
+  Sets verified_status to `verified` and creates a verification_result
+  record with result=pass. Uses pessimistic locking to prevent duplicate
+  verifications. Requires agent_status to be `reported_done`.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+  - `params` -- map with `summary` (required), optional `findings`, `review_type`
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %Story{}}` on success
+  - `{:error, :not_found}` if story not found in tenant
+  - `{:error, :invalid_transition}` if story is not reported_done
+  """
+  @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Story.t()} | {:error, atom()}
+  def verify_story(tenant_id, story_id, params, opts \\ []) do
+    orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+
+    verification_params = extract_verification_params(params)
+
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        validate_verifiable(story)
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        apply_verified_status(story)
+      end)
+      |> insert_verification_result(tenant_id, orchestrator_agent_id, :pass, verification_params)
+      |> audit_verification(tenant_id, "verified", actor_id, actor_label, orchestrator_agent_id)
+
+    unwrap_verification_transaction(multi)
+  end
+
+  @doc """
+  Rejects a story: orchestrator marks it as failing verification.
+
+  Sets verified_status to `rejected` and creates a verification_result
+  record with result=fail. Uses pessimistic locking. Can be called on
+  reported_done or verified stories (allowing re-rejection).
+
+  Requires a non-empty reason.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+  - `params` -- map with `reason` (required), optional `findings`, `review_type`
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %Story{}}` on success
+  - `{:error, :not_found}` if story not found in tenant
+  - `{:error, :invalid_transition}` if story is not reported_done or verified
+  - `{:error, :reason_required}` if reason is missing or blank
+  """
+  @spec reject_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Story.t()} | {:error, atom()}
+  def reject_story(tenant_id, story_id, params, opts \\ []) do
+    orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+
+    reason = Map.get(params, "reason") || Map.get(params, :reason)
+    rejection_params = extract_rejection_params(params)
+
+    with :ok <- validate_reason(reason) do
+      multi =
+        Multi.new()
+        |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+        |> Multi.run(:validate, fn _repo, %{lock: story} ->
+          validate_rejectable(story)
+        end)
+        |> Multi.run(:story, fn _repo, %{lock: story} ->
+          apply_rejected_status(story, reason)
+        end)
+        |> insert_verification_result(tenant_id, orchestrator_agent_id, :fail, rejection_params)
+        |> audit_verification(tenant_id, "rejected", actor_id, actor_label, orchestrator_agent_id)
+
+      unwrap_verification_transaction(multi)
+    end
+  end
+
+  @doc """
+  Lists verification results for a story.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+
+  ## Returns
+
+  - `{:ok, [%VerificationResult{}]}` on success
+  """
+  @spec list_verifications(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, [VerificationResult.t()]}
+  def list_verifications(tenant_id, story_id) do
+    results =
+      VerificationResult
+      |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
+      |> order_by([v], asc: v.iteration)
+      |> AdminRepo.all()
+
+    {:ok, results}
+  end
+
+  # --- Verification/Rejection helpers ---
+
+  defp validate_verifiable(story) do
+    cond do
+      story.agent_status != :reported_done -> {:error, :invalid_transition}
+      story.verified_status == :verified -> {:error, :invalid_transition}
+      true -> {:ok, story}
+    end
+  end
+
+  defp validate_rejectable(story) do
+    if story.agent_status == :reported_done or story.verified_status == :verified do
+      {:ok, story}
+    else
+      {:error, :invalid_transition}
+    end
+  end
+
+  defp apply_verified_status(story) do
+    now = DateTime.utc_now()
+
+    story
+    |> Ecto.Changeset.change(%{
+      verified_status: :verified,
+      verified_at: now,
+      rejected_at: nil,
+      rejection_reason: nil
+    })
+    |> AdminRepo.update()
+  end
+
+  defp apply_rejected_status(story, reason) do
+    now = DateTime.utc_now()
+
+    story
+    |> Ecto.Changeset.change(%{
+      verified_status: :rejected,
+      rejected_at: now,
+      rejection_reason: reason
+    })
+    |> AdminRepo.update()
+  end
+
+  defp insert_verification_result(multi, tenant_id, orch_agent_id, result, params) do
+    Multi.run(multi, :verification_result, fn _repo, %{lock: story} ->
+      iteration = count_verifications(tenant_id, story.id) + 1
+
+      %VerificationResult{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        orchestrator_agent_id: orch_agent_id
+      }
+      |> VerificationResult.create_changeset(
+        Map.merge(params, %{result: result, iteration: iteration})
+      )
+      |> AdminRepo.insert()
+    end)
+  end
+
+  defp audit_verification(multi, tenant_id, action, actor_id, actor_label, orch_agent_id) do
+    Audit.log_in_multi(multi, :audit, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: action,
+        actor_type: "api_key",
+        actor_id: actor_id,
+        actor_label: actor_label,
+        old_state: %{"verified_status" => to_string(old.verified_status)},
+        new_state: %{
+          "verified_status" => to_string(updated.verified_status),
+          "orchestrator_agent_id" => orch_agent_id
+        }
+      }
+    end)
+  end
+
+  defp unwrap_verification_transaction(multi) do
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
+      {:error, :verification_result, changeset, _} -> {:error, changeset}
+    end
+  end
+
+  defp extract_verification_params(params) do
+    %{
+      summary: Map.get(params, "summary") || Map.get(params, :summary),
+      findings: Map.get(params, "findings") || Map.get(params, :findings, %{}),
+      review_type: Map.get(params, "review_type") || Map.get(params, :review_type)
+    }
+  end
+
+  defp extract_rejection_params(params) do
+    reason = Map.get(params, "reason") || Map.get(params, :reason)
+
+    %{
+      summary: reason,
+      findings: Map.get(params, "findings") || Map.get(params, :findings, %{}),
+      review_type: Map.get(params, "review_type") || Map.get(params, :review_type)
+    }
+  end
+
   # --- Private helpers ---
 
   defp get_story(tenant_id, story_id) do
@@ -451,5 +678,23 @@ defmodule Loopctl.Progress do
 
       AdminRepo.insert(changeset)
     end)
+  end
+
+  defp validate_reason(nil), do: {:error, :reason_required}
+
+  defp validate_reason(reason) when is_binary(reason) do
+    if String.trim(reason) == "" do
+      {:error, :reason_required}
+    else
+      :ok
+    end
+  end
+
+  defp validate_reason(_), do: {:error, :reason_required}
+
+  defp count_verifications(tenant_id, story_id) do
+    VerificationResult
+    |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
+    |> AdminRepo.aggregate(:count, :id)
   end
 end

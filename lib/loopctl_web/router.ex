@@ -63,6 +63,11 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/report", StoryStatusController, :report
     post "/stories/:id/unclaim", StoryStatusController, :unclaim
 
+    # Story verification (orchestrator side of two-tier trust model)
+    post "/stories/:id/verify", StoryVerificationController, :verify
+    post "/stories/:id/reject", StoryVerificationController, :reject
+    get "/stories/:story_id/verifications", StoryVerificationController, :index
+
     # Agent management
     post "/agents/register", AgentController, :register
     get "/agents", AgentController, :index
