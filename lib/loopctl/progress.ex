@@ -17,7 +17,9 @@ defmodule Loopctl.Progress do
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Tenants
+  alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
   # --- Agent Status Transitions (US-7.1) ---
@@ -400,6 +402,7 @@ defmodule Loopctl.Progress do
       end)
       |> insert_verification_result(tenant_id, orchestrator_agent_id, :pass, verification_params)
       |> audit_verification(tenant_id, "verified", actor_id, actor_label, orchestrator_agent_id)
+      |> maybe_complete_epic(tenant_id, actor_id, actor_label)
 
     unwrap_verification_transaction(multi)
   end
@@ -479,6 +482,18 @@ defmodule Loopctl.Progress do
     {:ok, results}
   end
 
+  @doc """
+  Checks if all stories in an epic are verified.
+
+  Returns false for empty epics (zero stories).
+  """
+  @spec all_stories_verified?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def all_stories_verified?(tenant_id, epic_id) do
+    total = count_stories_in_epic(tenant_id, epic_id)
+    unverified = count_unverified_in_epic(tenant_id, epic_id)
+    total > 0 and unverified == 0
+  end
+
   # --- Verification/Rejection helpers ---
 
   defp validate_verifiable(story) do
@@ -555,6 +570,77 @@ defmodule Loopctl.Progress do
         }
       }
     end)
+  end
+
+  defp maybe_complete_epic(multi, tenant_id, actor_id, actor_label) do
+    Multi.run(multi, :epic_completion, fn _repo, %{story: story} ->
+      check_epic_completion(tenant_id, story.epic_id, actor_id, actor_label)
+    end)
+  end
+
+  defp check_epic_completion(tenant_id, epic_id, actor_id, actor_label) do
+    total_stories = count_stories_in_epic(tenant_id, epic_id)
+    unverified_count = count_unverified_in_epic(tenant_id, epic_id)
+
+    cond do
+      # Zero-story epics never complete
+      total_stories == 0 ->
+        {:ok, :no_stories}
+
+      # Not all verified yet
+      unverified_count > 0 ->
+        {:ok, :incomplete}
+
+      # All verified - check if already completed (idempotent)
+      epic_already_completed?(tenant_id, epic_id) ->
+        {:ok, :already_completed}
+
+      # All verified and not yet completed - fire event
+      true ->
+        record_epic_completion(tenant_id, epic_id, total_stories, actor_id, actor_label)
+    end
+  end
+
+  defp count_stories_in_epic(tenant_id, epic_id) do
+    Story
+    |> where([s], s.tenant_id == ^tenant_id and s.epic_id == ^epic_id)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  defp count_unverified_in_epic(tenant_id, epic_id) do
+    Story
+    |> where([s], s.tenant_id == ^tenant_id and s.epic_id == ^epic_id)
+    |> where([s], s.verified_status != :verified)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  defp epic_already_completed?(tenant_id, epic_id) do
+    AuditLog
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where([a], a.entity_type == "epic" and a.entity_id == ^epic_id)
+    |> where([a], a.action == "completed")
+    |> AdminRepo.exists?()
+  end
+
+  defp record_epic_completion(tenant_id, epic_id, story_count, actor_id, actor_label) do
+    epic = AdminRepo.get!(Epic, epic_id)
+
+    # NOTE(Epic 10): Webhook event for epic.completed deferred to Epic 10.
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "epic",
+      entity_id: epic_id,
+      action: "completed",
+      actor_type: "api_key",
+      actor_id: actor_id,
+      actor_label: actor_label,
+      new_state: %{
+        "epic_id" => epic_id,
+        "epic_number" => epic.number,
+        "epic_title" => epic.title,
+        "project_id" => epic.project_id,
+        "story_count" => story_count
+      }
+    })
   end
 
   defp unwrap_verification_transaction(multi) do
