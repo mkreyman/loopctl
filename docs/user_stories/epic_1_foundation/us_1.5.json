@@ -144,10 +144,8 @@
     "Use a dedicated Loopctl.Health module for the check logic, keep the controller thin",
     "Consider adding a response_time_ms field for each check for observability",
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
-    "Health check uses opts-based dependency injection (project DI standard). The health check function accepts a `health_checker:` opt: `check_health(opts \\\\ [])` where opts can include `health_checker: MockHealthChecker`. Default from `Application.get_env(:loopctl, :health_checker, Loopctl.HealthCheck.Default)`. Tests pass mock via opts, NOT via Application.put_env.",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "Health check uses config-based dependency injection. Define Loopctl.HealthCheck.Behaviour with @callback check/0. Real impl: Loopctl.HealthCheck.Default. Config: `config :loopctl, :health_checker, Loopctl.MockHealthChecker` in test.exs. Consumer: `defp health_checker, do: Application.get_env(:loopctl, :health_checker, Loopctl.HealthCheck.Default)`. Tests use Mox expectations set via expect/3 on mocks defined in test/support/mocks.ex. Default permissive stubs are set in DataCase/ConnCase setup via stub_all_defaults/0.",
+    "Testing infrastructure: (1) Mox mocks defined in test/support/mocks.ex, (2) Default permissive stubs in DataCase/ConnCase setup via Mox.stub/3, (3) Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert + auto-deps), (6) NEVER Application.put_env in tests."
   ],
   "dependencies": [],
   "estimated_hours": 1

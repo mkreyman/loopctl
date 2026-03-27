@@ -254,10 +254,8 @@
     "Use Req.Test or Mox to mock HTTP requests in tests. Never make real HTTP calls in test.",
     "Oban queue configuration in config: queues: [webhooks: 10].",
     "Consider using Oban.Pro's SmartEngine if available, otherwise standard Oban retry with manual snooze scheduling.",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
-    "Webhook HTTP delivery DI: Oban job args are serialized JSON and cannot contain module references. Use Req.Test for test mocking — configure a test plug that intercepts outbound requests. In production, the worker calls `Req.post/2` directly. In tests, configure `Req.Test.stub(Loopctl.Webhooks.DeliveryReq, fn conn -> ... end)` and pass the Req client name through Application config (not job args). This is config-based DI specifically for Oban workers, which is the ONE exception to the opts-based DI pattern used elsewhere.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Webhook delivery uses compile-time DI: @delivery_client Application.compile_env(:loopctl, :webhook_delivery, Loopctl.Webhooks.ReqDelivery). For HTTP mocking in tests, Req.Test plug: config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.DeliveryWorker} in test.exs. Worker calls: Req.post(url, plug: maybe_plug()) where maybe_plug() reads the config.",
     "Oban worker MUST implement `@impl Oban.Worker` callback with `perform(%Oban.Job{})` function signature."
   ],
   "dependencies": [

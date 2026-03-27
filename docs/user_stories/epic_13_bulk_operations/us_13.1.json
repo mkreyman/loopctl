@@ -273,9 +273,7 @@
     "Webhook events MUST be created inside the Ecto.Multi transaction for atomicity (consistent with US-10.2 AC-10.2.2). Events are enqueued for delivery after commit via Oban.",
     "Limit batch size to a configurable maximum (default 50) to prevent oversized transactions",
     "The controller should delegate to a BulkOperations context module that coordinates the Ecto.Multi and returns {:ok, results} | {:error, failed_results}",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs."
   ],
   "dependencies": [
     "US-7.2",

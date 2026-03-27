@@ -184,10 +184,8 @@
     "The RateLimiter plug should be the LAST plug in the auth pipeline (after RequireAuth), so unauthenticated requests don't consume rate limit budget",
     "Consider using :atomics instead of ETS for even better performance (Erlang/OTP 21+)",
     "Test note: rate limit tests may need to reset ETS state between tests to avoid pollution",
-    "Rate limiting uses opts-based dependency injection (matching the project DI standard). Context functions accept a `clock:` opt for time injection in tests: `check_rate(api_key, opts \\\\ [])` where opts can include `clock: MockClock`. Default clock uses `DateTime.utc_now/0`. Mock defined in test/support/mocks.ex.",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "Rate limiting uses config-based dependency injection via Application.get_env(:loopctl, :clock, Loopctl.Clock.Default). Define Loopctl.Clock.Behaviour with @callback utc_now/0. Config: `config :loopctl, :clock, Loopctl.MockClock` in test.exs. Consumer: `defp clock, do: Application.get_env(:loopctl, :clock, Loopctl.Clock.Default)`. Tests use Mox expectations set via expect/3 on mocks defined in test/support/mocks.ex. Default permissive stubs are set in DataCase/ConnCase setup via stub_all_defaults/0.",
+    "Testing infrastructure: (1) Mox mocks defined in test/support/mocks.ex, (2) Default permissive stubs in DataCase/ConnCase setup via Mox.stub/3, (3) Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert + auto-deps), (6) NEVER Application.put_env in tests."
   ],
   "dependencies": [
     "US-2.3"

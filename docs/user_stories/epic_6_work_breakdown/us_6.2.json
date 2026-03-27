@@ -307,9 +307,8 @@
     "Denormalize project_id onto stories table (set programmatically via epic.project_id, never in changeset cast). This enables project-wide uniqueness constraint and simplifies queries that filter by project.",
     "Consider adding a max_stories_per_project limit check from tenant settings",
     "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
   ],
   "dependencies": [
     "US-6.1",

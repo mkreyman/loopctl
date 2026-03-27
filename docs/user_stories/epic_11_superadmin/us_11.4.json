@@ -194,9 +194,7 @@
     "Consider creating a shared Audit.list_entries_admin/1 function that skips tenant scoping, alongside the existing tenant-scoped Audit.list_entries/2.",
     "Performance: ensure the (tenant_id, inserted_at) index on audit_log supports the combined tenant_id + date range queries efficiently. The cross-tenant unfiltered query relies on the inserted_at index alone.",
     "Response includes tenant context: {tenant_id: uuid|null, tenant_name: string|null, tenant_slug: string|null} alongside the standard audit entry fields.",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
     "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [

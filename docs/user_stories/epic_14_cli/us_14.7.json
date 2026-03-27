@@ -212,10 +212,8 @@
     "The --data @file syntax should work identically to the --artifact @file syntax from US-14.6 \u2014 extract the file-reading logic into a shared utility",
     "The verify --findings flag should accept the same inline JSON or @file syntax",
     "Consider adding a --state-key flag to state save/load (default: 'main') for orchestrators that maintain multiple state namespaces",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
-    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "CLI HTTP client uses Req with Req.Test plug injection for tests. Config: config :loopctl, :api_req_plug, {Req.Test, Loopctl.CLI.Client} in test.exs. CLI client checks Application.get_env(:loopctl, :api_req_plug) and applies plug if present."
   ],
   "dependencies": [
     "US-14.1",

@@ -266,9 +266,7 @@
     "The epic.completed event requires checking if all stories in the epic are verified after each story verification. This check runs inside the verify transaction.",
     "For bulk operations (US-13.1), querying active webhooks inside Ecto.Multi for each story could result in N * W database queries (N stories * W webhooks). Consider caching active webhook subscriptions in ETS with a short TTL (e.g., 60 seconds) keyed by {tenant_id, project_id}. Invalidate on webhook create/update/delete.",
     "Consider a helper function that wraps the common pattern: update entity + create audit log + generate webhook events, all in one Ecto.Multi.",
-    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
-    "All tests using Mox MUST include `setup :verify_on_exit!`",
-    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
     "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
     "WebhookCleanupWorker runs in the :default queue on a cron schedule (daily at 3 AM). Delete in batches of 1000 to avoid long-running transactions. Add `webhook_event_retention_days` to tenant settings (default: 30)."
   ],
