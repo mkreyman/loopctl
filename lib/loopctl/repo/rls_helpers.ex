@@ -32,6 +32,8 @@ defmodule Loopctl.Repo.RlsHelpers do
   1. `ALTER TABLE <table> ENABLE ROW LEVEL SECURITY`
   2. `ALTER TABLE <table> FORCE ROW LEVEL SECURITY`
   3. Creates a `tenant_isolation` policy using `current_tenant_id()`
+  4. Grants ALL privileges to the `loopctl_app` role (used in test/dev
+     when `SET LOCAL ROLE` switches from superuser)
   """
   defmacro enable_rls(table) do
     quote do
@@ -61,6 +63,25 @@ defmodule Loopctl.Repo.RlsHelpers do
         END $$;
         """,
         "DROP POLICY IF EXISTS tenant_isolation ON #{table_name}"
+      )
+
+      Ecto.Migration.execute(
+        """
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'loopctl_app') THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON #{table_name} TO loopctl_app';
+          END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'loopctl_app') THEN
+            EXECUTE 'REVOKE ALL ON #{table_name} FROM loopctl_app';
+          END IF;
+        END $$;
+        """
       )
     end
   end

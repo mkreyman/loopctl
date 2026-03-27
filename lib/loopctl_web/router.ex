@@ -11,6 +11,7 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.SetTenant
     plug LoopctlWeb.Plugs.RequireAuth
     plug LoopctlWeb.Plugs.RateLimiter
+    plug LoopctlWeb.Plugs.UpdateLastSeen
   end
 
   pipeline :registration_rate_limit do
@@ -50,5 +51,10 @@ defmodule LoopctlWeb.Router do
 
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
+
+    # Agent management
+    post "/agents/register", AgentController, :register
+    get "/agents", AgentController, :index
+    get "/agents/:id", AgentController, :show
   end
 end

@@ -80,7 +80,8 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
         []
       )
 
-    for [partition_name] <- rows do
+    for [partition_name] <- rows,
+        partition_name =~ ~r/^audit_log_y\d{4}m\d{2}$/ do
       case parse_partition_date(partition_name) do
         {year, month} when year < cutoff_year or (year == cutoff_year and month < cutoff_month) ->
           SQL.query(Loopctl.Repo, "DROP TABLE IF EXISTS #{partition_name}", [])

@@ -124,18 +124,15 @@ defmodule LoopctlWeb.ChangeControllerTest do
 
       past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
 
-      # Create 5 entries — set config cap to 3 for this test
+      # Create 5 entries — use limit query param to cap at 3
       for i <- 1..5 do
         create_audit_entry(tenant.id, %{actor_label: "user:entry-#{i}"})
       end
 
-      # Use a low limit via config
-      Application.put_env(:loopctl, :change_feed_limit, 3)
-
       conn =
         conn
         |> auth_conn(raw_key)
-        |> get(~p"/api/v1/changes?since=#{past}")
+        |> get(~p"/api/v1/changes?since=#{past}&limit=3")
 
       body = json_response(conn, 200)
       assert length(body["data"]) == 3
@@ -146,13 +143,11 @@ defmodule LoopctlWeb.ChangeControllerTest do
       conn2 =
         build_conn()
         |> auth_conn(raw_key)
-        |> get(~p"/api/v1/changes?since=#{body["next_since"]}")
+        |> get(~p"/api/v1/changes?since=#{body["next_since"]}&limit=3")
 
       body2 = json_response(conn2, 200)
       assert length(body2["data"]) == 2
       assert body2["has_more"] == false
-    after
-      Application.delete_env(:loopctl, :change_feed_limit)
     end
 
     test "agent role can access change feed", %{conn: conn} do
