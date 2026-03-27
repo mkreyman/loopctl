@@ -17,6 +17,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Tenants
   alias Loopctl.WorkBreakdown.Story
 
   # --- Agent Status Transitions (US-7.1) ---
@@ -448,6 +449,7 @@ defmodule Loopctl.Progress do
         end)
         |> insert_verification_result(tenant_id, orchestrator_agent_id, :fail, rejection_params)
         |> audit_verification(tenant_id, "rejected", actor_id, actor_label, orchestrator_agent_id)
+        |> maybe_auto_reset(tenant_id)
 
       unwrap_verification_transaction(multi)
     end
@@ -557,11 +559,62 @@ defmodule Loopctl.Progress do
 
   defp unwrap_verification_transaction(multi) do
     case AdminRepo.transaction(multi) do
+      # When auto-reset happened, return the reset story (non-nil means reset was performed)
+      {:ok, %{auto_reset: %Story{} = reset_story}} -> {:ok, reset_story}
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
       {:error, :verification_result, changeset, _} -> {:error, changeset}
+      {:error, :auto_reset, reason, _} -> {:error, reason}
+    end
+  end
+
+  defp maybe_auto_reset(multi, tenant_id) do
+    Multi.run(multi, :auto_reset, fn _repo, %{lock: old_story, story: rejected_story} ->
+      with {:ok, tenant} <- Tenants.get_tenant(tenant_id),
+           true <- Tenants.get_tenant_settings(tenant, "auto_reset_on_rejection", true) do
+        perform_auto_reset(rejected_story, old_story, tenant_id)
+      else
+        false -> {:ok, nil}
+        error -> error
+      end
+    end)
+  end
+
+  defp perform_auto_reset(story, old_story, tenant_id) do
+    changeset =
+      Ecto.Changeset.change(story, %{
+        agent_status: :pending,
+        assigned_agent_id: nil,
+        assigned_at: nil,
+        reported_done_at: nil
+      })
+
+    case AdminRepo.update(changeset) do
+      {:ok, reset_story} ->
+        # Log auto_reset audit entry with actor_type=system
+        Audit.create_log_entry(tenant_id, %{
+          entity_type: "story",
+          entity_id: reset_story.id,
+          action: "auto_reset",
+          actor_type: "system",
+          actor_id: nil,
+          actor_label: "system:auto_reset",
+          old_state: %{
+            "agent_status" => to_string(old_story.agent_status),
+            "assigned_agent_id" => old_story.assigned_agent_id
+          },
+          new_state: %{
+            "agent_status" => "pending",
+            "assigned_agent_id" => nil
+          }
+        })
+
+        {:ok, reset_story}
+
+      error ->
+        error
     end
   end
 
