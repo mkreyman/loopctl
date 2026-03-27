@@ -15,6 +15,7 @@ defmodule LoopctlWeb.StoryController do
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
   alias Loopctl.WorkBreakdown.Stories
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -41,10 +42,9 @@ defmodule LoopctlWeb.StoryController do
         metadata: params["metadata"] || %{}
       }
 
-      case Stories.create_story(tenant_id, attrs,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      audit_opts = AuditContext.from_conn(conn)
+
+      case Stories.create_story(tenant_id, attrs, audit_opts) do
         {:ok, story} ->
           conn
           |> put_status(:created)
@@ -152,10 +152,9 @@ defmodule LoopctlWeb.StoryController do
       # Remove nil values so we only update provided fields
       attrs = Map.reject(attrs, fn {_k, v} -> is_nil(v) end)
 
-      case Stories.update_story(tenant_id, story, attrs,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      audit_opts = AuditContext.from_conn(conn)
+
+      case Stories.update_story(tenant_id, story, attrs, audit_opts) do
         {:ok, updated} ->
           json(conn, %{story: story_json(updated)})
 
@@ -175,10 +174,9 @@ defmodule LoopctlWeb.StoryController do
     tenant_id = api_key.tenant_id
 
     with {:ok, story} <- Stories.get_story(tenant_id, story_id) do
-      case Stories.delete_story(tenant_id, story,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      audit_opts = AuditContext.from_conn(conn)
+
+      case Stories.delete_story(tenant_id, story, audit_opts) do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 

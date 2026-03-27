@@ -11,6 +11,7 @@ defmodule LoopctlWeb.EpicDependencyController do
 
   alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Dependencies
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -31,10 +32,9 @@ defmodule LoopctlWeb.EpicDependencyController do
       depends_on_epic_id: params["depends_on_epic_id"]
     }
 
-    case Dependencies.create_epic_dependency(tenant_id, attrs,
-           actor_id: api_key.id,
-           actor_label: "user:#{api_key.name}"
-         ) do
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Dependencies.create_epic_dependency(tenant_id, attrs, audit_opts) do
       {:ok, dep} ->
         conn
         |> put_status(:created)
@@ -73,10 +73,9 @@ defmodule LoopctlWeb.EpicDependencyController do
     tenant_id = api_key.tenant_id
 
     with {:ok, dep} <- Dependencies.get_epic_dependency(tenant_id, dep_id) do
-      case Dependencies.delete_epic_dependency(tenant_id, dep,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      audit_opts = AuditContext.from_conn(conn)
+
+      case Dependencies.delete_epic_dependency(tenant_id, dep, audit_opts) do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 

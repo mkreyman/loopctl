@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ArtifactReportController do
 
   alias Loopctl.Artifacts
   alias Loopctl.WorkBreakdown.Stories
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -44,12 +45,16 @@ defmodule LoopctlWeb.ArtifactReportController do
         |> Map.reject(fn {_k, v} -> is_nil(v) end)
 
       reported_by = derive_reported_by(api_key.role)
+      audit_opts = AuditContext.from_conn(conn)
 
-      case Artifacts.create_artifact_report(tenant_id, story_id, attrs,
-             agent_id: api_key.agent_id,
-             reported_by: reported_by,
-             actor_id: api_key.id,
-             actor_label: "#{reported_by}:#{api_key.name}"
+      case Artifacts.create_artifact_report(
+             tenant_id,
+             story_id,
+             attrs,
+             Keyword.merge(audit_opts,
+               agent_id: api_key.agent_id,
+               reported_by: reported_by
+             )
            ) do
         {:ok, report} ->
           conn

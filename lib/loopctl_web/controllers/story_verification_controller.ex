@@ -8,8 +8,6 @@ defmodule LoopctlWeb.StoryVerificationController do
   - GET /stories/:id/verifications -- list verification history
 
   All mutation endpoints require exact_role: :orchestrator.
-
-  TODO: Superadmin access via impersonation with X-Effective-Role header (US-11.2)
   """
 
   use LoopctlWeb, :controller
@@ -17,6 +15,7 @@ defmodule LoopctlWeb.StoryVerificationController do
   alias Loopctl.Artifacts
   alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Stories
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -34,12 +33,9 @@ defmodule LoopctlWeb.StoryVerificationController do
   def verify(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.verify_story(tenant_id, story_id, params,
-           orchestrator_agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "orchestrator:#{api_key.name}"
-         ) do
+    case Progress.verify_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -60,12 +56,9 @@ defmodule LoopctlWeb.StoryVerificationController do
   def reject(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.reject_story(tenant_id, story_id, params,
-           orchestrator_agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "orchestrator:#{api_key.name}"
-         ) do
+    case Progress.reject_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -135,12 +128,9 @@ defmodule LoopctlWeb.StoryVerificationController do
   def force_unclaim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.force_unclaim_story(tenant_id, story_id,
-           orchestrator_agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "orchestrator:#{api_key.name}"
-         ) do
+    case Progress.force_unclaim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 

@@ -10,6 +10,7 @@ defmodule LoopctlWeb.AgentController do
   use LoopctlWeb, :controller
 
   alias Loopctl.Agents
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -36,12 +37,12 @@ defmodule LoopctlWeb.AgentController do
         metadata: params["metadata"] || %{}
       }
 
-      actor_label = "agent:#{params["name"] || "unknown"}"
+      audit_opts = AuditContext.from_conn(conn)
 
-      case Agents.register_agent(tenant_id, attrs,
-             api_key_id: api_key.id,
-             actor_id: api_key.id,
-             actor_label: actor_label
+      case Agents.register_agent(
+             tenant_id,
+             attrs,
+             Keyword.merge(audit_opts, api_key_id: api_key.id)
            ) do
         {:ok, agent} ->
           conn

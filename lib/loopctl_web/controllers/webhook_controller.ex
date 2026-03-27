@@ -11,6 +11,7 @@ defmodule LoopctlWeb.WebhookController do
   use LoopctlWeb, :controller
 
   alias Loopctl.Webhooks
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -31,10 +32,9 @@ defmodule LoopctlWeb.WebhookController do
       "project_id" => params["project_id"]
     }
 
-    case Webhooks.create_webhook(tenant_id, attrs,
-           actor_id: api_key.id,
-           actor_label: actor_label(api_key)
-         ) do
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Webhooks.create_webhook(tenant_id, attrs, audit_opts) do
       {:ok, %{webhook: webhook, signing_secret: secret}} ->
         conn
         |> put_status(:created)
@@ -91,10 +91,9 @@ defmodule LoopctlWeb.WebhookController do
       |> Enum.reject(fn {_k, v} -> is_nil(v) end)
       |> Map.new()
 
-    case Webhooks.update_webhook(tenant_id, webhook_id, attrs,
-           actor_id: api_key.id,
-           actor_label: actor_label(api_key)
-         ) do
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Webhooks.update_webhook(tenant_id, webhook_id, attrs, audit_opts) do
       {:ok, webhook} ->
         json(conn, %{webhook: webhook_json(webhook)})
 
@@ -170,10 +169,9 @@ defmodule LoopctlWeb.WebhookController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    case Webhooks.delete_webhook(tenant_id, webhook_id,
-           actor_id: api_key.id,
-           actor_label: actor_label(api_key)
-         ) do
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Webhooks.delete_webhook(tenant_id, webhook_id, audit_opts) do
       {:ok, _webhook} ->
         send_resp(conn, :no_content, "")
 
@@ -214,10 +212,6 @@ defmodule LoopctlWeb.WebhookController do
     webhook
     |> webhook_json()
     |> Map.put(:signing_secret, secret)
-  end
-
-  defp actor_label(api_key) do
-    "#{api_key.role}:#{api_key.name}"
   end
 
   defp parse_int(nil), do: nil
