@@ -8,6 +8,8 @@ defmodule LoopctlWeb.Router do
   # Health check — unauthenticated, outside /api/v1
   scope "/", LoopctlWeb do
     pipe_through :api
+
+    get "/health", HealthController, :check
   end
 
   # API v1 — all authenticated endpoints
