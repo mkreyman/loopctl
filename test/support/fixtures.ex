@@ -16,6 +16,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -111,6 +112,10 @@ defmodule Loopctl.Fixtures do
       },
       Enum.into(attrs, %{})
     )
+  end
+
+  def build(:epic_dependency, attrs) do
+    Enum.into(attrs, %{})
   end
 
   def build(:api_key, attrs) do
@@ -290,6 +295,22 @@ defmodule Loopctl.Fixtures do
     else
       story
     end
+  end
+
+  def fixture(:epic_dependency, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    epic_id = Map.fetch!(attrs, :epic_id)
+    depends_on_epic_id = Map.fetch!(attrs, :depends_on_epic_id)
+
+    changeset =
+      %EpicDependency{tenant_id: tenant_id}
+      |> EpicDependency.create_changeset(%{
+        epic_id: epic_id,
+        depends_on_epic_id: depends_on_epic_id
+      })
+
+    AdminRepo.insert!(changeset)
   end
 
   def fixture(:api_key, attrs) do
