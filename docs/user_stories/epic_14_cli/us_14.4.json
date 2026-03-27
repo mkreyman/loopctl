@@ -217,8 +217,12 @@
     "Story number extraction: parse the 'id' field (e.g., 'US-14.1') to get the story number '14.1' for the API payload",
     "Cross-epic dependency resolution: build a map of story_number -> story_data across all files, then resolve 'dependencies' arrays to story numbers",
     "Export --dir should sanitize epic titles for directory names (lowercase, underscores, no special chars)",
-    "The PROJECT argument should accept either a project UUID or slug — try UUID first, then look up by slug via the list endpoint",
-    "Import should handle both flat JSON file input (single file with full payload) and directory structure input (epic_*/us_*.json)"
+    "The PROJECT argument should accept either a project UUID or slug \u2014 try UUID first, then look up by slug via the list endpoint",
+    "Import should handle both flat JSON file input (single file with full payload) and directory structure input (epic_*/us_*.json)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

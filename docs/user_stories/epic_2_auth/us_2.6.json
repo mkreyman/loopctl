@@ -58,6 +58,11 @@
       "id": "AC-2.6.9",
       "description": "API key count per tenant is limited by the max_api_keys tenant setting (default 100); creating beyond the limit returns 422",
       "status": "pending"
+    },
+    {
+      "id": "AC-2.6.10",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -194,6 +199,23 @@
         "Error message indicates API key limit reached"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-2.6.8",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :user)"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -201,7 +223,12 @@
     "Rotation is essentially: create new key + update old key's expires_at in a transaction",
     "The list endpoint should exclude revoked keys by default, with an optional ?include_revoked=true query param",
     "Tenant scoping is enforced both by application (WHERE tenant_id) and RLS",
-    "Consider adding pagination to the list endpoint (offset/limit) for tenants with many keys"
+    "Consider adding pagination to the list endpoint (offset/limit) for tenants with many keys",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.4"

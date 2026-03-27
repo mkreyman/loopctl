@@ -12,7 +12,7 @@
     "i_want_to": "send a test event to a webhook and have webhooks auto-disabled after too many consecutive failures, with visibility into recent delivery attempts",
     "so_that": "I can verify my webhook endpoint works before relying on it, broken webhooks stop wasting delivery resources, and I can diagnose delivery issues"
   },
-  "rationale": "Without a test endpoint, tenants must trigger a real state change to verify their webhook is configured correctly — an error-prone and inconvenient workflow. Auto-disable prevents wasted Oban worker time on permanently broken endpoints (e.g., decommissioned servers). The deliveries listing gives tenants visibility into what was delivered, what failed, and why, enabling self-service debugging.",
+  "rationale": "Without a test endpoint, tenants must trigger a real state change to verify their webhook is configured correctly \u2014 an error-prone and inconvenient workflow. Auto-disable prevents wasted Oban worker time on permanently broken endpoints (e.g., decommissioned servers). The deliveries listing gives tenants visibility into what was delivered, what failed, and why, enabling self-service debugging.",
   "acceptance_criteria": [
     {
       "id": "AC-10.5.1",
@@ -21,7 +21,7 @@
     },
     {
       "id": "AC-10.5.2",
-      "description": "The test endpoint returns 200 OK with the created webhook_event ID. Delivery happens asynchronously — the response does not wait for delivery to complete.",
+      "description": "The test endpoint returns 200 OK with the created webhook_event ID. Delivery happens asynchronously \u2014 the response does not wait for delivery to complete.",
       "status": "pending"
     },
     {
@@ -233,7 +233,11 @@
     "When PATCH sets active=true and the webhook's current consecutive_failures > 0, the update changeset should also reset consecutive_failures to 0.",
     "Test events should bypass the normal active check in the delivery worker. Add a flag in the worker args or check event_type='webhook.test'.",
     "The deliveries endpoint should exclude the full payload from the list response for performance. Include a link or note that full payload is available via the audit log.",
-    "Add webhook_max_consecutive_failures to the tenant settings schema with a default of 10."
+    "Add webhook_max_consecutive_failures to the tenant settings schema with a default of 10.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Webhook HTTP delivery MUST use a behaviour-based HTTP client (e.g., Loopctl.Webhooks.DeliveryBehaviour) for testability. Real implementation uses Req. Mock defined in test/support/mocks.ex. Tests inject mock via opts, never via Application.put_env."
   ],
   "dependencies": [
     "US-10.3"

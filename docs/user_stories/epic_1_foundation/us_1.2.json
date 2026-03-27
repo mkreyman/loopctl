@@ -174,6 +174,23 @@
         "deleted_at is not in the list of fields"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-1.2.8",
+      "name": "Cross-tenant isolation: tenant A cannot access tenant B data",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "entity = fixture(:entity, tenant: tenant_a)"
+      ],
+      "steps": [
+        "Query/access entity using tenant_b credentials"
+      ],
+      "expected_results": [
+        "Returns empty list or 404, never tenant_a's data"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -181,8 +198,13 @@
     "tenant_id should be belongs_to :tenant, Loopctl.Tenants.Tenant, type: :binary_id — but the Tenant schema may not exist yet; use a plain field for now and add the association later",
     "Consider providing a base_changeset/2 function that validates tenant_id presence, which downstream schemas can pipe into",
     "The not_deleted/1 helper should use Ecto.Query: where(query, [r], is_nil(r.deleted_at))",
-    "Ensure the macro works with both schema/2 and embedded_schema/1 patterns if needed"
+    "Ensure the macro works with both schema/2 and embedded_schema/1 patterns if needed",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
-  "dependencies": [],
+  "dependencies": [
+    "US-1.1"
+  ],
   "estimated_hours": 3
 }

@@ -167,7 +167,10 @@
     "PLT cache key should include OTP and Elixir versions: ${{ runner.os }}-plt-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}",
     "PostgreSQL service: image: postgres:16, env: POSTGRES_PASSWORD: postgres, ports: ['5432:5432'], options: --health-cmd pg_isready",
     "Test job needs MIX_ENV=test and DATABASE_URL pointing to the service container",
-    "The deploy job shell script will be fully defined in US-1.7"
+    "The deploy job shell script will be fully defined in US-1.7",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [],
   "estimated_hours": 4

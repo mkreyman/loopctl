@@ -10,9 +10,9 @@
   "story": {
     "as_a": "tenant administrator",
     "i_want_to": "re-import an updated JSON file into an existing project with a merge flag that creates new stories, updates metadata on existing stories (matched by number), and preserves progress on unchanged stories",
-    "so_that": "I can evolve a project's work breakdown over time — adding new stories, refining descriptions, adjusting estimates — without losing existing progress, agent assignments, or verification results"
+    "so_that": "I can evolve a project's work breakdown over time \u2014 adding new stories, refining descriptions, adjusting estimates \u2014 without losing existing progress, agent assignments, or verification results"
   },
-  "rationale": "Projects evolve. New stories are added mid-sprint, acceptance criteria are refined, and estimates are adjusted. A fresh import would wipe all progress — every agent assignment, every verification result, every artifact report. Merge import solves this by matching stories by their number and intelligently merging: new stories are created, existing stories get metadata updates (but not status resets), and stories missing from the import JSON are flagged for attention without auto-deletion.",
+  "rationale": "Projects evolve. New stories are added mid-sprint, acceptance criteria are refined, and estimates are adjusted. A fresh import would wipe all progress \u2014 every agent assignment, every verification result, every artifact report. Merge import solves this by matching stories by their number and intelligently merging: new stories are created, existing stories get metadata updates (but not status resets), and stories missing from the import JSON are flagged for attention without auto-deletion.",
   "acceptance_criteria": [
     {
       "id": "AC-12.3.1",
@@ -62,6 +62,11 @@
     {
       "id": "AC-12.3.10",
       "description": "Cycle detection runs on the COMBINED dependency graph (existing + new dependencies) to ensure the merge does not introduce cycles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-12.3.11",
+      "description": "All story creates and updates during merge import MUST be recorded in the audit log within the same transaction.",
       "status": "pending"
     }
   ],
@@ -241,6 +246,26 @@
         "No new story was created (rolled back)"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-12.3.9",
+      "name": "cross-tenant isolation \u2014 merge import cannot access other tenant's project",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "fixture(:project, %{tenant_id: tenant_b.id})",
+        "fixture(:epic, %{tenant_id: tenant_b.id, project_id: project.id, number: 1})"
+      ],
+      "steps": [
+        "POST /api/v1/projects/<tenant_b_project_id>/import?merge=true with Tenant A's API key and valid import JSON"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found (project not visible to Tenant A via RLS)",
+        "No data is modified in Tenant B's project"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -251,7 +276,11 @@
     "Orphan detection: after processing all import stories, diff against existing story numbers. Return orphans in the response but do not delete them.",
     "Cycle detection must operate on the MERGED graph: existing dependencies UNION new dependencies. Load existing deps from DB, combine with import deps, then run cycle detection.",
     "The merge=true query parameter is checked in the controller. Controller dispatches to import_project/3 or merge_import_project/3 based on the flag.",
-    "Transaction includes: epic upserts, story upserts, new dependency creation, cycle validation, audit logging. All in one Ecto.Multi."
+    "Transaction includes: epic upserts, story upserts, new dependency creation, cycle validation, audit logging. All in one Ecto.Multi.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [
     "US-12.1",

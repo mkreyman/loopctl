@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-11.2.7",
-      "description": "Impersonation works with suspended tenants — the superadmin can impersonate a suspended tenant to inspect or fix their data. The tenant suspension check is bypassed during impersonation.",
+      "description": "Impersonation works with suspended tenants \u2014 the superadmin can impersonate a suspended tenant to inspect or fix their data. The tenant suspension check is bypassed during impersonation.",
       "status": "pending"
     },
     {
@@ -116,7 +116,7 @@
       "expected_results": [
         "Response is 200 OK",
         "Returns only Tenant A's projects (not Tenant B's)",
-        "Header is silently ignored — no error"
+        "Header is silently ignored \u2014 no error"
       ],
       "status": "pending"
     },
@@ -203,8 +203,11 @@
     "Superadmin effective role during impersonation: the role check plugs should treat superadmin as having all capabilities (user + orchestrator + agent).",
     "Audit logging integration: modify the audit helper to check conn.assigns.impersonating and include superadmin attribution when true.",
     "Bypass tenant suspension check: the suspension plug should check if conn.assigns.impersonating is true and skip the check if so.",
-    "Security consideration: impersonation only works with superadmin keys. The header is completely ignored for all other roles — no error, no hint.",
-    "The X-Impersonate-Tenant header accepts a UUID (tenant ID), not a slug, to avoid ambiguity."
+    "Security consideration: impersonation only works with superadmin keys. The header is completely ignored for all other roles \u2014 no error, no hint.",
+    "The X-Impersonate-Tenant header accepts a UUID (tenant ID), not a slug, to avoid ambiguity.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-11.1"

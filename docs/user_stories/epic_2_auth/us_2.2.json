@@ -63,6 +63,11 @@
       "id": "AC-2.2.10",
       "description": "The api_keys table has a unique index on key_hash and an index on tenant_id",
       "status": "pending"
+    },
+    {
+      "id": "AC-2.2.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -188,6 +193,40 @@
         "Returns {:error, %Ecto.Changeset{}} with error on tenant_id"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-2.2.9",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :user)"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-2.2.10",
+      "name": "Cross-tenant isolation: tenant A cannot access tenant B data",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "entity = fixture(:entity, tenant: tenant_a)"
+      ],
+      "steps": [
+        "Query/access entity using tenant_b credentials"
+      ],
+      "expected_results": [
+        "Returns empty list or 404, never tenant_a's data"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -197,7 +236,13 @@
     "The api_keys table needs RLS enabled with tenant_id policy, but superadmin keys (tenant_id IS NULL) need a special policy clause",
     "Consider a separate changeset for creation (with key_hash, key_prefix) vs. update (only name, revoked_at, etc.)",
     "The verify_api_key/1 function must be constant-time safe — use Plug.Crypto.secure_compare for hash comparison if applicable, though hash lookup by index is inherently timing-safe",
-    "Preload the tenant association on verify_api_key for use in the auth pipeline"
+    "Preload the tenant association on verify_api_key for use in the auth pipeline",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.1"

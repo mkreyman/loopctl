@@ -169,7 +169,10 @@
     "The nginx config should include WebSocket upgrade headers for future Phoenix Channel support",
     "systemd: After=network.target postgresql.service, Restart=on-failure, RestartSec=5",
     "The deploy script should set MIX_ENV=prod for compilation and migration",
-    "Health check loop: for i in 1..30; curl -sf http://localhost:$PORT/health && break; sleep 1; done"
+    "Health check loop: for i in 1..30; curl -sf http://localhost:$PORT/health && break; sleep 1; done",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [],
   "estimated_hours": 4

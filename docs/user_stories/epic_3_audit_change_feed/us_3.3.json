@@ -181,7 +181,11 @@
     "First validate the story exists (and belongs to the tenant via RLS), then query audit_log. This prevents information leakage about story existence across tenants.",
     "For related entries (AC-9.3.6), also include audit entries where metadata contains the story_id (e.g., artifact_report and verification_result entries that reference this story). Use a jsonb query or OR clause on entity_id.",
     "Reuses Loopctl.Audit.list_entries/2 with pre-set filters, or add a dedicated Audit.story_history/2 function.",
-    "Ordering is ascending (chronological) — opposite of the main audit endpoint which is descending (most recent first). This makes the history read like a timeline."
+    "Ordering is ascending (chronological) — opposite of the main audit endpoint which is descending (most recent first). This makes the history read like a timeline.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-3.1",

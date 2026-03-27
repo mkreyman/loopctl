@@ -240,10 +240,14 @@
     "The full graph endpoint may be expensive for large projects; consider caching or lazy loading",
     "Order ready stories by: epic.position ASC, story.number ASC for natural priority",
     "The ready endpoint is the most performance-critical query — consider adding database indexes on (agent_status) and (verified_status)",
-    "For the blocked endpoint, include the blocker story's agent_status so the orchestrator knows if it's in progress or still pending"
+    "For the blocked endpoint, include the blocker story's agent_status so the orchestrator knows if it's in progress or still pending",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-6.4"
+    "US-6.4",
+    "US-6.3"
   ],
   "estimated_hours": 6
 }

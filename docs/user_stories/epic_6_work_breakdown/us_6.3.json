@@ -63,6 +63,11 @@
       "id": "AC-6.3.10",
       "description": "RLS policy is enabled on the epic_dependencies table enforcing tenant isolation",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.3.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -110,7 +115,7 @@
     },
     {
       "id": "TC-6.3.3",
-      "name": "Reject transitive cycle (A→B→C→A)",
+      "name": "Reject transitive cycle (A->B->C->A)",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant) as tenant",
@@ -212,6 +217,46 @@
         "Response contains the dependency edge with epic_id and depends_on_epic_id"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-6.3.8",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.3.9",
+      "name": "Cross-tenant isolation: tenant A cannot access tenant B data",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant_a.id}) as project_a",
+        "fixture(:epic, %{tenant_id: tenant_a.id, project_id: project_a.id}) as epic_a",
+        "fixture(:epic, %{tenant_id: tenant_a.id, project_id: project_a.id}) as epic_b",
+        "fixture(:epic_dependency, %{tenant_id: tenant_a.id, epic_id: epic_b.id, depends_on_epic_id: epic_a.id})"
+      ],
+      "steps": [
+        "Query/access entity using tenant_b credentials"
+      ],
+      "expected_results": [
+        "Returns empty list or 404, never tenant_a's data"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -220,7 +265,11 @@
     "Foreign keys: epic_id and depends_on_epic_id both reference epics(id)",
     "The cycle detection must load all existing edges for the project and check the new edge against them — this is O(V+E) which is fine for expected graph sizes (<100 epics)",
     "Consider implementing cycle detection in a dedicated Loopctl.WorkBreakdown.Graph module that can be reused for story dependencies",
-    "When an epic is deleted (US-6.1), cascade delete its dependency edges too"
+    "When an epic is deleted (US-6.1), cascade delete its dependency edges too",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-6.1"

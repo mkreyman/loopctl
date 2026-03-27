@@ -215,7 +215,13 @@
     "The creation of verification_result records is already done within the verify/reject Ecto.Multi in US-7.2. This story adds the listing endpoint and ensures the schema/context module is complete.",
     "Controller at LoopctlWeb.VerificationController with index action, nested under /api/v1/stories/:story_id/verifications.",
     "No update or delete — this is an append-only table for audit integrity.",
-    "Agent-role keys are explicitly denied access to verification results to maintain the trust boundary."
+    "Agent-role keys are explicitly denied access to verification results to maintain the trust boundary.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-7.2"

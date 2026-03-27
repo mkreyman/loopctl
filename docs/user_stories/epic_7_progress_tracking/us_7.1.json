@@ -259,7 +259,13 @@
     "Return 404 (not 403) for cross-tenant resource access to avoid information leakage.",
     "The report endpoint should accept an optional 'artifact' key in the request body and create an artifact_report record within the same Ecto.Multi transaction.",
     "All status transition endpoints should be idempotent-safe: if already in the target state by the same agent, return 200 rather than 409.",
-    "Controller at LoopctlWeb.StoryStatusController, routes nested under /api/v1/stories/:id/."
+    "Controller at LoopctlWeb.StoryStatusController, routes nested under /api/v1/stories/:id/.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-6.2",

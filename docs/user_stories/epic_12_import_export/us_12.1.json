@@ -12,7 +12,7 @@
     "i_want_to": "import a complete project work breakdown (epics, stories, and dependencies) from a JSON file in a single API call",
     "so_that": "I can bootstrap a project's tracking state from an external source (user story JSON files, PRD tooling output, or another loopctl instance) without manually creating each entity"
   },
-  "rationale": "Real projects have 25+ epics and 185+ stories. Manually creating each via individual API calls is impractical. Bulk import allows the entire work breakdown structure to be loaded atomically — either everything succeeds or nothing does. This is the primary onboarding path for new projects and the foundation for round-trip import/export (US-12.3).",
+  "rationale": "Real projects have 25+ epics and 185+ stories. Manually creating each via individual API calls is impractical. Bulk import allows the entire work breakdown structure to be loaded atomically \u2014 either everything succeeds or nothing does. This is the primary onboarding path for new projects and the foundation for round-trip import/export (US-12.3).",
   "acceptance_criteria": [
     {
       "id": "AC-12.1.1",
@@ -230,7 +230,11 @@
     "Controller: ImportController or add import action to ProjectController. Route: POST /api/v1/projects/:id/import.",
     "The import JSON format should match the export format (US-12.2) for round-trip fidelity. Design the schema now with export in mind.",
     "Consider adding epic_dependencies support in the import payload alongside story_dependencies.",
-    "Payload size limit: consider a max import size (e.g., 10MB) to prevent abuse."
+    "Payload size limit: consider a max import size (e.g., 10MB) to prevent abuse.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)"
   ],
   "dependencies": [
     "US-6.4"

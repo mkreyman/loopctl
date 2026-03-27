@@ -196,12 +196,15 @@
     "Epic completion check: an epic is complete when it has at least one story AND all its stories have verified_status = :verified",
     "Handle division by zero for verification_percentage when total_stories = 0 (return 0.0)",
     "Consider caching this endpoint since it involves multiple aggregation queries — or use a single complex SQL query with CTEs",
-    "This story depends on US-7.1 (Story schema) being available, since it aggregates story data. If implementing before US-7.1, the context function can be written with the expected schema and tested once stories exist.",
-    "The Loopctl.Projects context should have a get_project_progress/1 function that returns a map of all progress data"
+    "This story depends on US-6.2 (Story schema) being available, since it aggregates story data. If implementing before US-6.2, the context function can be written with the expected schema and tested once stories exist.",
+    "The Loopctl.Projects context should have a get_project_progress/1 function that returns a map of all progress data",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-5.1",
-    "US-7.1"
+    "US-6.2"
   ],
   "estimated_hours": 3
 }

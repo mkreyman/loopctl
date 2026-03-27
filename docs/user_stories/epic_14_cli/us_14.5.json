@@ -190,10 +190,14 @@
   "technical_notes": [
     "Story number resolution: the CLI takes a human-friendly story number like '2.1' and needs to resolve it to a UUID. This requires querying the stories list filtered by project and number, or using a lookup endpoint",
     "Epic number resolution: similar to story numbers, take an integer epic number and resolve to UUID via the epics list endpoint filtered by project",
-    "The 'next' command is the primary interface for orchestrator agents to discover assignable work — JSON output must be clean and parseable",
+    "The 'next' command is the primary interface for orchestrator agents to discover assignable work \u2014 JSON output must be clean and parseable",
     "Consider caching the project ID lookup (slug to UUID) within a single command invocation to avoid duplicate requests",
-    "For human format, use box-drawing characters or simple dashes/pipes for table formatting — keep it readable in terminal output",
-    "The blocked command should include enough dependency context that the user can understand what needs to happen to unblock each story"
+    "For human format, use box-drawing characters or simple dashes/pipes for table formatting \u2014 keep it readable in terminal output",
+    "The blocked command should include enough dependency context that the user can understand what needs to happen to unblock each story",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

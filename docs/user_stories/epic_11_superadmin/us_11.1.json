@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-11.1.3",
-      "description": "PATCH /api/v1/admin/tenants/:id allows updating tenant fields: name, email, settings (partial merge — provided keys override, unspecified keys preserved), status. Returns updated tenant.",
+      "description": "PATCH /api/v1/admin/tenants/:id allows updating tenant fields: name, email, settings (partial merge \u2014 provided keys override, unspecified keys preserved), status. Returns updated tenant.",
       "status": "pending"
     },
     {
@@ -229,7 +229,12 @@
     "Tenant suspension check: add a plug in the auth pipeline after ResolveApiKey that checks tenant.status. If suspended, halt with 403.",
     "Settings merge on PATCH: Map.merge(existing_settings, provided_settings). Deep merge if needed for nested settings.",
     "Audit logging for suspend/activate: actor_type='superadmin', tenant_id=affected_tenant.id (not NULL, since the action is about that tenant).",
-    "Search filter: WHERE lower(name) LIKE lower('%query%') OR lower(slug) LIKE lower('%query%')."
+    "Search filter: WHERE lower(name) LIKE lower('%query%') OR lower(slug) LIKE lower('%query%').",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)"
   ],
   "dependencies": [
     "US-2.4"

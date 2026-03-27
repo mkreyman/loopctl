@@ -211,7 +211,12 @@
     "Controller at LoopctlWeb.OrchestratorStateController with history action.",
     "Route: GET /api/v1/orchestrator/state/:project_id/history. RequireRole plug set to [:orchestrator, :superadmin].",
     "Validate that the project_id exists and belongs to the tenant before querying history.",
-    "Consider indexing audit_log on (entity_type, entity_id) for efficient history queries."
+    "Consider indexing audit_log on (entity_type, entity_id) for efficient history queries.",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-9.1"

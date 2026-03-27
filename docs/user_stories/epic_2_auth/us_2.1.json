@@ -63,6 +63,11 @@
       "id": "AC-2.1.10",
       "description": "The tenants table is NOT subject to RLS policies (it has no tenant_id column)",
       "status": "pending"
+    },
+    {
+      "id": "AC-2.1.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -190,6 +195,23 @@
         "Settings now contain the rate_limit_requests_per_minute key with value 500"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-2.1.9",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :user)"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -197,7 +219,11 @@
     "Slug validation regex: ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/ (starts and ends with alphanumeric)",
     "Settings field should use :map type in Ecto schema, stored as jsonb in PostgreSQL",
     "Default settings values from PRD section 5.3: max_concurrent_agents: 10, max_projects: 50, etc.",
-    "The tenants table should NOT have RLS enabled since it is the root entity and needs to be queryable by the auth pipeline before tenant context is set"
+    "The tenants table should NOT have RLS enabled since it is the root entity and needs to be queryable by the auth pipeline before tenant context is set",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-1.2",

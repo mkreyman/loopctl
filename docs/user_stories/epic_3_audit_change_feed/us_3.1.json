@@ -243,10 +243,17 @@
     "AuditLog schema: create_changeset/1 only. No update changeset.",
     "Helper function Loopctl.Audit.log_in_multi/3 to add an audit log insert step to any Ecto.Multi pipeline.",
     "Controller: AuditController with index action. Filters parsed from query params: entity_type, entity_id, action, actor_type, actor_id, from, to.",
-    "Route: GET /api/v1/audit, guarded by RequireRole plug for :user role minimum."
+    "Route: GET /api/v1/audit, guarded by RequireRole plug for :user role minimum.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-1.2"
+    "US-1.2",
+    "US-2.4"
   ],
   "estimated_hours": 6
 }

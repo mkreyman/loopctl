@@ -228,10 +228,17 @@
     "Registration uses Ecto.Multi: insert agent + update api_key.agent_id + insert audit_log, all atomic.",
     "last_seen_at update: add a plug in the auth pipeline (after SetTenant) that does an async update (Task.start or Ecto.Adapters.SQL.query for non-blocking) to avoid adding latency to every request. Alternatively, use a GenServer buffer that flushes periodically.",
     "Controller at LoopctlWeb.AgentController with register action at POST /api/v1/agents/register.",
-    "The agent_type field determines behavior elsewhere (orchestrator agents can be linked to orchestrator API keys in US-7.2)."
+    "The agent_type field determines behavior elsewhere (orchestrator agents can be linked to orchestrator API keys in US-7.2).",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-2.4"
+    "US-2.4",
+    "US-3.1"
   ],
   "estimated_hours": 4
 }

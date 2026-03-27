@@ -63,6 +63,11 @@
       "id": "AC-6.2.10",
       "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy. RLS is enabled on the stories table.",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.2.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -228,6 +233,25 @@
         "GET /api/v1/stories/<story.id> returns 404"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-6.2.9",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -238,7 +262,11 @@
     "acceptance_criteria is stored as jsonb — no validation on its internal structure beyond being valid JSON",
     "The show endpoint preloads are: dependencies (story_dependencies), artifact_reports (latest N), verification_results (latest)",
     "estimated_hours uses Decimal type for precision (e.g., 0.5 hours)",
-    "Consider adding a max_stories_per_project limit check from tenant settings"
+    "Consider adding a max_stories_per_project limit check from tenant settings",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-6.1"

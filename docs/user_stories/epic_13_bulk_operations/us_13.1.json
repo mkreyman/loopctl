@@ -246,6 +246,27 @@
         "Each webhook_event has the correct story_id in its payload"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-13.1.9",
+      "name": "cross-tenant isolation \u2014 bulk operations cannot access other tenant's stories",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})",
+        "fixture(:project, %{tenant_id: tenant_b.id})",
+        "fixture(:epic, %{project_id: project.id, tenant_id: tenant_b.id})",
+        "fixture(:story, %{epic_id: epic.id, tenant_id: tenant_b.id, agent_status: :pending})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/bulk/claim with {story_ids: [tenant_b_story.id]} using Tenant A's agent API key"
+      ],
+      "expected_results": [
+        "Response indicates failure (story not found or not accessible)",
+        "Tenant B's story remains unchanged (RLS prevents cross-tenant access)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -253,12 +274,17 @@
     "Validate each story individually within the Multi pipeline before any updates; collect all validation errors and return them in the per-story results",
     "Lock stories with SELECT FOR UPDATE within the transaction to prevent concurrent claim races",
     "Reuse existing story status transition logic from the single-story endpoints (claim, verify, reject) to ensure consistent validation",
-    "Fire webhook events after the transaction commits, not inside it, to avoid delivering events for rolled-back changes",
+    "Webhook events MUST be created inside the Ecto.Multi transaction for atomicity (consistent with US-10.2 AC-10.2.2). Events are enqueued for delivery after commit via Oban.",
     "Limit batch size to a configurable maximum (default 50) to prevent oversized transactions",
-    "The controller should delegate to a BulkOperations context module that coordinates the Ecto.Multi and returns {:ok, results} | {:error, failed_results}"
+    "The controller should delegate to a BulkOperations context module that coordinates the Ecto.Multi and returns {:ok, results} | {:error, failed_results}",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-7.2"
+    "US-7.2",
+    "US-7.1",
+    "US-7.3"
   ],
   "estimated_hours": 6
 }

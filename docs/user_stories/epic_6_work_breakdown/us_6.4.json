@@ -63,6 +63,11 @@
       "id": "AC-6.4.10",
       "description": "All operations are scoped to the current tenant via RLS and application-level checks. RLS is enabled on the story_dependencies table.",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.4.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -217,6 +222,48 @@
         "Response includes the cross-epic dependency (story_2 depends on story_1)"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-6.4.8",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_a",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id}) as story_b",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-6.4.9",
+      "name": "Cross-tenant isolation: tenant A cannot access tenant B data",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant_a.id}) as project_a",
+        "fixture(:epic, %{tenant_id: tenant_a.id, project_id: project_a.id}) as epic_a",
+        "fixture(:story, %{tenant_id: tenant_a.id, epic_id: epic_a.id}) as story_a",
+        "fixture(:story, %{tenant_id: tenant_a.id, epic_id: epic_a.id}) as story_b",
+        "fixture(:story_dependency, %{tenant_id: tenant_a.id, story_id: story_b.id, depends_on_story_id: story_a.id})"
+      ],
+      "steps": [
+        "Query/access entity using tenant_b credentials"
+      ],
+      "expected_results": [
+        "Returns empty list or 404, never tenant_a's data"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -225,7 +272,11 @@
     "To check same-project constraint: join story -> epic -> project for both stories and compare project_ids",
     "Cross-epic dependencies are explicitly allowed — a story in Epic 3 can depend on a story in Epic 1",
     "When a story is deleted (US-6.2), cascade delete its dependency edges (both directions)",
-    "The list endpoint for an epic should return deps where either story_id or depends_on_story_id belongs to a story in that epic"
+    "The list endpoint for an epic should return deps where either story_id or depends_on_story_id belongs to a story in that epic",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-6.2"

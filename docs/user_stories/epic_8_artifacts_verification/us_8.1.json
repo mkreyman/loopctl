@@ -238,7 +238,13 @@
     "RLS policy on artifact_reports: tenant_id = current_setting('app.current_tenant_id')::uuid.",
     "Controller at LoopctlWeb.ArtifactController with create and index actions, nested under /api/v1/stories/:story_id/.",
     "The reported_by field is derived from the API key role, not sent by the client. Agent keys set reported_by='agent', orchestrator keys set reported_by='orchestrator'.",
-    "This is an append-only table — no update or delete endpoints for artifact reports."
+    "This is an append-only table — no update or delete endpoints for artifact reports.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-7.1"

@@ -173,7 +173,11 @@
     "Story status aggregates can use GROUP BY with count: SELECT agent_status, count(*) FROM stories GROUP BY agent_status.",
     "active_agents query: WHERE status = 'active' AND last_seen_at > NOW() - INTERVAL '24 hours'.",
     "Response is a flat JSON object (not paginated) since it's a single aggregate record.",
-    "Consider caching stats for a short TTL (e.g., 60 seconds) if the queries become expensive at scale."
+    "Consider caching stats for a short TTL (e.g., 60 seconds) if the queries become expensive at scale.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [
     "US-11.1"

@@ -171,7 +171,11 @@
     "The raw API key from create and rotate responses should be highlighted or formatted prominently in human output mode",
     "Keys list should handle pagination if the API supports it, but for v1 a simple single-page list is sufficient",
     "The revoke command should accept the key UUID, not the key prefix, to avoid ambiguity",
-    "Use Req.Test.expect/3 to mock HTTP responses in tests rather than hitting a real server"
+    "Use Req.Test.expect/3 to mock HTTP responses in tests rather than hitting a real server",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

@@ -226,7 +226,11 @@
     "The changes command --since parameter should accept both ISO8601 full timestamps and date-only strings (auto-appending T00:00:00Z for dates)",
     "The history command reuses story number resolution from US-14.6",
     "Admin commands should check the API key role client-side if possible and warn early if a non-superadmin key is being used",
-    "Webhook test should display the delivery result including HTTP status code and any error message from the target"
+    "Webhook test should display the delivery result including HTTP status code and any error message from the target",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

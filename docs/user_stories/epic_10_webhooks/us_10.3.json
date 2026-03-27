@@ -224,6 +224,25 @@
         "Content-Type header is 'application/json'"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-10.3.9",
+      "name": "cross-tenant isolation \u2014 delivery worker cannot access other tenant's webhook",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:webhook, %{tenant_id: tenant_b.id, url: 'https://b.example.com/hooks', active: true})",
+        "fixture(:webhook_event, %{webhook_id: tenant_b_webhook.id, tenant_id: tenant_b.id, status: :pending})"
+      ],
+      "steps": [
+        "Attempt to load and deliver the webhook_event with Tenant A's context"
+      ],
+      "expected_results": [
+        "The webhook_event is not accessible from Tenant A's context (RLS prevents cross-tenant access)",
+        "Delivery only succeeds when run in the correct tenant context"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -234,7 +253,12 @@
     "Worker flow: load webhook_event -> load webhook -> check active -> make HTTP POST -> update event status -> update webhook consecutive_failures.",
     "Use Req.Test or Mox to mock HTTP requests in tests. Never make real HTTP calls in test.",
     "Oban queue configuration in config: queues: [webhooks: 10].",
-    "Consider using Oban.Pro's SmartEngine if available, otherwise standard Oban retry with manual snooze scheduling."
+    "Consider using Oban.Pro's SmartEngine if available, otherwise standard Oban retry with manual snooze scheduling.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Webhook HTTP delivery MUST use a behaviour-based HTTP client (e.g., Loopctl.Webhooks.DeliveryBehaviour) for testability. Real implementation uses Req. Mock defined in test/support/mocks.ex. Tests inject mock via opts, never via Application.put_env.",
+    "Oban worker MUST implement `@impl Oban.Worker` callback with `perform(%Oban.Job{})` function signature."
   ],
   "dependencies": [
     "US-10.2"

@@ -189,8 +189,13 @@
     "The Ecto Sandbox in test mode wraps each test in a transaction, which works well with SET LOCAL",
     "Consider using Repo.prepare_query/3 callback to inject SET LOCAL before queries rather than default_options, since we need to execute SQL",
     "For superadmin bypass, consider a separate database role without RLS restrictions, or SET LOCAL app.current_tenant_id = '00000000-0000-0000-0000-000000000000' with a policy that allows a sentinel value",
-    "IMPORTANT: The Ecto.Repo sandbox (SQL.Sandbox) used in tests already wraps queries in transactions, so SET LOCAL works naturally in test mode"
+    "IMPORTANT: The Ecto.Repo sandbox (SQL.Sandbox) used in tests already wraps queries in transactions, so SET LOCAL works naturally in test mode",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
-  "dependencies": [],
+  "dependencies": [
+    "US-1.1"
+  ],
   "estimated_hours": 6
 }

@@ -171,6 +171,26 @@
         "Re-encoding the payload to JSON (which may reorder keys) and signing produces a DIFFERENT signature, proving raw bytes are used"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-10.4.7",
+      "name": "cross-tenant isolation \u2014 signing secret only decrypted for correct tenant's webhook",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:webhook, %{tenant_id: tenant_a.id, active: true})",
+        "fixture(:webhook, %{tenant_id: tenant_b.id, active: true})"
+      ],
+      "steps": [
+        "Deliver a webhook_event for Tenant A's webhook",
+        "Capture the X-Signature-256 header"
+      ],
+      "expected_results": [
+        "The signature is computed using Tenant A's webhook signing secret, not Tenant B's",
+        "Verifying the signature with Tenant B's secret fails"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -179,7 +199,11 @@
     "Cloak decryption happens when the webhook Ecto schema is loaded (Cloak.Ecto handles this transparently). Ensure the schema field type is Loopctl.Encrypted.Binary.",
     "Payload truncation: check byte_size(json_body) > 65_536 before signing. If oversized, remove old_state/new_state from data and add truncated: true.",
     "Headers to set on every delivery: X-Signature-256, X-Webhook-ID, X-Webhook-Timestamp, Content-Type: application/json, User-Agent: Loopctl-Webhook/1.0.",
-    "This story modifies the WebhookDeliveryWorker from US-10.3 to add signing and security headers before making the HTTP request."
+    "This story modifies the WebhookDeliveryWorker from US-10.3 to add signing and security headers before making the HTTP request.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Webhook HTTP delivery MUST use a behaviour-based HTTP client (e.g., Loopctl.Webhooks.DeliveryBehaviour) for testability. Real implementation uses Req. Mock defined in test/support/mocks.ex. Tests inject mock via opts, never via Application.put_env."
   ],
   "dependencies": [
     "US-10.3"

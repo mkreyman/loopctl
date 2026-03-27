@@ -173,7 +173,11 @@
     "GenServer sends itself a periodic message every 60 seconds to clean expired windows",
     "The RateLimiter plug should be the LAST plug in the auth pipeline (after RequireAuth), so unauthenticated requests don't consume rate limit budget",
     "Consider using :atomics instead of ETS for even better performance (Erlang/OTP 21+)",
-    "Test note: rate limit tests may need to reset ETS state between tests to avoid pollution"
+    "Test note: rate limit tests may need to reset ETS state between tests to avoid pollution",
+    "Time/clock dependencies MUST be injectable via a Clock behaviour for test determinism. Define Loopctl.Clock behaviour, mock in test/support/mocks.ex.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.3"

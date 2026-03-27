@@ -63,6 +63,11 @@
       "id": "AC-6.1.10",
       "description": "RLS policy is enabled on the epics table enforcing tenant isolation at the database level",
       "status": "pending"
+    },
+    {
+      "id": "AC-6.1.11",
+      "description": "Every mutation (create, update, delete) MUST be recorded in the audit log via Ecto.Multi in the same transaction as the entity change.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -203,6 +208,24 @@
         "Counts match the fixture data"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-6.1.8",
+      "name": "Mutation creates audit log entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "Perform the mutation via API endpoint"
+      ],
+      "expected_results": [
+        "Audit log entry created with correct entity_type, entity_id, action, and actor",
+        "Audit entry is in the same transaction (no orphaned entity without audit)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -212,10 +235,14 @@
     "Consider a Loopctl.WorkBreakdown context module that handles both epics and stories",
     "The list endpoint should support optional filtering by phase: ?phase=p0_foundation",
     "Epic number is an integer (not a string) unlike story numbers which are strings (e.g., '2.1')",
-    "Metadata jsonb defaults to %{} (empty map)"
+    "Metadata jsonb defaults to %{} (empty map)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
-    "US-5.1"
+    "US-5.1",
+    "US-3.1"
   ],
   "estimated_hours": 4
 }

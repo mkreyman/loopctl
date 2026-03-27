@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-10.1.1",
-      "description": "A webhooks table exists with columns: id (uuid PK), tenant_id (uuid FK), url (string, required), signing_secret_encrypted (binary, Cloak AES-256-GCM), events ({:array, :string}, required, non-empty), project_id (uuid FK, nullable — NULL means all projects), active (boolean, default true), consecutive_failures (integer, default 0), last_delivery_at (utc_datetime, nullable), inserted_at, updated_at.",
+      "description": "A webhooks table exists with columns: id (uuid PK), tenant_id (uuid FK), url (string, required), signing_secret_encrypted (binary, Cloak AES-256-GCM), events ({:array, :string}, required, non-empty), project_id (uuid FK, nullable \u2014 NULL means all projects), active (boolean, default true), consecutive_failures (integer, default 0), last_delivery_at (utc_datetime, nullable), inserted_at, updated_at.",
       "status": "pending"
     },
     {
@@ -62,6 +62,11 @@
     {
       "id": "AC-10.1.10",
       "description": "The signing_secret is generated as a cryptographically random 32-byte hex string and stored encrypted using Cloak's Ecto type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-10.1.11",
+      "description": "Webhook creation, update, and deletion MUST be recorded in the audit log via Ecto.Multi.",
       "status": "pending"
     }
   ],
@@ -182,7 +187,7 @@
     },
     {
       "id": "TC-10.1.7",
-      "name": "tenant isolation — cannot access other tenant's webhooks",
+      "name": "tenant isolation \u2014 cannot access other tenant's webhooks",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant, %{name: 'Tenant A'})",
@@ -229,7 +234,13 @@
     "Loopctl.Webhooks context module: create_webhook/2, list_webhooks/1, get_webhook!/2, update_webhook/2, delete_webhook/1.",
     "WebhookController with create, index, show, update, delete actions. Routes under /api/v1/webhooks.",
     "URL validation: require https:// scheme (reject http:// in production, allow in dev/test). Validate URL format with URI.parse.",
-    "The signing_secret is only returned in the POST creation response. All other endpoints omit it. Use a separate JSON view/serializer for creation vs. list/show."
+    "The signing_secret is only returned in the POST creation response. All other endpoints omit it. Use a separate JSON view/serializer for creation vs. list/show.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)"
   ],
   "dependencies": [
     "US-2.4"

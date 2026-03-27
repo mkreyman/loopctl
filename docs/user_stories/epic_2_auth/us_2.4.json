@@ -175,7 +175,10 @@
     "The exact_role option is needed for agent-only endpoints (claim, start, report) where orchestrators should NOT be able to act as agents",
     "Consider implementing the role hierarchy in a separate Loopctl.Auth.Role module for reuse",
     "The plug should work both as a pipeline plug and as an inline controller plug",
-    "Error message should indicate the required role without revealing the full hierarchy"
+    "Error message should indicate the required role without revealing the full hierarchy",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.3"

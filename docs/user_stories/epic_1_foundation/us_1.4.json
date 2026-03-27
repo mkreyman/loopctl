@@ -182,7 +182,10 @@
     "Changeset error traversal: Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} -> ... end) to produce human-readable messages",
     "Consider a LoopctlWeb.ErrorHelpers module for changeset → map translation that can be reused",
     "The ErrorJSON view should handle the render/2 callback for all error templates (404.json, 422.json, 500.json, etc.)",
-    "In production, ensure Phoenix.Endpoint error handler uses ErrorJSON, not ErrorHTML"
+    "In production, ensure Phoenix.Endpoint error handler uses ErrorJSON, not ErrorHTML",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [],
   "estimated_hours": 3

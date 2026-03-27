@@ -204,7 +204,10 @@
     "SetTenant bridges the Phoenix request lifecycle to the Ecto/RLS layer via the process dictionary",
     "The pipeline order in the router: plug ExtractApiKey -> plug ResolveApiKey -> plug SetTenant -> plug RequireAuth",
     "RequireAuth should use the FallbackController error format for consistency",
-    "Consider a test helper that builds an authenticated conn: build_conn() |> authenticate(api_key)"
+    "Consider a test helper that builds an authenticated conn: build_conn() |> authenticate(api_key)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.2"

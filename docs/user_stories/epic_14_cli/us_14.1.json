@@ -209,8 +209,12 @@
     "Use Jason for JSON parsing/encoding of the config file",
     "Req client should be built once per command invocation and passed through to API-calling functions",
     "Output formatting should be handled by a Loopctl.CLI.Formatter module with format/2 that accepts data and format type (:json, :human, :csv)",
-    "The escript needs to include all dependencies (Req, Jason, etc.) — verify with mix escript.build that all deps are bundled",
-    "Global flags (--format, --help) should be extracted before dispatching to command modules"
+    "The escript needs to include all dependencies (Req, Jason, etc.) \u2014 verify with mix escript.build that all deps are bundled",
+    "Global flags (--format, --help) should be extracted before dispatching to command modules",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-1.1"

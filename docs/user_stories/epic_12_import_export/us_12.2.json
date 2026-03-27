@@ -90,7 +90,7 @@
     },
     {
       "id": "TC-12.2.2",
-      "name": "round-trip fidelity — export then import",
+      "name": "round-trip fidelity \u2014 export then import",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant, %{})",
@@ -176,7 +176,7 @@
       "preconditions": [
         "fixture(:tenant, %{})",
         "fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
-        "fixture(:project, %{tenant_id: tenant.id}) — no epics or stories"
+        "fixture(:project, %{tenant_id: tenant.id}) \u2014 no epics or stories"
       ],
       "steps": [
         "GET /api/v1/projects/:id/export"
@@ -218,7 +218,11 @@
     "Controller: add export action to ProjectController or create ExportController. Route: GET /api/v1/projects/:id/export.",
     "The loopctl_version in export_metadata should come from Mix.Project.config()[:version] or an Application config value.",
     "For large projects (1000+ stories), consider streaming the JSON response or setting appropriate timeouts. For v1, a simple Jason.encode! should suffice.",
-    "Ensure the export format is documented (in the export_metadata or a separate schema doc) so consumers know the structure."
+    "Ensure the export format is documented (in the export_metadata or a separate schema doc) so consumers know the structure.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [
     "US-6.4"

@@ -227,6 +227,28 @@
         "No webhook_event records exist (rolled back with the transaction)"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-10.2.9",
+      "name": "cross-tenant isolation \u2014 webhook events not visible to other tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{name: 'Tenant A'})",
+        "fixture(:tenant, %{name: 'Tenant B'})",
+        "fixture(:webhook, %{tenant_id: tenant_a.id, events: ['story.status_changed'], active: true})",
+        "fixture(:webhook, %{tenant_id: tenant_b.id, events: ['story.status_changed'], active: true})",
+        "fixture(:story, %{tenant_id: tenant_a.id, agent_status: :pending})",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/claim with Tenant A's agent API key",
+        "Query webhook_events for Tenant B's webhook"
+      ],
+      "expected_results": [
+        "No webhook_event records exist for Tenant B's webhook",
+        "webhook_event exists only for Tenant A's webhook (RLS ensures tenant isolation)"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
@@ -237,7 +259,11 @@
     "After the transaction commits, enqueue Oban jobs for each pending webhook_event. This can be done via an Ecto.Multi after-commit callback or an Oban insert_all in the multi (Oban jobs are transactional when inserted in the same multi).",
     "Payload schema examples: story.status_changed: {event: 'story.status_changed', story_id, project_id, epic_id, old_status, new_status, agent_id, timestamp}.",
     "The epic.completed event requires checking if all stories in the epic are verified after each story verification. This check runs inside the verify transaction.",
-    "Consider a helper function that wraps the common pattern: update entity + create audit log + generate webhook events, all in one Ecto.Multi."
+    "Consider a helper function that wraps the common pattern: update entity + create audit log + generate webhook events, all in one Ecto.Multi.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)"
   ],
   "dependencies": [
     "US-10.1",

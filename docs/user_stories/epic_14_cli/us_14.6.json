@@ -212,12 +212,16 @@
     }
   ],
   "technical_notes": [
-    "All story-number-based commands (claim, start, report, unclaim) need the same story number resolution logic — extract this into a shared helper in the CLI module",
+    "All story-number-based commands (claim, start, report, unclaim) need the same story number resolution logic \u2014 extract this into a shared helper in the CLI module",
     "Story number resolution requires a --project flag to scope the lookup; if only one project exists, auto-detect it",
     "The @file syntax for --artifact should read the file, parse it as JSON, and fail with a clear error if the file doesn't exist or contains invalid JSON",
     "The agent register command should store the returned agent_id in the config file for use by subsequent claim/start/report commands",
     "Consider adding --project to the config file so agents don't need to specify it on every command",
-    "All agent commands should handle common API errors gracefully: 409 (already claimed), 403 (wrong role), 422 (precondition failed)"
+    "All agent commands should handle common API errors gracefully: 409 (already claimed), 403 (wrong role), 422 (precondition failed)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

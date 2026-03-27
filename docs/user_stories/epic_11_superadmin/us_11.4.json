@@ -12,7 +12,7 @@
     "i_want_to": "query the audit log across all tenants from a single endpoint, filterable by tenant, entity type, action, and date range",
     "so_that": "I can investigate platform-wide incidents, trace cross-tenant issues, and review superadmin actions without switching between tenant contexts"
   },
-  "rationale": "The standard audit endpoint (US-3.1) is tenant-scoped — each tenant can only see their own audit entries. For platform operations (investigating abuse, auditing superadmin actions, debugging cross-tenant issues), the superadmin needs visibility across all tenants. This endpoint surfaces the same audit data but without tenant-scoping, with an additional tenant_id filter for narrowing results.",
+  "rationale": "The standard audit endpoint (US-3.1) is tenant-scoped \u2014 each tenant can only see their own audit entries. For platform operations (investigating abuse, auditing superadmin actions, debugging cross-tenant issues), the superadmin needs visibility across all tenants. This endpoint surfaces the same audit data but without tenant-scoping, with an additional tenant_id filter for narrowing results.",
   "acceptance_criteria": [
     {
       "id": "AC-11.4.1",
@@ -193,7 +193,11 @@
     "Reuse the filter parsing logic from AuditController (US-3.1) but add the tenant_id filter parameter.",
     "Consider creating a shared Audit.list_entries_admin/1 function that skips tenant scoping, alongside the existing tenant-scoped Audit.list_entries/2.",
     "Performance: ensure the (tenant_id, inserted_at) index on audit_log supports the combined tenant_id + date range queries efficiently. The cross-tenant unfiltered query relies on the inserted_at index alone.",
-    "Response includes tenant context: {tenant_id: uuid|null, tenant_name: string|null, tenant_slug: string|null} alongside the standard audit entry fields."
+    "Response includes tenant context: {tenant_id: uuid|null, tenant_name: string|null, tenant_slug: string|null} alongside the standard audit entry fields.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [
     "US-11.1",

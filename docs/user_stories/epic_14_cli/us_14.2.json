@@ -189,12 +189,16 @@
     }
   ],
   "technical_notes": [
-    "Auth login should validate credentials by making a test API call before storing them — never store untested credentials",
+    "Auth login should validate credentials by making a test API call before storing them \u2014 never store untested credentials",
     "The whoami command should extract the key prefix from the locally stored API key (first 8 chars), not from the server response",
     "Tenant register is unique: it needs a --server flag since no config exists yet. Accept server from --server flag or LOOPCTL_SERVER env var",
-    "Use Req.Test for mocking HTTP responses in tests — configure the test adapter via Req.Test.expect/3",
+    "Use Req.Test for mocking HTTP responses in tests \u2014 configure the test adapter via Req.Test.expect/3",
     "Settings parsing for 'key=value' format should handle integer values (auto-parse numeric strings) and boolean values ('true'/'false')",
-    "All commands should delegate to a shared HTTP module for consistent error handling and response parsing"
+    "All commands should delegate to a shared HTTP module for consistent error handling and response parsing",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",

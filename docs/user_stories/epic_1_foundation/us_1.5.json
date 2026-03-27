@@ -142,7 +142,12 @@
     "Database check: Ecto.Adapters.SQL.query(Repo, \"SELECT 1\") wrapped in a try/catch or Task.await with timeout",
     "Oban check: Process.whereis(Oban) |> is_pid()",
     "Use a dedicated Loopctl.Health module for the check logic, keep the controller thin",
-    "Consider adding a response_time_ms field for each check for observability"
+    "Consider adding a response_time_ms field for each check for observability",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "Database health check MUST be injectable via behaviour-based DI for test mocking. Define a HealthCheck behaviour, mock it in test/support/mocks.ex.",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [],
   "estimated_hours": 1

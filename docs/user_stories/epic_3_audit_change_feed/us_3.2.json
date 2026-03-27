@@ -226,7 +226,11 @@
     "Consider adding a project_id column to audit_log (denormalized) for efficient project-scoped change feed queries. Alternative: store project_id in the metadata jsonb.",
     "Result cap (default 1000) should be configurable via application config. Response shape: {data: [...], has_more: bool, next_since: ISO8601|null}.",
     "Omit old_state from the change feed response to reduce payload size. Clients can use GET /audit for full state diffs.",
-    "Index on (tenant_id, inserted_at) from US-3.1 supports the primary query pattern (since > timestamp, scoped by tenant)."
+    "Index on (tenant_id, inserted_at) from US-3.1 supports the primary query pattern (since > timestamp, scoped by tenant).",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-3.1"

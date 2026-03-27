@@ -247,7 +247,13 @@
     "Controller at LoopctlWeb.StoryVerificationController with verify and reject actions.",
     "The reject endpoint must trigger auto-reset logic (US-7.3) but that is a separate story — this story just handles the verified_status write and verification_result creation.",
     "Verification results are immutable — each verify/reject creates a new record, building a history.",
-    "RLS policies must scope verification_results to tenant_id."
+    "RLS policies must scope verification_results to tenant_id.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-7.1",

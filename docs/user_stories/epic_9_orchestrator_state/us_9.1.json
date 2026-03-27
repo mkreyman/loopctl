@@ -244,7 +244,13 @@
     "RLS policy on orchestrator_state: tenant_id = current_setting('app.current_tenant_id')::uuid.",
     "Controller at LoopctlWeb.OrchestratorStateController with save and show actions.",
     "Routes: PUT /api/v1/orchestrator/state/:project_id and GET /api/v1/orchestrator/state/:project_id. RequireRole plug set to [:orchestrator, :superadmin].",
-    "The project_id in the URL must be validated as an existing project within the tenant before any state operations."
+    "The project_id in the URL must be validated as an existing project within the tenant before any state operations.",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering (maps error atoms to HTTP status codes per US-1.4)",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files"
   ],
   "dependencies": [
     "US-2.4",

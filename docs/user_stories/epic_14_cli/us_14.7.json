@@ -10,7 +10,7 @@
   "story": {
     "as_a": "AI orchestrator agent",
     "i_want_to": "verify stories, reject stories with reasons, list pending verifications, and save/load orchestrator state via the CLI",
-    "so_that": "I can perform my orchestration duties — verifying deliverables, rejecting inadequate work, and checkpointing my state for crash recovery — through a simple command interface"
+    "so_that": "I can perform my orchestration duties \u2014 verifying deliverables, rejecting inadequate work, and checkpointing my state for crash recovery \u2014 through a simple command interface"
   },
   "rationale": "The orchestrator is the trust layer in loopctl's two-tier model. It needs CLI commands to record verification results (pass/fail/partial), reject stories with actionable reasons that auto-reset agent_status, query for stories awaiting verification, and persist its own state for session recovery. These commands are the orchestrator's primary interface for writing to the verified_status track and maintaining crash resilience.",
   "acceptance_criteria": [
@@ -206,12 +206,16 @@
     }
   ],
   "technical_notes": [
-    "The verify and reject commands share the story number resolution logic from US-14.6 — reuse the shared helper",
+    "The verify and reject commands share the story number resolution logic from US-14.6 \u2014 reuse the shared helper",
     "The pending command may need to make a filtered query to the stories list endpoint with query parameters for agent_status and verified_status, or use a dedicated endpoint if one exists",
     "State save should include optimistic locking: first load the current version, then save with version+1. If the server returns a version conflict (409), inform the user",
-    "The --data @file syntax should work identically to the --artifact @file syntax from US-14.6 — extract the file-reading logic into a shared utility",
+    "The --data @file syntax should work identically to the --artifact @file syntax from US-14.6 \u2014 extract the file-reading logic into a shared utility",
     "The verify --findings flag should accept the same inline JSON or @file syntax",
-    "Consider adding a --state-key flag to state save/load (default: 'main') for orchestrators that maintain multiple state namespaces"
+    "Consider adding a --state-key flag to state save/load (default: 'main') for orchestrators that maintain multiple state namespaces",
+    "All test modules MUST use `async: true` (e.g., `use Loopctl.DataCase, async: true` or `use LoopctlWeb.ConnCase, async: true`)",
+    "All tests using Mox MUST include `setup :verify_on_exit!`",
+    "All mocks MUST be defined centrally in `test/support/mocks.ex`, never in individual test files",
+    "CLI HTTP client MUST be injectable via behaviour or Req.Test for test isolation. Use Req.Test.expect/3 for HTTP mocking in tests. Never use Application.put_env in test files."
   ],
   "dependencies": [
     "US-14.1",
