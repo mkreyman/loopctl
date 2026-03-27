@@ -69,6 +69,9 @@ config :loopctl, :clock, Loopctl.MockClock
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 
+# DI: Use Req.Test plug for CLI HTTP client in tests
+config :loopctl, :cli_req_plug, {Req.Test, Loopctl.CLI.Client}
+
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.
 config :loopctl, :rls_role, "loopctl_app"
