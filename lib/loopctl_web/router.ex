@@ -41,5 +41,14 @@ defmodule LoopctlWeb.Router do
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
     post "/api_keys/:id/rotate", ApiKeyController, :rotate
+
+    # Audit log
+    get "/audit", AuditController, :index
+
+    # Change feed
+    get "/changes", ChangeController, :index
+
+    # Story history
+    get "/stories/:id/history", StoryHistoryController, :show
   end
 end

@@ -14,6 +14,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :conflict}` -> 409
   - `{:error, :rate_limited}` -> 429
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
+  - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
   """
 
@@ -57,6 +58,12 @@ defmodule LoopctlWeb.FallbackController do
     conn
     |> put_status(:unprocessable_entity)
     |> json(%{error: %{status: 422, message: "Validation failed", details: details}})
+  end
+
+  def call(conn, {:error, :bad_request, message}) when is_binary(message) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{error: %{status: 400, message: message}})
   end
 
   def call(conn, {:error, :unprocessable_entity, message}) when is_binary(message) do
