@@ -129,6 +129,12 @@ defmodule LoopctlWeb.Router do
     resources "/webhooks", WebhookController, only: [:create, :index, :update, :delete]
     post "/webhooks/:id/test", WebhookController, :test
     get "/webhooks/:id/deliveries", WebhookController, :deliveries
+
+    # Skills (Epic 15)
+    resources "/skills", SkillController, only: [:create, :index, :show, :update, :delete]
+    post "/skills/:id/versions", SkillController, :create_version
+    get "/skills/:id/versions", SkillController, :list_versions
+    get "/skills/:id/versions/:version", SkillController, :get_version
   end
 
   # Superadmin endpoints (Epic 11)
