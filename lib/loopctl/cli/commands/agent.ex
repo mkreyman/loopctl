@@ -26,9 +26,25 @@ defmodule Loopctl.CLI.Commands.Agent do
   end
 
   def run("contract", [story_id | _rest], opts) do
-    case Client.post("/api/v1/stories/#{story_id}/contract", %{}) do
-      {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
-      {:error, reason} -> handle_error(reason)
+    case Client.get("/api/v1/stories/#{story_id}", opts) do
+      {:ok, %{"story" => story}} ->
+        title = story["title"]
+        ac_count = length(story["acceptance_criteria"] || [])
+        Output.success("Story: #{title}")
+        Output.success("Acceptance Criteria: #{ac_count}")
+
+        body = %{"story_title" => title, "ac_count" => ac_count}
+
+        case Client.post("/api/v1/stories/#{story_id}/contract", body, opts) do
+          {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
+          {:error, reason} -> handle_error(reason)
+        end
+
+      {:ok, _unexpected} ->
+        Output.error("Unexpected response format when fetching story #{story_id}")
+
+      {:error, reason} ->
+        handle_error(reason)
     end
   end
 

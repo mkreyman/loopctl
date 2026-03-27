@@ -15,6 +15,19 @@ defmodule Loopctl.CLI.Commands.AgentTest do
             "agent" => %{"id" => "a-1", "name" => "worker-1", "agent_type" => "implementer"}
           })
 
+        {"GET", "/api/v1/stories/" <> _id} ->
+          Req.Test.json(conn, %{
+            "story" => %{
+              "id" => "s-1",
+              "title" => "Build API",
+              "acceptance_criteria" => [
+                %{"id" => "AC-1", "description" => "Endpoint works"},
+                %{"id" => "AC-2", "description" => "Tests pass"}
+              ],
+              "agent_status" => "pending"
+            }
+          })
+
         {"POST", "/api/v1/stories/" <> _rest} ->
           Req.Test.json(conn, %{
             "story" => %{"id" => "s-1", "agent_status" => "contracted"}
@@ -50,12 +63,14 @@ defmodule Loopctl.CLI.Commands.AgentTest do
   end
 
   describe "contract" do
-    test "contracts a story" do
+    test "fetches story, displays info, then contracts" do
       output =
         capture_io(fn ->
           Agent.run("contract", ["s-1"], [])
         end)
 
+      assert output =~ "Story: Build API"
+      assert output =~ "Acceptance Criteria: 2"
       assert output =~ "contracted"
     end
   end

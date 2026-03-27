@@ -22,7 +22,9 @@ defmodule Loopctl.Progress do
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.WorkBreakdown.StoryDependency
   alias Loopctl.Workers.WebhookDeliveryWorker
 
   # --- Agent Status Transitions (US-7.1) ---
@@ -158,6 +160,9 @@ defmodule Loopctl.Progress do
           error -> error
         end
       end)
+      |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
+        check_claim_dependencies(story)
+      end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 
@@ -208,6 +213,7 @@ defmodule Loopctl.Progress do
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :check_deps, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
@@ -916,6 +922,7 @@ defmodule Loopctl.Progress do
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
       {:error, :verification_result, changeset, _} -> {:error, changeset}
+      {:error, :epic_completion, reason, _} -> {:error, reason}
       {:error, :auto_reset, reason, _} -> {:error, reason}
     end
   end
@@ -1074,20 +1081,54 @@ defmodule Loopctl.Progress do
     end
   end
 
+  defp check_claim_dependencies(story) do
+    # Check story-level dependencies: all depends_on stories must be verified
+    story_deps_unmet =
+      from(sd in StoryDependency,
+        join: dep in Story,
+        on: dep.id == sd.depends_on_story_id,
+        where: sd.story_id == ^story.id and dep.verified_status != :verified,
+        select: count(sd.id)
+      )
+      |> AdminRepo.one()
+
+    if story_deps_unmet > 0 do
+      {:error, :dependencies_not_met}
+    else
+      # Check epic-level dependencies: all stories in prerequisite epics must be verified
+      epic_deps_unmet =
+        from(ed in EpicDependency,
+          where: ed.epic_id == ^story.epic_id,
+          join: prereq_story in Story,
+          on: prereq_story.epic_id == ed.depends_on_epic_id,
+          where: prereq_story.verified_status != :verified,
+          select: count(prereq_story.id)
+        )
+        |> AdminRepo.one()
+
+      if epic_deps_unmet > 0 do
+        {:error, :dependencies_not_met}
+      else
+        {:ok, :deps_satisfied}
+      end
+    end
+  end
+
+  defp validate_unclaim(story, _agent_id) when story.agent_status == :pending do
+    {:error, :invalid_transition}
+  end
+
+  defp validate_unclaim(story, _agent_id) when story.agent_status == :contracted do
+    # Contracted stories have no assigned agent, so regular agents cannot
+    # unclaim them. Only the orchestrator (via force_unclaim) can reset these.
+    {:error, :not_assigned_to_you}
+  end
+
   defp validate_unclaim(story, agent_id) do
-    cond do
-      story.agent_status == :pending ->
-        {:error, :invalid_transition}
-
-      # For contracted state, no agent is assigned yet, so any agent can unclaim
-      story.agent_status == :contracted ->
-        :ok
-
-      story.assigned_agent_id != agent_id ->
-        {:error, :not_assigned_agent}
-
-      true ->
-        :ok
+    if story.assigned_agent_id == agent_id do
+      :ok
+    else
+      {:error, :not_assigned_agent}
     end
   end
 

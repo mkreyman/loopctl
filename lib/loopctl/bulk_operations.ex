@@ -239,6 +239,7 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp process_reject(story, params, tenant_id, orchestrator_agent_id, actor_id, actor_label) do
+    require Logger
     reason = params["reason"] || params[:reason]
 
     with :ok <- validate_reason(reason),
@@ -247,8 +248,15 @@ defmodule Loopctl.BulkOperations do
       create_rejection_result(tenant_id, story, orchestrator_agent_id, params)
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
       emit_reject_event(tenant_id, updated, orchestrator_agent_id, reason)
-      {:ok, reset} = auto_reset_agent_status(updated)
-      audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+
+      case auto_reset_agent_status(updated) do
+        {:ok, reset} ->
+          audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+
+        {:error, reset_reason} ->
+          Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
+      end
+
       %{story_id: story.id, status: "success"}
     else
       {:error, reason} ->

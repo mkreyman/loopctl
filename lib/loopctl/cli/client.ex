@@ -91,11 +91,11 @@ defmodule Loopctl.CLI.Client do
         |> maybe_add_plug(plug)
 
       case Req.request(req_opts) do
-        {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
-          {:ok, body}
-
         {:ok, %Req.Response{status: 204}} ->
           {:ok, %{}}
+
+        {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+          {:ok, body}
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {status, body}}

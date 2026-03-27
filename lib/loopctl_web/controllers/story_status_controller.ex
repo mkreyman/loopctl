@@ -68,6 +68,9 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :invalid_transition} ->
         {:error, :conflict}
 
+      {:error, :dependencies_not_met} ->
+        {:error, :conflict}
+
       {:error, :not_found} ->
         {:error, :not_found}
     end
@@ -139,6 +142,9 @@ defmodule LoopctlWeb.StoryStatusController do
         json(conn, %{story: story})
 
       {:error, :not_assigned_agent} ->
+        {:error, :forbidden}
+
+      {:error, :not_assigned_to_you} ->
         {:error, :forbidden}
 
       {:error, :invalid_transition} ->

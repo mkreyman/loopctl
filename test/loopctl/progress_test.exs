@@ -242,14 +242,12 @@ defmodule Loopctl.ProgressTest do
                Progress.unclaim_story(tenant.id, story.id, agent_id: agent.id)
     end
 
-    test "contracted story can be unclaimed by any agent" do
+    test "contracted story cannot be unclaimed by regular agent" do
       %{tenant: tenant, story: story, agent: agent} =
         setup_story(%{agent_status: :contracted})
 
-      assert {:ok, updated} =
+      assert {:error, :not_assigned_to_you} =
                Progress.unclaim_story(tenant.id, story.id, agent_id: agent.id)
-
-      assert updated.agent_status == :pending
     end
   end
 
