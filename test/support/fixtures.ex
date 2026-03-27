@@ -10,6 +10,7 @@ defmodule Loopctl.Fixtures do
   """
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Tenants.Tenant
@@ -44,6 +45,17 @@ defmodule Loopctl.Fixtures do
         actor_label: "user:test",
         old_state: nil,
         new_state: %{"name" => "Test"},
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:agent, attrs) do
+    Map.merge(
+      %{
+        name: "agent-#{System.unique_integer([:positive])}",
+        agent_type: :implementer,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -86,6 +98,29 @@ defmodule Loopctl.Fixtures do
     else
       tenant
     end
+  end
+
+  def fixture(:agent, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:agent, attrs)
+
+    changeset =
+      %Agent{tenant_id: tenant_id}
+      |> Agent.register_changeset(data)
+
+    AdminRepo.insert!(changeset)
   end
 
   def fixture(:api_key, attrs) do
