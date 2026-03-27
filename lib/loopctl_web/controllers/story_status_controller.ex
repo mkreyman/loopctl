@@ -31,7 +31,7 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def contract(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Progress.contract_story(tenant_id, story_id, params,
            agent_id: api_key.agent_id,
@@ -62,7 +62,7 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def claim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Progress.claim_story(tenant_id, story_id,
            agent_id: api_key.agent_id,
@@ -87,7 +87,7 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def start(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Progress.start_story(tenant_id, story_id,
            agent_id: api_key.agent_id,
@@ -115,7 +115,7 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def report(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
     artifact_params = extract_artifact_params(params)
 
     case Progress.report_story(
@@ -149,7 +149,7 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def unclaim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Progress.unclaim_story(tenant_id, story_id,
            agent_id: api_key.agent_id,
@@ -182,4 +182,7 @@ defmodule LoopctlWeb.StoryStatusController do
   end
 
   defp extract_artifact_params(_), do: nil
+
+  defp resolve_tenant_id(%{assigns: %{impersonated_tenant_id: id}}), do: id
+  defp resolve_tenant_id(%{assigns: %{current_api_key: %{tenant_id: id}}}), do: id
 end

@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ProjectController do
   use LoopctlWeb, :controller
 
   alias Loopctl.Projects
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -25,8 +26,8 @@ defmodule LoopctlWeb.ProjectController do
   Creates a new project. Requires user+ role.
   """
   def create(conn, params) do
-    api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
+    audit_opts = AuditContext.from_conn(conn)
 
     attrs = %{
       name: params["name"],
@@ -37,10 +38,7 @@ defmodule LoopctlWeb.ProjectController do
       metadata: params["metadata"] || %{}
     }
 
-    case Projects.create_project(tenant_id, attrs,
-           actor_id: api_key.id,
-           actor_label: "user:#{api_key.name}"
-         ) do
+    case Projects.create_project(tenant_id, attrs, audit_opts) do
       {:ok, project} ->
         conn
         |> put_status(:created)
@@ -61,7 +59,7 @@ defmodule LoopctlWeb.ProjectController do
   Supports pagination via ?page=N&page_size=M.
   """
   def index(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     opts =
       []
@@ -90,7 +88,7 @@ defmodule LoopctlWeb.ProjectController do
   Returns epic_count and story_count aggregates (zeroed until Epic 6).
   """
   def show(conn, %{"id" => project_id}) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Projects.get_project(tenant_id, project_id) do
       {:ok, project} ->
@@ -114,8 +112,8 @@ defmodule LoopctlWeb.ProjectController do
   Updates a project. Requires user+ role. Slug cannot be changed.
   """
   def update(conn, %{"id" => project_id} = params) do
-    api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
+    audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, project} <- Projects.get_project(tenant_id, project_id) do
       attrs = %{
@@ -130,10 +128,7 @@ defmodule LoopctlWeb.ProjectController do
       # Remove nil values so we only update provided fields
       attrs = Map.reject(attrs, fn {_k, v} -> is_nil(v) end)
 
-      case Projects.update_project(tenant_id, project, attrs,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      case Projects.update_project(tenant_id, project, attrs, audit_opts) do
         {:ok, updated} ->
           json(conn, %{project: project_json(updated)})
 
@@ -149,14 +144,11 @@ defmodule LoopctlWeb.ProjectController do
   Archives a project (soft delete). Requires user+ role.
   """
   def delete(conn, %{"id" => project_id}) do
-    api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
+    audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, project} <- Projects.get_project(tenant_id, project_id) do
-      case Projects.archive_project(tenant_id, project,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      case Projects.archive_project(tenant_id, project, audit_opts) do
         {:ok, archived} ->
           json(conn, %{project: project_json(archived)})
 
@@ -172,7 +164,7 @@ defmodule LoopctlWeb.ProjectController do
   Returns progress summary for a project. Requires agent+ role.
   """
   def progress(conn, %{"id" => project_id}) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    tenant_id = resolve_tenant_id(conn)
 
     case Projects.get_project_progress(tenant_id, project_id) do
       {:ok, progress} ->
@@ -231,4 +223,7 @@ defmodule LoopctlWeb.ProjectController do
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
+
+  defp resolve_tenant_id(%{assigns: %{impersonated_tenant_id: id}}), do: id
+  defp resolve_tenant_id(%{assigns: %{current_api_key: %{tenant_id: id}}}), do: id
 end

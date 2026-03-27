@@ -44,6 +44,8 @@ defmodule Loopctl.Projects do
   def create_project(tenant_id, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    metadata = Keyword.get(opts, :metadata, %{})
 
     changeset =
       %Project{tenant_id: tenant_id}
@@ -64,9 +66,10 @@ defmodule Loopctl.Projects do
           entity_type: "project",
           entity_id: project.id,
           action: "created",
-          actor_type: "api_key",
+          actor_type: actor_type,
           actor_id: actor_id,
           actor_label: actor_label,
+          metadata: metadata,
           new_state: %{
             "name" => project.name,
             "slug" => project.slug,
@@ -143,6 +146,8 @@ defmodule Loopctl.Projects do
   def update_project(tenant_id, %Project{} = project, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    metadata = Keyword.get(opts, :metadata, %{})
 
     changeset = Project.update_changeset(project, attrs)
 
@@ -155,9 +160,10 @@ defmodule Loopctl.Projects do
           entity_type: "project",
           entity_id: updated.id,
           action: "updated",
-          actor_type: "api_key",
+          actor_type: actor_type,
           actor_id: actor_id,
           actor_label: actor_label,
+          metadata: metadata,
           old_state: %{
             "name" => project.name,
             "status" => to_string(project.status)
@@ -199,6 +205,8 @@ defmodule Loopctl.Projects do
   def archive_project(tenant_id, %Project{} = project, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    metadata = Keyword.get(opts, :metadata, %{})
 
     changeset = Project.archive_changeset(project)
 
@@ -211,9 +219,10 @@ defmodule Loopctl.Projects do
           entity_type: "project",
           entity_id: archived.id,
           action: "archived",
-          actor_type: "api_key",
+          actor_type: actor_type,
           actor_id: actor_id,
           actor_label: actor_label,
+          metadata: metadata,
           old_state: %{"status" => to_string(project.status)},
           new_state: %{"status" => to_string(archived.status)}
         }
