@@ -41,6 +41,13 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# Override phoenix_ecto's Plug.Exception for CastError (default: 400 -> our: 404)
+# An invalid UUID in a URL path means the resource cannot exist, hence 404.
+config :phoenix_ecto, :exclude_ecto_exceptions_from_plug, [
+  Ecto.CastError,
+  Ecto.Query.CastError
+]
+
 # Hammer rate limiting (ETS backend)
 config :hammer,
   backend: {Hammer.Backend.ETS, [expiry_ms: 60_000 * 60, cleanup_interval_ms: 60_000 * 10]}
