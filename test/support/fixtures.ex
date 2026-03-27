@@ -125,6 +125,17 @@ defmodule Loopctl.Fixtures do
     Enum.into(attrs, %{})
   end
 
+  def build(:orchestrator_state, attrs) do
+    Map.merge(
+      %{
+        state_key: "main",
+        state_data: %{"current_epic" => 1, "completed_stories" => []},
+        version: 1
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   def build(:api_key, attrs) do
     Map.merge(
       %{
