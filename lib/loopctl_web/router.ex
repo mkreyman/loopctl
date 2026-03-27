@@ -5,6 +5,18 @@ defmodule LoopctlWeb.Router do
     plug :accepts, ["json"]
   end
 
+  pipeline :authenticated do
+    plug LoopctlWeb.Plugs.ExtractApiKey
+    plug LoopctlWeb.Plugs.ResolveApiKey
+    plug LoopctlWeb.Plugs.SetTenant
+    plug LoopctlWeb.Plugs.RequireAuth
+    plug LoopctlWeb.Plugs.RateLimiter
+  end
+
+  pipeline :registration_rate_limit do
+    plug LoopctlWeb.Plugs.RegistrationRateLimiter
+  end
+
   # Health check — unauthenticated, outside /api/v1
   scope "/", LoopctlWeb do
     pipe_through :api
@@ -12,8 +24,22 @@ defmodule LoopctlWeb.Router do
     get "/health", HealthController, :check
   end
 
+  # Public API endpoints (no auth required)
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :registration_rate_limit]
+
+    post "/tenants/register", TenantController, :register
+  end
+
   # API v1 — all authenticated endpoints
   scope "/api/v1", LoopctlWeb do
-    pipe_through :api
+    pipe_through [:api, :authenticated]
+
+    get "/tenants/me", TenantController, :show
+    patch "/tenants/me", TenantController, :update
+
+    # API key management
+    resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
+    post "/api_keys/:id/rotate", ApiKeyController, :rotate
   end
 end

@@ -128,8 +128,18 @@ defmodule Loopctl.SchemaTest do
 
     test "returns only non-deleted records from the database" do
       alias Loopctl.Repo.RlsTestRecord
+      alias Loopctl.Tenants.Tenant
 
-      tenant = fixture(:tenant)
+      # Insert tenant via Repo so it's visible within with_tenant transactions
+      tenant =
+        %Tenant{
+          id: Ecto.UUID.generate(),
+          name: "not-deleted-test",
+          slug: "not-deleted-#{System.unique_integer([:positive])}",
+          email: "not-deleted@example.com",
+          status: :active
+        }
+        |> Repo.insert!()
 
       {:ok, _active} =
         Repo.with_tenant(tenant.id, fn ->
@@ -180,8 +190,18 @@ defmodule Loopctl.SchemaTest do
   describe "timestamp precision" do
     test "timestamps preserve microsecond precision via DB round-trip" do
       alias Loopctl.Repo.RlsTestRecord
+      alias Loopctl.Tenants.Tenant
 
-      tenant = fixture(:tenant)
+      # Insert tenant via Repo so it's visible within with_tenant transactions
+      tenant =
+        %Tenant{
+          id: Ecto.UUID.generate(),
+          name: "precision-test",
+          slug: "precision-#{System.unique_integer([:positive])}",
+          email: "precision@example.com",
+          status: :active
+        }
+        |> Repo.insert!()
 
       {:ok, inserted} =
         Repo.with_tenant(tenant.id, fn ->

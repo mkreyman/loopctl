@@ -55,7 +55,13 @@ config :hammer,
 # Oban background jobs
 config :loopctl, Oban,
   repo: Loopctl.Repo,
-  queues: [default: 10, webhooks: 5, cleanup: 2]
+  queues: [default: 10, webhooks: 5, cleanup: 2],
+  plugins: [
+    {Oban.Plugins.Cron,
+     crontab: [
+       {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker}
+     ]}
+  ]
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
