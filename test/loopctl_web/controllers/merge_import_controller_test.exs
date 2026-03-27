@@ -362,5 +362,42 @@ defmodule LoopctlWeb.MergeImportControllerTest do
 
       assert json_response(conn, 404)
     end
+
+    test "duplicate import without merge flag returns 409", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        number: "1.1",
+        title: "Existing Story"
+      })
+
+      payload = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [
+              %{"number" => "1.1", "title" => "Conflicting Story"}
+            ]
+          }
+        ]
+      }
+
+      # POST without merge=true should return 409 when duplicates exist
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import", payload)
+
+      body = json_response(conn, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["message"] =~ "merge=true"
+      assert "1.1" in body["error"]["details"]["duplicate_story_numbers"]
+    end
   end
 end

@@ -420,8 +420,27 @@ defmodule Loopctl.ImportExport do
         existing_story_deps,
         epics_data
       )
-      |> merge_epic_deps(tenant_id, epic_deps_data, epics_data, epic_by_number)
+      |> merge_epic_deps(tenant_id, project_id, epic_deps_data, epics_data, epic_by_number)
       |> audit_merge_import(tenant_id, project_id, actor_id, actor_label)
+      |> EventGenerator.generate_events(:webhook_events, fn changes ->
+        {epics_created, _epics_updated} = count_merge_epics(changes)
+        {stories_created, stories_updated} = count_merge_stories(changes)
+
+        %{
+          tenant_id: tenant_id,
+          event_type: "project.imported",
+          project_id: project_id,
+          payload: %{
+            "event" => "project.imported",
+            "project_id" => project_id,
+            "merge" => true,
+            "epics_created" => epics_created,
+            "stories_created" => stories_created,
+            "stories_updated" => stories_updated,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
 
     case AdminRepo.transaction(multi) do
       {:ok, changes} ->
@@ -623,12 +642,19 @@ defmodule Loopctl.ImportExport do
     end)
   end
 
-  defp merge_epic_deps(multi, _tenant_id, epic_deps_data, _epics_data, _epic_by_number)
+  defp merge_epic_deps(
+         multi,
+         _tenant_id,
+         _project_id,
+         epic_deps_data,
+         _epics_data,
+         _epic_by_number
+       )
        when epic_deps_data == [] do
     multi
   end
 
-  defp merge_epic_deps(multi, tenant_id, epic_deps_data, epics_data, epic_by_number) do
+  defp merge_epic_deps(multi, tenant_id, project_id, epic_deps_data, epics_data, epic_by_number) do
     multi
     |> Multi.run(:merge_resolve_epic_deps, fn _repo, changes ->
       number_to_id =
@@ -639,12 +665,12 @@ defmodule Loopctl.ImportExport do
       resolve_epic_dep_references(epic_deps_data, number_to_id)
     end)
     |> Multi.run(:merge_insert_epic_deps, fn _repo, %{merge_resolve_epic_deps: resolved_deps} ->
-      insert_new_epic_deps(tenant_id, resolved_deps)
+      insert_new_epic_deps(tenant_id, project_id, resolved_deps)
     end)
   end
 
-  defp insert_new_epic_deps(tenant_id, resolved_deps) do
-    existing = load_all_epic_dependencies(tenant_id, nil)
+  defp insert_new_epic_deps(tenant_id, project_id, resolved_deps) do
+    existing = load_all_epic_dependencies(tenant_id, project_id)
 
     existing_set =
       MapSet.new(existing, fn dep -> {dep.epic_id, dep.depends_on_epic_id} end)
