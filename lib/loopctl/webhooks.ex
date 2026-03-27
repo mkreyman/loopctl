@@ -17,6 +17,8 @@ defmodule Loopctl.Webhooks do
   alias Loopctl.Audit
   alias Loopctl.Tenants
   alias Loopctl.Webhooks.Webhook
+  alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @doc """
   Creates a new webhook subscription for a tenant.
@@ -264,6 +266,163 @@ defmodule Loopctl.Webhooks do
     Webhook
     |> where([w], w.tenant_id == ^tenant_id)
     |> AdminRepo.aggregate(:count, :id)
+  end
+
+  @doc """
+  Sends a test event to a webhook endpoint.
+
+  Creates a webhook_event with event_type='webhook.test' and enqueues
+  it for delivery via the Oban worker. Works even if the webhook is
+  inactive (test events bypass the active check in the delivery worker).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `webhook_id` -- the webhook UUID
+
+  ## Returns
+
+  - `{:ok, %WebhookEvent{}}` on success
+  - `{:error, :not_found}` if webhook not found
+  """
+  @spec test_webhook(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, WebhookEvent.t()} | {:error, :not_found}
+  def test_webhook(tenant_id, webhook_id) do
+    with {:ok, webhook} <- get_webhook(tenant_id, webhook_id) do
+      now = DateTime.utc_now()
+
+      changeset =
+        %WebhookEvent{
+          tenant_id: tenant_id,
+          webhook_id: webhook.id
+        }
+        |> WebhookEvent.create_changeset(%{
+          event_type: "webhook.test",
+          payload: %{
+            "event" => "webhook.test",
+            "data" => %{
+              "message" => "This is a test event",
+              "webhook_id" => webhook.id
+            },
+            "timestamp" => DateTime.to_iso8601(now)
+          }
+        })
+
+      multi =
+        Multi.new()
+        |> Multi.insert(:event, changeset)
+        |> Multi.run(:oban_job, fn _repo, %{event: event} ->
+          job =
+            WebhookDeliveryWorker.new(%{
+              webhook_event_id: event.id,
+              tenant_id: tenant_id
+            })
+
+          Oban.insert(job)
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{event: event}} -> {:ok, event}
+      end
+    end
+  end
+
+  @doc """
+  Lists recent delivery attempts (webhook events) for a webhook.
+
+  Returns events ordered by inserted_at descending. Does NOT include
+  the full payload to reduce response size.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `webhook_id` -- the webhook UUID
+  - `opts` -- keyword list with `:page` (default 1), `:page_size` (default 25, max 100)
+
+  ## Returns
+
+  `{:ok, %{data: [%WebhookEvent{}], total: integer, page: integer, page_size: integer}}`
+  or `{:error, :not_found}` if webhook not found.
+  """
+  @spec list_deliveries(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             data: [WebhookEvent.t()],
+             total: non_neg_integer(),
+             page: pos_integer(),
+             page_size: pos_integer()
+           }}
+          | {:error, :not_found}
+  def list_deliveries(tenant_id, webhook_id, opts \\ []) do
+    with {:ok, _webhook} <- get_webhook(tenant_id, webhook_id) do
+      page = max(Keyword.get(opts, :page, 1), 1)
+      page_size = opts |> Keyword.get(:page_size, 25) |> max(1) |> min(100)
+      offset = (page - 1) * page_size
+
+      base_query =
+        WebhookEvent
+        |> where([e], e.tenant_id == ^tenant_id and e.webhook_id == ^webhook_id)
+
+      total = AdminRepo.aggregate(base_query, :count, :id)
+
+      events =
+        base_query
+        |> order_by([e], desc: e.inserted_at)
+        |> limit(^page_size)
+        |> offset(^offset)
+        |> AdminRepo.all()
+
+      {:ok, %{data: events, total: total, page: page, page_size: page_size}}
+    end
+  end
+
+  @doc """
+  Checks if a webhook should be auto-disabled based on consecutive failures.
+
+  Called by the delivery worker after exhaustion. Compares the webhook's
+  consecutive_failures against the tenant's configurable threshold.
+  If exceeded, sets active=false and logs an audit entry.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `webhook` -- the webhook struct with updated consecutive_failures
+
+  ## Returns
+
+  - `{:ok, :disabled}` if auto-disabled
+  - `{:ok, :still_active}` if under threshold
+  """
+  @spec maybe_auto_disable(Ecto.UUID.t(), Webhook.t()) ::
+          {:ok, :disabled | :still_active}
+  def maybe_auto_disable(tenant_id, webhook) do
+    with {:ok, tenant} <- Tenants.get_tenant(tenant_id) do
+      threshold =
+        Tenants.get_tenant_settings(tenant, "webhook_max_consecutive_failures", 10)
+
+      if webhook.consecutive_failures >= threshold do
+        webhook
+        |> Ecto.Changeset.change(%{active: false})
+        |> AdminRepo.update!()
+
+        Audit.create_log_entry(tenant_id, %{
+          entity_type: "webhook",
+          entity_id: webhook.id,
+          action: "webhook_auto_disabled",
+          actor_type: "system",
+          actor_id: nil,
+          actor_label: "system:auto_disable",
+          new_state: %{
+            "consecutive_failures" => webhook.consecutive_failures,
+            "threshold" => threshold
+          }
+        })
+
+        {:ok, :disabled}
+      else
+        {:ok, :still_active}
+      end
+    end
   end
 
   # --- Private helpers ---

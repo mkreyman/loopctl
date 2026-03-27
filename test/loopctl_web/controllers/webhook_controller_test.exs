@@ -242,4 +242,111 @@ defmodule LoopctlWeb.WebhookControllerTest do
       assert json_response(conn, 404)
     end
   end
+
+  # --- Test endpoint tests ---
+
+  describe "POST /api/v1/webhooks/:id/test" do
+    test "creates and enqueues a test event", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      webhook = fixture(:webhook, %{tenant_id: tenant.id})
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn_req ->
+        Req.Test.json(conn_req, %{"ok" => true})
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/webhooks/#{webhook.id}/test")
+
+      body = json_response(conn, 200)
+      assert is_binary(body["webhook_event_id"])
+      assert body["status"] == "pending"
+    end
+
+    test "works on inactive webhook", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      webhook = fixture(:webhook, %{tenant_id: tenant.id, active: false})
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn_req ->
+        Req.Test.json(conn_req, %{"ok" => true})
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/webhooks/#{webhook.id}/test")
+
+      assert json_response(conn, 200)
+    end
+
+    test "returns 404 for other tenant's webhook", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+      webhook = fixture(:webhook, %{tenant_id: tenant_b.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/webhooks/#{webhook.id}/test")
+
+      assert json_response(conn, 404)
+    end
+  end
+
+  # --- Deliveries endpoint tests ---
+
+  describe "GET /api/v1/webhooks/:id/deliveries" do
+    test "lists delivery attempts for a webhook", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      webhook = fixture(:webhook, %{tenant_id: tenant.id})
+
+      fixture(:webhook_event, %{
+        tenant_id: tenant.id,
+        webhook_id: webhook.id,
+        status: :delivered
+      })
+
+      fixture(:webhook_event, %{
+        tenant_id: tenant.id,
+        webhook_id: webhook.id,
+        status: :failed
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/webhooks/#{webhook.id}/deliveries")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+      assert body["meta"]["total_count"] == 2
+
+      # Verify payload is NOT included in response
+      delivery = List.first(body["data"])
+      refute Map.has_key?(delivery, "payload")
+      assert Map.has_key?(delivery, "id")
+      assert Map.has_key?(delivery, "event_type")
+      assert Map.has_key?(delivery, "status")
+      assert Map.has_key?(delivery, "attempts")
+    end
+
+    test "returns 404 for other tenant's webhook", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+      webhook = fixture(:webhook, %{tenant_id: tenant_b.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/webhooks/#{webhook.id}/deliveries")
+
+      assert json_response(conn, 404)
+    end
+  end
 end

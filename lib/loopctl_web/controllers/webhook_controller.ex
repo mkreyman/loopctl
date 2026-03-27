@@ -107,6 +107,61 @@ defmodule LoopctlWeb.WebhookController do
   end
 
   @doc """
+  POST /api/v1/webhooks/:id/test
+
+  Sends a test event to the webhook endpoint. Works even on inactive webhooks.
+  """
+  def test(conn, %{"id" => webhook_id}) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    case Webhooks.test_webhook(tenant_id, webhook_id) do
+      {:ok, event} ->
+        json(conn, %{
+          webhook_event_id: event.id,
+          status: "pending",
+          message: "Test event created and enqueued for delivery"
+        })
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
+  GET /api/v1/webhooks/:id/deliveries
+
+  Lists recent delivery attempts for a webhook.
+  """
+  def deliveries(conn, %{"id" => webhook_id} = params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    opts = [
+      page: parse_int(params["page"]),
+      page_size: parse_int(params["page_size"])
+    ]
+
+    opts = Enum.reject(opts, fn {_k, v} -> is_nil(v) end)
+
+    case Webhooks.list_deliveries(tenant_id, webhook_id, opts) do
+      {:ok, result} ->
+        json(conn, %{
+          data: Enum.map(result.data, &delivery_json/1),
+          meta: %{
+            page: result.page,
+            page_size: result.page_size,
+            total_count: result.total,
+            total_pages: ceil_div(result.total, result.page_size)
+          }
+        })
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+    end
+  end
+
+  @doc """
   DELETE /api/v1/webhooks/:id
 
   Deletes a webhook and all its pending events.
@@ -140,6 +195,18 @@ defmodule LoopctlWeb.WebhookController do
       last_delivery_at: webhook.last_delivery_at,
       inserted_at: webhook.inserted_at,
       updated_at: webhook.updated_at
+    }
+  end
+
+  defp delivery_json(event) do
+    %{
+      id: event.id,
+      event_type: event.event_type,
+      status: event.status,
+      attempts: event.attempts,
+      delivered_at: event.delivered_at,
+      error: event.error,
+      inserted_at: event.inserted_at
     }
   end
 

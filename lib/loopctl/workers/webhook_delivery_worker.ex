@@ -24,6 +24,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.Signing
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -163,9 +164,13 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
     # Increment consecutive failures
     new_failures = webhook.consecutive_failures + 1
 
-    webhook
-    |> Ecto.Changeset.change(%{consecutive_failures: new_failures})
-    |> AdminRepo.update!()
+    updated_webhook =
+      webhook
+      |> Ecto.Changeset.change(%{consecutive_failures: new_failures})
+      |> AdminRepo.update!()
+
+    # Check auto-disable threshold
+    Webhooks.maybe_auto_disable(webhook.tenant_id, updated_webhook)
   end
 
   defp mark_deactivated(event) do
