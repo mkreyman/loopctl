@@ -10,6 +10,7 @@ defmodule Loopctl.MixProject do
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      escript: escript(),
       releases: releases(),
       listeners: [Phoenix.CodeReloader],
       dialyzer: [
@@ -30,6 +31,13 @@ defmodule Loopctl.MixProject do
   def cli do
     [
       preferred_envs: [precommit: :test]
+    ]
+  end
+
+  defp escript do
+    [
+      main_module: Loopctl.CLI.Main,
+      name: :loopctl
     ]
   end
 

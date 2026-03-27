@@ -17,6 +17,9 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Auth
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
+  alias Loopctl.Skills.Skill
+  alias Loopctl.Skills.SkillResult
+  alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -194,6 +197,43 @@ defmodule Loopctl.Fixtures do
       %{
         name: "test-key-#{System.unique_integer([:positive])}",
         role: :user
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:skill, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        name: "test-skill-#{seq}",
+        description: "A test skill",
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:skill_version, attrs) do
+    Map.merge(
+      %{
+        prompt_text: "Test prompt text for skill version",
+        changelog: "Initial version",
+        created_by: "test"
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:skill_result, attrs) do
+    Map.merge(
+      %{
+        metrics: %{
+          "findings_count" => 5,
+          "false_positive_count" => 1,
+          "true_positive_count" => 4
+        }
       },
       Enum.into(attrs, %{})
     )
@@ -657,6 +697,87 @@ defmodule Loopctl.Fixtures do
     else
       state
     end
+  end
+
+  def fixture(:skill, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    project_id = Map.get(attrs, :project_id)
+    prompt_text = Map.get(attrs, :prompt_text, "Default skill prompt text")
+    data = build(:skill, attrs)
+
+    changeset =
+      %Skill{tenant_id: tenant_id, project_id: project_id}
+      |> Skill.create_changeset(data)
+
+    skill = AdminRepo.insert!(changeset)
+
+    # Create v1 version
+    version_changeset =
+      %SkillVersion{
+        tenant_id: tenant_id,
+        skill_id: skill.id,
+        version: 1
+      }
+      |> SkillVersion.create_changeset(%{
+        prompt_text: prompt_text,
+        created_by: "fixture",
+        changelog: "Initial version"
+      })
+
+    AdminRepo.insert!(version_changeset)
+
+    skill
+  end
+
+  def fixture(:skill_version, attrs) do
+    attrs = Enum.into(attrs, %{})
+    skill_id = Map.fetch!(attrs, :skill_id)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    version = Map.fetch!(attrs, :version)
+
+    data = build(:skill_version, attrs)
+
+    changeset =
+      %SkillVersion{
+        tenant_id: tenant_id,
+        skill_id: skill_id,
+        version: version
+      }
+      |> SkillVersion.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:skill_result, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    skill_version_id = Map.fetch!(attrs, :skill_version_id)
+    verification_result_id = Map.fetch!(attrs, :verification_result_id)
+    story_id = Map.fetch!(attrs, :story_id)
+
+    data = build(:skill_result, attrs)
+
+    changeset =
+      %SkillResult{
+        tenant_id: tenant_id,
+        skill_version_id: skill_version_id,
+        verification_result_id: verification_result_id,
+        story_id: story_id
+      }
+      |> SkillResult.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
   end
 
   @doc """

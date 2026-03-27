@@ -82,6 +82,11 @@ defmodule Loopctl.DataCase do
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
       Req.Test.json(conn, %{"ok" => true})
     end)
+
+    # Default Req.Test stub for CLI HTTP client
+    Req.Test.stub(Loopctl.CLI.Client, fn conn ->
+      Req.Test.json(conn, %{"error" => "not stubbed"})
+    end)
   end
 
   @doc """
