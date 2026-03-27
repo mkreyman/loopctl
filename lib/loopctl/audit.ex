@@ -220,6 +220,11 @@ defmodule Loopctl.Audit do
 
   Used by the story history shortcut endpoint and similar entity history views.
 
+  Currently returns only direct audit entries for the given entity. It does
+  not include entries for related entities (e.g., artifact_reports or
+  verification_results referencing a story_id). Cross-entity history
+  requires schemas from Epics 6-8.
+
   ## Options
 
   - `:page` — page number (default 1)
@@ -238,6 +243,9 @@ defmodule Loopctl.Audit do
     page_size = opts |> Keyword.get(:page_size, 100) |> max(1) |> min(100)
     offset = (page - 1) * page_size
 
+    # NOTE(Epics 6-8): When artifact_reports and verification_results
+    # schemas with story_id references are added, extend this query to
+    # include related entity entries via UNION or OR-based entity_id matching.
     base_query =
       AuditLog
       |> where([a], a.tenant_id == ^tenant_id)

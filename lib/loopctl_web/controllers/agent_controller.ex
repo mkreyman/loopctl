@@ -13,7 +13,7 @@ defmodule LoopctlWeb.AgentController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:register]
+  plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:register]
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:index, :show]
 
   @doc """
@@ -24,27 +24,33 @@ defmodule LoopctlWeb.AgentController do
   """
   def register(conn, params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
 
-    attrs = %{
-      name: params["name"],
-      agent_type: safe_to_agent_type(params["agent_type"]),
-      metadata: params["metadata"] || %{}
-    }
+    if api_key.agent_id do
+      {:error, :conflict}
+    else
+      tenant_id = api_key.tenant_id
 
-    actor_label = "agent:#{params["name"] || "unknown"}"
+      attrs = %{
+        name: params["name"],
+        agent_type: safe_to_agent_type(params["agent_type"]),
+        metadata: params["metadata"] || %{}
+      }
 
-    case Agents.register_agent(tenant_id, attrs,
-           actor_id: api_key.id,
-           actor_label: actor_label
-         ) do
-      {:ok, agent} ->
-        conn
-        |> put_status(:created)
-        |> json(%{agent: agent_json(agent)})
+      actor_label = "agent:#{params["name"] || "unknown"}"
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      case Agents.register_agent(tenant_id, attrs,
+             api_key_id: api_key.id,
+             actor_id: api_key.id,
+             actor_label: actor_label
+           ) do
+        {:ok, agent} ->
+          conn
+          |> put_status(:created)
+          |> json(%{agent: agent_json(agent)})
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+      end
     end
   end
 
@@ -59,8 +65,9 @@ defmodule LoopctlWeb.AgentController do
 
     opts =
       []
-      |> maybe_add_filter(:agent_type, safe_to_agent_type(params["type"]))
+      |> maybe_add_filter(:agent_type, safe_to_agent_type(params["agent_type"]))
       |> maybe_add_filter(:status, safe_to_status(params["status"]))
+      |> maybe_add_filter(:sort_by, params["sort_by"])
       |> maybe_add_filter(:page, parse_int(params["page"]))
       |> maybe_add_filter(:page_size, parse_int(params["page_size"]))
 

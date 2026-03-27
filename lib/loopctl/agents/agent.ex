@@ -59,6 +59,7 @@ defmodule Loopctl.Agents.Agent do
     |> validate_inclusion(:agent_type, @agent_types)
     |> validate_length(:name, min: 1, max: 255)
     |> validate_metadata()
+    |> put_change(:last_seen_at, DateTime.utc_now())
     |> unique_constraint([:tenant_id, :name],
       message: "has already been taken for this tenant"
     )

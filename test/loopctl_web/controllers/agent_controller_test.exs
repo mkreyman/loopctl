@@ -50,10 +50,11 @@ defmodule LoopctlWeb.AgentControllerTest do
 
     test "rejects duplicate name within tenant", %{conn: conn} do
       tenant = fixture(:tenant)
-      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {raw_key_1, _api_key_1} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {raw_key_2, _api_key_2} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
       conn
-      |> auth_conn(raw_key)
+      |> auth_conn(raw_key_1)
       |> post(~p"/api/v1/agents/register", %{
         "name" => "worker-1",
         "agent_type" => "implementer"
@@ -61,7 +62,7 @@ defmodule LoopctlWeb.AgentControllerTest do
 
       conn2 =
         build_conn()
-        |> auth_conn(raw_key)
+        |> auth_conn(raw_key_2)
         |> post(~p"/api/v1/agents/register", %{
           "name" => "worker-1",
           "agent_type" => "implementer"
@@ -82,7 +83,7 @@ defmodule LoopctlWeb.AgentControllerTest do
       assert json_response(conn, 422)
     end
 
-    test "requires agent role", %{conn: conn} do
+    test "rejects non-agent roles (user)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
@@ -94,14 +95,11 @@ defmodule LoopctlWeb.AgentControllerTest do
           "agent_type" => "implementer"
         })
 
-      # user role should have access since agent is the minimum, and user > agent
-      # Actually, the RequireRole with role: :agent means ANY role >= agent can access
-      # user (3) >= agent (1), so user CAN access this endpoint
-      body = json_response(conn, 201)
-      assert body["agent"]["name"] == "worker-1"
+      # exact_role: :agent means only agent keys can register, not user/orchestrator
+      assert json_response(conn, 403)
     end
 
-    test "orchestrator role can also register", %{conn: conn} do
+    test "rejects non-agent roles (orchestrator)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -113,8 +111,31 @@ defmodule LoopctlWeb.AgentControllerTest do
           "agent_type" => "orchestrator"
         })
 
-      body = json_response(conn, 201)
-      assert body["agent"]["name"] == "orch-agent"
+      assert json_response(conn, 403)
+    end
+
+    test "returns 409 when API key already has an agent", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # First registration should succeed
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/agents/register", %{
+        "name" => "first-agent",
+        "agent_type" => "implementer"
+      })
+
+      # Second registration with same key should return 409
+      conn2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/agents/register", %{
+          "name" => "second-agent",
+          "agent_type" => "implementer"
+        })
+
+      assert json_response(conn2, 409)
     end
   end
 
@@ -139,7 +160,7 @@ defmodule LoopctlWeb.AgentControllerTest do
       fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: "orch"})
       fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: "impl"})
 
-      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/agents?type=orchestrator")
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/agents?agent_type=orchestrator")
 
       body = json_response(conn, 200)
       assert length(body["agents"]) == 1
@@ -179,6 +200,21 @@ defmodule LoopctlWeb.AgentControllerTest do
       assert body["total"] == 5
       assert body["page"] == 1
       assert body["page_size"] == 2
+    end
+
+    test "sorts by sort_by parameter", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: "beta"})
+      fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: "alpha"})
+
+      conn =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/agents?sort_by=agent_type")
+
+      body = json_response(conn, 200)
+      types = Enum.map(body["agents"], & &1["agent_type"])
+      # implementer < orchestrator alphabetically
+      assert types == ["implementer", "orchestrator"]
     end
 
     test "requires orchestrator+ role", %{conn: conn} do

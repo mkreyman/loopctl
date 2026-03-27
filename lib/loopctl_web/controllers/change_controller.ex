@@ -26,11 +26,14 @@ defmodule LoopctlWeb.ChangeController do
     with {:ok, since} <- parse_since(params["since"]) do
       tenant_id = conn.assigns.current_tenant.id
 
+      limit = parse_limit(params["limit"])
+
       opts =
         []
         |> maybe_put(:project_id, params["project_id"])
         |> maybe_put(:entity_type, params["entity_type"])
         |> maybe_put(:action, params["action"])
+        |> maybe_put(:limit, limit)
 
       {:ok, result} = Audit.list_changes(tenant_id, since, opts)
 
@@ -75,6 +78,18 @@ defmodule LoopctlWeb.ChangeController do
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, _key, ""), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp parse_limit(nil), do: nil
+
+  defp parse_limit(val) when is_binary(val) do
+    case Integer.parse(val) do
+      {n, _} when n > 0 -> n
+      _ -> nil
+    end
+  end
+
+  defp parse_limit(val) when is_integer(val) and val > 0, do: val
+  defp parse_limit(_), do: nil
 
   defp format_datetime(nil), do: nil
   defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)

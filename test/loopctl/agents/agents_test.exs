@@ -27,7 +27,7 @@ defmodule Loopctl.AgentsTest do
       assert agent.status == :active
       assert agent.tenant_id == tenant.id
       assert agent.metadata == %{"lang" => "elixir"}
-      assert is_nil(agent.last_seen_at)
+      assert %DateTime{} = agent.last_seen_at
     end
 
     test "registers orchestrator agent" do
@@ -248,6 +248,28 @@ defmodule Loopctl.AgentsTest do
 
       names = Enum.map(result.data, & &1.name)
       assert names == ["alpha-agent", "zeta-agent"]
+    end
+
+    test "sorts by specified field" do
+      tenant = fixture(:tenant)
+      fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator, name: "beta"})
+      fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer, name: "alpha"})
+
+      {:ok, result} = Agents.list_agents(tenant.id, sort_by: "agent_type")
+
+      types = Enum.map(result.data, & &1.agent_type)
+      assert types == [:implementer, :orchestrator]
+    end
+
+    test "falls back to name for invalid sort_by" do
+      tenant = fixture(:tenant)
+      fixture(:agent, %{tenant_id: tenant.id, name: "zeta"})
+      fixture(:agent, %{tenant_id: tenant.id, name: "alpha"})
+
+      {:ok, result} = Agents.list_agents(tenant.id, sort_by: "invalid_field")
+
+      names = Enum.map(result.data, & &1.name)
+      assert names == ["alpha", "zeta"]
     end
   end
 

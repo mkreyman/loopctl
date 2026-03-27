@@ -24,14 +24,16 @@ defmodule Loopctl.Agents do
   @doc """
   Registers a new agent within a tenant.
 
-  Creates the agent record and logs an audit entry atomically via
-  `Ecto.Multi`. The `tenant_id` is set on the struct, not via cast.
+  Creates the agent record, links the API key to the agent, and logs
+  an audit entry atomically via `Ecto.Multi`. The `tenant_id` is set
+  on the struct, not via cast.
 
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `attrs` -- map with `:name`, `:agent_type`, and optional `:metadata`
   - `opts` -- keyword list with:
+    - `:api_key_id` -- UUID of the API key to link to the new agent
     - `:actor_id` -- UUID of the API key performing the action
     - `:actor_label` -- human-readable label (e.g., "agent:worker-1")
 
@@ -43,6 +45,7 @@ defmodule Loopctl.Agents do
   @spec register_agent(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Agent.t()} | {:error, Ecto.Changeset.t()}
   def register_agent(tenant_id, attrs, opts \\ []) do
+    api_key_id = Keyword.get(opts, :api_key_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
@@ -53,6 +56,7 @@ defmodule Loopctl.Agents do
     multi =
       Multi.new()
       |> Multi.insert(:agent, changeset)
+      |> maybe_link_api_key(api_key_id)
       |> Audit.log_in_multi(:audit, fn %{agent: agent} ->
         %{
           tenant_id: tenant_id,
@@ -144,6 +148,8 @@ defmodule Loopctl.Agents do
     end
   end
 
+  @allowed_sort_fields ~w(name agent_type status last_seen_at inserted_at)
+
   @doc """
   Lists agents for a tenant with optional filters and page-based pagination.
 
@@ -151,6 +157,7 @@ defmodule Loopctl.Agents do
 
   - `:agent_type` -- filter by agent type (`:orchestrator` or `:implementer`)
   - `:status` -- filter by status (`:active`, `:idle`, `:deactivated`)
+  - `:sort_by` -- sort field, one of #{inspect(@allowed_sort_fields)} (default "name")
   - `:page` -- page number (default 1)
   - `:page_size` -- agents per page (default 20, max 100)
 
@@ -169,6 +176,7 @@ defmodule Loopctl.Agents do
   def list_agents(tenant_id, opts \\ []) do
     page = max(Keyword.get(opts, :page, 1), 1)
     page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
+    sort_field = resolve_sort_field(Keyword.get(opts, :sort_by, "name"))
     offset = (page - 1) * page_size
 
     base_query =
@@ -180,7 +188,7 @@ defmodule Loopctl.Agents do
 
     agents =
       base_query
-      |> order_by([a], asc: a.name)
+      |> order_by([a], asc: field(a, ^sort_field))
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -201,4 +209,19 @@ defmodule Loopctl.Agents do
 
   defp filter_by_status(query, nil), do: query
   defp filter_by_status(query, status), do: where(query, [a], a.status == ^status)
+
+  defp resolve_sort_field(field) when field in @allowed_sort_fields do
+    String.to_existing_atom(field)
+  end
+
+  defp resolve_sort_field(_), do: :name
+
+  defp maybe_link_api_key(multi, nil), do: multi
+
+  defp maybe_link_api_key(multi, api_key_id) do
+    Multi.update(multi, :link_api_key, fn %{agent: agent} ->
+      api_key = AdminRepo.get!(Loopctl.Auth.ApiKey, api_key_id)
+      Ecto.Changeset.change(api_key, %{agent_id: agent.id})
+    end)
+  end
 end

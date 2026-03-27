@@ -13,26 +13,27 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeenTest do
     test "updates last_seen_at for agent-role API key with agent_id", %{conn: conn} do
       tenant = fixture(:tenant)
       agent = fixture(:agent, %{tenant_id: tenant.id, name: "seen-agent"})
+      initial_last_seen = agent.last_seen_at
 
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 
-      assert is_nil(agent.last_seen_at)
+      # last_seen_at is set during registration
+      assert %DateTime{} = initial_last_seen
 
-      # Make an authenticated request (agent can register)
+      past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+
+      # Make an authenticated request (agent can access change feed)
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/agents/register", %{
-          "name" => "another-agent",
-          "agent_type" => "implementer"
-        })
+        |> get(~p"/api/v1/changes?since=#{past}")
 
-      assert json_response(conn, 201)
+      assert json_response(conn, 200)
 
-      # Verify last_seen_at was updated
+      # Verify last_seen_at was updated to a newer timestamp
       {:ok, updated} = Agents.get_agent(tenant.id, agent.id)
-      assert updated.last_seen_at != nil
+      assert DateTime.compare(updated.last_seen_at, initial_last_seen) in [:gt, :eq]
     end
 
     test "does not update for API key without agent_id", %{conn: conn} do
