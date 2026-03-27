@@ -54,6 +54,11 @@ defmodule LoopctlWeb.Router do
     get "/stories/ready", DependencyGraphController, :ready
     get "/stories/blocked", DependencyGraphController, :blocked
 
+    # Bulk operations (Epic 13) — must be before stories/:id to avoid route conflicts
+    post "/stories/bulk/claim", BulkOperationsController, :claim
+    post "/stories/bulk/verify", BulkOperationsController, :verify
+    post "/stories/bulk/reject", BulkOperationsController, :reject
+
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
@@ -82,6 +87,10 @@ defmodule LoopctlWeb.Router do
     # Project management
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
+
+    # Import/Export (Epic 12)
+    post "/projects/:id/import", ImportExportController, :import_project
+    get "/projects/:id/export", ImportExportController, :export_project
 
     # Epic management
     get "/projects/:project_id/epics", EpicController, :index
