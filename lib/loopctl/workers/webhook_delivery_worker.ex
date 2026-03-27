@@ -24,6 +24,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Webhooks.Signing
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
 
@@ -65,11 +66,11 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   end
 
   defp attempt_delivery(event, webhook) do
-    # Build the delivery payload
+    # Build and size-limit the delivery payload
     payload = build_delivery_payload(event)
-    json_body = Jason.encode!(payload)
+    json_body = Signing.prepare_payload(payload)
 
-    # Build headers (signing added in US-10.4)
+    # Build headers with HMAC-SHA256 signature
     headers = build_headers(event, webhook, json_body)
 
     case @delivery_client.deliver(webhook.url, json_body, headers) do
@@ -95,7 +96,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
     timestamp = System.system_time(:second)
     signing_secret = webhook.signing_secret_encrypted
 
-    signature = compute_signature(json_body, signing_secret)
+    signature = Signing.sign_payload(json_body, signing_secret)
 
     [
       {"content-type", "application/json"},
@@ -104,14 +105,6 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
       {"x-webhook-timestamp", to_string(timestamp)},
       {"x-signature-256", signature}
     ]
-  end
-
-  defp compute_signature(body, secret) do
-    hmac =
-      :crypto.mac(:hmac, :sha256, secret, body)
-      |> Base.encode16(case: :lower)
-
-    "sha256=#{hmac}"
   end
 
   defp mark_delivered(event, webhook) do
