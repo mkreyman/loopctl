@@ -18,6 +18,7 @@ defmodule Loopctl.Artifacts do
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Webhooks.EventGenerator
 
   # --- Artifact Reports ---
 
@@ -75,6 +76,22 @@ defmodule Loopctl.Artifacts do
             "exists" => report.exists,
             "reported_by" => to_string(report.reported_by),
             "reporter_agent_id" => agent_id
+          }
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{artifact_report: report} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "artifact.reported",
+          payload: %{
+            "event" => "artifact.reported",
+            "artifact_report_id" => report.id,
+            "story_id" => story_id,
+            "artifact_type" => report.artifact_type,
+            "path" => report.path,
+            "reported_by" => to_string(report.reported_by),
+            "reporter_agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
         }
       end)
