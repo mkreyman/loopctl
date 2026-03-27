@@ -155,4 +155,171 @@ defmodule LoopctlWeb.ImpersonationIntegrationTest do
       assert json_response(conn, 200)
     end
   end
+
+  describe "impersonation across resource types" do
+    setup %{conn: conn} do
+      {raw_key, _sa_key} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{name: "Impersonation Target"})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      webhook = fixture(:webhook, %{tenant_id: tenant.id})
+
+      base_conn =
+        conn
+        |> auth_conn(raw_key)
+        |> impersonate_conn(tenant.id)
+
+      {:ok,
+       sa_conn: base_conn,
+       tenant: tenant,
+       project: project,
+       epic: epic,
+       story: story,
+       agent: agent,
+       webhook: webhook}
+    end
+
+    test "superadmin can list epics via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/projects/#{ctx.project.id}/epics")
+
+      body = json_response(conn, 200)
+      assert is_list(body["data"])
+      assert body["data"] != []
+    end
+
+    test "superadmin can get epic detail via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/epics/#{ctx.epic.id}")
+
+      body = json_response(conn, 200)
+      assert body["epic"]["id"] == ctx.epic.id
+    end
+
+    test "superadmin can list stories via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/epics/#{ctx.epic.id}/stories")
+
+      body = json_response(conn, 200)
+      assert is_list(body["data"])
+      assert body["data"] != []
+    end
+
+    test "superadmin can get story detail via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/stories/#{ctx.story.id}")
+
+      body = json_response(conn, 200)
+      assert body["story"]["id"] == ctx.story.id
+    end
+
+    test "superadmin can list agents via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/agents")
+
+      body = json_response(conn, 200)
+      assert is_list(body["agents"])
+      ids = Enum.map(body["agents"], & &1["id"])
+      assert ctx.agent.id in ids
+    end
+
+    test "superadmin can get agent detail via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/agents/#{ctx.agent.id}")
+
+      body = json_response(conn, 200)
+      assert body["agent"]["id"] == ctx.agent.id
+    end
+
+    test "superadmin can list webhooks via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/webhooks")
+
+      body = json_response(conn, 200)
+      assert is_list(body["data"])
+      ids = Enum.map(body["data"], & &1["id"])
+      assert ctx.webhook.id in ids
+    end
+
+    test "superadmin can save orchestrator state via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> effective_role_conn("orchestrator")
+        |> put(~p"/api/v1/orchestrator/state/#{ctx.project.id}", %{
+          "state_key" => "main",
+          "state_data" => %{"phase" => "testing"}
+        })
+
+      body = json_response(conn, 200)
+      assert body["state"]["state_key"] == "main"
+    end
+
+    test "superadmin can read orchestrator state via impersonation", ctx do
+      # First save state
+      ctx.sa_conn
+      |> effective_role_conn("orchestrator")
+      |> put(~p"/api/v1/orchestrator/state/#{ctx.project.id}", %{
+        "state_key" => "main",
+        "state_data" => %{"phase" => "read-test"}
+      })
+      |> json_response(200)
+
+      conn =
+        ctx.sa_conn
+        |> effective_role_conn("orchestrator")
+        |> get(~p"/api/v1/orchestrator/state/#{ctx.project.id}")
+
+      body = json_response(conn, 200)
+      assert body["state"]["state_data"]["phase"] == "read-test"
+    end
+
+    test "superadmin can list dependency graph via impersonation", ctx do
+      conn =
+        ctx.sa_conn
+        |> get(~p"/api/v1/projects/#{ctx.project.id}/dependency_graph")
+
+      body = json_response(conn, 200)
+      assert Map.has_key?(body, "graph")
+    end
+  end
+
+  describe "admin routes are not affected by impersonation" do
+    test "impersonation header is ignored on admin routes", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{name: "Targeted Tenant"})
+
+      # Even with impersonation header, admin list-tenants should work normally
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> impersonate_conn(tenant.id)
+        |> get(~p"/api/v1/admin/tenants")
+
+      body = json_response(conn, 200)
+      assert is_list(body["data"])
+    end
+
+    test "admin tenant detail works with impersonation header present", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant, %{name: "Admin Detail Tenant"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> impersonate_conn(tenant.id)
+        |> get(~p"/api/v1/admin/tenants/#{tenant.id}")
+
+      body = json_response(conn, 200)
+      assert body["tenant"]["name"] == "Admin Detail Tenant"
+    end
+  end
 end

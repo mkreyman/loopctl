@@ -152,6 +152,48 @@ defmodule Loopctl.TenantsTest do
     end
   end
 
+  describe "list_tenants_admin/1" do
+    test "search escapes LIKE metacharacters" do
+      # Create tenants with names containing LIKE special characters
+      fixture(:tenant, %{name: "100% Complete"})
+      fixture(:tenant, %{name: "Just Normal"})
+
+      # Searching for "100%" should only match the tenant with "100%" in the name,
+      # not match all tenants (which would happen if % is not escaped)
+      {:ok, result} = Tenants.list_tenants_admin(search: "100%")
+      names = Enum.map(result.data, & &1.tenant.name)
+      assert "100% Complete" in names
+      refute "Just Normal" in names
+    end
+
+    test "search escapes underscore metacharacter" do
+      fixture(:tenant, %{name: "a_b_c Corp"})
+      fixture(:tenant, %{name: "axbxc Corp"})
+
+      # Searching for "a_b" should only match literal underscores, not any character
+      {:ok, result} = Tenants.list_tenants_admin(search: "a_b")
+      names = Enum.map(result.data, & &1.tenant.name)
+      assert "a_b_c Corp" in names
+      refute "axbxc Corp" in names
+    end
+
+    test "returns stats via subqueries (N+1 eliminated)" do
+      tenant = fixture(:tenant, %{name: "Stats Tenant"})
+      fixture(:project, %{tenant_id: tenant.id})
+      fixture(:project, %{tenant_id: tenant.id})
+      fixture(:agent, %{tenant_id: tenant.id})
+
+      {:ok, result} = Tenants.list_tenants_admin(search: "Stats Tenant")
+      assert length(result.data) == 1
+
+      entry = hd(result.data)
+      assert entry.project_count == 2
+      assert entry.agent_count == 1
+      assert entry.story_count == 0
+      assert entry.epic_count == 0
+    end
+  end
+
   describe "get_tenant_settings/3" do
     test "returns setting value when present" do
       tenant = fixture(:tenant, %{settings: %{"max_projects" => 10}})

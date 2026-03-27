@@ -45,6 +45,8 @@ defmodule LoopctlWeb.Plugs.ImpersonateTest do
       assert result.assigns.current_tenant.id == tenant.id
       assert result.assigns.superadmin_api_key.id == api_key.id
       assert result.assigns.impersonated_tenant_id == tenant.id
+      # F1 fix: current_api_key.tenant_id is updated to impersonated tenant
+      assert result.assigns.current_api_key.tenant_id == tenant.id
     end
 
     test "silently ignores header for non-superadmin keys", %{conn: conn} do
@@ -129,6 +131,23 @@ defmodule LoopctlWeb.Plugs.ImpersonateTest do
         |> Impersonate.call([])
 
       assert result.assigns.effective_role == nil
+      assert result.assigns.current_api_key.role == :superadmin
+    end
+
+    test "skips impersonation on admin routes", %{conn: conn} do
+      {raw_key, api_key} = fixture(:api_key, %{role: :superadmin})
+      tenant = fixture(:tenant)
+
+      result =
+        conn
+        |> Map.put(:path_info, ["api", "v1", "admin", "tenants"])
+        |> impersonate_conn(tenant.id)
+        |> resolve_and_auth(raw_key)
+        |> Impersonate.call([])
+
+      # Should NOT be impersonating — admin route skips impersonation
+      refute Map.get(result.assigns, :impersonating)
+      assert result.assigns.current_api_key.id == api_key.id
       assert result.assigns.current_api_key.role == :superadmin
     end
   end

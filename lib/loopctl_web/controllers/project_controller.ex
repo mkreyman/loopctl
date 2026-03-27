@@ -26,7 +26,7 @@ defmodule LoopctlWeb.ProjectController do
   Creates a new project. Requires user+ role.
   """
   def create(conn, params) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
     attrs = %{
@@ -59,7 +59,7 @@ defmodule LoopctlWeb.ProjectController do
   Supports pagination via ?page=N&page_size=M.
   """
   def index(conn, params) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
 
     opts =
       []
@@ -88,7 +88,7 @@ defmodule LoopctlWeb.ProjectController do
   Returns epic_count and story_count aggregates (zeroed until Epic 6).
   """
   def show(conn, %{"id" => project_id}) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
 
     case Projects.get_project(tenant_id, project_id) do
       {:ok, project} ->
@@ -112,7 +112,7 @@ defmodule LoopctlWeb.ProjectController do
   Updates a project. Requires user+ role. Slug cannot be changed.
   """
   def update(conn, %{"id" => project_id} = params) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, project} <- Projects.get_project(tenant_id, project_id) do
@@ -144,7 +144,7 @@ defmodule LoopctlWeb.ProjectController do
   Archives a project (soft delete). Requires user+ role.
   """
   def delete(conn, %{"id" => project_id}) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, project} <- Projects.get_project(tenant_id, project_id) do
@@ -164,7 +164,7 @@ defmodule LoopctlWeb.ProjectController do
   Returns progress summary for a project. Requires agent+ role.
   """
   def progress(conn, %{"id" => project_id}) do
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = conn.assigns.current_api_key.tenant_id
 
     case Projects.get_project_progress(tenant_id, project_id) do
       {:ok, progress} ->
@@ -223,7 +223,4 @@ defmodule LoopctlWeb.ProjectController do
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
-
-  defp resolve_tenant_id(%{assigns: %{impersonated_tenant_id: id}}), do: id
-  defp resolve_tenant_id(%{assigns: %{current_api_key: %{tenant_id: id}}}), do: id
 end

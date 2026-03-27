@@ -14,6 +14,7 @@ defmodule LoopctlWeb.EpicController do
 
   alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Epics
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -28,6 +29,7 @@ defmodule LoopctlWeb.EpicController do
   def create(conn, %{"project_id" => project_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
       attrs = %{
@@ -40,10 +42,7 @@ defmodule LoopctlWeb.EpicController do
         metadata: params["metadata"] || %{}
       }
 
-      case Epics.create_epic(tenant_id, attrs,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      case Epics.create_epic(tenant_id, attrs, audit_opts) do
         {:ok, epic} ->
           conn
           |> put_status(:created)
@@ -111,6 +110,7 @@ defmodule LoopctlWeb.EpicController do
   def update(conn, %{"id" => epic_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, epic} <- Epics.get_epic(tenant_id, epic_id) do
       attrs = %{
@@ -124,10 +124,7 @@ defmodule LoopctlWeb.EpicController do
       # Remove nil values so we only update provided fields
       attrs = Map.reject(attrs, fn {_k, v} -> is_nil(v) end)
 
-      case Epics.update_epic(tenant_id, epic, attrs,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      case Epics.update_epic(tenant_id, epic, attrs, audit_opts) do
         {:ok, updated} ->
           json(conn, %{epic: epic_json(updated)})
 
@@ -145,12 +142,10 @@ defmodule LoopctlWeb.EpicController do
   def delete(conn, %{"id" => epic_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
     with {:ok, epic} <- Epics.get_epic(tenant_id, epic_id) do
-      case Epics.delete_epic(tenant_id, epic,
-             actor_id: api_key.id,
-             actor_label: "user:#{api_key.name}"
-           ) do
+      case Epics.delete_epic(tenant_id, epic, audit_opts) do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 

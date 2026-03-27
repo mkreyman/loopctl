@@ -10,13 +10,12 @@ defmodule LoopctlWeb.StoryStatusController do
   - POST /stories/:id/unclaim -- release story (any -> pending)
 
   All endpoints require exact_role: :agent.
-
-  TODO: Superadmin access via impersonation with X-Effective-Role header (US-11.2)
   """
 
   use LoopctlWeb, :controller
 
   alias Loopctl.Progress
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -31,13 +30,10 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def contract(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
 
-    case Progress.contract_story(tenant_id, story_id, params,
-           agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "agent:#{api_key.name}"
-         ) do
+    case Progress.contract_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -62,13 +58,10 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def claim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
 
-    case Progress.claim_story(tenant_id, story_id,
-           agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "agent:#{api_key.name}"
-         ) do
+    case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -87,13 +80,10 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def start(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
 
-    case Progress.start_story(tenant_id, story_id,
-           agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "agent:#{api_key.name}"
-         ) do
+    case Progress.start_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -115,19 +105,11 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def report(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
     artifact_params = extract_artifact_params(params)
 
-    case Progress.report_story(
-           tenant_id,
-           story_id,
-           [
-             agent_id: api_key.agent_id,
-             actor_id: api_key.id,
-             actor_label: "agent:#{api_key.name}"
-           ],
-           artifact_params
-         ) do
+    case Progress.report_story(tenant_id, story_id, opts, artifact_params) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -149,13 +131,10 @@ defmodule LoopctlWeb.StoryStatusController do
   """
   def unclaim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = resolve_tenant_id(conn)
+    tenant_id = api_key.tenant_id
+    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
 
-    case Progress.unclaim_story(tenant_id, story_id,
-           agent_id: api_key.agent_id,
-           actor_id: api_key.id,
-           actor_label: "agent:#{api_key.name}"
-         ) do
+    case Progress.unclaim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         json(conn, %{story: story})
 
@@ -182,7 +161,4 @@ defmodule LoopctlWeb.StoryStatusController do
   end
 
   defp extract_artifact_params(_), do: nil
-
-  defp resolve_tenant_id(%{assigns: %{impersonated_tenant_id: id}}), do: id
-  defp resolve_tenant_id(%{assigns: %{current_api_key: %{tenant_id: id}}}), do: id
 end

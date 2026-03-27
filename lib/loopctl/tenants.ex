@@ -357,13 +357,20 @@ defmodule Loopctl.Tenants do
 
   defp apply_search_filter(query, search) do
     import Ecto.Query
-    pattern = "%#{search}%"
+    pattern = "%#{escape_like(search)}%"
 
     where(
       query,
       [t],
       ilike(t.name, ^pattern) or ilike(t.slug, ^pattern)
     )
+  end
+
+  defp escape_like(str) do
+    str
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   defp tenant_with_stats(%Tenant{} = tenant) do
@@ -375,37 +382,32 @@ defmodule Loopctl.Tenants do
     alias Loopctl.WorkBreakdown.Epic
     alias Loopctl.WorkBreakdown.Story
 
-    project_count =
-      from(p in Project, where: p.tenant_id == ^tenant.id, select: count(p.id))
-      |> AdminRepo.one()
+    tid = tenant.id
 
-    story_count =
-      from(s in Story, where: s.tenant_id == ^tenant.id, select: count(s.id))
-      |> AdminRepo.one()
-
-    epic_count =
-      from(e in Epic, where: e.tenant_id == ^tenant.id, select: count(e.id))
-      |> AdminRepo.one()
-
-    agent_count =
-      from(a in Agent, where: a.tenant_id == ^tenant.id, select: count(a.id))
-      |> AdminRepo.one()
-
-    api_key_count =
-      from(ak in ApiKey,
-        where: ak.tenant_id == ^tenant.id and is_nil(ak.revoked_at),
-        select: count(ak.id)
+    # Single query with subqueries instead of 5 individual queries
+    stats =
+      from(t in Tenant,
+        where: t.id == ^tid,
+        select: %{
+          project_count:
+            subquery(from(p in Project, where: p.tenant_id == ^tid, select: count(p.id))),
+          story_count:
+            subquery(from(s in Story, where: s.tenant_id == ^tid, select: count(s.id))),
+          epic_count: subquery(from(e in Epic, where: e.tenant_id == ^tid, select: count(e.id))),
+          agent_count:
+            subquery(from(a in Agent, where: a.tenant_id == ^tid, select: count(a.id))),
+          api_key_count:
+            subquery(
+              from(ak in ApiKey,
+                where: ak.tenant_id == ^tid and is_nil(ak.revoked_at),
+                select: count(ak.id)
+              )
+            )
+        }
       )
-      |> AdminRepo.one()
+      |> AdminRepo.one!()
 
-    %{
-      tenant: tenant,
-      project_count: project_count,
-      story_count: story_count,
-      epic_count: epic_count,
-      agent_count: agent_count,
-      api_key_count: api_key_count
-    }
+    Map.put(stats, :tenant, tenant)
   end
 
   defp merge_settings(tenant, attrs) do

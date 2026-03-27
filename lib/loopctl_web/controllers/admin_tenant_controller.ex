@@ -16,6 +16,7 @@ defmodule LoopctlWeb.AdminTenantController do
 
   alias Loopctl.Audit
   alias Loopctl.Tenants
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -67,7 +68,7 @@ defmodule LoopctlWeb.AdminTenantController do
   """
   def update(conn, %{"id" => id} = params) do
     with {:ok, %{tenant: tenant}} <- Tenants.get_tenant_admin(id) do
-      api_key = conn.assigns.current_api_key
+      audit = AuditContext.from_conn(conn)
 
       case Tenants.update_tenant_admin(tenant, params) do
         {:ok, updated} ->
@@ -75,9 +76,9 @@ defmodule LoopctlWeb.AdminTenantController do
             entity_type: "tenant",
             entity_id: updated.id,
             action: "tenant_updated",
-            actor_type: "superadmin",
-            actor_id: api_key.id,
-            actor_label: "superadmin:#{api_key.name}",
+            actor_type: Keyword.get(audit, :actor_type, "superadmin"),
+            actor_id: Keyword.fetch!(audit, :actor_id),
+            actor_label: Keyword.fetch!(audit, :actor_label),
             new_state: %{
               "name" => updated.name,
               "email" => updated.email,
@@ -102,7 +103,7 @@ defmodule LoopctlWeb.AdminTenantController do
   def suspend(conn, %{"id" => id}) do
     with {:ok, %{tenant: tenant}} <- Tenants.get_tenant_admin(id),
          :ok <- check_not_status(tenant, :suspended, "Tenant is already suspended") do
-      api_key = conn.assigns.current_api_key
+      audit = AuditContext.from_conn(conn)
 
       case Tenants.suspend_tenant(tenant) do
         {:ok, updated} ->
@@ -110,9 +111,9 @@ defmodule LoopctlWeb.AdminTenantController do
             entity_type: "tenant",
             entity_id: updated.id,
             action: "tenant_suspended",
-            actor_type: "superadmin",
-            actor_id: api_key.id,
-            actor_label: "superadmin:#{api_key.name}",
+            actor_type: Keyword.get(audit, :actor_type, "superadmin"),
+            actor_id: Keyword.fetch!(audit, :actor_id),
+            actor_label: Keyword.fetch!(audit, :actor_label),
             new_state: %{"status" => "suspended"}
           })
 
@@ -133,7 +134,7 @@ defmodule LoopctlWeb.AdminTenantController do
   def activate(conn, %{"id" => id}) do
     with {:ok, %{tenant: tenant}} <- Tenants.get_tenant_admin(id),
          :ok <- check_not_status(tenant, :active, "Tenant is already active") do
-      api_key = conn.assigns.current_api_key
+      audit = AuditContext.from_conn(conn)
 
       case Tenants.activate_tenant(tenant) do
         {:ok, updated} ->
@@ -141,9 +142,9 @@ defmodule LoopctlWeb.AdminTenantController do
             entity_type: "tenant",
             entity_id: updated.id,
             action: "tenant_activated",
-            actor_type: "superadmin",
-            actor_id: api_key.id,
-            actor_label: "superadmin:#{api_key.name}",
+            actor_type: Keyword.get(audit, :actor_type, "superadmin"),
+            actor_id: Keyword.fetch!(audit, :actor_id),
+            actor_label: Keyword.fetch!(audit, :actor_label),
             new_state: %{"status" => "active"}
           })
 

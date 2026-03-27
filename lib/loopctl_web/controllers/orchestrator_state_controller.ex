@@ -10,6 +10,7 @@ defmodule LoopctlWeb.OrchestratorStateController do
   use LoopctlWeb, :controller
 
   alias Loopctl.Orchestrator
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -31,10 +32,9 @@ defmodule LoopctlWeb.OrchestratorStateController do
       version: params["version"]
     }
 
-    case Orchestrator.save_state(tenant_id, project_id, attrs,
-           actor_id: api_key.id,
-           actor_label: "orchestrator:#{api_key.name}"
-         ) do
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Orchestrator.save_state(tenant_id, project_id, attrs, audit_opts) do
       {:ok, state} ->
         json(conn, %{state: state_json(state)})
 

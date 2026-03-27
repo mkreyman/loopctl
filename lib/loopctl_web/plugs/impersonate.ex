@@ -43,6 +43,16 @@ defmodule LoopctlWeb.Plugs.Impersonate do
 
   @impl true
   def call(conn, _opts) do
+    # Skip impersonation on admin routes — superadmin should retain its own
+    # identity (role, tenant_id=nil) when using /api/v1/admin/* endpoints.
+    if admin_route?(conn) do
+      conn
+    else
+      do_impersonate(conn)
+    end
+  end
+
+  defp do_impersonate(conn) do
     with %{current_api_key: %{role: :superadmin} = api_key} <- conn.assigns,
          [tenant_id] when tenant_id != "" <- get_req_header(conn, "x-impersonate-tenant"),
          {:ok, tenant} <- lookup_tenant(tenant_id) do
@@ -51,13 +61,15 @@ defmodule LoopctlWeb.Plugs.Impersonate do
 
       effective_role = resolve_effective_role(conn)
 
-      # Build a virtual API key struct with the effective role for RequireRole checks
+      # Build a virtual API key struct with the impersonated tenant_id so all
+      # controllers that read current_api_key.tenant_id work automatically.
+      # Also apply the effective role if provided.
       impersonated_api_key =
         if effective_role do
-          %{api_key | role: effective_role}
+          %{api_key | tenant_id: tenant.id, role: effective_role}
         else
           # Default: superadmin keeps its own role (passes all role checks via hierarchy)
-          api_key
+          %{api_key | tenant_id: tenant.id}
         end
 
       conn
@@ -111,4 +123,7 @@ defmodule LoopctlWeb.Plugs.Impersonate do
         nil
     end
   end
+
+  defp admin_route?(%{path_info: ["api", "v1", "admin" | _]}), do: true
+  defp admin_route?(_conn), do: false
 end

@@ -49,9 +49,10 @@ defmodule LoopctlWeb.AuditContext do
       ]
     else
       api_key = assigns.current_api_key
+      actor_type = if api_key.role == :superadmin, do: "superadmin", else: "api_key"
 
       [
-        actor_type: "api_key",
+        actor_type: actor_type,
         actor_id: api_key.id,
         actor_label: "#{api_key.role}:#{api_key.name}"
       ]
