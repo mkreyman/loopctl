@@ -10,6 +10,7 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.ResolveApiKey
     plug LoopctlWeb.Plugs.SetTenant
     plug LoopctlWeb.Plugs.RequireAuth
+    plug LoopctlWeb.Plugs.RateLimiter
   end
 
   pipeline :registration_rate_limit do
