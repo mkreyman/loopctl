@@ -43,38 +43,45 @@ defmodule Loopctl.Projects do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    with :ok <- check_project_limit(tenant_id) do
-      changeset =
-        %Project{tenant_id: tenant_id}
-        |> Project.create_changeset(attrs)
+    changeset =
+      %Project{tenant_id: tenant_id}
+      |> Project.create_changeset(attrs)
 
-      multi =
-        Multi.new()
-        |> Multi.insert(:project, changeset)
-        |> Audit.log_in_multi(:audit, fn %{project: project} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "project",
-            entity_id: project.id,
-            action: "created",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            new_state: %{
-              "name" => project.name,
-              "slug" => project.slug,
-              "status" => to_string(project.status)
-            }
+    multi =
+      Multi.new()
+      |> Multi.run(:check_limit, fn _repo, _changes ->
+        count = count_projects(tenant_id, status: :active)
+        max = get_project_limit(tenant_id)
+
+        if count < max, do: {:ok, count}, else: {:error, :project_limit_reached}
+      end)
+      |> Multi.insert(:project, changeset)
+      |> Audit.log_in_multi(:audit, fn %{project: project} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "project",
+          entity_id: project.id,
+          action: "created",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          new_state: %{
+            "name" => project.name,
+            "slug" => project.slug,
+            "status" => to_string(project.status)
           }
-        end)
+        }
+      end)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{project: project}} ->
-          {:ok, project}
+    case AdminRepo.transaction(multi) do
+      {:ok, %{project: project}} ->
+        {:ok, project}
 
-        {:error, :project, changeset, _changes} ->
-          {:error, changeset}
-      end
+      {:error, :check_limit, :project_limit_reached, _changes} ->
+        {:error, :project_limit_reached}
+
+      {:error, :project, changeset, _changes} ->
+        {:error, changeset}
     end
   end
 
@@ -310,6 +317,30 @@ defmodule Loopctl.Projects do
     end
   end
 
+  @doc """
+  Counts projects for a tenant with optional status filtering.
+
+  ## Options (keyword list)
+
+  - `:status` -- filter by status (`:active` or `:archived`). When omitted, counts all projects.
+
+  ## Returns
+
+  A non-negative integer count.
+  """
+  @spec count_projects(Ecto.UUID.t(), keyword()) :: non_neg_integer()
+  def count_projects(tenant_id, opts \\ []) do
+    query = where(Project, [p], p.tenant_id == ^tenant_id)
+
+    query =
+      case Keyword.get(opts, :status) do
+        nil -> query
+        status -> where(query, [p], p.status == ^status)
+      end
+
+    AdminRepo.aggregate(query, :count, :id)
+  end
+
   # --- Private helpers ---
 
   defp apply_filters(query, opts) do
@@ -328,19 +359,8 @@ defmodule Loopctl.Projects do
     end
   end
 
-  defp check_project_limit(tenant_id) do
+  defp get_project_limit(tenant_id) do
     tenant = AdminRepo.get!(Tenant, tenant_id)
-    max_projects = Map.get(tenant.settings, "max_projects", 50)
-
-    current_count =
-      Project
-      |> where([p], p.tenant_id == ^tenant_id)
-      |> AdminRepo.aggregate(:count, :id)
-
-    if current_count >= max_projects do
-      {:error, :project_limit_reached}
-    else
-      :ok
-    end
+    Map.get(tenant.settings, "max_projects", 50)
   end
 end

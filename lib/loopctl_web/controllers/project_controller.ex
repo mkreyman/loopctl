@@ -65,6 +65,7 @@ defmodule LoopctlWeb.ProjectController do
 
     opts =
       []
+      |> maybe_add_opt(:status, safe_to_status(params["status"]))
       |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
       |> maybe_add_opt(:page, parse_int(params["page"]))
       |> maybe_add_opt(:page_size, parse_int(params["page_size"]))

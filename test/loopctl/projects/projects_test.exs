@@ -80,7 +80,7 @@ defmodule Loopctl.ProjectsTest do
 
       attrs2 = %{name: "Second", slug: "my-project"}
       assert {:error, changeset} = Projects.create_project(tenant.id, attrs2)
-      assert "has already been taken for this tenant" in errors_on(changeset).tenant_id
+      assert "has already been taken for this tenant" in errors_on(changeset).slug
     end
 
     test "allows same slug in different tenants" do
@@ -146,6 +146,26 @@ defmodule Loopctl.ProjectsTest do
       # Should succeed (well under default limit of 50)
       attrs = %{name: "within-limit", slug: "within-limit"}
       assert {:ok, _} = Projects.create_project(tenant.id, attrs)
+    end
+
+    test "archived projects do not count toward limit" do
+      tenant = fixture(:tenant, %{settings: %{"max_projects" => 2}})
+
+      attrs1 = %{name: "first", slug: "first"}
+      assert {:ok, _} = Projects.create_project(tenant.id, attrs1)
+
+      attrs2 = %{name: "second", slug: "second"}
+      assert {:ok, project2} = Projects.create_project(tenant.id, attrs2)
+
+      # At limit -- cannot create a third
+      attrs3 = %{name: "third", slug: "third"}
+      assert {:error, :project_limit_reached} = Projects.create_project(tenant.id, attrs3)
+
+      # Archive one project
+      assert {:ok, _} = Projects.archive_project(tenant.id, project2)
+
+      # Now can create again since only 1 active project remains
+      assert {:ok, _} = Projects.create_project(tenant.id, attrs3)
     end
   end
 
@@ -358,6 +378,41 @@ defmodule Loopctl.ProjectsTest do
 
       {:ok, result} = Projects.list_projects(tenant.id, page_size: 200)
       assert result.page_size == 100
+    end
+  end
+
+  describe "count_projects/2" do
+    test "counts all projects for a tenant" do
+      tenant = fixture(:tenant)
+      fixture(:project, %{tenant_id: tenant.id, slug: "proj-a"})
+      fixture(:project, %{tenant_id: tenant.id, slug: "proj-b"})
+
+      assert Projects.count_projects(tenant.id) == 2
+    end
+
+    test "counts only active projects when status filter is given" do
+      tenant = fixture(:tenant)
+      fixture(:project, %{tenant_id: tenant.id, slug: "active-proj"})
+      archived = fixture(:project, %{tenant_id: tenant.id, slug: "archived-proj"})
+      Projects.archive_project(tenant.id, archived)
+
+      assert Projects.count_projects(tenant.id, status: :active) == 1
+      assert Projects.count_projects(tenant.id, status: :archived) == 1
+    end
+
+    test "returns zero for tenant with no projects" do
+      tenant = fixture(:tenant)
+      assert Projects.count_projects(tenant.id) == 0
+    end
+
+    test "does not count projects from other tenants" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      fixture(:project, %{tenant_id: tenant_a.id, slug: "proj-a"})
+      fixture(:project, %{tenant_id: tenant_b.id, slug: "proj-b"})
+
+      assert Projects.count_projects(tenant_a.id) == 1
+      assert Projects.count_projects(tenant_b.id) == 1
     end
   end
 

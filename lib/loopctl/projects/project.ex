@@ -66,7 +66,8 @@ defmodule Loopctl.Projects.Project do
     |> validate_slug()
     |> validate_metadata()
     |> unique_constraint([:tenant_id, :slug],
-      message: "has already been taken for this tenant"
+      message: "has already been taken for this tenant",
+      error_key: :slug
     )
   end
 

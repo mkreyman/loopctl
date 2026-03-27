@@ -181,6 +181,32 @@ defmodule LoopctlWeb.ProjectControllerTest do
       assert body["meta"]["total_pages"] == 3
     end
 
+    test "filters by status query parameter", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:project, %{tenant_id: tenant.id, slug: "active-one"})
+      archived = fixture(:project, %{tenant_id: tenant.id, slug: "archived-one"})
+      Projects.archive_project(tenant.id, archived)
+
+      # Filter for archived only
+      conn_archived =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/projects?status=archived")
+
+      body = json_response(conn_archived, 200)
+      assert length(body["data"]) == 1
+      assert hd(body["data"])["slug"] == "archived-one"
+
+      # Filter for active only
+      conn_active =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects?status=active")
+
+      body_active = json_response(conn_active, 200)
+      assert length(body_active["data"]) == 1
+      assert hd(body_active["data"])["slug"] == "active-one"
+    end
+
     test "returns pagination metadata", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
