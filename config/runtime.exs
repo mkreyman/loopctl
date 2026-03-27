@@ -23,6 +23,17 @@ end
 config :loopctl, LoopctlWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Cloak Vault — key from environment in all environments where CLOAK_KEY is set
+if cloak_key = System.get_env("CLOAK_KEY") do
+  config :loopctl, Loopctl.Vault,
+    ciphers: [
+      default: {
+        Cloak.Ciphers.AES.GCM,
+        tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12
+      }
+    ]
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||

@@ -26,11 +26,15 @@ defmodule Loopctl.DataCase do
       import Ecto.Changeset
       import Ecto.Query
       import Loopctl.DataCase
+      import Loopctl.Fixtures
+      import Mox
     end
   end
 
   setup tags do
     Loopctl.DataCase.setup_sandbox(tags)
+    Mox.set_mox_from_context(tags)
+    stub_all_defaults()
     :ok
   end
 
@@ -40,6 +44,24 @@ defmodule Loopctl.DataCase do
   def setup_sandbox(tags) do
     pid = Sandbox.start_owner!(Loopctl.Repo, shared: not tags[:async])
     on_exit(fn -> Sandbox.stop_owner(pid) end)
+  end
+
+  @doc """
+  Sets permissive default stubs for all Mox mocks.
+
+  These stubs allow tests to run without explicitly setting up
+  expectations for every mock. Override with `expect/3` in individual
+  tests as needed.
+  """
+  def stub_all_defaults do
+    Mox.stub(Loopctl.MockHealthChecker, :check, fn ->
+      {:ok,
+       %{
+         status: "ok",
+         version: "0.1.0-test",
+         checks: %{database: "ok", oban: "ok"}
+       }}
+    end)
   end
 
   @doc """

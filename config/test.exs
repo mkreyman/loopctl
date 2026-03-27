@@ -29,6 +29,20 @@ config :loopctl, Oban, testing: :inline
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 
+# Cloak Vault — static test key (32 bytes, base64-encoded)
+config :loopctl, Loopctl.Vault,
+  ciphers: [
+    default: {
+      Cloak.Ciphers.AES.GCM,
+      tag: "AES.GCM.V1",
+      key: Base.decode64!("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleXRlcw=="),
+      iv_length: 12
+    }
+  ]
+
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# DI: Use mock health checker in tests
+config :loopctl, :health_checker, Loopctl.MockHealthChecker
