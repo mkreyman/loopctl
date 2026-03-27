@@ -59,7 +59,8 @@ config :loopctl, Oban,
   plugins: [
     {Oban.Plugins.Cron,
      crontab: [
-       {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker}
+       {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
+       {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker}
      ]}
   ]
 
