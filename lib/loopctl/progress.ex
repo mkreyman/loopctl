@@ -55,42 +55,50 @@ defmodule Loopctl.Progress do
     story_title = Map.get(params, "story_title") || Map.get(params, :story_title)
     ac_count = Map.get(params, "ac_count") || Map.get(params, :ac_count)
 
-    with {:ok, story} <- get_story(tenant_id, story_id),
-         :ok <- validate_transition(story.agent_status, :contracted),
-         :ok <- validate_title(story, story_title),
-         :ok <- validate_ac_count(story, ac_count) do
-      now = DateTime.utc_now()
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        with :ok <- validate_transition(story.agent_status, :contracted),
+             :ok <- validate_title(story, story_title),
+             :ok <- validate_ac_count(story, ac_count) do
+          {:ok, story}
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        now = DateTime.utc_now()
 
-      changeset =
-        Ecto.Changeset.change(story, %{
+        story
+        |> Ecto.Changeset.change(%{
           agent_status: :contracted,
           updated_at: now
         })
-
-      multi =
-        Multi.new()
-        |> Multi.update(:story, changeset)
-        |> Audit.log_in_multi(:audit, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "story",
-            entity_id: updated.id,
-            action: "status_changed",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{"agent_status" => to_string(story.agent_status)},
-            new_state: %{
-              "agent_status" => to_string(updated.agent_status),
-              "agent_id" => agent_id
-            }
+        |> AdminRepo.update()
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "status_changed",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"agent_status" => to_string(old.agent_status)},
+          new_state: %{
+            "agent_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id
           }
-        end)
+        }
+      end)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, :story, changeset, _} -> {:error, changeset}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
 
@@ -193,38 +201,46 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    with {:ok, story} <- get_story(tenant_id, story_id),
-         :ok <- validate_transition(story.agent_status, :implementing),
-         :ok <- validate_assigned_agent(story, agent_id) do
-      changeset =
-        Ecto.Changeset.change(story, %{
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        with :ok <- validate_transition(story.agent_status, :implementing),
+             :ok <- validate_assigned_agent(story, agent_id) do
+          {:ok, story}
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        story
+        |> Ecto.Changeset.change(%{
           agent_status: :implementing
         })
-
-      multi =
-        Multi.new()
-        |> Multi.update(:story, changeset)
-        |> Audit.log_in_multi(:audit, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "story",
-            entity_id: updated.id,
-            action: "status_changed",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{"agent_status" => to_string(story.agent_status)},
-            new_state: %{
-              "agent_status" => to_string(updated.agent_status),
-              "agent_id" => agent_id
-            }
+        |> AdminRepo.update()
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "status_changed",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"agent_status" => to_string(old.agent_status)},
+          new_state: %{
+            "agent_status" => to_string(updated.agent_status),
+            "agent_id" => agent_id
           }
-        end)
+        }
+      end)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, :story, changeset, _} -> {:error, changeset}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
 
@@ -256,44 +272,52 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    with {:ok, story} <- get_story(tenant_id, story_id),
-         :ok <- validate_transition(story.agent_status, :reported_done),
-         :ok <- validate_assigned_agent(story, agent_id) do
-      now = DateTime.utc_now()
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        with :ok <- validate_transition(story.agent_status, :reported_done),
+             :ok <- validate_assigned_agent(story, agent_id) do
+          {:ok, story}
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        now = DateTime.utc_now()
 
-      changeset =
-        Ecto.Changeset.change(story, %{
+        story
+        |> Ecto.Changeset.change(%{
           agent_status: :reported_done,
           reported_done_at: now
         })
-
-      multi =
-        Multi.new()
-        |> Multi.update(:story, changeset)
-        |> maybe_create_artifact(tenant_id, story_id, agent_id, artifact_params)
-        |> Audit.log_in_multi(:audit, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "story",
-            entity_id: updated.id,
-            action: "status_changed",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{"agent_status" => to_string(story.agent_status)},
-            new_state: %{
-              "agent_status" => to_string(updated.agent_status),
-              "reported_done_at" => to_string(now),
-              "agent_id" => agent_id
-            }
+        |> AdminRepo.update()
+      end)
+      |> maybe_create_artifact(tenant_id, story_id, agent_id, artifact_params)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "status_changed",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"agent_status" => to_string(old.agent_status)},
+          new_state: %{
+            "agent_status" => to_string(updated.agent_status),
+            "reported_done_at" => to_string(updated.reported_done_at),
+            "agent_id" => agent_id
           }
-        end)
+        }
+      end)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, :story, changeset, _} -> {:error, changeset}
-        {:error, :artifact, changeset, _} -> {:error, changeset}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
+      {:error, :artifact, changeset, _} -> {:error, changeset}
     end
   end
 
@@ -754,30 +778,25 @@ defmodule Loopctl.Progress do
         reported_done_at: nil
       })
 
-    case AdminRepo.update(changeset) do
-      {:ok, reset_story} ->
-        # Log auto_reset audit entry with actor_type=system
-        Audit.create_log_entry(tenant_id, %{
-          entity_type: "story",
-          entity_id: reset_story.id,
-          action: "auto_reset",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "system:auto_reset",
-          old_state: %{
-            "agent_status" => to_string(old_story.agent_status),
-            "assigned_agent_id" => old_story.assigned_agent_id
-          },
-          new_state: %{
-            "agent_status" => "pending",
-            "assigned_agent_id" => nil
-          }
-        })
-
-        {:ok, reset_story}
-
-      error ->
-        error
+    with {:ok, reset_story} <- AdminRepo.update(changeset),
+         {:ok, _audit} <-
+           Audit.create_log_entry(tenant_id, %{
+             entity_type: "story",
+             entity_id: reset_story.id,
+             action: "auto_reset",
+             actor_type: "system",
+             actor_id: nil,
+             actor_label: "system:auto_reset",
+             old_state: %{
+               "agent_status" => to_string(old_story.agent_status),
+               "assigned_agent_id" => old_story.assigned_agent_id
+             },
+             new_state: %{
+               "agent_status" => "pending",
+               "assigned_agent_id" => nil
+             }
+           }) do
+      {:ok, reset_story}
     end
   end
 
