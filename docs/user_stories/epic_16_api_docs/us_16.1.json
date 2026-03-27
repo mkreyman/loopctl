@@ -1,0 +1,208 @@
+{
+  "id": "US-16.1",
+  "title": "OpenAPI 3.0 Specification and Swagger UI",
+  "epic": {
+    "id": "epic_16",
+    "name": "API Documentation"
+  },
+  "priority": "high",
+  "phase": "documentation",
+  "story": {
+    "as_a": "AI agent or developer integrating with loopctl",
+    "i_want_to": "discover all API endpoints, request/response schemas, and authentication requirements from a machine-readable OpenAPI 3.0 specification served by the application itself",
+    "so_that": "I can self-service my integration without reading source code or asking a human for the API contract"
+  },
+  "rationale": "loopctl is an agent-first platform — AI agents are the primary consumers. Agents need a machine-readable API specification to discover endpoints, understand request/response shapes, and authenticate correctly. Without this, every new agent must be manually instructed about the API. An OpenAPI spec also provides interactive Swagger UI for human developers and enables automated client generation.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-16.1.1",
+      "description": "GET /api/v1/openapi returns a valid OpenAPI 3.0 JSON specification document describing all API endpoints, including paths, methods, parameters, request bodies, response schemas, and status codes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.2",
+      "description": "GET /swaggerui serves an interactive Swagger UI HTML page that loads the OpenAPI spec from /api/v1/openapi and allows users to explore and test endpoints in the browser.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.3",
+      "description": "GET /api/v1/ returns a JSON welcome response with links to the OpenAPI spec and health endpoint: {\"name\": \"loopctl\", \"version\": \"0.1.0\", \"docs\": \"/api/v1/openapi\", \"health\": \"/health\"}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.4",
+      "description": "The OpenAPI spec includes a securitySchemes section defining Bearer API key authentication (type: http, scheme: bearer) and applies it as the default security requirement on all authenticated endpoints.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.5",
+      "description": "Every existing controller action (50+ endpoints across tenants, API keys, projects, epics, stories, dependencies, agents, progress, artifacts, verification, orchestrator state, webhooks, admin, import/export, bulk operations, skills) has an OpenApiSpex.operation/2 annotation with summary, description, parameters, request_body, and responses.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.6",
+      "description": "Request and response shapes are defined as OpenApiSpex schema modules (e.g., Loopctl.ApiSpec.Schemas.TenantResponse, Loopctl.ApiSpec.Schemas.StoryRequest) that reference the actual field types and validations from the Ecto schemas.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.7",
+      "description": "The spec documents all error response shapes: 400 (bad request), 401 (unauthorized), 403 (forbidden), 404 (not found), 409 (conflict), 422 (validation error), 429 (rate limited) with consistent error object schema {\"error\": {\"message\": string, \"status\": integer}}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.8",
+      "description": "Pagination parameters (page, page_size) and pagination response metadata (page, page_size, total_count, total_pages) are documented as reusable components referenced by all list endpoints.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.9",
+      "description": "The OpenAPI spec is auto-generated from controller annotations — not a static file. Changes to controllers automatically update the spec.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.10",
+      "description": "The /api/v1/openapi and /swaggerui endpoints are publicly accessible (no authentication required) so agents can discover the API before registering.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-16.1.11",
+      "description": "The spec includes x-agent-hints custom extensions on key endpoints describing the typical agent workflow: register → create project → import stories → contract → claim → implement → report → verify.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-16.1.1",
+      "name": "OpenAPI spec endpoint returns valid JSON",
+      "type": "integration",
+      "preconditions": [
+        "Application running"
+      ],
+      "steps": [
+        "GET /api/v1/openapi"
+      ],
+      "expected_results": [
+        "200 response with Content-Type application/json",
+        "Response body is valid OpenAPI 3.0 (has openapi, info, paths, components keys)",
+        "info.title is 'loopctl'",
+        "info.version matches application version"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.2",
+      "name": "Swagger UI serves HTML page",
+      "type": "integration",
+      "preconditions": [
+        "Application running"
+      ],
+      "steps": [
+        "GET /swaggerui"
+      ],
+      "expected_results": [
+        "200 response with Content-Type text/html",
+        "Response body contains 'swagger-ui'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.3",
+      "name": "API root returns welcome response",
+      "type": "integration",
+      "preconditions": [
+        "Application running"
+      ],
+      "steps": [
+        "GET /api/v1/"
+      ],
+      "expected_results": [
+        "200 response with JSON body",
+        "Body includes name, version, docs, health keys"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.4",
+      "name": "All controller actions have OpenAPI operations",
+      "type": "unit",
+      "preconditions": [
+        "All controller modules compiled"
+      ],
+      "steps": [
+        "For each controller, verify OpenApiSpex.operation/2 is defined for every action"
+      ],
+      "expected_results": [
+        "No controller action is missing an operation spec",
+        "The generated spec paths count matches the total route count"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.5",
+      "name": "Security scheme is present in spec",
+      "type": "integration",
+      "preconditions": [
+        "Application running"
+      ],
+      "steps": [
+        "GET /api/v1/openapi, parse JSON"
+      ],
+      "expected_results": [
+        "components.securitySchemes.BearerAuth exists",
+        "securitySchemes.BearerAuth.type == 'http'",
+        "securitySchemes.BearerAuth.scheme == 'bearer'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.6",
+      "name": "Public endpoints (register, health, openapi) have no security requirement",
+      "type": "integration",
+      "preconditions": [
+        "Application running"
+      ],
+      "steps": [
+        "GET /api/v1/openapi, check paths for /tenants/register, /health, /api/v1/openapi"
+      ],
+      "expected_results": [
+        "These paths have security: [] (empty array, explicitly no auth)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-16.1.7",
+      "name": "OpenAPI and Swagger UI accessible without auth",
+      "type": "integration",
+      "preconditions": [
+        "No API key configured"
+      ],
+      "steps": [
+        "GET /api/v1/openapi without Authorization header",
+        "GET /swaggerui without Authorization header"
+      ],
+      "expected_results": [
+        "Both return 200, not 401"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add {:open_api_spex, \"~> 3.21\"} to mix.exs dependencies",
+    "Create lib/loopctl/api_spec.ex as the root ApiSpec module implementing OpenApiSpex.OpenApi behaviour",
+    "Create lib/loopctl/api_spec/schemas/ directory for request/response schema modules",
+    "Use OpenApiSpex.schema/1 macro in schema modules to define properties from Ecto schema fields",
+    "Add `operation/2` callbacks to every controller using `OpenApiSpex.Controller` or manual `open_api_operation/1` functions",
+    "Mount OpenApiSpex.Plug.RenderSpec at /api/v1/openapi in the router (outside authenticated scope)",
+    "Mount OpenApiSpex.Plug.SwaggerUI at /swaggerui in the router (outside authenticated scope)",
+    "Add a simple WelcomeController for GET /api/v1/ with the discovery response",
+    "Reusable components: PaginationParams, PaginationMeta, ErrorResponse, TenantResponse, ProjectResponse, StoryResponse, etc.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: behaviours resolved via Application.get_env(:loopctl, :key, DefaultModule). config/test.exs maps behaviours to Mox mocks. Tests use expect/3 to set specific expectations."
+  ],
+  "dependencies": [
+    "US-2.4",
+    "US-5.1",
+    "US-7.1"
+  ],
+  "estimated_hours": 8
+}
