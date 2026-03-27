@@ -20,7 +20,7 @@ defmodule LoopctlWeb.StoryVerificationController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [exact_role: :orchestrator] when action in [:verify, :reject]
+       [exact_role: :orchestrator] when action in [:verify, :reject, :force_unclaim]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index]
@@ -90,6 +90,29 @@ defmodule LoopctlWeb.StoryVerificationController do
     with {:ok, _story} <- Stories.get_story(tenant_id, story_id),
          {:ok, results} <- Progress.list_verifications(tenant_id, story_id) do
       json(conn, %{data: results})
+    end
+  end
+
+  @doc """
+  POST /api/v1/stories/:id/force-unclaim
+
+  Orchestrator force-unclaims a story, resetting it to pending.
+  Idempotent on already-pending stories. Does NOT reset verified_status.
+  """
+  def force_unclaim(conn, %{"id" => story_id}) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    case Progress.force_unclaim_story(tenant_id, story_id,
+           orchestrator_agent_id: api_key.agent_id,
+           actor_id: api_key.id,
+           actor_label: "orchestrator:#{api_key.name}"
+         ) do
+      {:ok, story} ->
+        json(conn, %{story: story})
+
+      {:error, :not_found} ->
+        {:error, :not_found}
     end
   end
 end

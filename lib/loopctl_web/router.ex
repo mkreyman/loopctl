@@ -67,6 +67,7 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/verify", StoryVerificationController, :verify
     post "/stories/:id/reject", StoryVerificationController, :reject
     get "/stories/:story_id/verifications", StoryVerificationController, :index
+    post "/stories/:id/force-unclaim", StoryVerificationController, :force_unclaim
 
     # Agent management
     post "/agents/register", AgentController, :register

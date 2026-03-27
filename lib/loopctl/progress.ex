@@ -494,6 +494,83 @@ defmodule Loopctl.Progress do
     total > 0 and unverified == 0
   end
 
+  # --- Orchestrator Force-Unclaim (US-7.5) ---
+
+  @doc """
+  Force-unclaims a story: orchestrator resets it to pending.
+
+  Resets agent_status to `pending`, clears assigned_agent_id and
+  assigned_at. Does NOT reset verified_status. Idempotent on
+  already-pending stories. Works from any agent_status.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %Story{}}` on success
+  - `{:error, :not_found}` if story not found in tenant
+  """
+  @spec force_unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Story.t()} | {:error, atom()}
+  def force_unclaim_story(tenant_id, story_id, opts \\ []) do
+    orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+
+    with {:ok, story} <- get_story(tenant_id, story_id) do
+      # Idempotent: if already pending, return as-is
+      if story.agent_status == :pending do
+        {:ok, story}
+      else
+        apply_force_unclaim(story, tenant_id, orchestrator_agent_id, actor_id, actor_label)
+      end
+    end
+  end
+
+  defp apply_force_unclaim(story, tenant_id, orch_agent_id, actor_id, actor_label) do
+    changeset =
+      Ecto.Changeset.change(story, %{
+        agent_status: :pending,
+        assigned_agent_id: nil,
+        assigned_at: nil,
+        reported_done_at: nil
+      })
+
+    multi =
+      Multi.new()
+      |> Multi.update(:story, changeset)
+      |> Audit.log_in_multi(:audit, fn %{story: updated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "force_unclaimed",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{
+            "agent_status" => to_string(story.agent_status),
+            "assigned_agent_id" => story.assigned_agent_id
+          },
+          new_state: %{
+            "agent_status" => "pending",
+            "orchestrator_agent_id" => orch_agent_id
+          }
+        }
+      end)
+
+    # NOTE(Epic 10): Webhook event for story.force_unclaimed deferred to Epic 10.
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :story, changeset, _} -> {:error, changeset}
+    end
+  end
+
   # --- Verification/Rejection helpers ---
 
   defp validate_verifiable(story) do
