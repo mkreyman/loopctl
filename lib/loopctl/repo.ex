@@ -102,16 +102,22 @@ defmodule Loopctl.Repo do
       [tenant_id]
     )
 
-    rls_role = Application.get_env(:loopctl, :rls_role)
-
-    if rls_role do
-      SQL.query!(
-        __MODULE__,
-        "SET LOCAL ROLE #{rls_role}",
-        []
-      )
-    end
-
+    maybe_set_local_role()
     :ok
+  end
+
+  # Compile-time RLS role switching.
+  # In test/dev, the DB connection is a superuser, so we SET LOCAL ROLE
+  # to a non-superuser to enforce RLS policies. In production, the Repo
+  # connects as a non-superuser natively, so no role switch is needed.
+  # sobelow_skip ["SQL.Query"]
+  case Application.compile_env(:loopctl, :rls_role) do
+    nil ->
+      defp maybe_set_local_role, do: :ok
+
+    role when is_binary(role) ->
+      defp maybe_set_local_role do
+        SQL.query!(__MODULE__, "SET LOCAL ROLE #{unquote(role)}", [])
+      end
   end
 end
