@@ -11,6 +11,7 @@ defmodule LoopctlWeb.StoryController do
 
   use LoopctlWeb, :controller
 
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
   alias Loopctl.WorkBreakdown.Stories
 
@@ -97,11 +98,22 @@ defmodule LoopctlWeb.StoryController do
 
     case Stories.get_story(tenant_id, story_id) do
       {:ok, story} ->
+        {:ok, story_deps} =
+          Dependencies.list_story_dependencies_for_epic(tenant_id, story.epic_id)
+
+        # Filter to deps where this story is the dependent
+        deps_for_story =
+          story_deps
+          |> Enum.filter(fn dep -> dep.story_id == story.id end)
+          |> Enum.map(fn dep ->
+            %{story_id: dep.story_id, depends_on_story_id: dep.depends_on_story_id}
+          end)
+
         json(conn, %{
           story:
             story_json(story)
             |> Map.merge(%{
-              dependencies: [],
+              dependencies: deps_for_story,
               artifacts: [],
               latest_verification: nil
             })

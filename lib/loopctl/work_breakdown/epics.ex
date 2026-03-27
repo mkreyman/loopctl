@@ -277,7 +277,10 @@ defmodule Loopctl.WorkBreakdown.Epics do
             0.0
           end
 
-        Map.merge(Map.from_struct(epic), %{
+        epic
+        |> Map.from_struct()
+        |> Map.drop([:__meta__, :stories])
+        |> Map.merge(%{
           story_count: stats.total,
           completion_percentage: completion
         })

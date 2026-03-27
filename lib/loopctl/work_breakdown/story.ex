@@ -94,6 +94,7 @@ defmodule Loopctl.WorkBreakdown.Story do
       :metadata
     ])
     |> validate_required([:number, :title])
+    |> validate_number_format()
     |> compute_sort_key()
     |> validate_metadata()
     |> unique_constraint([:tenant_id, :project_id, :number],
@@ -164,6 +165,28 @@ defmodule Loopctl.WorkBreakdown.Story do
   def compute_sort_key_value(_), do: 0
 
   # --- Private helpers ---
+
+  defp validate_number_format(changeset) do
+    validate_change(changeset, :number, fn :number, value ->
+      parts = String.split(value, ".")
+
+      cond do
+        length(parts) > 2 ->
+          [number: "must be in format 'major.minor' or 'major'"]
+
+        Enum.any?(parts, fn part ->
+          case Integer.parse(part) do
+            {n, ""} -> n < 0 or n >= 10_000
+            _ -> true
+          end
+        end) ->
+          [number: "each part must be a non-negative integer less than 10000"]
+
+        true ->
+          []
+      end
+    end)
+  end
 
   defp compute_sort_key(changeset) do
     case get_change(changeset, :number) do

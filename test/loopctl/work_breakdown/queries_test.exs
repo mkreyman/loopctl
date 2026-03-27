@@ -222,6 +222,44 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
       assert length(item.blocking_dependencies) == 1
       assert hd(item.blocking_dependencies).id == blocker.id
     end
+
+    test "returns stories blocked by epic-level dependencies (no story deps)" do
+      %{tenant: tenant, project: project} = setup_project()
+      epic_1 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic_2 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      # Epic 2 depends on Epic 1
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: epic_2.id,
+        depends_on_epic_id: epic_1.id
+      })
+
+      # Epic 1 has an unverified story
+      _unverified_in_epic_1 =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic_1.id,
+          number: "1.1",
+          agent_status: :implementing,
+          verified_status: :unverified
+        })
+
+      # Epic 2 has a story with NO story-level deps — but it is still
+      # blocked because epic 1 has unverified stories
+      story_in_epic_2 =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic_2.id,
+          number: "2.1",
+          agent_status: :pending
+        })
+
+      {:ok, result} = Queries.list_blocked_stories(tenant.id, project_id: project.id)
+
+      blocked_ids = Enum.map(result.data, & &1.story.id)
+      assert story_in_epic_2.id in blocked_ids
+    end
   end
 
   describe "get_dependency_graph/2" do

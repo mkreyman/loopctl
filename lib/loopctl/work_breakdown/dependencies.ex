@@ -5,6 +5,12 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
   Dependencies are directed edges forming a DAG (directed acyclic graph).
   Cycle detection prevents circular dependencies. Cross-level consistency
   checks prevent deadlocks between epic and story dependency layers.
+
+  NOTE: Cycle detection is not atomic with insertion (TOCTOU race). Under
+  concurrent dependency creation, a race could allow a cyclic graph. For the
+  expected graph sizes (<100 nodes) and single-orchestrator usage pattern,
+  this is acceptable. A future improvement would use advisory locks or
+  serializable transactions.
   """
 
   import Ecto.Query
@@ -65,11 +71,12 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
          :ok <- validate_no_epic_cycle(tenant_id, epic.project_id, epic_id, depends_on_id),
          :ok <- validate_no_cross_level_deadlock(tenant_id, epic_id, depends_on_id) do
       changeset =
-        %EpicDependency{tenant_id: tenant_id}
-        |> EpicDependency.create_changeset(%{
+        %EpicDependency{
+          tenant_id: tenant_id,
           epic_id: epic_id,
           depends_on_epic_id: depends_on_id
-        })
+        }
+        |> EpicDependency.create_changeset()
 
       multi =
         Multi.new()
@@ -203,11 +210,12 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
          :ok <-
            validate_no_story_epic_deadlock(tenant_id, story.epic_id, dep_story.epic_id) do
       changeset =
-        %StoryDependency{tenant_id: tenant_id}
-        |> StoryDependency.create_changeset(%{
+        %StoryDependency{
+          tenant_id: tenant_id,
           story_id: story_id,
           depends_on_story_id: depends_on_id
-        })
+        }
+        |> StoryDependency.create_changeset()
 
       multi =
         Multi.new()
@@ -358,20 +366,6 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
     # Check if there are any story_dependencies where:
     #   story in depends_on_epic_id depends on story in epic_id
 
-    # Only check if story_dependencies table exists (it may not exist yet in US-6.3)
-    case AdminRepo.query("SELECT to_regclass('story_dependencies')") do
-      {:ok, %{rows: [[nil]]}} ->
-        :ok
-
-      {:ok, _} ->
-        check_cross_level_story_deps(tenant_id, epic_id, depends_on_epic_id)
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp check_cross_level_story_deps(tenant_id, epic_id, depends_on_epic_id) do
     # Stories in depends_on_epic_id (Epic B)
     stories_in_b =
       from(s in Story,
@@ -393,7 +387,7 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
     else
       # Check if any story in B depends on any story in A
       conflicting =
-        from(d in "story_dependencies",
+        from(d in StoryDependency,
           where: d.story_id in ^stories_in_b and d.depends_on_story_id in ^stories_in_a,
           select: {d.story_id, d.depends_on_story_id}
         )

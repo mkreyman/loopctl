@@ -16,6 +16,7 @@ defmodule Loopctl.Repo.Migrations.CreateStories do
       add :number, :string, null: false
       add :title, :string, null: false
       add :description, :text
+      # Stored as jsonb which natively supports arrays; schema uses {:array, :map}
       add :acceptance_criteria, :map
       add :estimated_hours, :decimal
       add :agent_status, :string, null: false, default: "pending"

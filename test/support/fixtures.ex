@@ -101,10 +101,12 @@ defmodule Loopctl.Fixtures do
 
   def build(:story, attrs) do
     seq = System.unique_integer([:positive])
+    # Keep minor part under 10000 to satisfy sort_key validation
+    minor = rem(seq, 9999) + 1
 
     Map.merge(
       %{
-        number: "1.#{seq}",
+        number: "1.#{minor}",
         title: "Story #{seq}",
         description: "Test story description",
         acceptance_criteria: [],
@@ -309,11 +311,12 @@ defmodule Loopctl.Fixtures do
     depends_on_epic_id = Map.fetch!(attrs, :depends_on_epic_id)
 
     changeset =
-      %EpicDependency{tenant_id: tenant_id}
-      |> EpicDependency.create_changeset(%{
+      %EpicDependency{
+        tenant_id: tenant_id,
         epic_id: epic_id,
         depends_on_epic_id: depends_on_epic_id
-      })
+      }
+      |> EpicDependency.create_changeset()
 
     AdminRepo.insert!(changeset)
   end
@@ -325,11 +328,12 @@ defmodule Loopctl.Fixtures do
     depends_on_story_id = Map.fetch!(attrs, :depends_on_story_id)
 
     changeset =
-      %StoryDependency{tenant_id: tenant_id}
-      |> StoryDependency.create_changeset(%{
+      %StoryDependency{
+        tenant_id: tenant_id,
         story_id: story_id,
         depends_on_story_id: depends_on_story_id
-      })
+      }
+      |> StoryDependency.create_changeset()
 
     AdminRepo.insert!(changeset)
   end

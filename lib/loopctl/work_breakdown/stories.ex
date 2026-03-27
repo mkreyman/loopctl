@@ -299,9 +299,18 @@ defmodule Loopctl.WorkBreakdown.Stories do
     where(query, [s], s.verified_status == ^status)
   end
 
+  @valid_statuses %{
+    "pending" => :pending,
+    "contracted" => :contracted,
+    "assigned" => :assigned,
+    "implementing" => :implementing,
+    "reported_done" => :reported_done,
+    "unverified" => :unverified,
+    "verified" => :verified,
+    "rejected" => :rejected
+  }
+
   defp safe_to_status_atom(str) do
-    String.to_existing_atom(str)
-  rescue
-    ArgumentError -> nil
+    Map.get(@valid_statuses, str)
   end
 end

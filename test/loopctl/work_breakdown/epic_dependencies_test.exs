@@ -136,6 +136,33 @@ defmodule Loopctl.WorkBreakdown.EpicDependenciesTest do
                  depends_on_epic_id: epic_a.id
                })
     end
+
+    test "rejects cross-level deadlock from epic side (story dep exists, epic dep would conflict)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic_a = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic_b = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      story_a = fixture(:story, %{tenant_id: tenant.id, epic_id: epic_a.id, number: "1.1"})
+      story_b = fixture(:story, %{tenant_id: tenant.id, epic_id: epic_b.id, number: "2.1"})
+
+      # Story B depends on Story A (cross-epic)
+      fixture(:story_dependency, %{
+        tenant_id: tenant.id,
+        story_id: story_b.id,
+        depends_on_story_id: story_a.id
+      })
+
+      # Now try: Epic A depends on Epic B — this conflicts because
+      # story_b (in Epic B, the prerequisite) depends on story_a (in Epic A, the dependent)
+      assert {:error, {:cross_level_deadlock, msg}} =
+               Dependencies.create_epic_dependency(tenant.id, %{
+                 epic_id: epic_a.id,
+                 depends_on_epic_id: epic_b.id
+               })
+
+      assert msg =~ "Cross-level deadlock"
+    end
   end
 
   describe "delete_epic_dependency/3" do

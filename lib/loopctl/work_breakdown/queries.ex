@@ -128,7 +128,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
     page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
     offset = (page - 1) * page_size
 
-    # Stories that have at least one unverified dependency
+    # Stories that have at least one unverified dependency (story-level or epic-level)
     blocked_query =
       Story
       |> where([s], s.tenant_id == ^tenant_id)
@@ -143,8 +143,18 @@ defmodule Loopctl.WorkBreakdown.Queries do
             WHERE sd.story_id = ?
             AND dep.verified_status != 'verified'
           )
+          OR EXISTS (
+            SELECT 1 FROM epic_dependencies ed
+            WHERE ed.epic_id = ?
+            AND EXISTS (
+              SELECT 1 FROM stories prereq_story
+              WHERE prereq_story.epic_id = ed.depends_on_epic_id
+              AND prereq_story.verified_status != 'verified'
+            )
+          )
           """,
-          s.id
+          s.id,
+          s.epic_id
         )
       )
 
@@ -157,14 +167,15 @@ defmodule Loopctl.WorkBreakdown.Queries do
       |> offset(^offset)
       |> AdminRepo.all()
 
-    # For each blocked story, fetch its blocking dependencies
+    # For each blocked story, fetch its blocking dependencies (story + epic level)
     data =
       Enum.map(stories, fn story ->
-        blockers = fetch_blocking_dependencies(story.id)
+        story_blockers = fetch_blocking_story_dependencies(story.id)
+        epic_blockers = fetch_blocking_epic_dependencies(story.epic_id)
 
         %{
           story: story,
-          blocking_dependencies: blockers
+          blocking_dependencies: story_blockers ++ epic_blockers
         }
       end)
 
@@ -268,7 +279,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
     end
   end
 
-  defp fetch_blocking_dependencies(story_id) do
+  defp fetch_blocking_story_dependencies(story_id) do
     from(sd in StoryDependency,
       join: dep in Story,
       on: dep.id == sd.depends_on_story_id,
@@ -279,6 +290,23 @@ defmodule Loopctl.WorkBreakdown.Queries do
         title: dep.title,
         agent_status: dep.agent_status,
         verified_status: dep.verified_status
+      }
+    )
+    |> AdminRepo.all()
+  end
+
+  defp fetch_blocking_epic_dependencies(epic_id) do
+    # Find unverified stories in prerequisite epics (via epic_dependencies)
+    from(ed in EpicDependency,
+      join: prereq_story in Story,
+      on: prereq_story.epic_id == ed.depends_on_epic_id,
+      where: ed.epic_id == ^epic_id and prereq_story.verified_status != :verified,
+      select: %{
+        id: prereq_story.id,
+        number: prereq_story.number,
+        title: prereq_story.title,
+        agent_status: prereq_story.agent_status,
+        verified_status: prereq_story.verified_status
       }
     )
     |> AdminRepo.all()

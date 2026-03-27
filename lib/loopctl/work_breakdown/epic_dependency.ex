@@ -30,12 +30,14 @@ defmodule Loopctl.WorkBreakdown.EpicDependency do
   @doc """
   Changeset for creating a new epic dependency.
 
-  The `tenant_id` is set programmatically, not via cast.
+  The `tenant_id`, `epic_id`, and `depends_on_epic_id` are set programmatically
+  on the struct, not via cast. This changeset only validates and applies
+  database constraints.
   """
-  @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
-  def create_changeset(dep \\ %__MODULE__{}, attrs) do
+  @spec create_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def create_changeset(dep \\ %__MODULE__{}) do
     dep
-    |> cast(attrs, [:epic_id, :depends_on_epic_id])
+    |> change()
     |> validate_required([:epic_id, :depends_on_epic_id])
     |> unique_constraint([:epic_id, :depends_on_epic_id],
       message: "dependency already exists"
