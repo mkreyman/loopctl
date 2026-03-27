@@ -125,12 +125,12 @@ defmodule LoopctlWeb.VerificationListingTest do
       assert body["meta"]["total_count"] == 0
     end
 
-    test "results are ordered by iteration (ascending)", %{conn: conn} do
+    test "results are ordered by inserted_at descending (newest first)", %{conn: conn} do
       %{story: story, orch_key: orch_key, tenant: tenant, orch_agent: orch_agent} =
         setup_verified_story()
 
-      # Insert in reverse order to verify ordering
-      for i <- [3, 1, 2] do
+      # Insert sequentially so inserted_at increases
+      for i <- [1, 2, 3] do
         fixture(:verification_result, %{
           tenant_id: tenant.id,
           story_id: story.id,
@@ -148,7 +148,7 @@ defmodule LoopctlWeb.VerificationListingTest do
 
       body = json_response(conn, 200)
       iterations = Enum.map(body["data"], & &1["iteration"])
-      assert iterations == [1, 2, 3]
+      assert iterations == [3, 2, 1]
     end
   end
 
@@ -199,8 +199,8 @@ defmodule LoopctlWeb.VerificationListingTest do
 
       body = json_response(conn, 200)
       iterations = Enum.map(body["data"], & &1["iteration"])
-      # verify(1) -> reject(2) -> verify(3) = 3 verification results
-      assert iterations == [1, 2, 3]
+      # verify(1) -> reject(2) -> verify(3) = 3 results, newest first
+      assert iterations == [3, 2, 1]
     end
   end
 
@@ -335,6 +335,21 @@ defmodule LoopctlWeb.VerificationListingTest do
     end
   end
 
+  # --- Role enforcement ---
+
+  describe "role enforcement (verifications listing)" do
+    test "agent role gets 403 on verification listing", %{conn: conn} do
+      %{story: story, agent_key: agent_key} = setup_verified_story()
+
+      conn =
+        conn
+        |> auth_conn(agent_key)
+        |> get(~p"/api/v1/stories/#{story.id}/verifications")
+
+      assert json_response(conn, 403)
+    end
+  end
+
   # --- Tenant isolation ---
 
   describe "tenant isolation (verifications listing)" do
@@ -342,10 +357,10 @@ defmodule LoopctlWeb.VerificationListingTest do
       %{story: story} = setup_verified_story()
 
       tenant_b = fixture(:tenant)
-      agent_b = fixture(:agent, %{tenant_id: tenant_b.id, agent_type: :implementer})
+      orch_b = fixture(:agent, %{tenant_id: tenant_b.id, agent_type: :orchestrator})
 
       {key_b, _} =
-        fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent, agent_id: agent_b.id})
+        fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator, agent_id: orch_b.id})
 
       conn =
         conn

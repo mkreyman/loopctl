@@ -424,7 +424,12 @@ defmodule Loopctl.Progress do
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_verified_status(story)
       end)
-      |> insert_verification_result(tenant_id, orchestrator_agent_id, :pass, verification_params)
+      |> insert_verification_result(
+        tenant_id,
+        orchestrator_agent_id,
+        verification_params.result,
+        verification_params
+      )
       |> audit_verification(tenant_id, "verified", actor_id, actor_label, orchestrator_agent_id)
       |> maybe_complete_epic(tenant_id, actor_id, actor_label)
 
@@ -500,7 +505,7 @@ defmodule Loopctl.Progress do
     results =
       VerificationResult
       |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
-      |> order_by([v], asc: v.iteration)
+      |> order_by([v], desc: v.inserted_at)
       |> AdminRepo.all()
 
     {:ok, results}
@@ -801,12 +806,19 @@ defmodule Loopctl.Progress do
   end
 
   defp extract_verification_params(params) do
+    result = parse_verification_result(Map.get(params, "result") || Map.get(params, :result))
+
     %{
       summary: Map.get(params, "summary") || Map.get(params, :summary),
       findings: Map.get(params, "findings") || Map.get(params, :findings, %{}),
-      review_type: Map.get(params, "review_type") || Map.get(params, :review_type)
+      review_type: Map.get(params, "review_type") || Map.get(params, :review_type),
+      result: result
     }
   end
+
+  defp parse_verification_result("partial"), do: :partial
+  defp parse_verification_result(:partial), do: :partial
+  defp parse_verification_result(_), do: :pass
 
   defp extract_rejection_params(params) do
     reason = Map.get(params, "reason") || Map.get(params, :reason)
@@ -930,6 +942,6 @@ defmodule Loopctl.Progress do
   defp count_verifications(tenant_id, story_id) do
     VerificationResult
     |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
-    |> AdminRepo.aggregate(:count, :id)
+    |> AdminRepo.aggregate(:max, :iteration) || 0
   end
 end

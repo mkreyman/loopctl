@@ -24,7 +24,7 @@ defmodule LoopctlWeb.StoryVerificationController do
        [exact_role: :orchestrator] when action in [:verify, :reject, :force_unclaim]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :agent] when action in [:index]
+       [role: :orchestrator] when action in [:index]
 
   @doc """
   POST /api/v1/stories/:id/verify

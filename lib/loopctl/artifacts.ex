@@ -163,7 +163,7 @@ defmodule Loopctl.Artifacts do
 
     results =
       base_query
-      |> order_by([v], asc: v.iteration)
+      |> order_by([v], desc: v.inserted_at)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -211,6 +211,6 @@ defmodule Loopctl.Artifacts do
   def count_verifications(tenant_id, story_id) do
     VerificationResult
     |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
-    |> AdminRepo.aggregate(:count, :id)
+    |> AdminRepo.aggregate(:max, :iteration) || 0
   end
 end

@@ -80,6 +80,21 @@ defmodule Loopctl.ArtifactsTest do
       assert errors_on(changeset)[:artifact_type] != nil
     end
 
+    test "requires path" do
+      %{tenant: tenant, story: story, agent: agent} = setup_story()
+
+      assert {:error, changeset} =
+               Artifacts.create_artifact_report(
+                 tenant.id,
+                 story.id,
+                 %{"artifact_type" => "schema"},
+                 agent_id: agent.id,
+                 reported_by: :agent
+               )
+
+      assert errors_on(changeset)[:path] != nil
+    end
+
     test "defaults exists to true" do
       %{tenant: tenant, story: story, agent: agent} = setup_story()
 
@@ -87,7 +102,7 @@ defmodule Loopctl.ArtifactsTest do
                Artifacts.create_artifact_report(
                  tenant.id,
                  story.id,
-                 %{"artifact_type" => "schema"},
+                 %{"artifact_type" => "schema", "path" => "lib/test.ex"},
                  agent_id: agent.id,
                  reported_by: :agent
                )
@@ -102,7 +117,7 @@ defmodule Loopctl.ArtifactsTest do
         Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => "schema", "path" => "lib/test.ex"},
+          %{"artifact_type" => "schema", "path" => "lib/schema.ex"},
           agent_id: agent.id,
           reported_by: :agent,
           actor_id: agent.id,
@@ -130,7 +145,7 @@ defmodule Loopctl.ArtifactsTest do
         Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => "schema"},
+          %{"artifact_type" => "schema", "path" => "lib/schema.ex"},
           agent_id: agent.id,
           reported_by: :agent
         )
@@ -139,7 +154,7 @@ defmodule Loopctl.ArtifactsTest do
         Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => "migration"},
+          %{"artifact_type" => "migration", "path" => "priv/repo/migrations/001.exs"},
           agent_id: agent.id,
           reported_by: :agent
         )
@@ -169,7 +184,7 @@ defmodule Loopctl.ArtifactsTest do
         Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => type},
+          %{"artifact_type" => type, "path" => "lib/#{type}.ex"},
           agent_id: agent.id,
           reported_by: :agent
         )
@@ -198,7 +213,7 @@ defmodule Loopctl.ArtifactsTest do
         Artifacts.create_artifact_report(
           tenant_a.id,
           story_a.id,
-          %{"artifact_type" => "schema"},
+          %{"artifact_type" => "schema", "path" => "lib/schema.ex"},
           agent_id: agent_a.id,
           reported_by: :agent
         )
@@ -212,7 +227,7 @@ defmodule Loopctl.ArtifactsTest do
   # --- Verification Results ---
 
   describe "list_verifications/3" do
-    test "lists verification results ordered by iteration" do
+    test "lists verification results ordered by inserted_at descending" do
       %{tenant: tenant, story: story} = setup_story()
       orch = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
@@ -237,7 +252,8 @@ defmodule Loopctl.ArtifactsTest do
       {:ok, result} = Artifacts.list_verifications(tenant.id, story.id)
 
       assert length(result.data) == 2
-      assert Enum.map(result.data, & &1.id) == [v1.id, v2.id]
+      # Newest first (desc by inserted_at)
+      assert Enum.map(result.data, & &1.id) == [v2.id, v1.id]
       assert result.total == 2
     end
 

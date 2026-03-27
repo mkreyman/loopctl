@@ -137,7 +137,7 @@ defmodule LoopctlWeb.ArtifactReportControllerTest do
       assert audit.new_state["story_id"] == story.id
     end
 
-    test "exists defaults to true when not provided", %{conn: conn} do
+    test "requires path (422)", %{conn: conn} do
       %{story: story, agent_key: agent_key} = setup_story_with_keys()
 
       conn =
@@ -145,6 +145,20 @@ defmodule LoopctlWeb.ArtifactReportControllerTest do
         |> auth_conn(agent_key)
         |> post(~p"/api/v1/stories/#{story.id}/artifacts", %{
           "artifact_type" => "schema"
+        })
+
+      assert json_response(conn, 422)
+    end
+
+    test "exists defaults to true when not provided", %{conn: conn} do
+      %{story: story, agent_key: agent_key} = setup_story_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(agent_key)
+        |> post(~p"/api/v1/stories/#{story.id}/artifacts", %{
+          "artifact_type" => "schema",
+          "path" => "lib/schema.ex"
         })
 
       body = json_response(conn, 201)
@@ -159,6 +173,7 @@ defmodule LoopctlWeb.ArtifactReportControllerTest do
         |> auth_conn(agent_key)
         |> post(~p"/api/v1/stories/#{story.id}/artifacts", %{
           "artifact_type" => "migration",
+          "path" => "priv/repo/migrations/001.exs",
           "exists" => false
         })
 
@@ -179,7 +194,7 @@ defmodule LoopctlWeb.ArtifactReportControllerTest do
         Loopctl.Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => type},
+          %{"artifact_type" => type, "path" => "lib/#{type}.ex"},
           agent_id: impl_agent.id,
           reported_by: :agent
         )
@@ -217,7 +232,7 @@ defmodule LoopctlWeb.ArtifactReportControllerTest do
         Loopctl.Artifacts.create_artifact_report(
           tenant.id,
           story.id,
-          %{"artifact_type" => type},
+          %{"artifact_type" => type, "path" => "lib/#{type}.ex"},
           agent_id: impl_agent.id,
           reported_by: :agent
         )
