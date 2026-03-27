@@ -215,9 +215,25 @@ defmodule LoopctlWeb.EpicController do
   end
 
   defp epic_detail_json(epic) do
-    # NOTE(US-6.2): Stories preloading added when Story schema exists
+    stories =
+      case Map.get(epic, :stories) do
+        %Ecto.Association.NotLoaded{} ->
+          []
+
+        stories when is_list(stories) ->
+          Enum.map(stories, fn story ->
+            %{
+              id: story.id,
+              number: story.number,
+              title: story.title,
+              agent_status: story.agent_status,
+              verified_status: story.verified_status
+            }
+          end)
+      end
+
     epic_json(epic)
-    |> Map.put(:stories, [])
+    |> Map.put(:stories, stories)
   end
 
   defp parse_int(nil), do: nil

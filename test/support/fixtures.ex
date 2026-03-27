@@ -16,6 +16,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   @doc """
   Builds a data map for the given type without database insertion.
@@ -90,6 +91,22 @@ defmodule Loopctl.Fixtures do
         description: "Test epic description",
         phase: "p0_foundation",
         position: 0,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:story, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        number: "1.#{seq}",
+        title: "Story #{seq}",
+        description: "Test story description",
+        acceptance_criteria: [],
+        estimated_hours: nil,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -212,6 +229,67 @@ defmodule Loopctl.Fixtures do
       |> Epic.create_changeset(data)
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:story, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    # Auto-create epic if not provided
+    {epic, attrs} =
+      case Map.get(attrs, :epic_id) do
+        nil ->
+          project_id = Map.get(attrs, :project_id)
+
+          epic =
+            if project_id do
+              fixture(:epic, %{tenant_id: tenant_id, project_id: project_id})
+            else
+              fixture(:epic, %{tenant_id: tenant_id})
+            end
+
+          attrs = Map.put(attrs, :epic_id, epic.id)
+          attrs = Map.put(attrs, :project_id, epic.project_id)
+          {epic, attrs}
+
+        eid ->
+          epic = AdminRepo.get!(Epic, eid)
+          attrs = Map.put(attrs, :project_id, epic.project_id)
+          {epic, attrs}
+      end
+
+    project_id = Map.get(attrs, :project_id, epic.project_id)
+
+    # Handle optional status overrides
+    agent_status = Map.get(attrs, :agent_status, :pending)
+    verified_status = Map.get(attrs, :verified_status, :unverified)
+
+    data = build(:story, attrs)
+
+    changeset =
+      %Story{tenant_id: tenant_id, project_id: project_id, epic_id: epic.id}
+      |> Story.create_changeset(data)
+
+    story = AdminRepo.insert!(changeset)
+
+    # Apply status overrides if non-default
+    if agent_status != :pending or verified_status != :unverified do
+      story
+      |> Ecto.Changeset.change(%{agent_status: agent_status, verified_status: verified_status})
+      |> AdminRepo.update!()
+    else
+      story
+    end
   end
 
   def fixture(:api_key, attrs) do

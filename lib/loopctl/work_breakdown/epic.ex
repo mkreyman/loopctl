@@ -45,7 +45,8 @@ defmodule Loopctl.WorkBreakdown.Epic do
     field :position, :integer, default: 0
     field :metadata, :map, default: %{}
 
-    # NOTE(US-6.2): has_many :stories added when Story schema is created
+    has_many :stories, Loopctl.WorkBreakdown.Story
+
     timestamps()
   end
 

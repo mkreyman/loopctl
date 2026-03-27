@@ -15,6 +15,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   @doc """
   Creates a new epic within a project.
@@ -98,8 +99,15 @@ defmodule Loopctl.WorkBreakdown.Epics do
   @spec get_epic_with_stories(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, Epic.t()} | {:error, :not_found}
   def get_epic_with_stories(tenant_id, epic_id) do
-    # NOTE(US-6.2): Add preload(:stories) when Story schema is created
-    get_epic(tenant_id, epic_id)
+    query =
+      Epic
+      |> where([e], e.id == ^epic_id and e.tenant_id == ^tenant_id)
+      |> preload(stories: ^from(s in Loopctl.WorkBreakdown.Story, order_by: [asc: s.sort_key]))
+
+    case AdminRepo.one(query) do
+      nil -> {:error, :not_found}
+      epic -> {:ok, epic}
+    end
   end
 
   @doc """
@@ -329,49 +337,30 @@ defmodule Loopctl.WorkBreakdown.Epics do
   defp fetch_story_stats([]), do: %{}
 
   defp fetch_story_stats(epic_ids) do
-    if stories_table_exists?() do
-      story_query =
-        from(s in "stories",
-          where: s.epic_id in ^epic_ids,
-          group_by: s.epic_id,
-          select:
-            {s.epic_id, count(s.id),
-             count(fragment("CASE WHEN ? = 'verified' THEN 1 END", s.verified_status))}
-        )
+    story_query =
+      from(s in Story,
+        where: s.epic_id in ^epic_ids,
+        group_by: s.epic_id,
+        select:
+          {s.epic_id, count(s.id),
+           count(fragment("CASE WHEN ? = 'verified' THEN 1 END", s.verified_status))}
+      )
 
-      AdminRepo.all(story_query)
-      |> Enum.into(%{}, fn {epic_id, total, verified} ->
-        {epic_id, %{total: total, verified: verified}}
-      end)
-    else
-      %{}
-    end
+    AdminRepo.all(story_query)
+    |> Enum.into(%{}, fn {epic_id, total, verified} ->
+      {epic_id, %{total: total, verified: verified}}
+    end)
   end
 
   defp count_stories_by_field(epic_id, field) do
-    if stories_table_exists?() do
-      from(s in "stories",
-        where: s.epic_id == ^epic_id,
-        group_by: field(s, ^field),
-        select: {field(s, ^field), count(s.id)}
-      )
-      |> AdminRepo.all()
-      |> Enum.into(%{}, fn {status, count} ->
-        {safe_to_atom(status), count}
-      end)
-    else
-      %{}
-    end
+    from(s in Story,
+      where: s.epic_id == ^epic_id,
+      group_by: field(s, ^field),
+      select: {field(s, ^field), count(s.id)}
+    )
+    |> AdminRepo.all()
+    |> Enum.into(%{}, fn {status, count} ->
+      {status, count}
+    end)
   end
-
-  defp stories_table_exists? do
-    case AdminRepo.query("SELECT to_regclass('stories')") do
-      {:ok, %{rows: [[nil]]}} -> false
-      {:ok, _} -> true
-      _ -> false
-    end
-  end
-
-  defp safe_to_atom(val) when is_atom(val), do: val
-  defp safe_to_atom(val) when is_binary(val), do: String.to_existing_atom(val)
 end

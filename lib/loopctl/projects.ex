@@ -16,6 +16,8 @@ defmodule Loopctl.Projects do
   alias Loopctl.Audit
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   @doc """
   Creates a new project within a tenant.
@@ -273,8 +275,7 @@ defmodule Loopctl.Projects do
   @doc """
   Returns a progress summary for a project.
 
-  NOTE: Story and Epic schemas don't exist yet (Epic 6). Returns zeroed/empty
-  progress data. The queries will be updated when Epic 6 is implemented.
+  Uses aggregate queries against the epics and stories tables for efficiency.
 
   ## Returns
 
@@ -286,28 +287,42 @@ defmodule Loopctl.Projects do
   def get_project_progress(tenant_id, project_id) do
     case get_project(tenant_id, project_id) do
       {:ok, _project} ->
-        # NOTE(Epic 6): Replace with actual aggregate queries when Story and Epic
-        # schemas are available. Use SQL GROUP BY / COUNT for efficiency rather than
-        # loading all stories into memory.
+        total_epics = count_epics(tenant_id, project_id)
+        story_counts = count_stories_by_status(tenant_id, project_id)
+
+        total_stories = Map.values(story_counts.by_agent_status) |> Enum.sum()
+        verified_count = Map.get(story_counts.by_verified_status, :verified, 0)
+
+        verification_percentage =
+          if total_stories > 0 do
+            Float.round(verified_count / total_stories * 100, 1)
+          else
+            0.0
+          end
+
+        hours = estimate_hours(tenant_id, project_id)
+
+        epics_completed = count_completed_epics(tenant_id, project_id)
+
         progress = %{
-          total_stories: 0,
+          total_stories: total_stories,
           stories_by_agent_status: %{
-            pending: 0,
-            contracted: 0,
-            assigned: 0,
-            implementing: 0,
-            reported_done: 0
+            pending: Map.get(story_counts.by_agent_status, :pending, 0),
+            contracted: Map.get(story_counts.by_agent_status, :contracted, 0),
+            assigned: Map.get(story_counts.by_agent_status, :assigned, 0),
+            implementing: Map.get(story_counts.by_agent_status, :implementing, 0),
+            reported_done: Map.get(story_counts.by_agent_status, :reported_done, 0)
           },
           stories_by_verified_status: %{
-            unverified: 0,
-            verified: 0,
-            rejected: 0
+            unverified: Map.get(story_counts.by_verified_status, :unverified, 0),
+            verified: Map.get(story_counts.by_verified_status, :verified, 0),
+            rejected: Map.get(story_counts.by_verified_status, :rejected, 0)
           },
-          total_epics: 0,
-          epics_completed: 0,
-          verification_percentage: 0.0,
-          estimated_hours_total: 0,
-          estimated_hours_completed: 0
+          total_epics: total_epics,
+          epics_completed: epics_completed,
+          verification_percentage: verification_percentage,
+          estimated_hours_total: hours.total,
+          estimated_hours_completed: hours.completed
         }
 
         {:ok, progress}
@@ -341,6 +356,26 @@ defmodule Loopctl.Projects do
     AdminRepo.aggregate(query, :count, :id)
   end
 
+  @doc """
+  Counts epics for a project within a tenant.
+  """
+  @spec count_epics(Ecto.UUID.t(), Ecto.UUID.t()) :: non_neg_integer()
+  def count_epics(tenant_id, project_id) do
+    Epic
+    |> where([e], e.tenant_id == ^tenant_id and e.project_id == ^project_id)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  @doc """
+  Counts stories for a project within a tenant.
+  """
+  @spec count_stories(Ecto.UUID.t(), Ecto.UUID.t()) :: non_neg_integer()
+  def count_stories(tenant_id, project_id) do
+    Story
+    |> where([s], s.tenant_id == ^tenant_id and s.project_id == ^project_id)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
   # --- Private helpers ---
 
   defp apply_filters(query, opts) do
@@ -362,5 +397,73 @@ defmodule Loopctl.Projects do
   defp get_project_limit(tenant_id) do
     tenant = AdminRepo.get!(Tenant, tenant_id)
     Map.get(tenant.settings, "max_projects", 50)
+  end
+
+  defp count_stories_by_status(tenant_id, project_id) do
+    agent_counts =
+      from(s in Story,
+        where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        group_by: s.agent_status,
+        select: {s.agent_status, count(s.id)}
+      )
+      |> AdminRepo.all()
+      |> Enum.into(%{})
+
+    verified_counts =
+      from(s in Story,
+        where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        group_by: s.verified_status,
+        select: {s.verified_status, count(s.id)}
+      )
+      |> AdminRepo.all()
+      |> Enum.into(%{})
+
+    %{by_agent_status: agent_counts, by_verified_status: verified_counts}
+  end
+
+  defp estimate_hours(tenant_id, project_id) do
+    total =
+      from(s in Story,
+        where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        select: coalesce(sum(s.estimated_hours), 0)
+      )
+      |> AdminRepo.one()
+
+    completed =
+      from(s in Story,
+        where:
+          s.tenant_id == ^tenant_id and s.project_id == ^project_id and
+            s.verified_status == :verified,
+        select: coalesce(sum(s.estimated_hours), 0)
+      )
+      |> AdminRepo.one()
+
+    %{total: decimal_to_number(total), completed: decimal_to_number(completed)}
+  end
+
+  defp decimal_to_number(%Decimal{} = d), do: Decimal.to_float(d)
+  defp decimal_to_number(val) when is_number(val), do: val
+  defp decimal_to_number(_), do: 0
+
+  defp count_completed_epics(tenant_id, project_id) do
+    # An epic is "completed" when all its stories are verified
+    epic_ids =
+      from(e in Epic,
+        where: e.tenant_id == ^tenant_id and e.project_id == ^project_id,
+        select: e.id
+      )
+      |> AdminRepo.all()
+
+    Enum.count(epic_ids, fn epic_id ->
+      story_count =
+        from(s in Story, where: s.epic_id == ^epic_id)
+        |> AdminRepo.aggregate(:count, :id)
+
+      verified_count =
+        from(s in Story, where: s.epic_id == ^epic_id and s.verified_status == :verified)
+        |> AdminRepo.aggregate(:count, :id)
+
+      story_count > 0 and story_count == verified_count
+    end)
   end
 end

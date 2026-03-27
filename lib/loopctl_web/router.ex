@@ -68,5 +68,12 @@ defmodule LoopctlWeb.Router do
     patch "/epics/:id", EpicController, :update
     delete "/epics/:id", EpicController, :delete
     get "/epics/:id/progress", EpicController, :progress
+
+    # Story management
+    get "/epics/:epic_id/stories", StoryController, :index
+    post "/epics/:epic_id/stories", StoryController, :create
+    get "/stories/:id", StoryController, :show
+    patch "/stories/:id", StoryController, :update
+    delete "/stories/:id", StoryController, :delete
   end
 end

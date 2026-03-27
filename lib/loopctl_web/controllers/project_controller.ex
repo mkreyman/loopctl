@@ -94,11 +94,13 @@ defmodule LoopctlWeb.ProjectController do
 
     case Projects.get_project(tenant_id, project_id) do
       {:ok, project} ->
-        # NOTE(Epic 6): Replace with actual counts when Epic/Story schemas exist.
+        epic_count = Projects.count_epics(tenant_id, project_id)
+        story_count = Projects.count_stories(tenant_id, project_id)
+
         json(conn, %{
           project:
             project_json(project)
-            |> Map.merge(%{epic_count: 0, story_count: 0})
+            |> Map.merge(%{epic_count: epic_count, story_count: story_count})
         })
 
       {:error, :not_found} ->
