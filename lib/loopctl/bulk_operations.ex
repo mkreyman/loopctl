@@ -35,8 +35,8 @@ defmodule Loopctl.BulkOperations do
   @doc """
   Claims multiple stories for an agent.
 
-  Each story is processed independently. Stories must be in `pending` status
-  with all dependencies satisfied.
+  Each story is processed independently. Stories must be in `contracted` status
+  (matching individual claim_story) with all dependencies satisfied.
 
   ## Parameters
 
@@ -269,8 +269,8 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp validate_claim_preconditions(story) do
-    if story.agent_status != :pending do
-      {:error, "Story is not in pending status (current: #{story.agent_status})"}
+    if story.agent_status != :contracted do
+      {:error, "Story is not in contracted status (current: #{story.agent_status})"}
     else
       check_story_dependencies_satisfied(story)
     end
@@ -402,40 +402,62 @@ defmodule Loopctl.BulkOperations do
   # ===================================================================
 
   defp create_verification_result(tenant_id, story, orchestrator_agent_id, params) do
+    require Logger
     iteration = count_verifications(tenant_id, story.id) + 1
 
-    %VerificationResult{
-      tenant_id: tenant_id,
-      story_id: story.id,
-      orchestrator_agent_id: orchestrator_agent_id
-    }
-    |> VerificationResult.create_changeset(%{
-      result: :pass,
-      summary: params["summary"] || params[:summary] || "Verified via bulk operation",
-      findings: params["findings"] || params[:findings] || %{},
-      review_type: params["review_type"] || "bulk_verify",
-      iteration: iteration
-    })
-    |> AdminRepo.insert!()
+    case %VerificationResult{
+           tenant_id: tenant_id,
+           story_id: story.id,
+           orchestrator_agent_id: orchestrator_agent_id
+         }
+         |> VerificationResult.create_changeset(%{
+           result: :pass,
+           summary: params["summary"] || params[:summary] || "Verified via bulk operation",
+           findings: params["findings"] || params[:findings] || %{},
+           review_type: params["review_type"] || "bulk_verify",
+           iteration: iteration
+         })
+         |> AdminRepo.insert() do
+      {:ok, result} ->
+        result
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create verification result for story #{story.id}: #{inspect(reason)}"
+        )
+
+        nil
+    end
   end
 
   defp create_rejection_result(tenant_id, story, orchestrator_agent_id, params) do
+    require Logger
     reason = params["reason"] || params[:reason]
     iteration = count_verifications(tenant_id, story.id) + 1
 
-    %VerificationResult{
-      tenant_id: tenant_id,
-      story_id: story.id,
-      orchestrator_agent_id: orchestrator_agent_id
-    }
-    |> VerificationResult.create_changeset(%{
-      result: :fail,
-      summary: reason,
-      findings: params["findings"] || params[:findings] || %{},
-      review_type: params["review_type"] || "bulk_reject",
-      iteration: iteration
-    })
-    |> AdminRepo.insert!()
+    case %VerificationResult{
+           tenant_id: tenant_id,
+           story_id: story.id,
+           orchestrator_agent_id: orchestrator_agent_id
+         }
+         |> VerificationResult.create_changeset(%{
+           result: :fail,
+           summary: reason,
+           findings: params["findings"] || params[:findings] || %{},
+           review_type: params["review_type"] || "bulk_reject",
+           iteration: iteration
+         })
+         |> AdminRepo.insert() do
+      {:ok, result} ->
+        result
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create rejection result for story #{story.id}: #{inspect(reason)}"
+        )
+
+        nil
+    end
   end
 
   defp count_verifications(tenant_id, story_id) do
@@ -551,27 +573,31 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp emit_story_event(tenant_id, event_type, story, payload) do
+    require Logger
     webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, story.project_id)
 
     Enum.each(webhooks, fn webhook ->
-      {:ok, event} =
-        %WebhookEvent{
-          tenant_id: tenant_id,
-          webhook_id: webhook.id
-        }
-        |> WebhookEvent.create_changeset(%{
-          event_type: event_type,
-          payload: payload
-        })
-        |> AdminRepo.insert()
-
-      {:ok, _job} =
-        WebhookDeliveryWorker.new(%{
-          webhook_event_id: event.id,
-          tenant_id: tenant_id
-        })
-        |> Oban.insert()
+      emit_single_webhook_event(tenant_id, webhook, event_type, payload)
     end)
+  end
+
+  defp emit_single_webhook_event(tenant_id, webhook, event_type, payload) do
+    require Logger
+
+    with {:ok, event} <-
+           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
+           |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
+           |> AdminRepo.insert(),
+         {:ok, _job} <-
+           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
+           |> Oban.insert() do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
+        )
+    end
   end
 
   # ===================================================================

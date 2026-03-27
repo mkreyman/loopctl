@@ -84,6 +84,9 @@ defmodule Loopctl.Webhooks do
 
         {:error, :webhook, changeset, _} ->
           {:error, changeset}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
       end
     end
   end
@@ -254,6 +257,7 @@ defmodule Loopctl.Webhooks do
 
       case AdminRepo.transaction(multi) do
         {:ok, %{webhook: deleted}} -> {:ok, deleted}
+        {:error, _step, reason, _changes} -> {:error, reason}
       end
     end
   end
@@ -312,17 +316,16 @@ defmodule Loopctl.Webhooks do
         Multi.new()
         |> Multi.insert(:event, changeset)
         |> Multi.run(:oban_job, fn _repo, %{event: event} ->
-          job =
-            WebhookDeliveryWorker.new(%{
-              webhook_event_id: event.id,
-              tenant_id: tenant_id
-            })
-
-          Oban.insert(job)
+          WebhookDeliveryWorker.new(%{
+            webhook_event_id: event.id,
+            tenant_id: tenant_id
+          })
+          |> Oban.insert()
         end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{event: event}} -> {:ok, event}
+        {:error, _step, reason, _changes} -> {:error, reason}
       end
     end
   end

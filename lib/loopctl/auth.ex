@@ -25,6 +25,7 @@ defmodule Loopctl.Auth do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.IdempotencyCache
   alias Loopctl.Tenants.Tenant
@@ -79,6 +80,38 @@ defmodule Loopctl.Auth do
           |> Ecto.Changeset.put_change(:key_prefix, key_prefix)
 
         AdminRepo.insert(changeset)
+      end)
+      |> Audit.log_in_multi(:audit_tenant, fn %{tenant: tenant} ->
+        %{
+          tenant_id: tenant.id,
+          entity_type: "tenant",
+          entity_id: tenant.id,
+          action: "registered",
+          actor_type: "system",
+          actor_id: nil,
+          actor_label: "system:registration",
+          new_state: %{
+            "name" => tenant.name,
+            "slug" => tenant.slug,
+            "email" => tenant.email
+          }
+        }
+      end)
+      |> Audit.log_in_multi(:audit_api_key, fn %{tenant: tenant, api_key: api_key} ->
+        %{
+          tenant_id: tenant.id,
+          entity_type: "api_key",
+          entity_id: api_key.id,
+          action: "created",
+          actor_type: "system",
+          actor_id: nil,
+          actor_label: "system:registration",
+          new_state: %{
+            "name" => api_key.name,
+            "role" => to_string(api_key.role),
+            "key_prefix" => api_key.key_prefix
+          }
+        }
       end)
 
     multi =

@@ -418,57 +418,66 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    with {:ok, story} <- get_story(tenant_id, story_id),
-         :ok <- validate_unclaim(story, agent_id) do
-      changeset =
-        Ecto.Changeset.change(story, %{
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        case validate_unclaim(story, agent_id) do
+          :ok -> {:ok, story}
+          error -> error
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        story
+        |> Ecto.Changeset.change(%{
           agent_status: :pending,
           assigned_agent_id: nil,
           assigned_at: nil,
           reported_done_at: nil
         })
-
-      multi =
-        Multi.new()
-        |> Multi.update(:story, changeset)
-        |> Audit.log_in_multi(:audit, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "story",
-            entity_id: updated.id,
-            action: "status_changed",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{
-              "agent_status" => to_string(story.agent_status),
-              "assigned_agent_id" => story.assigned_agent_id
-            },
-            new_state: %{"agent_status" => "pending", "agent_id" => agent_id}
+        |> AdminRepo.update()
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "status_changed",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{
+            "agent_status" => to_string(old.agent_status),
+            "assigned_agent_id" => old.assigned_agent_id
+          },
+          new_state: %{"agent_status" => "pending", "agent_id" => agent_id}
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.status_changed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.status_changed",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => "pending",
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
-        end)
-        |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            event_type: "story.status_changed",
-            project_id: updated.project_id,
-            payload: %{
-              "event" => "story.status_changed",
-              "story_id" => updated.id,
-              "project_id" => updated.project_id,
-              "epic_id" => updated.epic_id,
-              "old_status" => to_string(story.agent_status),
-              "new_status" => "pending",
-              "agent_id" => agent_id,
-              "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-            }
-          }
-        end)
+        }
+      end)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, :story, changeset, _} -> {:error, changeset}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
 
@@ -671,29 +680,27 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    with {:ok, story} <- get_story(tenant_id, story_id) do
-      # Idempotent: if already pending, return as-is
-      if story.agent_status == :pending do
-        {:ok, story}
-      else
-        apply_force_unclaim(story, tenant_id, orchestrator_agent_id, actor_id, actor_label)
-      end
-    end
-  end
-
-  defp apply_force_unclaim(story, tenant_id, orch_agent_id, actor_id, actor_label) do
-    changeset =
-      Ecto.Changeset.change(story, %{
-        agent_status: :pending,
-        assigned_agent_id: nil,
-        assigned_at: nil,
-        reported_done_at: nil
-      })
-
     multi =
       Multi.new()
-      |> Multi.update(:story, changeset)
-      |> Audit.log_in_multi(:audit, fn %{story: updated} ->
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        # Idempotent: if already pending, return as-is without updating
+        if story.agent_status == :pending do
+          {:ok, story}
+        else
+          story
+          |> Ecto.Changeset.change(%{
+            agent_status: :pending,
+            assigned_agent_id: nil,
+            assigned_at: nil,
+            reported_done_at: nil
+          })
+          |> AdminRepo.update()
+        end
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
           entity_type: "story",
@@ -703,16 +710,16 @@ defmodule Loopctl.Progress do
           actor_id: actor_id,
           actor_label: actor_label,
           old_state: %{
-            "agent_status" => to_string(story.agent_status),
-            "assigned_agent_id" => story.assigned_agent_id
+            "agent_status" => to_string(old.agent_status),
+            "assigned_agent_id" => old.assigned_agent_id
           },
           new_state: %{
             "agent_status" => "pending",
-            "orchestrator_agent_id" => orch_agent_id
+            "orchestrator_agent_id" => orchestrator_agent_id
           }
         }
       end)
-      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
           event_type: "story.force_unclaimed",
@@ -722,9 +729,9 @@ defmodule Loopctl.Progress do
             "story_id" => updated.id,
             "project_id" => updated.project_id,
             "epic_id" => updated.epic_id,
-            "old_status" => to_string(story.agent_status),
+            "old_status" => to_string(old.agent_status),
             "new_status" => "pending",
-            "orchestrator_agent_id" => orch_agent_id,
+            "orchestrator_agent_id" => orchestrator_agent_id,
             "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           }
         }
@@ -732,6 +739,7 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
@@ -976,26 +984,31 @@ defmodule Loopctl.Progress do
   end
 
   defp insert_events_with_delivery(tenant_id, event_type, project_id, payload) do
+    require Logger
+
     EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
     |> Enum.each(fn webhook ->
-      {:ok, event} =
-        %WebhookEvent{
-          tenant_id: tenant_id,
-          webhook_id: webhook.id
-        }
-        |> WebhookEvent.create_changeset(%{
-          event_type: event_type,
-          payload: payload
-        })
-        |> AdminRepo.insert()
-
-      {:ok, _job} =
-        WebhookDeliveryWorker.new(%{
-          webhook_event_id: event.id,
-          tenant_id: tenant_id
-        })
-        |> Oban.insert()
+      insert_single_event_with_delivery(tenant_id, webhook, event_type, payload)
     end)
+  end
+
+  defp insert_single_event_with_delivery(tenant_id, webhook, event_type, payload) do
+    require Logger
+
+    with {:ok, event} <-
+           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
+           |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
+           |> AdminRepo.insert(),
+         {:ok, _job} <-
+           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
+           |> Oban.insert() do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
+        )
+    end
   end
 
   defp extract_verification_params(params) do
@@ -1024,13 +1037,6 @@ defmodule Loopctl.Progress do
   end
 
   # --- Private helpers ---
-
-  defp get_story(tenant_id, story_id) do
-    case AdminRepo.get_by(Story, id: story_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      story -> {:ok, story}
-    end
-  end
 
   defp lock_story(tenant_id, story_id) do
     query =

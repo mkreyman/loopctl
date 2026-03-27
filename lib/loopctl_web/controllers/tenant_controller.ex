@@ -14,6 +14,9 @@ defmodule LoopctlWeb.TenantController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # Agents and orchestrators can view tenant profile but only users+ can modify settings
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
+
   @doc """
   POST /api/v1/tenants/register
 
@@ -50,11 +53,11 @@ defmodule LoopctlWeb.TenantController do
   Returns the current tenant profile based on the authenticated API key.
   """
   def show(conn, _params) do
-    tenant = conn.assigns.current_tenant
-
-    conn
-    |> put_status(:ok)
-    |> json(%{tenant: tenant_json(tenant)})
+    with {:ok, tenant} <- require_tenant(conn) do
+      conn
+      |> put_status(:ok)
+      |> json(%{tenant: tenant_json(tenant)})
+    end
   end
 
   @doc """
@@ -63,16 +66,16 @@ defmodule LoopctlWeb.TenantController do
   Updates the current tenant profile.
   """
   def update(conn, params) do
-    tenant = conn.assigns.current_tenant
+    with {:ok, tenant} <- require_tenant(conn) do
+      case Tenants.update_tenant(tenant, params) do
+        {:ok, updated} ->
+          conn
+          |> put_status(:ok)
+          |> json(%{tenant: tenant_json(updated)})
 
-    case Tenants.update_tenant(tenant, params) do
-      {:ok, updated} ->
-        conn
-        |> put_status(:ok)
-        |> json(%{tenant: tenant_json(updated)})
-
-      {:error, changeset} ->
-        {:error, changeset}
+        {:error, changeset} ->
+          {:error, changeset}
+      end
     end
   end
 
@@ -87,5 +90,12 @@ defmodule LoopctlWeb.TenantController do
       inserted_at: tenant.inserted_at,
       updated_at: tenant.updated_at
     }
+  end
+
+  defp require_tenant(conn) do
+    case conn.assigns[:current_tenant] do
+      %{id: _} = tenant -> {:ok, tenant}
+      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
+    end
   end
 end

@@ -74,6 +74,11 @@ defmodule Loopctl.Webhooks.EventGenerator do
         Enum.map(webhooks, fn webhook ->
           {:ok, event} = insert_webhook_event(tenant_id, webhook.id, event_type, payload)
 
+          # NOTE: Oban.insert/1 is safe inside Multi.run because Ecto checks
+          # out one connection per process — all Repo operations within this
+          # process (including Oban's internal Repo.insert) reuse the Multi's
+          # transaction connection. If the Multi rolls back, the Oban job row
+          # is also rolled back.
           {:ok, _job} =
             WebhookDeliveryWorker.new(%{
               webhook_event_id: event.id,

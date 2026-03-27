@@ -24,9 +24,9 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 
-      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
-      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
-      s3 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
+      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
+      s3 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
 
       conn =
         conn
@@ -66,10 +66,10 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 
-      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
       # story2 is already assigned -- should fail
       s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :assigned})
-      s3 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+      s3 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
 
       conn =
         conn
@@ -103,8 +103,8 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 
-      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
-      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+      s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
+      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :contracted})
 
       # s2 depends on s1 (s1 not verified yet)
       fixture(:story_dependency, %{
@@ -142,7 +142,9 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
 
       project_b = fixture(:project, %{tenant_id: tenant_b.id})
       epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id})
-      s_b = fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id, agent_status: :pending})
+
+      s_b =
+        fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id, agent_status: :contracted})
 
       conn =
         conn

@@ -22,31 +22,31 @@ defmodule LoopctlWeb.AuditController do
   project_id, from, to, page, page_size.
   """
   def index(conn, params) do
-    tenant_id = conn.assigns.current_tenant.id
+    with {:ok, tenant_id} <- require_tenant(conn) do
+      opts =
+        []
+        |> maybe_put(:entity_type, params["entity_type"])
+        |> maybe_put(:entity_id, params["entity_id"])
+        |> maybe_put(:action, params["action"])
+        |> maybe_put(:actor_type, params["actor_type"])
+        |> maybe_put(:actor_id, params["actor_id"])
+        |> maybe_put(:project_id, params["project_id"])
+        |> maybe_put_datetime(:from, params["from"])
+        |> maybe_put_datetime(:to, params["to"])
+        |> maybe_put_integer(:page, params["page"])
+        |> maybe_put_integer(:page_size, params["page_size"])
 
-    opts =
-      []
-      |> maybe_put(:entity_type, params["entity_type"])
-      |> maybe_put(:entity_id, params["entity_id"])
-      |> maybe_put(:action, params["action"])
-      |> maybe_put(:actor_type, params["actor_type"])
-      |> maybe_put(:actor_id, params["actor_id"])
-      |> maybe_put(:project_id, params["project_id"])
-      |> maybe_put_datetime(:from, params["from"])
-      |> maybe_put_datetime(:to, params["to"])
-      |> maybe_put_integer(:page, params["page"])
-      |> maybe_put_integer(:page_size, params["page_size"])
+      {:ok, result} = Audit.list_entries(tenant_id, opts)
 
-    {:ok, result} = Audit.list_entries(tenant_id, opts)
-
-    json(conn, %{
-      data: Enum.map(result.data, &entry_json/1),
-      pagination: %{
-        total: result.total,
-        page: result.page,
-        page_size: result.page_size
-      }
-    })
+      json(conn, %{
+        data: Enum.map(result.data, &entry_json/1),
+        pagination: %{
+          total: result.total,
+          page: result.page,
+          page_size: result.page_size
+        }
+      })
+    end
   end
 
   defp entry_json(entry) do
@@ -89,6 +89,13 @@ defmodule LoopctlWeb.AuditController do
     case DateTime.from_iso8601(value) do
       {:ok, dt, _offset} -> Keyword.put(opts, key, dt)
       _ -> opts
+    end
+  end
+
+  defp require_tenant(conn) do
+    case conn.assigns[:current_tenant] do
+      %{id: id} when is_binary(id) -> {:ok, id}
+      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
     end
   end
 end

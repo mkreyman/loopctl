@@ -16,6 +16,10 @@ defmodule LoopctlWeb.ChangeController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  # No RequireRole needed: within :authenticated pipeline, accessible to all
+  # roles including agent. Agents and orchestrators need the change feed for
+  # polling state changes (US-9.1).
+
   @doc """
   GET /api/v1/changes?since=ISO8601
 
@@ -23,9 +27,8 @@ defmodule LoopctlWeb.ChangeController do
   Optional: `project_id`, `entity_type`, `action`
   """
   def index(conn, params) do
-    with {:ok, since} <- parse_since(params["since"]) do
-      tenant_id = conn.assigns.current_tenant.id
-
+    with {:ok, since} <- parse_since(params["since"]),
+         {:ok, tenant_id} <- require_tenant(conn) do
       limit = parse_limit(params["limit"])
 
       opts =
@@ -93,4 +96,11 @@ defmodule LoopctlWeb.ChangeController do
 
   defp format_datetime(nil), do: nil
   defp format_datetime(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+
+  defp require_tenant(conn) do
+    case conn.assigns[:current_tenant] do
+      %{id: id} when is_binary(id) -> {:ok, id}
+      _ -> {:error, :bad_request, "Superadmin must use X-Impersonate-Tenant header"}
+    end
+  end
 end
