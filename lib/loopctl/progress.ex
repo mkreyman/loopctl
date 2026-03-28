@@ -1069,7 +1069,13 @@ defmodule Loopctl.Progress do
     if Map.get(@valid_transitions, current_status) == target_status do
       :ok
     else
-      {:error, :invalid_transition}
+      # Return specific errors for common out-of-order transition attempts
+      case {current_status, target_status} do
+        {:pending, :assigned} -> {:error, :must_contract_first}
+        {:pending, :implementing} -> {:error, :must_contract_first}
+        {:contracted, :implementing} -> {:error, :must_claim_first}
+        _ -> {:error, :invalid_transition}
+      end
     end
   end
 

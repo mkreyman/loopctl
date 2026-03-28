@@ -195,6 +195,14 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
      -d '{"name": "worker-1", "agent_type": "implementer"}'
    ```
 
+> **Note:** Each agent-role API key can register exactly ONE agent (one-to-one binding). Once an agent key has registered an agent, calling `/agents/register` again with the same key returns 409. To register multiple agents, create separate agent keys for each:
+> ```bash
+> # Create keys for 2 implementation agents + 1 orchestrator bootstrap
+> curl -X POST .../api_keys -d '{"name": "worker-1", "role": "agent"}'
+> curl -X POST .../api_keys -d '{"name": "worker-2", "role": "agent"}'
+> curl -X POST .../api_keys -d '{"name": "orch-bootstrap", "role": "agent"}'
+> ```
+
 Now the agent key can contract, claim, start, and report stories. The orchestrator key (linked to its agent) can verify and reject stories.
 
 ### Typical Agent Workflow
@@ -376,10 +384,12 @@ Every webhook delivery is a JSON POST with the following envelope. The `data` fi
   "epic_id": "c3d4e5f6-...",
   "orchestrator_agent_id": "e5f6a7b8-...",
   "reason": "Missing test coverage for edge cases",
-  "findings": ["No test for empty input", "Missing error handling"],
+  "findings": {"missing_tests": ["empty input handling", "error boundary"]},
   "timestamp": "2026-03-27T15:00:00Z"
 }
 ```
+
+The `findings` field is a map (object) matching whatever the orchestrator passed in the reject request body. It defaults to `{}` if omitted.
 
 Payloads are signed with HMAC-SHA256 using the webhook's secret. Verify the `X-Loopctl-Signature` header to authenticate delivery.
 

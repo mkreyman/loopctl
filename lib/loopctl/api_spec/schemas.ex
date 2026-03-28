@@ -502,6 +502,82 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  # ---------- Verification / Rejection ----------
+
+  defmodule VerifyRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "VerifyRequest",
+      description: "Orchestrator verifies a reported_done story",
+      type: :object,
+      properties: %{
+        result: %Schema{
+          type: :string,
+          enum: ["pass", "partial"],
+          default: "pass",
+          description: "Verification result: pass (full) or partial"
+        },
+        summary: %Schema{
+          type: :string,
+          description: "Human-readable summary of the verification",
+          example: "All ACs met"
+        },
+        findings: %Schema{
+          type: :object,
+          additionalProperties: true,
+          description: "Structured findings from the review"
+        },
+        review_type: %Schema{
+          type: :string,
+          description: "Type of review performed (e.g. enhanced_review, quick_check)",
+          example: "enhanced_review"
+        }
+      },
+      example: %{
+        result: "pass",
+        summary: "All ACs met",
+        findings: %{},
+        review_type: "enhanced_review"
+      }
+    })
+  end
+
+  defmodule RejectRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RejectRequest",
+      description: "Orchestrator rejects a story with reason",
+      type: :object,
+      required: [:reason],
+      properties: %{
+        reason: %Schema{
+          type: :string,
+          description: "Rejection reason (required, cannot be blank)",
+          example: "Missing LiveView tests"
+        },
+        findings: %Schema{
+          type: :object,
+          additionalProperties: true,
+          description: "Structured findings from the review"
+        },
+        review_type: %Schema{
+          type: :string,
+          description: "Type of review performed (e.g. enhanced_review, quick_check)",
+          example: "enhanced_review"
+        }
+      },
+      example: %{
+        reason: "Missing LiveView tests",
+        findings: %{missing_tests: ["empty input handling", "error boundary"]},
+        review_type: "enhanced_review"
+      }
+    })
+  end
+
   # ---------- Artifacts ----------
 
   defmodule ArtifactReportRequest do

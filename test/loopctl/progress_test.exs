@@ -111,7 +111,7 @@ defmodule Loopctl.ProgressTest do
     test "rejects from pending (must contract first)" do
       %{tenant: tenant, story: story, agent: agent} = setup_story()
 
-      assert {:error, :invalid_transition} =
+      assert {:error, :must_contract_first} =
                Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
     end
 

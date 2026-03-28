@@ -34,14 +34,7 @@ defmodule LoopctlWeb.StoryVerificationController do
     description:
       "Orchestrator verifies a reported_done story. Creates verification_result with result=pass.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
-    request_body:
-      {"Verification params", "application/json",
-       %OpenApiSpex.Schema{
-         type: :object,
-         properties: %{
-           notes: %OpenApiSpex.Schema{type: :string, nullable: true}
-         }
-       }},
+    request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
       200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
@@ -55,15 +48,7 @@ defmodule LoopctlWeb.StoryVerificationController do
     description:
       "Orchestrator rejects a story with reason. Creates verification_result with result=fail.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
-    request_body:
-      {"Rejection params", "application/json",
-       %OpenApiSpex.Schema{
-         type: :object,
-         required: [:reason],
-         properties: %{
-           reason: %OpenApiSpex.Schema{type: :string, description: "Rejection reason (required)"}
-         }
-       }},
+    request_body: {"Rejection params", "application/json", Schemas.RejectRequest},
     responses: %{
       200 => {"Story rejected", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},

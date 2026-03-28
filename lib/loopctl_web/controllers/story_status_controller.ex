@@ -153,6 +153,9 @@ defmodule LoopctlWeb.StoryStatusController do
       {:ok, story} ->
         json(conn, %{story: story})
 
+      {:error, :must_contract_first} ->
+        {:error, :must_contract_first}
+
       {:error, :invalid_transition} ->
         {:error, :conflict}
 
@@ -180,6 +183,12 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
+
+      {:error, :must_contract_first} ->
+        {:error, :must_contract_first}
+
+      {:error, :must_claim_first} ->
+        {:error, :must_claim_first}
 
       {:error, :invalid_transition} ->
         {:error, :conflict}
