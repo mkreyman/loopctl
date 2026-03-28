@@ -1,5 +1,10 @@
 # loopctl
 
+[![CI](https://github.com/mkreyman/loopctl/actions/workflows/ci.yml/badge.svg)](https://github.com/mkreyman/loopctl/actions/workflows/ci.yml)
+![Elixir](https://img.shields.io/badge/Elixir-1.18-purple)
+![Phoenix](https://img.shields.io/badge/Phoenix-1.8-orange)
+![License](https://img.shields.io/badge/License-MIT-green)
+
 An open-source, agent-native project state store for AI development loops.
 
 loopctl provides a multi-tenant REST API and CLI for AI coding agents and orchestrators to track project work breakdown, report progress, verify deliverables, and maintain audit trails. It solves the problem of AI agents fabricating results by separating self-reported progress from independently verified progress.
@@ -299,6 +304,121 @@ Subscribe to real-time notifications for these event types:
 | `project.imported` | Work breakdown imported into a project |
 | `webhook.test` | Manual test ping via POST /webhooks/:id/test |
 
+#### Webhook Payloads
+
+Every webhook delivery is a JSON POST with the following envelope. The `data` fields vary by event type.
+
+**`story.status_changed`** -- fired on contract, claim, start, report:
+
+```json
+{
+  "event": "story.status_changed",
+  "story_id": "a1b2c3d4-...",
+  "project_id": "b2c3d4e5-...",
+  "epic_id": "c3d4e5f6-...",
+  "old_status": "pending",
+  "new_status": "contracted",
+  "agent_id": "d4e5f6a7-...",
+  "timestamp": "2026-03-27T12:00:00Z"
+}
+```
+
+**`story.verified`** -- fired when orchestrator verifies a story:
+
+```json
+{
+  "event": "story.verified",
+  "story_id": "a1b2c3d4-...",
+  "project_id": "b2c3d4e5-...",
+  "epic_id": "c3d4e5f6-...",
+  "orchestrator_agent_id": "e5f6a7b8-...",
+  "summary": "All acceptance criteria met",
+  "timestamp": "2026-03-27T14:00:00Z"
+}
+```
+
+**`story.rejected`** -- fired when orchestrator rejects a story:
+
+```json
+{
+  "event": "story.rejected",
+  "story_id": "a1b2c3d4-...",
+  "project_id": "b2c3d4e5-...",
+  "epic_id": "c3d4e5f6-...",
+  "orchestrator_agent_id": "e5f6a7b8-...",
+  "reason": "Missing test coverage for edge cases",
+  "findings": ["No test for empty input", "Missing error handling"],
+  "timestamp": "2026-03-27T15:00:00Z"
+}
+```
+
+Payloads are signed with HMAC-SHA256 using the webhook's secret. Verify the `X-Loopctl-Signature` header to authenticate delivery.
+
+### Rate Limiting
+
+API requests are rate-limited per API key and per tenant:
+
+- **Per key:** 300 requests/minute (configurable via tenant settings)
+- **Per tenant:** 3x the per-key limit (aggregate across all keys)
+- **Registration:** 5 requests/hour per IP address
+- **Superadmin:** exempt from rate limiting
+
+Rate limit headers are included in every authenticated response:
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | Requests allowed per window |
+| `X-RateLimit-Remaining` | Requests remaining in current window |
+| `X-RateLimit-Reset` | Unix timestamp when the window resets |
+
+429 responses include a `Retry-After` header with seconds until the window resets.
+
+### Pagination
+
+All list endpoints support page-based pagination:
+
+- `?page=1&page_size=20` (defaults)
+- Maximum `page_size`: 100
+
+Responses include metadata:
+
+```json
+{
+  "data": [...],
+  "meta": {
+    "page": 1,
+    "page_size": 20,
+    "total_count": 42,
+    "total_pages": 3
+  }
+}
+```
+
+The change feed (`GET /api/v1/changes`) uses cursor-based pagination with `?since=<ISO8601>`. Responses include `has_more` and `next_since` for continuation.
+
+### Error Responses
+
+All errors follow a consistent envelope format:
+
+```json
+{"error": {"message": "Not found", "status": 404}}
+```
+
+Validation errors include field-level details:
+
+```json
+{
+  "error": {
+    "message": "Validation failed",
+    "status": 422,
+    "details": {
+      "slug": ["has already been taken"],
+      "email": ["can't be blank"]
+    }
+  }
+}
+```
+
 ## CLI
 
 The CLI is an escript binary that wraps the REST API:
@@ -373,6 +493,55 @@ loopctl deploys as a 3-container Docker Compose stack:
 | nginx | nginx:alpine | 8443 (HTTPS), 8080 (HTTP redirect) |
 
 See [deploy/](deploy/) for nginx config, systemd service, backup scripts, and setup guide.
+
+## Troubleshooting
+
+### `mix setup` fails with "role loopctl_app does not exist"
+
+Create the RLS role used by tests:
+
+```bash
+psql -U postgres -c "CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app_pass';"
+```
+
+### Health check returns `{"oban":"error"}`
+
+Run pending migrations and restart the app:
+
+```bash
+docker compose exec -T app /app/bin/migrate
+docker compose restart app
+```
+
+### Agent gets 403 on `/stories/:id/claim`
+
+The claim endpoint requires `exact_role: :agent`. User and orchestrator keys cannot claim stories. Create an agent key:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/api_keys \
+  -H "Authorization: Bearer lc_user_key" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "worker-1", "role": "agent"}'
+```
+
+### Import returns 422 with validation errors
+
+Story numbers must be plain strings like `"1.1"` (no `"US-"` prefix). Epic numbers are integers. Dependencies use number references:
+
+```json
+{"story": "1.1", "depends_on": "1.2"}
+{"epic": 1, "depends_on": 2}
+```
+
+### Superadmin gets 403 on tenant-scoped endpoints
+
+Superadmin keys are tenant-less. Use the `X-Impersonate-Tenant` header for tenant-scoped endpoints:
+
+```bash
+curl http://localhost:4000/api/v1/projects \
+  -H "Authorization: Bearer lc_superadmin_key" \
+  -H "X-Impersonate-Tenant: <tenant_id>"
+```
 
 ## License
 

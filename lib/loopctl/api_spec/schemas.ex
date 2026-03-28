@@ -590,6 +590,111 @@ defmodule Loopctl.ApiSpec.Schemas do
 
   # ---------- Import/Export ----------
 
+  defmodule AcceptanceCriterion do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AcceptanceCriterion",
+      description: "A single acceptance criterion",
+      type: :object,
+      required: [:criterion],
+      properties: %{
+        criterion: %Schema{type: :string, description: "Acceptance criterion text"}
+      }
+    })
+  end
+
+  defmodule ImportStory do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ImportStory",
+      description: "Story within an import epic",
+      type: :object,
+      required: [:number, :title],
+      properties: %{
+        number: %Schema{
+          type: :string,
+          description: "Story number (e.g. \"1.1\")",
+          example: "1.1"
+        },
+        title: %Schema{type: :string, example: "Implement login endpoint"},
+        description: %Schema{type: :string, nullable: true},
+        acceptance_criteria: %Schema{
+          type: :array,
+          items: AcceptanceCriterion,
+          nullable: true,
+          description: "List of acceptance criteria"
+        },
+        estimated_hours: %Schema{type: :number, nullable: true, example: 4.0},
+        depends_on_stories: %Schema{
+          type: :array,
+          items: %Schema{type: :string},
+          nullable: true,
+          description: "Story numbers this story depends on"
+        }
+      }
+    })
+  end
+
+  defmodule ImportEpic do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ImportEpic",
+      description: "Epic within an import payload",
+      type: :object,
+      required: [:number, :title],
+      properties: %{
+        number: %Schema{type: :integer, description: "Epic number", example: 1},
+        title: %Schema{type: :string, example: "User Authentication"},
+        description: %Schema{type: :string, nullable: true},
+        phase: %Schema{type: :string, nullable: true},
+        position: %Schema{type: :integer, nullable: true},
+        stories: %Schema{
+          type: :array,
+          items: ImportStory,
+          description: "Stories nested under this epic"
+        }
+      }
+    })
+  end
+
+  defmodule ImportEpicDependency do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ImportEpicDependency",
+      description: "Epic-level dependency declaration",
+      type: :object,
+      required: [:epic, :depends_on],
+      properties: %{
+        epic: %Schema{type: :integer, description: "Epic number", example: 2},
+        depends_on: %Schema{type: :integer, description: "Depends-on epic number", example: 1}
+      }
+    })
+  end
+
+  defmodule ImportStoryDependency do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ImportStoryDependency",
+      description: "Story-level dependency declaration",
+      type: :object,
+      required: [:story, :depends_on],
+      properties: %{
+        story: %Schema{type: :string, description: "Story number", example: "1.2"},
+        depends_on: %Schema{type: :string, description: "Depends-on story number", example: "1.1"}
+      }
+    })
+  end
+
   defmodule ImportRequest do
     @moduledoc false
     require OpenApiSpex
@@ -602,18 +707,18 @@ defmodule Loopctl.ApiSpec.Schemas do
       properties: %{
         epics: %Schema{
           type: :array,
-          items: %Schema{type: :object, additionalProperties: true},
+          items: ImportEpic,
           description: "Array of epic objects with nested stories"
         },
         story_dependencies: %Schema{
           type: :array,
-          items: %Schema{type: :object, additionalProperties: true},
+          items: ImportStoryDependency,
           description: "Optional cross-story dependencies",
           nullable: true
         },
         epic_dependencies: %Schema{
           type: :array,
-          items: %Schema{type: :object, additionalProperties: true},
+          items: ImportEpicDependency,
           description: "Optional cross-epic dependencies",
           nullable: true
         }
@@ -650,18 +755,122 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ExportMetadata do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ExportMetadata",
+      description: "Metadata about the export",
+      type: :object,
+      properties: %{
+        exported_at: %Schema{type: :string, format: :"date-time"},
+        loopctl_version: %Schema{type: :string},
+        project_id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid}
+      }
+    })
+  end
+
+  defmodule ExportProject do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ExportProject",
+      description: "Project metadata in an export",
+      type: :object,
+      properties: %{
+        name: %Schema{type: :string},
+        slug: %Schema{type: :string},
+        description: %Schema{type: :string, nullable: true},
+        repo_url: %Schema{type: :string, nullable: true},
+        tech_stack: %Schema{type: :string, nullable: true},
+        status: %Schema{type: :string, enum: ["active", "archived"]},
+        metadata: %Schema{type: :object, additionalProperties: true}
+      }
+    })
+  end
+
+  defmodule ExportStory do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ExportStory",
+      description: "Story within an export epic",
+      type: :object,
+      properties: %{
+        number: %Schema{type: :string, example: "1.1"},
+        title: %Schema{type: :string},
+        description: %Schema{type: :string, nullable: true},
+        acceptance_criteria: %Schema{
+          type: :array,
+          items: AcceptanceCriterion,
+          nullable: true
+        },
+        estimated_hours: %Schema{type: :number, nullable: true},
+        agent_status: %Schema{
+          type: :string,
+          enum: ["pending", "contracted", "assigned", "implementing", "reported_done"]
+        },
+        verified_status: %Schema{
+          type: :string,
+          enum: ["unverified", "verified", "rejected"]
+        },
+        assigned_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        assigned_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        reported_done_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        verified_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        rejected_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        rejection_reason: %Schema{type: :string, nullable: true},
+        metadata: %Schema{type: :object, additionalProperties: true}
+      }
+    })
+  end
+
+  defmodule ExportEpic do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ExportEpic",
+      description: "Epic within an export payload",
+      type: :object,
+      properties: %{
+        number: %Schema{type: :integer},
+        title: %Schema{type: :string},
+        description: %Schema{type: :string, nullable: true},
+        phase: %Schema{type: :string, nullable: true},
+        position: %Schema{type: :integer},
+        metadata: %Schema{type: :object, additionalProperties: true},
+        stories: %Schema{type: :array, items: ExportStory}
+      }
+    })
+  end
+
   defmodule ExportResponse do
     @moduledoc false
     require OpenApiSpex
 
     OpenApiSpex.schema(%{
       title: "ExportResponse",
-      description: "Complete project export",
+      description: "Complete project export with round-trip fidelity",
       type: :object,
       properties: %{
-        project: %Schema{type: :object, additionalProperties: true},
-        epics: %Schema{type: :array, items: %Schema{type: :object, additionalProperties: true}},
-        dependencies: %Schema{type: :object, additionalProperties: true}
+        export_metadata: ExportMetadata,
+        project: ExportProject,
+        epics: %Schema{type: :array, items: ExportEpic},
+        story_dependencies: %Schema{
+          type: :array,
+          items: ImportStoryDependency,
+          description: "Story-level dependencies using story numbers"
+        },
+        epic_dependencies: %Schema{
+          type: :array,
+          items: ImportEpicDependency,
+          description: "Epic-level dependencies using epic numbers"
+        }
       }
     })
   end
@@ -735,6 +944,31 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule BulkStoryResult do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "BulkStoryResult",
+      description: "Result of a single story in a bulk operation",
+      type: :object,
+      required: [:story_id, :status],
+      properties: %{
+        story_id: %Schema{type: :string, format: :uuid, description: "The story ID"},
+        status: %Schema{
+          type: :string,
+          enum: ["success", "error"],
+          description: "Whether this story's operation succeeded"
+        },
+        error: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Error message if status is \"error\""
+        }
+      }
+    })
+  end
+
   defmodule BulkResultResponse do
     @moduledoc false
     require OpenApiSpex
@@ -743,18 +977,23 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "BulkResultResponse",
       description: "Per-story results from a bulk operation",
       type: :object,
+      required: [:results],
       properties: %{
         results: %Schema{
           type: :array,
-          items: %Schema{
-            type: :object,
-            properties: %{
-              story_id: %Schema{type: :string, format: :uuid},
-              status: %Schema{type: :string, enum: ["success", "error"]},
-              error: %Schema{type: :string, nullable: true}
-            }
-          }
+          items: BulkStoryResult,
+          description: "One result per story in the request"
         }
+      },
+      example: %{
+        results: [
+          %{story_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890", status: "success", error: nil},
+          %{
+            story_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+            status: "error",
+            error: "Story is not in reported_done status"
+          }
+        ]
       }
     })
   end
