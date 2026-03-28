@@ -37,7 +37,8 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story contracted", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
-      422 => {"Mismatch", "application/json", Schemas.ErrorResponse}
+      422 => {"Mismatch", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -49,7 +50,8 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse}
+        {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -61,7 +63,8 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story started", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -89,7 +92,8 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story reported done", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -101,7 +105,8 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

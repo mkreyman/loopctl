@@ -30,7 +30,8 @@ defmodule LoopctlWeb.ProjectController do
     request_body: {"Project params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       201 => {"Project created", "application/json", Schemas.ProjectResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -52,7 +53,8 @@ defmodule LoopctlWeb.ProjectController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.ProjectResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -62,7 +64,8 @@ defmodule LoopctlWeb.ProjectController do
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     responses: %{
       200 => {"Project detail", "application/json", Schemas.ProjectResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -74,7 +77,8 @@ defmodule LoopctlWeb.ProjectController do
     responses: %{
       200 => {"Updated project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -84,7 +88,8 @@ defmodule LoopctlWeb.ProjectController do
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     responses: %{
       200 => {"Archived project", "application/json", Schemas.ProjectResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -96,7 +101,8 @@ defmodule LoopctlWeb.ProjectController do
       200 =>
         {"Progress summary", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

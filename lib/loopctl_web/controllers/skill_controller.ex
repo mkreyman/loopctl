@@ -48,7 +48,8 @@ defmodule LoopctlWeb.SkillController do
        }},
     responses: %{
       201 => {"Skill created", "application/json", Schemas.SkillResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -71,7 +72,8 @@ defmodule LoopctlWeb.SkillController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.SkillResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -81,7 +83,8 @@ defmodule LoopctlWeb.SkillController do
     parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
     responses: %{
       200 => {"Skill detail", "application/json", Schemas.SkillResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -95,7 +98,8 @@ defmodule LoopctlWeb.SkillController do
     responses: %{
       200 => {"Updated skill", "application/json", Schemas.SkillResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -105,7 +109,8 @@ defmodule LoopctlWeb.SkillController do
     parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
     responses: %{
       200 => {"Archived skill", "application/json", Schemas.SkillResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -127,7 +132,8 @@ defmodule LoopctlWeb.SkillController do
     responses: %{
       201 => {"Version created", "application/json", Schemas.SkillVersionResponse},
       404 => {"Skill not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -144,7 +150,8 @@ defmodule LoopctlWeb.SkillController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.SkillVersionResponse}
            }
          }},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -158,7 +165,8 @@ defmodule LoopctlWeb.SkillController do
     responses: %{
       200 => {"Version detail", "application/json", Schemas.SkillVersionResponse},
       400 => {"Invalid version", "application/json", Schemas.ErrorResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -181,7 +189,8 @@ defmodule LoopctlWeb.SkillController do
       200 =>
         {"Import summary", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      400 => {"Bad request", "application/json", Schemas.ErrorResponse}
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -193,7 +202,8 @@ defmodule LoopctlWeb.SkillController do
       200 =>
         {"Skill stats", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -209,7 +219,8 @@ defmodule LoopctlWeb.SkillController do
         {"Version results", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       400 => {"Invalid version", "application/json", Schemas.ErrorResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

@@ -37,7 +37,8 @@ defmodule LoopctlWeb.ArtifactReportController do
         {"Artifact created", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -61,7 +62,8 @@ defmodule LoopctlWeb.ArtifactReportController do
              },
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

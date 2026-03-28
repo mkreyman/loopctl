@@ -51,7 +51,8 @@ defmodule LoopctlWeb.StoryController do
     responses: %{
       201 => {"Story created", "application/json", Schemas.StoryResponse},
       404 => {"Epic not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -74,7 +75,8 @@ defmodule LoopctlWeb.StoryController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.StoryResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -84,7 +86,8 @@ defmodule LoopctlWeb.StoryController do
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story detail", "application/json", Schemas.StoryResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -98,7 +101,8 @@ defmodule LoopctlWeb.StoryController do
     responses: %{
       200 => {"Updated story", "application/json", Schemas.StoryResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -108,7 +112,8 @@ defmodule LoopctlWeb.StoryController do
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

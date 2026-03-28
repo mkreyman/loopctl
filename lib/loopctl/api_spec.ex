@@ -6,7 +6,19 @@ defmodule Loopctl.ApiSpec do
   API specification from controller annotations.
   """
 
-  alias OpenApiSpex.{Components, Info, OpenApi, Paths, SecurityScheme, Server}
+  alias OpenApiSpex.{
+    Components,
+    Info,
+    MediaType,
+    OpenApi,
+    Paths,
+    Response,
+    SecurityScheme,
+    Server,
+    Tag
+  }
+
+  alias Loopctl.ApiSpec.Schemas
 
   @behaviour OpenApi
 
@@ -21,7 +33,36 @@ defmodule Loopctl.ApiSpec do
             "Provides multi-tenant project management, work breakdown, " <>
             "two-tier trust model for story verification, and orchestrator state."
       },
-      servers: [%Server{url: "/"}],
+      servers: [
+        %Server{url: "/", description: "Current server"},
+        %Server{url: "http://localhost:4000", description: "Local development"},
+        %Server{url: "https://loopctl.local:8443", description: "Docker/Beelink deployment"}
+      ],
+      tags: [
+        %Tag{name: "Discovery", description: "API discovery and health"},
+        %Tag{name: "Health", description: "Health check endpoints"},
+        %Tag{name: "Tenants", description: "Tenant registration and management"},
+        %Tag{name: "Auth", description: "API key management"},
+        %Tag{name: "Projects", description: "Project CRUD"},
+        %Tag{name: "Epics", description: "Epic CRUD within projects"},
+        %Tag{name: "Stories", description: "Story CRUD within epics"},
+        %Tag{
+          name: "Progress",
+          description: "Two-tier story status management (contract/claim/verify)"
+        },
+        %Tag{
+          name: "Dependencies",
+          description: "Epic and story dependency management with cycle detection"
+        },
+        %Tag{name: "Artifacts", description: "Artifact reports and verification results"},
+        %Tag{name: "Agents", description: "Agent registration and listing"},
+        %Tag{name: "Orchestrator", description: "Orchestrator state checkpointing"},
+        %Tag{name: "Webhooks", description: "Webhook subscriptions and delivery"},
+        %Tag{name: "Import/Export", description: "Bulk import/export of project data"},
+        %Tag{name: "Skills", description: "Skill versioning and performance tracking"},
+        %Tag{name: "Admin", description: "Superadmin tenant management and system stats"},
+        %Tag{name: "Audit", description: "Immutable audit log and change feed"}
+      ],
       paths: Paths.from_router(LoopctlWeb.Router),
       components: %Components{
         securitySchemes: %{
@@ -30,6 +71,14 @@ defmodule Loopctl.ApiSpec do
             scheme: "bearer",
             description:
               "API key obtained from tenant registration (POST /api/v1/tenants/register)"
+          }
+        },
+        responses: %{
+          "RateLimitError" => %Response{
+            description: "Rate limit exceeded. Check Retry-After header for reset time.",
+            content: %{
+              "application/json" => %MediaType{schema: Schemas.RateLimitError}
+            }
           }
         }
       },

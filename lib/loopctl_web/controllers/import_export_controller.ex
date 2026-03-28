@@ -36,7 +36,8 @@ defmodule LoopctlWeb.ImportExportController do
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Project not found", "application/json", Schemas.ErrorResponse},
       409 => {"Conflict", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -46,7 +47,8 @@ defmodule LoopctlWeb.ImportExportController do
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     responses: %{
       200 => {"Export data", "application/json", Schemas.ExportResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

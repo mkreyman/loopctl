@@ -38,7 +38,8 @@ defmodule LoopctlWeb.AdminTenantController do
     responses: %{
       200 =>
         {"Tenant list", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -50,7 +51,8 @@ defmodule LoopctlWeb.AdminTenantController do
       200 =>
         {"Tenant detail", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -66,7 +68,8 @@ defmodule LoopctlWeb.AdminTenantController do
         {"Updated tenant", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -79,7 +82,8 @@ defmodule LoopctlWeb.AdminTenantController do
         {"Tenant suspended", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Already suspended", "application/json", Schemas.ErrorResponse}
+      422 => {"Already suspended", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -92,7 +96,8 @@ defmodule LoopctlWeb.AdminTenantController do
         {"Tenant activated", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Already active", "application/json", Schemas.ErrorResponse}
+      422 => {"Already active", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

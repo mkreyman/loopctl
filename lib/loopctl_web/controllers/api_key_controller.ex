@@ -25,7 +25,8 @@ defmodule LoopctlWeb.ApiKeyController do
     responses: %{
       201 => {"API key created", "application/json", Schemas.ApiKeyResponse},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -43,7 +44,8 @@ defmodule LoopctlWeb.ApiKeyController do
            properties: %{
              api_keys: %OpenApiSpex.Schema{type: :array, items: Schemas.ApiKeyResponse}
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -53,7 +55,8 @@ defmodule LoopctlWeb.ApiKeyController do
     parameters: [id: [in: :path, type: :string, description: "API key UUID"]],
     responses: %{
       200 => {"API key revoked", "application/json", Schemas.ApiKeyResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -80,7 +83,8 @@ defmodule LoopctlWeb.ApiKeyController do
         {"Rotated key", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Cannot rotate", "application/json", Schemas.ErrorResponse}
+      422 => {"Cannot rotate", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

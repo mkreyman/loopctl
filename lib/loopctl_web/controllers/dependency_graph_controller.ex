@@ -37,7 +37,8 @@ defmodule LoopctlWeb.DependencyGraphController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.StoryResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -52,7 +53,8 @@ defmodule LoopctlWeb.DependencyGraphController do
     responses: %{
       200 =>
         {"Blocked stories", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -64,7 +66,8 @@ defmodule LoopctlWeb.DependencyGraphController do
       200 =>
         {"Dependency graph", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

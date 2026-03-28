@@ -44,6 +44,36 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule RateLimitError do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RateLimitError",
+      description: "Rate limit exceeded response",
+      type: :object,
+      properties: %{
+        error: %Schema{
+          type: :object,
+          required: [:status, :message],
+          properties: %{
+            status: %Schema{type: :integer, example: 429},
+            message: %Schema{type: :string, example: "Rate limit exceeded"}
+          }
+        },
+        retry_after: %Schema{
+          type: :integer,
+          description: "Seconds until rate limit resets",
+          example: 45
+        }
+      },
+      example: %{
+        error: %{status: 429, message: "Rate limit exceeded"},
+        retry_after: 45
+      }
+    })
+  end
+
   defmodule PaginationMeta do
     @moduledoc false
     require OpenApiSpex
@@ -93,6 +123,16 @@ defmodule Loopctl.ApiSpec.Schemas do
         status: %Schema{type: :string, enum: ["active", "suspended", "deactivated"]},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        name: "My Org",
+        slug: "my-org",
+        email: "admin@example.com",
+        settings: %{},
+        status: "active",
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -209,6 +249,16 @@ defmodule Loopctl.ApiSpec.Schemas do
         expires_at: %Schema{type: :string, format: :"date-time", nullable: true},
         revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
         inserted_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        name: "default",
+        key_prefix: "lc_abc1",
+        role: "user",
+        last_used_at: "2026-03-25T14:30:00Z",
+        expires_at: nil,
+        revoked_at: nil,
+        inserted_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -264,6 +314,19 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        name: "My Project",
+        slug: "my-project",
+        repo_url: "https://github.com/org/repo",
+        description: "An example project",
+        tech_stack: "elixir,phoenix",
+        status: "active",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -290,6 +353,19 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        number: 1,
+        title: "Foundation",
+        description: "Core infrastructure and setup",
+        phase: "p0",
+        position: 1,
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -342,6 +418,32 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        epic_id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        number: "US-2.1",
+        title: "Implement user authentication",
+        description: "Add login and session management",
+        acceptance_criteria: [
+          %{criterion: "Users can log in with email and password", met: false},
+          %{criterion: "Invalid credentials return 401", met: false}
+        ],
+        estimated_hours: 4.0,
+        agent_status: "pending",
+        verified_status: "unverified",
+        assigned_agent_id: nil,
+        assigned_at: nil,
+        reported_done_at: nil,
+        verified_at: nil,
+        rejected_at: nil,
+        rejection_reason: nil,
+        sort_key: "002.001",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -359,6 +461,15 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :object,
           description: "Updated story state",
           additionalProperties: true
+        }
+      },
+      example: %{
+        story: %{
+          id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+          number: "US-2.1",
+          title: "Implement user authentication",
+          agent_status: "contracted",
+          verified_status: "unverified"
         }
       }
     })
@@ -416,6 +527,39 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ArtifactReportResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ArtifactReportResponse",
+      description: "Artifact report record",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        artifact_type: %Schema{type: :string},
+        path: %Schema{type: :string},
+        exists: %Schema{type: :boolean},
+        details: %Schema{type: :object, additionalProperties: true},
+        reported_by: %Schema{type: :string, enum: ["agent", "orchestrator"]},
+        reporter_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "f2a3b4c5-d6e7-8901-fabc-123456789012",
+        story_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        artifact_type: "file",
+        path: "lib/my_app/auth.ex",
+        exists: true,
+        details: %{line_count: 142},
+        reported_by: "agent",
+        reporter_agent_id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        inserted_at: "2026-03-25T14:30:00Z"
+      }
+    })
+  end
+
   defmodule VerificationResultResponse do
     @moduledoc false
     require OpenApiSpex
@@ -430,6 +574,13 @@ defmodule Loopctl.ApiSpec.Schemas do
         result: %Schema{type: :string, enum: ["pass", "fail"]},
         reason: %Schema{type: :string, nullable: true},
         inserted_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "d0e1f2a3-b4c5-6789-defa-890123456789",
+        story_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        result: "pass",
+        reason: "All acceptance criteria met",
+        inserted_at: "2026-03-25T15:00:00Z"
       }
     })
   end
@@ -471,6 +622,17 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        name: "worker-1",
+        agent_type: "implementer",
+        status: "active",
+        last_seen_at: "2026-03-25T14:30:00Z",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-03-25T14:30:00Z"
       }
     })
   end
@@ -487,9 +649,32 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:url, :events],
       properties: %{
-        url: %Schema{type: :string, format: :uri},
-        events: %Schema{type: :array, items: %Schema{type: :string}},
+        url: %Schema{type: :string, format: :uri, example: "https://example.com/webhook"},
+        events: %Schema{
+          type: :array,
+          items: %Schema{
+            type: :string,
+            enum: [
+              "story.status_changed",
+              "story.verified",
+              "story.rejected",
+              "story.auto_reset",
+              "story.force_unclaimed",
+              "epic.completed",
+              "artifact.reported",
+              "agent.registered",
+              "project.imported",
+              "webhook.test"
+            ]
+          },
+          description: "Event types to subscribe to"
+        },
         project_id: %Schema{type: :string, format: :uuid, nullable: true}
+      },
+      example: %{
+        url: "https://example.com/webhook",
+        events: ["story.verified", "story.rejected"],
+        project_id: nil
       }
     })
   end
@@ -512,6 +697,17 @@ defmodule Loopctl.ApiSpec.Schemas do
         last_delivery_at: %Schema{type: :string, format: :"date-time", nullable: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "a7b8c9d0-e1f2-3456-abcd-567890123456",
+        url: "https://example.com/webhook",
+        events: ["story.verified", "story.rejected"],
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        active: true,
+        consecutive_failures: 0,
+        last_delivery_at: "2026-03-25T14:30:00Z",
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-03-25T14:30:00Z"
       }
     })
   end
@@ -543,6 +739,37 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule OrchestratorStateResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "OrchestratorStateResponse",
+      description: "Orchestrator state checkpoint",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        project_id: %Schema{type: :string, format: :uuid},
+        state_key: %Schema{type: :string},
+        state_data: %Schema{type: :object, additionalProperties: true},
+        version: %Schema{type: :integer},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "e1f2a3b4-c5d6-7890-efab-012345678901",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        state_key: "main",
+        state_data: %{phase: "epic_3", current_epic: 3, stories_verified: 12},
+        version: 5,
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-03-25T14:30:00Z"
+      }
+    })
+  end
+
   # ---------- Skills ----------
 
   defmodule SkillResponse do
@@ -563,6 +790,17 @@ defmodule Loopctl.ApiSpec.Schemas do
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "b8c9d0e1-f2a3-4567-bcde-678901234567",
+        name: "loopctl:review",
+        description: "Code review skill for orchestrator verification",
+        current_version: 3,
+        status: "active",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-03-20T09:15:00Z"
       }
     })
   end
@@ -584,6 +822,17 @@ defmodule Loopctl.ApiSpec.Schemas do
         created_by: %Schema{type: :string, nullable: true},
         metadata: %Schema{type: :object, additionalProperties: true},
         inserted_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "c9d0e1f2-a3b4-5678-cdef-789012345678",
+        skill_id: "b8c9d0e1-f2a3-4567-bcde-678901234567",
+        version: 1,
+        prompt_text:
+          "You are reviewing code for correctness and adherence to acceptance criteria...",
+        changelog: "Initial version",
+        created_by: "orchestrator-main",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z"
       }
     })
   end
@@ -871,6 +1120,31 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: ImportEpicDependency,
           description: "Epic-level dependencies using epic numbers"
         }
+      },
+      example: %{
+        export_metadata: %{
+          exported_at: "2026-03-25T14:30:00Z",
+          loopctl_version: "0.1.0",
+          project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+          tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        },
+        project: %{name: "My Project", slug: "my-project", status: "active"},
+        epics: [
+          %{
+            number: 1,
+            title: "Foundation",
+            stories: [
+              %{
+                number: "1.1",
+                title: "Setup",
+                agent_status: "pending",
+                verified_status: "unverified"
+              }
+            ]
+          }
+        ],
+        story_dependencies: [],
+        epic_dependencies: []
       }
     })
   end

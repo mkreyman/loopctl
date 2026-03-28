@@ -31,7 +31,8 @@ defmodule LoopctlWeb.OrchestratorStateController do
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Project not found", "application/json", Schemas.ErrorResponse},
       409 => {"Version conflict", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -46,7 +47,8 @@ defmodule LoopctlWeb.OrchestratorStateController do
       200 =>
         {"State", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -72,7 +74,8 @@ defmodule LoopctlWeb.OrchestratorStateController do
              meta: Schemas.PaginationMeta
            }
          }},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

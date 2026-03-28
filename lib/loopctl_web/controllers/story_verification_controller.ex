@@ -45,7 +45,8 @@ defmodule LoopctlWeb.StoryVerificationController do
     responses: %{
       200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -67,7 +68,8 @@ defmodule LoopctlWeb.StoryVerificationController do
       200 => {"Story rejected", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
-      422 => {"Reason required", "application/json", Schemas.ErrorResponse}
+      422 => {"Reason required", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -88,7 +90,8 @@ defmodule LoopctlWeb.StoryVerificationController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.VerificationResultResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -98,7 +101,8 @@ defmodule LoopctlWeb.StoryVerificationController do
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

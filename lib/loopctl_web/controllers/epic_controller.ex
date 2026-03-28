@@ -46,7 +46,8 @@ defmodule LoopctlWeb.EpicController do
     responses: %{
       201 => {"Epic created", "application/json", Schemas.EpicResponse},
       404 => {"Project not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -68,7 +69,8 @@ defmodule LoopctlWeb.EpicController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.EpicResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -78,7 +80,8 @@ defmodule LoopctlWeb.EpicController do
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     responses: %{
       200 => {"Epic detail", "application/json", Schemas.EpicResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -92,7 +95,8 @@ defmodule LoopctlWeb.EpicController do
     responses: %{
       200 => {"Updated epic", "application/json", Schemas.EpicResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -102,7 +106,8 @@ defmodule LoopctlWeb.EpicController do
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -114,7 +119,8 @@ defmodule LoopctlWeb.EpicController do
       200 =>
         {"Epic progress", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

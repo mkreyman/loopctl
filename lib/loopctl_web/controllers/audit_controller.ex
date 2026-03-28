@@ -9,6 +9,7 @@ defmodule LoopctlWeb.AuditController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
 
   action_fallback LoopctlWeb.FallbackController
@@ -35,7 +36,8 @@ defmodule LoopctlWeb.AuditController do
     responses: %{
       200 =>
         {"Audit log", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

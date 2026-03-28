@@ -28,7 +28,8 @@ defmodule LoopctlWeb.AgentController do
     responses: %{
       201 => {"Agent created", "application/json", Schemas.AgentResponse},
       409 => {"Agent already registered", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -52,7 +53,8 @@ defmodule LoopctlWeb.AgentController do
              page: %OpenApiSpex.Schema{type: :integer},
              page_size: %OpenApiSpex.Schema{type: :integer}
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -62,7 +64,8 @@ defmodule LoopctlWeb.AgentController do
     parameters: [id: [in: :path, type: :string, description: "Agent UUID"]],
     responses: %{
       200 => {"Agent detail", "application/json", Schemas.AgentResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

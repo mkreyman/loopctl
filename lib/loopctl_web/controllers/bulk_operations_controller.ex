@@ -29,7 +29,8 @@ defmodule LoopctlWeb.BulkOperationsController do
     request_body: {"Claim params", "application/json", Schemas.BulkClaimRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
-      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -39,7 +40,8 @@ defmodule LoopctlWeb.BulkOperationsController do
     request_body: {"Verify params", "application/json", Schemas.BulkVerifyRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
-      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -49,7 +51,8 @@ defmodule LoopctlWeb.BulkOperationsController do
     request_body: {"Reject params", "application/json", Schemas.BulkRejectRequest},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
-      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

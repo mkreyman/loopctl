@@ -46,6 +46,20 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 - **CLI** -- escript binary for all operations (`loopctl status`, `loopctl claim`, `loopctl verify`)
 - **OpenAPI 3.0** -- self-documenting API with Swagger UI for agent discovery
 
+## Concepts
+
+| Term | Definition |
+|------|-----------|
+| **Tenant** | An organization. All data is isolated per tenant via PostgreSQL RLS. |
+| **Project** | A codebase being tracked (e.g., a GitHub repo). |
+| **Epic** | A group of related stories within a project. |
+| **Story** | The atomic unit of work with acceptance criteria. |
+| **Agent** | An AI coding agent that implements features (implementer) or coordinates work (orchestrator). |
+| **Orchestrator** | An AI agent that assigns work, verifies deliverables, and manages the development loop. |
+| **Two-tier trust** | Implementing agents write `agent_status`; orchestrators write `verified_status`. Neither can write the other. |
+| **Contract** | An agent acknowledges a story's acceptance criteria before claiming it. |
+| **Skill** | A versioned prompt/instruction set used by orchestrators, with performance tracking. |
+
 ## Tech Stack
 
 | Component | Technology |
@@ -120,6 +134,8 @@ mix phx.gen.secret
 # CLOAK_KEY (32 bytes, base64)
 elixir -e ':crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()'
 ```
+
+> **Ports:** Local development runs on `http://localhost:4000`. Docker deployment uses `https://localhost:8443` (nginx TLS proxy). All examples below use the local dev URL.
 
 ## API Overview
 

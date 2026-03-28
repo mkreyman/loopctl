@@ -41,7 +41,8 @@ defmodule LoopctlWeb.SkillResultController do
       201 =>
         {"Result created", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

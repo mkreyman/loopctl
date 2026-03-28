@@ -50,7 +50,8 @@ defmodule LoopctlWeb.ChangeController do
              next_since: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true}
            }
          }},
-      400 => {"Bad request", "application/json", Schemas.ErrorResponse}
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

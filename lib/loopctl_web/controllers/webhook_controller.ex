@@ -27,7 +27,8 @@ defmodule LoopctlWeb.WebhookController do
     request_body: {"Webhook params", "application/json", Schemas.WebhookCreateRequest},
     responses: %{
       201 => {"Webhook created", "application/json", Schemas.WebhookResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -47,7 +48,8 @@ defmodule LoopctlWeb.WebhookController do
              data: %OpenApiSpex.Schema{type: :array, items: Schemas.WebhookResponse},
              meta: Schemas.PaginationMeta
            }
-         }}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -61,7 +63,8 @@ defmodule LoopctlWeb.WebhookController do
     responses: %{
       200 => {"Updated webhook", "application/json", Schemas.WebhookResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -73,7 +76,8 @@ defmodule LoopctlWeb.WebhookController do
       200 =>
         {"Test enqueued", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -98,7 +102,8 @@ defmodule LoopctlWeb.WebhookController do
              meta: Schemas.PaginationMeta
            }
          }},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -108,7 +113,8 @@ defmodule LoopctlWeb.WebhookController do
     parameters: [id: [in: :path, type: :string, description: "Webhook UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

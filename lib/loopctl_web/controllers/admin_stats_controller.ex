@@ -9,6 +9,7 @@ defmodule LoopctlWeb.AdminStatsController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
@@ -23,7 +24,8 @@ defmodule LoopctlWeb.AdminStatsController do
     responses: %{
       200 =>
         {"System stats", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 

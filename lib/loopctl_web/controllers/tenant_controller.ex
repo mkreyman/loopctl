@@ -40,7 +40,8 @@ defmodule LoopctlWeb.TenantController do
     description: "Returns the tenant profile for the authenticated API key.",
     responses: %{
       200 => {"Tenant profile", "application/json", Schemas.TenantResponse},
-      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -51,7 +52,8 @@ defmodule LoopctlWeb.TenantController do
     responses: %{
       200 => {"Updated tenant", "application/json", Schemas.TenantResponse},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
