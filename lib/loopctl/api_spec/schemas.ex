@@ -34,6 +34,12 @@ defmodule Loopctl.ApiSpec.Schemas do
             }
           }
         }
+      },
+      example: %{
+        error: %{
+          status: 404,
+          message: "Not found"
+        }
       }
     })
   end
@@ -101,10 +107,20 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:name, :slug, :email],
       properties: %{
-        name: %Schema{type: :string, description: "Tenant display name"},
-        slug: %Schema{type: :string, description: "Unique slug (lowercase, hyphens)"},
-        email: %Schema{type: :string, format: :email, description: "Contact email"}
-      }
+        name: %Schema{type: :string, description: "Tenant display name", example: "My Org"},
+        slug: %Schema{
+          type: :string,
+          description: "Unique slug (lowercase, hyphens)",
+          example: "my-org"
+        },
+        email: %Schema{
+          type: :string,
+          format: :email,
+          description: "Contact email",
+          example: "admin@example.com"
+        }
+      },
+      example: %{name: "My Org", slug: "my-org", email: "admin@example.com"}
     })
   end
 
@@ -122,11 +138,31 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :object,
           properties: %{
             id: %Schema{type: :string, format: :uuid},
-            raw_key: %Schema{type: :string, description: "The raw API key (shown only once)"},
-            key_prefix: %Schema{type: :string},
-            role: %Schema{type: :string},
-            name: %Schema{type: :string}
+            raw_key: %Schema{
+              type: :string,
+              description: "The raw API key (shown only once)",
+              example: "lc_abc123def456..."
+            },
+            key_prefix: %Schema{type: :string, example: "lc_abc1"},
+            role: %Schema{type: :string, example: "user"},
+            name: %Schema{type: :string, example: "default"}
           }
+        }
+      },
+      example: %{
+        tenant: %{
+          id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+          name: "My Org",
+          slug: "my-org",
+          email: "admin@example.com",
+          status: "active"
+        },
+        api_key: %{
+          id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+          raw_key: "lc_abc123def456...",
+          key_prefix: "lc_abc1",
+          role: "user",
+          name: "default"
         }
       }
     })
@@ -189,12 +225,21 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:name, :slug],
       properties: %{
-        name: %Schema{type: :string},
-        slug: %Schema{type: :string},
-        repo_url: %Schema{type: :string, nullable: true},
+        name: %Schema{type: :string, example: "My Project"},
+        slug: %Schema{type: :string, example: "my-project"},
+        repo_url: %Schema{
+          type: :string,
+          nullable: true,
+          example: "https://github.com/org/repo"
+        },
         description: %Schema{type: :string, nullable: true},
-        tech_stack: %Schema{type: :string, nullable: true},
+        tech_stack: %Schema{type: :string, nullable: true, example: "elixir,phoenix"},
         metadata: %Schema{type: :object, additionalProperties: true}
+      },
+      example: %{
+        name: "My Project",
+        slug: "my-project",
+        repo_url: "https://github.com/org/repo"
       }
     })
   end
@@ -264,16 +309,29 @@ defmodule Loopctl.ApiSpec.Schemas do
         tenant_id: %Schema{type: :string, format: :uuid},
         project_id: %Schema{type: :string, format: :uuid},
         epic_id: %Schema{type: :string, format: :uuid},
-        number: %Schema{type: :string},
-        title: %Schema{type: :string},
+        number: %Schema{type: :string, example: "US-2.1"},
+        title: %Schema{type: :string, example: "Implement user authentication"},
         description: %Schema{type: :string, nullable: true},
-        acceptance_criteria: %Schema{type: :array, items: %Schema{type: :object}, nullable: true},
-        estimated_hours: %Schema{type: :number, nullable: true},
+        acceptance_criteria: %Schema{
+          type: :array,
+          items: %Schema{type: :object},
+          nullable: true,
+          example: [
+            %{criterion: "Users can log in with email and password", met: false},
+            %{criterion: "Invalid credentials return 401", met: false}
+          ]
+        },
+        estimated_hours: %Schema{type: :number, nullable: true, example: 4.0},
         agent_status: %Schema{
           type: :string,
-          enum: ["pending", "contracted", "assigned", "implementing", "reported_done"]
+          enum: ["pending", "contracted", "assigned", "implementing", "reported_done"],
+          example: "pending"
         },
-        verified_status: %Schema{type: :string, enum: ["unverified", "verified", "rejected"]},
+        verified_status: %Schema{
+          type: :string,
+          enum: ["unverified", "verified", "rejected"],
+          example: "unverified"
+        },
         assigned_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
         assigned_at: %Schema{type: :string, format: :"date-time", nullable: true},
         reported_done_at: %Schema{type: :string, format: :"date-time", nullable: true},
@@ -316,12 +374,18 @@ defmodule Loopctl.ApiSpec.Schemas do
       type: :object,
       required: [:story_title, :ac_count],
       properties: %{
-        story_title: %Schema{type: :string, description: "Must match the story title exactly"},
+        story_title: %Schema{
+          type: :string,
+          description: "Must match the story title exactly",
+          example: "Implement user authentication"
+        },
         ac_count: %Schema{
           type: :integer,
-          description: "Must match the number of acceptance criteria"
+          description: "Must match the number of acceptance criteria",
+          example: 8
         }
-      }
+      },
+      example: %{story_title: "Implement user authentication", ac_count: 8}
     })
   end
 
@@ -540,7 +604,48 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :array,
           items: %Schema{type: :object, additionalProperties: true},
           description: "Array of epic objects with nested stories"
+        },
+        story_dependencies: %Schema{
+          type: :array,
+          items: %Schema{type: :object, additionalProperties: true},
+          description: "Optional cross-story dependencies",
+          nullable: true
+        },
+        epic_dependencies: %Schema{
+          type: :array,
+          items: %Schema{type: :object, additionalProperties: true},
+          description: "Optional cross-epic dependencies",
+          nullable: true
         }
+      },
+      example: %{
+        epics: [
+          %{
+            number: 1,
+            title: "User Authentication",
+            description: "Auth infrastructure",
+            stories: [
+              %{
+                number: "US-1.1",
+                title: "Implement login endpoint",
+                acceptance_criteria: [
+                  %{criterion: "POST /login returns JWT on valid credentials"},
+                  %{criterion: "Invalid credentials return 401"}
+                ]
+              },
+              %{
+                number: "US-1.2",
+                title: "Implement logout endpoint",
+                acceptance_criteria: [
+                  %{criterion: "POST /logout invalidates the session"}
+                ]
+              }
+            ]
+          }
+        ],
+        story_dependencies: [
+          %{predecessor: "US-1.1", successor: "US-1.2"}
+        ]
       }
     })
   end

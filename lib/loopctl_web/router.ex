@@ -20,10 +20,11 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.RegistrationRateLimiter
   end
 
-  # Health check — unauthenticated, outside /api/v1
+  # Health check and root redirect — unauthenticated, outside /api/v1
   scope "/", LoopctlWeb do
     pipe_through :api
 
+    get "/", WelcomeController, :redirect_to_api
     get "/health", HealthController, :check
   end
 
