@@ -365,4 +365,44 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       assert result["reason"] =~ "reason"
     end
   end
+
+  describe "orchestrator key without agent_id" do
+    test "bulk verify returns 400 when orchestrator key has no agent_id", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/verify", %{
+          "stories" => [
+            %{"story_id" => Ecto.UUID.generate(), "result" => "pass", "summary" => "ok"}
+          ]
+        })
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "must be linked to a registered agent"
+    end
+
+    test "bulk reject returns 400 when orchestrator key has no agent_id", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/reject", %{
+          "stories" => [
+            %{"story_id" => Ecto.UUID.generate(), "reason" => "test"}
+          ]
+        })
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "must be linked to a registered agent"
+    end
+  end
 end

@@ -228,7 +228,8 @@ defmodule Loopctl.ApiSpec.Schemas do
           description: "Optional expiration"
         },
         agent_id: %Schema{type: :string, format: :uuid, description: "Optional linked agent"}
-      }
+      },
+      example: %{name: "my-key", role: "agent", expires_at: nil}
     })
   end
 
@@ -523,6 +524,12 @@ defmodule Loopctl.ApiSpec.Schemas do
           additionalProperties: true,
           description: "Additional details"
         }
+      },
+      example: %{
+        artifact_type: "commit_diff",
+        path: "abc123..def456",
+        exists: true,
+        details: %{files_changed: 5}
       }
     })
   end
@@ -600,7 +607,8 @@ defmodule Loopctl.ApiSpec.Schemas do
         name: %Schema{type: :string},
         agent_type: %Schema{type: :string, enum: ["orchestrator", "implementer"]},
         metadata: %Schema{type: :object, additionalProperties: true}
-      }
+      },
+      example: %{name: "worker-1", agent_type: "implementer"}
     })
   end
 
@@ -735,7 +743,8 @@ defmodule Loopctl.ApiSpec.Schemas do
           description: "Expected version for optimistic lock",
           nullable: true
         }
-      }
+      },
+      example: %{state_key: "main", state_data: %{phase: "epic_3"}, version: 0}
     })
   end
 
@@ -850,7 +859,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       required: [:criterion],
       properties: %{
         criterion: %Schema{type: :string, description: "Acceptance criterion text"}
-      }
+      },
+      example: %{criterion: "POST /login returns JWT on valid credentials"}
     })
   end
 
@@ -1017,6 +1027,12 @@ defmodule Loopctl.ApiSpec.Schemas do
         loopctl_version: %Schema{type: :string},
         project_id: %Schema{type: :string, format: :uuid},
         tenant_id: %Schema{type: :string, format: :uuid}
+      },
+      example: %{
+        exported_at: "2026-03-25T14:30:00Z",
+        loopctl_version: "0.1.0",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
       }
     })
   end
@@ -1037,6 +1053,15 @@ defmodule Loopctl.ApiSpec.Schemas do
         tech_stack: %Schema{type: :string, nullable: true},
         status: %Schema{type: :string, enum: ["active", "archived"]},
         metadata: %Schema{type: :object, additionalProperties: true}
+      },
+      example: %{
+        name: "My Project",
+        slug: "my-project",
+        description: "An example project",
+        repo_url: "https://github.com/org/repo",
+        tech_stack: "elixir,phoenix",
+        status: "active",
+        metadata: %{}
       }
     })
   end
@@ -1094,6 +1119,22 @@ defmodule Loopctl.ApiSpec.Schemas do
         position: %Schema{type: :integer},
         metadata: %Schema{type: :object, additionalProperties: true},
         stories: %Schema{type: :array, items: ExportStory}
+      },
+      example: %{
+        number: 1,
+        title: "User Authentication",
+        description: "Auth infrastructure",
+        phase: "p0",
+        position: 1,
+        metadata: %{},
+        stories: [
+          %{
+            number: "1.1",
+            title: "Implement login endpoint",
+            agent_status: "reported_done",
+            verified_status: "verified"
+          }
+        ]
       }
     })
   end
@@ -1166,6 +1207,12 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: %Schema{type: :string, format: :uuid},
           description: "Story IDs to claim (max 50)"
         }
+      },
+      example: %{
+        story_ids: [
+          "e5f6a7b8-c9d0-1234-efab-345678901234",
+          "f6a7b8c9-d0e1-2345-fabc-456789012345"
+        ]
       }
     })
   end
@@ -1190,6 +1237,11 @@ defmodule Loopctl.ApiSpec.Schemas do
             }
           }
         }
+      },
+      example: %{
+        stories: [
+          %{story_id: "e5f6a7b8-c9d0-1234-efab-345678901234", notes: "All ACs met"}
+        ]
       }
     })
   end
@@ -1214,6 +1266,11 @@ defmodule Loopctl.ApiSpec.Schemas do
             }
           }
         }
+      },
+      example: %{
+        stories: [
+          %{story_id: "e5f6a7b8-c9d0-1234-efab-345678901234", reason: "Missing LiveView tests"}
+        ]
       }
     })
   end
@@ -1239,6 +1296,11 @@ defmodule Loopctl.ApiSpec.Schemas do
           nullable: true,
           description: "Error message if status is \"error\""
         }
+      },
+      example: %{
+        story_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        status: "success",
+        error: nil
       }
     })
   end

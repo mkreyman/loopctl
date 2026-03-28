@@ -161,20 +161,33 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
 
 2. **Create role-specific keys** (using your user key):
    ```bash
-   # Create an agent key for implementation agents
+   # Create an agent key (needed to register agents)
+   curl -X POST http://localhost:4000/api/v1/api_keys \
+     -H "Authorization: Bearer lc_user_key" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "agent-bootstrap", "role": "agent"}'
+
+   # Register an orchestrator agent
+   curl -X POST http://localhost:4000/api/v1/agents/register \
+     -H "Authorization: Bearer lc_agent_bootstrap_key" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "orchestrator-main", "agent_type": "orchestrator"}'
+   # Note the agent ID from the response
+
+   # Create the orchestrator key linked to the agent
+   curl -X POST http://localhost:4000/api/v1/api_keys \
+     -H "Authorization: Bearer lc_user_key" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "orchestrator-main", "role": "orchestrator", "agent_id": "<agent_id>"}'
+
+   # Create an implementer agent key
    curl -X POST http://localhost:4000/api/v1/api_keys \
      -H "Authorization: Bearer lc_user_key" \
      -H "Content-Type: application/json" \
      -d '{"name": "worker-1", "role": "agent"}'
-
-   # Create an orchestrator key for verification
-   curl -X POST http://localhost:4000/api/v1/api_keys \
-     -H "Authorization: Bearer lc_user_key" \
-     -H "Content-Type: application/json" \
-     -d '{"name": "orchestrator-main", "role": "orchestrator"}'
    ```
 
-3. **Register your agent** (using the agent key):
+3. **Register your implementer agent** (using the agent key):
    ```bash
    curl -X POST http://localhost:4000/api/v1/agents/register \
      -H "Authorization: Bearer lc_agent_key" \
@@ -182,7 +195,7 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
      -d '{"name": "worker-1", "agent_type": "implementer"}'
    ```
 
-Now the agent key can contract, claim, start, and report stories. The orchestrator key can verify and reject stories.
+Now the agent key can contract, claim, start, and report stories. The orchestrator key (linked to its agent) can verify and reject stories.
 
 ### Typical Agent Workflow
 
@@ -369,6 +382,21 @@ Every webhook delivery is a JSON POST with the following envelope. The `data` fi
 ```
 
 Payloads are signed with HMAC-SHA256 using the webhook's secret. Verify the `X-Loopctl-Signature` header to authenticate delivery.
+
+#### Verifying Webhook Signatures
+
+```elixir
+# Elixir
+expected = :crypto.mac(:hmac, :sha256, signing_secret, raw_body)
+           |> Base.encode16(case: :lower)
+signature = "sha256=" <> expected
+# Compare with X-Loopctl-Signature header
+```
+
+```bash
+# Bash
+echo -n "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/.* /sha256=/'
+```
 
 ### Rate Limiting
 
@@ -557,6 +585,25 @@ Superadmin keys are tenant-less. Use the `X-Impersonate-Tenant` header for tenan
 curl http://localhost:4000/api/v1/projects \
   -H "Authorization: Bearer lc_superadmin_key" \
   -H "X-Impersonate-Tenant: <tenant_id>"
+```
+
+### Orchestrator verify returns 500
+
+The orchestrator API key must have `agent_id` set, linking it to a registered agent with `agent_type: orchestrator`. Create the agent first via `/agents/register`, then create the orchestrator key with `agent_id`:
+
+```bash
+# 1. Register the orchestrator agent (using an agent-role bootstrap key)
+curl -X POST http://localhost:4000/api/v1/agents/register \
+  -H "Authorization: Bearer lc_agent_bootstrap_key" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "orchestrator-main", "agent_type": "orchestrator"}'
+# Note the agent ID from the response
+
+# 2. Create the orchestrator key with agent_id
+curl -X POST http://localhost:4000/api/v1/api_keys \
+  -H "Authorization: Bearer lc_user_key" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "orchestrator-main", "role": "orchestrator", "agent_id": "<agent_id>"}'
 ```
 
 ## License

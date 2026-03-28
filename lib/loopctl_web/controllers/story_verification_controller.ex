@@ -113,18 +113,21 @@ defmodule LoopctlWeb.StoryVerificationController do
   """
   def verify(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.verify_story(tenant_id, story_id, params, opts) do
-      {:ok, story} ->
-        json(conn, %{story: story})
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-      {:error, :invalid_transition} ->
-        {:error, :conflict}
+      case Progress.verify_story(tenant_id, story_id, params, opts) do
+        {:ok, story} ->
+          json(conn, %{story: story})
 
-      {:error, :not_found} ->
-        {:error, :not_found}
+        {:error, :invalid_transition} ->
+          {:error, :conflict}
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+      end
     end
   end
 
@@ -136,21 +139,24 @@ defmodule LoopctlWeb.StoryVerificationController do
   """
   def reject(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.reject_story(tenant_id, story_id, params, opts) do
-      {:ok, story} ->
-        json(conn, %{story: story})
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-      {:error, :reason_required} ->
-        {:error, :unprocessable_entity, "reason is required and cannot be blank"}
+      case Progress.reject_story(tenant_id, story_id, params, opts) do
+        {:ok, story} ->
+          json(conn, %{story: story})
 
-      {:error, :invalid_transition} ->
-        {:error, :conflict}
+        {:error, :reason_required} ->
+          {:error, :unprocessable_entity, "reason is required and cannot be blank"}
 
-      {:error, :not_found} ->
-        {:error, :not_found}
+        {:error, :invalid_transition} ->
+          {:error, :conflict}
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+      end
     end
   end
 
@@ -208,15 +214,27 @@ defmodule LoopctlWeb.StoryVerificationController do
   """
   def force_unclaim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-    case Progress.force_unclaim_story(tenant_id, story_id, opts) do
-      {:ok, story} ->
-        json(conn, %{story: story})
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-      {:error, :not_found} ->
-        {:error, :not_found}
+      case Progress.force_unclaim_story(tenant_id, story_id, opts) do
+        {:ok, story} ->
+          json(conn, %{story: story})
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+      end
     end
   end
+
+  defp validate_orchestrator_agent_linked(%{agent_id: nil}) do
+    {:error, :bad_request,
+     "Orchestrator API key must be linked to a registered agent. " <>
+       "Create an agent with agent_type: orchestrator first, " <>
+       "then create an API key with agent_id set."}
+  end
+
+  defp validate_orchestrator_agent_linked(_api_key), do: :ok
 end

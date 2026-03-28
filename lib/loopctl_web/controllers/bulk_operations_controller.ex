@@ -90,19 +90,22 @@ defmodule LoopctlWeb.BulkOperationsController do
   """
   def verify(conn, %{"stories" => stories}) when is_list(stories) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
-    orchestrator_agent_id = api_key.agent_id
-    audit_opts = AuditContext.from_conn(conn)
 
-    case BulkOperations.bulk_verify(tenant_id, stories, orchestrator_agent_id, audit_opts) do
-      {:ok, results} ->
-        respond_with_results(conn, results)
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      orchestrator_agent_id = api_key.agent_id
+      audit_opts = AuditContext.from_conn(conn)
 
-      {:error, :empty_batch} ->
-        {:error, :unprocessable_entity, "stories must not be empty"}
+      case BulkOperations.bulk_verify(tenant_id, stories, orchestrator_agent_id, audit_opts) do
+        {:ok, results} ->
+          respond_with_results(conn, results)
 
-      {:error, :batch_too_large} ->
-        {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+        {:error, :empty_batch} ->
+          {:error, :unprocessable_entity, "stories must not be empty"}
+
+        {:error, :batch_too_large} ->
+          {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+      end
     end
   end
 
@@ -117,19 +120,22 @@ defmodule LoopctlWeb.BulkOperationsController do
   """
   def reject(conn, %{"stories" => stories}) when is_list(stories) do
     api_key = conn.assigns.current_api_key
-    tenant_id = api_key.tenant_id
-    orchestrator_agent_id = api_key.agent_id
-    audit_opts = AuditContext.from_conn(conn)
 
-    case BulkOperations.bulk_reject(tenant_id, stories, orchestrator_agent_id, audit_opts) do
-      {:ok, results} ->
-        respond_with_results(conn, results)
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      orchestrator_agent_id = api_key.agent_id
+      audit_opts = AuditContext.from_conn(conn)
 
-      {:error, :empty_batch} ->
-        {:error, :unprocessable_entity, "stories must not be empty"}
+      case BulkOperations.bulk_reject(tenant_id, stories, orchestrator_agent_id, audit_opts) do
+        {:ok, results} ->
+          respond_with_results(conn, results)
 
-      {:error, :batch_too_large} ->
-        {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+        {:error, :empty_batch} ->
+          {:error, :unprocessable_entity, "stories must not be empty"}
+
+        {:error, :batch_too_large} ->
+          {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+      end
     end
   end
 
@@ -164,4 +170,13 @@ defmodule LoopctlWeb.BulkOperationsController do
         json(conn, %{results: clean_results})
     end
   end
+
+  defp validate_orchestrator_agent_linked(%{agent_id: nil}) do
+    {:error, :bad_request,
+     "Orchestrator API key must be linked to a registered agent. " <>
+       "Create an agent with agent_type: orchestrator first, " <>
+       "then create an API key with agent_id set."}
+  end
+
+  defp validate_orchestrator_agent_linked(_api_key), do: :ok
 end

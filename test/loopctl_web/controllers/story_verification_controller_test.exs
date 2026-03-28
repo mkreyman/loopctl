@@ -292,6 +292,56 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     end
   end
 
+  # --- Nil agent_id guard tests ---
+
+  describe "orchestrator key without agent_id" do
+    defp setup_unlinked_orchestrator_key(tenant) do
+      {orch_key, _orch_api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      orch_key
+    end
+
+    test "verify returns 400 when orchestrator key has no agent_id", %{conn: conn} do
+      %{story: story, tenant: tenant} = setup_reported_story()
+      orch_key = setup_unlinked_orchestrator_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "must be linked to a registered agent"
+    end
+
+    test "reject returns 400 when orchestrator key has no agent_id", %{conn: conn} do
+      %{story: story, tenant: tenant} = setup_reported_story()
+      orch_key = setup_unlinked_orchestrator_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/reject", %{"reason" => "test"})
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "must be linked to a registered agent"
+    end
+
+    test "force_unclaim returns 400 when orchestrator key has no agent_id", %{conn: conn} do
+      %{story: story, tenant: tenant} = setup_reported_story()
+      orch_key = setup_unlinked_orchestrator_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/force-unclaim")
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "must be linked to a registered agent"
+    end
+  end
+
   # --- Tenant isolation tests ---
 
   describe "tenant isolation" do
