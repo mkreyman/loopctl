@@ -531,9 +531,10 @@ mix escript.build   # Build CLI binary
 
 ## Documentation
 
+- **[Orchestration Guide](docs/orchestration-guide.md)** -- How to use loopctl to manage AI development projects (methodology, skills, step-by-step walkthrough)
 - **[PRD](docs/prd.md)** -- Full product requirements document
 - **[User Stories](docs/user_stories/)** -- 61 stories across 16 epics
-- **[Skills](skills/)** -- 6 orchestration skill definitions
+- **[Skills](skills/)** -- 6 orchestration skill definitions (read by the orchestrator during the loop)
 - **[OpenAPI Spec](https://loopctl.local:8443/api/v1/openapi)** -- Machine-readable API spec (when running)
 
 ## Deployment
