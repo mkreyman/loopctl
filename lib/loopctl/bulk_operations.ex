@@ -169,8 +169,113 @@ defmodule Loopctl.BulkOperations do
   end
 
   # ===================================================================
+  # Bulk Mark Complete (API Discoverability Issue 5)
+  # ===================================================================
+
+  @doc """
+  Marks multiple stories as completed in one step (admin operation).
+
+  Sets both `agent_status` to `reported_done` AND `verified_status` to `verified`
+  atomically. Intended for marking pre-existing work — skips the normal
+  contract → claim → start → report → verify workflow.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `stories` -- list of maps with `"story_id"`, `"summary"`, `"review_type"`
+  - `orchestrator_agent_id` -- the orchestrator's agent UUID (used for audit)
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, results}` -- list of per-story results (partial-success semantics)
+  - `{:error, :batch_too_large}` -- if batch exceeds max size
+  - `{:error, :empty_batch}` -- if stories list is empty
+  """
+  @spec bulk_mark_complete(Ecto.UUID.t(), [map()], Ecto.UUID.t() | nil, keyword()) ::
+          {:ok, [map()]} | {:error, atom()}
+  def bulk_mark_complete(tenant_id, stories, orchestrator_agent_id, opts \\ []) do
+    story_ids = Enum.map(stories, &(&1["story_id"] || &1[:story_id]))
+
+    with :ok <- validate_batch_size(story_ids) do
+      actor_id = Keyword.get(opts, :actor_id)
+      actor_label = Keyword.get(opts, :actor_label)
+
+      story_params =
+        Map.new(stories, fn s ->
+          sid = s["story_id"] || s[:story_id]
+          {sid, s}
+        end)
+
+      sorted_ids = Enum.sort(story_ids)
+
+      ctx = %{
+        tenant_id: tenant_id,
+        orch_id: orchestrator_agent_id,
+        actor_id: actor_id,
+        actor_label: actor_label
+      }
+
+      AdminRepo.transaction(fn ->
+        locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
+        process_mark_completes(sorted_ids, locked_stories, story_params, ctx)
+      end)
+    end
+  end
+
+  # ===================================================================
   # Private: Batch Processors (reduce nesting by extracting from transaction body)
   # ===================================================================
+
+  defp process_mark_completes(sorted_ids, locked_stories, story_params, ctx) do
+    Enum.map(sorted_ids, fn story_id ->
+      params = Map.get(story_params, story_id, %{})
+
+      case Map.get(locked_stories, story_id) do
+        nil ->
+          %{story_id: story_id, status: "error", reason: "Story not found"}
+
+        story ->
+          process_mark_complete(
+            story,
+            params,
+            ctx.tenant_id,
+            ctx.orch_id,
+            ctx.actor_id,
+            ctx.actor_label
+          )
+      end
+    end)
+  end
+
+  defp process_mark_complete(
+         story,
+         params,
+         tenant_id,
+         orchestrator_agent_id,
+         actor_id,
+         actor_label
+       ) do
+    case apply_mark_complete(story) do
+      {:ok, updated} ->
+        create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
+
+        audit_mark_complete(
+          tenant_id,
+          story,
+          updated,
+          actor_id,
+          actor_label,
+          orchestrator_agent_id
+        )
+
+        emit_mark_complete_event(tenant_id, updated, orchestrator_agent_id, params)
+        %{story_id: story.id, status: "success"}
+
+      {:error, reason} ->
+        %{story_id: story.id, status: "error", reason: format_reason(reason)}
+    end
+  end
 
   defp process_claims(sorted_ids, locked_stories, agent_id, tenant_id, actor_id, actor_label) do
     Enum.map(sorted_ids, fn story_id ->
@@ -394,6 +499,21 @@ defmodule Loopctl.BulkOperations do
     |> AdminRepo.update()
   end
 
+  defp apply_mark_complete(story) do
+    now = DateTime.utc_now()
+
+    story
+    |> Ecto.Changeset.change(%{
+      agent_status: :reported_done,
+      reported_done_at: now,
+      verified_status: :verified,
+      verified_at: now,
+      rejected_at: nil,
+      rejection_reason: nil
+    })
+    |> AdminRepo.update()
+  end
+
   defp auto_reset_agent_status(story) do
     story
     |> Ecto.Changeset.change(%{
@@ -468,6 +588,37 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
+  defp create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params) do
+    require Logger
+    iteration = count_verifications(tenant_id, story.id) + 1
+    summary = params["summary"] || params[:summary] || "Marked complete (pre-existing work)"
+    review_type = params["review_type"] || "pre_existing"
+
+    case %VerificationResult{
+           tenant_id: tenant_id,
+           story_id: story.id,
+           orchestrator_agent_id: orchestrator_agent_id
+         }
+         |> VerificationResult.create_changeset(%{
+           result: :pass,
+           summary: summary,
+           findings: %{},
+           review_type: review_type,
+           iteration: iteration
+         })
+         |> AdminRepo.insert() do
+      {:ok, result} ->
+        result
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create mark_complete result for story #{story.id}: #{inspect(reason)}"
+        )
+
+        nil
+    end
+  end
+
   defp count_verifications(tenant_id, story_id) do
     VerificationResult
     |> where([v], v.tenant_id == ^tenant_id and v.story_id == ^story_id)
@@ -527,6 +678,26 @@ defmodule Loopctl.BulkOperations do
     })
   end
 
+  defp audit_mark_complete(tenant_id, old_story, updated, actor_id, actor_label, orch_id) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "story",
+      entity_id: updated.id,
+      action: "mark_complete",
+      actor_type: "api_key",
+      actor_id: actor_id,
+      actor_label: actor_label,
+      old_state: %{
+        "agent_status" => to_string(old_story.agent_status),
+        "verified_status" => to_string(old_story.verified_status)
+      },
+      new_state: %{
+        "agent_status" => to_string(updated.agent_status),
+        "verified_status" => to_string(updated.verified_status),
+        "orchestrator_agent_id" => orch_id
+      }
+    })
+  end
+
   defp audit_auto_reset(tenant_id, old_story, reset_story, actor_id, actor_label) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "story",
@@ -576,6 +747,19 @@ defmodule Loopctl.BulkOperations do
       "epic_id" => updated.epic_id,
       "orchestrator_agent_id" => orchestrator_agent_id,
       "reason" => reason,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    })
+  end
+
+  defp emit_mark_complete_event(tenant_id, updated, orchestrator_agent_id, params) do
+    emit_story_event(tenant_id, "story.verified", updated, %{
+      "event" => "story.verified",
+      "story_id" => updated.id,
+      "project_id" => updated.project_id,
+      "epic_id" => updated.epic_id,
+      "orchestrator_agent_id" => orchestrator_agent_id,
+      "summary" => params["summary"] || params[:summary] || "Marked complete (pre-existing work)",
+      "review_type" => params["review_type"] || "pre_existing",
       "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
     })
   end

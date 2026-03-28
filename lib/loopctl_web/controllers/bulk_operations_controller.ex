@@ -19,7 +19,9 @@ defmodule LoopctlWeb.BulkOperationsController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:claim]
-  plug LoopctlWeb.Plugs.RequireRole, [exact_role: :orchestrator] when action in [:verify, :reject]
+
+  plug LoopctlWeb.Plugs.RequireRole,
+       [exact_role: :orchestrator] when action in [:verify, :reject, :mark_complete]
 
   tags(["Progress"])
 
@@ -49,6 +51,57 @@ defmodule LoopctlWeb.BulkOperationsController do
     summary: "Bulk reject stories",
     description: "Orchestrator rejects multiple stories with reasons.",
     request_body: {"Reject params", "application/json", Schemas.BulkRejectRequest},
+    responses: %{
+      200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:mark_complete,
+    summary: "Bulk mark stories as complete",
+    description:
+      "ADMIN USE ONLY. Marks multiple stories as both reported_done AND verified in one step. " <>
+        "Intended for importing pre-existing work. " <>
+        "Skips the normal contract→claim→start→report→verify workflow. " <>
+        "Requires orchestrator role.",
+    request_body:
+      {"Mark-complete params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:stories],
+         properties: %{
+           stories: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{
+               type: :object,
+               required: [:story_id],
+               properties: %{
+                 story_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+                 summary: %OpenApiSpex.Schema{
+                   type: :string,
+                   description: "Brief summary of the pre-existing work",
+                   example: "Pre-existing on master"
+                 },
+                 review_type: %OpenApiSpex.Schema{
+                   type: :string,
+                   description: "Review type label",
+                   example: "pre_existing"
+                 }
+               }
+             }
+           }
+         },
+         example: %{
+           stories: [
+             %{
+               story_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+               summary: "Pre-existing on master",
+               review_type: "pre_existing"
+             }
+           ]
+         }
+       }},
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
@@ -140,6 +193,42 @@ defmodule LoopctlWeb.BulkOperationsController do
   end
 
   def reject(_conn, _params) do
+    {:error, :unprocessable_entity, "stories is required and must be an array"}
+  end
+
+  @doc """
+  POST /api/v1/stories/bulk/mark-complete
+
+  ADMIN USE ONLY. Marks multiple stories as reported_done + verified atomically.
+  For importing pre-existing work that does not need the full workflow.
+  """
+  def mark_complete(conn, %{"stories" => stories}) when is_list(stories) do
+    api_key = conn.assigns.current_api_key
+
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      orchestrator_agent_id = api_key.agent_id
+      audit_opts = AuditContext.from_conn(conn)
+
+      case BulkOperations.bulk_mark_complete(
+             tenant_id,
+             stories,
+             orchestrator_agent_id,
+             audit_opts
+           ) do
+        {:ok, results} ->
+          respond_with_results(conn, results)
+
+        {:error, :empty_batch} ->
+          {:error, :unprocessable_entity, "stories must not be empty"}
+
+        {:error, :batch_too_large} ->
+          {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+      end
+    end
+  end
+
+  def mark_complete(_conn, _params) do
     {:error, :unprocessable_entity, "stories is required and must be an array"}
   end
 

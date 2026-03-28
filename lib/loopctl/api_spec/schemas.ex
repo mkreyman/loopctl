@@ -938,13 +938,27 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "AcceptanceCriterion",
-      description: "A single acceptance criterion",
+      description:
+        ~s(A single acceptance criterion. ) <>
+          ~s(Accepts both `{"criterion": "..."}` and `{"id": "AC-1", "description": "..."}` formats. ) <>
+          "When `description` is present it is mapped to `criterion` automatically.",
       type: :object,
-      required: [:criterion],
       properties: %{
-        criterion: %Schema{type: :string, description: "Acceptance criterion text"}
+        criterion: %Schema{
+          type: :string,
+          description: "Acceptance criterion text (canonical key)"
+        },
+        description: %Schema{
+          type: :string,
+          description: "Acceptance criterion text (alias for criterion, normalized on import)"
+        },
+        id: %Schema{
+          type: :string,
+          description: "Optional identifier (e.g. \"AC-1\")",
+          example: "AC-1"
+        }
       },
-      example: %{criterion: "POST /login returns JWT on valid credentials"}
+      example: %{id: "AC-1", description: "POST /login returns JWT on valid credentials"}
     })
   end
 

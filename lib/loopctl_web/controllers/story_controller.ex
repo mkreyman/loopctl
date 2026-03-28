@@ -21,8 +21,11 @@ defmodule LoopctlWeb.StoryController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
-  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :user] when action in [:create, :update, :delete]
+
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :agent] when action in [:index, :show, :index_by_project]
 
   tags(["Stories"])
 
@@ -76,6 +79,64 @@ defmodule LoopctlWeb.StoryController do
              meta: Schemas.PaginationMeta
            }
          }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:index_by_project,
+    summary: "List stories by project",
+    description:
+      "Lists all stories for a project. " <>
+        "Requires agent+ role. Supports filtering by status and epic. " <>
+        "Uses offset-based pagination (limit/offset).",
+    parameters: [
+      project_id: [in: :query, type: :string, required: true, description: "Project UUID"],
+      agent_status: [
+        in: :query,
+        type: :string,
+        description: "Filter by agent status",
+        example: "pending"
+      ],
+      verified_status: [
+        in: :query,
+        type: :string,
+        description: "Filter by verified status",
+        example: "unverified"
+      ],
+      epic_id: [
+        in: :query,
+        type: :string,
+        description: "Filter to a specific epic UUID"
+      ],
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Max stories to return (default 100, max 500)"
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Number of stories to skip (default 0)"
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Story list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.StoryResponse},
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 total_count: %OpenApiSpex.Schema{type: :integer},
+                 limit: %OpenApiSpex.Schema{type: :integer},
+                 offset: %OpenApiSpex.Schema{type: :integer}
+               }
+             }
+           }
+         }},
+      400 => {"Missing project_id", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -181,6 +242,41 @@ defmodule LoopctlWeb.StoryController do
         }
       })
     end
+  end
+
+  @doc """
+  GET /api/v1/stories?project_id=X
+
+  Lists all stories for a project. Requires agent+ role.
+  Supports ?agent_status=, ?verified_status=, ?epic_id=, ?limit=, ?offset=
+  """
+  def index_by_project(conn, %{"project_id" => project_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts =
+      []
+      |> maybe_add_opt(:agent_status, params["agent_status"])
+      |> maybe_add_opt(:verified_status, params["verified_status"])
+      |> maybe_add_opt(:epic_id, params["epic_id"])
+      |> maybe_add_opt(:limit, parse_int(params["limit"]))
+      |> maybe_add_opt(:offset, parse_int(params["offset"]))
+
+    {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)
+
+    json(conn, %{
+      data: Enum.map(result.data, &story_json/1),
+      meta: %{
+        total_count: result.total,
+        limit: result.limit,
+        offset: result.offset
+      }
+    })
+  end
+
+  def index_by_project(conn, _params) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{error: %{status: 400, message: "project_id query parameter is required"}})
   end
 
   @doc """

@@ -254,6 +254,52 @@ defmodule Loopctl.WorkBreakdown.Stories do
     {:ok, %{data: stories, total: total, page: page, page_size: page_size}}
   end
 
+  @doc """
+  Lists stories for a project with optional filters and offset-based pagination.
+
+  Stories are ordered by sort_key (natural numeric order).
+
+  ## Options (keyword list)
+
+  - `:agent_status` -- filter by agent_status enum value
+  - `:verified_status` -- filter by verified_status enum value
+  - `:epic_id` -- filter to a specific epic within the project
+  - `:limit` -- max stories to return (default 100, max 500)
+  - `:offset` -- how many stories to skip (default 0)
+
+  ## Returns
+
+  `{:ok, %{data: [%Story{}], total: integer, limit: integer, offset: integer}}`
+  """
+  @spec list_stories_by_project(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             data: [Story.t()],
+             total: non_neg_integer(),
+             limit: pos_integer(),
+             offset: non_neg_integer()
+           }}
+  def list_stories_by_project(tenant_id, project_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 100) |> max(1) |> min(500)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+
+    base_query =
+      Story
+      |> where([s], s.tenant_id == ^tenant_id and s.project_id == ^project_id)
+      |> apply_project_filters(opts)
+
+    total = AdminRepo.aggregate(base_query, :count, :id)
+
+    stories =
+      base_query
+      |> order_by([s], asc: s.sort_key)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+  end
+
   # --- Private helpers ---
 
   defp get_parent_epic(tenant_id, epic_id) when is_binary(epic_id) do
@@ -270,6 +316,17 @@ defmodule Loopctl.WorkBreakdown.Stories do
     |> filter_by_agent_status(Keyword.get(opts, :agent_status))
     |> filter_by_verified_status(Keyword.get(opts, :verified_status))
   end
+
+  defp apply_project_filters(query, opts) do
+    query
+    |> filter_by_agent_status(Keyword.get(opts, :agent_status))
+    |> filter_by_verified_status(Keyword.get(opts, :verified_status))
+    |> filter_by_epic_id(Keyword.get(opts, :epic_id))
+  end
+
+  defp filter_by_epic_id(query, nil), do: query
+  defp filter_by_epic_id(query, ""), do: query
+  defp filter_by_epic_id(query, epic_id), do: where(query, [s], s.epic_id == ^epic_id)
 
   defp filter_by_agent_status(query, nil), do: query
   defp filter_by_agent_status(query, ""), do: query

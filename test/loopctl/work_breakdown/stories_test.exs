@@ -382,6 +382,99 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
     end
   end
 
+  describe "list_stories_by_project/3" do
+    test "lists all stories across epics in a project" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic1 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic2 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic1.id, number: "1.1"})
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic2.id, number: "2.1"})
+
+      {:ok, result} = Stories.list_stories_by_project(tenant.id, project.id)
+
+      assert result.total == 2
+      assert length(result.data) == 2
+    end
+
+    test "filters by epic_id" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic1 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic2 = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic1.id, number: "1.1"})
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic2.id, number: "2.1"})
+
+      {:ok, result} = Stories.list_stories_by_project(tenant.id, project.id, epic_id: epic1.id)
+
+      assert result.total == 1
+      assert hd(result.data).epic_id == epic1.id
+    end
+
+    test "filters by agent_status" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        number: "1.1",
+        agent_status: :pending
+      })
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        number: "1.2",
+        agent_status: :implementing
+      })
+
+      {:ok, result} =
+        Stories.list_stories_by_project(tenant.id, project.id, agent_status: "pending")
+
+      assert result.total == 1
+      assert hd(result.data).agent_status == :pending
+    end
+
+    test "respects limit and offset" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      {:ok, result} = Stories.list_stories_by_project(tenant.id, project.id, limit: 2, offset: 0)
+      assert length(result.data) == 2
+      assert result.total == 5
+      assert result.limit == 2
+      assert result.offset == 0
+
+      {:ok, result2} =
+        Stories.list_stories_by_project(tenant.id, project.id, limit: 2, offset: 2)
+
+      assert length(result2.data) == 2
+      assert result2.offset == 2
+    end
+
+    test "does not return stories from another tenant's project" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id})
+      fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id})
+
+      {:ok, result} = Stories.list_stories_by_project(tenant_a.id, project_b.id)
+
+      assert result.total == 0
+      assert result.data == []
+    end
+  end
+
   describe "tenant isolation" do
     test "tenant A cannot see tenant B's stories" do
       tenant_a = fixture(:tenant)

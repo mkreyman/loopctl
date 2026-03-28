@@ -310,7 +310,7 @@ defmodule Loopctl.ImportExport do
       number: story_data["number"],
       title: story_data["title"],
       description: story_data["description"],
-      acceptance_criteria: story_data["acceptance_criteria"],
+      acceptance_criteria: normalize_acceptance_criteria(story_data["acceptance_criteria"]),
       estimated_hours: story_data["estimated_hours"],
       metadata: story_data["metadata"] || %{}
     }
@@ -558,7 +558,7 @@ defmodule Loopctl.ImportExport do
       number: story_data["number"],
       title: story_data["title"],
       description: story_data["description"],
-      acceptance_criteria: story_data["acceptance_criteria"],
+      acceptance_criteria: normalize_acceptance_criteria(story_data["acceptance_criteria"]),
       estimated_hours: story_data["estimated_hours"],
       metadata: story_data["metadata"] || %{}
     }
@@ -582,7 +582,10 @@ defmodule Loopctl.ImportExport do
       %{}
       |> maybe_put("title", story_data["title"])
       |> maybe_put("description", story_data["description"])
-      |> maybe_put("acceptance_criteria", story_data["acceptance_criteria"])
+      |> maybe_put(
+        "acceptance_criteria",
+        normalize_acceptance_criteria(story_data["acceptance_criteria"])
+      )
       |> maybe_put("estimated_hours", story_data["estimated_hours"])
       |> maybe_put("metadata", story_data["metadata"])
 
@@ -747,24 +750,52 @@ defmodule Loopctl.ImportExport do
     stories
     |> Enum.with_index()
     |> Enum.reduce_while(:ok, fn {story, story_index}, :ok ->
-      cond do
-        not is_map(story) ->
-          {:halt, {:error, "epics[#{epic_index}].stories[#{story_index}]: must be an object"}}
-
-        is_nil(story["number"]) ->
-          {:halt, {:error, "epics[#{epic_index}].stories[#{story_index}].number: is required"}}
-
-        is_nil(story["title"]) or story["title"] == "" ->
-          {:halt, {:error, "epics[#{epic_index}].stories[#{story_index}].title: can't be blank"}}
-
-        true ->
-          {:cont, :ok}
-      end
+      validate_single_story(story, epic_index, story_index)
     end)
   end
 
   defp validate_stories_list(_, epic_index),
     do: {:error, "epics[#{epic_index}].stories: must be an array"}
+
+  defp validate_single_story(story, epic_index, story_index) do
+    path = "epics[#{epic_index}].stories[#{story_index}]"
+
+    cond do
+      not is_map(story) ->
+        {:halt, {:error, "#{path}: must be an object"}}
+
+      is_nil(story["number"]) ->
+        {:halt, {:error, "#{path}.number: is required"}}
+
+      is_nil(story["title"]) or story["title"] == "" ->
+        {:halt, {:error, "#{path}.title: can't be blank"}}
+
+      true ->
+        case validate_acceptance_criteria(story["acceptance_criteria"], path) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+    end
+  end
+
+  defp validate_acceptance_criteria(nil, _path), do: :ok
+  defp validate_acceptance_criteria([], _path), do: :ok
+
+  defp validate_acceptance_criteria(acs, path) when is_list(acs) do
+    if Enum.all?(acs, &is_map/1) do
+      :ok
+    else
+      {:error,
+       "#{path}.acceptance_criteria must be an array of objects with 'id' and 'description' keys, " <>
+         "e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
+    end
+  end
+
+  defp validate_acceptance_criteria(_acs, path) do
+    {:error,
+     "#{path}.acceptance_criteria must be an array of objects with 'id' and 'description' keys, " <>
+       "e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
+  end
 
   defp validate_no_duplicate_numbers(epics_data) do
     # Check duplicate epic numbers
@@ -1343,4 +1374,29 @@ defmodule Loopctl.ImportExport do
   defp handle_import_error(_step, reason) do
     {:error, :validation, inspect(reason)}
   end
+
+  # ===================================================================
+  # Private: Acceptance Criteria Normalization (Issue 2)
+  # ===================================================================
+
+  # Accepts both {"criterion": "..."} and {"id": "AC-1", "description": "..."}
+  # If an item has "description" but not "criterion", maps it to "criterion".
+  # If both present, "description" wins (the more descriptive key).
+  defp normalize_acceptance_criteria(nil), do: nil
+  defp normalize_acceptance_criteria([]), do: []
+
+  defp normalize_acceptance_criteria(acs) when is_list(acs) do
+    Enum.map(acs, &normalize_ac_item/1)
+  end
+
+  defp normalize_acceptance_criteria(other), do: other
+
+  defp normalize_ac_item(%{"description" => desc} = item) do
+    # Prefer "description" over "criterion"; preserve other keys (e.g. "id")
+    item
+    |> Map.put("criterion", desc)
+    |> Map.delete("description")
+  end
+
+  defp normalize_ac_item(item), do: item
 end

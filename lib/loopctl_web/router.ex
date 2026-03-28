@@ -69,10 +69,14 @@ defmodule LoopctlWeb.Router do
     get "/stories/ready", DependencyGraphController, :ready
     get "/stories/blocked", DependencyGraphController, :blocked
 
+    # Project-scoped story listing (must be before stories/:id to avoid route conflicts)
+    get "/stories", StoryController, :index_by_project
+
     # Bulk operations (Epic 13) — must be before stories/:id to avoid route conflicts
     post "/stories/bulk/claim", BulkOperationsController, :claim
     post "/stories/bulk/verify", BulkOperationsController, :verify
     post "/stories/bulk/reject", BulkOperationsController, :reject
+    post "/stories/bulk/mark-complete", BulkOperationsController, :mark_complete
 
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
@@ -83,6 +87,9 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/start", StoryStatusController, :start
     post "/stories/:id/report", StoryStatusController, :report
     post "/stories/:id/unclaim", StoryStatusController, :unclaim
+    # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
+    post "/stories/:id/report-done", StoryStatusController, :report
+    post "/stories/:id/start-work", StoryStatusController, :start
 
     # Artifact reports (Epic 8)
     post "/stories/:id/artifacts", ArtifactReportController, :create
