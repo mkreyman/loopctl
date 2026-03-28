@@ -1,0 +1,161 @@
+{
+  "id": "US-17.1",
+  "title": "Orchestrator Audit Logging & Session Observability",
+  "epic": {
+    "id": "epic_17",
+    "name": "Orchestrator Observability & Guardrails"
+  },
+  "priority": "high",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "project owner reviewing autonomous orchestrator runs",
+    "i_want_to": "see a structured audit trail of every orchestrator decision, agent dispatch, tool call, and rule violation",
+    "so_that": "I can diagnose why the orchestrator made specific decisions, catch when it breaks its own rules, and continuously improve the orchestration process"
+  },
+  "rationale": "Autonomous orchestrators run for hours without human oversight. When things go wrong (orchestrator writes code directly, agents stall, reviews are skipped), there is no way to understand why without parsing raw JSONL logs manually. Structured observability enables post-run auditing, rule violation detection, and process improvement — turning opaque overnight runs into transparent, debuggable workflows.",
+  "status": "completed",
+  "completed_date": "2026-03-28",
+  "acceptance_criteria": [
+    {
+      "id": "AC-17.1.1",
+      "description": "A PostToolUse hook (audit-log.sh) logs every Edit, Write, Bash, and Agent tool call to ~/.claude/audit/<session_id>.log with UTC timestamp, tool name, and truncated input (200 chars). Read-only tools (Read, Glob, Grep) are excluded to reduce noise.",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.2",
+      "description": "A PreToolUse hook (orchestrator-guardrail.sh) blocks Edit, Write, and MultiEdit tool calls when CLAUDE_ORCHESTRATOR_MODE=true, returning exit code 2 with message 'BLOCKED: Orchestrator cannot write code directly. Dispatch a sub-agent instead.'",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.3",
+      "description": "A /loopctl:observe command parses any session's JSONL log file and produces a structured audit report showing: decision chain (numbered turns with decisions and justifications), rule violations (orchestrator writing code, background agents, missing commits, skipped reviews), and tool usage summary with violation flags.",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.4",
+      "description": "A PostCompact hook (post-compact-reinject.sh) outputs critical orchestration rules to stdout after context window compaction, ensuring the orchestrator remembers: always run full enhanced review, review agents must use Opus, never use run_in_background, one commit per story, fix all review findings, independently verify agent claims.",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.5",
+      "description": "All hook scripts are stored in the claude-config repo (hooks/ directory), symlinked from ~/.claude/hooks on all dev machines, and use $HOME instead of absolute paths for macOS/Linux portability.",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.6",
+      "description": "The /loopctl:observe command provides a 'quick mode' that counts tool types used by the orchestrator and flags Edit/Write/MultiEdit as violations without parsing the full decision chain.",
+      "status": "completed"
+    },
+    {
+      "id": "AC-17.1.7",
+      "description": "The orchestrate command (Rule 1) explicitly bans precommit fixes, credo cleanups, test fixes, and 'small' edits — specifying that only git, curl (loopctl API), and gh (PRs) commands may be run directly by the orchestrator.",
+      "status": "completed"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-17.1.1",
+      "name": "Audit log captures Edit tool calls with truncated input",
+      "type": "integration",
+      "preconditions": [
+        "audit-log.sh is installed as PostToolUse hook",
+        "~/.claude/audit/ directory exists"
+      ],
+      "steps": [
+        "Trigger an Edit tool call in a Claude Code session",
+        "Read the audit log file for the session"
+      ],
+      "expected_results": [
+        "Log file contains a line with UTC timestamp, 'Edit', and truncated input",
+        "Read/Glob/Grep calls are NOT logged"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TC-17.1.2",
+      "name": "Orchestrator guardrail blocks Edit when in orchestrator mode",
+      "type": "integration",
+      "preconditions": [
+        "orchestrator-guardrail.sh is installed as PreToolUse hook",
+        "CLAUDE_ORCHESTRATOR_MODE=true is set"
+      ],
+      "steps": [
+        "Attempt to use Edit tool"
+      ],
+      "expected_results": [
+        "Hook returns exit code 2",
+        "Stderr contains 'BLOCKED: Orchestrator cannot write code directly'"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TC-17.1.3",
+      "name": "Observer command detects rule violations in session log",
+      "type": "integration",
+      "preconditions": [
+        "A session JSONL log exists with Edit tool calls from the orchestrator"
+      ],
+      "steps": [
+        "Run /loopctl:observe against the log file"
+      ],
+      "expected_results": [
+        "Report shows Edit calls flagged as violations",
+        "Decision chain shows the turn where orchestrator started writing code",
+        "Quick mode summary shows Edit count with violation marker"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TC-17.1.4",
+      "name": "PostCompact hook re-injects critical rules",
+      "type": "integration",
+      "preconditions": [
+        "post-compact-reinject.sh is installed as PostCompact hook"
+      ],
+      "steps": [
+        "Trigger context compaction in a long session"
+      ],
+      "expected_results": [
+        "Hook outputs critical rules to stdout",
+        "Rules include: full enhanced review, Opus for review agents, no run_in_background, no deferrals"
+      ],
+      "status": "completed"
+    },
+    {
+      "id": "TC-17.1.5",
+      "name": "Hooks work on both macOS and Linux via $HOME paths",
+      "type": "integration",
+      "preconditions": [
+        "Hooks symlinked on macOS (MacBook) and Linux (beelink)",
+        "settings.json uses $HOME in hook paths"
+      ],
+      "steps": [
+        "Run any hook-triggering action on both machines"
+      ],
+      "expected_results": [
+        "Hooks execute successfully on macOS (/Users/mkreyman)",
+        "Hooks execute successfully on Linux (/home/mkreyman)"
+      ],
+      "status": "completed"
+    }
+  ],
+  "technical_notes": [
+    "Implementation lives in claude-config repo: hooks/ directory and commands/loopctl/observe.md",
+    "Hooks are symlinked: ~/.claude/hooks -> ~/workspace/claude-config/hooks",
+    "settings.json hook paths use $HOME for cross-platform portability",
+    "Audit logs written to ~/.claude/audit/<session_id>.log (not in repo, machine-local)",
+    "JSONL session logs at ~/.claude/projects/-Users-*-workspace-<project>/*.jsonl",
+    "CLAUDE_ORCHESTRATOR_MODE env var must be set by the orchestrate command's session_start",
+    "The guardrail hook only blocks when CLAUDE_ORCHESTRATOR_MODE=true — normal sessions unaffected",
+    "Observer command uses Python3 for JSONL parsing (available on all dev machines)"
+  ],
+  "dependencies": [
+    "US-9.1",
+    "US-9.2"
+  ],
+  "estimated_hours": 4,
+  "background": {
+    "reference": "2026-03-28 session: orchestrator was observed writing code directly (fixing credo issues, extracting helpers) instead of dispatching sub-agents. Root cause: continuation agent hit maxTurns, orchestrator decided 'let me handle the commit myself', then precommit failed and it snowballed into direct code edits.",
+    "includes": "PostToolUse audit hook, PreToolUse guardrail hook, PostCompact re-injection hook, /loopctl:observe command, orchestrate Rule 1 strengthening"
+  }
+}
