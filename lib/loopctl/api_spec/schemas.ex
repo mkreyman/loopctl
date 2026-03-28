@@ -991,13 +991,31 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: %Schema{type: :string},
           nullable: true,
           description: "Story numbers this story depends on"
+        },
+        initial_agent_status: %Schema{
+          type: :string,
+          enum: ["pending", "reported_done"],
+          nullable: true,
+          description:
+            "Set initial agent status at import time. " <>
+              "Use 'reported_done' for pre-existing work that has been completed."
+        },
+        initial_verified_status: %Schema{
+          type: :string,
+          enum: ["unverified", "verified"],
+          nullable: true,
+          description:
+            "Set initial verified status at import time. " <>
+              "Use 'verified' for pre-existing work that has already been verified. " <>
+              "When set to 'verified', agent_status is also set to 'reported_done'."
         }
       },
       example: %{
         number: "1.1",
         title: "Implement login endpoint",
         acceptance_criteria: [%{criterion: "Returns JWT"}],
-        estimated_hours: 4.0
+        estimated_hours: 4.0,
+        initial_verified_status: "verified"
       }
     })
   end

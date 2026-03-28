@@ -101,6 +101,9 @@ defmodule LoopctlWeb.Router do
     get "/stories/:story_id/verifications", StoryVerificationController, :index
     post "/stories/:id/force-unclaim", StoryVerificationController, :force_unclaim
 
+    # Bulk epic verification (orchestrator convenience)
+    post "/epics/:id/verify-all", StoryVerificationController, :verify_all
+
     # Agent management
     post "/agents/register", AgentController, :register
     get "/agents", AgentController, :index

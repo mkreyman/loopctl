@@ -51,11 +51,13 @@ defmodule Loopctl.Progress do
   - `{:error, :ac_count_mismatch}` if echoed AC count doesn't match
   """
   @spec contract_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()}
+          | {:error, atom() | {:contract_mismatch, map()} | {:invalid_transition, map()}}
   def contract_story(tenant_id, story_id, params, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    skip_contract_check = Keyword.get(opts, :skip_contract_check, false)
 
     story_title = Map.get(params, "story_title") || Map.get(params, :story_title)
     ac_count = Map.get(params, "ac_count") || Map.get(params, :ac_count)
@@ -66,9 +68,8 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        with :ok <- validate_transition(story.agent_status, :contracted),
-             :ok <- validate_title(story, story_title),
-             :ok <- validate_ac_count(story, ac_count) do
+        with :ok <- validate_transition_ctx(story, :contracted, "contract"),
+             :ok <- maybe_validate_contract(story, story_title, ac_count, skip_contract_check) do
           {:ok, story}
         end
       end)
@@ -143,7 +144,7 @@ defmodule Loopctl.Progress do
   - `{:error, :invalid_transition}` if not in contracted state
   """
   @spec claim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def claim_story(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -155,7 +156,7 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        case validate_transition(story.agent_status, :assigned) do
+        case validate_transition_ctx(story, :assigned, "claim") do
           :ok -> {:ok, story}
           error -> error
         end
@@ -238,7 +239,7 @@ defmodule Loopctl.Progress do
   - `{:error, :not_assigned_agent}` if calling agent is not the assigned agent
   """
   @spec start_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def start_story(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -250,7 +251,7 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        with :ok <- validate_transition(story.agent_status, :implementing),
+        with :ok <- validate_transition_ctx(story, :implementing, "start"),
              :ok <- validate_assigned_agent(story, agent_id) do
           {:ok, story}
         end
@@ -327,7 +328,7 @@ defmodule Loopctl.Progress do
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
-          {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()} | Ecto.Changeset.t()}
   def report_story(tenant_id, story_id, opts \\ [], artifact_params \\ nil) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -339,7 +340,7 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        with :ok <- validate_transition(story.agent_status, :reported_done),
+        with :ok <- validate_transition_ctx(story, :reported_done, "report"),
              :ok <- validate_assigned_agent(story, agent_id) do
           {:ok, story}
         end
@@ -511,7 +512,7 @@ defmodule Loopctl.Progress do
   - `{:error, :invalid_transition}` if story is not reported_done
   """
   @spec verify_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def verify_story(tenant_id, story_id, params, opts \\ []) do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -586,7 +587,7 @@ defmodule Loopctl.Progress do
   - `{:error, :reason_required}` if reason is missing or blank
   """
   @spec reject_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
   def reject_story(tenant_id, story_id, params, opts \\ []) do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -630,6 +631,68 @@ defmodule Loopctl.Progress do
         |> maybe_auto_reset(tenant_id, orchestrator_agent_id)
 
       unwrap_verification_transaction(multi)
+    end
+  end
+
+  @doc """
+  Verifies all reported_done stories in an epic in a single operation.
+
+  Finds all stories in the epic with agent_status=reported_done and
+  verified_status=unverified, then verifies each one using the same
+  logic as `verify_story/4`. Requires orchestrator role.
+
+  Stories that fail verification (e.g., self-verify block) are skipped
+  and reported in the errors list.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `epic_id` -- the epic UUID
+  - `params` -- map with `summary` and `review_type` (same as single verify)
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %{verified_count: integer, skipped_count: integer, errors: [map()]}}` on success
+  """
+  @spec verify_all_in_epic(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, map()} | {:error, :review_required}
+  def verify_all_in_epic(tenant_id, epic_id, params, opts \\ []) do
+    verification_params = extract_verification_params(params)
+
+    with {:ok, _} <- validate_review_evidence(verification_params) do
+      stories_to_verify = fetch_eligible_stories_for_verify(tenant_id, epic_id)
+      results = Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts))
+
+      verified = Enum.count(results, &match?({:ok, _}, &1))
+      errors = results |> Enum.filter(&match?({:error, _}, &1)) |> Enum.map(&elem(&1, 1))
+
+      {:ok,
+       %{
+         verified_count: verified,
+         skipped_count: length(errors),
+         total_eligible: length(stories_to_verify),
+         errors: errors
+       }}
+    end
+  end
+
+  defp fetch_eligible_stories_for_verify(tenant_id, epic_id) do
+    Story
+    |> where(
+      [s],
+      s.tenant_id == ^tenant_id and
+        s.epic_id == ^epic_id and
+        s.agent_status == :reported_done and
+        s.verified_status == :unverified
+    )
+    |> AdminRepo.all()
+  end
+
+  defp verify_single(tenant_id, story, params, opts) do
+    case verify_story(tenant_id, story.id, params, opts) do
+      {:ok, _updated} -> {:ok, story.id}
+      {:error, reason} -> {:error, %{story_id: story.id, reason: inspect(reason)}}
     end
   end
 
@@ -772,9 +835,28 @@ defmodule Loopctl.Progress do
 
   defp validate_verifiable(story) do
     cond do
-      story.agent_status != :reported_done -> {:error, :invalid_transition}
-      story.verified_status == :verified -> {:error, :invalid_transition}
-      true -> {:ok, story}
+      story.agent_status != :reported_done ->
+        {:error,
+         {:invalid_transition,
+          %{
+            current_agent_status: story.agent_status,
+            current_verified_status: story.verified_status,
+            attempted_action: "verify",
+            hint: "Story must be in 'reported_done' agent_status before it can be verified"
+          }}}
+
+      story.verified_status == :verified ->
+        {:error,
+         {:invalid_transition,
+          %{
+            current_agent_status: story.agent_status,
+            current_verified_status: story.verified_status,
+            attempted_action: "verify",
+            hint: "Story is already verified"
+          }}}
+
+      true ->
+        {:ok, story}
     end
   end
 
@@ -798,7 +880,16 @@ defmodule Loopctl.Progress do
     if story.agent_status == :reported_done or story.verified_status == :verified do
       {:ok, story}
     else
-      {:error, :invalid_transition}
+      {:error,
+       {:invalid_transition,
+        %{
+          current_agent_status: story.agent_status,
+          current_verified_status: story.verified_status,
+          attempted_action: "reject",
+          hint:
+            "Story must be 'reported_done' or 'verified' before it can be rejected. " <>
+              "Did the agent report done first?"
+        }}}
     end
   end
 
@@ -952,6 +1043,7 @@ defmodule Loopctl.Progress do
       # When auto-reset happened, return the reset story (non-nil means reset was performed)
       {:ok, %{auto_reset: %Story{} = reset_story}} -> {:ok, reset_story}
       {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, _step, {:invalid_transition, _ctx} = reason, _completed} -> {:error, reason}
       {:error, _step, reason, _completed} -> {:error, reason}
     end
   end
@@ -1108,6 +1200,26 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # Returns :ok or {:error, {:invalid_transition, context}} with rich context for the caller.
+  defp validate_transition_ctx(story, target_status, attempted_action) do
+    case validate_transition(story.agent_status, target_status) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_transition} ->
+        {:error,
+         {:invalid_transition,
+          %{
+            current_agent_status: story.agent_status,
+            current_verified_status: story.verified_status,
+            attempted_action: attempted_action
+          }}}
+
+      other ->
+        other
+    end
+  end
+
   defp validate_assigned_agent(story, agent_id) do
     if story.assigned_agent_id == agent_id do
       :ok
@@ -1181,7 +1293,17 @@ defmodule Loopctl.Progress do
     if actual_count == ac_count do
       :ok
     else
-      {:error, :ac_count_mismatch}
+      {:error,
+       {:contract_mismatch,
+        %{expected_ac_count: actual_count, provided_ac_count: ac_count, field: :ac_count}}}
+    end
+  end
+
+  defp maybe_validate_contract(_story, _story_title, _ac_count, true), do: :ok
+
+  defp maybe_validate_contract(story, story_title, ac_count, false) do
+    with :ok <- validate_title(story, story_title) do
+      validate_ac_count(story, ac_count)
     end
   end
 

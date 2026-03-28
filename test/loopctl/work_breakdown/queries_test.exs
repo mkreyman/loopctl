@@ -311,4 +311,50 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
       assert {:error, :not_found} = Queries.get_dependency_graph(tenant_a.id, project_b.id)
     end
   end
+
+  # --- Issue 13: Increased pagination limit ---
+
+  describe "list_ready_stories/2 pagination limits" do
+    test "default page_size is 100" do
+      %{tenant: tenant} = setup_project()
+
+      {:ok, result} = Queries.list_ready_stories(tenant.id)
+
+      assert result.page_size == 100
+    end
+
+    test "allows page_size up to 500" do
+      %{tenant: tenant} = setup_project()
+
+      {:ok, result} = Queries.list_ready_stories(tenant.id, page_size: 500)
+
+      assert result.page_size == 500
+    end
+
+    test "caps page_size at 500 (not 100)" do
+      %{tenant: tenant} = setup_project()
+
+      {:ok, result} = Queries.list_ready_stories(tenant.id, page_size: 999)
+
+      assert result.page_size == 500
+    end
+  end
+
+  describe "list_blocked_stories/2 pagination limits" do
+    test "default page_size is 100" do
+      %{tenant: tenant} = setup_project()
+
+      {:ok, result} = Queries.list_blocked_stories(tenant.id)
+
+      assert result.page_size == 100
+    end
+
+    test "allows page_size up to 500" do
+      %{tenant: tenant} = setup_project()
+
+      {:ok, result} = Queries.list_blocked_stories(tenant.id, page_size: 500)
+
+      assert result.page_size == 500
+    end
+  end
 end

@@ -215,8 +215,8 @@ Now the agent key can contract, claim, start, and report stories. The orchestrat
 5. Get ready stories    GET  /api/v1/stories/ready?project_id=...
 6. Contract story       POST /api/v1/stories/:id/contract
 7. Claim story          POST /api/v1/stories/:id/claim
-8. Start implementing   POST /api/v1/stories/:id/start
-9. Report done          POST /api/v1/stories/:id/report
+8. Start implementing   POST /api/v1/stories/:id/start-work  (or /start)
+9. Report done          POST /api/v1/stories/:id/report-done (or /report)
 10. (Orchestrator)      POST /api/v1/stories/:id/verify  OR  /reject
 ```
 
@@ -239,13 +239,15 @@ Now the agent key can contract, claim, start, and report stories. The orchestrat
 Agent endpoints (exact_role: agent):
   POST /stories/:id/contract
   POST /stories/:id/claim
-  POST /stories/:id/start
-  POST /stories/:id/report
+  POST /stories/:id/start           (alias: /start-work)
+  POST /stories/:id/report          (alias: /report-done)
 
 Orchestrator endpoints (exact_role: orchestrator):
-  POST /stories/:id/verify
+  POST /stories/:id/verify          (requires review_type and summary — returns 422 without them)
   POST /stories/:id/reject
   POST /stories/:id/force-unclaim
+  POST /stories/bulk/mark-complete  (mark pre-existing stories complete in one call)
+  POST /epics/:id/verify-all        (verify all reported_done stories in an epic)
 ```
 
 An agent key **cannot** call verify/reject. An orchestrator key **cannot** call claim/start/report. This is enforced at the plug level with strict atom equality -- no role hierarchy bypass.
@@ -263,6 +265,95 @@ curl -X POST http://localhost:4000/api/v1/stories/:id/contract \
 ```
 
 If the title or count does not match, the contract is rejected.
+
+Orchestrators can skip contract validation for bulk operations using `skip_contract_check: true`
+(orchestrator role only):
+
+```bash
+curl -X POST http://localhost:4000/api/v1/stories/:id/contract \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"skip_contract_check": true}'
+```
+
+### Listing Stories
+
+`GET /api/v1/stories` returns stories with flexible filters. Supports up to 500 results per page
+via `limit` and `offset`.
+
+```bash
+# All stories in a project
+curl http://localhost:4000/api/v1/stories?project_id=<id>
+
+# Filter by status fields
+curl "http://localhost:4000/api/v1/stories?project_id=<id>&agent_status=reported_done&verified_status=unverified"
+
+# Filter to a specific epic
+curl "http://localhost:4000/api/v1/stories?project_id=<id>&epic_id=<epic_id>"
+
+# Paginate a large project
+curl "http://localhost:4000/api/v1/stories?project_id=<id>&limit=500&offset=0"
+curl "http://localhost:4000/api/v1/stories?project_id=<id>&limit=500&offset=500"
+```
+
+Available query parameters: `project_id` (required), `agent_status`, `verified_status`, `epic_id`,
+`limit` (max 500, default 100), `offset` (default 0).
+
+### Bulk and Admin Endpoints
+
+**Mark pre-existing stories as complete** in a single request. Useful when bootstrapping a project
+that already has completed work:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stories": [
+      {"story_id": "<uuid>", "summary": "Pre-existing implementation", "review_type": "pre_existing"},
+      {"story_id": "<uuid>", "summary": "Carried over from v1", "review_type": "pre_existing"}
+    ]
+  }'
+```
+
+**Verify all reported_done stories in an epic** at once (orchestrator only). Both `review_type` and
+`summary` are required:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/epics/:id/verify-all \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"review_type": "enhanced", "summary": "All stories reviewed and AC-compliant"}'
+```
+
+### Verify Endpoint Requirements
+
+The verify endpoint **requires** both `review_type` and `summary`. Omitting either returns 422:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/stories/:id/verify \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"result": "pass", "review_type": "enhanced", "summary": "All acceptance criteria met"}'
+```
+
+### 409 Conflict Responses
+
+When a state transition is invalid, 409 responses include structured context:
+
+```json
+{
+  "error": {
+    "message": "Conflict",
+    "current_state": "assigned",
+    "attempted_action": "claim",
+    "hints": ["Story is already claimed by another agent. Use force-unclaim to reset it."]
+  }
+}
+```
+
+The `current_state`, `attempted_action`, and `hints` fields are always present on 409 responses
+from story transition endpoints. Read `hints` to understand the corrective action.
 
 ### Story Lifecycle
 
@@ -323,6 +414,28 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
 ```
 
 Each epic requires `number` (integer) and `title` (string). Each story requires `number` (string, e.g. "1.1") and `title`. Stories are nested under their epic's `stories` array. Story dependencies use `"story"` and `"depends_on"` keys referencing story numbers. Epic dependencies use `"epic"` and `"depends_on"` keys referencing epic numbers. All dependencies are validated for cycles.
+
+#### Importing Pre-existing Work
+
+Stories can be imported with initial status overrides using `initial_agent_status` and
+`initial_verified_status`. This allows bootstrapping projects where some or all work already exists:
+
+```json
+{
+  "stories": [
+    {
+      "number": "1.1",
+      "title": "Database schema",
+      "acceptance_criteria": [{"criterion": "Migrations applied"}],
+      "initial_agent_status": "reported_done",
+      "initial_verified_status": "pass"
+    }
+  ]
+}
+```
+
+Stories imported with `initial_verified_status: "pass"` are treated as already verified and will
+not appear in the ready queue or block dependent stories.
 
 ### Webhook Event Types
 
@@ -432,7 +545,8 @@ Rate limit headers are included in every authenticated response:
 All list endpoints support page-based pagination:
 
 - `?page=1&page_size=20` (defaults)
-- Maximum `page_size`: 100
+- Maximum `page_size`: 100 (general endpoints)
+- Maximum `limit`: 500 (`GET /stories` endpoint)
 
 Responses include metadata:
 

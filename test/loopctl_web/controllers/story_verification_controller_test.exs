@@ -572,4 +572,139 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert statuses == [200, 409]
     end
   end
+
+  # --- Issue 8: descriptive 409 errors ---
+
+  describe "descriptive 409 responses" do
+    test "verify on pending story returns 409 with current state", %{conn: conn} do
+      %{orch_key: orch_key, epic: epic, tenant: tenant} = setup_reported_story()
+
+      pending_story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{pending_story.id}/verify", %{
+          "summary" => "Looks good",
+          "review_type" => "enhanced"
+        })
+
+      body = json_response(conn, 409)
+      assert body["error"]["context"]["current_agent_status"] == "pending"
+      assert body["error"]["context"]["attempted_action"] == "verify"
+      assert body["error"]["message"] =~ "Cannot verify"
+    end
+
+    test "reject on pending story returns 409 with current state", %{conn: conn} do
+      %{orch_key: orch_key, epic: epic, tenant: tenant} = setup_reported_story()
+
+      pending_story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{pending_story.id}/reject", %{
+          "reason" => "Bad work"
+        })
+
+      body = json_response(conn, 409)
+      assert body["error"]["context"]["current_agent_status"] == "pending"
+      assert body["error"]["context"]["attempted_action"] == "reject"
+    end
+  end
+
+  # --- Issue 11: verify-all endpoint ---
+
+  describe "POST /api/v1/epics/:id/verify-all" do
+    test "verifies all reported_done unverified stories in an epic", %{conn: conn} do
+      %{tenant: tenant, epic: epic, impl_agent: impl_agent, orch_key: orch_key} =
+        setup_reported_story()
+
+      # Create 2 more reported_done stories in the same epic
+      for _ <- 1..2 do
+        story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: impl_agent.id,
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+      end
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
+          "summary" => "All stories pass review",
+          "review_type" => "enhanced"
+        })
+
+      body = json_response(conn, 200)
+      assert body["verified_count"] == 3
+      assert body["skipped_count"] == 0
+      assert body["total_eligible"] == 3
+      assert body["errors"] == []
+    end
+
+    test "returns zero counts when no stories are eligible", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {orch_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
+
+      # No reported_done stories
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
+          "summary" => "Nothing to verify",
+          "review_type" => "enhanced"
+        })
+
+      body = json_response(conn, 200)
+      assert body["verified_count"] == 0
+      assert body["total_eligible"] == 0
+    end
+
+    test "requires review evidence", %{conn: conn} do
+      %{orch_key: orch_key, epic: epic} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
+          "summary" => ""
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "Review evidence required"
+    end
+
+    test "requires orchestrator role (403 for agent)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {agent_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{agent_key}")
+        |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
+          "summary" => "All good",
+          "review_type" => "enhanced"
+        })
+
+      assert conn.status == 403
+    end
+  end
 end

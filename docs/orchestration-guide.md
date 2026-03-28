@@ -139,6 +139,84 @@ back via the history API. This decouples observability from any specific toolcha
 
 ---
 
+## Bootstrapping Pre-existing Projects
+
+When onboarding a project that already has completed work, three patterns are available:
+
+### Pattern 1: Import with initial status
+
+Set `initial_agent_status` and `initial_verified_status` on stories at import time. Stories
+imported as `pass` are immediately treated as verified and unblock their dependents:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/projects/:id/import \
+  -H "Authorization: Bearer lc_user_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "epics": [{
+      "number": 1,
+      "title": "Foundation",
+      "stories": [{
+        "number": "1.1",
+        "title": "Database schema",
+        "acceptance_criteria": [{"criterion": "Migrations applied"}],
+        "initial_agent_status": "reported_done",
+        "initial_verified_status": "pass"
+      }]
+    }]
+  }'
+```
+
+Use this pattern when you know the status of work at import time.
+
+### Pattern 2: Bulk mark-complete after import
+
+Import stories normally (they start as `pending`), then bulk-complete them in one call:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stories": [
+      {"story_id": "<uuid>", "summary": "Pre-existing implementation", "review_type": "pre_existing"},
+      {"story_id": "<uuid>", "summary": "Carried over from v1", "review_type": "pre_existing"}
+    ]
+  }'
+```
+
+Use this pattern when you need to import first and then batch-verify after reviewing what exists.
+
+### Pattern 3: Epic-wide verification
+
+After implementation agents have reported done on all stories in an epic, the orchestrator can
+verify the entire epic in a single call instead of verifying each story individually:
+
+```bash
+curl -X POST http://localhost:4000/api/v1/epics/:id/verify-all \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"review_type": "enhanced", "summary": "Epic-wide review passed, all ACs met"}'
+```
+
+This verifies only stories in `reported_done` state. Stories still in progress are skipped.
+
+### Querying Status During Bootstrap
+
+Use `GET /stories?project_id=X` for comprehensive status queries during bootstrap. The endpoint
+supports filtering by `agent_status`, `verified_status`, and `epic_id` with up to 500 results
+per page:
+
+```bash
+# Find all stories still pending after bulk import
+curl "http://localhost:4000/api/v1/stories?project_id=:id&verified_status=unverified&limit=500"
+
+# Find reported_done stories awaiting orchestrator verification
+curl "http://localhost:4000/api/v1/stories?project_id=:id&agent_status=reported_done&verified_status=unverified"
+```
+
+---
+
 ## Best Practices
 
 **One commit per story.** Mixing multiple stories in a single commit breaks artifact traceability.

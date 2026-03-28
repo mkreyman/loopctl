@@ -504,7 +504,7 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
   # --- Role enforcement tests ---
 
   describe "role enforcement" do
-    test "orchestrator role cannot use agent endpoints (403)", %{conn: conn} do
+    test "orchestrator role cannot use agent-only endpoints (403)", %{conn: conn} do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -515,7 +515,8 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       {orch_key, _} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
 
-      for action <- ["contract", "claim", "start", "report", "unclaim"] do
+      # claim, start, report, unclaim are agent-only (contract allows orchestrator)
+      for action <- ["claim", "start", "report", "unclaim"] do
         resp =
           conn
           |> auth_conn(orch_key)
@@ -523,6 +524,28 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
         assert resp.status == 403, "#{action} should require agent role, got #{resp.status}"
       end
+    end
+
+    test "orchestrator role can use contract endpoint (skip_contract_check)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {orch_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
+
+      # Orchestrators skip the title/ac_count validation — any params succeed
+      resp =
+        conn
+        |> auth_conn(orch_key)
+        |> post("/api/v1/stories/#{story.id}/contract", %{})
+
+      assert resp.status == 200
+      body = json_response(resp, 200)
+      assert body["story"]["agent_status"] == "contracted"
     end
 
     test "user role cannot use agent endpoints (403)", %{conn: conn} do

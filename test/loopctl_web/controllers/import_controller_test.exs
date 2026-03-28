@@ -339,5 +339,96 @@ defmodule LoopctlWeb.ImportControllerTest do
 
       assert json_response(conn, 403)
     end
+
+    # --- Issue 10: initial_status support ---
+
+    test "imports story with initial_verified_status=verified sets both statuses", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      payload = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Pre-existing Epic",
+            "stories" => [
+              %{
+                "number" => "1.1",
+                "title" => "Pre-existing Story",
+                "initial_verified_status" => "verified"
+              },
+              %{
+                "number" => "1.2",
+                "title" => "New Pending Story"
+              }
+            ]
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import", payload)
+
+      assert json_response(conn, 201)
+
+      stories =
+        Story
+        |> where([s], s.tenant_id == ^tenant.id and s.project_id == ^project.id)
+        |> AdminRepo.all()
+        |> Enum.sort_by(& &1.number)
+
+      verified_story = Enum.find(stories, &(&1.number == "1.1"))
+      pending_story = Enum.find(stories, &(&1.number == "1.2"))
+
+      assert verified_story.agent_status == :reported_done
+      assert verified_story.verified_status == :verified
+      assert verified_story.verified_at != nil
+
+      assert pending_story.agent_status == :pending
+      assert pending_story.verified_status == :unverified
+    end
+
+    test "imports story with initial_agent_status=reported_done sets agent_status only", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      payload = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [
+              %{
+                "number" => "1.1",
+                "title" => "Done But Not Verified",
+                "initial_agent_status" => "reported_done"
+              }
+            ]
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import", payload)
+
+      assert json_response(conn, 201)
+
+      [story] =
+        Story
+        |> where([s], s.tenant_id == ^tenant.id and s.project_id == ^project.id)
+        |> AdminRepo.all()
+
+      assert story.agent_status == :reported_done
+      assert story.verified_status == :unverified
+      assert story.reported_done_at != nil
+    end
   end
 end

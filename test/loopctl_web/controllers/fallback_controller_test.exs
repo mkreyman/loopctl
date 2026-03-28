@@ -91,6 +91,71 @@ defmodule LoopctlWeb.FallbackControllerTest do
     end
   end
 
+  # --- Issue 4: contract_mismatch error with counts ---
+
+  describe "contract_mismatch handling" do
+    test "renders 422 with expected and provided ac_count", %{conn: conn} do
+      conn =
+        call_fallback(
+          conn,
+          {:error, {:contract_mismatch, %{expected_ac_count: 5, provided_ac_count: 3}}}
+        )
+
+      assert conn.status == 422
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "expected ac_count 5"
+      assert body["error"]["message"] =~ "got 3"
+      assert body["error"]["context"]["expected_ac_count"] == 5
+      assert body["error"]["context"]["provided_ac_count"] == 3
+    end
+  end
+
+  # --- Issue 8: descriptive invalid_transition errors ---
+
+  describe "invalid_transition context handling" do
+    test "renders 409 with current state and attempted action", %{conn: conn} do
+      conn =
+        call_fallback(
+          conn,
+          {:error,
+           {:invalid_transition,
+            %{
+              current_agent_status: :pending,
+              current_verified_status: :unverified,
+              attempted_action: "claim"
+            }}}
+        )
+
+      assert conn.status == 409
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 409
+      assert body["error"]["message"] =~ "Cannot claim"
+      assert body["error"]["message"] =~ "pending"
+      assert body["error"]["context"]["current_agent_status"] == "pending"
+      assert body["error"]["context"]["attempted_action"] == "claim"
+    end
+
+    test "renders 409 with hint when present", %{conn: conn} do
+      conn =
+        call_fallback(
+          conn,
+          {:error,
+           {:invalid_transition,
+            %{
+              current_agent_status: :pending,
+              current_verified_status: :unverified,
+              attempted_action: "verify",
+              hint: "Story must be in 'reported_done' agent_status before it can be verified"
+            }}}
+        )
+
+      assert conn.status == 409
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["message"] =~ "reported_done"
+    end
+  end
+
   describe "ErrorJSON" do
     test "renders 500 without leaking internal details" do
       body = LoopctlWeb.ErrorJSON.render("500.json", %{})

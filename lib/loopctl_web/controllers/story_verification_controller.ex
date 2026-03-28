@@ -22,7 +22,7 @@ defmodule LoopctlWeb.StoryVerificationController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [exact_role: :orchestrator] when action in [:verify, :reject, :force_unclaim]
+       [exact_role: :orchestrator] when action in [:verify, :reject, :force_unclaim, :verify_all]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :orchestrator] when action in [:index]
@@ -91,6 +91,33 @@ defmodule LoopctlWeb.StoryVerificationController do
     }
   )
 
+  operation(:verify_all,
+    summary: "Verify all reported-done stories in an epic",
+    description:
+      "Orchestrator convenience endpoint that verifies all stories in the epic " <>
+        "that have agent_status=reported_done and verified_status=unverified. " <>
+        "Requires review_type and summary in the body (same as single verify). " <>
+        "Returns count of verified stories and any errors.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
+    responses: %{
+      200 =>
+        {"Verify-all result", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             verified_count: %OpenApiSpex.Schema{type: :integer, example: 5},
+             skipped_count: %OpenApiSpex.Schema{type: :integer, example: 0},
+             total_eligible: %OpenApiSpex.Schema{type: :integer, example: 5},
+             errors: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :object}}
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Review evidence required", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   @doc """
   POST /api/v1/stories/:id/verify
 
@@ -112,6 +139,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :review_required} ->
           {:error, :review_required}
+
+        {:error, {:invalid_transition, _ctx} = err} ->
+          {:error, err}
 
         {:error, :invalid_transition} ->
           {:error, :conflict}
@@ -144,6 +174,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :reason_required} ->
           {:error, :unprocessable_entity, "reason is required and cannot be blank"}
+
+        {:error, {:invalid_transition, _ctx} = err} ->
+          {:error, err}
 
         {:error, :invalid_transition} ->
           {:error, :conflict}
@@ -219,6 +252,29 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :not_found} ->
           {:error, :not_found}
+      end
+    end
+  end
+
+  @doc """
+  POST /api/v1/epics/:id/verify-all
+
+  Orchestrator bulk-verifies all reported_done, unverified stories in an epic.
+  Requires review_type and summary in the body.
+  """
+  def verify_all(conn, %{"id" => epic_id} = params) do
+    api_key = conn.assigns.current_api_key
+
+    with :ok <- validate_orchestrator_agent_linked(api_key) do
+      tenant_id = api_key.tenant_id
+      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+
+      case Progress.verify_all_in_epic(tenant_id, epic_id, params, opts) do
+        {:ok, result} ->
+          json(conn, result)
+
+        {:error, :review_required} ->
+          {:error, :review_required}
       end
     end
   end

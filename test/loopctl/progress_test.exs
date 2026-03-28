@@ -63,10 +63,10 @@ defmodule Loopctl.ProgressTest do
                )
     end
 
-    test "rejects with wrong ac_count" do
+    test "rejects with wrong ac_count (returns contract_mismatch with counts)" do
       %{tenant: tenant, story: story, agent: agent} = setup_story()
 
-      assert {:error, :ac_count_mismatch} =
+      assert {:error, {:contract_mismatch, ctx}} =
                Progress.contract_story(
                  tenant.id,
                  story.id,
@@ -76,13 +76,16 @@ defmodule Loopctl.ProgressTest do
                  },
                  agent_id: agent.id
                )
+
+      assert ctx.expected_ac_count == 2
+      assert ctx.provided_ac_count == 99
     end
 
-    test "rejects transition from non-pending state" do
+    test "rejects transition from non-pending state (returns invalid_transition context)" do
       %{tenant: tenant, story: story, agent: agent} =
         setup_story(%{agent_status: :contracted})
 
-      assert {:error, :invalid_transition} =
+      assert {:error, {:invalid_transition, ctx}} =
                Progress.contract_story(
                  tenant.id,
                  story.id,
@@ -92,6 +95,9 @@ defmodule Loopctl.ProgressTest do
                  },
                  agent_id: agent.id
                )
+
+      assert ctx.current_agent_status == :contracted
+      assert ctx.attempted_action == "contract"
     end
   end
 
@@ -115,12 +121,15 @@ defmodule Loopctl.ProgressTest do
                Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
     end
 
-    test "rejects from assigned (already claimed)" do
+    test "rejects from assigned (already claimed, returns invalid_transition context)" do
       %{tenant: tenant, story: story, agent: agent} =
         setup_story(%{agent_status: :assigned})
 
-      assert {:error, :invalid_transition} =
+      assert {:error, {:invalid_transition, ctx}} =
                Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
+
+      assert ctx.current_agent_status == :assigned
+      assert ctx.attempted_action == "claim"
     end
   end
 
@@ -373,6 +382,176 @@ defmodule Loopctl.ProgressTest do
                )
 
       assert updated.verified_status == :rejected
+    end
+  end
+
+  # --- Issue 3: skip_contract_check for orchestrator ---
+
+  describe "contract_story/4 skip_contract_check" do
+    test "orchestrator can contract with skip_contract_check: true (no params required)" do
+      %{tenant: tenant, story: story} = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      assert {:ok, updated} =
+               Progress.contract_story(
+                 tenant.id,
+                 story.id,
+                 %{},
+                 agent_id: orch_agent.id,
+                 skip_contract_check: true
+               )
+
+      assert updated.agent_status == :contracted
+    end
+
+    test "skip_contract_check does not bypass state transition validation" do
+      %{tenant: tenant, story: story} = setup_story(%{agent_status: :contracted})
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # Even with skip, cannot re-contract an already-contracted story
+      assert {:error, {:invalid_transition, ctx}} =
+               Progress.contract_story(
+                 tenant.id,
+                 story.id,
+                 %{},
+                 agent_id: orch_agent.id,
+                 skip_contract_check: true
+               )
+
+      assert ctx.current_agent_status == :contracted
+    end
+  end
+
+  # --- Issue 8: descriptive invalid_transition errors ---
+
+  describe "verify_story/4 invalid transition errors" do
+    test "returns descriptive error when story is not reported_done" do
+      %{tenant: tenant} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # Story is pending, not reported_done
+      assert {:error, {:invalid_transition, error_ctx}} =
+               Progress.verify_story(
+                 tenant.id,
+                 ctx.story.id,
+                 %{"summary" => "Looks good", "review_type" => "enhanced"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert error_ctx.attempted_action == "verify"
+      assert error_ctx.current_agent_status == :pending
+      assert error_ctx.hint =~ "reported_done"
+    end
+
+    test "returns descriptive error when story is already verified" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          verified_status: :verified
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, {:invalid_transition, error_ctx}} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Looks good", "review_type" => "enhanced"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert error_ctx.current_verified_status == :verified
+      assert error_ctx.hint =~ "already verified"
+    end
+  end
+
+  describe "reject_story/4 invalid transition errors" do
+    test "returns descriptive error when story is not reportable" do
+      %{tenant: tenant} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # Story is pending — cannot be rejected
+      assert {:error, {:invalid_transition, error_ctx}} =
+               Progress.reject_story(
+                 tenant.id,
+                 ctx.story.id,
+                 %{"reason" => "Bad code"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert error_ctx.attempted_action == "reject"
+      assert error_ctx.current_agent_status == :pending
+      assert error_ctx.hint =~ "reported_done"
+    end
+  end
+
+  # --- Issue 11: verify_all_in_epic ---
+
+  describe "verify_all_in_epic/4" do
+    test "verifies all reported_done unverified stories in an epic" do
+      %{tenant: tenant, epic: epic, agent: agent} = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # Create 3 more stories in same epic, all reported_done
+      for _ <- 1..3 do
+        story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+      end
+
+      assert {:ok, result} =
+               Progress.verify_all_in_epic(
+                 tenant.id,
+                 epic.id,
+                 %{"summary" => "All pass", "review_type" => "enhanced"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert result.verified_count == 3
+      assert result.skipped_count == 0
+      assert result.total_eligible == 3
+      assert result.errors == []
+    end
+
+    test "returns zero counts when no stories are eligible" do
+      %{tenant: tenant, epic: epic} = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # The setup_story creates one pending story — not eligible for verify_all
+
+      assert {:ok, result} =
+               Progress.verify_all_in_epic(
+                 tenant.id,
+                 epic.id,
+                 %{"summary" => "All pass", "review_type" => "enhanced"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert result.verified_count == 0
+      assert result.total_eligible == 0
+    end
+
+    test "requires review evidence (review_type and summary)" do
+      %{tenant: tenant, epic: epic} = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      assert {:error, :review_required} =
+               Progress.verify_all_in_epic(
+                 tenant.id,
+                 epic.id,
+                 %{"summary" => ""},
+                 orchestrator_agent_id: orch_agent.id
+               )
     end
   end
 

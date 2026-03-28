@@ -49,6 +49,53 @@ defmodule LoopctlWeb.FallbackController do
     |> json(%{error: %{status: 409, message: "Conflict"}})
   end
 
+  def call(conn, {:error, {:invalid_transition, ctx}}) do
+    current_agent = ctx |> Map.get(:current_agent_status) |> to_string()
+    current_verified = ctx |> Map.get(:current_verified_status) |> to_string()
+    attempted = Map.get(ctx, :attempted_action, "transition")
+    hint = Map.get(ctx, :hint)
+
+    message =
+      if hint do
+        "Cannot #{attempted}: story is in agent_status='#{current_agent}', " <>
+          "verified_status='#{current_verified}'. #{hint}"
+      else
+        "Cannot #{attempted}: story is in agent_status='#{current_agent}', " <>
+          "verified_status='#{current_verified}'"
+      end
+
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        message: message,
+        context: %{
+          current_agent_status: current_agent,
+          current_verified_status: current_verified,
+          attempted_action: attempted
+        }
+      }
+    })
+  end
+
+  def call(conn, {:error, {:contract_mismatch, ctx}}) do
+    expected = Map.get(ctx, :expected_ac_count)
+    provided = Map.get(ctx, :provided_ac_count)
+
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        message:
+          "Contract mismatch: expected ac_count #{expected} but got #{provided}. " <>
+            "Story has #{expected} acceptance criteria.",
+        context: %{expected_ac_count: expected, provided_ac_count: provided}
+      }
+    })
+  end
+
   def call(conn, {:error, :must_contract_first}) do
     conn
     |> put_status(:conflict)

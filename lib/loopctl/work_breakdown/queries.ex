@@ -28,7 +28,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
   - `:project_id` -- filter to one project
   - `:epic_id` -- filter to one epic
   - `:page` -- page number (default 1)
-  - `:page_size` -- stories per page (default 20, max 100)
+  - `:page_size` -- stories per page (default 100, max 500)
   """
   @spec list_ready_stories(Ecto.UUID.t(), keyword()) ::
           {:ok,
@@ -40,7 +40,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
            }}
   def list_ready_stories(tenant_id, opts \\ []) do
     page = max(Keyword.get(opts, :page, 1), 1)
-    page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
+    page_size = opts |> Keyword.get(:page_size, 100) |> max(1) |> min(500)
     offset = (page - 1) * page_size
 
     base_query =
@@ -113,7 +113,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
   - `:project_id` -- filter to one project
   - `:page` -- page number (default 1)
-  - `:page_size` -- stories per page (default 20, max 100)
+  - `:page_size` -- stories per page (default 100, max 500)
   """
   @spec list_blocked_stories(Ecto.UUID.t(), keyword()) ::
           {:ok,
@@ -125,7 +125,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
            }}
   def list_blocked_stories(tenant_id, opts \\ []) do
     page = max(Keyword.get(opts, :page, 1), 1)
-    page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
+    page_size = opts |> Keyword.get(:page_size, 100) |> max(1) |> min(500)
     offset = (page - 1) * page_size
 
     # Stories that have at least one unverified dependency (story-level or epic-level)

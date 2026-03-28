@@ -22,7 +22,10 @@ defmodule LoopctlWeb.StoryStatusController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [exact_role: :agent] when action in [:contract, :claim, :start, :report, :unclaim]
+       [exact_role: [:agent, :orchestrator]] when action in [:contract]
+
+  plug LoopctlWeb.Plugs.RequireRole,
+       [exact_role: :agent] when action in [:claim, :start, :report, :unclaim]
 
   tags(["Progress"])
 
@@ -119,7 +122,12 @@ defmodule LoopctlWeb.StoryStatusController do
   def contract(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+    skip_check = api_key.role in [:orchestrator, :admin]
+
+    opts =
+      AuditContext.from_conn(conn)
+      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.put(:skip_contract_check, skip_check)
 
     case Progress.contract_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
@@ -128,8 +136,11 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :title_mismatch} ->
         {:error, :unprocessable_entity, "story_title does not match"}
 
-      {:error, :ac_count_mismatch} ->
-        {:error, :unprocessable_entity, "ac_count does not match"}
+      {:error, {:contract_mismatch, _ctx} = err} ->
+        {:error, err}
+
+      {:error, {:invalid_transition, _ctx} = err} ->
+        {:error, err}
 
       {:error, :invalid_transition} ->
         {:error, :conflict}
@@ -155,6 +166,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
+
+      {:error, {:invalid_transition, _ctx} = err} ->
+        {:error, err}
 
       {:error, :invalid_transition} ->
         {:error, :conflict}
@@ -190,6 +204,9 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :must_claim_first} ->
         {:error, :must_claim_first}
 
+      {:error, {:invalid_transition, _ctx} = err} ->
+        {:error, err}
+
       {:error, :invalid_transition} ->
         {:error, :conflict}
 
@@ -215,6 +232,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
+
+      {:error, {:invalid_transition, _ctx} = err} ->
+        {:error, err}
 
       {:error, :invalid_transition} ->
         {:error, :conflict}

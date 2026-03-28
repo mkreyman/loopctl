@@ -320,10 +320,42 @@ defmodule Loopctl.ImportExport do
     |> AdminRepo.insert()
     |> case do
       {:ok, story} ->
-        {:ok, story}
+        apply_initial_status(story, story_data)
 
       {:error, cs} ->
         {:error, format_changeset_path_error(cs, "epics[#{epic_index}].stories[#{story_index}]")}
+    end
+  end
+
+  defp apply_initial_status(story, story_data) do
+    initial_verified = story_data["initial_verified_status"]
+    initial_agent = story_data["initial_agent_status"]
+
+    cond do
+      initial_verified == "verified" ->
+        now = DateTime.utc_now()
+
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          verified_status: :verified,
+          reported_done_at: now,
+          verified_at: now
+        })
+        |> AdminRepo.update()
+
+      initial_agent == "reported_done" ->
+        now = DateTime.utc_now()
+
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          reported_done_at: now
+        })
+        |> AdminRepo.update()
+
+      true ->
+        {:ok, story}
     end
   end
 
