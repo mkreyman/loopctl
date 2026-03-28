@@ -510,8 +510,11 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "VerifyRequest",
-      description: "Orchestrator verifies a reported_done story",
+      description:
+        "Orchestrator verifies a reported_done story. " <>
+          "Requires review_type and summary as proof that an independent review was conducted.",
       type: :object,
+      required: [:review_type, :summary],
       properties: %{
         result: %Schema{
           type: :string,
@@ -521,8 +524,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         summary: %Schema{
           type: :string,
-          description: "Human-readable summary of the verification",
-          example: "All ACs met"
+          description:
+            "Required. Human-readable summary of the review findings. " <>
+              "Must describe what was reviewed and what was found.",
+          example: "Enhanced review: 2 rounds, 6 agents, 5 bugs fixed, 0 deferrals"
         },
         findings: %Schema{
           type: :object,
@@ -531,15 +536,17 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         review_type: %Schema{
           type: :string,
-          description: "Type of review performed (e.g. enhanced_review, quick_check)",
-          example: "enhanced_review"
+          description:
+            "Required. Type of independent review performed. " <>
+              "Examples: enhanced, team, adversarial, single_agent",
+          example: "enhanced"
         }
       },
       example: %{
         result: "pass",
-        summary: "All ACs met",
+        summary: "Enhanced review: 2 rounds, 6 agents, 5 bugs fixed, 0 deferrals",
         findings: %{},
-        review_type: "enhanced_review"
+        review_type: "enhanced"
       }
     })
   end

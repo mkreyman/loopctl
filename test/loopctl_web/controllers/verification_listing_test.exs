@@ -188,7 +188,8 @@ defmodule LoopctlWeb.VerificationListingTest do
       build_conn()
       |> auth_conn(orch_key)
       |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-        "summary" => "Second pass"
+        "summary" => "Second pass",
+        "review_type" => "enhanced"
       })
 
       # Check iterations

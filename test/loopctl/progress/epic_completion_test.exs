@@ -42,7 +42,10 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       last_story = Enum.at(stories, 1)
 
       assert {:ok, _updated} =
-               Progress.verify_story(tenant.id, last_story.id, %{"summary" => "All good"},
+               Progress.verify_story(
+                 tenant.id,
+                 last_story.id,
+                 %{"summary" => "All good", "review_type" => "enhanced"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -64,7 +67,10 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       first_story = Enum.at(stories, 0)
 
       assert {:ok, _updated} =
-               Progress.verify_story(tenant.id, first_story.id, %{"summary" => "Partial"},
+               Progress.verify_story(
+                 tenant.id,
+                 first_story.id,
+                 %{"summary" => "Partial", "review_type" => "enhanced"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -89,7 +95,10 @@ defmodule Loopctl.Progress.EpicCompletionTest do
 
       # First verification triggers completion
       assert {:ok, _} =
-               Progress.verify_story(tenant.id, story.id, %{"summary" => "Pass 1"},
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Pass 1", "review_type" => "enhanced"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -119,7 +128,10 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       |> Loopctl.AdminRepo.update!()
 
       assert {:ok, _} =
-               Progress.verify_story(tenant.id, story.id, %{"summary" => "Pass 2"},
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Pass 2", "review_type" => "enhanced"},
                  orchestrator_agent_id: orch_agent.id
                )
 

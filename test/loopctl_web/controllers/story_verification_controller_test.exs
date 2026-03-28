@@ -114,7 +114,8 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         conn
         |> auth_conn(orch_key)
         |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-          "summary" => "All good"
+          "summary" => "All good",
+          "review_type" => "enhanced"
         })
 
       body = json_response(conn, 200)
@@ -125,6 +126,49 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
       assert [result] = results
       assert result.result == :pass
+    end
+
+    test "rejects verify without review_type (422)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "Review evidence required"
+    end
+
+    test "rejects verify without summary (422)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "review_type" => "enhanced"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "Review evidence required"
+    end
+
+    test "rejects verify with empty review_type (422)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good",
+          "review_type" => ""
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "Review evidence required"
     end
 
     test "rejects verify on non-reported_done story (409)", %{conn: conn} do
@@ -147,7 +191,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       conn =
         conn
         |> auth_conn(orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "test",
+          "review_type" => "enhanced"
+        })
 
       assert json_response(conn, 409)
     end
@@ -157,7 +204,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
       conn
       |> auth_conn(orch_key)
-      |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "Looks good"})
+      |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+        "summary" => "Looks good",
+        "review_type" => "enhanced"
+      })
 
       {:ok, result} =
         Loopctl.Audit.list_entries(tenant.id,
@@ -260,7 +310,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       verify_conn =
         conn
         |> auth_conn(agent_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "test",
+          "review_type" => "enhanced"
+        })
 
       assert json_response(verify_conn, 403)
 
@@ -279,7 +332,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       verify_conn =
         conn
         |> auth_conn(user_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "test",
+          "review_type" => "enhanced"
+        })
 
       assert json_response(verify_conn, 403)
 
@@ -309,7 +365,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       conn =
         conn
         |> auth_conn(self_orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "Looks good"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "Looks good",
+          "review_type" => "enhanced"
+        })
 
       body = json_response(conn, 409)
       assert body["error"]["message"] =~ "Cannot verify your own implementation"
@@ -340,7 +399,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       conn =
         conn
         |> auth_conn(orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "All good"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good",
+          "review_type" => "enhanced"
+        })
 
       assert json_response(conn, 200)["story"]["verified_status"] == "verified"
     end
@@ -363,7 +425,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       conn =
         conn
         |> auth_conn(orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "test",
+          "review_type" => "enhanced"
+        })
 
       body = json_response(conn, 400)
       assert body["error"]["message"] =~ "must be linked to a registered agent"
@@ -412,7 +477,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       verify_conn =
         conn
         |> auth_conn(orch_key_b)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "test"})
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "test",
+          "review_type" => "enhanced"
+        })
 
       assert json_response(verify_conn, 404)
 
@@ -434,7 +502,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       # Create a verification
       build_conn()
       |> auth_conn(orch_key)
-      |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "Pass"})
+      |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+        "summary" => "Pass",
+        "review_type" => "enhanced"
+      })
 
       conn =
         conn
@@ -473,7 +544,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
           build_conn()
           |> auth_conn(key_1)
-          |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "pass-1"})
+          |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+            "summary" => "pass-1",
+            "review_type" => "enhanced"
+          })
         end)
 
       task_2 =
@@ -483,7 +557,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
           build_conn()
           |> auth_conn(key_2)
-          |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "pass-2"})
+          |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+            "summary" => "pass-2",
+            "review_type" => "enhanced"
+          })
         end)
 
       result_1 = Task.await(task_1, 10_000)

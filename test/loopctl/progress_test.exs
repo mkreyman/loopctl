@@ -294,7 +294,7 @@ defmodule Loopctl.ProgressTest do
                Progress.verify_story(
                  tenant.id,
                  story.id,
-                 %{"summary" => "Looks good"},
+                 %{"summary" => "Looks good", "review_type" => "enhanced"},
                  orchestrator_agent_id: agent.id
                )
     end
@@ -318,7 +318,7 @@ defmodule Loopctl.ProgressTest do
                Progress.verify_story(
                  tenant.id,
                  story.id,
-                 %{"summary" => "All good"},
+                 %{"summary" => "All good", "review_type" => "enhanced"},
                  orchestrator_agent_id: other_agent.id
                )
 

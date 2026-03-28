@@ -194,8 +194,18 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/stories/bulk/verify", %{
           "stories" => [
-            %{"story_id" => s1.id, "result" => "pass", "summary" => "All checks pass"},
-            %{"story_id" => s2.id, "result" => "pass", "summary" => "Verified"}
+            %{
+              "story_id" => s1.id,
+              "result" => "pass",
+              "summary" => "All checks pass",
+              "review_type" => "enhanced"
+            },
+            %{
+              "story_id" => s2.id,
+              "result" => "pass",
+              "summary" => "Verified",
+              "review_type" => "enhanced"
+            }
           ]
         })
 
@@ -219,7 +229,12 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/stories/bulk/verify", %{
           "stories" => [
-            %{"story_id" => Ecto.UUID.generate(), "result" => "pass", "summary" => "ok"}
+            %{
+              "story_id" => Ecto.UUID.generate(),
+              "result" => "pass",
+              "summary" => "ok",
+              "review_type" => "enhanced"
+            }
           ]
         })
 
@@ -264,8 +279,18 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/stories/bulk/verify", %{
           "stories" => [
-            %{"story_id" => s1.id, "result" => "pass", "summary" => "ok"},
-            %{"story_id" => s2.id, "result" => "pass", "summary" => "ok"}
+            %{
+              "story_id" => s1.id,
+              "result" => "pass",
+              "summary" => "ok",
+              "review_type" => "enhanced"
+            },
+            %{
+              "story_id" => s2.id,
+              "result" => "pass",
+              "summary" => "ok",
+              "review_type" => "enhanced"
+            }
           ]
         })
 
@@ -378,7 +403,12 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/stories/bulk/verify", %{
           "stories" => [
-            %{"story_id" => Ecto.UUID.generate(), "result" => "pass", "summary" => "ok"}
+            %{
+              "story_id" => Ecto.UUID.generate(),
+              "result" => "pass",
+              "summary" => "ok",
+              "review_type" => "enhanced"
+            }
           ]
         })
 

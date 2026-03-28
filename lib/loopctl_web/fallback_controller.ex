@@ -88,6 +88,21 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  def call(conn, {:error, :review_required}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        message:
+          "Review evidence required. " <>
+            "Include 'review_type' (e.g. 'enhanced', 'team', 'adversarial') and " <>
+            "a non-empty 'summary' describing review findings. " <>
+            "Verification without independent review is not allowed."
+      }
+    })
+  end
+
   def call(conn, {:error, :rate_limited}) do
     conn
     |> put_status(:too_many_requests)

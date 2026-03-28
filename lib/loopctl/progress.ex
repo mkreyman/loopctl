@@ -528,6 +528,9 @@ defmodule Loopctl.Progress do
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)
+      |> Multi.run(:review_evidence, fn _repo, _changes ->
+        validate_review_evidence(verification_params)
+      end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_verified_status(story)
       end)
@@ -772,6 +775,22 @@ defmodule Loopctl.Progress do
       story.agent_status != :reported_done -> {:error, :invalid_transition}
       story.verified_status == :verified -> {:error, :invalid_transition}
       true -> {:ok, story}
+    end
+  end
+
+  defp validate_review_evidence(verification_params) do
+    review_type = verification_params.review_type
+    summary = verification_params.summary
+
+    cond do
+      is_nil(review_type) or review_type == "" ->
+        {:error, :review_required}
+
+      is_nil(summary) or summary == "" ->
+        {:error, :review_required}
+
+      true ->
+        {:ok, :review_evidence_present}
     end
   end
 

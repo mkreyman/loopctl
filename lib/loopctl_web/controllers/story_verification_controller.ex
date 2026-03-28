@@ -110,6 +110,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
 
+        {:error, :review_required} ->
+          {:error, :review_required}
+
         {:error, :invalid_transition} ->
           {:error, :conflict}
 
