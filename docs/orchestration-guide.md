@@ -1,195 +1,164 @@
 # loopctl Orchestration Guide
 
-How to use loopctl to manage AI-driven software development projects.
+Methodology reference for running AI-driven development projects with loopctl.
 
-## Overview
+---
 
-loopctl is a state store. It tracks what work exists, who's doing it, and whether it's been verified. The actual orchestration logic — deciding what to assign, when to review, how to verify — lives in **skills**: instruction sets that AI orchestrators follow.
+## The Autonomous Loop
 
-This guide explains the methodology and the skills that drive the development loop.
-
-## The Development Loop
+The orchestration loop repeats for every story until the project is complete:
 
 ```
-          ┌─────────────────────────────────────────────┐
-          │                                             │
-          ▼                                             │
-    ┌──────────┐     ┌───────────┐     ┌──────────┐    │
-    │   PLAN   │────▶│ IMPLEMENT │────▶│  REVIEW  │────┤
-    └──────────┘     └───────────┘     └──────────┘    │
-          │                                  │          │
-          │                            ┌─────┴─────┐   │
-          │                            │  VERIFIED? │   │
-          │                            └─────┬─────┘   │
-          │                              yes │ no      │
-          │                                  │ └───────┘
-          │                                  ▼
-          │                           ┌────────────┐
-          └──────────────────────────▶│    DONE    │
-                                      └────────────┘
+find ready → contract → claim → implement → report → review → verify
+                                                              │
+                                              pass ──────────┤
+                                              fail ──▶ reject ──▶ (back to pending)
 ```
 
-### Roles
+**find ready** — Query `/stories/ready?project_id=...` to get stories whose dependencies are all
+verified. A story is not ready if any predecessor has `verified_status != pass`.
 
-| Role | What They Do | loopctl Role |
-|------|-------------|--------------|
-| **Orchestrator** | Plans work, dispatches agents, reviews results, verifies deliverables | `orchestrator` |
-| **Implementation Agent** | Reads stories, writes code, commits, reports completion | `agent` |
-| **Human** | Imports stories, monitors progress, reviews at milestones | `user` |
+**contract** — The agent POSTs to `/stories/:id/contract` with the story title and acceptance
+criteria count. This proves the agent read the story before claiming it.
 
-### The Trust Model
+**claim / start** — Two separate transitions. Claim reserves the story; start signals active work.
+A story can be claimed by only one agent at a time.
 
-The orchestrator and implementation agents are **different processes with different API keys**. An implementation agent cannot mark its own work as verified. This prevents the pattern where agents fabricate review results.
+**implement** — The agent does the work: writes code, commits, runs tests. One commit per story.
+
+**report** — The agent POSTs an artifact describing what was produced (commit hash, files created,
+test results). This is the agent's self-report — it does not advance `verified_status`.
+
+**review** — The orchestrator runs an independent review using a separate process that has not seen
+the implementation. The review process reads the story's acceptance criteria and audits the artifact.
+
+**verify / reject** — Only the orchestrator can set `verified_status`. A passing verification
+unblocks dependent stories. A rejection resets the story to `pending` and increments the cycle count.
+
+---
+
+## The Two-Tier Trust Model
+
+Every story carries two independent status fields:
+
+| Field | Set by | Meaning |
+|-------|--------|---------|
+| `agent_status` | Implementation agent | Self-reported completion |
+| `verified_status` | Orchestrator only | Independently confirmed |
+
+These fields are never the same key. An agent reporting `completed` does not advance `verified_status`.
+Stories surface in dependency resolution only when `verified_status = pass`.
+
+**Why this matters:** Without separate fields, agents can and do fabricate review results. The trust
+model makes fabrication structurally impossible — an agent's API key cannot write to `verified_status`.
+
+The orchestrator API key is separate from the agent API key. The loopctl RBAC layer enforces the
+boundary: verification endpoints reject requests from agent-role keys.
+
+---
+
+## Dependency Resolution
+
+Stories carry a `depends_on` list of story IDs. The `/stories/ready` endpoint computes readiness by
+walking the dependency graph and returning only stories where every predecessor has
+`verified_status = pass`.
+
+This means:
+
+- Stories become available progressively as earlier work is verified, not merely reported.
+- Parallel work is possible: stories with no shared dependencies can be dispatched simultaneously.
+- Rejections have cascading effects — if a foundational story is rejected and re-verified after fixes,
+  the orchestrator should re-check whether any story that was ready has become ready again.
+
+The orchestrator should poll `/stories/ready` after every verification, not just after every report.
+
+---
+
+## Orchestrator State Checkpointing
+
+Orchestrator sessions can run for hours. Process restarts, context compaction, and timeout evictions
+all terminate the session mid-loop. Checkpointing enables recovery.
 
 ```
-Implementation Agent (agent key):
-  contract → claim → start → report
-
-Orchestrator (orchestrator key):
-  verify OR reject → (rejected stories auto-reset to pending)
+PUT /orchestrator/state/:project_id
+{
+  "state_key": "main",
+  "state_data": {
+    "phase": "epic_3",
+    "last_verified": "US-3.4",
+    "pending_review": "US-3.5",
+    "cycle_counts": {"US-2.1": 1, "US-3.2": 2}
+  },
+  "version": 4
+}
 ```
 
-## Skills
+The `version` field is an optimistic lock. Concurrent writes fail if versions do not match,
+preventing two orchestrator sessions from diverging silently.
 
-Skills are instruction sets stored as markdown files in the `skills/` directory. The orchestrator reads a skill before performing the corresponding action. Skills are versioned — when you improve a prompt, you create a new version and can compare performance.
+On session start, the orchestrator loads its checkpoint:
 
-### Available Skills
-
-| Skill | File | Purpose |
-|-------|------|---------|
-| `loopctl:orchestrate` | [loopctl-orchestrate.md](../skills/loopctl-orchestrate.md) | Main loop: poll → dispatch → review → verify → iterate |
-| `loopctl:review` | [loopctl-review.md](../skills/loopctl-review.md) | Independent code review calibrated for skepticism |
-| `loopctl:contract` | [loopctl-contract.md](../skills/loopctl-contract.md) | Agent reads story and confirms understanding before claiming |
-| `loopctl:plan` | [loopctl-plan.md](../skills/loopctl-plan.md) | Analyze dependency graph, determine implementation order |
-| `loopctl:verify-artifacts` | [loopctl-verify-artifacts.md](../skills/loopctl-verify-artifacts.md) | Check that expected files/modules/tests actually exist |
-| `loopctl:status` | [loopctl-status.md](../skills/loopctl-status.md) | Query project progress and display summary |
-
-### How Skills Are Used
-
-1. The orchestrator fetches a skill (reads the markdown file or queries the loopctl Skills API)
-2. The skill text becomes the system prompt or instruction set for the action
-3. After the action, the orchestrator records which skill version was used alongside the verification result
-4. Over time, you compare skill versions to see which prompts produce better reviews
-
-## Step-by-Step: Running a Project
-
-### 1. Setup
-
-```bash
-# Register your organization
-curl -X POST https://loopctl.local:8443/api/v1/tenants/register \
-  -H "Content-Type: application/json" \
-  -d '{"name": "My Team", "slug": "my-team", "email": "admin@example.com"}'
-# Save the returned API key (user role)
-
-# Create agent and orchestrator keys (see README Authentication Flow)
+```
+GET /orchestrator/state/:project_id?state_key=main
 ```
 
-### 2. Import Your Stories
+If no checkpoint exists, the orchestrator starts from scratch. If a checkpoint exists, it resumes
+from the recorded phase, re-validates the state against current story statuses, and continues the
+loop.
 
-Write your user stories as JSON files (see [README Import Format](../README.md#import-json-format)), then import:
+**Checkpoint after every verification** — not just at phase boundaries. A crash between two verifications
+costs at most one re-verification, not a full phase replay.
 
-```bash
-curl -X POST https://loopctl.local:8443/api/v1/projects/{id}/import \
-  -H "Authorization: Bearer $USER_KEY" \
-  -H "Content-Type: application/json" \
-  -d @stories.json
+---
+
+## Auditing Orchestrator Sessions
+
+loopctl tracks every state transition in an immutable audit log. External observers can reconstruct
+the decision chain for any story:
+
+```
+GET /stories/:id/history
 ```
 
-### 3. Plan
+Returns all transitions: who triggered them, when, and what was reported. Use this to audit whether
+reviews were run, whether rejections were acted on, and whether verification came from a different
+actor than the implementation.
 
-The orchestrator reads `loopctl:plan` and analyzes the dependency graph:
+The change feed provides project-wide observability:
 
-```bash
-# Get the dependency graph
-curl https://loopctl.local:8443/api/v1/projects/{id}/dependency_graph \
-  -H "Authorization: Bearer $ORCH_KEY"
-
-# Get ready stories (all dependencies met)
-curl https://loopctl.local:8443/api/v1/stories/ready?project_id={id} \
-  -H "Authorization: Bearer $ORCH_KEY"
+```
+GET /changes?since=2026-03-01T00:00:00Z&project_id=:id
 ```
 
-### 4. The Loop (per story)
+Observer processes can tail this feed to detect anomalies: stories verified by their own agent,
+stories with zero review cycles, or stories completed without artifact reports.
 
-```bash
-# Agent: contract the story (proves you read the ACs)
-curl -X POST .../stories/{id}/contract \
-  -H "Authorization: Bearer $AGENT_KEY" \
-  -d '{"story_title": "...", "ac_count": 8}'
+The `/loopctl:observe` pattern refers to the practice of POSTing structured orchestrator events
+(session start, rule violations, agent dispatches) to loopctl as audit entries, then querying them
+back via the history API. This decouples observability from any specific toolchain.
 
-# Agent: claim → start → implement → report
-curl -X POST .../stories/{id}/claim -H "Authorization: Bearer $AGENT_KEY"
-curl -X POST .../stories/{id}/start -H "Authorization: Bearer $AGENT_KEY"
-# ... agent writes code, commits ...
-curl -X POST .../stories/{id}/report -H "Authorization: Bearer $AGENT_KEY" \
-  -d '{"artifact": {"artifact_type": "commit_diff", "path": "abc..def", "exists": true}}'
+---
 
-# Orchestrator: review independently (reads loopctl:review skill)
-# Orchestrator: verify or reject
-curl -X POST .../stories/{id}/verify \
-  -H "Authorization: Bearer $ORCH_KEY" \
-  -d '{"result": "pass", "summary": "All ACs met"}'
-# OR
-curl -X POST .../stories/{id}/reject \
-  -H "Authorization: Bearer $ORCH_KEY" \
-  -d '{"reason": "Missing controller tests"}'
-# Rejected stories auto-reset to pending and re-enter the queue
-```
+## Best Practices
 
-### 5. Monitor Progress
+**One commit per story.** Mixing multiple stories in a single commit breaks artifact traceability.
+The artifact report references a commit; that commit should correspond to exactly one story.
 
-```bash
-# Project-wide progress
-curl .../projects/{id}/progress -H "Authorization: Bearer $USER_KEY"
+**Always run independent review.** The review process must not be the same process that implemented
+the story. Different context, different API key, same acceptance criteria. No exceptions.
 
-# Change feed (orchestrator polls this)
-curl ".../changes?since=2026-03-27T00:00:00Z&project_id={id}" \
-  -H "Authorization: Bearer $ORCH_KEY"
+**Never self-verify.** The orchestrator dispatches the implementation and runs the review, but
+verification is the conclusion of the review — not a rubber stamp. If the review finds problems,
+reject and cycle.
 
-# Audit trail for a story
-curl .../stories/{id}/history -H "Authorization: Bearer $ORCH_KEY"
-```
+**Fresh agent per story.** Long agent contexts accumulate coherence degradation. Dispatching a fresh
+agent per story keeps implementation quality consistent across a long project.
 
-### 6. Checkpoint
+**Checkpoint after every verification.** If the session dies between verifications, the checkpoint
+allows resumption without re-doing completed work.
 
-The orchestrator saves its state for crash recovery:
+**Maximum five cycles per story.** If a story fails review five times, escalate to a human. Automated
+fix loops beyond this threshold indicate a design problem that agents cannot resolve alone.
 
-```bash
-curl -X PUT .../orchestrator/state/{project_id} \
-  -H "Authorization: Bearer $ORCH_KEY" \
-  -d '{"state_key": "main", "state_data": {"phase": "epic_3", "last_verified": "US-2.1"}, "version": 0}'
-```
-
-On restart, the orchestrator loads its state and resumes from the checkpoint.
-
-## Key Principles
-
-1. **The orchestrator never writes code.** It dispatches agents and verifies their work.
-2. **Never trust agent self-reports.** Always run an independent review.
-3. **Fresh agent per story.** Context resets prevent coherence degradation over long sessions.
-4. **One commit per story.** The precommit hook forces quality at every step.
-5. **Review agent ≠ implementation agent.** Separate processes, separate keys.
-6. **Checkpoint after every verification.** Enable crash recovery.
-7. **Maximum 5 review-fix cycles per story.** Escalate to human if stuck.
-
-## Skill Versioning (Future)
-
-When running loopctl as a service, you can store skills in the database via the Skills API:
-
-```bash
-# Import skills from files
-curl -X POST .../skills/import \
-  -H "Authorization: Bearer $USER_KEY" \
-  -d '[{"name": "loopctl:review", "description": "...", "prompt_text": "..."}]'
-
-# Track which skill version produced which results
-curl -X POST .../skill_results \
-  -H "Authorization: Bearer $ORCH_KEY" \
-  -d '{"skill_version_id": "...", "verification_result_id": "...", "story_id": "...", "metrics": {"findings_count": 5}}'
-
-# Compare versions
-curl .../skills/{id}/stats -H "Authorization: Bearer $USER_KEY"
-```
-
-This enables data-driven prompt optimization: see which review prompt version catches the most real bugs with the fewest false positives.
+**Treat agent reports as unverified input.** Read artifact reports to inform the review, not to
+replace it. The orchestrator's job is to verify independently, not to confirm what the agent claimed.

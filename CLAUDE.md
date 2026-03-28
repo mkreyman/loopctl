@@ -129,4 +129,22 @@ mix ecto.reset         # Drop, create, migrate
 - **PRD**: `docs/prd.md` — full product requirements
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
+- **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
+
+## Epic 17: Orchestrator Observability
+
+loopctl supports external observability tooling through its API and data model:
+
+- **Two-tier trust model**: `agent_status` (self-reported) vs `verified_status` (orchestrator-set) are
+  separate fields on every story. External tools can compare them to detect unverified completions.
+- **Orchestrator state checkpointing**: `PUT /orchestrator/state/:project_id` persists orchestrator
+  session state (phase, last verified story, decision context). Enables crash recovery and session
+  handoff. Versioned with optimistic locking.
+- **Audit API**: `GET /stories/:id/history` returns the immutable event log for any story. External
+  observers can replay the decision chain for any story without parsing raw session logs.
+- **Change feed**: `GET /changes?since=...` lets observer processes poll for all state transitions
+  across a project, enabling external dashboards and alerting.
+- **`/loopctl:observe` pattern**: Orchestrators can POST structured audit events to loopctl (session
+  start/end, rule violations, review outcomes) and query them back via the audit API. This allows
+  post-run analysis of orchestrator behavior without coupling to any specific AI tool's log format.
