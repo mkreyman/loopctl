@@ -75,6 +75,10 @@ psql -U postgres -c "GRANT ALL ON DATABASE loopctl_dev TO loopctl_app;"
 #    A default Cloak encryption key is configured in config.exs for dev.
 mix setup
 mix phx.server       # Start server at localhost:4000
+
+# Verify it's working
+curl http://localhost:4000/health
+# Should return: {"status":"ok",...}
 ```
 
 > **Note:** The `CLOAK_KEY` and `SECRET_KEY_BASE` environment variables are only required for production/Docker deployments. Dev uses defaults from `config/dev.exs` and `config/config.exs`.
@@ -89,13 +93,17 @@ cp .env.example .env
 
 # Generate TLS certificates for nginx (deploy/certs/ must exist)
 mkdir -p deploy/certs
-openssl req -x509 -newkey rsa:4096 -keyout deploy/certs/key.pem \
-  -out deploy/certs/cert.pem -days 365 -nodes \
+openssl req -x509 -newkey rsa:4096 -keyout deploy/certs/selfsigned.key \
+  -out deploy/certs/selfsigned.crt -days 365 -nodes \
   -subj "/CN=loopctl.local"
 
 docker compose build
 docker compose up -d
 docker compose exec -T app /app/bin/migrate
+
+# Verify it's working
+curl -sk https://localhost:8443/health
+# Should return: {"status":"ok",...}
 ```
 
 ### Generate Secrets
@@ -181,6 +189,8 @@ Now the agent key can contract, claim, start, and report stories. The orchestrat
 
 > **Role design note:** The `user` role is for tenant administration -- managing settings, API keys, and projects. It does not participate in the development trust model. The `orchestrator` and `agent` roles manage the development loop. This separation is by design: tenant admins provision infrastructure while the trust model governs the implementation/verification cycle.
 
+> **Superadmin keys** are created via the database or by a privileged script -- they cannot be created through the API since they require `tenant_id=NULL`.
+
 ### Two-Tier Trust Model
 
 ```
@@ -244,7 +254,7 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
         "description": "Auth infrastructure",
         "stories": [
           {
-            "number": "US-1.1",
+            "number": "1.1",
             "title": "Implement login endpoint",
             "acceptance_criteria": [
               {"criterion": "POST /login returns JWT on valid credentials"},
@@ -252,7 +262,7 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
             ]
           },
           {
-            "number": "US-1.2",
+            "number": "1.2",
             "title": "Implement logout endpoint",
             "acceptance_criteria": [
               {"criterion": "POST /logout invalidates the session"}
@@ -262,15 +272,15 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
       }
     ],
     "story_dependencies": [
-      {"predecessor": "US-1.1", "successor": "US-1.2"}
+      {"story": "1.1", "depends_on": "1.2"}
     ],
     "epic_dependencies": [
-      {"predecessor": 1, "successor": 2}
+      {"epic": 1, "depends_on": 2}
     ]
   }'
 ```
 
-Each epic requires `number` (integer) and `title` (string). Each story requires `number` (string, e.g. "US-1.1") and `title`. Stories are nested under their epic's `stories` array. Dependencies reference story numbers (for story deps) or epic numbers (for epic deps) and are validated for cycles.
+Each epic requires `number` (integer) and `title` (string). Each story requires `number` (string, e.g. "1.1") and `title`. Stories are nested under their epic's `stories` array. Story dependencies use `"story"` and `"depends_on"` keys referencing story numbers. Epic dependencies use `"epic"` and `"depends_on"` keys referencing epic numbers. All dependencies are validated for cycles.
 
 ### Webhook Event Types
 

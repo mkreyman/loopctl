@@ -626,7 +626,7 @@ defmodule Loopctl.ApiSpec.Schemas do
             description: "Auth infrastructure",
             stories: [
               %{
-                number: "US-1.1",
+                number: "1.1",
                 title: "Implement login endpoint",
                 acceptance_criteria: [
                   %{criterion: "POST /login returns JWT on valid credentials"},
@@ -634,7 +634,7 @@ defmodule Loopctl.ApiSpec.Schemas do
                 ]
               },
               %{
-                number: "US-1.2",
+                number: "1.2",
                 title: "Implement logout endpoint",
                 acceptance_criteria: [
                   %{criterion: "POST /logout invalidates the session"}
@@ -644,7 +644,7 @@ defmodule Loopctl.ApiSpec.Schemas do
           }
         ],
         story_dependencies: [
-          %{predecessor: "US-1.1", successor: "US-1.2"}
+          %{story: "1.1", depends_on: "1.2"}
         ]
       }
     })
