@@ -107,6 +107,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:ok, story} ->
           json(conn, %{story: story})
 
+        {:error, :self_verify_blocked} ->
+          {:error, :self_verify_blocked}
+
         {:error, :invalid_transition} ->
           {:error, :conflict}
 
@@ -132,6 +135,9 @@ defmodule LoopctlWeb.StoryVerificationController do
       case Progress.reject_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
           json(conn, %{story: story})
+
+        {:error, :self_verify_blocked} ->
+          {:error, :self_verify_blocked}
 
         {:error, :reason_required} ->
           {:error, :unprocessable_entity, "reason is required and cannot be blank"}

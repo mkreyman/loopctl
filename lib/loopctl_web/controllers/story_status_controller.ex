@@ -221,6 +221,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
     end
   end
 

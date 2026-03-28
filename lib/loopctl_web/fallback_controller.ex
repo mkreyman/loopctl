@@ -14,6 +14,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :conflict}` -> 409
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
+  - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :rate_limited}` -> 429
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
@@ -70,6 +71,19 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "Story must be claimed before starting. " <>
             "Call POST /stories/:id/claim first."
+      }
+    })
+  end
+
+  def call(conn, {:error, :self_verify_blocked}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        message:
+          "Cannot verify your own implementation. " <>
+            "The orchestrator agent must be different from the implementing agent."
       }
     })
   end

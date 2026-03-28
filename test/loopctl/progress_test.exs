@@ -182,6 +182,29 @@ defmodule Loopctl.ProgressTest do
       assert updated.reported_done_at != nil
     end
 
+    test "returns changeset error when artifact params are invalid" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # Missing required 'path' field
+      bad_artifact = %{
+        "artifact_type" => "migration",
+        "exists" => true,
+        "details" => %{"lines" => 50}
+      }
+
+      assert {:error, %Ecto.Changeset{}} =
+               Progress.report_story(tenant.id, story.id, [agent_id: agent.id], bad_artifact)
+    end
+
     test "creates artifact report when provided" do
       %{tenant: tenant, agent: agent} = ctx = setup_story()
 
@@ -248,6 +271,108 @@ defmodule Loopctl.ProgressTest do
 
       assert {:error, :not_assigned_to_you} =
                Progress.unclaim_story(tenant.id, story.id, agent_id: agent.id)
+    end
+  end
+
+  describe "verify_story/4 self-verify block" do
+    test "blocks same agent from verifying their own implementation" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      # Set up story as reported_done with agent assigned
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # Same agent_id tries to verify
+      assert {:error, :self_verify_blocked} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Looks good"},
+                 orchestrator_agent_id: agent.id
+               )
+    end
+
+    test "allows different agent to verify" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      other_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      assert {:ok, updated} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "All good"},
+                 orchestrator_agent_id: other_agent.id
+               )
+
+      assert updated.verified_status == :verified
+    end
+  end
+
+  describe "reject_story/4 self-verify block" do
+    test "blocks same agent from rejecting their own implementation" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :self_verify_blocked} =
+               Progress.reject_story(
+                 tenant.id,
+                 story.id,
+                 %{"reason" => "Bad code"},
+                 orchestrator_agent_id: agent.id
+               )
+    end
+
+    test "allows different agent to reject" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      other_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      assert {:ok, updated} =
+               Progress.reject_story(
+                 tenant.id,
+                 story.id,
+                 %{"reason" => "Missing tests"},
+                 orchestrator_agent_id: other_agent.id
+               )
+
+      assert updated.verified_status == :rejected
     end
   end
 

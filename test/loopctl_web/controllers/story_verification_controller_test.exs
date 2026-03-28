@@ -292,6 +292,60 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     end
   end
 
+  # --- Self-verify block tests ---
+
+  describe "self-verify block" do
+    test "same agent cannot verify their own implementation (409)", %{conn: conn} do
+      %{story: story, tenant: tenant, impl_agent: impl_agent} = setup_reported_story()
+
+      # Create an orchestrator key linked to the SAME agent that implemented
+      {self_orch_key, _} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: impl_agent.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(self_orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "Looks good"})
+
+      body = json_response(conn, 409)
+      assert body["error"]["message"] =~ "Cannot verify your own implementation"
+    end
+
+    test "same agent cannot reject their own implementation (409)", %{conn: conn} do
+      %{story: story, tenant: tenant, impl_agent: impl_agent} = setup_reported_story()
+
+      {self_orch_key, _} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: impl_agent.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(self_orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/reject", %{"reason" => "Bad code"})
+
+      body = json_response(conn, 409)
+      assert body["error"]["message"] =~ "Cannot verify your own implementation"
+    end
+
+    test "different agent can verify (200)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "All good"})
+
+      assert json_response(conn, 200)["story"]["verified_status"] == "verified"
+    end
+  end
+
   # --- Nil agent_id guard tests ---
 
   describe "orchestrator key without agent_id" do

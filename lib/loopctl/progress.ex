@@ -324,9 +324,10 @@ defmodule Loopctl.Progress do
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in implementing state
   - `{:error, :not_assigned_agent}` if calling agent is not the assigned agent
+  - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def report_story(tenant_id, story_id, opts \\ [], artifact_params \\ nil) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -521,6 +522,9 @@ defmodule Loopctl.Progress do
     multi =
       Multi.new()
       |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+      |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
+        validate_not_self_verify(story, orchestrator_agent_id)
+      end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)
@@ -592,6 +596,9 @@ defmodule Loopctl.Progress do
       multi =
         Multi.new()
         |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+        |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
+          validate_not_self_verify(story, orchestrator_agent_id)
+        end)
         |> Multi.run(:validate, fn _repo, %{lock: story} ->
           validate_rejectable(story)
         end)
@@ -751,6 +758,14 @@ defmodule Loopctl.Progress do
   end
 
   # --- Verification/Rejection helpers ---
+
+  defp validate_not_self_verify(story, orchestrator_agent_id) do
+    if story.assigned_agent_id == orchestrator_agent_id do
+      {:error, :self_verify_blocked}
+    else
+      {:ok, story}
+    end
+  end
 
   defp validate_verifiable(story) do
     cond do
@@ -918,12 +933,7 @@ defmodule Loopctl.Progress do
       # When auto-reset happened, return the reset story (non-nil means reset was performed)
       {:ok, %{auto_reset: %Story{} = reset_story}} -> {:ok, reset_story}
       {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
-      {:error, :verification_result, changeset, _} -> {:error, changeset}
-      {:error, :epic_completion, reason, _} -> {:error, reason}
-      {:error, :auto_reset, reason, _} -> {:error, reason}
+      {:error, _step, reason, _completed} -> {:error, reason}
     end
   end
 

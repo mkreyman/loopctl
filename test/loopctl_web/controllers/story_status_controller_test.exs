@@ -326,6 +326,33 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       assert artifact.reporter_agent_id == agent.id
     end
 
+    test "returns 422 when artifact changeset is invalid", %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent} = setup_story_with_agent()
+
+      story =
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report", %{
+          "artifact" => %{
+            "artifact_type" => "migration",
+            "exists" => true
+            # Missing required "path" field
+          }
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
     test "rejects report by wrong agent (403)", %{conn: conn} do
       %{story: story, tenant: tenant, agent: agent} = setup_story_with_agent()
 
