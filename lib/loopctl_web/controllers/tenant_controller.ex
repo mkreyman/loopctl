@@ -8,7 +8,9 @@ defmodule LoopctlWeb.TenantController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Auth
   alias Loopctl.Tenants
 
@@ -16,6 +18,42 @@ defmodule LoopctlWeb.TenantController do
 
   # Agents and orchestrators can view tenant profile but only users+ can modify settings
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
+
+  tags(["Tenants"])
+
+  operation(:register,
+    summary: "Register a new tenant",
+    description:
+      "Public endpoint. Creates a new tenant and first user-role API key. " <>
+        "The raw API key is returned only once.",
+    security: [],
+    request_body: {"Registration params", "application/json", Schemas.TenantRegistrationRequest},
+    responses: %{
+      201 => {"Tenant created", "application/json", Schemas.TenantRegistrationResponse},
+      409 => {"Conflict", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:show,
+    summary: "Get current tenant profile",
+    description: "Returns the tenant profile for the authenticated API key.",
+    responses: %{
+      200 => {"Tenant profile", "application/json", Schemas.TenantResponse},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update current tenant profile",
+    description: "Updates the tenant profile. Requires user+ role.",
+    request_body: {"Update params", "application/json", Schemas.TenantResponse},
+    responses: %{
+      200 => {"Updated tenant", "application/json", Schemas.TenantResponse},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/tenants/register

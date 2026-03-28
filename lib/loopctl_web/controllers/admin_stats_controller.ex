@@ -7,12 +7,25 @@ defmodule LoopctlWeb.AdminStatsController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
+
+  tags(["Admin"])
+
+  operation(:show,
+    summary: "System-wide stats (admin)",
+    description: "Returns system-wide aggregate statistics. Requires superadmin.",
+    responses: %{
+      200 =>
+        {"System stats", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
 
   @doc """
   GET /api/v1/admin/stats

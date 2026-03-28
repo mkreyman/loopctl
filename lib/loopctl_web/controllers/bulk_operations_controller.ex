@@ -10,7 +10,9 @@ defmodule LoopctlWeb.BulkOperationsController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.BulkOperations
   alias LoopctlWeb.AuditContext
 
@@ -18,6 +20,38 @@ defmodule LoopctlWeb.BulkOperationsController do
 
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:claim]
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :orchestrator] when action in [:verify, :reject]
+
+  tags(["Progress"])
+
+  operation(:claim,
+    summary: "Bulk claim stories",
+    description: "Agent claims multiple pending stories. Partial-success semantics.",
+    request_body: {"Claim params", "application/json", Schemas.BulkClaimRequest},
+    responses: %{
+      200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:verify,
+    summary: "Bulk verify stories",
+    description: "Orchestrator verifies multiple reported_done stories.",
+    request_body: {"Verify params", "application/json", Schemas.BulkVerifyRequest},
+    responses: %{
+      200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:reject,
+    summary: "Bulk reject stories",
+    description: "Orchestrator rejects multiple stories with reasons.",
+    request_body: {"Reject params", "application/json", Schemas.BulkRejectRequest},
+    responses: %{
+      200 => {"Results", "application/json", Schemas.BulkResultResponse},
+      422 => {"Invalid input", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/stories/bulk/claim

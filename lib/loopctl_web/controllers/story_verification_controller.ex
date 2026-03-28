@@ -11,7 +11,9 @@ defmodule LoopctlWeb.StoryVerificationController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Stories
@@ -24,6 +26,81 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :orchestrator] when action in [:index]
+
+  tags(["Progress"])
+
+  operation(:verify,
+    summary: "Verify story",
+    description:
+      "Orchestrator verifies a reported_done story. Creates verification_result with result=pass.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Verification params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           notes: %OpenApiSpex.Schema{type: :string, nullable: true}
+         }
+       }},
+    responses: %{
+      200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:reject,
+    summary: "Reject story",
+    description:
+      "Orchestrator rejects a story with reason. Creates verification_result with result=fail.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Rejection params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:reason],
+         properties: %{
+           reason: %OpenApiSpex.Schema{type: :string, description: "Rejection reason (required)"}
+         }
+       }},
+    responses: %{
+      200 => {"Story rejected", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      422 => {"Reason required", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List verifications",
+    description: "Lists verification results for a story with pagination.",
+    parameters: [
+      story_id: [in: :path, type: :string, description: "Story UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Verification list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.VerificationResultResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:force_unclaim,
+    summary: "Force unclaim story",
+    description: "Orchestrator force-unclaims a story, resetting it to pending.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/stories/:id/verify

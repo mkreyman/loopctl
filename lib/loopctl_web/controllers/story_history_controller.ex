@@ -10,10 +10,30 @@ defmodule LoopctlWeb.StoryHistoryController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
 
   action_fallback LoopctlWeb.FallbackController
+
+  tags(["Stories"])
+
+  operation(:show,
+    summary: "Get story history",
+    description: "Returns the full audit trail for a specific story.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Story UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Story history", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   # No RequireRole needed: within :authenticated pipeline, accessible to all
   # roles including agent. Agents need story history to understand prior

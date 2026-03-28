@@ -10,7 +10,9 @@ defmodule LoopctlWeb.StoryController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
@@ -21,6 +23,94 @@ defmodule LoopctlWeb.StoryController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show]
+
+  tags(["Stories"])
+
+  operation(:create,
+    summary: "Create story",
+    description: "Creates a new story within an epic. Requires user+ role.",
+    parameters: [epic_id: [in: :path, type: :string, description: "Epic UUID"]],
+    request_body:
+      {"Story params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:number, :title],
+         properties: %{
+           number: %OpenApiSpex.Schema{type: :string},
+           title: %OpenApiSpex.Schema{type: :string},
+           description: %OpenApiSpex.Schema{type: :string, nullable: true},
+           acceptance_criteria: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :object},
+             nullable: true
+           },
+           estimated_hours: %OpenApiSpex.Schema{type: :number, nullable: true},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 => {"Story created", "application/json", Schemas.StoryResponse},
+      404 => {"Epic not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List stories",
+    description: "Lists stories for an epic with pagination and status filtering.",
+    parameters: [
+      epic_id: [in: :path, type: :string, description: "Epic UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"],
+      agent_status: [in: :query, type: :string, description: "Filter by agent status"],
+      verified_status: [in: :query, type: :string, description: "Filter by verified status"]
+    ],
+    responses: %{
+      200 =>
+        {"Story list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.StoryResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:show,
+    summary: "Get story",
+    description: "Returns a single story with dependencies and artifacts.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"Story detail", "application/json", Schemas.StoryResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update story",
+    description: "Updates story metadata fields. Cannot update agent_status or verified_status.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Update params", "application/json",
+       %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+    responses: %{
+      200 => {"Updated story", "application/json", Schemas.StoryResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Delete story",
+    description: "Deletes a story. Requires user+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/epics/:epic_id/stories

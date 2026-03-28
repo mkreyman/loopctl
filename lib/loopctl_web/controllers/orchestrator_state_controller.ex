@@ -8,13 +8,73 @@ defmodule LoopctlWeb.OrchestratorStateController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Orchestrator
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: [:orchestrator, :superadmin]
+
+  tags(["Orchestrator"])
+
+  operation(:save,
+    summary: "Save orchestrator state",
+    description: "Saves (upserts) orchestrator state with optimistic locking.",
+    parameters: [project_id: [in: :path, type: :string, description: "Project UUID"]],
+    request_body: {"State params", "application/json", Schemas.OrchestratorStateRequest},
+    responses: %{
+      200 =>
+        {"State saved", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Project not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Version conflict", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:show,
+    summary: "Get orchestrator state",
+    description: "Retrieves orchestrator state. Defaults to state_key='main'.",
+    parameters: [
+      project_id: [in: :path, type: :string, description: "Project UUID"],
+      state_key: [in: :query, type: :string, description: "State key (default: main)"]
+    ],
+    responses: %{
+      200 =>
+        {"State", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:history,
+    summary: "Get orchestrator state history",
+    description: "Returns version history derived from audit log entries.",
+    parameters: [
+      project_id: [in: :path, type: :string, description: "Project UUID"],
+      state_key: [in: :query, type: :string, description: "State key filter"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"State history", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   PUT /api/v1/orchestrator/state/:project_id

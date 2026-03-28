@@ -7,12 +7,37 @@ defmodule LoopctlWeb.AdminAuditController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
+
+  tags(["Admin"])
+
+  operation(:index,
+    summary: "Cross-tenant audit log (admin)",
+    description: "Returns paginated audit log entries across all tenants. Requires superadmin.",
+    parameters: [
+      tenant_id: [in: :query, type: :string, description: "Filter by tenant"],
+      entity_type: [in: :query, type: :string, description: "Filter by entity type"],
+      entity_id: [in: :query, type: :string, description: "Filter by entity ID"],
+      action: [in: :query, type: :string, description: "Filter by action"],
+      actor_type: [in: :query, type: :string, description: "Filter by actor type"],
+      actor_id: [in: :query, type: :string, description: "Filter by actor ID"],
+      from: [in: :query, type: :string, description: "ISO8601 start time"],
+      to: [in: :query, type: :string, description: "ISO8601 end time"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Audit log", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
 
   @doc """
   GET /api/v1/admin/audit

@@ -8,7 +8,9 @@ defmodule LoopctlWeb.StoryDependencyController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
   alias LoopctlWeb.AuditContext
@@ -17,6 +19,52 @@ defmodule LoopctlWeb.StoryDependencyController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
+
+  tags(["Dependencies"])
+
+  operation(:create,
+    summary: "Create story dependency",
+    description: "Creates a dependency: story_id depends on depends_on_story_id.",
+    request_body:
+      {"Dependency params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:story_id, :depends_on_story_id],
+         properties: %{
+           story_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           depends_on_story_id: %OpenApiSpex.Schema{type: :string, format: :uuid}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Dependency created", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Conflict", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Delete story dependency",
+    description: "Removes a story dependency edge.",
+    parameters: [id: [in: :path, type: :string, description: "Dependency UUID"]],
+    responses: %{
+      204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List story dependencies",
+    description: "Lists story dependency edges for stories in an epic.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    responses: %{
+      200 =>
+        {"Dependencies", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
 
   @doc """
   POST /api/v1/story_dependencies

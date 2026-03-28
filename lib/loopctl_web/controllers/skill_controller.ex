@@ -13,7 +13,9 @@ defmodule LoopctlWeb.SkillController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Skills
   alias LoopctlWeb.AuditContext
 
@@ -25,6 +27,191 @@ defmodule LoopctlWeb.SkillController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
        when action in [:index, :show, :list_versions, :get_version, :stats, :version_results]
+
+  tags(["Skills"])
+
+  operation(:create,
+    summary: "Create skill",
+    description: "Creates a skill with v1. Requires user role.",
+    request_body:
+      {"Skill params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:name, :prompt_text],
+         properties: %{
+           name: %OpenApiSpex.Schema{type: :string},
+           description: %OpenApiSpex.Schema{type: :string, nullable: true},
+           prompt_text: %OpenApiSpex.Schema{type: :string},
+           project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 => {"Skill created", "application/json", Schemas.SkillResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List skills",
+    description: "Lists skills with pagination and filtering.",
+    parameters: [
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"],
+      project_id: [in: :query, type: :string, description: "Filter by project"],
+      status: [in: :query, type: :string, description: "Filter by status"],
+      name: [in: :query, type: :string, description: "Filter by name pattern"]
+    ],
+    responses: %{
+      200 =>
+        {"Skill list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.SkillResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:show,
+    summary: "Get skill",
+    description: "Returns skill detail with current version prompt.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    responses: %{
+      200 => {"Skill detail", "application/json", Schemas.SkillResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update skill metadata",
+    description: "Updates skill description, status, or metadata.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    request_body:
+      {"Update params", "application/json",
+       %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+    responses: %{
+      200 => {"Updated skill", "application/json", Schemas.SkillResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Archive skill",
+    description: "Archives a skill (soft delete).",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    responses: %{
+      200 => {"Archived skill", "application/json", Schemas.SkillResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:create_version,
+    summary: "Create skill version",
+    description: "Creates a new version of a skill with updated prompt text.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    request_body:
+      {"Version params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:prompt_text],
+         properties: %{
+           prompt_text: %OpenApiSpex.Schema{type: :string},
+           changelog: %OpenApiSpex.Schema{type: :string, nullable: true},
+           created_by: %OpenApiSpex.Schema{type: :string, nullable: true}
+         }
+       }},
+    responses: %{
+      201 => {"Version created", "application/json", Schemas.SkillVersionResponse},
+      404 => {"Skill not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:list_versions,
+    summary: "List skill versions",
+    description: "Lists all versions of a skill.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    responses: %{
+      200 =>
+        {"Version list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.SkillVersionResponse}
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:get_version,
+    summary: "Get skill version",
+    description: "Returns a specific version of a skill.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Skill UUID"],
+      version: [in: :path, type: :integer, description: "Version number"]
+    ],
+    responses: %{
+      200 => {"Version detail", "application/json", Schemas.SkillVersionResponse},
+      400 => {"Invalid version", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:import_skills,
+    summary: "Import skills",
+    description: "Bulk import skills from an array.",
+    request_body:
+      {"Import params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:skills],
+         properties: %{
+           skills: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Import summary", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:stats,
+    summary: "Get skill stats",
+    description: "Returns performance statistics for a skill.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    responses: %{
+      200 =>
+        {"Skill stats", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:version_results,
+    summary: "Get version results",
+    description: "Returns skill results for a specific version.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Skill UUID"],
+      version: [in: :path, type: :integer, description: "Version number"]
+    ],
+    responses: %{
+      200 =>
+        {"Version results", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Invalid version", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc "POST /api/v1/skills"
   def create(conn, params) do

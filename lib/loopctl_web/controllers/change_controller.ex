@@ -11,10 +11,48 @@ defmodule LoopctlWeb.ChangeController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
 
   action_fallback LoopctlWeb.FallbackController
+
+  tags(["Audit"])
+
+  operation(:index,
+    summary: "Poll change feed",
+    description:
+      "Cursor-based change feed for orchestrators. Returns audit log entries since a given timestamp.",
+    parameters: [
+      since: [
+        in: :query,
+        type: :string,
+        required: true,
+        description: "ISO8601 timestamp (required)"
+      ],
+      project_id: [in: :query, type: :string, description: "Filter by project"],
+      entity_type: [in: :query, type: :string, description: "Filter by entity type"],
+      action: [in: :query, type: :string, description: "Filter by action"],
+      limit: [in: :query, type: :integer, description: "Max results"]
+    ],
+    responses: %{
+      200 =>
+        {"Change feed", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             },
+             has_more: %OpenApiSpex.Schema{type: :boolean},
+             next_since: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true}
+           }
+         }},
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   # No RequireRole needed: within :authenticated pipeline, accessible to all
   # roles including agent. Agents and orchestrators need the change feed for

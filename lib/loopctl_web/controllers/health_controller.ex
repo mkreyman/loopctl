@@ -10,8 +10,25 @@ defmodule LoopctlWeb.HealthController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
   action_fallback LoopctlWeb.FallbackController
+
+  tags(["Health"])
+
+  operation(:check,
+    summary: "Health check",
+    description: "Returns application health including database and Oban status.",
+    security: [],
+    responses: %{
+      200 =>
+        {"Healthy", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      503 =>
+        {"Degraded", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
 
   def check(conn, _params) do
     case health_checker().check() do

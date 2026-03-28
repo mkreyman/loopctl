@@ -8,14 +8,63 @@ defmodule LoopctlWeb.AgentController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.Agents
+  alias Loopctl.ApiSpec.Schemas
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:register]
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:index, :show]
+
+  tags(["Agents"])
+
+  operation(:register,
+    summary: "Register agent",
+    description: "Self-registers a new agent. Requires an API key with agent role.",
+    request_body: {"Agent params", "application/json", Schemas.AgentRegisterRequest},
+    responses: %{
+      201 => {"Agent created", "application/json", Schemas.AgentResponse},
+      409 => {"Agent already registered", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List agents",
+    description: "Lists agents for the current tenant. Requires orchestrator+ role.",
+    parameters: [
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"],
+      agent_type: [in: :query, type: :string, description: "Filter by agent type"],
+      status: [in: :query, type: :string, description: "Filter by status"]
+    ],
+    responses: %{
+      200 =>
+        {"Agent list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             agents: %OpenApiSpex.Schema{type: :array, items: Schemas.AgentResponse},
+             total: %OpenApiSpex.Schema{type: :integer},
+             page: %OpenApiSpex.Schema{type: :integer},
+             page_size: %OpenApiSpex.Schema{type: :integer}
+           }
+         }}
+    }
+  )
+
+  operation(:show,
+    summary: "Get agent",
+    description: "Returns agent detail. Requires orchestrator+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Agent UUID"]],
+    responses: %{
+      200 => {"Agent detail", "application/json", Schemas.AgentResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/agents/register

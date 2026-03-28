@@ -6,13 +6,44 @@ defmodule LoopctlWeb.SkillResultController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Skills
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: [:orchestrator, :superadmin]
+
+  tags(["Skills"])
+
+  operation(:create,
+    summary: "Record skill result",
+    description: "Records a skill execution result. Requires orchestrator role.",
+    request_body:
+      {"Result params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:skill_version_id, :story_id, :metrics],
+         properties: %{
+           skill_version_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           verification_result_id: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             nullable: true
+           },
+           story_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           metrics: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Result created", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc "POST /api/v1/skill_results"
   def create(conn, params) do

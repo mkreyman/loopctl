@@ -11,7 +11,9 @@ defmodule LoopctlWeb.EpicController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Epics
   alias LoopctlWeb.AuditContext
@@ -20,6 +22,101 @@ defmodule LoopctlWeb.EpicController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
+
+  tags(["Epics"])
+
+  operation(:create,
+    summary: "Create epic",
+    description: "Creates a new epic within a project. Requires user+ role.",
+    parameters: [project_id: [in: :path, type: :string, description: "Project UUID"]],
+    request_body:
+      {"Epic params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:number, :title],
+         properties: %{
+           number: %OpenApiSpex.Schema{type: :integer},
+           title: %OpenApiSpex.Schema{type: :string},
+           description: %OpenApiSpex.Schema{type: :string, nullable: true},
+           phase: %OpenApiSpex.Schema{type: :string, nullable: true},
+           position: %OpenApiSpex.Schema{type: :integer},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 => {"Epic created", "application/json", Schemas.EpicResponse},
+      404 => {"Project not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List epics",
+    description: "Lists epics for a project with pagination and phase filtering.",
+    parameters: [
+      project_id: [in: :path, type: :string, description: "Project UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"],
+      phase: [in: :query, type: :string, description: "Filter by phase"]
+    ],
+    responses: %{
+      200 =>
+        {"Epic list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.EpicResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:show,
+    summary: "Get epic",
+    description: "Returns epic detail with stories preloaded.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    responses: %{
+      200 => {"Epic detail", "application/json", Schemas.EpicResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update epic",
+    description: "Updates an epic. Number cannot be changed. Requires user+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    request_body:
+      {"Update params", "application/json",
+       %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+    responses: %{
+      200 => {"Updated epic", "application/json", Schemas.EpicResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Delete epic",
+    description: "Deletes an epic and cascades to stories. Requires user+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    responses: %{
+      204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:progress,
+    summary: "Get epic progress",
+    description: "Returns epic-level progress: story count by agent_status and verified_status.",
+    parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
+    responses: %{
+      200 =>
+        {"Epic progress", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/projects/:project_id/epics

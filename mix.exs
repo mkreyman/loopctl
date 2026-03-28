@@ -79,6 +79,9 @@ defmodule Loopctl.MixProject do
       {:cloak, "~> 1.1"},
       {:cloak_ecto, "~> 1.3"},
 
+      # OpenAPI spec and Swagger UI
+      {:open_api_spex, "~> 3.21"},
+
       # Structured JSON logging
       {:logger_json, "~> 7.0"},
 

@@ -13,7 +13,9 @@ defmodule LoopctlWeb.StoryStatusController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Progress
   alias LoopctlWeb.AuditContext
 
@@ -21,6 +23,87 @@ defmodule LoopctlWeb.StoryStatusController do
 
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: :agent] when action in [:contract, :claim, :start, :report, :unclaim]
+
+  tags(["Progress"])
+
+  operation(:contract,
+    summary: "Contract story",
+    description:
+      "Agent acknowledges the story's acceptance criteria. " <>
+        "Transitions pending -> contracted.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body: {"Contract params", "application/json", Schemas.ContractRequest},
+    responses: %{
+      200 => {"Story contracted", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      422 => {"Mismatch", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:claim,
+    summary: "Claim story",
+    description: "Agent claims a contracted story. Uses pessimistic locking.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:start,
+    summary: "Start story",
+    description: "Agent starts work on an assigned story.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"Story started", "application/json", Schemas.StoryStatusResponse},
+      403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:report,
+    summary: "Report story done",
+    description: "Agent reports story as done. Optionally includes an artifact report.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Report params (optional artifact)", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           artifact: %OpenApiSpex.Schema{
+             type: :object,
+             properties: %{
+               artifact_type: %OpenApiSpex.Schema{type: :string},
+               path: %OpenApiSpex.Schema{type: :string},
+               exists: %OpenApiSpex.Schema{type: :boolean},
+               details: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             }
+           }
+         }
+       }},
+    responses: %{
+      200 => {"Story reported done", "application/json", Schemas.StoryStatusResponse},
+      403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:unclaim,
+    summary: "Unclaim story",
+    description: "Agent releases a story back to pending.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
+      403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/stories/:id/contract

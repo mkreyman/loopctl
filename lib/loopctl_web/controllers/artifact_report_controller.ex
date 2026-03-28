@@ -10,7 +10,9 @@ defmodule LoopctlWeb.ArtifactReportController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.AuditContext
@@ -22,6 +24,46 @@ defmodule LoopctlWeb.ArtifactReportController do
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index]
+
+  tags(["Artifacts"])
+
+  operation(:create,
+    summary: "Submit artifact report",
+    description: "Submits an artifact report for a story.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body: {"Artifact params", "application/json", Schemas.ArtifactReportRequest},
+    responses: %{
+      201 =>
+        {"Artifact created", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Story not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List artifact reports",
+    description: "Lists all artifact reports for a story with pagination.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Story UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Artifact list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
 
   @doc """
   POST /api/v1/stories/:id/artifacts

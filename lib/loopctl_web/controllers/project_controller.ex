@@ -11,7 +11,9 @@ defmodule LoopctlWeb.ProjectController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Projects
   alias LoopctlWeb.AuditContext
 
@@ -19,6 +21,84 @@ defmodule LoopctlWeb.ProjectController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
+
+  tags(["Projects"])
+
+  operation(:create,
+    summary: "Create project",
+    description: "Creates a new project. Requires user+ role.",
+    request_body: {"Project params", "application/json", Schemas.ProjectCreateRequest},
+    responses: %{
+      201 => {"Project created", "application/json", Schemas.ProjectResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List projects",
+    description: "Lists projects for the current tenant with pagination.",
+    parameters: [
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"],
+      status: [in: :query, type: :string, description: "Filter by status (active/archived)"],
+      include_archived: [in: :query, type: :boolean, description: "Include archived projects"]
+    ],
+    responses: %{
+      200 =>
+        {"Project list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.ProjectResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:show,
+    summary: "Get project",
+    description: "Returns project detail with epic and story counts.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 => {"Project detail", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update project",
+    description: "Updates a project. Slug cannot be changed. Requires user+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    request_body: {"Update params", "application/json", Schemas.ProjectCreateRequest},
+    responses: %{
+      200 => {"Updated project", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Archive project",
+    description: "Archives a project (soft delete). Requires user+ role.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 => {"Archived project", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:progress,
+    summary: "Get project progress",
+    description: "Returns progress summary for a project.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 =>
+        {"Progress summary", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/projects

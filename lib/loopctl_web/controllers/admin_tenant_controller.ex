@@ -13,7 +13,9 @@ defmodule LoopctlWeb.AdminTenantController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
@@ -21,6 +23,78 @@ defmodule LoopctlWeb.AdminTenantController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :superadmin
+
+  tags(["Admin"])
+
+  operation(:index,
+    summary: "List all tenants (admin)",
+    description: "Lists all tenants with summary stats. Requires superadmin.",
+    parameters: [
+      status: [in: :query, type: :string, description: "Filter by status"],
+      search: [in: :query, type: :string, description: "Search by name or slug"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Tenant list", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
+
+  operation(:show,
+    summary: "Get tenant detail (admin)",
+    description: "Returns full tenant detail with all summary stats.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 =>
+        {"Tenant detail", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:update,
+    summary: "Update tenant (admin)",
+    description: "Updates a tenant. Settings are partially merged.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    request_body:
+      {"Update params", "application/json",
+       %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+    responses: %{
+      200 =>
+        {"Updated tenant", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:suspend,
+    summary: "Suspend tenant (admin)",
+    description: "Suspends a tenant. Returns 422 if already suspended.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 =>
+        {"Tenant suspended", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Already suspended", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:activate,
+    summary: "Activate tenant (admin)",
+    description: "Activates a tenant. Returns 422 if already active.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 =>
+        {"Tenant activated", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Already active", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   GET /api/v1/admin/tenants

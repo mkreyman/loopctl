@@ -8,12 +8,65 @@ defmodule LoopctlWeb.DependencyGraphController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.WorkBreakdown.Queries
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:ready, :blocked, :graph]
+
+  tags(["Dependencies"])
+
+  operation(:ready,
+    summary: "List ready stories",
+    description: "Returns stories ready to be assigned (pending, all deps verified).",
+    parameters: [
+      project_id: [in: :query, type: :string, description: "Filter by project"],
+      epic_id: [in: :query, type: :string, description: "Filter by epic"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Ready stories", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.StoryResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:blocked,
+    summary: "List blocked stories",
+    description: "Returns stories blocked by unverified dependencies.",
+    parameters: [
+      project_id: [in: :query, type: :string, description: "Filter by project"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Blocked stories", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}}
+    }
+  )
+
+  operation(:graph,
+    summary: "Get dependency graph",
+    description: "Returns the full dependency graph for a project.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 =>
+        {"Dependency graph", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   GET /api/v1/stories/ready

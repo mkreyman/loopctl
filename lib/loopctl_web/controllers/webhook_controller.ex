@@ -9,13 +9,108 @@ defmodule LoopctlWeb.WebhookController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Webhooks
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, role: :user
+
+  tags(["Webhooks"])
+
+  operation(:create,
+    summary: "Create webhook",
+    description: "Creates a new webhook subscription. Returns the signing secret once.",
+    request_body: {"Webhook params", "application/json", Schemas.WebhookCreateRequest},
+    responses: %{
+      201 => {"Webhook created", "application/json", Schemas.WebhookResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List webhooks",
+    description: "Lists all webhook subscriptions for the authenticated tenant.",
+    parameters: [
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Webhook list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array, items: Schemas.WebhookResponse},
+             meta: Schemas.PaginationMeta
+           }
+         }}
+    }
+  )
+
+  operation(:update,
+    summary: "Update webhook",
+    description: "Updates a webhook subscription.",
+    parameters: [id: [in: :path, type: :string, description: "Webhook UUID"]],
+    request_body:
+      {"Update params", "application/json",
+       %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+    responses: %{
+      200 => {"Updated webhook", "application/json", Schemas.WebhookResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:test,
+    summary: "Test webhook",
+    description: "Sends a test event to the webhook endpoint.",
+    parameters: [id: [in: :path, type: :string, description: "Webhook UUID"]],
+    responses: %{
+      200 =>
+        {"Test enqueued", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:deliveries,
+    summary: "List webhook deliveries",
+    description: "Lists recent delivery attempts for a webhook.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Webhook UUID"],
+      page: [in: :query, type: :integer, description: "Page number"],
+      page_size: [in: :query, type: :integer, description: "Items per page"]
+    ],
+    responses: %{
+      200 =>
+        {"Delivery list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:delete,
+    summary: "Delete webhook",
+    description: "Deletes a webhook and all its pending events.",
+    parameters: [id: [in: :path, type: :string, description: "Webhook UUID"]],
+    responses: %{
+      204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/webhooks

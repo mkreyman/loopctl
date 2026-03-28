@@ -8,7 +8,9 @@ defmodule LoopctlWeb.ImportExportController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.ImportExport
   alias Loopctl.Projects
   alias LoopctlWeb.AuditContext
@@ -17,6 +19,36 @@ defmodule LoopctlWeb.ImportExportController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:import_project]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:export_project]
+
+  tags(["Import/Export"])
+
+  operation(:import_project,
+    summary: "Import work breakdown",
+    description: "Imports a work breakdown into a project. Use merge=true for merge import.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Project UUID"],
+      merge: [in: :query, type: :boolean, description: "Merge mode (update existing)"]
+    ],
+    request_body: {"Import data", "application/json", Schemas.ImportRequest},
+    responses: %{
+      201 =>
+        {"Import summary", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Project not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Conflict", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:export_project,
+    summary: "Export project",
+    description: "Exports a complete project as JSON.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 => {"Export data", "application/json", Schemas.ExportResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/projects/:id/import

@@ -3,6 +3,7 @@ defmodule LoopctlWeb.Router do
 
   pipeline :api do
     plug :accepts, ["json"]
+    plug OpenApiSpex.Plug.PutApiSpec, module: Loopctl.ApiSpec
   end
 
   pipeline :authenticated do
@@ -24,6 +25,19 @@ defmodule LoopctlWeb.Router do
     pipe_through :api
 
     get "/health", HealthController, :check
+  end
+
+  # OpenAPI spec — unauthenticated
+  scope "/api/v1" do
+    pipe_through [:api]
+
+    get "/openapi", OpenApiSpex.Plug.RenderSpec, []
+    get "/", LoopctlWeb.WelcomeController, :index
+  end
+
+  # Swagger UI — unauthenticated
+  scope "/swaggerui" do
+    get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
 
   # Public API endpoints (no auth required)

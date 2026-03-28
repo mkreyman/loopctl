@@ -6,13 +6,83 @@ defmodule LoopctlWeb.ApiKeyController do
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Auth
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, role: :user
+
+  tags(["Auth"])
+
+  operation(:create,
+    summary: "Create API key",
+    description: "Creates a new API key. Returns the raw key once. Requires user role.",
+    request_body: {"API key params", "application/json", Schemas.ApiKeyCreateRequest},
+    responses: %{
+      201 => {"API key created", "application/json", Schemas.ApiKeyResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:index,
+    summary: "List API keys",
+    description: "Lists all API keys for the current tenant. Never exposes raw key or hash.",
+    parameters: [
+      include_revoked: [in: :query, type: :boolean, description: "Include revoked keys"]
+    ],
+    responses: %{
+      200 =>
+        {"API key list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             api_keys: %OpenApiSpex.Schema{type: :array, items: Schemas.ApiKeyResponse}
+           }
+         }}
+    }
+  )
+
+  operation(:delete,
+    summary: "Revoke API key",
+    description: "Revokes an API key (sets revoked_at). Requires user role.",
+    parameters: [id: [in: :path, type: :string, description: "API key UUID"]],
+    responses: %{
+      200 => {"API key revoked", "application/json", Schemas.ApiKeyResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:rotate,
+    summary: "Rotate API key",
+    description:
+      "Creates a new key with the same name/role and sets a grace period on the old key.",
+    parameters: [
+      id: [in: :path, type: :string, description: "API key UUID to rotate"]
+    ],
+    request_body:
+      {"Rotation params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           grace_period_hours: %OpenApiSpex.Schema{
+             type: :integer,
+             description: "Grace period in hours (default: 24)"
+           }
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Rotated key", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Cannot rotate", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/api_keys
