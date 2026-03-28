@@ -87,7 +87,8 @@ defmodule Loopctl.ApiSpec.Schemas do
         page_size: %Schema{type: :integer, example: 20},
         total_count: %Schema{type: :integer, example: 42},
         total_pages: %Schema{type: :integer, example: 3}
-      }
+      },
+      example: %{page: 1, page_size: 20, total_count: 42, total_pages: 3}
     })
   end
 
@@ -894,6 +895,12 @@ defmodule Loopctl.ApiSpec.Schemas do
           nullable: true,
           description: "Story numbers this story depends on"
         }
+      },
+      example: %{
+        number: "1.1",
+        title: "Implement login endpoint",
+        acceptance_criteria: [%{criterion: "Returns JWT"}],
+        estimated_hours: 4.0
       }
     })
   end
@@ -918,6 +925,11 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: ImportStory,
           description: "Stories nested under this epic"
         }
+      },
+      example: %{
+        number: 1,
+        title: "User Authentication",
+        stories: [%{number: "1.1", title: "Login endpoint"}]
       }
     })
   end
@@ -934,7 +946,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       properties: %{
         epic: %Schema{type: :integer, description: "Epic number", example: 2},
         depends_on: %Schema{type: :integer, description: "Depends-on epic number", example: 1}
-      }
+      },
+      example: %{epic: 2, depends_on: 1}
     })
   end
 
@@ -950,7 +963,8 @@ defmodule Loopctl.ApiSpec.Schemas do
       properties: %{
         story: %Schema{type: :string, description: "Story number", example: "1.2"},
         depends_on: %Schema{type: :string, description: "Depends-on story number", example: "1.1"}
-      }
+      },
+      example: %{story: "1.2", depends_on: "1.1"}
     })
   end
 
@@ -1099,6 +1113,13 @@ defmodule Loopctl.ApiSpec.Schemas do
         rejected_at: %Schema{type: :string, format: :"date-time", nullable: true},
         rejection_reason: %Schema{type: :string, nullable: true},
         metadata: %Schema{type: :object, additionalProperties: true}
+      },
+      example: %{
+        number: "1.1",
+        title: "Login endpoint",
+        agent_status: "verified",
+        verified_status: "verified",
+        estimated_hours: 4.0
       }
     })
   end
