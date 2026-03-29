@@ -172,7 +172,34 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{method: "POST", path: "/api/v1/api_keys", description: "Create API key"},
       %{method: "DELETE", path: "/api/v1/api_keys/:id", description: "Delete API key"},
       %{method: "POST", path: "/api/v1/api_keys/:id/rotate", description: "Rotate API key"},
-      %{method: "GET", path: "/api/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"}
+      %{method: "GET", path: "/api/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"},
+
+      # UI Test Runs (project-level QA)
+      %{
+        method: "POST",
+        path: "/api/v1/projects/:project_id/ui-tests",
+        description: "Start a UI test run"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/projects/:project_id/ui-tests",
+        description: "List UI test runs. Filters: status, limit, offset"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/projects/:project_id/ui-tests/:id",
+        description: "Get UI test run with findings"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/projects/:project_id/ui-tests/:id/findings",
+        description: "Add a finding to a UI test run"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/projects/:project_id/ui-tests/:id/complete",
+        description: "Complete a UI test run (pass/fail)"
+      }
     ]
 
     json(conn, %{routes: routes, count: length(routes)})
