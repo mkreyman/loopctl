@@ -299,6 +299,76 @@ curl "http://localhost:4000/api/v1/stories?project_id=<id>&limit=500&offset=500"
 Available query parameters: `project_id` (required), `agent_status`, `verified_status`, `epic_id`,
 `limit` (max 500, default 100), `offset` (default 0).
 
+### UI Test Runs
+
+UI test runs track project-level, ad-hoc QA walkthroughs against a running application. They are
+not tied to individual stories — a UI test run covers the whole app from a user's perspective.
+
+UI testing is **optional**. Not all projects need it. Run a UI test pass when you want to verify
+the full application works end-to-end after a batch of stories has been merged.
+
+**Start a UI test run:**
+
+```bash
+curl -X POST http://localhost:4000/api/v1/projects/:id/ui_test_runs \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"notes": "Post-epic-37 QA pass"}'
+# Returns: {"data": {"id": "<run_uuid>", "status": "running", ...}}
+```
+
+**Record findings** (one call per finding):
+
+```bash
+curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/findings \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "severity": "bug",
+    "title": "Login form does not show error on invalid password",
+    "steps": "1. Visit /login\n2. Enter wrong password\n3. Submit",
+    "expected": "Error message displayed below the password field",
+    "actual": "Page reloads with no feedback"
+  }'
+```
+
+**Complete a UI test run:**
+
+```bash
+curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/complete \
+  -H "Authorization: Bearer lc_orch_key" \
+  -H "Content-Type: application/json" \
+  -d '{"summary": "3 bugs found, 1 enhancement suggestion"}'
+```
+
+**List runs for a project:**
+
+```bash
+curl "http://localhost:4000/api/v1/projects/:id/ui_test_runs" \
+  -H "Authorization: Bearer lc_orch_key"
+```
+
+**Get a single run with its findings:**
+
+```bash
+curl "http://localhost:4000/api/v1/ui_test_runs/:id" \
+  -H "Authorization: Bearer lc_orch_key"
+```
+
+#### Finding Format
+
+Each finding has the following fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `severity` | Yes | One of: `bug`, `enhancement`, `blocker` |
+| `title` | Yes | Short description of the finding |
+| `steps` | No | Reproduction steps |
+| `expected` | No | Expected behavior |
+| `actual` | No | Actual behavior observed |
+
+---
+
 ### Bulk and Admin Endpoints
 
 **Mark pre-existing stories as complete** in a single request. Useful when bootstrapping a project

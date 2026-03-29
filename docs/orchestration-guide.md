@@ -217,6 +217,57 @@ curl "http://localhost:4000/api/v1/stories?project_id=:id&agent_status=reported_
 
 ---
 
+## Optional: UI Testing
+
+UI test runs are a project-level QA step. They are not part of the per-story loop — they cover the
+whole application from a user's perspective.
+
+**When to run a UI test pass:**
+- After a batch of stories from a major epic has been merged
+- When the project has a user guide describing the expected UX flows
+- When you want an end-to-end sanity check before a release
+
+**How it works:**
+
+1. **Start the run** via the loopctl API (orchestrator role):
+   ```bash
+   curl -sk -X POST https://192.168.86.55:8443/api/v1/projects/:id/ui_test_runs \
+     -H "Authorization: Bearer ${LOOPCTL_API_KEY:-$LOOPCTL_ORCH_KEY}" \
+     -H "Content-Type: application/json" \
+     -d '{"notes": "Post-epic-37 QA pass"}'
+   ```
+
+2. **Dispatch a ui-tester agent** (foreground, not background) with the guide path and app URL:
+   ```
+   Agent(
+     subagent_type: "elixir-engineer",
+     description: "UI test pass — <project>",
+     prompt: "You are a QA tester for the application at <app_url>.
+              Read the user guide at <guide_path>.
+              Walk through every flow described in the guide.
+              Record each finding via the loopctl API at
+              POST /api/v1/ui_test_runs/<run_id>/findings.
+              You are READ-ONLY — do NOT edit any code.
+              When done, call POST /api/v1/ui_test_runs/<run_id>/complete."
+   )
+   ```
+
+3. **If findings exist**, dispatch a fix agent to address them, then re-dispatch the ui-tester
+   agent with a new run to confirm the fixes.
+
+4. **If no findings**, the run is complete. Continue with the normal story loop or mark the
+   project phase as QA-passed.
+
+**Important constraints:**
+- The ui-tester agent is **READ-ONLY** — it records findings but never edits code.
+- Fixes are handled by a separate fix agent dispatched by the orchestrator.
+- There is no requirement to run UI tests on every story or every epic. It is a project-wide
+  QA pass, not a per-story gate.
+- A project without a user guide cannot run a UI test pass — the tester has no reference for
+  expected behavior.
+
+---
+
 ## Best Practices
 
 **One commit per story.** Mixing multiple stories in a single commit breaks artifact traceability.
