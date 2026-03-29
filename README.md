@@ -538,7 +538,23 @@ Rate limit headers are included in every authenticated response:
 | `X-RateLimit-Remaining` | Requests remaining in current window |
 | `X-RateLimit-Reset` | Unix timestamp when the window resets |
 
-429 responses include a `Retry-After` header with seconds until the window resets.
+429 responses include a `Retry-After` header and `retry_after_seconds` in the JSON body:
+
+```json
+{"error": {"status": 429, "message": "Too many requests. Retry after 45 seconds.", "retry_after_seconds": 45}}
+```
+
+### Route Discovery
+
+```
+GET /api/v1/routes
+```
+
+Returns all available API endpoints with method, path, and description. Agents can call this first to discover the API without probing blindly.
+
+### Parameter Aliasing
+
+All list endpoints accept both `limit` and `page_size` as query params (bidirectional aliasing). Use whichever you prefer — they are interchangeable.
 
 ### Pagination
 
