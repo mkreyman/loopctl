@@ -1469,4 +1469,154 @@ defmodule Loopctl.ApiSpec.Schemas do
       }
     })
   end
+
+  # ---------- UI Tests ----------
+
+  defmodule StartUiTestRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "StartUiTestRequest",
+      description: "Request body for starting a UI test run",
+      type: :object,
+      required: [:guide_reference],
+      properties: %{
+        guide_reference: %Schema{
+          type: :string,
+          description: "Path or URL to the user guide being followed",
+          example: "docs/user_guides/checkout_flow.md"
+        }
+      },
+      example: %{guide_reference: "docs/user_guides/checkout_flow.md"}
+    })
+  end
+
+  defmodule UiTestFindingRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "UiTestFindingRequest",
+      description: "A structured finding recorded during a UI test run",
+      type: :object,
+      properties: %{
+        step: %Schema{type: :string, description: "The UI step where the finding occurred"},
+        severity: %Schema{
+          type: :string,
+          enum: ["critical", "high", "medium", "low"],
+          description: "Finding severity level"
+        },
+        type: %Schema{
+          type: :string,
+          description: "Finding type (crash, wrong_behavior, ui_defect, etc.)"
+        },
+        description: %Schema{
+          type: :string,
+          description: "Human-readable description of the finding"
+        },
+        screenshot_path: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Optional path to a screenshot"
+        },
+        console_errors: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Optional console error output"
+        }
+      },
+      example: %{
+        step: "3. Submit checkout form",
+        severity: "critical",
+        type: "crash",
+        description: "Page crashes with 500 error when submitting empty form",
+        screenshot_path: "screenshots/checkout_crash.png",
+        console_errors: "Uncaught TypeError: Cannot read properties of undefined"
+      }
+    })
+  end
+
+  defmodule CompleteUiTestRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "CompleteUiTestRequest",
+      description: "Request body for completing a UI test run",
+      type: :object,
+      required: [:status, :summary],
+      properties: %{
+        status: %Schema{
+          type: :string,
+          enum: ["passed", "failed"],
+          description: "Final status of the test run"
+        },
+        summary: %Schema{
+          type: :string,
+          description: "Human-readable summary of the test run",
+          example:
+            "Tested 12 flows. Found 2 critical issues in checkout. Cart and auth flows passed."
+        }
+      },
+      example: %{
+        status: "failed",
+        summary:
+          "Tested 12 flows. Found 2 critical issues in checkout. Cart and auth flows passed."
+      }
+    })
+  end
+
+  defmodule UiTestRunResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "UiTestRunResponse",
+      description: "A UI test run resource",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        project_id: %Schema{type: :string, format: :uuid},
+        started_by_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        status: %Schema{
+          type: :string,
+          enum: ["in_progress", "passed", "failed", "cancelled"]
+        },
+        guide_reference: %Schema{type: :string},
+        findings: %Schema{
+          type: :array,
+          items: %Schema{type: :object, additionalProperties: true}
+        },
+        summary: %Schema{type: :string, nullable: true},
+        screenshots_count: %Schema{type: :integer},
+        findings_count: %Schema{type: :integer},
+        critical_count: %Schema{type: :integer},
+        high_count: %Schema{type: :integer},
+        started_at: %Schema{type: :string, format: :"date-time"},
+        completed_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        tenant_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        started_by_agent_id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        status: "in_progress",
+        guide_reference: "docs/user_guides/checkout_flow.md",
+        findings: [],
+        summary: nil,
+        screenshots_count: 0,
+        findings_count: 0,
+        critical_count: 0,
+        high_count: 0,
+        started_at: "2026-03-29T10:00:00Z",
+        completed_at: nil,
+        inserted_at: "2026-03-29T10:00:00Z",
+        updated_at: "2026-03-29T10:00:00Z"
+      }
+    })
+  end
 end

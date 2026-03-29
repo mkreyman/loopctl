@@ -17,6 +17,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Auth
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
+  alias Loopctl.QualityAssurance.UiTestRun
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
@@ -234,6 +235,16 @@ defmodule Loopctl.Fixtures do
           "false_positive_count" => 1,
           "true_positive_count" => 4
         }
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:ui_test_run, attrs) do
+    Map.merge(
+      %{
+        guide_reference: "docs/user_guides/test_guide_#{System.unique_integer([:positive])}.md",
+        started_at: DateTime.utc_now()
       },
       Enum.into(attrs, %{})
     )
@@ -778,6 +789,54 @@ defmodule Loopctl.Fixtures do
       |> SkillResult.create_changeset(data)
 
     AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:ui_test_run, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {project_id, attrs} =
+      case Map.get(attrs, :project_id) do
+        nil ->
+          project = fixture(:project, %{tenant_id: tenant_id})
+          {project.id, Map.put(attrs, :project_id, project.id)}
+
+        pid ->
+          {pid, attrs}
+      end
+
+    agent_id = Map.get(attrs, :started_by_agent_id)
+    status = Map.get(attrs, :status, :in_progress)
+
+    data = build(:ui_test_run, attrs)
+
+    changeset =
+      %UiTestRun{
+        tenant_id: tenant_id,
+        project_id: project_id,
+        started_by_agent_id: agent_id
+      }
+      |> UiTestRun.create_changeset(data)
+
+    run = AdminRepo.insert!(changeset)
+
+    # Apply non-default status overrides after creation
+    if status != :in_progress do
+      run
+      |> Ecto.Changeset.change(%{status: status, completed_at: DateTime.utc_now()})
+      |> AdminRepo.update!()
+    else
+      run
+    end
   end
 
   @doc """

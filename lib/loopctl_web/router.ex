@@ -119,6 +119,13 @@ defmodule LoopctlWeb.Router do
     post "/projects/:id/import", ImportExportController, :import_project
     get "/projects/:id/export", ImportExportController, :export_project
 
+    # UI Test Runs
+    post "/projects/:project_id/ui-tests", UiTestController, :create
+    get "/projects/:project_id/ui-tests", UiTestController, :index
+    get "/projects/:project_id/ui-tests/:id", UiTestController, :show
+    post "/projects/:project_id/ui-tests/:id/findings", UiTestController, :add_finding
+    post "/projects/:project_id/ui-tests/:id/complete", UiTestController, :complete
+
     # Epic management
     get "/projects/:project_id/epics", EpicController, :index
     post "/projects/:project_id/epics", EpicController, :create
