@@ -223,12 +223,14 @@ defmodule LoopctlWeb.StoryController do
     tenant_id = api_key.tenant_id
 
     with {:ok, _epic} <- Epics.get_epic(tenant_id, epic_id) do
+      page_size = parse_int(params["page_size"]) || parse_int(params["limit"])
+
       opts =
         []
         |> maybe_add_opt(:agent_status, params["agent_status"])
         |> maybe_add_opt(:verified_status, params["verified_status"])
         |> maybe_add_opt(:page, parse_int(params["page"]))
-        |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+        |> maybe_add_opt(:page_size, page_size)
 
       {:ok, result} = Stories.list_stories(tenant_id, epic_id, opts)
 
@@ -253,12 +255,14 @@ defmodule LoopctlWeb.StoryController do
   def index_by_project(conn, %{"project_id" => project_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
+    limit = parse_int(params["limit"]) || parse_int(params["page_size"])
+
     opts =
       []
       |> maybe_add_opt(:agent_status, params["agent_status"])
       |> maybe_add_opt(:verified_status, params["verified_status"])
       |> maybe_add_opt(:epic_id, params["epic_id"])
-      |> maybe_add_opt(:limit, parse_int(params["limit"]))
+      |> maybe_add_opt(:limit, limit)
       |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
     {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)

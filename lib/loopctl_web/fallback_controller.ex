@@ -15,7 +15,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
-  - `{:error, :rate_limited}` -> 429
+  - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
@@ -151,9 +151,17 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :rate_limited}) do
+    retry_after = conn |> get_resp_header("retry-after") |> List.first() || "60"
+
     conn
     |> put_status(:too_many_requests)
-    |> json(%{error: %{status: 429, message: "Too many requests"}})
+    |> json(%{
+      error: %{
+        status: 429,
+        message: "Too many requests. Retry after #{retry_after} seconds.",
+        retry_after_seconds: String.to_integer(retry_after)
+      }
+    })
   end
 
   def call(conn, {:error, %Changeset{} = changeset}) do

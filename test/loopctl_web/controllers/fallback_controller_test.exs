@@ -48,13 +48,27 @@ defmodule LoopctlWeb.FallbackControllerTest do
       assert body["error"]["message"] == "Conflict"
     end
 
-    test "renders 429 for :rate_limited", %{conn: conn} do
+    test "renders 429 for :rate_limited with default retry hint", %{conn: conn} do
       conn = call_fallback(conn, {:error, :rate_limited})
 
       assert conn.status == 429
       body = Jason.decode!(conn.resp_body)
       assert body["error"]["status"] == 429
-      assert body["error"]["message"] == "Too many requests"
+      assert body["error"]["message"] =~ "Retry after 60 seconds"
+      assert body["error"]["retry_after_seconds"] == 60
+    end
+
+    test "renders 429 with retry_after_seconds from response header", %{conn: conn} do
+      conn =
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "30")
+        |> call_fallback({:error, :rate_limited})
+
+      assert conn.status == 429
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 429
+      assert body["error"]["message"] =~ "Retry after 30 seconds"
+      assert body["error"]["retry_after_seconds"] == 30
     end
   end
 

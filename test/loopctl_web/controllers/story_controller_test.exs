@@ -324,4 +324,112 @@ defmodule LoopctlWeb.StoryControllerTest do
       assert json_response(conn, 404)
     end
   end
+
+  # Issue 2: param aliasing — page_size accepted as alias for limit in epic stories index
+  describe "GET /api/v1/epics/:epic_id/stories — param aliasing" do
+    test "accepts page_size as alias for page_size (normal param)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/epics/#{epic.id}/stories?page_size=2")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+      assert body["meta"]["page_size"] == 2
+    end
+
+    test "accepts limit as alias for page_size in epic stories index", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/epics/#{epic.id}/stories?limit=3")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 3
+      assert body["meta"]["page_size"] == 3
+    end
+
+    test "page_size takes precedence over limit when both provided", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/epics/#{epic.id}/stories?page_size=2&limit=4")
+
+      body = json_response(conn, 200)
+      # page_size is preferred when both are present
+      assert length(body["data"]) == 2
+      assert body["meta"]["page_size"] == 2
+    end
+  end
+
+  # Issue 2: param aliasing — limit accepted as alias for page_size in project stories index
+  describe "GET /api/v1/stories?project_id=X — param aliasing" do
+    test "accepts page_size as alias for limit in project stories index", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories?project_id=#{project.id}&page_size=2")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+      assert body["meta"]["limit"] == 2
+    end
+
+    test "limit takes precedence over page_size when both provided", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      for i <- 1..5 do
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.#{i}"})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories?project_id=#{project.id}&limit=3&page_size=2")
+
+      body = json_response(conn, 200)
+      # limit is preferred when both are present
+      assert length(body["data"]) == 3
+      assert body["meta"]["limit"] == 3
+    end
+  end
 end

@@ -52,6 +52,8 @@ defmodule LoopctlWeb.Router do
   scope "/api/v1", LoopctlWeb do
     pipe_through [:api, :authenticated]
 
+    get "/routes", RouteDiscoveryController, :index
+
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
 
