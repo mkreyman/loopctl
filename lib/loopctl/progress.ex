@@ -311,7 +311,8 @@ defmodule Loopctl.Progress do
 
   Transitions agent_status from `implementing` to `reported_done`.
   Optionally accepts an artifact report that is created atomically.
-  Only the assigned agent can report.
+  A DIFFERENT agent from the implementer must call this (chain-of-custody enforcement).
+  The calling agent is recorded as `reported_by_agent_id`.
 
   ## Parameters
 
@@ -325,7 +326,7 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in implementing state
-  - `{:error, :not_assigned_agent}` if calling agent is not the assigned agent
+  - `{:error, :self_report_blocked}` if calling agent is the same as the assigned agent
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
@@ -342,7 +343,7 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         with :ok <- validate_transition_ctx(story, :reported_done, "report"),
-             :ok <- validate_assigned_agent(story, agent_id) do
+             :ok <- validate_not_self_report(story, agent_id) do
           {:ok, story}
         end
       end)
@@ -352,7 +353,8 @@ defmodule Loopctl.Progress do
         story
         |> Ecto.Changeset.change(%{
           agent_status: :reported_done,
-          reported_done_at: now
+          reported_done_at: now,
+          reported_by_agent_id: agent_id
         })
         |> AdminRepo.update()
       end)
@@ -402,6 +404,55 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
+  Signals that the assigned agent has finished implementation and requests review.
+
+  Does NOT change agent_status. Fires a `story.review_requested` webhook event.
+  Only the assigned agent can call this. Story must be in `implementing` status.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %Story{}}` on success
+  - `{:error, :not_found}` if story not found in tenant
+  - `{:error, :not_assigned_agent}` if caller is not the assigned agent
+  - `{:error, {:invalid_transition, map()}}` if story is not in implementing status
+  """
+  @spec request_review(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
+  def request_review(tenant_id, story_id, opts \\ []) do
+    agent_id = Keyword.get(opts, :agent_id)
+
+    query =
+      Story
+      |> where([s], s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+    case AdminRepo.one(query) do
+      nil ->
+        {:error, :not_found}
+
+      story ->
+        with :ok <- validate_story_implementing(story),
+             :ok <- validate_assigned_agent(story, agent_id) do
+          insert_events_with_delivery(tenant_id, "story.review_requested", story.project_id, %{
+            "event" => "story.review_requested",
+            "story_id" => story_id,
+            "project_id" => story.project_id,
+            "epic_id" => story.epic_id,
+            "agent_id" => agent_id,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          })
+
+          {:ok, story}
+        end
+    end
+  end
+
+  @doc """
   Unclaims a story: resets it to pending.
 
   Only the assigned agent can unclaim (unless already pending).
@@ -444,7 +495,8 @@ defmodule Loopctl.Progress do
           agent_status: :pending,
           assigned_agent_id: nil,
           assigned_at: nil,
-          reported_done_at: nil
+          reported_done_at: nil,
+          reported_by_agent_id: nil
         })
         |> AdminRepo.update()
       end)
@@ -520,7 +572,8 @@ defmodule Loopctl.Progress do
     reviewer_agent_id = Keyword.get(opts, :reviewer_agent_id)
 
     with {:ok, story} <- fetch_story_for_review(tenant_id, story_id),
-         :ok <- validate_story_reported_done(story) do
+         :ok <- validate_story_reported_done(story),
+         :ok <- validate_not_self_review(story, reviewer_agent_id) do
       completed_at =
         Map.get(params, "completed_at") ||
           Map.get(params, :completed_at) ||
@@ -542,7 +595,20 @@ defmodule Loopctl.Progress do
         }
         |> ReviewRecord.create_changeset(attrs)
 
-      AdminRepo.insert(changeset)
+      with {:ok, review_record} <- AdminRepo.insert(changeset) do
+        insert_events_with_delivery(tenant_id, "story.review_completed", story.project_id, %{
+          "event" => "story.review_completed",
+          "story_id" => story_id,
+          "project_id" => story.project_id,
+          "epic_id" => story.epic_id,
+          "reviewer_agent_id" => reviewer_agent_id,
+          "review_type" => attrs.review_type,
+          "findings_count" => attrs.findings_count,
+          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+        })
+
+        {:ok, review_record}
+      end
     end
   end
 
@@ -842,7 +908,8 @@ defmodule Loopctl.Progress do
             agent_status: :pending,
             assigned_agent_id: nil,
             assigned_at: nil,
-            reported_done_at: nil
+            reported_done_at: nil,
+            reported_by_agent_id: nil
           })
           |> AdminRepo.update()
         end
@@ -1301,6 +1368,35 @@ defmodule Loopctl.Progress do
     else
       {:error, :not_assigned_agent}
     end
+  end
+
+  defp validate_not_self_report(story, agent_id) do
+    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
+      {:error, :self_report_blocked}
+    else
+      :ok
+    end
+  end
+
+  defp validate_not_self_review(story, reviewer_agent_id) do
+    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do
+      {:error, :self_review_blocked}
+    else
+      :ok
+    end
+  end
+
+  defp validate_story_implementing(%Story{agent_status: :implementing}), do: :ok
+
+  defp validate_story_implementing(story) do
+    {:error,
+     {:invalid_transition,
+      %{
+        current_agent_status: story.agent_status,
+        current_verified_status: story.verified_status,
+        attempted_action: "request-review",
+        hint: "Story must be in 'implementing' status to request review"
+      }}}
   end
 
   defp check_claim_dependencies(story) do

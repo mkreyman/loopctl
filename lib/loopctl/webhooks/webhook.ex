@@ -27,6 +27,8 @@ defmodule Loopctl.Webhooks.Webhook do
     story.rejected
     story.auto_reset
     story.force_unclaimed
+    story.review_requested
+    story.review_completed
     epic.completed
     artifact.reported
     agent.registered

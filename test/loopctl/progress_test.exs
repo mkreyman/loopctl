@@ -173,8 +173,11 @@ defmodule Loopctl.ProgressTest do
   end
 
   describe "report_story/4" do
-    test "transitions implementing -> reported_done" do
+    test "transitions implementing -> reported_done (cross-agent)" do
       %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      # A second agent (the reviewer) does the reporting
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
       story =
         ctx.story
@@ -186,14 +189,33 @@ defmodule Loopctl.ProgressTest do
         |> Loopctl.AdminRepo.update!()
 
       assert {:ok, updated} =
-               Progress.report_story(tenant.id, story.id, agent_id: agent.id)
+               Progress.report_story(tenant.id, story.id, agent_id: reviewer.id)
 
       assert updated.agent_status == :reported_done
       assert updated.reported_done_at != nil
+      assert updated.reported_by_agent_id == reviewer.id
+    end
+
+    test "blocks self-report (assigned agent cannot report their own work)" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :self_report_blocked} =
+               Progress.report_story(tenant.id, story.id, agent_id: agent.id)
     end
 
     test "returns changeset error when artifact params are invalid" do
       %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
       story =
         ctx.story
@@ -212,11 +234,18 @@ defmodule Loopctl.ProgressTest do
       }
 
       assert {:error, %Ecto.Changeset{}} =
-               Progress.report_story(tenant.id, story.id, [agent_id: agent.id], bad_artifact)
+               Progress.report_story(
+                 tenant.id,
+                 story.id,
+                 [agent_id: reviewer.id],
+                 bad_artifact
+               )
     end
 
     test "creates artifact report when provided" do
       %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
       story =
         ctx.story
@@ -235,7 +264,7 @@ defmodule Loopctl.ProgressTest do
       }
 
       assert {:ok, _updated} =
-               Progress.report_story(tenant.id, story.id, [agent_id: agent.id], artifact)
+               Progress.report_story(tenant.id, story.id, [agent_id: reviewer.id], artifact)
 
       reports =
         Loopctl.AdminRepo.all(
@@ -674,6 +703,121 @@ defmodule Loopctl.ProgressTest do
                  tenant.id,
                  story.id,
                  %{"review_type" => ""}
+               )
+    end
+
+    test "blocks self-review when reviewer is the assigned implementer" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :self_review_blocked} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => "enhanced"},
+                 reviewer_agent_id: agent.id
+               )
+    end
+
+    test "allows cross-agent review" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, review_record} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => "enhanced"},
+                 reviewer_agent_id: reviewer.id
+               )
+
+      assert review_record.reviewer_agent_id == reviewer.id
+    end
+  end
+
+  describe "request_review/3" do
+    test "succeeds when called by the assigned agent on an implementing story" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, returned_story} =
+               Progress.request_review(tenant.id, story.id, agent_id: agent.id)
+
+      assert returned_story.id == story.id
+      # Status does NOT change
+      assert returned_story.agent_status == :implementing
+    end
+
+    test "rejects if caller is not the assigned agent" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      other_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :not_assigned_agent} =
+               Progress.request_review(tenant.id, story.id, agent_id: other_agent.id)
+    end
+
+    test "rejects if story is not in implementing status" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :assigned,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, {:invalid_transition, ctx}} =
+               Progress.request_review(tenant.id, story.id, agent_id: agent.id)
+
+      assert ctx.attempted_action == "request-review"
+    end
+
+    test "returns not_found for unknown story" do
+      %{tenant: tenant} = setup_story()
+
+      assert {:error, :not_found} =
+               Progress.request_review(tenant.id, Ecto.UUID.generate(),
+                 agent_id: Ecto.UUID.generate()
                )
     end
   end

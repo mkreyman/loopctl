@@ -13,19 +13,16 @@ defmodule LoopctlWeb.StoryStatusAliasControllerTest do
   end
 
   describe "POST /api/v1/stories/:id/report-done" do
-    test "alias works identically to /report", %{conn: conn} do
+    test "alias works identically to /report (cross-agent)", %{conn: conn} do
       tenant = fixture(:tenant)
       agent = fixture(:agent, %{tenant_id: tenant.id})
-
-      {raw_key, _} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
       story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
 
-      # Manually set to implementing with correct agent (mirrors setup_story_with_agent in existing tests)
+      # Manually set to implementing with the implementer agent
       story =
         story
         |> Ecto.Changeset.change(%{
@@ -35,9 +32,15 @@ defmodule LoopctlWeb.StoryStatusAliasControllerTest do
         })
         |> Loopctl.AdminRepo.update!()
 
+      # A different agent (reviewer) does the reporting
+      reviewer = fixture(:agent, %{tenant_id: tenant.id})
+
+      {reviewer_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: reviewer.id})
+
       conn =
         conn
-        |> auth_conn(raw_key)
+        |> auth_conn(reviewer_key)
         |> post(~p"/api/v1/stories/#{story.id}/report-done", %{
           "summary" => "Done via alias"
         })

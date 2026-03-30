@@ -60,8 +60,16 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       },
       %{
         method: "POST",
+        path: "/api/v1/stories/:id/request-review",
+        description:
+          "Signal implementation is ready for review (assigned agent only). " <>
+            "Fires story.review_requested webhook. Does NOT change status."
+      },
+      %{
+        method: "POST",
         path: "/api/v1/stories/:id/report",
-        description: "Report done (alias: /report-done)"
+        description:
+          "Confirm implementation done (chain-of-custody: caller must be a DIFFERENT agent from implementer). Alias: /report-done"
       },
       %{method: "POST", path: "/api/v1/stories/:id/unclaim", description: "Unclaim story"},
       %{

@@ -101,6 +101,9 @@ defmodule LoopctlWeb.ReviewRecordController do
       {:error, :story_not_reported_done} ->
         {:error, :story_not_reported_done}
 
+      {:error, :self_review_blocked} ->
+        {:error, :self_review_blocked}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end

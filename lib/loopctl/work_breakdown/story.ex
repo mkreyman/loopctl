@@ -41,6 +41,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :agent_status,
              :verified_status,
              :assigned_agent_id,
+             :reported_by_agent_id,
              :assigned_at,
              :reported_done_at,
              :verified_at,
@@ -57,6 +58,7 @@ defmodule Loopctl.WorkBreakdown.Story do
     belongs_to :project, Loopctl.Projects.Project
     belongs_to :epic, Loopctl.WorkBreakdown.Epic
     belongs_to :assigned_agent, Loopctl.Agents.Agent
+    belongs_to :reported_by_agent, Loopctl.Agents.Agent
 
     field :number, :string
     field :title, :string

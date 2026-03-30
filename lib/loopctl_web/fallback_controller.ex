@@ -15,6 +15,8 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
+  - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
+  - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
@@ -131,6 +133,32 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "Cannot verify your own implementation. " <>
             "The orchestrator agent must be different from the implementing agent."
+      }
+    })
+  end
+
+  def call(conn, {:error, :self_report_blocked}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        message:
+          "Cannot report your own implementation as done. " <>
+            "A different agent (the reviewer) must call POST /stories/:id/report to confirm."
+      }
+    })
+  end
+
+  def call(conn, {:error, :self_review_blocked}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        message:
+          "Cannot review your own implementation. " <>
+            "The reviewer agent must be different from the implementing agent."
       }
     })
   end

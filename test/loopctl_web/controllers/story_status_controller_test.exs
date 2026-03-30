@@ -261,7 +261,36 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
   # --- Report tests ---
 
   describe "POST /api/v1/stories/:id/report" do
-    test "reports an implementing story as done", %{conn: conn} do
+    test "cross-agent report succeeds (reviewer != implementer)", %{conn: conn} do
+      %{story: story, agent: agent, tenant: tenant} = setup_story_with_agent()
+
+      story =
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # A different agent (reviewer) does the reporting
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {reviewer_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: reviewer.id})
+
+      conn =
+        conn
+        |> auth_conn(reviewer_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report")
+
+      body = json_response(conn, 200)
+      assert body["story"]["agent_status"] == "reported_done"
+      assert body["story"]["reported_done_at"] != nil
+      assert body["story"]["reported_by_agent_id"] == reviewer.id
+    end
+
+    test "self-report blocked (409) — assigned agent cannot report their own work", %{conn: conn} do
       %{story: story, raw_key: raw_key, agent: agent} = setup_story_with_agent()
 
       story =
@@ -278,13 +307,13 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/stories/#{story.id}/report")
 
-      body = json_response(conn, 200)
-      assert body["story"]["agent_status"] == "reported_done"
-      assert body["story"]["reported_done_at"] != nil
+      body = json_response(conn, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["message"] =~ "Cannot report your own implementation"
     end
 
-    test "reports with optional artifact", %{conn: conn} do
-      %{story: story, raw_key: raw_key, agent: agent} = setup_story_with_agent()
+    test "reports with optional artifact (cross-agent)", %{conn: conn} do
+      %{story: story, agent: agent, tenant: tenant} = setup_story_with_agent()
 
       story =
         story
@@ -295,9 +324,14 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
         })
         |> Loopctl.AdminRepo.update!()
 
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {reviewer_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: reviewer.id})
+
       conn =
         conn
-        |> auth_conn(raw_key)
+        |> auth_conn(reviewer_key)
         |> post(~p"/api/v1/stories/#{story.id}/report", %{
           "artifact" => %{
             "artifact_type" => "commit_diff",
@@ -323,10 +357,46 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       assert artifact.exists == true
       assert artifact.details == %{"files_changed" => 5}
       assert artifact.reported_by == :agent
-      assert artifact.reporter_agent_id == agent.id
+      assert artifact.reporter_agent_id == reviewer.id
     end
 
-    test "returns 422 when artifact changeset is invalid", %{conn: conn} do
+    test "returns 422 when artifact changeset is invalid (cross-agent)", %{conn: conn} do
+      %{story: story, agent: agent, tenant: tenant} = setup_story_with_agent()
+
+      story =
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :implementing,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {reviewer_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: reviewer.id})
+
+      conn =
+        conn
+        |> auth_conn(reviewer_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report", %{
+          "artifact" => %{
+            "artifact_type" => "migration",
+            "exists" => true
+            # Missing required "path" field
+          }
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- Request Review tests ---
+
+  describe "POST /api/v1/stories/:id/request-review" do
+    test "succeeds for the assigned agent on an implementing story", %{conn: conn} do
       %{story: story, raw_key: raw_key, agent: agent} = setup_story_with_agent()
 
       story =
@@ -341,20 +411,16 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/stories/#{story.id}/report", %{
-          "artifact" => %{
-            "artifact_type" => "migration",
-            "exists" => true
-            # Missing required "path" field
-          }
-        })
+        |> post(~p"/api/v1/stories/#{story.id}/request-review")
 
-      body = json_response(conn, 422)
-      assert body["error"]["status"] == 422
+      body = json_response(conn, 200)
+      # Status does NOT change
+      assert body["story"]["agent_status"] == "implementing"
+      assert body["story"]["id"] == story.id
     end
 
-    test "rejects report by wrong agent (403)", %{conn: conn} do
-      %{story: story, tenant: tenant, agent: agent} = setup_story_with_agent()
+    test "rejects non-assigned agent (403)", %{conn: conn} do
+      %{story: story, agent: agent, tenant: tenant} = setup_story_with_agent()
 
       story =
         story
@@ -373,9 +439,30 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       conn =
         conn
         |> auth_conn(other_raw_key)
-        |> post(~p"/api/v1/stories/#{story.id}/report")
+        |> post(~p"/api/v1/stories/#{story.id}/request-review")
 
       assert json_response(conn, 403)
+    end
+
+    test "rejects wrong status (409)", %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent} = setup_story_with_agent()
+
+      # Story is in assigned status, not implementing
+      story =
+        story
+        |> Ecto.Changeset.change(%{
+          agent_status: :assigned,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/request-review")
+
+      assert json_response(conn, 409)
     end
   end
 
@@ -445,9 +532,15 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
   # --- Full lifecycle test ---
 
   describe "full agent lifecycle" do
-    test "contract -> claim -> start -> report", %{conn: _conn} do
+    test "contract -> claim -> start -> request-review -> report (cross-agent)", %{conn: _conn} do
       %{story: story, raw_key: raw_key, agent: agent, tenant: tenant} =
         setup_story_with_agent()
+
+      # Create a reviewer agent (different from implementer)
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {reviewer_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: reviewer.id})
 
       # Contract
       conn1 =
@@ -479,17 +572,26 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
       assert json_response(conn3, 200)["story"]["agent_status"] == "implementing"
 
-      # Report
-      conn4 =
+      # Request review (implementer signals readiness)
+      conn_rr =
         build_conn()
         |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/request-review")
+
+      assert json_response(conn_rr, 200)["story"]["agent_status"] == "implementing"
+
+      # Report (reviewer confirms implementation done)
+      conn4 =
+        build_conn()
+        |> auth_conn(reviewer_key)
         |> post(~p"/api/v1/stories/#{story.id}/report")
 
       body4 = json_response(conn4, 200)
       assert body4["story"]["agent_status"] == "reported_done"
       assert body4["story"]["reported_done_at"] != nil
+      assert body4["story"]["reported_by_agent_id"] == reviewer.id
 
-      # Verify 4 audit log entries with action=status_changed
+      # Verify 4 audit log entries with action=status_changed (contract, claim, start, report)
       {:ok, result} =
         Loopctl.Audit.list_entries(tenant.id,
           entity_type: "story",
@@ -515,8 +617,8 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       {orch_key, _} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
 
-      # claim, start, report, unclaim are agent-only (contract allows orchestrator)
-      for action <- ["claim", "start", "report", "unclaim"] do
+      # claim, start, unclaim are agent-only; report and contract allow orchestrator too
+      for action <- ["claim", "start", "unclaim"] do
         resp =
           conn
           |> auth_conn(orch_key)
