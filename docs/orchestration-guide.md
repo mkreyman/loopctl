@@ -9,10 +9,10 @@ Methodology reference for running AI-driven development projects with loopctl.
 The orchestration loop repeats for every story until the project is complete:
 
 ```
-find ready → contract → claim → implement → report → review → verify
-                                                              │
-                                              pass ──────────┤
-                                              fail ──▶ reject ──▶ (back to pending)
+find ready → contract → claim → implement → request-review → [reviewer] report → review-complete → verify
+                                                                                                    │
+                                                                                    pass ───────────┤
+                                                                                    fail ──▶ reject ──▶ (back to pending)
 ```
 
 **find ready** — Query `/stories/ready?project_id=...` to get stories whose dependencies are all
@@ -26,14 +26,48 @@ A story can be claimed by only one agent at a time.
 
 **implement** — The agent does the work: writes code, commits, runs tests. One commit per story.
 
-**report** — The agent POSTs an artifact describing what was produced (commit hash, files created,
-test results). This is the agent's self-report — it does not advance `verified_status`.
+**request-review** — The implementer POSTs to `/stories/:id/request-review` to signal that the
+work is ready for review. This is the implementer's final action on the story. It does NOT mark the
+story as done — it fires a `story.review_requested` webhook and puts the story in a "awaiting
+review" state. The implementer cannot call `/report` on their own story (409 self_report_blocked).
 
-**review** — The orchestrator runs an independent review using a separate process that has not seen
-the implementation. The review process reads the story's acceptance criteria and audits the artifact.
+**report (reviewer)** — A DIFFERENT agent (the reviewer) calls `/stories/:id/report` to confirm
+the implementation artifact. The API enforces that the caller is not the assigned implementer
+(`reported_by_agent_id` must differ from `assigned_agent_id`). If they match, the response is
+`409 self_report_blocked`.
+
+**review** — The reviewer reads the acceptance criteria and audits the implementation. This is the
+independent review step — a separate process that has not seen the implementation.
+
+**review-complete (reviewer)** — The reviewer calls `/stories/:id/review-complete` to signal that
+the review is finished and findings have been recorded. This fires a `story.review_completed`
+webhook. The same identity gate applies: 409 if caller == implementer.
 
 **verify / reject** — Only the orchestrator can set `verified_status`. A passing verification
-unblocks dependent stories. A rejection resets the story to `pending` and increments the cycle count.
+unblocks dependent stories. A rejection resets the story to `pending` and increments the cycle
+count. If the orchestrator was also the implementer, verify returns `409 self_verify_blocked`.
+
+---
+
+## Why the Chain-of-Custody Matters
+
+In practice, orchestrators skipped reviews. A common failure mode was:
+
+1. Orchestrator dispatches an implementer agent
+2. Orchestrator receives the agent's self-report
+3. Orchestrator calls `/verify` directly without running a review
+
+The result: stories get verified with no independent check. This defeats the entire trust model.
+
+The chain-of-custody pattern closes this gap structurally. The implementer **cannot** call `/report`
+on their own story — the API returns 409. This means the orchestrator cannot skip the review step by
+having the implementer self-report and then verifying. A genuinely different agent must confirm the
+implementation before verification is possible.
+
+The three identity gates are enforced at the API layer regardless of role:
+- `POST /report` — 409 `self_report_blocked` if caller == assigned_agent_id
+- `POST /review-complete` — 409 `self_review_blocked` if caller == assigned_agent_id
+- `POST /verify` — 409 `self_verify_blocked` if caller == assigned_agent_id
 
 ---
 

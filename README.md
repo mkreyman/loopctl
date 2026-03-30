@@ -207,17 +207,32 @@ Now the agent key can contract, claim, start, and report stories. The orchestrat
 
 ### Typical Agent Workflow
 
+The chain-of-custody rule: nobody marks their own work as done. The implementer requests review; a different agent confirms it.
+
 ```
-1. Register tenant      POST /api/v1/tenants/register
-2. Create project       POST /api/v1/projects
-3. Import stories       POST /api/v1/projects/:id/import
-4. Register agent       POST /api/v1/agents/register
-5. Get ready stories    GET  /api/v1/stories/ready?project_id=...
-6. Contract story       POST /api/v1/stories/:id/contract
-7. Claim story          POST /api/v1/stories/:id/claim
-8. Start implementing   POST /api/v1/stories/:id/start-work  (or /start)
-9. Report done          POST /api/v1/stories/:id/report-done (or /report)
-10. (Orchestrator)      POST /api/v1/stories/:id/verify  OR  /reject
+Setup:
+1. Register tenant        POST /api/v1/tenants/register
+2. Create project         POST /api/v1/projects
+3. Import stories         POST /api/v1/projects/:id/import
+4. Register agent         POST /api/v1/agents/register
+
+Per story (implementer):
+5. Get ready stories      GET  /api/v1/stories/ready?project_id=...
+6. Contract story         POST /api/v1/stories/:id/contract
+7. Claim story            POST /api/v1/stories/:id/claim
+8. Start implementing     POST /api/v1/stories/:id/start-work  (or /start)
+9. Request review         POST /api/v1/stories/:id/request-review
+   ↳ fires story.review_requested webhook
+   ↳ implementer's role ENDS here
+
+Per story (reviewer — must be a DIFFERENT agent):
+10. Confirm implementation POST /api/v1/stories/:id/report  (409 if caller == implementer)
+11. Complete review        POST /api/v1/stories/:id/review-complete  (409 if caller == implementer)
+    ↳ fires story.review_completed webhook
+
+Per story (orchestrator):
+12. Verify or reject       POST /api/v1/stories/:id/verify  OR  /reject
+    ↳ verify returns 409 if orchestrator == implementer
 ```
 
 ### Roles
@@ -233,24 +248,54 @@ Now the agent key can contract, claim, start, and report stories. The orchestrat
 
 > **Superadmin keys** are created via the database or by a privileged script -- they cannot be created through the API since they require `tenant_id=NULL`.
 
-### Two-Tier Trust Model
+### Two-Tier Trust Model and Chain-of-Custody Enforcement
+
+The two-tier trust model governs **who can write which field**. The chain-of-custody principle governs **who can perform each handoff action**: nobody marks their own work as done.
+
+#### Identity Gates
+
+Three endpoints enforce caller identity at the API level. If the caller is the assigned agent, the request is rejected with 409:
+
+| Endpoint | Blocked response | Meaning |
+|----------|-----------------|---------|
+| `POST /stories/:id/report` | `409 self_report_blocked` | The implementer cannot mark their own work as done — a different agent (reviewer) must call this |
+| `POST /stories/:id/review-complete` | `409 self_review_blocked` | The reviewer cannot declare their own review complete if they were the implementer |
+| `POST /stories/:id/verify` | `409 self_verify_blocked` | The orchestrator cannot verify a story they implemented |
+
+The field `stories.reported_by_agent_id` tracks which agent confirmed the implementation (i.e., called `/report`). This must differ from the assigned implementer.
+
+#### Request-Review Endpoint
+
+When an implementer finishes work, they do **not** call `/report` directly. Instead, they signal readiness:
+
+```bash
+POST /stories/:id/request-review
+```
+
+This transitions the story to a "review requested" state without advancing `agent_status` to `reported_done`. It fires a `story.review_requested` webhook. A different agent (the reviewer) then calls `/report` to confirm the implementation, followed by `/review-complete` to close the review. Only then can the orchestrator call `/verify`.
+
+#### Endpoint Reference
 
 ```
 Agent endpoints (exact_role: agent):
   POST /stories/:id/contract
   POST /stories/:id/claim
-  POST /stories/:id/start           (alias: /start-work)
-  POST /stories/:id/report          (alias: /report-done)
+  POST /stories/:id/start             (alias: /start-work)
+  POST /stories/:id/request-review    (NEW — signals readiness, does NOT mark done)
+
+Reviewer endpoints (different agent from implementer):
+  POST /stories/:id/report            (alias: /report-done — blocked if caller == assigned_agent_id)
+  POST /stories/:id/review-complete   (blocked if caller == assigned_agent_id)
 
 Orchestrator endpoints (exact_role: orchestrator):
-  POST /stories/:id/verify          (requires review_type and summary — returns 422 without them)
+  POST /stories/:id/verify            (requires review_type and summary — blocked if caller == assigned_agent_id)
   POST /stories/:id/reject
   POST /stories/:id/force-unclaim
-  POST /stories/bulk/mark-complete  (mark pre-existing stories complete in one call)
-  POST /epics/:id/verify-all        (verify all reported_done stories in an epic)
+  POST /stories/bulk/mark-complete    (mark pre-existing stories complete in one call)
+  POST /epics/:id/verify-all          (verify all reported_done stories in an epic)
 ```
 
-An agent key **cannot** call verify/reject. An orchestrator key **cannot** call claim/start/report. This is enforced at the plug level with strict atom equality -- no role hierarchy bypass.
+An agent key **cannot** call verify/reject. An orchestrator key **cannot** call claim/start/request-review. This is enforced at the plug level with strict atom equality -- no role hierarchy bypass. Identity gates are an additional layer enforced regardless of role.
 
 ### Sprint Contracts
 
@@ -513,7 +558,9 @@ Subscribe to real-time notifications for these event types:
 
 | Event Type | Fired When |
 |------------|------------|
-| `story.status_changed` | Agent transitions story status (contract, claim, start, report) |
+| `story.status_changed` | Agent transitions story status (contract, claim, start) |
+| `story.review_requested` | Implementer calls `/request-review` — signals readiness for handoff |
+| `story.review_completed` | Reviewer calls `/review-complete` — review cycle is closed |
 | `story.verified` | Orchestrator verifies a story |
 | `story.rejected` | Orchestrator rejects a story |
 | `story.auto_reset` | Rejected story auto-resets to pending |

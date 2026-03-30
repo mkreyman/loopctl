@@ -133,6 +133,20 @@ mix ecto.reset         # Drop, create, migrate
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
+## Chain-of-Custody Enforcement
+
+The API enforces that nobody marks their own work as done. Three identity gates check that the
+caller's agent ID differs from the story's assigned agent ID:
+
+- `POST /stories/:id/report` — returns `409 self_report_blocked` if caller == assigned_agent_id
+- `POST /stories/:id/review-complete` — returns `409 self_review_blocked` if caller == assigned_agent_id
+- `POST /stories/:id/verify` — returns `409 self_verify_blocked` if caller == assigned_agent_id
+
+The implementer's final action is `POST /stories/:id/request-review`. All three subsequent steps
+(report, review-complete, verify) must come from different agents.
+
+---
+
 ## Epic 17: Orchestrator Observability
 
 loopctl supports external observability tooling through its API and data model:
