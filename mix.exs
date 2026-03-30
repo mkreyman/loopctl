@@ -97,7 +97,8 @@ defmodule Loopctl.MixProject do
       # Code quality
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false}
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
     ]
   end
 
@@ -112,6 +113,7 @@ defmodule Loopctl.MixProject do
         "deps.unlock --check-unused",
         "format --check-formatted",
         "credo --strict",
+        "deps.audit",
         "dialyzer",
         "test"
       ]
