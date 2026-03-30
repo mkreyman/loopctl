@@ -1,0 +1,13 @@
+{
+  "name": "loopctl-mcp",
+  "version": "1.0.0",
+  "description": "MCP server wrapping the loopctl REST API for Claude Code agents",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest"
+  }
+}
