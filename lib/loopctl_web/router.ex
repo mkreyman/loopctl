@@ -97,6 +97,9 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/artifacts", ArtifactReportController, :create
     get "/stories/:id/artifacts", ArtifactReportController, :index
 
+    # Review pipeline completion (must precede verify)
+    post "/stories/:id/review-complete", ReviewRecordController, :create
+
     # Story verification (orchestrator side of two-tier trust model)
     post "/stories/:id/verify", StoryVerificationController, :verify
     post "/stories/:id/reject", StoryVerificationController, :reject

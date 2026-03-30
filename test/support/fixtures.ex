@@ -12,6 +12,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Artifacts.ArtifactReport
+  alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
@@ -245,6 +246,19 @@ defmodule Loopctl.Fixtures do
       %{
         guide_reference: "docs/user_guides/test_guide_#{System.unique_integer([:positive])}.md",
         started_at: DateTime.utc_now()
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:review_record, attrs) do
+    Map.merge(
+      %{
+        review_type: "enhanced",
+        findings_count: 0,
+        fixes_count: 0,
+        summary: "Review completed.",
+        completed_at: DateTime.utc_now()
       },
       Enum.into(attrs, %{})
     )
@@ -527,6 +541,50 @@ defmodule Loopctl.Fixtures do
         orchestrator_agent_id: orchestrator_agent_id
       }
       |> VerificationResult.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:review_record, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {story_id, attrs} =
+      case Map.get(attrs, :story_id) do
+        nil ->
+          story =
+            fixture(:story, %{
+              tenant_id: tenant_id,
+              agent_status: :reported_done,
+              reported_done_at: DateTime.utc_now()
+            })
+
+          {story.id, Map.put(attrs, :story_id, story.id)}
+
+        sid ->
+          {sid, attrs}
+      end
+
+    reviewer_agent_id = Map.get(attrs, :reviewer_agent_id)
+
+    data = build(:review_record, attrs)
+
+    changeset =
+      %ReviewRecord{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        reviewer_agent_id: reviewer_agent_id
+      }
+      |> ReviewRecord.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end

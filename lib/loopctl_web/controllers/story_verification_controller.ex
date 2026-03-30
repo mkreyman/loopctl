@@ -32,13 +32,16 @@ defmodule LoopctlWeb.StoryVerificationController do
   operation(:verify,
     summary: "Verify story",
     description:
-      "Orchestrator verifies a reported_done story. Creates verification_result with result=pass.",
+      "Orchestrator verifies a reported_done story. Creates verification_result with result=pass. " <>
+        "Requires a review_record to exist (call POST /stories/:id/review-complete first). " <>
+        "The review_record must have been completed AFTER the story was reported done.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Verification params", "application/json", Schemas.VerifyRequest},
     responses: %{
       200 => {"Story verified", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      422 => {"No review record found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -113,7 +116,6 @@ defmodule LoopctlWeb.StoryVerificationController do
            }
          }},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Review evidence required", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -137,8 +139,8 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
 
-        {:error, :review_required} ->
-          {:error, :review_required}
+        {:error, :review_not_conducted} ->
+          {:error, :review_not_conducted}
 
         {:error, {:invalid_transition, _ctx} = err} ->
           {:error, err}
@@ -269,13 +271,8 @@ defmodule LoopctlWeb.StoryVerificationController do
       tenant_id = api_key.tenant_id
       opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
-      case Progress.verify_all_in_epic(tenant_id, epic_id, params, opts) do
-        {:ok, result} ->
-          json(conn, result)
-
-        {:error, :review_required} ->
-          {:error, :review_required}
-      end
+      {:ok, result} = Progress.verify_all_in_epic(tenant_id, epic_id, params, opts)
+      json(conn, result)
     end
   end
 

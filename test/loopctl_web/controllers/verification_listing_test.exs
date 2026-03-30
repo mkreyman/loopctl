@@ -15,6 +15,8 @@ defmodule LoopctlWeb.VerificationListingTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Progress
+
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
@@ -39,10 +41,13 @@ defmodule LoopctlWeb.VerificationListingTest do
         agent_status: :reported_done
       })
 
-    # Set assigned agent for realism
+    # Set assigned agent and reported_done_at for review-record enforcement
     story =
       story
-      |> Ecto.Changeset.change(%{assigned_agent_id: impl_agent.id})
+      |> Ecto.Changeset.change(%{
+        assigned_agent_id: impl_agent.id,
+        reported_done_at: DateTime.utc_now()
+      })
       |> Loopctl.AdminRepo.update!()
 
     %{
@@ -55,6 +60,12 @@ defmodule LoopctlWeb.VerificationListingTest do
       orch_key: orch_key,
       story: story
     }
+  end
+
+  # Creates a fresh review_record so the next POST /verify succeeds.
+  defp create_review_record(tenant_id, story_id) do
+    {:ok, _} =
+      Progress.record_review(tenant_id, story_id, %{"review_type" => "enhanced"})
   end
 
   # --- Paginated verification listing ---
@@ -156,7 +167,10 @@ defmodule LoopctlWeb.VerificationListingTest do
 
   describe "iteration field auto-computation" do
     test "verify creates verification result with correct iteration number", %{conn: conn} do
-      %{story: story, orch_key: orch_key} = setup_verified_story()
+      %{tenant: tenant, story: story, orch_key: orch_key} = setup_verified_story()
+
+      # Create review record so first verify succeeds
+      create_review_record(tenant.id, story.id)
 
       # First verification
       build_conn()
@@ -174,15 +188,19 @@ defmodule LoopctlWeb.VerificationListingTest do
         "reason" => "Regression found"
       })
 
-      # Advance story back to reported_done for second verify
+      # Advance story back to reported_done for second verify; set fresh reported_done_at
       story_now = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
 
       story_now
       |> Ecto.Changeset.change(%{
         agent_status: :reported_done,
-        verified_status: :unverified
+        verified_status: :unverified,
+        reported_done_at: DateTime.utc_now()
       })
       |> Loopctl.AdminRepo.update!()
+
+      # Create a fresh review record so second verify succeeds
+      create_review_record(tenant.id, story.id)
 
       # Second verification
       build_conn()
@@ -209,7 +227,10 @@ defmodule LoopctlWeb.VerificationListingTest do
 
   describe "verification result fields" do
     test "result enum includes pass, fail values", %{conn: conn} do
-      %{story: story, orch_key: orch_key} = setup_verified_story()
+      %{tenant: tenant, story: story, orch_key: orch_key} = setup_verified_story()
+
+      # Create review record so verify succeeds
+      create_review_record(tenant.id, story.id)
 
       # Verify (pass)
       build_conn()

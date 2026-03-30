@@ -2,8 +2,8 @@ defmodule LoopctlWeb.ImportExportController do
   @moduledoc """
   Controller for project import and export operations.
 
-  - `POST /api/v1/projects/:id/import` -- import work breakdown (user role)
-  - `POST /api/v1/projects/:id/import?merge=true` -- merge import (user role)
+  - `POST /api/v1/projects/:id/import` -- import work breakdown (orchestrator, user, or superadmin role)
+  - `POST /api/v1/projects/:id/import?merge=true` -- merge import (orchestrator, user, or superadmin role)
   - `GET /api/v1/projects/:id/export` -- export project (agent+ role)
   """
 
@@ -17,7 +17,9 @@ defmodule LoopctlWeb.ImportExportController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:import_project]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [exact_role: [:orchestrator, :user, :superadmin]] when action in [:import_project]
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:export_project]
 
   tags(["Import/Export"])

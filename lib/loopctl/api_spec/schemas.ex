@@ -676,6 +676,43 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ReviewRecordResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ReviewRecordResponse",
+      description: "Review record proving an independent review was conducted",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        reviewer_agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        review_type: %Schema{type: :string},
+        findings_count: %Schema{type: :integer},
+        fixes_count: %Schema{type: :integer},
+        summary: %Schema{type: :string, nullable: true},
+        completed_at: %Schema{type: :string, format: :"date-time"},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "f1a2b3c4-d5e6-7890-abcd-ef1234567890",
+        tenant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        story_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        reviewer_agent_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        review_type: "enhanced",
+        findings_count: 5,
+        fixes_count: 5,
+        summary: "Enhanced review completed. 5 findings, all fixed.",
+        completed_at: "2026-03-30T01:44:41Z",
+        inserted_at: "2026-03-30T01:44:41Z",
+        updated_at: "2026-03-30T01:44:41Z"
+      }
+    })
+  end
+
   # ---------- Agents ----------
 
   defmodule AgentRegisterRequest do

@@ -5,6 +5,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Artifacts.VerificationResult
+  alias Loopctl.Progress
 
   setup :verify_on_exit!
 
@@ -35,13 +36,16 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
     story = fixture(:story, story_attrs)
 
-    # Set assigned_agent_id for realism
+    # Set assigned_agent_id and reported_done_at for realism
     story =
       story
-      |> Ecto.Changeset.change(%{assigned_agent_id: impl_agent.id})
+      |> Ecto.Changeset.change(%{
+        assigned_agent_id: impl_agent.id,
+        reported_done_at: DateTime.utc_now()
+      })
       |> Loopctl.AdminRepo.update!()
 
-    %{
+    ctx = %{
       tenant: tenant,
       project: project,
       epic: epic,
@@ -51,6 +55,17 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       orch_key: orch_key,
       story: story
     }
+
+    # Optionally create a review_record (default: true for most tests)
+    if Map.get(opts, :with_review_record, true) do
+      {:ok, _} =
+        Progress.record_review(tenant.id, story.id, %{
+          "review_type" => "enhanced",
+          "summary" => "Review passed"
+        })
+    end
+
+    ctx
   end
 
   # --- Verify tests ---
@@ -128,8 +143,9 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert result.result == :pass
     end
 
-    test "rejects verify without review_type (422)", %{conn: conn} do
-      %{story: story, orch_key: orch_key} = setup_reported_story()
+    test "rejects verify when no review_record exists (422)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} =
+        setup_reported_story(%{with_review_record: false})
 
       conn =
         conn
@@ -139,36 +155,23 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         })
 
       body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "Review evidence required"
+      assert body["error"]["message"] =~ "No review record found"
+      assert body["error"]["message"] =~ "review-complete"
     end
 
-    test "rejects verify without summary (422)", %{conn: conn} do
+    test "succeeds when review_record exists (review_type and summary are now optional)", %{
+      conn: conn
+    } do
       %{story: story, orch_key: orch_key} = setup_reported_story()
 
+      # review_type and summary are now optional on the verify endpoint
       conn =
         conn
         |> auth_conn(orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-          "review_type" => "enhanced"
-        })
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{})
 
-      body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "Review evidence required"
-    end
-
-    test "rejects verify with empty review_type (422)", %{conn: conn} do
-      %{story: story, orch_key: orch_key} = setup_reported_story()
-
-      conn =
-        conn
-        |> auth_conn(orch_key)
-        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-          "summary" => "All good",
-          "review_type" => ""
-        })
-
-      body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "Review evidence required"
+      body = json_response(conn, 200)
+      assert body["story"]["verified_status"] == "verified"
     end
 
     test "rejects verify on non-reported_done story (409)", %{conn: conn} do
@@ -499,13 +502,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     test "lists verification results for a story", %{conn: conn} do
       %{story: story, orch_key: orch_key} = setup_reported_story()
 
-      # Create a verification
+      # Create a verification (review_record already created by setup_reported_story)
       build_conn()
       |> auth_conn(orch_key)
-      |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-        "summary" => "Pass",
-        "review_type" => "enhanced"
-      })
+      |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "Pass"})
 
       conn =
         conn
@@ -544,10 +544,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
           build_conn()
           |> auth_conn(key_1)
-          |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-            "summary" => "pass-1",
-            "review_type" => "enhanced"
-          })
+          |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "pass-1"})
         end)
 
       task_2 =
@@ -557,10 +554,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
           build_conn()
           |> auth_conn(key_2)
-          |> post(~p"/api/v1/stories/#{story.id}/verify", %{
-            "summary" => "pass-2",
-            "review_type" => "enhanced"
-          })
+          |> post(~p"/api/v1/stories/#{story.id}/verify", %{"summary" => "pass-2"})
         end)
 
       result_1 = Task.await(task_1, 10_000)
@@ -616,29 +610,37 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
   # --- Issue 11: verify-all endpoint ---
 
   describe "POST /api/v1/epics/:id/verify-all" do
-    test "verifies all reported_done unverified stories in an epic", %{conn: conn} do
+    test "verifies all reported_done unverified stories in an epic when review_records exist", %{
+      conn: conn
+    } do
       %{tenant: tenant, epic: epic, impl_agent: impl_agent, orch_key: orch_key} =
         setup_reported_story()
 
-      # Create 2 more reported_done stories in the same epic
+      # Create 2 more reported_done stories in the same epic, each with a review_record
       for _ <- 1..2 do
         story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
 
-        story
-        |> Ecto.Changeset.change(%{
-          agent_status: :reported_done,
-          assigned_agent_id: impl_agent.id,
-          reported_done_at: DateTime.utc_now()
-        })
-        |> Loopctl.AdminRepo.update!()
+        story =
+          story
+          |> Ecto.Changeset.change(%{
+            agent_status: :reported_done,
+            assigned_agent_id: impl_agent.id,
+            reported_done_at: DateTime.utc_now()
+          })
+          |> Loopctl.AdminRepo.update!()
+
+        {:ok, _} =
+          Progress.record_review(tenant.id, story.id, %{
+            "review_type" => "enhanced",
+            "summary" => "Passed"
+          })
       end
 
       conn =
         conn
         |> auth_conn(orch_key)
         |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
-          "summary" => "All stories pass review",
-          "review_type" => "enhanced"
+          "summary" => "All stories pass review"
         })
 
       body = json_response(conn, 200)
@@ -664,8 +666,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         conn
         |> auth_conn(orch_key)
         |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
-          "summary" => "Nothing to verify",
-          "review_type" => "enhanced"
+          "summary" => "Nothing to verify"
         })
 
       body = json_response(conn, 200)
@@ -673,18 +674,33 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert body["total_eligible"] == 0
     end
 
-    test "requires review evidence", %{conn: conn} do
-      %{orch_key: orch_key, epic: epic} = setup_reported_story()
+    test "reports skipped stories when no review_records exist", %{conn: conn} do
+      %{tenant: tenant, epic: epic, impl_agent: impl_agent, orch_key: orch_key} =
+        setup_reported_story(%{with_review_record: false})
+
+      # Add a second reported_done story without a review_record
+      story2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      story2
+      |> Ecto.Changeset.change(%{
+        agent_status: :reported_done,
+        assigned_agent_id: impl_agent.id,
+        reported_done_at: DateTime.utc_now()
+      })
+      |> Loopctl.AdminRepo.update!()
 
       conn =
         conn
         |> auth_conn(orch_key)
         |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
-          "summary" => ""
+          "summary" => "All good"
         })
 
-      body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "Review evidence required"
+      body = json_response(conn, 200)
+      assert body["verified_count"] == 0
+      assert body["total_eligible"] == 2
+      # Both stories skipped because they have no review_records
+      assert body["skipped_count"] == 2
     end
 
     test "requires orchestrator role (403 for agent)", %{conn: conn} do
@@ -700,11 +716,156 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         conn
         |> put_req_header("authorization", "Bearer #{agent_key}")
         |> post(~p"/api/v1/epics/#{epic.id}/verify-all", %{
-          "summary" => "All good",
-          "review_type" => "enhanced"
+          "summary" => "All good"
         })
 
       assert conn.status == 403
+    end
+  end
+
+  # --- review-complete endpoint tests ---
+
+  describe "POST /api/v1/stories/:id/review-complete" do
+    test "orchestrator can record review completion (201)", %{conn: conn} do
+      %{story: story, orch_key: orch_key} =
+        setup_reported_story(%{with_review_record: false})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+          "review_type" => "enhanced",
+          "findings_count" => 5,
+          "fixes_count" => 5,
+          "summary" => "Enhanced review completed. All findings fixed."
+        })
+
+      body = json_response(conn, 201)
+      assert body["review_record"]["review_type"] == "enhanced"
+      assert body["review_record"]["findings_count"] == 5
+      assert body["review_record"]["fixes_count"] == 5
+      assert body["review_record"]["story_id"] == story.id
+    end
+
+    test "user role can record review completion (201)", %{conn: conn} do
+      %{tenant: tenant, story: story} = setup_reported_story(%{with_review_record: false})
+      {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+          "review_type" => "team"
+        })
+
+      assert json_response(conn, 201)
+    end
+
+    test "agent role cannot record review completion (403)", %{conn: conn} do
+      %{tenant: tenant, story: story, impl_agent: impl_agent} =
+        setup_reported_story(%{with_review_record: false})
+
+      {agent_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: impl_agent.id})
+
+      conn =
+        conn
+        |> auth_conn(agent_key)
+        |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+          "review_type" => "enhanced"
+        })
+
+      assert json_response(conn, 403)
+    end
+
+    test "returns 422 when story is not reported_done", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {orch_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
+
+      # Pending story
+      pending_story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{pending_story.id}/review-complete", %{
+          "review_type" => "enhanced"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "reported_done"
+    end
+
+    test "returns 404 for unknown story", %{conn: conn} do
+      %{orch_key: orch_key} = setup_reported_story(%{with_review_record: false})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{Ecto.UUID.generate()}/review-complete", %{
+          "review_type" => "enhanced"
+        })
+
+      assert json_response(conn, 404)
+    end
+
+    test "verify succeeds after review-complete", %{conn: conn} do
+      %{story: story, orch_key: orch_key, orch_agent: orch_agent} =
+        setup_reported_story(%{with_review_record: false})
+
+      # Step 1: Call review-complete
+      build_conn()
+      |> auth_conn(orch_key)
+      |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+        "review_type" => "enhanced",
+        "findings_count" => 3,
+        "fixes_count" => 3,
+        "summary" => "Three issues found and fixed."
+      })
+      |> json_response(201)
+
+      # Step 2: Verify succeeds
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good"
+        })
+
+      body = json_response(conn, 200)
+      assert body["story"]["verified_status"] == "verified"
+
+      # Verify a verification_result was created
+      results =
+        Loopctl.AdminRepo.all(from(v in VerificationResult, where: v.story_id == ^story.id))
+
+      assert [result] = results
+      assert result.result == :pass
+      assert result.orchestrator_agent_id == orch_agent.id
+    end
+
+    test "tenant isolation: cannot record review for another tenant's story", %{conn: conn} do
+      %{story: story} = setup_reported_story(%{with_review_record: false})
+
+      tenant_b = fixture(:tenant)
+      orch_b = fixture(:agent, %{tenant_id: tenant_b.id, agent_type: :orchestrator})
+
+      {orch_key_b, _} =
+        fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator, agent_id: orch_b.id})
+
+      conn =
+        conn
+        |> auth_conn(orch_key_b)
+        |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
+          "review_type" => "enhanced"
+        })
+
+      assert json_response(conn, 404)
     end
   end
 end

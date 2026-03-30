@@ -41,11 +41,20 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       # stories[0] is verified, stories[1] is unverified (reported_done)
       last_story = Enum.at(stories, 1)
 
+      # Ensure reported_done_at is set and create review record
+      last_story =
+        last_story
+        |> Ecto.Changeset.change(%{reported_done_at: DateTime.utc_now()})
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, _} =
+               Progress.record_review(tenant.id, last_story.id, %{"review_type" => "enhanced"})
+
       assert {:ok, _updated} =
                Progress.verify_story(
                  tenant.id,
                  last_story.id,
-                 %{"summary" => "All good", "review_type" => "enhanced"},
+                 %{"summary" => "All good"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -66,11 +75,19 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       # Verify just one of three
       first_story = Enum.at(stories, 0)
 
+      first_story =
+        first_story
+        |> Ecto.Changeset.change(%{reported_done_at: DateTime.utc_now()})
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, _} =
+               Progress.record_review(tenant.id, first_story.id, %{"review_type" => "enhanced"})
+
       assert {:ok, _updated} =
                Progress.verify_story(
                  tenant.id,
                  first_story.id,
-                 %{"summary" => "Partial", "review_type" => "enhanced"},
+                 %{"summary" => "Partial"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -93,12 +110,20 @@ defmodule Loopctl.Progress.EpicCompletionTest do
           )
         )
 
+      # Set reported_done_at and create review record for first verify
+      story
+      |> Ecto.Changeset.change(%{reported_done_at: DateTime.utc_now()})
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, _} =
+               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"})
+
       # First verification triggers completion
       assert {:ok, _} =
                Progress.verify_story(
                  tenant.id,
                  story.id,
-                 %{"summary" => "Pass 1", "review_type" => "enhanced"},
+                 %{"summary" => "Pass 1"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -123,15 +148,20 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       story
       |> Ecto.Changeset.change(%{
         agent_status: :reported_done,
-        verified_status: :unverified
+        verified_status: :unverified,
+        reported_done_at: DateTime.utc_now()
       })
       |> Loopctl.AdminRepo.update!()
+
+      # Create another review record for the second verify
+      assert {:ok, _} =
+               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"})
 
       assert {:ok, _} =
                Progress.verify_story(
                  tenant.id,
                  story.id,
-                 %{"summary" => "Pass 2", "review_type" => "enhanced"},
+                 %{"summary" => "Pass 2"},
                  orchestrator_agent_id: orch_agent.id
                )
 

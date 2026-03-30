@@ -21,7 +21,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{
         method: "POST",
         path: "/api/v1/projects/:id/import",
-        description: "Import epics and stories"
+        description: "Import epics and stories (orchestrator, user, or superadmin role)"
       },
       %{
         method: "GET",
@@ -66,8 +66,17 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{method: "POST", path: "/api/v1/stories/:id/unclaim", description: "Unclaim story"},
       %{
         method: "POST",
+        path: "/api/v1/stories/:id/review-complete",
+        description:
+          "Record review completion (call AFTER reported_done, BEFORE verify). " <>
+            "Required params: review_type. Optional: findings_count, fixes_count, summary, completed_at."
+      },
+      %{
+        method: "POST",
         path: "/api/v1/stories/:id/verify",
-        description: "Verify story (requires review_type + summary)"
+        description:
+          "Verify story (requires a review_record — call /review-complete first). " <>
+            "Optional params: summary, findings, result, review_type."
       },
       %{
         method: "POST",

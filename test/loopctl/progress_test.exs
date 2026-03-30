@@ -3,6 +3,7 @@ defmodule Loopctl.ProgressTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Progress
 
   defp setup_story(attrs \\ %{}) do
@@ -308,7 +309,7 @@ defmodule Loopctl.ProgressTest do
                )
     end
 
-    test "allows different agent to verify" do
+    test "allows different agent to verify when review_record exists" do
       %{tenant: tenant, agent: agent} = ctx = setup_story()
 
       story =
@@ -323,11 +324,19 @@ defmodule Loopctl.ProgressTest do
 
       other_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
+      # Create review_record first
+      assert {:ok, _} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => "enhanced", "summary" => "Review passed"}
+               )
+
       assert {:ok, updated} =
                Progress.verify_story(
                  tenant.id,
                  story.id,
-                 %{"summary" => "All good", "review_type" => "enhanced"},
+                 %{"summary" => "All good"},
                  orchestrator_agent_id: other_agent.id
                )
 
@@ -492,28 +501,36 @@ defmodule Loopctl.ProgressTest do
   # --- Issue 11: verify_all_in_epic ---
 
   describe "verify_all_in_epic/4" do
-    test "verifies all reported_done unverified stories in an epic" do
+    test "verifies all reported_done unverified stories in an epic when review_records exist" do
       %{tenant: tenant, epic: epic, agent: agent} = setup_story()
       orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
-      # Create 3 more stories in same epic, all reported_done
+      # Create 3 more stories in same epic, all reported_done, each with a review_record
       for _ <- 1..3 do
         story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
 
-        story
-        |> Ecto.Changeset.change(%{
-          agent_status: :reported_done,
-          assigned_agent_id: agent.id,
-          reported_done_at: DateTime.utc_now()
-        })
-        |> Loopctl.AdminRepo.update!()
+        story =
+          story
+          |> Ecto.Changeset.change(%{
+            agent_status: :reported_done,
+            assigned_agent_id: agent.id,
+            reported_done_at: DateTime.utc_now()
+          })
+          |> Loopctl.AdminRepo.update!()
+
+        # Review record required for each story
+        assert {:ok, _} =
+                 Progress.record_review(tenant.id, story.id, %{
+                   "review_type" => "enhanced",
+                   "summary" => "Passed"
+                 })
       end
 
       assert {:ok, result} =
                Progress.verify_all_in_epic(
                  tenant.id,
                  epic.id,
-                 %{"summary" => "All pass", "review_type" => "enhanced"},
+                 %{"summary" => "All pass"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -533,7 +550,7 @@ defmodule Loopctl.ProgressTest do
                Progress.verify_all_in_epic(
                  tenant.id,
                  epic.id,
-                 %{"summary" => "All pass", "review_type" => "enhanced"},
+                 %{"summary" => "All pass"},
                  orchestrator_agent_id: orch_agent.id
                )
 
@@ -541,17 +558,33 @@ defmodule Loopctl.ProgressTest do
       assert result.total_eligible == 0
     end
 
-    test "requires review evidence (review_type and summary)" do
-      %{tenant: tenant, epic: epic} = setup_story()
+    test "reports errors for stories without review_records" do
+      %{tenant: tenant, epic: epic, agent: agent} = setup_story()
       orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
-      assert {:error, :review_required} =
+      # Create a reported_done story WITHOUT a review_record
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      story
+      |> Ecto.Changeset.change(%{
+        agent_status: :reported_done,
+        assigned_agent_id: agent.id,
+        reported_done_at: DateTime.utc_now()
+      })
+      |> Loopctl.AdminRepo.update!()
+
+      assert {:ok, result} =
                Progress.verify_all_in_epic(
                  tenant.id,
                  epic.id,
-                 %{"summary" => ""},
+                 %{"summary" => "All pass"},
                  orchestrator_agent_id: orch_agent.id
                )
+
+      assert result.verified_count == 0
+      assert result.skipped_count == 1
+      assert result.total_eligible == 1
+      assert length(result.errors) == 1
     end
   end
 
@@ -562,6 +595,213 @@ defmodule Loopctl.ProgressTest do
 
       assert {:error, :not_found} =
                Progress.claim_story(tenant_b.id, story.id, agent_id: Ecto.UUID.generate())
+    end
+  end
+
+  # --- Review Records ---
+
+  describe "record_review/4" do
+    test "creates a review_record for a reported_done story" do
+      %{tenant: tenant, story: story} =
+        setup_story(%{agent_status: :reported_done, reported_done_at: DateTime.utc_now()})
+
+      assert {:ok, review_record} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{
+                   "review_type" => "enhanced",
+                   "findings_count" => 5,
+                   "fixes_count" => 5,
+                   "summary" => "Enhanced review completed. All findings fixed."
+                 }
+               )
+
+      assert review_record.review_type == "enhanced"
+      assert review_record.findings_count == 5
+      assert review_record.fixes_count == 5
+      assert review_record.story_id == story.id
+      assert review_record.tenant_id == tenant.id
+      assert review_record.completed_at != nil
+    end
+
+    test "creates review_record with reviewer_agent_id" do
+      %{tenant: tenant, story: story} =
+        setup_story(%{agent_status: :reported_done, reported_done_at: DateTime.utc_now()})
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      assert {:ok, review_record} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => "team"},
+                 reviewer_agent_id: reviewer.id
+               )
+
+      assert review_record.reviewer_agent_id == reviewer.id
+    end
+
+    test "returns not_found for unknown story" do
+      %{tenant: tenant} = setup_story()
+
+      assert {:error, :not_found} =
+               Progress.record_review(
+                 tenant.id,
+                 Ecto.UUID.generate(),
+                 %{"review_type" => "enhanced"}
+               )
+    end
+
+    test "returns story_not_reported_done when story is not in reported_done status" do
+      %{tenant: tenant, story: story} = setup_story()
+
+      # Story is in pending status
+      assert {:error, :story_not_reported_done} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => "enhanced"}
+               )
+    end
+
+    test "returns changeset error when review_type is blank" do
+      %{tenant: tenant, story: story} =
+        setup_story(%{agent_status: :reported_done, reported_done_at: DateTime.utc_now()})
+
+      assert {:error, %Ecto.Changeset{}} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{"review_type" => ""}
+               )
+    end
+  end
+
+  describe "verify_story/4 review_record enforcement" do
+    test "fails with review_not_conducted when no review_record exists" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      assert {:error, :review_not_conducted} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Looks good"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+    end
+
+    test "succeeds when review_record exists and is after reported_done_at" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      reported_done_at = ~U[2026-03-30 00:00:00.000000Z]
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: reported_done_at
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # Review completed after reported_done_at
+      assert {:ok, _} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{
+                   "review_type" => "enhanced",
+                   "completed_at" => ~U[2026-03-30 01:00:00.000000Z]
+                 }
+               )
+
+      assert {:ok, updated} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Looks good"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+
+      assert updated.verified_status == :verified
+    end
+
+    test "fails when review_record completed_at is before reported_done_at (stale review)" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      reported_done_at = ~U[2026-03-30 02:00:00.000000Z]
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: reported_done_at
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # Review completed BEFORE reported_done_at (stale)
+      {:ok, _} =
+        Loopctl.AdminRepo.insert(
+          %ReviewRecord{
+            tenant_id: tenant.id,
+            story_id: story.id
+          }
+          |> ReviewRecord.create_changeset(%{
+            review_type: "enhanced",
+            completed_at: ~U[2026-03-30 01:00:00.000000Z]
+          })
+        )
+
+      assert {:error, :review_not_conducted} =
+               Progress.verify_story(
+                 tenant.id,
+                 story.id,
+                 %{"summary" => "Looks good"},
+                 orchestrator_agent_id: orch_agent.id
+               )
+    end
+  end
+
+  describe "review_record tenant isolation" do
+    test "tenant A cannot create review_record for tenant B story" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id})
+
+      story_b =
+        fixture(:story, %{
+          tenant_id: tenant_b.id,
+          epic_id: epic_b.id,
+          agent_status: :reported_done,
+          reported_done_at: DateTime.utc_now()
+        })
+
+      # Tenant A tries to create review_record for tenant B story
+      assert {:error, :not_found} =
+               Progress.record_review(
+                 tenant_a.id,
+                 story_b.id,
+                 %{"review_type" => "enhanced"}
+               )
     end
   end
 end

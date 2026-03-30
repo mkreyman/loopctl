@@ -15,6 +15,7 @@ defmodule Loopctl.Progress do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ArtifactReport
+  alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
@@ -489,6 +490,77 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # --- Review Records ---
+
+  @doc """
+  Records that an independent review was completed for a story.
+
+  Creates a `review_record` proving the review pipeline ran. The `verify_story/4`
+  function checks for the existence of a valid review record (completed AFTER
+  `reported_done_at`) before allowing verification to proceed.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `story_id` -- the story UUID
+  - `params` -- map with `review_type` (required), optional `findings_count`,
+    `fixes_count`, `summary`, `completed_at`
+  - `opts` -- keyword list with `:reviewer_agent_id`, `:actor_id`, `:actor_label`
+
+  ## Returns
+
+  - `{:ok, %ReviewRecord{}}` on success
+  - `{:error, :not_found}` if story not found in tenant
+  - `{:error, :story_not_reported_done}` if story is not in reported_done status
+  - `{:error, %Ecto.Changeset{}}` on validation failure
+  """
+  @spec record_review(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, ReviewRecord.t()} | {:error, atom() | Ecto.Changeset.t()}
+  def record_review(tenant_id, story_id, params, opts \\ []) do
+    reviewer_agent_id = Keyword.get(opts, :reviewer_agent_id)
+
+    with {:ok, story} <- fetch_story_for_review(tenant_id, story_id),
+         :ok <- validate_story_reported_done(story) do
+      completed_at =
+        Map.get(params, "completed_at") ||
+          Map.get(params, :completed_at) ||
+          DateTime.utc_now()
+
+      attrs = %{
+        review_type: Map.get(params, "review_type") || Map.get(params, :review_type),
+        findings_count: Map.get(params, "findings_count") || Map.get(params, :findings_count, 0),
+        fixes_count: Map.get(params, "fixes_count") || Map.get(params, :fixes_count, 0),
+        summary: Map.get(params, "summary") || Map.get(params, :summary),
+        completed_at: completed_at
+      }
+
+      changeset =
+        %ReviewRecord{
+          tenant_id: tenant_id,
+          story_id: story_id,
+          reviewer_agent_id: reviewer_agent_id
+        }
+        |> ReviewRecord.create_changeset(attrs)
+
+      AdminRepo.insert(changeset)
+    end
+  end
+
+  defp fetch_story_for_review(tenant_id, story_id) do
+    query =
+      Story
+      |> where([s], s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+    case AdminRepo.one(query) do
+      nil -> {:error, :not_found}
+      story -> {:ok, story}
+    end
+  end
+
+  defp validate_story_reported_done(%Story{agent_status: :reported_done}), do: :ok
+
+  defp validate_story_reported_done(_story), do: {:error, :story_not_reported_done}
+
   # --- Orchestrator Verification (US-7.2) ---
 
   @doc """
@@ -529,8 +601,8 @@ defmodule Loopctl.Progress do
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)
-      |> Multi.run(:review_evidence, fn _repo, _changes ->
-        validate_review_evidence(verification_params)
+      |> Multi.run(:check_review_record, fn _repo, %{lock: story} ->
+        validate_review_record_exists(tenant_id, story_id, story)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         apply_verified_status(story)
@@ -656,25 +728,21 @@ defmodule Loopctl.Progress do
   - `{:ok, %{verified_count: integer, skipped_count: integer, errors: [map()]}}` on success
   """
   @spec verify_all_in_epic(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, map()} | {:error, :review_required}
+          {:ok, map()}
   def verify_all_in_epic(tenant_id, epic_id, params, opts \\ []) do
-    verification_params = extract_verification_params(params)
+    stories_to_verify = fetch_eligible_stories_for_verify(tenant_id, epic_id)
+    results = Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts))
 
-    with {:ok, _} <- validate_review_evidence(verification_params) do
-      stories_to_verify = fetch_eligible_stories_for_verify(tenant_id, epic_id)
-      results = Enum.map(stories_to_verify, &verify_single(tenant_id, &1, params, opts))
+    verified = Enum.count(results, &match?({:ok, _}, &1))
+    errors = results |> Enum.filter(&match?({:error, _}, &1)) |> Enum.map(&elem(&1, 1))
 
-      verified = Enum.count(results, &match?({:ok, _}, &1))
-      errors = results |> Enum.filter(&match?({:error, _}, &1)) |> Enum.map(&elem(&1, 1))
-
-      {:ok,
-       %{
-         verified_count: verified,
-         skipped_count: length(errors),
-         total_eligible: length(stories_to_verify),
-         errors: errors
-       }}
-    end
+    {:ok,
+     %{
+       verified_count: verified,
+       skipped_count: length(errors),
+       total_eligible: length(stories_to_verify),
+       errors: errors
+     }}
   end
 
   defp fetch_eligible_stories_for_verify(tenant_id, epic_id) do
@@ -860,19 +928,26 @@ defmodule Loopctl.Progress do
     end
   end
 
-  defp validate_review_evidence(verification_params) do
-    review_type = verification_params.review_type
-    summary = verification_params.summary
+  defp validate_review_record_exists(tenant_id, story_id, story) do
+    reported_done_at = story.reported_done_at
 
-    cond do
-      is_nil(review_type) or review_type == "" ->
-        {:error, :review_required}
+    query =
+      ReviewRecord
+      |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^story_id)
 
-      is_nil(summary) or summary == "" ->
-        {:error, :review_required}
+    query =
+      if reported_done_at do
+        where(query, [r], r.completed_at > ^reported_done_at)
+      else
+        query
+      end
 
-      true ->
-        {:ok, :review_evidence_present}
+    case AdminRepo.one(query) do
+      nil ->
+        {:error, :review_not_conducted}
+
+      _record ->
+        {:ok, :review_record_present}
     end
   end
 

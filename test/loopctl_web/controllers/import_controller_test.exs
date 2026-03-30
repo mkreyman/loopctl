@@ -340,6 +340,24 @@ defmodule LoopctlWeb.ImportControllerTest do
       assert json_response(conn, 403)
     end
 
+    test "orchestrator role can import", %{conn: conn} do
+      tenant = fixture(:tenant)
+      orch_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: orch_agent.id})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import", valid_import_payload())
+
+      body = json_response(conn, 201)
+      assert body["import"]["epics_created"] >= 1
+    end
+
     # --- Issue 10: initial_status support ---
 
     test "imports story with initial_verified_status=verified sets both statuses", %{conn: conn} do

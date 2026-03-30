@@ -150,6 +150,34 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  def call(conn, {:error, :review_not_conducted}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        message:
+          "No review record found for this story. " <>
+            "Run the review pipeline and call POST /stories/:id/review-complete " <>
+            "before attempting to verify. " <>
+            "The review must be completed AFTER the story was reported done."
+      }
+    })
+  end
+
+  def call(conn, {:error, :story_not_reported_done}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        message:
+          "Story must be in reported_done status before a review record can be created. " <>
+            "The agent must call POST /stories/:id/report first."
+      }
+    })
+  end
+
   def call(conn, {:error, :rate_limited}) do
     retry_after = conn |> get_resp_header("retry-after") |> List.first() || "60"
 
