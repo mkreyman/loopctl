@@ -31,7 +31,7 @@ defmodule LoopctlWeb.Plugs.ResolveApiKey do
           conn
           |> put_status(:forbidden)
           |> Phoenix.Controller.json(%{
-            error: %{status: 403, message: "Tenant is #{tenant.status}"}
+            error: %{status: 403, message: "Access denied"}
           })
           |> halt()
         else

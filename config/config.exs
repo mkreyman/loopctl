@@ -67,15 +67,10 @@ config :loopctl, Oban,
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
+# The actual cipher is set in config/runtime.exs (prod) or config/test.exs (test).
+# Default is empty — prod will raise at startup if CLOAK_KEY is not set.
 config :loopctl, Loopctl.Vault,
-  ciphers: [
-    default: {
-      Cloak.Ciphers.AES.GCM,
-      tag: "AES.GCM.V1",
-      key: Base.decode64!("tv9k+u3uqigJly2BdAZTVhtkB5uRBNObattywOn5KCE="),
-      iv_length: 12
-    }
-  ],
+  ciphers: [],
   retired_ciphers: [
     # Add previous keys here during key rotation, e.g.:
     # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}

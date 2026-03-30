@@ -82,6 +82,9 @@ defmodule LoopctlWeb.TenantController do
       {:error, :conflict} ->
         {:error, :conflict}
 
+      {:error, :idempotency_key_too_long} ->
+        {:error, :unprocessable_entity, "idempotency_key must be 128 characters or fewer"}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end

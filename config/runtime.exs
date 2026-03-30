@@ -23,8 +23,16 @@ end
 config :loopctl, LoopctlWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
-# Cloak Vault — key from environment in all environments where CLOAK_KEY is set
-if cloak_key = System.get_env("CLOAK_KEY") do
+# Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
+# In production, CLOAK_KEY is required — startup fails if it is missing.
+if config_env() == :prod do
+  cloak_key =
+    System.get_env("CLOAK_KEY") ||
+      raise """
+      environment variable CLOAK_KEY is missing.
+      Generate one with: :crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()
+      """
+
   config :loopctl, Loopctl.Vault,
     ciphers: [
       default: {
@@ -32,6 +40,16 @@ if cloak_key = System.get_env("CLOAK_KEY") do
         tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12
       }
     ]
+else
+  if cloak_key = System.get_env("CLOAK_KEY") do
+    config :loopctl, Loopctl.Vault,
+      ciphers: [
+        default: {
+          Cloak.Ciphers.AES.GCM,
+          tag: "AES.GCM.V1", key: Base.decode64!(cloak_key), iv_length: 12
+        }
+      ]
+  end
 end
 
 if config_env() == :prod do

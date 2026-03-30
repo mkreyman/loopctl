@@ -217,11 +217,12 @@ defmodule Loopctl.ImportExport do
        ) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    caller_role = Keyword.get(opts, :caller_role)
 
     multi =
       Multi.new()
       |> insert_epics(tenant_id, project_id, epics_data)
-      |> insert_stories(tenant_id, project_id, epics_data)
+      |> insert_stories(tenant_id, project_id, epics_data, caller_role)
       |> resolve_and_validate_story_deps(tenant_id, story_deps_data, epics_data)
       |> resolve_and_validate_epic_deps(tenant_id, epic_deps_data, epics_data)
       |> audit_import(tenant_id, project_id, actor_id, actor_label)
@@ -285,13 +286,22 @@ defmodule Loopctl.ImportExport do
     end
   end
 
-  defp insert_stories(multi, tenant_id, project_id, epics_data) do
+  defp insert_stories(multi, tenant_id, project_id, epics_data, caller_role) do
     story_steps = flatten_story_steps(epics_data)
 
     Enum.reduce(story_steps, multi, fn {epic_index, story_index, story_data}, multi ->
       Multi.run(multi, {:story, epic_index, story_index}, fn _repo, changes ->
         epic = Map.fetch!(changes, {:epic, epic_index})
-        do_insert_story(tenant_id, project_id, epic.id, story_data, epic_index, story_index)
+
+        do_insert_story(
+          tenant_id,
+          project_id,
+          epic.id,
+          story_data,
+          epic_index,
+          story_index,
+          caller_role
+        )
       end)
     end)
   end
@@ -305,7 +315,15 @@ defmodule Loopctl.ImportExport do
     end)
   end
 
-  defp do_insert_story(tenant_id, project_id, epic_id, story_data, epic_index, story_index) do
+  defp do_insert_story(
+         tenant_id,
+         project_id,
+         epic_id,
+         story_data,
+         epic_index,
+         story_index,
+         caller_role
+       ) do
     attrs = %{
       number: story_data["number"],
       title: story_data["title"],
@@ -320,16 +338,20 @@ defmodule Loopctl.ImportExport do
     |> AdminRepo.insert()
     |> case do
       {:ok, story} ->
-        apply_initial_status(story, story_data)
+        apply_initial_status(story, story_data, caller_role)
 
       {:error, cs} ->
         {:error, format_changeset_path_error(cs, "epics[#{epic_index}].stories[#{story_index}]")}
     end
   end
 
-  defp apply_initial_status(story, story_data) do
-    initial_verified = story_data["initial_verified_status"]
+  # Only superadmin callers may set initial_verified_status. For all other roles,
+  # the initial_verified_status field is silently ignored to prevent RBAC bypass.
+  defp apply_initial_status(story, story_data, caller_role) do
     initial_agent = story_data["initial_agent_status"]
+
+    initial_verified =
+      if caller_role == :superadmin, do: story_data["initial_verified_status"], else: nil
 
     cond do
       initial_verified == "verified" ->
@@ -742,10 +764,29 @@ defmodule Loopctl.ImportExport do
   # Private: Validation
   # ===================================================================
 
+  @max_epics 500
+  @max_stories 5_000
+
   defp validate_payload_structure(epics_data) when is_list(epics_data) do
-    case validate_epics_list(epics_data) do
-      :ok -> :ok
-      {:error, msg} -> {:error, :validation, msg}
+    total_stories =
+      Enum.sum(
+        Enum.map(epics_data, fn epic ->
+          epic |> Map.get("stories", []) |> length()
+        end)
+      )
+
+    cond do
+      length(epics_data) > @max_epics ->
+        {:error, :validation, "payload exceeds maximum of #{@max_epics} epics"}
+
+      total_stories > @max_stories ->
+        {:error, :validation, "payload exceeds maximum of #{@max_stories} total stories"}
+
+      true ->
+        case validate_epics_list(epics_data) do
+          :ok -> :ok
+          {:error, msg} -> {:error, :validation, msg}
+        end
     end
   end
 

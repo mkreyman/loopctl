@@ -77,6 +77,7 @@ defmodule LoopctlWeb.Plugs.Impersonate do
       |> assign(:current_api_key, impersonated_api_key)
       |> assign(:impersonating, true)
       |> assign(:superadmin_api_key, api_key)
+      |> assign(:original_api_key_id, api_key.id)
       |> assign(:impersonated_tenant_id, tenant.id)
       |> assign(:effective_role, effective_role)
     else

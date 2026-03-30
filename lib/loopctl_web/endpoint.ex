@@ -41,8 +41,9 @@ defmodule LoopctlWeb.Endpoint do
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
   plug Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
+    parsers: [:urlencoded, :json],
     pass: ["*/*"],
+    length: 2_000_000,
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride

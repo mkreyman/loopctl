@@ -50,19 +50,26 @@ defmodule Loopctl.Auth do
   @spec register_tenant(map()) ::
           {:ok, %{tenant: Tenant.t(), raw_key: String.t(), api_key: ApiKey.t()}}
           | {:error, :conflict}
+          | {:error, :idempotency_key_too_long}
           | {:error, Ecto.Changeset.t()}
+  @max_idempotency_key_length 128
+
   def register_tenant(attrs) do
     idempotency_key = Map.get(attrs, "idempotency_key") || Map.get(attrs, :idempotency_key)
+    register_tenant_with_key(attrs, idempotency_key)
+  end
 
-    if idempotency_key do
-      case check_idempotency(idempotency_key) do
-        {:ok, cached} -> {:ok, cached}
-        :miss -> do_register_tenant(attrs, idempotency_key)
-      end
-    else
-      do_register_tenant(attrs, nil)
+  defp register_tenant_with_key(attrs, nil), do: do_register_tenant(attrs, nil)
+
+  defp register_tenant_with_key(attrs, key)
+       when is_binary(key) and byte_size(key) <= @max_idempotency_key_length do
+    case check_idempotency(key) do
+      {:ok, cached} -> {:ok, cached}
+      :miss -> do_register_tenant(attrs, key)
     end
   end
+
+  defp register_tenant_with_key(_attrs, _key), do: {:error, :idempotency_key_too_long}
 
   defp do_register_tenant(attrs, idempotency_key) do
     raw_key = generate_raw_key()
@@ -160,7 +167,7 @@ defmodule Loopctl.Auth do
         :miss
 
       %IdempotencyCache{response_data: data} ->
-        {:ok, :erlang.binary_to_term(data)}
+        {:ok, :erlang.binary_to_term(data, [:safe])}
     end
   end
 
@@ -227,15 +234,21 @@ defmodule Loopctl.Auth do
         preload: [:tenant]
 
     case AdminRepo.one(query) do
-      nil ->
-        {:error, :unauthorized}
+      nil -> {:error, :unauthorized}
+      api_key -> verify_and_touch(api_key, key_hash)
+    end
+  end
 
-      api_key ->
-        # Update last_used_at (best-effort, don't fail verification on touch error)
-        case update_last_used(api_key) do
-          {:ok, updated} -> {:ok, updated}
-          _error -> {:ok, api_key}
-        end
+  defp verify_and_touch(api_key, key_hash) do
+    # Constant-time comparison to prevent timing-based side channels.
+    # Both sides are SHA-256 hex strings of equal length.
+    if Plug.Crypto.secure_compare(api_key.key_hash, key_hash) do
+      case update_last_used(api_key) do
+        {:ok, updated} -> {:ok, updated}
+        _error -> {:ok, api_key}
+      end
+    else
+      {:error, :unauthorized}
     end
   end
 

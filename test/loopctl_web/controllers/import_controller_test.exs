@@ -360,10 +360,12 @@ defmodule LoopctlWeb.ImportControllerTest do
 
     # --- Issue 10: initial_status support ---
 
-    test "imports story with initial_verified_status=verified sets both statuses", %{conn: conn} do
+    test "imports story with initial_verified_status=verified sets both statuses (superadmin only)",
+         %{conn: conn} do
       tenant = fixture(:tenant)
-      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       project = fixture(:project, %{tenant_id: tenant.id})
+      # initial_verified_status is only honored for superadmin callers (RBAC enforcement)
+      {raw_key, _api_key} = fixture(:api_key, %{role: :superadmin})
 
       payload = %{
         "epics" => [
@@ -388,6 +390,7 @@ defmodule LoopctlWeb.ImportControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
+        |> put_req_header("x-impersonate-tenant", tenant.id)
         |> post(~p"/api/v1/projects/#{project.id}/import", payload)
 
       assert json_response(conn, 201)

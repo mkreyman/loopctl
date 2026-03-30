@@ -48,7 +48,9 @@ defmodule Loopctl.Progress.EpicCompletionTest do
         |> Loopctl.AdminRepo.update!()
 
       assert {:ok, _} =
-               Progress.record_review(tenant.id, last_story.id, %{"review_type" => "enhanced"})
+               Progress.record_review(tenant.id, last_story.id, %{"review_type" => "enhanced"},
+                 reviewer_agent_id: orch_agent.id
+               )
 
       assert {:ok, _updated} =
                Progress.verify_story(
@@ -81,7 +83,9 @@ defmodule Loopctl.Progress.EpicCompletionTest do
         |> Loopctl.AdminRepo.update!()
 
       assert {:ok, _} =
-               Progress.record_review(tenant.id, first_story.id, %{"review_type" => "enhanced"})
+               Progress.record_review(tenant.id, first_story.id, %{"review_type" => "enhanced"},
+                 reviewer_agent_id: orch_agent.id
+               )
 
       assert {:ok, _updated} =
                Progress.verify_story(
@@ -116,7 +120,9 @@ defmodule Loopctl.Progress.EpicCompletionTest do
       |> Loopctl.AdminRepo.update!()
 
       assert {:ok, _} =
-               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"})
+               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"},
+                 reviewer_agent_id: orch_agent.id
+               )
 
       # First verification triggers completion
       assert {:ok, _} =
@@ -155,7 +161,9 @@ defmodule Loopctl.Progress.EpicCompletionTest do
 
       # Create another review record for the second verify
       assert {:ok, _} =
-               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"})
+               Progress.record_review(tenant.id, story.id, %{"review_type" => "enhanced"},
+                 reviewer_agent_id: orch_agent.id
+               )
 
       assert {:ok, _} =
                Progress.verify_story(

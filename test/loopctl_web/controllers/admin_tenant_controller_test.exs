@@ -255,7 +255,7 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
         |> get(~p"/api/v1/tenants/me")
 
       body = json_response(conn2, 403)
-      assert body["error"]["message"] =~ "suspended"
+      assert body["error"]["message"] == "Access denied"
     end
 
     test "creates audit log entry for suspension", %{conn: conn} do

@@ -60,6 +60,8 @@ defmodule Loopctl.WorkBreakdown.Epic do
     epic
     |> cast(attrs, [:number, :title, :description, :phase, :position, :metadata])
     |> validate_required([:number, :title])
+    |> validate_length(:title, max: 500)
+    |> validate_length(:description, max: 50_000)
     |> validate_number(:number, greater_than: 0)
     |> validate_number(:position, greater_than_or_equal_to: 0)
     |> validate_metadata()
@@ -77,6 +79,8 @@ defmodule Loopctl.WorkBreakdown.Epic do
   def update_changeset(epic, attrs) do
     epic
     |> cast(attrs, [:title, :description, :phase, :position, :metadata])
+    |> validate_length(:title, max: 500)
+    |> validate_length(:description, max: 50_000)
     |> validate_number(:position, greater_than_or_equal_to: 0)
     |> validate_metadata()
   end

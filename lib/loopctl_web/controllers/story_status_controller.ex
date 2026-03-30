@@ -272,6 +272,15 @@ defmodule LoopctlWeb.StoryStatusController do
   def report(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
+
+    if is_nil(api_key.agent_id) do
+      {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
+    else
+      do_report(conn, tenant_id, api_key, story_id, params)
+    end
+  end
+
+  defp do_report(conn, tenant_id, api_key, story_id, params) do
     opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
     artifact_params = extract_artifact_params(params)
 

@@ -262,15 +262,20 @@ defmodule LoopctlWeb.ApiKeyController do
     end
   end
 
+  @max_grace_period_hours 168
+
   defp parse_grace_period(nil), do: 24
-  defp parse_grace_period(hours) when is_integer(hours), do: hours
+
+  defp parse_grace_period(hours) when is_integer(hours),
+    do: min(hours, @max_grace_period_hours)
 
   defp parse_grace_period(hours) when is_binary(hours) do
     case Integer.parse(hours) do
-      {n, _} -> n
+      {n, _} -> min(n, @max_grace_period_hours)
       :error -> 24
     end
   end
 
-  defp parse_grace_period(hours) when is_float(hours), do: round(hours)
+  defp parse_grace_period(hours) when is_float(hours),
+    do: min(round(hours), @max_grace_period_hours)
 end

@@ -7,9 +7,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-loopctl_prod}
       DB_APP_USER: ${DB_APP_USER:-loopctl_app}
-      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-loopctl_app_pass}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD in .env}
       DB_ADMIN_USER: ${DB_ADMIN_USER:-loopctl_admin}
-      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:-loopctl_admin_pass}
+      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:?Set DB_ADMIN_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
@@ -26,8 +26,8 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: "ecto://${DB_APP_USER:-loopctl_app}:${DB_APP_PASSWORD:-loopctl_app_pass}@db/${POSTGRES_DB:-loopctl_prod}"
-      ADMIN_DATABASE_URL: "ecto://${DB_ADMIN_USER:-loopctl_admin}:${DB_ADMIN_PASSWORD:-loopctl_admin_pass}@db/${POSTGRES_DB:-loopctl_prod}"
+      DATABASE_URL: "ecto://${DB_APP_USER:-loopctl_app}:${DB_APP_PASSWORD:?Set DB_APP_PASSWORD in .env}@db/${POSTGRES_DB:-loopctl_prod}"
+      ADMIN_DATABASE_URL: "ecto://${DB_ADMIN_USER:-loopctl_admin}:${DB_ADMIN_PASSWORD:?Set DB_ADMIN_PASSWORD in .env}@db/${POSTGRES_DB:-loopctl_prod}"
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?Set SECRET_KEY_BASE in .env}
       CLOAK_KEY: ${CLOAK_KEY:?Set CLOAK_KEY in .env}
       PHX_HOST: ${PHX_HOST:-localhost}

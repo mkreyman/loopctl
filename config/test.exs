@@ -53,6 +53,9 @@ config :loopctl, Loopctl.Vault,
     }
   ]
 
+# Enable dev routes (openapi, swaggerui) in test so route compilation succeeds
+config :loopctl, dev_routes: true
+
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true

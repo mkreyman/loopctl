@@ -5,9 +5,9 @@
 set -euo pipefail
 
 DB_APP_USER="${DB_APP_USER:-loopctl_app}"
-DB_APP_PASSWORD="${DB_APP_PASSWORD:-loopctl_app_pass}"
+DB_APP_PASSWORD="${DB_APP_PASSWORD:?Set DB_APP_PASSWORD environment variable}"
 DB_ADMIN_USER="${DB_ADMIN_USER:-loopctl_admin}"
-DB_ADMIN_PASSWORD="${DB_ADMIN_PASSWORD:-loopctl_admin_pass}"
+DB_ADMIN_PASSWORD="${DB_ADMIN_PASSWORD:?Set DB_ADMIN_PASSWORD environment variable}"
 DB_NAME="${POSTGRES_DB:-loopctl_prod}"
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$DB_NAME" <<-EOSQL

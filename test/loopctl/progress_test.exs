@@ -698,11 +698,14 @@ defmodule Loopctl.ProgressTest do
       %{tenant: tenant, story: story} =
         setup_story(%{agent_status: :reported_done, reported_done_at: DateTime.utc_now()})
 
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
       assert {:error, %Ecto.Changeset{}} =
                Progress.record_review(
                  tenant.id,
                  story.id,
-                 %{"review_type" => ""}
+                 %{"review_type" => ""},
+                 reviewer_agent_id: reviewer.id
                )
     end
 

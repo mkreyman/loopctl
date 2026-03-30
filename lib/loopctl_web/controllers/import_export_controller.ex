@@ -61,8 +61,9 @@ defmodule LoopctlWeb.ImportExportController do
   is present, performs a merge import that updates existing entities.
   """
   def import_project(conn, %{"id" => project_id} = params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-    audit_opts = AuditContext.from_conn(conn)
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn) |> Keyword.put(:caller_role, api_key.role)
     merge? = params["merge"] == "true"
 
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do

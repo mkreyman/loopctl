@@ -89,6 +89,29 @@ defmodule Loopctl.Webhooks.Webhook do
     |> foreign_key_constraint(:project_id)
   end
 
+  @private_ip_prefixes ~w(
+    10.
+    172.16.
+    172.17.
+    172.18.
+    172.19.
+    172.20.
+    172.21.
+    172.22.
+    172.23.
+    172.24.
+    172.25.
+    172.26.
+    172.27.
+    172.28.
+    172.29.
+    172.30.
+    172.31.
+    192.168.
+    169.254.
+    127.
+  )
+
   defp validate_url(changeset) do
     validate_change(changeset, :url, fn :url, url ->
       uri = URI.parse(url)
@@ -100,10 +123,20 @@ defmodule Loopctl.Webhooks.Webhook do
         is_nil(uri.host) or uri.host == "" ->
           [url: "must have a valid host"]
 
+        private_host?(uri.host) ->
+          [url: "must not target a private or loopback address"]
+
         true ->
           []
       end
     end)
+  end
+
+  defp private_host?(host) do
+    normalized = String.downcase(host)
+
+    normalized in ["localhost", "::1"] or
+      Enum.any?(@private_ip_prefixes, &String.starts_with?(normalized, &1))
   end
 
   defp validate_events(changeset) do

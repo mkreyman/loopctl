@@ -85,6 +85,16 @@ defmodule LoopctlWeb.ReviewRecordController do
     tenant_id = api_key.tenant_id
     reviewer_agent_id = api_key.agent_id
 
+    # Agent and orchestrator keys must have an agent_id set for chain-of-custody enforcement.
+    # User-role keys may legitimately record reviews without an agent identity.
+    if api_key.role in [:agent, :orchestrator] and is_nil(reviewer_agent_id) do
+      {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
+    else
+      do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params)
+    end
+  end
+
+  defp do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params) do
     opts =
       AuditContext.from_conn(conn)
       |> Keyword.put(:reviewer_agent_id, reviewer_agent_id)

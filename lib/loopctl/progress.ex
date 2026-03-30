@@ -960,8 +960,10 @@ defmodule Loopctl.Progress do
 
   # --- Verification/Rejection helpers ---
 
+  defp validate_not_self_verify(story, nil), do: {:ok, story}
+
   defp validate_not_self_verify(story, orchestrator_agent_id) do
-    if story.assigned_agent_id == orchestrator_agent_id do
+    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id do
       {:error, :self_verify_blocked}
     else
       {:ok, story}
@@ -1370,6 +1372,9 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # nil agent_id: no agent identity — cannot determine self-report, allow through
+  defp validate_not_self_report(_story, nil), do: :ok
+
   defp validate_not_self_report(story, agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
       {:error, :self_report_blocked}
@@ -1377,6 +1382,9 @@ defmodule Loopctl.Progress do
       :ok
     end
   end
+
+  # nil reviewer_agent_id: no agent identity to compare — cannot self-review
+  defp validate_not_self_review(_story, nil), do: :ok
 
   defp validate_not_self_review(story, reviewer_agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do

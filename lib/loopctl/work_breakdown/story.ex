@@ -96,6 +96,8 @@ defmodule Loopctl.WorkBreakdown.Story do
       :metadata
     ])
     |> validate_required([:number, :title])
+    |> validate_length(:title, max: 500)
+    |> validate_length(:description, max: 50_000)
     |> validate_number_format()
     |> compute_sort_key()
     |> validate_metadata()
@@ -121,6 +123,8 @@ defmodule Loopctl.WorkBreakdown.Story do
       :estimated_hours,
       :metadata
     ])
+    |> validate_length(:title, max: 500)
+    |> validate_length(:description, max: 50_000)
     |> validate_metadata()
   end
 

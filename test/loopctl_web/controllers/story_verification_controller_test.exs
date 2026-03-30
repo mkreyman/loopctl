@@ -59,10 +59,12 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     # Optionally create a review_record (default: true for most tests)
     if Map.get(opts, :with_review_record, true) do
       {:ok, _} =
-        Progress.record_review(tenant.id, story.id, %{
-          "review_type" => "enhanced",
-          "summary" => "Review passed"
-        })
+        Progress.record_review(
+          tenant.id,
+          story.id,
+          %{"review_type" => "enhanced", "summary" => "Review passed"},
+          reviewer_agent_id: orch_agent.id
+        )
     end
 
     ctx

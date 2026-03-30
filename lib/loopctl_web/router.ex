@@ -28,17 +28,24 @@ defmodule LoopctlWeb.Router do
     get "/health", HealthController, :check
   end
 
-  # OpenAPI spec — unauthenticated
-  scope "/api/v1" do
-    pipe_through [:api]
+  # OpenAPI spec and Swagger UI — only available in dev/test
+  if Application.compile_env(:loopctl, :dev_routes, false) do
+    scope "/api/v1" do
+      pipe_through [:api]
 
-    get "/openapi", OpenApiSpex.Plug.RenderSpec, []
-    get "/", LoopctlWeb.WelcomeController, :index
-  end
+      get "/openapi", OpenApiSpex.Plug.RenderSpec, []
+      get "/", LoopctlWeb.WelcomeController, :index
+    end
 
-  # Swagger UI — unauthenticated
-  scope "/swaggerui" do
-    get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
+    scope "/swaggerui" do
+      get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
+    end
+  else
+    scope "/api/v1" do
+      pipe_through [:api]
+
+      get "/", LoopctlWeb.WelcomeController, :index
+    end
   end
 
   # Public API endpoints (no auth required)
