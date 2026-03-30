@@ -91,8 +91,22 @@ function toContent(result) {
 
 // --- Project Tools ---
 
+async function getTenant() {
+  const result = await apiCall("GET", "/api/v1/tenants/me");
+  return toContent(result);
+}
+
 async function listProjects() {
   const result = await apiCall("GET", "/api/v1/projects");
+  return toContent(result);
+}
+
+async function createProject({ name, slug, repo_url, description, tech_stack }) {
+  const body = { name, slug };
+  if (repo_url) body.repo_url = repo_url;
+  if (description) body.description = description;
+  if (tech_stack) body.tech_stack = tech_stack;
+  const result = await apiCall("POST", "/api/v1/projects", body, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
 
@@ -277,12 +291,36 @@ async function listRoutes() {
 const TOOLS = [
   // Project Tools
   {
+    name: "get_tenant",
+    description: "Get current tenant info. Use to verify connectivity.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: "list_projects",
     description: "List all projects in the current tenant.",
     inputSchema: {
       type: "object",
       properties: {},
       required: [],
+    },
+  },
+  {
+    name: "create_project",
+    description: "Create a new project in the current tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Project name." },
+        slug: { type: "string", description: "URL-safe slug." },
+        repo_url: { type: "string", description: "GitHub repo URL." },
+        description: { type: "string", description: "Project description." },
+        tech_stack: { type: "string", description: "Tech stack summary." },
+      },
+      required: ["name", "slug"],
     },
   },
   {
@@ -665,8 +703,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     // Project Tools
+    case "get_tenant":
+      return await getTenant();
+
     case "list_projects":
       return await listProjects();
+
+    case "create_project":
+      return await createProject(args);
 
     case "get_progress":
       return await getProgress(args);

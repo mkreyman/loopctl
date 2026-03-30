@@ -772,11 +772,13 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (17)
+### Available Tools (19)
 
 | Tool | Description | API Key Used |
 |------|------------|-------------|
+| `get_tenant` | Verify connectivity (current tenant info) | orchestrator |
 | `list_projects` | List all projects | orchestrator |
+| `create_project` | Create a new project | orchestrator |
 | `get_progress` | Project progress summary | orchestrator |
 | `import_stories` | Import epics and stories | orchestrator |
 | `list_stories` | List stories with filters | orchestrator |
@@ -794,7 +796,7 @@ Keys must be in the `env` block — the MCP server process does not inherit the 
 | `verify_all_in_epic` | Verify all in an epic | orchestrator |
 | `list_routes` | Discover all API endpoints | orchestrator |
 
-Agents call tools directly: `mcp__loopctl__list_projects()`, `mcp__loopctl__verify_story({story_id: "uuid", summary: "..."})`. No curl or bash needed.
+Agents call tools directly: `mcp__loopctl__get_tenant()`, `mcp__loopctl__list_projects()`, `mcp__loopctl__create_project({name: "MyApp", slug: "myapp"})`. No curl or bash needed.
 
 ## Project Structure
 
