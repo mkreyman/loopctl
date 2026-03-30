@@ -213,10 +213,11 @@ async function reportStory({ story_id, artifact_type, artifact_path }) {
   return toContent(result);
 }
 
-async function reviewComplete({ story_id, review_type, findings_count, fixes_count, summary }) {
+async function reviewComplete({ story_id, review_type, findings_count, fixes_count, disproved_count, summary }) {
   const body = { review_type };
   if (findings_count != null) body.findings_count = findings_count;
   if (fixes_count != null) body.fixes_count = fixes_count;
+  if (disproved_count != null) body.disproved_count = disproved_count;
   if (summary) body.summary = summary;
 
   const result = await apiCall(
@@ -550,7 +551,11 @@ const TOOLS = [
         },
         fixes_count: {
           type: "number",
-          description: "Optional: number of fixes applied.",
+          description: "Number of fixes applied. fixes_count + disproved_count must equal findings_count.",
+        },
+        disproved_count: {
+          type: "number",
+          description: "Number of findings disproved as false positives. fixes_count + disproved_count must equal findings_count.",
         },
         summary: {
           type: "string",
