@@ -31,6 +31,7 @@ defmodule Loopctl.Artifacts.ReviewRecord do
              :review_type,
              :findings_count,
              :fixes_count,
+             :disproved_count,
              :summary,
              :completed_at,
              :inserted_at,
@@ -45,6 +46,7 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     field :review_type, :string
     field :findings_count, :integer, default: 0
     field :fixes_count, :integer, default: 0
+    field :disproved_count, :integer, default: 0
     field :summary, :string
     field :completed_at, :utc_datetime_usec
 
@@ -60,10 +62,44 @@ defmodule Loopctl.Artifacts.ReviewRecord do
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(record \\ %__MODULE__{}, attrs) do
     record
-    |> cast(attrs, [:review_type, :findings_count, :fixes_count, :summary, :completed_at])
+    |> cast(attrs, [
+      :review_type,
+      :findings_count,
+      :fixes_count,
+      :disproved_count,
+      :summary,
+      :completed_at
+    ])
     |> validate_required([:review_type, :completed_at])
     |> validate_length(:review_type, min: 1)
     |> validate_number(:findings_count, greater_than_or_equal_to: 0)
     |> validate_number(:fixes_count, greater_than_or_equal_to: 0)
+    |> validate_number(:disproved_count, greater_than_or_equal_to: 0)
+    |> validate_findings_math()
+  end
+
+  defp validate_findings_math(changeset) do
+    findings = Ecto.Changeset.get_field(changeset, :findings_count) || 0
+    fixes = Ecto.Changeset.get_field(changeset, :fixes_count) || 0
+    disproved = Ecto.Changeset.get_field(changeset, :disproved_count) || 0
+
+    accounted = fixes + disproved
+
+    cond do
+      findings == 0 ->
+        changeset
+
+      accounted < findings ->
+        Ecto.Changeset.add_error(
+          changeset,
+          :fixes_count,
+          "#{findings} findings confirmed but only #{fixes} fixed and #{disproved} disproved. " <>
+            "All findings must be either fixed or explicitly disproved. " <>
+            "#{findings - accounted} findings unaccounted for."
+        )
+
+      true ->
+        changeset
+    end
   end
 end

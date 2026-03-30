@@ -583,6 +583,8 @@ defmodule Loopctl.Progress do
         review_type: Map.get(params, "review_type") || Map.get(params, :review_type),
         findings_count: Map.get(params, "findings_count") || Map.get(params, :findings_count, 0),
         fixes_count: Map.get(params, "fixes_count") || Map.get(params, :fixes_count, 0),
+        disproved_count:
+          Map.get(params, "disproved_count") || Map.get(params, :disproved_count, 0),
         summary: Map.get(params, "summary") || Map.get(params, :summary),
         completed_at: completed_at
       }

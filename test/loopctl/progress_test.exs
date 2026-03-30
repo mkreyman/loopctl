@@ -756,6 +756,71 @@ defmodule Loopctl.ProgressTest do
 
       assert review_record.reviewer_agent_id == reviewer.id
     end
+
+    test "rejects review-complete when fixes + disproved < findings" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # 6 findings, only 4 fixed, 0 disproved = 2 unaccounted
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{
+                   "review_type" => "enhanced",
+                   "findings_count" => 6,
+                   "fixes_count" => 4,
+                   "disproved_count" => 0
+                 },
+                 reviewer_agent_id: reviewer.id
+               )
+
+      {msg, _} = changeset.errors[:fixes_count]
+      assert msg =~ "6 findings confirmed but only 4 fixed and 0 disproved"
+    end
+
+    test "accepts review-complete when fixes + disproved == findings" do
+      %{tenant: tenant, agent: agent} = ctx = setup_story()
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      story =
+        ctx.story
+        |> Ecto.Changeset.change(%{
+          agent_status: :reported_done,
+          assigned_agent_id: agent.id,
+          assigned_at: DateTime.utc_now(),
+          reported_done_at: DateTime.utc_now()
+        })
+        |> Loopctl.AdminRepo.update!()
+
+      # 6 findings, 4 fixed, 2 disproved = all accounted
+      assert {:ok, review_record} =
+               Progress.record_review(
+                 tenant.id,
+                 story.id,
+                 %{
+                   "review_type" => "enhanced",
+                   "findings_count" => 6,
+                   "fixes_count" => 4,
+                   "disproved_count" => 2
+                 },
+                 reviewer_agent_id: reviewer.id
+               )
+
+      assert review_record.findings_count == 6
+      assert review_record.fixes_count == 4
+      assert review_record.disproved_count == 2
+    end
   end
 
   describe "request_review/3" do

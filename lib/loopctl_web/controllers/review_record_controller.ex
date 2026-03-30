@@ -52,6 +52,12 @@ defmodule LoopctlWeb.ReviewRecordController do
              description: "Number of findings that were fixed",
              example: 5
            },
+           disproved_count: %OpenApiSpex.Schema{
+             type: :integer,
+             description:
+               "Number of findings disproved as false positives. fixes_count + disproved_count must equal findings_count.",
+             example: 0
+           },
            summary: %OpenApiSpex.Schema{
              type: :string,
              description: "Summary of review findings and outcome",
