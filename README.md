@@ -742,6 +742,60 @@ mix escript.build
 
 Default output is JSON (agent-first). Use `--format human` for tables.
 
+## MCP Server (for Claude Code Agents)
+
+loopctl ships with an MCP (Model Context Protocol) server that gives Claude Code agents direct typed tool access — no curl, no bash, no JSON parsing.
+
+### Setup
+
+```bash
+# Install dependencies
+cd mcp-server && npm install
+
+# Add to ~/.claude/mcp.json (global) or <project>/.mcp.json (per-project)
+{
+  "mcpServers": {
+    "loopctl": {
+      "command": "node",
+      "args": ["/path/to/loopctl/mcp-server/index.js"],
+      "env": {
+        "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+        "LOOPCTL_SERVER": "https://192.168.86.55:8443",
+        "LOOPCTL_ORCH_KEY": "lc_your_orchestrator_key",
+        "LOOPCTL_AGENT_KEY": "lc_your_agent_key",
+        "LOOPCTL_REVIEWER_KEY": "lc_your_reviewer_key"
+      }
+    }
+  }
+}
+```
+
+Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
+
+### Available Tools (17)
+
+| Tool | Description | API Key Used |
+|------|------------|-------------|
+| `list_projects` | List all projects | orchestrator |
+| `get_progress` | Project progress summary | orchestrator |
+| `import_stories` | Import epics and stories | orchestrator |
+| `list_stories` | List stories with filters | orchestrator |
+| `list_ready_stories` | Stories ready for work | orchestrator |
+| `get_story` | Get story details | orchestrator |
+| `contract_story` | Contract a story | agent |
+| `claim_story` | Claim a story | agent |
+| `start_story` | Start implementation | agent |
+| `request_review` | Signal readiness for review | agent |
+| `report_story` | Mark implementation done (reviewer only) | orchestrator |
+| `review_complete` | Record review completion | orchestrator |
+| `verify_story` | Verify a story | orchestrator |
+| `reject_story` | Reject a story | orchestrator |
+| `bulk_mark_complete` | Bulk mark stories complete | orchestrator |
+| `verify_all_in_epic` | Verify all in an epic | orchestrator |
+| `list_routes` | Discover all API endpoints | orchestrator |
+
+Agents call tools directly: `mcp__loopctl__list_projects()`, `mcp__loopctl__verify_story({story_id: "uuid", summary: "..."})`. No curl or bash needed.
+
 ## Project Structure
 
 ```
