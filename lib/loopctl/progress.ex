@@ -1013,6 +1013,10 @@ defmodule Loopctl.Progress do
         query
       end
 
+    # Use limit 1 + order by to handle multiple review records for same story
+    # (e.g., both orchestrator and forked review agent called review_complete)
+    query = query |> order_by([r], desc: r.completed_at) |> limit(1)
+
     case AdminRepo.one(query) do
       nil ->
         {:error, :review_not_conducted}
