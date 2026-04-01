@@ -26,8 +26,15 @@ defmodule Loopctl.Release do
   def migrate do
     load_app()
 
+    # Run migrations from priv/repo/migrations/ using AdminRepo.
+    # AdminRepo has BYPASSRLS privilege needed for RLS policy DDL.
+    # We specify the path explicitly because AdminRepo defaults to
+    # priv/admin_repo/migrations/ but all migrations live in priv/repo/.
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(Loopctl.AdminRepo, &Ecto.Migrator.run(&1, :up, all: true))
+      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
+        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+        Ecto.Migrator.run(repo, path, :up, all: true)
+      end)
   end
 
   @doc """
@@ -37,7 +44,10 @@ defmodule Loopctl.Release do
     load_app()
 
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(Loopctl.AdminRepo, &Ecto.Migrator.run(&1, :down, to: version))
+      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
+        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+        Ecto.Migrator.run(repo, path, :down, to: version)
+      end)
   end
 
   defp load_app do
