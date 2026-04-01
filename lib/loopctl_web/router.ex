@@ -36,6 +36,8 @@ defmodule LoopctlWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
+    get "/terms", PageController, :terms
+    get "/privacy", PageController, :privacy
   end
 
   # Health check — unauthenticated JSON, outside /api/v1
@@ -45,24 +47,20 @@ defmodule LoopctlWeb.Router do
     get "/health", HealthController, :check
   end
 
-  # OpenAPI spec and Swagger UI — only available in dev/test
+  # OpenAPI spec, Swagger UI, and API discovery — available in all environments
+  scope "/api/v1" do
+    pipe_through [:api]
+
+    get "/openapi", OpenApiSpex.Plug.RenderSpec, []
+    get "/", LoopctlWeb.WelcomeController, :index
+  end
+
+  scope "/swaggerui" do
+    get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
+  end
+
+  # Dev-only routes (dashboard, etc.)
   if Application.compile_env(:loopctl, :dev_routes, false) do
-    scope "/api/v1" do
-      pipe_through [:api]
-
-      get "/openapi", OpenApiSpex.Plug.RenderSpec, []
-      get "/", LoopctlWeb.WelcomeController, :index
-    end
-
-    scope "/swaggerui" do
-      get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
-    end
-  else
-    scope "/api/v1" do
-      pipe_through [:api]
-
-      get "/", LoopctlWeb.WelcomeController, :index
-    end
   end
 
   # Public API endpoints (no auth required)

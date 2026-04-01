@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <title>Terms of Service -- loopctl</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
+  </head>
+  <body class="bg-slate-950 text-slate-300 font-body antialiased">
+    <nav class="sticky top-0 z-50 bg-slate-950/90 backdrop-blur-sm border-b border-slate-800">
+      <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+        <a href="/" class="font-mono text-sm font-semibold text-slate-100">loopctl</a>
+        <a
+          href="/"
+          class="text-sm text-slate-400 hover:text-slate-200 transition-colors"
+        >
+          Back to home
+        </a>
+      </div>
+    </nav>
+
+    <main class="max-w-3xl mx-auto px-6 py-16">
+      <h1 class="font-display text-3xl font-bold text-slate-100">Terms of Service</h1>
+      <p class="mt-2 text-sm text-slate-500">Last updated: April 1, 2026</p>
+
+      <div class="mt-8 space-y-6 text-sm text-slate-400 leading-relaxed">
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">1. Acceptance of Terms</h2>
+          <p>
+            By accessing or using loopctl ("the Service"), you agree to be bound by these Terms of Service.
+            If you do not agree, do not use the Service.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">2. Description of Service</h2>
+          <p>
+            loopctl is an agent-native project state store that provides API primitives for
+            chain-of-custody verification, review enforcement, and progress tracking in AI
+            development workflows. The Service is provided as a multi-tenant SaaS platform.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">
+            3. API Keys and Authentication
+          </h2>
+          <p>
+            You are responsible for maintaining the confidentiality of your API keys.
+            You agree not to share API keys with unauthorized parties. All activity under
+            your API key is your responsibility.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">4. Acceptable Use</h2>
+          <p>You agree not to:</p>
+          <ul class="list-disc list-inside mt-2 space-y-1">
+            <li>Use the Service to violate any applicable law or regulation</li>
+            <li>Attempt to gain unauthorized access to the Service or its infrastructure</li>
+            <li>
+              Interfere with or disrupt the Service or the servers or networks connected to it
+            </li>
+            <li>Use the Service to store or transmit malicious code</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">5. Data and Privacy</h2>
+          <p>
+            Your data is isolated via PostgreSQL Row-Level Security. We do not access your
+            tenant data except as necessary to provide the Service or as required by law.
+            See our
+            <a href="/privacy" class="text-accent-400 hover:text-accent-300">Privacy Policy</a>
+            for details.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">6. Service Availability</h2>
+          <p>
+            We strive to maintain high availability but do not guarantee uninterrupted access.
+            The Service is provided "as is" without warranties of any kind, express or implied.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">7. Limitation of Liability</h2>
+          <p>
+            To the maximum extent permitted by law, loopctl and its operators shall not be
+            liable for any indirect, incidental, special, consequential, or punitive damages
+            resulting from your use of or inability to use the Service.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">8. Changes to Terms</h2>
+          <p>
+            We reserve the right to modify these terms at any time. Continued use of the
+            Service after changes constitutes acceptance of the modified terms.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">9. Contact</h2>
+          <p>
+            For questions about these terms, open an issue on the <a
+              href="https://github.com/mkreyman/loopctl"
+              class="text-accent-400 hover:text-accent-300"
+              target="_blank"
+              rel="noopener noreferrer"
+            >GitHub repository</a>.
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <footer class="border-t border-slate-800 bg-slate-950">
+      <div class="max-w-5xl mx-auto px-6 py-8">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <p>&copy; {DateTime.utc_now().year} loopctl. All rights reserved.</p>
+          <div class="flex items-center gap-6">
+            <a href="/terms" class="text-slate-300">Terms</a>
+            <a href="/privacy" class="hover:text-slate-300 transition-colors">Privacy</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

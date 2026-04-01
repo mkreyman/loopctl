@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <title>Privacy Policy -- loopctl</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
+  </head>
+  <body class="bg-slate-950 text-slate-300 font-body antialiased">
+    <nav class="sticky top-0 z-50 bg-slate-950/90 backdrop-blur-sm border-b border-slate-800">
+      <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+        <a href="/" class="font-mono text-sm font-semibold text-slate-100">loopctl</a>
+        <a
+          href="/"
+          class="text-sm text-slate-400 hover:text-slate-200 transition-colors"
+        >
+          Back to home
+        </a>
+      </div>
+    </nav>
+
+    <main class="max-w-3xl mx-auto px-6 py-16">
+      <h1 class="font-display text-3xl font-bold text-slate-100">Privacy Policy</h1>
+      <p class="mt-2 text-sm text-slate-500">Last updated: April 1, 2026</p>
+
+      <div class="mt-8 space-y-6 text-sm text-slate-400 leading-relaxed">
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">1. What We Collect</h2>
+          <p>loopctl collects and stores the following data:</p>
+          <ul class="list-disc list-inside mt-2 space-y-1">
+            <li>
+              <strong class="text-slate-300">API key metadata:</strong>
+              hashed API keys, role, last-seen timestamp
+            </li>
+            <li>
+              <strong class="text-slate-300">Project data:</strong>
+              projects, epics, stories, acceptance criteria, and status transitions you create via the API
+            </li>
+            <li>
+              <strong class="text-slate-300">Audit log:</strong>
+              immutable record of all state transitions including actor identity and timestamps
+            </li>
+            <li>
+              <strong class="text-slate-300">Agent metadata:</strong>
+              agent IDs, labels, and registration timestamps
+            </li>
+            <li>
+              <strong class="text-slate-300">Request metadata:</strong>
+              IP addresses (for rate limiting), request IDs
+            </li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">2. How We Use Your Data</h2>
+          <p>Your data is used exclusively to:</p>
+          <ul class="list-disc list-inside mt-2 space-y-1">
+            <li>Provide the loopctl service (state tracking, verification, audit)</li>
+            <li>Enforce rate limits and prevent abuse</li>
+            <li>Deliver webhook events you have subscribed to</li>
+          </ul>
+          <p class="mt-2">
+            We do not sell, share, or use your data for advertising or analytics.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">3. Data Isolation</h2>
+          <p>
+            All tenant data is isolated using PostgreSQL Row-Level Security (RLS).
+            Your data is invisible to other tenants at the database level. API keys
+            are encrypted at rest using AES-256-GCM via Cloak.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">4. Data Retention</h2>
+          <p>
+            Project data and audit logs are retained for the lifetime of your tenant account.
+            Webhook delivery records are automatically cleaned up after 30 days.
+            Idempotency keys expire after 1 hour.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">5. Data Location</h2>
+          <p>
+            loopctl is hosted on Fly.io infrastructure in the Los Angeles (LAX) region.
+            Database backups are managed by Fly.io's managed PostgreSQL service.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">6. Your Rights</h2>
+          <p>You may:</p>
+          <ul class="list-disc list-inside mt-2 space-y-1">
+            <li>Access all your data via the REST API at any time</li>
+            <li>Export your data using the import/export API endpoints</li>
+            <li>Request deletion of your tenant and all associated data</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">7. Third-Party Services</h2>
+          <p>loopctl uses the following third-party services:</p>
+          <ul class="list-disc list-inside mt-2 space-y-1">
+            <li>
+              <strong class="text-slate-300">Fly.io:</strong> hosting and managed PostgreSQL
+            </li>
+            <li><strong class="text-slate-300">GitHub:</strong> source code hosting and CI/CD</li>
+            <li>
+              <strong class="text-slate-300">Google Fonts:</strong>
+              Geist typeface delivery (on the landing page only)
+            </li>
+          </ul>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">8. Changes to This Policy</h2>
+          <p>
+            We may update this policy from time to time. Changes will be reflected
+            in the "Last updated" date above.
+          </p>
+        </section>
+
+        <section>
+          <h2 class="text-lg font-semibold text-slate-200 mb-3">9. Contact</h2>
+          <p>
+            For privacy-related questions, open an issue on the <a
+              href="https://github.com/mkreyman/loopctl"
+              class="text-accent-400 hover:text-accent-300"
+              target="_blank"
+              rel="noopener noreferrer"
+            >GitHub repository</a>.
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <footer class="border-t border-slate-800 bg-slate-950">
+      <div class="max-w-5xl mx-auto px-6 py-8">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <p>&copy; {DateTime.utc_now().year} loopctl. All rights reserved.</p>
+          <div class="flex items-center gap-6">
+            <a href="/terms" class="hover:text-slate-300 transition-colors">Terms</a>
+            <a href="/privacy" class="text-slate-300">Privacy</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
