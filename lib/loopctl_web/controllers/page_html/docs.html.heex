@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <meta
+      name="description"
+      content="Configuration guide for loopctl orchestration: orchestrator commands, agent definitions, review pipelines, enforcement hooks, and project setup."
+    />
+    <title>Docs -- loopctl</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/app.js"}>
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-300 font-body antialiased">
+    <%!-- Skip to content --%>
+    <a
+      href="#main-content"
+      class="sr-only focus:not-sr-only focus:absolute focus:z-[100] focus:top-2 focus:left-2 focus:bg-accent-700 focus:text-white focus:px-4 focus:py-2 focus:rounded-md"
+    >
+      Skip to content
+    </a>
+
+    <%!-- Navigation --%>
+    <nav
+      class="sticky top-0 z-50 bg-slate-950/90 backdrop-blur-sm border-b border-slate-800"
+      aria-label="Main navigation"
+    >
+      <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+        <a
+          href="/"
+          class="font-mono text-sm font-semibold text-slate-100 focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+        >
+          loopctl
+        </a>
+
+        <%!-- Desktop nav --%>
+        <div class="hidden md:flex items-center gap-6 text-sm text-slate-400">
+          <a
+            href="/#features"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            Features
+          </a>
+          <a
+            href="/docs"
+            class="text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            Docs
+          </a>
+          <a
+            href="/swaggerui"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            API
+          </a>
+          <a
+            href="https://github.com/mkreyman/loopctl"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            GitHub
+          </a>
+          <a
+            href="/#get-started"
+            class="bg-accent-700 hover:bg-accent-600 text-white px-3 py-1.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950"
+          >
+            Get Started
+          </a>
+        </div>
+
+        <%!-- Mobile hamburger --%>
+        <button
+          type="button"
+          class="md:hidden p-2 min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-400 hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          aria-label="Open menu"
+          phx-click={JS.toggle(to: "#mobile-menu")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke-width="1.5"
+            stroke="currentColor"
+            class="size-6"
+            aria-hidden="true"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <%!-- Mobile menu --%>
+      <div id="mobile-menu" class="hidden md:hidden border-t border-slate-800 bg-slate-950">
+        <div class="px-6 py-4 space-y-3">
+          <a
+            href="/#features"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            Features
+          </a>
+          <a
+            href="/docs"
+            class="block text-sm text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            Docs
+          </a>
+          <a
+            href="/swaggerui"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            API
+          </a>
+          <a
+            href="https://github.com/mkreyman/loopctl"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            GitHub
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="max-w-5xl mx-auto px-6 py-12 lg:flex lg:gap-12">
+      <%!-- Sticky TOC sidebar (desktop only) --%>
+      <aside class="hidden lg:block lg:w-52 lg:flex-shrink-0 lg:sticky lg:top-20 lg:self-start">
+        <nav aria-label="Table of contents" class="text-sm">
+          <p class="font-mono text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">
+            On this page
+          </p>
+          <ul class="space-y-2.5 border-l border-slate-800 pl-4">
+            <li>
+              <a href="#overview" class="text-slate-400 hover:text-slate-200 transition-colors">
+                Overview
+              </a>
+            </li>
+            <li>
+              <a
+                href="#orchestrator"
+                class="text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                Orchestrator
+              </a>
+            </li>
+            <li>
+              <a href="#agents" class="text-slate-400 hover:text-slate-200 transition-colors">
+                Agents
+              </a>
+            </li>
+            <li>
+              <a href="#review" class="text-slate-400 hover:text-slate-200 transition-colors">
+                Review Pipeline
+              </a>
+            </li>
+            <li>
+              <a href="#hooks" class="text-slate-400 hover:text-slate-200 transition-colors">
+                Hooks
+              </a>
+            </li>
+            <li>
+              <a href="#setup" class="text-slate-400 hover:text-slate-200 transition-colors">
+                Project Setup
+              </a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <%!-- Main content --%>
+      <main id="main-content" class="min-w-0 flex-1">
+        <h1 class="font-display text-3xl font-bold text-slate-50 tracking-tight sm:text-4xl">
+          Configuration Guide
+        </h1>
+        <p class="mt-4 text-base text-slate-400 max-w-2xl">
+          Everything you need to set up the loopctl orchestration workflow. Copy
+          the configs below, adapt the placeholders for your project, and run.
+        </p>
+
+        <%!-- ============================================================ --%>
+        <%!-- 1. Overview --%>
+        <%!-- ============================================================ --%>
+        <section id="overview" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Overview</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              loopctl provides a structural trust layer for AI agent orchestration.
+              These configs define the workflow that enforces chain-of-custody
+              verification across every story in your project.
+            </p>
+            <p>The workflow follows a strict sequence:</p>
+            <ol class="list-decimal list-inside space-y-1.5 pl-1 text-slate-400">
+              <li>
+                <span class="text-slate-300">Orchestrator</span>
+                finds the next ready story and dispatches an implementation agent
+              </li>
+              <li>
+                <span class="text-slate-300">Implementation agent</span>
+                builds the feature, runs tests, and requests review
+              </li>
+              <li>
+                <span class="text-slate-300">Review agents</span>
+                (different identity) audit the work and record findings
+              </li>
+              <li>
+                <span class="text-slate-300">Orchestrator</span>
+                verifies the review, confirms the story, and moves to the next
+              </li>
+            </ol>
+            <p>
+              The key constraint: <span class="text-slate-200 font-medium">the implementer, reviewer, and verifier
+              must all be different identities</span>. This is enforced at the API
+              layer through three identity gates that return
+              <span class="font-mono text-slate-300">409 Conflict</span>
+              if any agent attempts to mark their own work as done.
+            </p>
+          </div>
+        </section>
+
+        <%!-- ============================================================ --%>
+        <%!-- 2. Orchestrator Command --%>
+        <%!-- ============================================================ --%>
+        <section id="orchestrator" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Orchestrator Command</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              The orchestrator is a long-running AI agent session that coordinates
+              the entire build loop. It never writes code directly -- it dispatches
+              sub-agents for implementation and review.
+            </p>
+            <p>Key concepts:</p>
+            <ul class="list-disc list-inside space-y-1.5 pl-1">
+              <li>
+                <span class="text-slate-300">MCP tool preference</span>
+                -- use typed MCP tools instead of raw curl for all loopctl interactions
+              </li>
+              <li>
+                <span class="text-slate-300">Session sentinel</span>
+                -- a file that hooks use to detect orchestrator mode
+              </li>
+              <li>
+                <span class="text-slate-300">Pre-flight context</span>
+                -- read CLAUDE.md, load architecture docs, check environment
+              </li>
+              <li>
+                <span class="text-slate-300">Autonomous loop</span>
+                -- find ready story, build context, dispatch, review, verify, repeat
+              </li>
+              <li>
+                <span class="text-slate-300">Chain of custody</span>
+                -- implementer, reviewer, and verifier are different identities
+              </li>
+            </ul>
+          </div>
+
+          <div class="mt-6 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                orchestrator-command.sh
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_orchestrator_code_block(assigns)}
+            </div>
+          </div>
+        </section>
+
+        <%!-- ============================================================ --%>
+        <%!-- 3. Agent Definitions --%>
+        <%!-- ============================================================ --%>
+        <section id="agents" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Agent Definitions</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              Agents are defined as YAML frontmatter files. Each agent has a name,
+              description, permission mode, model, and a set of skills that inform
+              its behavior.
+            </p>
+          </div>
+
+          <%!-- Implementation agent --%>
+          <h3 class="mt-8 text-sm font-semibold text-slate-200">Implementation Agent</h3>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                .claude/agents/implementation-agent.md
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_impl_agent_code_block(assigns)}
+            </div>
+          </div>
+          <div class="mt-3 text-sm text-slate-400 space-y-1.5">
+            <p>
+              <span class="font-mono text-slate-300">name</span>
+              -- unique identifier used in dispatch commands
+            </p>
+            <p>
+              <span class="font-mono text-slate-300">description</span>
+              -- human-readable purpose shown in agent listings
+            </p>
+            <p>
+              <span class="font-mono text-slate-300">permissionMode</span>
+              -- <span class="font-mono">bypassPermissions</span>
+              lets the agent run without interactive confirmation
+            </p>
+            <p>
+              <span class="font-mono text-slate-300">model</span>
+              -- which LLM to use (<span class="font-mono">sonnet</span> for implementation,
+              <span class="font-mono">opus</span>
+              for review)
+            </p>
+            <p>
+              <span class="font-mono text-slate-300">effort</span>
+              -- <span class="font-mono">high</span>
+              enables extended thinking and deeper analysis
+            </p>
+            <p>
+              <span class="font-mono text-slate-300">skills</span>
+              -- preloaded knowledge files that guide the agent's patterns
+            </p>
+          </div>
+
+          <%!-- Security adversary agent --%>
+          <h3 class="mt-10 text-sm font-semibold text-slate-200">Security Adversary Agent</h3>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                .claude/agents/security-adversary.md
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_security_agent_code_block(assigns)}
+            </div>
+          </div>
+          <div class="mt-3 text-sm text-slate-400">
+            <p>
+              This agent is <span class="text-slate-200">read-only</span>
+              -- it reviews code but never modifies it. It checks 10 defensive areas:
+            </p>
+            <ol class="mt-3 list-decimal list-inside space-y-1 pl-1 text-slate-400">
+              <li>Auth / Permissions / Trust Boundaries</li>
+              <li>Data Loss / Corruption</li>
+              <li>Idempotency / Retry Safety</li>
+              <li>Race Conditions / Concurrency</li>
+              <li>Degraded Dependencies</li>
+              <li>Schema Drift / Migration Safety</li>
+              <li>Observability Gaps</li>
+              <li>Resource Exhaustion / DoS</li>
+              <li>Tenant Leakage / Multi-tenancy</li>
+              <li>Information Disclosure</li>
+            </ol>
+          </div>
+        </section>
+
+        <%!-- ============================================================ --%>
+        <%!-- 4. Enhanced Review Pipeline --%>
+        <%!-- ============================================================ --%>
+        <section id="review" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">
+            Enhanced Review Pipeline
+          </h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              Every story passes through a two-stage review pipeline before
+              the orchestrator can verify it. The review runs in an isolated
+              forked context -- the orchestrator cannot interfere.
+            </p>
+          </div>
+
+          <div class="mt-6 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                review-pipeline-flow
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_review_pipeline_code_block(assigns)}
+            </div>
+          </div>
+
+          <div class="mt-6 space-y-4 text-sm text-slate-400">
+            <h3 class="text-sm font-semibold text-slate-200">
+              VCA: Verify, Classify, Aggregate
+            </h3>
+            <p>
+              After each review stage, a VCA pass deduplicates findings,
+              assigns confidence scores, and classifies each finding using
+              <span class="font-mono text-slate-300">git blame</span>
+              to determine whether the finding is in code touched by this
+              story or in pre-existing code.
+            </p>
+
+            <h3 class="text-sm font-semibold text-slate-200">Findings Math</h3>
+            <p>
+              The review completion endpoint enforces strict arithmetic:
+              every finding must be accounted for as either fixed or disproved.
+              No deferrals, no tech debt placeholders.
+            </p>
+          </div>
+
+          <div class="mt-4 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                findings-math
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_review_math_code_block(assigns)}
+            </div>
+          </div>
+
+          <div class="mt-6 space-y-4 text-sm text-slate-400">
+            <h3 class="text-sm font-semibold text-slate-200">Chain of Custody</h3>
+            <p>
+              The review agent calls
+              <span class="font-mono text-slate-300">/stories/:id/report</span>
+              to mark implementation done and
+              <span class="font-mono text-slate-300">/stories/:id/review-complete</span>
+              to record findings. Both endpoints enforce that the caller is not
+              the same agent that implemented the story. The orchestrator then
+              calls <span class="font-mono text-slate-300">/stories/:id/verify</span>
+              as a third identity.
+            </p>
+            <h3 class="text-sm font-semibold text-slate-200">Anti-Deferral Policy</h3>
+            <p>
+              Fix everything unless it is physically impossible. No "will address
+              in a future PR" -- every finding gets resolved before the story
+              can be verified.
+            </p>
+          </div>
+        </section>
+
+        <%!-- ============================================================ --%>
+        <%!-- 5. Enforcement Hooks --%>
+        <%!-- ============================================================ --%>
+        <section id="hooks" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Enforcement Hooks</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              Hooks provide client-side enforcement that complements the
+              server-side identity gates. They run automatically in the
+              agent's environment.
+            </p>
+          </div>
+
+          <%!-- Orchestrator guardrail hook --%>
+          <h3 class="mt-8 text-sm font-semibold text-slate-200">
+            Orchestrator Guardrail (PreToolUse)
+          </h3>
+          <p class="mt-2 text-sm text-slate-400">
+            Blocks file-writing tools when the orchestrator sentinel is active.
+            The orchestrator should coordinate -- agents write code.
+          </p>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                .claude/hooks/PreToolUse/orchestrator-guardrail.sh
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_guardrail_hook_code_block(assigns)}
+            </div>
+          </div>
+
+          <%!-- Keep-working hook --%>
+          <h3 class="mt-10 text-sm font-semibold text-slate-200">Keep-Working (Stop Hook)</h3>
+          <p class="mt-2 text-sm text-slate-400">
+            Prevents the orchestrator from stopping when stories remain in the
+            backlog. Queries the loopctl API for pending work and forces
+            continuation if any stories are still ready.
+          </p>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                .claude/hooks/Stop/keep-working.sh
+              </div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_keepworking_hook_code_block(assigns)}
+            </div>
+          </div>
+        </section>
+
+        <%!-- ============================================================ --%>
+        <%!-- 6. Project Setup --%>
+        <%!-- ============================================================ --%>
+        <section id="setup" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Project Setup</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              Two files configure loopctl integration in your project:
+              <span class="font-mono text-slate-300">CLAUDE.md</span>
+              (the project instruction file) and
+              <span class="font-mono text-slate-300">.mcp.json</span>
+              (the MCP server config).
+            </p>
+          </div>
+
+          <%!-- CLAUDE.md template --%>
+          <h3 class="mt-8 text-sm font-semibold text-slate-200">CLAUDE.md Template</h3>
+          <p class="mt-2 text-sm text-slate-400">
+            Add the loopctl loading instruction and chain-of-custody rules to
+            your project's CLAUDE.md. This ensures every agent session starts
+            with the current orchestration state.
+          </p>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">CLAUDE.md</div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_claude_md_code_block(assigns)}
+            </div>
+          </div>
+
+          <%!-- .mcp.json --%>
+          <h3 class="mt-10 text-sm font-semibold text-slate-200">MCP Server Config</h3>
+          <p class="mt-2 text-sm text-slate-400">
+            Add the loopctl MCP server to your project's <span class="font-mono text-slate-300">.mcp.json</span>. Use separate
+            keys for orchestrator and agent roles.
+          </p>
+          <div class="mt-3 bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+            <div class="flex bg-slate-900 border-b border-slate-700">
+              <div class="px-4 py-2 text-xs font-mono text-slate-400">.mcp.json</div>
+            </div>
+            <div class="p-4 sm:p-6 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed">
+              {docs_mcp_json_code_block(assigns)}
+            </div>
+          </div>
+
+          <%!-- Closing guidance --%>
+          <div class="mt-8 p-4 border border-slate-700 rounded-md bg-slate-900/50">
+            <p class="text-sm text-slate-400">
+              <span class="text-slate-200 font-medium">Next steps:</span>
+              Register a tenant, create API keys, import your stories, and
+              start the orchestrator. See the
+              <a
+                href="/#get-started"
+                class="text-accent-400 hover:text-accent-300 transition-colors"
+              >
+                Getting Started guide
+              </a>
+              on the home page for the full setup sequence.
+            </p>
+          </div>
+        </section>
+
+        <%!-- Bottom spacer --%>
+        <div class="mt-20"></div>
+      </main>
+    </div>
+
+    <%!-- Footer --%>
+    <footer class="border-t border-slate-800 bg-slate-950">
+      <div class="max-w-5xl mx-auto px-6 py-8">
+        <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <p class="text-xs text-slate-400">
+            &copy; {DateTime.utc_now().year} loopctl. Built with Elixir and Phoenix.
+          </p>
+          <div class="flex items-center gap-6 text-xs text-slate-400">
+            <a
+              href="https://github.com/mkreyman/loopctl"
+              class="hover:text-slate-300 transition-colors"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              GitHub
+            </a>
+            <a href="/health" class="hover:text-slate-300 transition-colors">API Status</a>
+            <a href="/terms" class="hover:text-slate-300 transition-colors">Terms</a>
+            <a href="/privacy" class="hover:text-slate-300 transition-colors">Privacy</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

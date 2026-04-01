@@ -36,6 +36,7 @@ defmodule LoopctlWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
+    get "/docs", PageController, :docs
     get "/terms", PageController, :terms
     get "/privacy", PageController, :privacy
   end
