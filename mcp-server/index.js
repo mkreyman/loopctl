@@ -1,9 +1,8 @@
+#!/usr/bin/env node
+
 // loopctl MCP Server
 // Wraps the loopctl REST API into typed MCP tools for Claude Code agents.
 // Runs via stdio (stdin/stdout).
-
-// Self-signed cert support — must be set before any HTTPS requests
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -17,7 +16,7 @@ import {
 // ---------------------------------------------------------------------------
 
 function getBaseUrl() {
-  return process.env.LOOPCTL_SERVER || "https://192.168.86.55:8443";
+  return process.env.LOOPCTL_SERVER || "https://loopctl.com";
 }
 
 /**

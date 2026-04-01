@@ -85,14 +85,17 @@ defmodule LoopctlWeb.PageHTML do
   """
 
   @step4_code ~S"""
-  <pre>// Add to .mcp.json
+  <pre>npm install loopctl-mcp-server
+
+  // Add to .mcp.json
   {
   "mcpServers": {
     "loopctl": {
-      "command": "node",
-      "args": ["node_modules/@loopctl/mcp-server/index.js"],
+      "command": "npx",
+      "args": ["loopctl-mcp-server"],
       "env": {
         "LOOPCTL_SERVER": "https://loopctl.com",
+        "LOOPCTL_ORCH_KEY": "lc_your_orchestrator_key",
         "LOOPCTL_AGENT_KEY": "lc_your_agent_key"
       }
     }
@@ -361,8 +364,8 @@ defmodule LoopctlWeb.PageHTML do
   <pre><code>{
   "mcpServers": {
     "loopctl": {
-      "command": "node",
-      "args": ["node_modules/@loopctl/mcp-server/index.js"],
+      "command": "npx",
+      "args": ["loopctl-mcp-server"],
       "env": {
         "LOOPCTL_SERVER": "https://loopctl.com",
         "LOOPCTL_ORCH_KEY": "lc_your_orchestrator_key",

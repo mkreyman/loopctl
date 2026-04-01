@@ -143,18 +143,18 @@ mix ecto.reset         # Drop, create, migrate
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 17 typed tools for Claude Code agents (no curl needed)
+- **MCP Server**: `mcp-server/` — 19 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
 ## MCP Server
 
-Claude Code agents should use the loopctl MCP tools instead of curl. Configure in `~/.claude/mcp.json` or `.mcp.json`:
+Claude Code agents should use the loopctl MCP tools instead of curl. Install via `npm install loopctl-mcp-server`, then configure in `~/.claude/mcp.json` or `.mcp.json`:
 
 ```json
-{"mcpServers": {"loopctl": {"command": "node", "args": ["<path>/loopctl/mcp-server/index.js"], "env": {"LOOPCTL_SERVER": "...", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
+{"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (17 total). See README for the full list.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (19 total). See `mcp-server/README.md` for the full list.
 
 ## Chain-of-Custody Enforcement
 
