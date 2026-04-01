@@ -188,10 +188,25 @@ jobs:
         run: mix dialyzer
 
   deploy:
-    name: Deploy
+    name: Deploy (beelink)
     runs-on: [self-hosted, beelink]
     needs: [lint, test, security, dialyzer]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: Deploy to beelink
         run: bash $HOME/workspace/loopctl/deploy/deploy.sh
+
+  fly-deploy:
+    name: Deploy (Fly.io)
+    runs-on: ubuntu-latest
+    needs: [lint, test, security, dialyzer]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
