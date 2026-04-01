@@ -21,8 +21,6 @@ defmodule LoopctlWeb.PageController do
     statics: LoopctlWeb.static_paths()
 
   def home(conn, _params) do
-    conn
-    |> put_resp_content_type("text/html")
-    |> render(:home, layout: false)
+    render(conn, :home, layout: false)
   end
 end

@@ -45,23 +45,4 @@ defmodule LoopctlWeb.WelcomeController do
       health: "/health"
     })
   end
-
-  operation(:redirect_to_api,
-    summary: "Root redirect",
-    description: "Redirects to the API discovery endpoint at /api/v1/.",
-    security: [],
-    responses: %{
-      302 => {"Redirect to /api/v1/", "text/html", nil}
-    }
-  )
-
-  @doc """
-  GET /
-
-  Redirects to the API discovery endpoint at /api/v1/.
-  """
-  def redirect_to_api(conn, _params) do
-    conn
-    |> redirect(to: "/api/v1/")
-  end
 end
