@@ -204,6 +204,16 @@
               <p class="mt-4 text-base text-slate-400">
                 Every primitive you need to enforce process integrity in multi-agent development workflows.
               </p>
+              <p class="mt-3 text-sm text-slate-500">
+                The model: <span class="text-slate-400">Tenants</span>
+                own <span class="text-slate-400">Projects</span>, which contain
+                <span class="text-slate-400">Epics</span>
+                and <span class="text-slate-400">Stories</span>.
+                <span class="text-slate-400">Agents</span>
+                contract, implement, and report on stories.
+                <span class="text-slate-400">Orchestrators</span>
+                verify completions.
+              </p>
             </div>
 
             <dl class="col-span-3 grid grid-cols-1 gap-x-8 gap-y-8 text-sm sm:grid-cols-2">
@@ -245,7 +255,7 @@
                   MCP Integration
                 </dt>
                 <dd class="mt-1.5 text-slate-400">
-                  17 typed tools for Claude Code agents. No curl needed -- agents interact through the MCP server.
+                  19 typed tools for AI coding agents. No curl needed — agents interact through the MCP server.
                 </dd>
               </div>
 
@@ -389,7 +399,7 @@
                 One API call to enforce trust
               </p>
               <p class="mt-4 text-base text-slate-400">
-                Every operation is an API call. Register agents, contract stories, track progress, and verify completions. The MCP server wraps these calls so Claude Code agents never need to write curl commands.
+                Every operation is an API call. Register agents, contract stories, track progress, and verify completions. The MCP server wraps these calls so AI coding agents never need to write curl commands.
               </p>
               <dl class="mt-8 max-w-xl space-y-6 text-sm">
                 <div class="relative pl-9">
@@ -459,18 +469,60 @@
             <div>
               <div class="bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
                 <div class="flex bg-slate-900 border-b border-slate-700">
-                  <div class="px-4 py-2 text-xs font-mono text-slate-100 border-r border-b border-r-slate-700 border-b-accent-700/50 bg-slate-800/50">
+                  <button
+                    type="button"
+                    id="tab-stories"
+                    class="px-4 py-2 text-xs font-mono text-slate-100 border-r border-b border-r-slate-700 border-b-accent-700/50 bg-slate-800/50"
+                    phx-click={
+                      JS.show(to: "#code-stories")
+                      |> JS.hide(to: "#code-verify")
+                      |> JS.add_class("text-slate-100 border-b-accent-700/50 bg-slate-800/50",
+                        to: "#tab-stories"
+                      )
+                      |> JS.remove_class("text-slate-400", to: "#tab-stories")
+                      |> JS.add_class("text-slate-400", to: "#tab-verify")
+                      |> JS.remove_class(
+                        "text-slate-100 border-b-accent-700/50 bg-slate-800/50",
+                        to: "#tab-verify"
+                      )
+                    }
+                  >
                     stories.sh
-                  </div>
-                  <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                  </button>
+                  <button
+                    type="button"
+                    id="tab-verify"
+                    class="px-4 py-2 text-xs font-mono text-slate-400"
+                    phx-click={
+                      JS.show(to: "#code-verify")
+                      |> JS.hide(to: "#code-stories")
+                      |> JS.add_class("text-slate-100 border-b-accent-700/50 bg-slate-800/50",
+                        to: "#tab-verify"
+                      )
+                      |> JS.remove_class("text-slate-400", to: "#tab-verify")
+                      |> JS.add_class("text-slate-400", to: "#tab-stories")
+                      |> JS.remove_class(
+                        "text-slate-100 border-b-accent-700/50 bg-slate-800/50",
+                        to: "#tab-stories"
+                      )
+                    }
+                  >
                     verify.sh
-                  </div>
+                  </button>
                 </div>
                 <div
+                  id="code-stories"
                   class="p-4 sm:p-6 font-mono text-sm text-slate-300 overflow-x-auto"
                   aria-label="curl command example"
                 >
-                  {api_code_block(assigns)}
+                  {api_stories_code_block(assigns)}
+                </div>
+                <div
+                  id="code-verify"
+                  class="p-4 sm:p-6 font-mono text-sm text-slate-300 overflow-x-auto hidden"
+                  aria-label="verification workflow example"
+                >
+                  {api_verify_code_block(assigns)}
                 </div>
               </div>
             </div>
@@ -478,33 +530,115 @@
         </div>
       </section>
 
-      <%!-- Final CTA Section --%>
+      <%!-- Getting Started Section --%>
       <section id="get-started" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
         <div class="max-w-5xl mx-auto px-6">
-          <div class="max-w-2xl">
-            <h2 class="font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
-              Start enforcing trust today
-            </h2>
-            <p class="mt-4 text-base text-slate-400">
-              Register your tenant, create a project, and start tracking stories in minutes.
-              The API is live and the MCP server is ready.
-            </p>
-            <div class="mt-8 flex flex-wrap gap-3">
-              <a
-                href="/swaggerui"
-                class="bg-accent-700 hover:bg-accent-600 text-white text-sm font-medium px-5 py-2.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
-              >
-                Explore the API
-              </a>
-              <a
-                href="https://github.com/mkreyman/loopctl"
-                class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium px-5 py-2.5 rounded-md border border-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                View on GitHub
-              </a>
+          <h2 class="text-sm font-semibold text-accent-400">Getting started</h2>
+          <p class="mt-2 font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+            Up and running in 5 minutes
+          </p>
+          <p class="mt-4 text-base text-slate-400 max-w-2xl">
+            loopctl is free during public beta. No credit card required. Rate limit: 300 requests per API key per minute.
+          </p>
+
+          <div class="mt-10 space-y-8">
+            <%!-- Step 1 --%>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
+                1
+              </div>
+              <div>
+                <h3 class="text-sm font-semibold text-slate-200">Register your tenant</h3>
+                <div class="mt-2 bg-slate-800 border border-slate-700 rounded-md p-3 font-mono text-xs text-slate-300 overflow-x-auto">
+                  {step1_code_block(assigns)}
+                </div>
+                <p class="mt-1.5 text-xs text-slate-500">
+                  Save the <span class="text-slate-400 font-mono">raw_key</span>
+                  from the response — it is your API key.
+                </p>
+              </div>
             </div>
+
+            <%!-- Step 2 --%>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
+                2
+              </div>
+              <div>
+                <h3 class="text-sm font-semibold text-slate-200">
+                  Create API keys for your agents
+                </h3>
+                <div class="mt-2 bg-slate-800 border border-slate-700 rounded-md p-3 font-mono text-xs text-slate-300 overflow-x-auto">
+                  {step2_code_block(assigns)}
+                </div>
+                <p class="mt-1.5 text-xs text-slate-500">
+                  Three roles: <span class="text-slate-400 font-mono">user</span>
+                  (admin), <span class="text-slate-400 font-mono">orchestrator</span>
+                  (verify/reject), <span class="text-slate-400 font-mono">agent</span>
+                  (implement).
+                </p>
+              </div>
+            </div>
+
+            <%!-- Step 3 --%>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
+                3
+              </div>
+              <div>
+                <h3 class="text-sm font-semibold text-slate-200">
+                  Create a project and import stories
+                </h3>
+                <div class="mt-2 bg-slate-800 border border-slate-700 rounded-md p-3 font-mono text-xs text-slate-300 overflow-x-auto">
+                  {step3_code_block(assigns)}
+                </div>
+                <p class="mt-1.5 text-xs text-slate-500">
+                  Then import stories via
+                  <span class="text-slate-400 font-mono">POST /projects/:id/import</span>
+                  with your epic/story JSON.
+                </p>
+              </div>
+            </div>
+
+            <%!-- Step 4 --%>
+            <div class="flex gap-4">
+              <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
+                4
+              </div>
+              <div>
+                <h3 class="text-sm font-semibold text-slate-200">
+                  Connect the MCP server (optional)
+                </h3>
+                <div class="mt-2 bg-slate-800 border border-slate-700 rounded-md p-3 font-mono text-xs text-slate-300 overflow-x-auto">
+                  {step4_code_block(assigns)}
+                </div>
+                <p class="mt-1.5 text-xs text-slate-500">
+                  Available on <a
+                    href="https://github.com/mkreyman/loopctl/tree/master/mcp-server"
+                    class="text-accent-400 hover:text-accent-300"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >GitHub</a>. npm package coming soon.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-12 flex flex-wrap gap-3">
+            <a
+              href="/swaggerui"
+              class="bg-accent-700 hover:bg-accent-600 text-white text-sm font-medium px-5 py-2.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+            >
+              Explore the API
+            </a>
+            <a
+              href="https://github.com/mkreyman/loopctl"
+              class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium px-5 py-2.5 rounded-md border border-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              View on GitHub
+            </a>
           </div>
         </div>
       </section>
@@ -515,7 +649,7 @@
       <div class="max-w-5xl mx-auto px-6 py-8">
         <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <p class="text-xs text-slate-400">
-            &copy; {DateTime.utc_now().year} loopctl. All rights reserved.
+            &copy; {DateTime.utc_now().year} loopctl. Built with Elixir and Phoenix.
           </p>
           <div class="flex items-center gap-6 text-xs text-slate-400">
             <a
@@ -526,7 +660,7 @@
             >
               GitHub
             </a>
-            <a href="/health" class="hover:text-slate-300 transition-colors">Health</a>
+            <a href="/health" class="hover:text-slate-300 transition-colors">API Status</a>
             <a href="/terms" class="hover:text-slate-300 transition-colors">Terms</a>
             <a href="/privacy" class="hover:text-slate-300 transition-colors">Privacy</a>
           </div>
