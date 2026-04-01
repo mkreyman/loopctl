@@ -1,9 +1,21 @@
 # loopctl
 
 Agent-native project state store for AI development loops.
-Stack: Elixir 1.18 / Phoenix 1.8 (API-only), PostgreSQL with RLS, Oban, Req, Cloak.
+Stack: Elixir 1.18 / Phoenix 1.8, PostgreSQL with RLS, Oban, Req, Cloak.
+Web: Phoenix LiveView (landing page + future admin), Tailwind CSS v4.
 
 **Also read [AGENTS.md](AGENTS.md)** — contains Phoenix 1.8 framework guidelines, Elixir conventions, Ecto patterns.
+
+## Design System Reference
+
+Refer to `docs/design-system.md` for full specifications. Key points:
+
+- **Dark mode only** — no light mode for v1
+- **Color palette**: cool slate grays (`slate-*`), deep indigo-blue accent (`accent-*`)
+- **Typography**: Geist (headings + body), Geist Mono (IDs, agent names, code, status badges)
+- **Cards**: `rounded-md` (6px), no shadows on inline cards, border-only structure
+- **Terminal aesthetic**: monospace for data, cool blue-gray tones, precision over decoration
+- **Anti-patterns**: no rounded-xl, no gradients, no glassmorphism, no warm grays, no centered heroes
 
 ---
 

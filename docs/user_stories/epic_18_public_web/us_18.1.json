@@ -1,0 +1,173 @@
+{
+  "id": "US-18.1",
+  "title": "Landing page and public web presence for loopctl.com",
+  "epic": {
+    "id": "epic_18",
+    "name": "Public Web Presence"
+  },
+  "priority": "high",
+  "phase": "public_launch",
+  "story": {
+    "as_a": "potential user visiting loopctl.com",
+    "i_want_to": "see a clear landing page that explains what loopctl is, how it works, and how to get started",
+    "so_that": "I can evaluate whether loopctl fits my AI development workflow and begin onboarding"
+  },
+  "rationale": "loopctl is currently a headless API with no public-facing web presence. To offer it as a service, the root domain needs a landing page that communicates the value proposition, links to documentation and API reference, and provides a path to sign up. Without this, visitors to loopctl.com hit a JSON redirect — not a viable first impression for a product.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-18.1.1",
+      "description": "Phoenix LiveView is enabled in the endpoint (socket uncommented, :browser pipeline added to router) alongside the existing :api pipeline. API routes under /api/v1/ are unaffected.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.2",
+      "description": "GET / serves an HTML landing page (not a JSON redirect) with: hero section explaining loopctl in one sentence, problem/solution section, key features list (chain-of-custody, MCP integration, structural trust, multi-tenant), quick-start code snippet, and a call-to-action.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.3",
+      "description": "Landing page includes a navigation bar with links to: Features (anchor), Docs (link to /docs or external), API Reference (link to /swaggerui or /api/v1/openapi), GitHub repo, and a Sign Up / Get Started CTA.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.4",
+      "description": "Landing page includes a footer with: copyright, GitHub link, API status link (/health), and legal placeholder links (terms, privacy).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.5",
+      "description": "A root layout (root.html.heex) and app layout exist with proper HTML skeleton: meta tags, viewport, font loading, and Tailwind CSS v4 via the asset pipeline.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.6",
+      "description": "Tailwind CSS v4 is configured with a design system appropriate for a developer-tools product: dark mode first, monospace for code/IDs, clean sans-serif for body text, high contrast for readability.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.7",
+      "description": "The landing page is server-rendered (LiveView or dead view) — no client-side JavaScript framework required. Page loads fast with no layout shift.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.8",
+      "description": "The existing /health endpoint and /api/v1/* routes continue to function identically. No regression in API behavior.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.9",
+      "description": "The page is responsive: readable on mobile (320px), tablet (768px), and desktop (1280px+). CTA buttons have minimum 44px touch targets on mobile.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.10",
+      "description": "All text meets WCAG AA contrast ratios (4.5:1 for body text, 3:1 for large text) against the chosen background colors.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-18.1.1",
+      "name": "GET / returns HTML landing page with 200 status",
+      "type": "integration",
+      "preconditions": [
+        "conn = build_conn()"
+      ],
+      "steps": [
+        "GET / with Accept: text/html"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Content-Type is text/html",
+        "Body contains 'loopctl' in the title or hero",
+        "Body contains navigation links",
+        "Body contains a CTA button"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.1.2",
+      "name": "API routes still return JSON and are unaffected",
+      "type": "integration",
+      "preconditions": [
+        "conn = build_conn()"
+      ],
+      "steps": [
+        "GET /api/v1/ with Accept: application/json",
+        "GET /health"
+      ],
+      "expected_results": [
+        "/api/v1/ returns JSON with routes list",
+        "/health returns JSON with status: ok"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.1.3",
+      "name": "Landing page contains required sections",
+      "type": "integration",
+      "preconditions": [
+        "conn = build_conn()"
+      ],
+      "steps": [
+        "GET / and parse the HTML response"
+      ],
+      "expected_results": [
+        "Page contains a hero section with product description",
+        "Page contains a features section",
+        "Page contains navigation with docs/API/GitHub links",
+        "Page contains a footer with copyright"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.1.4",
+      "name": "Static assets (CSS, JS) are served correctly",
+      "type": "integration",
+      "preconditions": [
+        "conn = build_conn()"
+      ],
+      "steps": [
+        "GET / and extract CSS/JS asset paths from the HTML",
+        "GET each asset path"
+      ],
+      "expected_results": [
+        "All referenced CSS files return 200",
+        "All referenced JS files return 200 (if any)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.1.5",
+      "name": "Landing page renders on mobile viewport without horizontal scroll",
+      "type": "integration",
+      "preconditions": [
+        "conn = build_conn()"
+      ],
+      "steps": [
+        "GET / and verify responsive meta tag is present"
+      ],
+      "expected_results": [
+        "HTML contains viewport meta tag with width=device-width",
+        "No fixed-width elements wider than 320px in the markup"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Enable LiveView socket in lib/loopctl_web/endpoint.ex (uncomment the socket /live line)",
+    "Add :browser pipeline to router.ex with :accepts html, :fetch_session, :fetch_live_flash, :put_root_layout, :protect_from_forgery, :put_secure_browser_headers",
+    "Root layout: lib/loopctl_web/components/layouts/root.html.heex — HTML skeleton with meta, fonts, CSS",
+    "App layout: lib/loopctl_web/components/layouts.ex — marketing layout function component",
+    "Landing LiveView: lib/loopctl_web/live/landing_live.ex — server-rendered, no real-time features needed",
+    "Add Tailwind CSS v4 to the asset pipeline: tailwindcss CLI or esbuild plugin in config/config.exs",
+    "Design system: dark mode first, developer-tools aesthetic — think Stripe docs or Linear, not generic SaaS",
+    "Fonts: consider Inter or Geist for body, JetBrains Mono or similar for code snippets",
+    "The existing WelcomeController.redirect_to_api/2 should be replaced by the new landing route",
+    "Keep /swaggerui route available in dev/test — consider making it available in prod behind /docs/api",
+    "No authentication required for the landing page — it is fully public",
+    "Add tailwind and esbuild to mix.exs deps if not already present"
+  ],
+  "dependencies": [],
+  "estimated_hours": 8
+}
