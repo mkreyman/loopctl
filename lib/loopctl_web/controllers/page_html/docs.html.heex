@@ -349,6 +349,14 @@
               -- preloaded knowledge files that guide the agent's patterns
             </p>
           </div>
+          <details class="mt-4 bg-slate-800/50 border border-slate-700 rounded-md">
+            <summary class="px-4 py-2 text-xs font-mono text-slate-400 cursor-pointer hover:text-slate-300 select-none">
+              View full agent prompt
+            </summary>
+            <div class="p-4 border-t border-slate-700 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed whitespace-pre-wrap">
+              {docs_impl_agent_body_block(assigns)}
+            </div>
+          </details>
 
           <%!-- Review team header --%>
           <h3 class="mt-12 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
@@ -380,6 +388,14 @@
               for deeper reasoning about requirements.
             </p>
           </div>
+          <details class="mt-4 bg-slate-800/50 border border-slate-700 rounded-md">
+            <summary class="px-4 py-2 text-xs font-mono text-slate-400 cursor-pointer hover:text-slate-300 select-none">
+              View full agent prompt
+            </summary>
+            <div class="p-4 border-t border-slate-700 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed whitespace-pre-wrap">
+              {docs_ba_agent_body_block(assigns)}
+            </div>
+          </details>
 
           <%!-- Systems architect agent --%>
           <h3 class="mt-10 text-sm font-semibold text-slate-200">Systems Architect Agent</h3>
@@ -401,6 +417,14 @@
               for deep architectural analysis.
             </p>
           </div>
+          <details class="mt-4 bg-slate-800/50 border border-slate-700 rounded-md">
+            <summary class="px-4 py-2 text-xs font-mono text-slate-400 cursor-pointer hover:text-slate-300 select-none">
+              View full agent prompt
+            </summary>
+            <div class="p-4 border-t border-slate-700 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed whitespace-pre-wrap">
+              {docs_architect_agent_body_block(assigns)}
+            </div>
+          </details>
 
           <%!-- Adversarial round header --%>
           <h3 class="mt-12 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
@@ -442,6 +466,14 @@
               <li>Information Disclosure</li>
             </ol>
           </div>
+          <details class="mt-4 bg-slate-800/50 border border-slate-700 rounded-md">
+            <summary class="px-4 py-2 text-xs font-mono text-slate-400 cursor-pointer hover:text-slate-300 select-none">
+              View full agent prompt
+            </summary>
+            <div class="p-4 border-t border-slate-700 font-mono text-xs text-slate-300 overflow-x-auto leading-relaxed whitespace-pre-wrap">
+              {docs_security_agent_body_block(assigns)}
+            </div>
+          </details>
         </section>
 
         <%!-- ============================================================ --%>
