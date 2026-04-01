@@ -249,6 +249,36 @@ defmodule LoopctlWeb.PageHTML do
   ---</code></pre>
   """
 
+  @docs_ba_agent_code ~S"""
+  <pre><code>---
+  name: business-analyst
+  description: Requirements analysis, AC validation, and story quality review
+  permissionMode: bypassPermissions
+  model: opus
+  effort: high
+  skills:
+  - patterns-elixir
+  - patterns-ecto
+  - patterns-phoenix-web
+  ---</code></pre>
+  """
+
+  @docs_architect_agent_code ~S"""
+  <pre><code>---
+  name: systems-architect
+  description: Architecture review, OTP compliance, fault tolerance, scalability
+  permissionMode: bypassPermissions
+  model: opus
+  effort: high
+  skills:
+  - patterns-elixir
+  - patterns-ecto
+  - patterns-phoenix-web
+  - patterns-elixir-otp
+  - patterns-elixir-integration
+  ---</code></pre>
+  """
+
   @docs_review_pipeline_code ~S"""
   <pre><code>Team Review (3 agents)  ──&gt;  VCA  ──&gt;  Fix
         │                                  │
@@ -353,6 +383,16 @@ defmodule LoopctlWeb.PageHTML do
   def docs_impl_agent_code_block(assigns) do
     _ = assigns
     Phoenix.HTML.raw(@docs_impl_agent_code)
+  end
+
+  def docs_ba_agent_code_block(assigns) do
+    _ = assigns
+    Phoenix.HTML.raw(@docs_ba_agent_code)
+  end
+
+  def docs_architect_agent_code_block(assigns) do
+    _ = assigns
+    Phoenix.HTML.raw(@docs_architect_agent_code)
   end
 
   def docs_security_agent_code_block(assigns) do
