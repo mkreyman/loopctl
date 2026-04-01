@@ -24,6 +24,10 @@ defmodule LoopctlWeb.PageController do
     render(conn, :home, layout: false)
   end
 
+  def docs(conn, _params) do
+    render(conn, :docs, layout: false)
+  end
+
   def terms(conn, _params) do
     render(conn, :terms, layout: false)
   end
