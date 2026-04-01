@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@theme {
+  /* Typography */
+  --font-display: "Geist", system-ui, sans-serif;
+  --font-body: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+
+  /* Primary: Indigo-Blue */
+  --color-accent-900: #1e1b4b;
+  --color-accent-800: #283572;
+  --color-accent-700: #3451a1;
+  --color-accent-600: #4263c9;
+  --color-accent-500: #5b7de6;
+  --color-accent-400: #8098f0;
+  --color-accent-300: #adb8f7;
+  --color-accent-200: #d4dafb;
+
+  /* Neutrals: Cool Gray (Slate) */
+  --color-slate-950: #0b0e14;
+  --color-slate-900: #111419;
+  --color-slate-850: #171b22;
+  --color-slate-800: #1e2028;
+  --color-slate-700: #2a2d36;
+  --color-slate-600: #3d4150;
+  --color-slate-500: #5a5f72;
+  --color-slate-400: #8b90a0;
+  --color-slate-300: #b4b8c7;
+  --color-slate-200: #d4d7e0;
+  --color-slate-100: #e8eaf0;
+  --color-slate-50: #f4f5f7;
+
+  /* Semantic / Status Colors */
+  --color-success-500: #34d399;
+  --color-success-900: #064e3b;
+  --color-warning-500: #fbbf24;
+  --color-warning-900: #451a03;
+  --color-danger-500: #f87171;
+  --color-danger-900: #450a0a;
+  --color-info-500: #60a5fa;
+}
+
+/* Transitions */
+.transition-colors {
+  transition: color 100ms ease-out, background-color 100ms ease-out, border-color 100ms ease-out;
+}

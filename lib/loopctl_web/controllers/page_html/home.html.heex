@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <meta
+      name="description"
+      content="Structural trust for AI development loops. Chain-of-custody verification, review enforcement, and progress tracking as API primitives."
+    />
+    <title>loopctl -- structural trust for AI development loops</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/app.js"}>
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-300 font-body antialiased">
+    <%!-- Skip to content for screen readers --%>
+    <a
+      href="#main-content"
+      class="sr-only focus:not-sr-only focus:absolute focus:z-[100] focus:top-2 focus:left-2 focus:bg-accent-700 focus:text-white focus:px-4 focus:py-2 focus:rounded-md"
+    >
+      Skip to content
+    </a>
+
+    <%!-- Navigation --%>
+    <nav
+      class="sticky top-0 z-50 bg-slate-950/90 backdrop-blur-sm border-b border-slate-800"
+      aria-label="Main navigation"
+    >
+      <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+        <a
+          href="/"
+          class="font-mono text-sm font-semibold text-slate-100 focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+        >
+          loopctl
+        </a>
+
+        <%!-- Desktop nav --%>
+        <div class="hidden md:flex items-center gap-6 text-sm text-slate-400">
+          <a
+            href="#features"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            Features
+          </a>
+          <a
+            href="#code-example"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            API
+          </a>
+          <a
+            href="https://github.com/mkreyman/loopctl"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            GitHub
+          </a>
+          <a
+            href="#get-started"
+            class="bg-accent-700 hover:bg-accent-600 text-white px-3 py-1.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950"
+          >
+            Get Started
+          </a>
+        </div>
+
+        <%!-- Mobile hamburger --%>
+        <button
+          type="button"
+          class="md:hidden p-2 min-h-[44px] min-w-[44px] flex items-center justify-center text-slate-400 hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          aria-label="Open menu"
+          phx-click={JS.toggle(to: "#mobile-menu")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke-width="1.5"
+            stroke="currentColor"
+            class="size-6"
+            aria-hidden="true"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <%!-- Mobile menu --%>
+      <div id="mobile-menu" class="hidden md:hidden border-t border-slate-800 bg-slate-950">
+        <div class="px-6 py-4 space-y-3">
+          <a
+            href="#features"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            Features
+          </a>
+          <a
+            href="#code-example"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            API
+          </a>
+          <a
+            href="https://github.com/mkreyman/loopctl"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            GitHub
+          </a>
+          <a
+            href="#get-started"
+            class="inline-flex items-center justify-center bg-accent-700 hover:bg-accent-600 text-white text-sm font-medium px-4 py-2.5 rounded-md transition-colors min-h-[44px]"
+          >
+            Get Started
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <main id="main-content">
+      <%!-- Hero Section — left-aligned, adapted from hero3 pattern --%>
+      <section class="relative isolate overflow-hidden bg-slate-950">
+        <div class="max-w-5xl mx-auto px-6 pt-24 pb-16 lg:flex lg:pt-32 lg:pb-24">
+          <div class="max-w-2xl shrink-0 lg:pt-8">
+            <%!-- Version badge --%>
+            <div class="mt-2 sm:mt-4 lg:mt-0">
+              <span class="inline-flex items-center">
+                <span class="rounded-sm bg-accent-900 px-2.5 py-1 text-xs font-mono font-medium text-accent-400 ring-1 ring-accent-700/40 ring-inset">
+                  v0.1.0
+                </span>
+                <span class="ml-3 text-sm font-medium text-slate-400">
+                  Now in public beta
+                </span>
+              </span>
+            </div>
+
+            <h1 class="mt-8 font-display text-4xl font-bold text-slate-50 max-w-2xl sm:text-5xl tracking-tight">
+              Structural trust for AI development loops
+            </h1>
+
+            <p class="mt-6 font-body text-lg text-slate-400 max-w-xl">
+              loopctl enforces that AI agents follow the process — not just promise to.
+              Chain-of-custody verification, review enforcement, and progress tracking as API primitives.
+            </p>
+
+            <div class="mt-8 flex flex-wrap gap-3">
+              <a
+                href="#get-started"
+                class="bg-accent-700 hover:bg-accent-600 text-white text-sm font-medium px-5 py-2.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+              >
+                Get Started
+              </a>
+              <a
+                href="https://github.com/mkreyman/loopctl"
+                class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium px-5 py-2.5 rounded-md border border-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                View on GitHub
+              </a>
+            </div>
+          </div>
+
+          <%!-- Code block on the right — replaces the screenshot from hero3 --%>
+          <div class="mt-16 sm:mt-20 lg:mt-0 lg:ml-10 lg:flex-1 lg:max-w-none">
+            <div class="bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+              <div class="flex bg-slate-900 border-b border-slate-700">
+                <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                  terminal
+                </div>
+              </div>
+              <div
+                class="p-4 sm:p-6 font-mono text-sm text-slate-300 overflow-x-auto"
+                aria-label="API usage example"
+              >
+                {hero_code_block(assigns)}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <%!-- Features Section — adapted from feature3 (checklist grid with 8 features) --%>
+      <section id="features" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
+        <div class="max-w-5xl mx-auto px-6">
+          <div class="grid max-w-2xl grid-cols-1 gap-x-8 gap-y-16 lg:mx-0 lg:max-w-none lg:grid-cols-5">
+            <div class="col-span-2">
+              <h2 class="text-sm font-semibold text-accent-400">Everything you need</h2>
+              <p class="mt-2 font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+                Built for AI agent orchestration
+              </p>
+              <p class="mt-4 text-base text-slate-400">
+                Every primitive you need to enforce process integrity in multi-agent development workflows.
+              </p>
+            </div>
+
+            <dl class="col-span-3 grid grid-cols-1 gap-x-8 gap-y-8 text-sm sm:grid-cols-2">
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Chain of Custody
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Immutable audit trail for every state transition. No agent marks their own work done.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  MCP Integration
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  17 typed tools for Claude Code agents. No curl needed -- agents interact through the MCP server.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Multi-Tenant RLS
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  PostgreSQL Row-Level Security isolates every tenant. Data boundaries enforced at the database level.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Review Enforcement
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Stories cannot be verified without independent review evidence. Three identity gates prevent self-validation.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Progress Tracking
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Two-tier status model separates agent self-reports from orchestrator verification. Trust is earned, not assumed.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Webhook Events
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Subscribe to state transitions with configurable webhooks. Exponential backoff, delivery tracking, and replay.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  Audit Trail
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Every action recorded with actor, timestamp, and context. Replay the decision chain for any story.
+                </dd>
+              </div>
+
+              <div class="relative pl-9">
+                <dt class="font-semibold text-slate-200">
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
+                    class="absolute top-0.5 left-0 size-5 text-accent-500"
+                  >
+                    <path
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clip-rule="evenodd"
+                      fill-rule="evenodd"
+                    />
+                  </svg>
+                  OpenAPI Spec
+                </dt>
+                <dd class="mt-1.5 text-slate-400">
+                  Full OpenAPI 3.1 specification with Swagger UI. Every endpoint documented with schemas and examples.
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <%!-- Code Example Section — adapted from feature2 (split layout with code on right) --%>
+      <section id="code-example" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
+        <div class="max-w-5xl mx-auto px-6">
+          <div class="grid grid-cols-1 gap-x-8 gap-y-12 lg:grid-cols-2 lg:items-start">
+            <div class="lg:pt-4">
+              <h2 class="text-sm font-semibold text-accent-400">API-first design</h2>
+              <p class="mt-2 font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+                One API call to enforce trust
+              </p>
+              <p class="mt-4 text-base text-slate-400">
+                Every operation is an API call. Register agents, contract stories, track progress, and verify completions. The MCP server wraps these calls so Claude Code agents never need to write curl commands.
+              </p>
+              <dl class="mt-8 max-w-xl space-y-6 text-sm">
+                <div class="relative pl-9">
+                  <dt class="inline font-semibold text-slate-200">
+                    <svg
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                      class="absolute top-0.5 left-1 size-5 text-accent-500"
+                    >
+                      <path
+                        d="M5.5 17a4.5 4.5 0 0 1-1.44-8.765 4.5 4.5 0 0 1 8.302-3.046 3.5 3.5 0 0 1 4.504 4.272A4 4 0 0 1 15 17H5.5Zm3.75-2.75a.75.75 0 0 0 1.5 0V9.66l1.95 2.1a.75.75 0 1 0 1.1-1.02l-3.25-3.5a.75.75 0 0 0-1.1 0l-3.25 3.5a.75.75 0 1 0 1.1 1.02l1.95-2.1v4.59Z"
+                        clip-rule="evenodd"
+                        fill-rule="evenodd"
+                      />
+                    </svg>
+                    REST + MCP.
+                  </dt>
+                  <dd class="inline text-slate-400">
+                    Full REST API with typed MCP tools. Agents use whichever interface fits their workflow.
+                  </dd>
+                </div>
+                <div class="relative pl-9">
+                  <dt class="inline font-semibold text-slate-200">
+                    <svg
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                      class="absolute top-0.5 left-1 size-5 text-accent-500"
+                    >
+                      <path
+                        d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z"
+                        clip-rule="evenodd"
+                        fill-rule="evenodd"
+                      />
+                    </svg>
+                    Identity gates.
+                  </dt>
+                  <dd class="inline text-slate-400">
+                    Three gates block self-reporting, self-reviewing, and self-verifying. Enforced at the API layer.
+                  </dd>
+                </div>
+                <div class="relative pl-9">
+                  <dt class="inline font-semibold text-slate-200">
+                    <svg
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                      class="absolute top-0.5 left-1 size-5 text-accent-500"
+                    >
+                      <path d="M4.632 3.533A2 2 0 0 1 6.577 2h6.846a2 2 0 0 1 1.945 1.533l1.976 8.234A3.489 3.489 0 0 0 16 11.5H4c-.476 0-.93.095-1.344.267l1.976-8.234Z" />
+                      <path
+                        d="M4 13a2 2 0 1 0 0 4h12a2 2 0 1 0 0-4H4Zm11.24 2a.75.75 0 0 1 .75-.75H16a.75.75 0 0 1 .75.75v.01a.75.75 0 0 1-.75.75h-.01a.75.75 0 0 1-.75-.75V15Zm-2.25-.75a.75.75 0 0 0-.75.75v.01c0 .414.336.75.75.75H13a.75.75 0 0 0 .75-.75V15a.75.75 0 0 0-.75-.75h-.01Z"
+                        clip-rule="evenodd"
+                        fill-rule="evenodd"
+                      />
+                    </svg>
+                    Change feed.
+                  </dt>
+                  <dd class="inline text-slate-400">
+                    Poll for all state transitions since any timestamp. Build dashboards and alerts without webhooks.
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
+            <div>
+              <div class="bg-slate-800 border border-slate-700 rounded-md overflow-hidden">
+                <div class="flex bg-slate-900 border-b border-slate-700">
+                  <div class="px-4 py-2 text-xs font-mono text-slate-100 border-r border-b border-r-slate-700 border-b-accent-700/50 bg-slate-800/50">
+                    stories.sh
+                  </div>
+                  <div class="px-4 py-2 text-xs font-mono text-slate-400">
+                    verify.sh
+                  </div>
+                </div>
+                <div
+                  class="p-4 sm:p-6 font-mono text-sm text-slate-300 overflow-x-auto"
+                  aria-label="curl command example"
+                >
+                  {api_code_block(assigns)}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <%!-- Final CTA Section --%>
+      <section id="get-started" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
+        <div class="max-w-5xl mx-auto px-6">
+          <div class="max-w-2xl">
+            <h2 class="font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+              Start enforcing trust today
+            </h2>
+            <p class="mt-4 text-base text-slate-400">
+              Register your tenant, create a project, and start tracking stories in minutes.
+              The API is live and the MCP server is ready.
+            </p>
+            <div class="mt-8 flex flex-wrap gap-3">
+              <a
+                href="/api/v1/"
+                class="bg-accent-700 hover:bg-accent-600 text-white text-sm font-medium px-5 py-2.5 rounded-md transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+              >
+                Explore the API
+              </a>
+              <a
+                href="https://github.com/mkreyman/loopctl"
+                class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium px-5 py-2.5 rounded-md border border-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 min-h-[44px] inline-flex items-center"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                View on GitHub
+              </a>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <%!-- Footer --%>
+    <footer class="border-t border-slate-800 bg-slate-950">
+      <div class="max-w-5xl mx-auto px-6 py-8">
+        <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <p class="text-xs text-slate-400">
+            &copy; {DateTime.utc_now().year} loopctl. All rights reserved.
+          </p>
+          <div class="flex items-center gap-6 text-xs text-slate-400">
+            <a
+              href="https://github.com/mkreyman/loopctl"
+              class="hover:text-slate-300 transition-colors"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              GitHub
+            </a>
+            <a href="/health" class="hover:text-slate-300 transition-colors">Health</a>
+            <a href="#" class="hover:text-slate-300 transition-colors">Terms</a>
+            <a href="#" class="hover:text-slate-300 transition-colors">Privacy</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
