@@ -5,7 +5,11 @@ defmodule LoopctlWeb.Router do
     plug :accepts, ["html"]
     plug :fetch_session
     plug :protect_from_forgery
-    plug :put_secure_browser_headers
+
+    plug :put_secure_browser_headers, %{
+      "content-security-policy" =>
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' wss:"
+    }
   end
 
   pipeline :api do
