@@ -113,7 +113,7 @@ defmodule Loopctl.MixProject do
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
-      "assets.deploy": ["tailwind default --minify", "esbuild loopctl --minify", "phx.digest"],
+      "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",
