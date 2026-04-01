@@ -1,4 +1,6 @@
 @import "tailwindcss";
+@source "../../lib/loopctl_web/**/*.html.heex";
+@source "../../lib/loopctl_web/**/*.ex";
 
 @theme {
   /* Typography */
