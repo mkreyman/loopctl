@@ -16,56 +16,61 @@
   "acceptance_criteria": [
     {
       "id": "AC-18.1.1",
-      "description": "Phoenix LiveView, phoenix_html, esbuild, and tailwind deps are added to mix.exs. The LiveView socket is uncommented in endpoint.ex. A :browser pipeline is added to router.ex with :accepts html, :fetch_session, :fetch_live_flash, :put_root_layout, :protect_from_forgery, :put_secure_browser_headers. API routes under /api/v1/ are unaffected.",
+      "description": "New deps added to mix.exs: {:phoenix_live_view, '~> 1.0'}, {:phoenix_html, '~> 4.2'}, {:esbuild, '~> 0.8'}, {:tailwind, '~> 0.2'}. LiveView socket uncommented in endpoint.ex. LoopctlWeb macro module (loopctl_web.ex) extended with html/0, live_view/0, and live_component/0 function clauses following Phoenix 1.8 patterns. Existing controller/0 clause with formats: [:json] is unchanged.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.2",
-      "description": "Tailwind CSS v4 asset pipeline is configured: assets/css/app.css exists with design system tokens (slate palette, Geist fonts, accent colors from docs/design-system.md), assets/js/app.js initializes LiveView hooks, esbuild and tailwind watchers run in dev. Static files are digested for production releases.",
+      "description": "A :browser pipeline added to router.ex with: plug :accepts, ['html']; plug :fetch_session; plug :fetch_live_flash; plug :put_root_layout, {LoopctlWeb.Layouts, :root}; plug :protect_from_forgery; plug :put_secure_browser_headers. The GET / route uses the :browser pipeline (live '/'. LandingLive). The GET /health route remains in a separate scope with the :api pipeline. No API routes are affected.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.3",
-      "description": "A root layout (root.html.heex) exists with proper HTML skeleton: meta tags (charset, viewport, description, og:title, og:description), Geist and Geist Mono font loading via Google Fonts, CSS and JS asset references, and dark mode as default.",
+      "description": "Tailwind CSS v4 asset pipeline configured: assets/css/app.css with @theme block defining design tokens (no tailwind.config.js — v4 uses CSS-only config), assets/js/app.js with phoenix_html import and LiveSocket init. Esbuild and tailwind profiles in config/config.exs (no --config flag for v4). Watchers merged into existing endpoint config in config/dev.exs. Mix aliases added: assets.setup (install binaries) and assets.deploy (minify + phx.digest).",
       "status": "pending"
     },
     {
       "id": "AC-18.1.4",
-      "description": "GET / serves an HTML landing page (not a JSON redirect) with: hero section (left-aligned, version badge, tagline, two CTAs), features section (icon grid with 6-8 loopctl capabilities), code example section (curl or MCP tool call), and a final CTA.",
+      "description": "A root layout (root.html.heex) exists with: <html lang='en' class='dark'> (dark mode only — class strategy, not media query), meta tags (charset, viewport, description, og:title, og:description), Geist and Geist Mono font loading via Google Fonts, CSS and JS asset references.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.5",
-      "description": "Landing page uses Tailwind Plus component patterns adapted to HEEx: hero from hero3 pattern, features from feature2/feature3 patterns, with loopctl design system tokens (slate-*, accent-*) replacing default indigo/gray.",
+      "description": "GET / serves an HTML landing page with: hero section (left-aligned, version badge, tagline, two CTAs), features section (icon grid with 6-8 loopctl capabilities), code example section (curl or MCP tool call), and a final CTA. Uses a plain controller + HEEx template (not LiveView) since the page is fully static with zero interactivity — avoids unnecessary WebSocket connections.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.6",
-      "description": "Landing page includes a sticky navigation bar with: loopctl logo (monospace), links to Features (anchor #features), Docs (/docs or external), API Reference (/swaggerui or /api/v1/openapi), GitHub repo, and a Get Started CTA button. Mobile nav collapses behind a hamburger menu.",
+      "description": "Landing page uses Tailwind Plus component patterns adapted to HEEx: hero from hero3 pattern, features from feature2/feature3 patterns, with loopctl design system tokens (slate-*, accent-*) replacing default indigo/gray. Interactive behavior (mobile menu toggle) uses Phoenix.LiveView.JS commands (JS.toggle_class, JS.show, JS.hide) — no Alpine.js or custom JS frameworks.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.7",
-      "description": "Landing page includes a footer with: copyright, GitHub link, API status link (/health), and legal placeholder links (terms, privacy).",
+      "description": "Landing page includes a sticky navigation bar with: loopctl logo (monospace), links to Features (#features), Docs, API Reference, GitHub, and a Get Started CTA. Mobile nav collapses behind a hamburger button using Phoenix.LiveView.JS for toggle — no custom JavaScript hook needed.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.8",
-      "description": "Endpoint render_errors config includes both JSON and HTML formats: formats: [json: LoopctlWeb.ErrorJSON, html: LoopctlWeb.ErrorHTML]. An ErrorHTML module exists with basic 404/500 pages.",
+      "description": "Landing page includes a footer with: copyright, GitHub link, API status link (/health — returns raw JSON when clicked, which is acceptable), and legal placeholder links (terms, privacy).",
       "status": "pending"
     },
     {
       "id": "AC-18.1.9",
-      "description": "The existing /health endpoint and /api/v1/* routes continue to function identically. No regression in API behavior. WelcomeController.redirect_to_api is replaced by the landing page route.",
+      "description": "Endpoint render_errors config updated to: formats: [json: LoopctlWeb.ErrorJSON, html: LoopctlWeb.ErrorHTML]. An ErrorHTML module exists with 404.html.heex and 500.html.heex templates.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.10",
-      "description": "The page is responsive: readable on mobile (320px), tablet (768px), and desktop (1280px+). CTA buttons have minimum 44px touch targets on mobile. Content maxes at max-w-5xl (1024px).",
+      "description": "The existing /health endpoint and /api/v1/* routes continue to function identically. No regression in API behavior. The root GET / route moves from the :api scope to the :browser scope.",
       "status": "pending"
     },
     {
       "id": "AC-18.1.11",
+      "description": "The page is responsive: readable on mobile (320px), tablet (768px), and desktop (1280px+). CTA buttons have minimum 44px touch targets on mobile (py-3 or min-h-[44px]). Content maxes at max-w-5xl (1024px). Tailwind responsive classes (sm:, md:, lg:) are used for breakpoints.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.1.12",
       "description": "All text meets WCAG AA contrast ratios (4.5:1 for body text, 3:1 for large text) against the slate-950 background. Focus indicators use ring-2 ring-accent-500.",
       "status": "pending"
     }
@@ -76,7 +81,8 @@
       "name": "GET / returns HTML landing page with 200 status",
       "type": "integration",
       "preconditions": [
-        "conn = build_conn() — uses ConnCase, not DataCase"
+        "use LoopctlWeb.ConnCase, async: true",
+        "setup :verify_on_exit!"
       ],
       "steps": [
         "conn |> get(~p\"/\")"
@@ -86,7 +92,8 @@
         "Content-Type includes text/html",
         "Body contains 'loopctl' in a heading element",
         "Body contains 'Get Started' CTA text",
-        "Body contains navigation links (Features, Docs, API, GitHub)"
+        "Body contains navigation links (Features, Docs, API, GitHub)",
+        "Body contains <html with class='dark'"
       ],
       "status": "pending"
     },
@@ -95,15 +102,16 @@
       "name": "API routes still return JSON and are unaffected by browser pipeline",
       "type": "integration",
       "preconditions": [
-        "conn = build_conn() — uses ConnCase"
+        "use LoopctlWeb.ConnCase, async: true"
       ],
       "steps": [
         "conn |> get(~p\"/api/v1/\")",
         "conn |> get(~p\"/health\")"
       ],
       "expected_results": [
-        "/api/v1/ returns 200 with JSON body containing routes",
-        "/health returns 200 with JSON body containing status: ok"
+        "/api/v1/ returns 200 with JSON body (WelcomeController.index response)",
+        "/health returns 200 with JSON body containing status: ok",
+        "Neither response contains text/html Content-Type"
       ],
       "status": "pending"
     },
@@ -112,74 +120,72 @@
       "name": "Landing page contains all required sections",
       "type": "integration",
       "preconditions": [
-        "conn = build_conn()"
+        "use LoopctlWeb.ConnCase, async: true"
       ],
       "steps": [
-        "conn |> get(~p\"/\") and inspect html_response(conn, 200)"
+        "conn |> get(~p\"/\") |> html_response(200)"
       ],
       "expected_results": [
-        "HTML contains a <nav> element with navigation links",
-        "HTML contains an element with id='features' (anchor target)",
+        "HTML contains a <nav> element",
+        "HTML contains an element with id='features'",
         "HTML contains a <footer> element with copyright text",
-        "HTML contains a code block with a curl or API example",
-        "HTML contains the viewport meta tag with width=device-width"
+        "HTML contains a <pre> or <code> block (API example)",
+        "HTML contains viewport meta tag",
+        "HTML contains responsive classes (sm: or lg: prefixes in class attrs)"
       ],
       "status": "pending"
     },
     {
       "id": "TC-18.1.4",
-      "name": "Root layout includes required meta tags and font loading",
+      "name": "Root layout includes meta tags, fonts, and dark mode",
       "type": "integration",
       "preconditions": [
-        "conn = build_conn()"
+        "use LoopctlWeb.ConnCase, async: true"
       ],
       "steps": [
-        "conn |> get(~p\"/\") and inspect the full HTML response"
+        "conn |> get(~p\"/\") — inspect full HTML"
       ],
       "expected_results": [
         "HTML contains <meta charset='utf-8'>",
         "HTML contains <meta name='viewport'>",
         "HTML contains a <link> to Google Fonts for Geist",
-        "HTML contains a <link> or <style> referencing the app CSS"
+        "HTML contains a <link> referencing app CSS asset",
+        "HTML <html> element has class='dark'"
       ],
       "status": "pending"
     },
     {
       "id": "TC-18.1.5",
-      "name": "404 page returns HTML for browser requests",
+      "name": "404 page returns HTML for unmatched browser routes",
       "type": "integration",
       "preconditions": [
-        "conn = build_conn()"
+        "use LoopctlWeb.ConnCase, async: true"
       ],
       "steps": [
-        "conn |> get(\"/nonexistent-page\")"
+        "conn |> put_req_header('accept', 'text/html') |> get('/nonexistent-page')"
       ],
       "expected_results": [
         "Response status is 404",
-        "Body contains a user-friendly error message (not raw JSON)"
+        "Body contains user-friendly error text (not raw JSON)"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "NEW DEPS REQUIRED: {:phoenix_live_view, '~> 1.0'}, {:phoenix_html, '~> 4.2'}, {:esbuild, '~> 0.8'}, {:tailwind, '~> 0.2'} — add to mix.exs deps",
-    "Enable LiveView socket in lib/loopctl_web/endpoint.ex — uncomment the socket '/live' block",
-    "Add :browser pipeline to router.ex: plug :accepts, ['html']; plug :fetch_session; plug :fetch_live_flash; plug :put_root_layout, html: {LoopctlWeb.Layouts, :root}; plug :protect_from_forgery; plug :put_secure_browser_headers",
-    "Create lib/loopctl_web/components/layouts.ex with root/1 and marketing/1 function components",
-    "Create lib/loopctl_web/components/layouts/root.html.heex — HTML skeleton with Geist font loading, CSS/JS assets",
-    "Create lib/loopctl_web/live/landing_live.ex — static LiveView, no mount/handle_event logic needed",
-    "Create lib/loopctl_web/controllers/error_html.ex — render 404.html.heex and 500.html.heex",
-    "Create assets/css/app.css with Tailwind v4 @theme block defining design system tokens from docs/design-system.md",
-    "Create assets/js/app.js — minimal: import phoenix_html, LiveSocket init, topbar",
-    "Add esbuild and tailwind watcher configs to config/dev.exs",
-    "Add esbuild and tailwind config to config/config.exs (profiles, version, args)",
-    "Update endpoint render_errors: formats: [json: LoopctlWeb.ErrorJSON, html: LoopctlWeb.ErrorHTML]",
-    "Replace WelcomeController.redirect_to_api route with landing page LiveView route",
-    "Reference components: docs/tailwind/hero3.html, feature2.html, feature3.html adapted to HEEx with loopctl design tokens",
-    "Design system is defined in docs/design-system.md — Geist fonts, cool slate palette, deep indigo-blue accent, dark mode only",
-    "The landing page is fully public — no authentication required",
-    "Keep /swaggerui route available in dev/test — consider exposing in prod under /docs/api"
+    "NEW DEPS: {:phoenix_live_view, '~> 1.0'}, {:phoenix_html, '~> 4.2'}, {:esbuild, '~> 0.8'}, {:tailwind, '~> 0.2'}",
+    "CRITICAL: Extend lib/loopctl_web.ex with def html, def live_view, and def live_component clauses following Phoenix 1.8 generator patterns. Do NOT modify the existing def controller clause (formats: [:json]) — it serves all API controllers",
+    "CRITICAL: Tailwind v4 uses CSS-only config (@theme blocks in app.css). Do NOT create tailwind.config.js. Tailwind CLI args must NOT include --config flag. The tailwind profile in config.exs should be: args ~w(--input=css/app.css --output=../priv/static/assets/app.css)",
+    "Router restructure: extract GET /health into its own :api scope. Add new :browser scope with live '/', LandingLive (or controller if using dead view). The two scopes must not share a pipeline",
+    "Use a plain controller + HEEx template for the landing page (not LiveView) — the page is fully static, no WebSocket needed. If future interactivity is added, convert to LiveView then",
+    "Mix aliases to add: 'assets.setup': ['tailwind.install --if-missing', 'esbuild.install --if-missing'], 'assets.deploy': ['tailwind default --minify', 'esbuild loopctl --minify', 'phx.digest']. Update setup alias to include assets.setup",
+    "Dark mode: <html> must have class='dark' unconditionally. Tailwind v4 dark mode uses class strategy by default",
+    "Mobile hamburger menu: use Phoenix.LiveView.JS commands (JS.toggle/2, JS.show/2, JS.hide/2) for menu toggle. No custom JS hooks, no Alpine.js",
+    "Tailwind Plus HTML → HEEx conversion: replace class with class, use {[...]} syntax for conditional classes. Reference files: docs/tailwind/hero3.html, feature2.html, feature3.html",
+    "Config/dev.exs: merge watchers into the EXISTING endpoint config block (do not add a second config block — it would silently override the first)",
+    "Create lib/loopctl_web/controllers/error_html.ex with basic 404/500 templates",
+    "Update endpoint render_errors: add html: LoopctlWeb.ErrorHTML alongside existing json: LoopctlWeb.ErrorJSON",
+    "Design system: docs/design-system.md — Geist fonts, cool slate palette, deep indigo-blue accent, dark mode only"
   ],
   "dependencies": [],
-  "estimated_hours": 10
+  "estimated_hours": 12
 }
