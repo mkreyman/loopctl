@@ -34,7 +34,10 @@ config :loopctl, LoopctlWeb.Endpoint,
   code_reloader: true,
   debug_errors: true,
   secret_key_base: "jW1/D0/L8Vk/kcM/AFQx9iV+NEkUHGWFtkg+McU35jRwiNokdpvoBuRRmFTH7igt",
-  watchers: []
+  watchers: [
+    esbuild: {Esbuild, :install_and_run, [:loopctl, ~w(--sourcemap=inline --watch)]},
+    tailwind: {Tailwind, :install_and_run, [:loopctl, ~w(--watch)]}
+  ]
 
 # ## SSL Support
 #

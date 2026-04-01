@@ -27,7 +27,7 @@ config :loopctl, LoopctlWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
   render_errors: [
-    formats: [json: LoopctlWeb.ErrorJSON],
+    formats: [html: LoopctlWeb.ErrorHTML, json: LoopctlWeb.ErrorJSON],
     layout: false
   ],
   pubsub_server: Loopctl.PubSub,
@@ -37,6 +37,27 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Production uses JSON via LoggerJSON; dev/test override with human-readable format.
 config :logger, :default_handler,
   formatter: {LoggerJSON.Formatters.Basic, metadata: [:request_id, :tenant_id, :remote_ip]}
+
+# Configure esbuild (the version is required)
+config :esbuild,
+  version: "0.25.0",
+  loopctl: [
+    args:
+      ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets --external:/fonts/* --external:/images/*),
+    cd: Path.expand("../assets", __DIR__),
+    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+  ]
+
+# Configure tailwind (the version is required)
+config :tailwind,
+  version: "4.0.14",
+  loopctl: [
+    args: ~w(
+      --input=css/app.css
+      --output=../priv/static/assets/app.css
+    ),
+    cd: Path.expand("../assets", __DIR__)
+  ]
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason

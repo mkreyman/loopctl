@@ -60,8 +60,12 @@ defmodule Loopctl.MixProject do
       # Phoenix
       {:phoenix, "~> 1.8.4"},
       {:phoenix_ecto, "~> 4.5"},
+      {:phoenix_html, "~> 4.2"},
+      {:phoenix_live_view, "~> 1.0"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
+      {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:gettext, "~> 1.0"},
@@ -104,10 +108,12 @@ defmodule Loopctl.MixProject do
 
   defp aliases do
     [
-      setup: ["deps.get", "ecto.setup"],
+      setup: ["deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
+      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.deploy": ["tailwind default --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",

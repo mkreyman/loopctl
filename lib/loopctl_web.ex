@@ -7,6 +7,7 @@ defmodule LoopctlWeb do
 
       use LoopctlWeb, :controller
       use LoopctlWeb, :html
+      use LoopctlWeb, :live_view
 
   The definitions below will be executed for every controller,
   component, etc, so keep them short and clean, focused
@@ -42,6 +43,50 @@ defmodule LoopctlWeb do
       use Gettext, backend: LoopctlWeb.Gettext
 
       import Plug.Conn
+
+      unquote(verified_routes())
+    end
+  end
+
+  def html do
+    quote do
+      use Phoenix.Component
+
+      # Import convenience functions from controllers
+      import Phoenix.Controller,
+        only: [get_csrf_token: 0, view_module: 1, view_template: 1]
+
+      # Include general helpers for rendering HTML
+      unquote(html_helpers())
+    end
+  end
+
+  def live_view do
+    quote do
+      use Phoenix.LiveView,
+        layout: {LoopctlWeb.Layouts, :app}
+
+      unquote(html_helpers())
+    end
+  end
+
+  def live_component do
+    quote do
+      use Phoenix.LiveComponent
+
+      unquote(html_helpers())
+    end
+  end
+
+  defp html_helpers do
+    quote do
+      # HTML escaping functionality
+      import Phoenix.HTML
+
+      # Shortcut for generating JS commands
+      alias Phoenix.LiveView.JS
+
+      use Gettext, backend: LoopctlWeb.Gettext
 
       unquote(verified_routes())
     end

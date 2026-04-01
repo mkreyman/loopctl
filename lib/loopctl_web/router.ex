@@ -1,6 +1,13 @@
 defmodule LoopctlWeb.Router do
   use LoopctlWeb, :router
 
+  pipeline :browser do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :protect_from_forgery
+    plug :put_secure_browser_headers
+  end
+
   pipeline :api do
     plug :accepts, ["json"]
     plug OpenApiSpex.Plug.PutApiSpec, module: Loopctl.ApiSpec
@@ -20,11 +27,17 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.RegistrationRateLimiter
   end
 
-  # Health check and root redirect — unauthenticated, outside /api/v1
+  # Landing page — browser pipeline (HTML)
+  scope "/", LoopctlWeb do
+    pipe_through :browser
+
+    get "/", PageController, :home
+  end
+
+  # Health check — unauthenticated JSON, outside /api/v1
   scope "/", LoopctlWeb do
     pipe_through :api
 
-    get "/", WelcomeController, :redirect_to_api
     get "/health", HealthController, :check
   end
 
