@@ -101,17 +101,14 @@ defmodule Loopctl.Audit do
   """
   @spec log_in_multi(Multi.t(), atom(), (map() -> map())) :: Multi.t()
   def log_in_multi(%Multi{} = multi, name, fun) when is_function(fun, 1) do
-    Multi.run(multi, name, fn _repo, changes ->
+    Multi.insert(multi, name, fn changes ->
       attrs = fun.(changes)
       tenant_id = Map.get(attrs, :tenant_id) || Map.get(attrs, "tenant_id")
       attrs = Map.drop(attrs, [:tenant_id, "tenant_id"])
 
-      changeset =
-        attrs
-        |> AuditLog.create_changeset()
-        |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
-
-      AdminRepo.insert(changeset)
+      attrs
+      |> AuditLog.create_changeset()
+      |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
     end)
   end
 
