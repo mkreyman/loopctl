@@ -16,57 +16,62 @@
   "acceptance_criteria": [
     {
       "id": "AC-18.2.1",
-      "description": "fly.toml is updated from placeholder to production-ready: app name 'loopctl', primary_region 'ord' (or 'lax'), PHX_HOST set to 'loopctl.com', internal_port 8080 (matching other Fly deployments), min_machines_running 1, health check on /health.",
+      "description": "fly.toml is updated from placeholder to production-ready: app name 'loopctl', primary_region 'lax', PHX_HOST set to 'loopctl.com', internal_port 8080, min_machines_running 1, health check on /health, force_https true.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.2",
-      "description": "Dockerfile is updated for Fly.io deployment: port 8080 (not 4000), EXPOSE 8080, runtime deps match current Dockerfile but optimized for the Fly environment (no tini needed — Fly handles process management).",
+      "description": "Dockerfile is updated for Fly.io deployment: port 8080 (EXPOSE 8080, ENV PORT=8080), Node.js added to builder stage for esbuild/tailwind asset compilation, tini removed (Fly handles init), runtime deps match production needs.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.3",
-      "description": "Fly Managed PostgreSQL is provisioned with RLS support: the init script (deploy/init-db.sh or equivalent) creates loopctl_app and loopctl_admin roles, enables RLS on all tables, and grants appropriate privileges. DATABASE_URL and ADMIN_DATABASE_URL are set as Fly secrets.",
+      "description": "Fly Managed PostgreSQL is provisioned. RLS roles (loopctl_app and loopctl_admin) are created via a one-time setup script run through 'fly postgres connect'. The setup script grants privileges and creates the current_tenant_id() function. This is documented in deploy/fly-db-setup.sh.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.4",
-      "description": "Runtime config (config/runtime.exs) detects Fly.io environment via FLY_APP_NAME env var and applies Fly-specific database tuning: connect_timeout, queue_target, queue_interval adjusted for PgBouncer (matching reportex patterns).",
+      "description": "DATABASE_URL uses direct Postgres connection (port 5433, bypassing PgBouncer) to ensure SET LOCAL works correctly for RLS. ADMIN_DATABASE_URL uses the loopctl_admin role. Both are set as Fly secrets. The runtime.exs documents why direct connections are required.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.5",
-      "description": "All required secrets are set via 'fly secrets set': DATABASE_URL, ADMIN_DATABASE_URL, SECRET_KEY_BASE, CLOAK_KEY. No secrets are hardcoded in fly.toml or Dockerfile.",
+      "description": "Runtime config (config/runtime.exs) detects Fly.io environment via FLY_APP_NAME env var and applies: connect_timeout 15s, queue_target 5s, queue_interval 10s (matching reportex patterns). IPv6 enabled via ECTO_IPV6.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.6",
-      "description": "Release command '/app/bin/migrate' runs Ecto migrations on deploy, including the RLS policy setup migration. The migration succeeds on a fresh database.",
+      "description": "All required secrets are set via 'fly secrets set': DATABASE_URL, ADMIN_DATABASE_URL, SECRET_KEY_BASE, CLOAK_KEY. No secrets are hardcoded in fly.toml or Dockerfile.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.7",
-      "description": "DNS is configured: loopctl.com points to the Fly.io app via CNAME or A record. Fly.io issues and manages the SSL certificate automatically. HTTPS is enforced (force_https: true).",
+      "description": "Release command '/app/bin/migrate' runs Ecto migrations on deploy. The Ecto.Migrator runs with the admin role to create/modify RLS policies. Migrations succeed on a fresh database.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.8",
-      "description": "GitHub Actions CI/CD workflow deploys to Fly.io on push to master: lint → test (with RLS-aware Postgres setup) → security (sobelow) → dialyzer → deploy. Deploy step uses 'flyctl deploy --remote-only'. Matches the pattern from home_care_billing and reportex workflows.",
+      "description": "DNS is configured: loopctl.com points to the Fly.io app via CNAME. Fly.io issues and manages the SSL certificate via 'fly certs add loopctl.com'. HTTPS is enforced.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.9",
-      "description": "Session affinity is enabled if LiveView is in use (from US-18.1): sticky sessions with TTL 3600s, h2_backend disabled for WebSocket stability.",
+      "description": "GitHub Actions CI/CD workflow adds a deploy job that runs on push to master after all quality gates pass. Deploy step uses 'flyctl deploy --remote-only'. FLY_API_TOKEN is stored as a GitHub secret.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.10",
-      "description": "After deployment, GET https://loopctl.com returns the landing page (from US-18.1), GET https://loopctl.com/health returns {status: ok}, and GET https://loopctl.com/api/v1/ returns the API discovery JSON. All existing API endpoints are functional.",
+      "description": "Session affinity is enabled for LiveView WebSocket stability: sticky sessions with TTL 3600s, http2 backend disabled (h2_backend = false). Matches home_care_billing and reportex patterns.",
       "status": "pending"
     },
     {
       "id": "AC-18.2.11",
-      "description": "The self-hosted beelink deployment (docker-compose) continues to work for local/development use. Fly.io deployment does not break the existing docker-compose setup.",
+      "description": "After deployment: GET https://loopctl.com returns the landing page, GET https://loopctl.com/health returns JSON {status: ok}, GET https://loopctl.com/api/v1/ returns the API discovery JSON. All API endpoints are functional with RLS enforced.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-18.2.12",
+      "description": "The self-hosted beelink deployment (docker-compose) continues to work. The PORT env var (default 4000 for beelink, 8080 for Fly) is the only difference. No code changes break the existing setup.",
       "status": "pending"
     }
   ],
@@ -90,42 +95,60 @@
     },
     {
       "id": "TC-18.2.2",
-      "name": "API routes are accessible on Fly.io",
-      "type": "integration",
-      "preconditions": [
-        "App is deployed to Fly.io",
-        "API key is provisioned"
-      ],
-      "steps": [
-        "curl https://loopctl.com/api/v1/ (unauthenticated)",
-        "curl -H 'Authorization: Bearer <key>' https://loopctl.com/api/v1/projects"
-      ],
-      "expected_results": [
-        "/api/v1/ returns route discovery JSON",
-        "/api/v1/projects returns 200 with projects list (or empty array)"
-      ],
-      "status": "pending"
-    },
-    {
-      "id": "TC-18.2.3",
-      "name": "RLS policies work correctly on Fly Managed Postgres",
+      "name": "API routes are accessible and RLS is enforced",
       "type": "integration",
       "preconditions": [
         "App is deployed to Fly.io",
         "Two tenants with API keys exist"
       ],
       "steps": [
+        "curl https://loopctl.com/api/v1/ (unauthenticated — returns routes)",
         "Create a project under tenant A via API",
-        "Attempt to list projects as tenant B"
+        "List projects as tenant B"
       ],
       "expected_results": [
-        "Tenant B cannot see tenant A's project",
-        "RLS policies are enforced at the database level"
+        "/api/v1/ returns route discovery JSON",
+        "Tenant B cannot see tenant A's project (RLS enforced)",
+        "SET LOCAL works correctly (not broken by PgBouncer)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.2.3",
+      "name": "Landing page is served on Fly.io",
+      "type": "integration",
+      "preconditions": [
+        "App is deployed with US-18.1 landing page"
+      ],
+      "steps": [
+        "curl https://loopctl.com"
+      ],
+      "expected_results": [
+        "Returns 200 with HTML content",
+        "Contains loopctl branding and navigation",
+        "Static assets (CSS, JS) load correctly"
       ],
       "status": "pending"
     },
     {
       "id": "TC-18.2.4",
+      "name": "HTTPS is enforced and certificate is valid",
+      "type": "integration",
+      "preconditions": [
+        "DNS is configured for loopctl.com"
+      ],
+      "steps": [
+        "curl -I http://loopctl.com",
+        "curl -I https://loopctl.com"
+      ],
+      "expected_results": [
+        "HTTP redirects to HTTPS (301 or 308)",
+        "HTTPS returns 200 with valid TLS certificate for loopctl.com"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-18.2.5",
       "name": "Migrations run successfully on deploy",
       "type": "integration",
       "preconditions": [
@@ -133,29 +156,12 @@
       ],
       "steps": [
         "Deploy via flyctl deploy",
-        "Check release command logs for migration output"
+        "Check release command logs"
       ],
       "expected_results": [
         "All migrations complete without errors",
-        "RLS policies are created by the migration",
-        "Both loopctl_app and loopctl_admin roles exist"
-      ],
-      "status": "pending"
-    },
-    {
-      "id": "TC-18.2.5",
-      "name": "HTTPS is enforced and certificate is valid",
-      "type": "integration",
-      "preconditions": [
-        "DNS is configured for loopctl.com"
-      ],
-      "steps": [
-        "curl -I http://loopctl.com (plain HTTP)",
-        "curl -I https://loopctl.com (HTTPS)"
-      ],
-      "expected_results": [
-        "HTTP request redirects to HTTPS (301 or 308)",
-        "HTTPS request returns 200 with valid TLS certificate for loopctl.com"
+        "RLS policies exist on all tenant-scoped tables",
+        "Both loopctl_app and loopctl_admin roles exist and function"
       ],
       "status": "pending"
     },
@@ -165,7 +171,7 @@
       "type": "integration",
       "preconditions": [
         "GitHub Actions workflow is configured",
-        "FLY_API_TOKEN is set as a GitHub secret"
+        "FLY_API_TOKEN is set as GitHub secret"
       ],
       "steps": [
         "Push a commit to master",
@@ -174,23 +180,24 @@
       "expected_results": [
         "Workflow runs: lint → test → security → dialyzer → deploy",
         "Deploy step completes successfully",
-        "New version is live at loopctl.com"
+        "New version is live at loopctl.com within 5 minutes"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Reference deployments: home_care_billing (fly.toml, Dockerfile, .github/workflows/ci.yml) and reportex (same files)",
-    "Fly.io provisioning: fly launch (skip if app exists), fly postgres create, fly secrets set",
-    "RLS on Fly Managed Postgres: need to run init-db.sh equivalent via fly postgres connect or as part of the migration",
-    "Fly Managed Postgres uses PgBouncer by default — use session mode for prepared statements + LISTEN/NOTIFY",
-    "Runtime config should detect FLY_APP_NAME to apply Fly-specific DB tuning (see reportex config/runtime.exs)",
-    "DNS: configure loopctl.com via fly certs add loopctl.com, then set CNAME at registrar",
-    "Port: change from 4000 to 8080 to match other Fly deployments (Fly routes external 443 → internal port)",
-    "GitHub Actions: add FLY_API_TOKEN secret, use superfly/flyctl-actions for deploy step",
-    "The beelink docker-compose deployment should remain as a fallback/dev option",
-    "Consider running 'fly scale memory 1024' if 512MB proves insufficient with LiveView + API traffic",
-    "Oban queue config: ensure Oban runs on Fly.io (webhook delivery worker needs outbound HTTP)"
+    "Reference deployments: home_care_billing and reportex (fly.toml, Dockerfile, .github/workflows/ci.yml)",
+    "CRITICAL: Fly Managed Postgres uses PgBouncer in transaction mode by default. SET LOCAL (required for RLS) does NOT work through PgBouncer transaction mode. Use DIRECT connections on port 5433 (not 5432) to bypass PgBouncer entirely.",
+    "RLS role setup: Fly Managed Postgres only gives you one superuser. Create loopctl_app and loopctl_admin roles manually via 'fly postgres connect -a loopctl-db' then run deploy/fly-db-setup.sh. This is a one-time setup, not per-deploy.",
+    "DATABASE_URL format for direct connection: postgres://loopctl_app:PASSWORD@loopctl-db.flycast:5433/loopctl?sslmode=disable (port 5433 = direct, 5432 = PgBouncer)",
+    "ADMIN_DATABASE_URL: same but with loopctl_admin role",
+    "Dockerfile: add Node.js to builder stage for esbuild/tailwind asset compilation (was API-only before US-18.1)",
+    "fly.toml session affinity: [http_service.http_options] h2_backend = false; [http_service.session_affinity] = { type = 'by_header', ttl = 3600 }",
+    "GitHub Actions deploy step: uses superfly/flyctl-actions/setup-flyctl@master then 'flyctl deploy --remote-only'",
+    "DNS: fly certs add loopctl.com, then CNAME loopctl.com → loopctl.fly.dev at registrar",
+    "The beelink docker-compose setup stays as-is — both deployment targets share the same codebase, only PORT and DATABASE_URL differ",
+    "Oban: ensure webhook delivery worker has outbound HTTP access (Fly allows this by default)",
+    "Consider fly scale memory 1024 if 512MB is insufficient with LiveView + API traffic"
   ],
   "dependencies": ["US-18.1"],
   "estimated_hours": 6
