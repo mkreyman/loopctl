@@ -1,4 +1,4 @@
-# Multi-stage Docker build for loopctl (API-only Phoenix app).
+# Multi-stage Docker build for loopctl (Phoenix app with LiveView assets).
 #
 # Based on these images:
 #   - https://hub.docker.com/r/hexpm/elixir/tags - for the build image
@@ -14,7 +14,7 @@ ARG RUNNER_IMAGE="docker.io/debian:${DEBIAN_VERSION}"
 
 FROM ${BUILDER_IMAGE} AS builder
 
-# install build dependencies (no nodejs/npm — loopctl is API-only, no assets)
+# install build dependencies (no nodejs/npm — esbuild and tailwind are standalone binaries)
 RUN apt-get update \
   && apt-get install -y --no-install-recommends build-essential git \
   && rm -rf /var/lib/apt/lists/*
@@ -42,9 +42,13 @@ RUN mix deps.compile
 
 COPY priv priv
 COPY lib lib
+COPY assets assets
 
 # Compile the release
 RUN mix compile
+
+# Build assets (esbuild + tailwind are standalone binaries — no Node.js needed)
+RUN mix assets.deploy
 
 # Changes to config/runtime.exs don't require recompiling the code
 COPY config/runtime.exs config/
@@ -73,6 +77,8 @@ RUN chown nobody /app
 
 # set runner ENV
 ENV MIX_ENV="prod"
+ENV PORT=8080
+EXPOSE 8080
 
 # Only copy the final release from the build stage
 COPY --from=builder --chown=nobody:root /app/_build/${MIX_ENV}/rel/loopctl ./
