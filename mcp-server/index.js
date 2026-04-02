@@ -16,7 +16,7 @@ import {
 // ---------------------------------------------------------------------------
 
 function getBaseUrl() {
-  return process.env.LOOPCTL_SERVER || "https://loopctl.com";
+  return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
 }
 
 /**
@@ -39,6 +39,10 @@ async function apiCall(method, path, body, keyOverride) {
   const url = `${getBaseUrl()}${path}`;
   const key = resolveKey(keyOverride);
 
+  if (!key) {
+    return { error: true, status: 0, body: "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY." };
+  }
+
   const options = {
     method,
     headers: {
@@ -46,13 +50,23 @@ async function apiCall(method, path, body, keyOverride) {
       "Content-Type": "application/json",
       Accept: "application/json",
     },
+    signal: AbortSignal.timeout(30_000),
   };
 
   if (body !== undefined && body !== null) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (err) {
+    return { error: true, status: 0, body: `Network error: ${err.message}` };
+  }
+
+  if (response.status === 204) {
+    return { ok: true };
+  }
 
   let responseBody;
   const contentType = response.headers.get("content-type") || "";
@@ -63,11 +77,11 @@ async function apiCall(method, path, body, keyOverride) {
   }
 
   if (!response.ok) {
-    return {
-      error: true,
-      status: response.status,
-      body: responseBody,
-    };
+    let errorBody = responseBody;
+    if (typeof errorBody === "string" && errorBody.length > 500) {
+      errorBody = errorBody.replace(/<[^>]+>/g, " ").trim().slice(0, 500) + "... (truncated)";
+    }
+    return { error: true, status: response.status, body: errorBody };
   }
 
   return responseBody;
@@ -382,11 +396,11 @@ const TOOLS = [
           description: "Filter by epic UUID.",
         },
         limit: {
-          type: "number",
+          type: "integer",
           description: "Maximum number of stories to return.",
         },
         offset: {
-          type: "number",
+          type: "integer",
           description: "Number of stories to skip (for pagination).",
         },
       },
@@ -405,7 +419,7 @@ const TOOLS = [
           description: "The UUID of the project.",
         },
         limit: {
-          type: "number",
+          type: "integer",
           description: "Maximum number of stories to return.",
         },
       },
@@ -446,7 +460,7 @@ const TOOLS = [
           description: "Must match the story's title exactly (anti-confusion check).",
         },
         ac_count: {
-          type: "number",
+          type: "integer",
           description: "Must match the number of acceptance criteria in the story.",
         },
       },
@@ -545,15 +559,15 @@ const TOOLS = [
             "The type of review conducted (e.g. enhanced_6_agent, single_reviewer, orchestrator).",
         },
         findings_count: {
-          type: "number",
+          type: "integer",
           description: "Optional: number of findings from the review.",
         },
         fixes_count: {
-          type: "number",
+          type: "integer",
           description: "Number of fixes applied. fixes_count + disproved_count must equal findings_count.",
         },
         disproved_count: {
-          type: "number",
+          type: "integer",
           description: "Number of findings disproved as false positives. fixes_count + disproved_count must equal findings_count.",
         },
         summary: {
@@ -780,4 +794,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ---------------------------------------------------------------------------
 
 const transport = new StdioServerTransport();
-await server.connect(transport);
+await server.connect(transport).catch((err) => {
+  process.stderr.write(`loopctl MCP server failed to start: ${err.message}\n`);
+  process.exit(1);
+});

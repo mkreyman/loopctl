@@ -8,6 +8,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: mcp-server
@@ -19,8 +22,13 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Sync version from tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/mcp-v}"
+          npm version "$VERSION" --no-git-tag-version
+
       - run: npm install
 
-      - run: npm publish
+      - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

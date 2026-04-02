@@ -24,13 +24,16 @@
     "directory": "mcp-server"
   },
   "homepage": "https://loopctl.com",
+  "author": "Mark Kreyman",
   "license": "MIT",
+  "exports": "./index.js",
   "engines": {
     "node": ">=18"
   },
   "files": [
     "index.js",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0"

@@ -62,7 +62,6 @@ Or if installed locally:
 | `LOOPCTL_API_KEY` | Global API key override (if set, always used) | -- |
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (verify, reject, review, import) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
-| `LOOPCTL_REVIEWER_KEY` | Reviewer role API key (if separate from orchestrator) | -- |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
