@@ -1,0 +1,51 @@
+<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3451a1;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#1e1b4b;stop-opacity:0.1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="#0b0e14"/>
+
+  <!-- Subtle accent glow -->
+  <ellipse cx="900" cy="200" rx="400" ry="300" fill="url(#accent)"/>
+
+  <!-- Grid pattern (terminal aesthetic) -->
+  <g stroke="#2a2d36" stroke-width="0.5" opacity="0.4">
+    <line x1="0" y1="0" x2="0" y2="630"/>
+    <line x1="120" y1="0" x2="120" y2="630"/>
+    <line x1="240" y1="0" x2="240" y2="630"/>
+    <line x1="360" y1="0" x2="360" y2="630"/>
+    <line x1="480" y1="0" x2="480" y2="630"/>
+    <line x1="600" y1="0" x2="600" y2="630"/>
+    <line x1="720" y1="0" x2="720" y2="630"/>
+    <line x1="840" y1="0" x2="840" y2="630"/>
+    <line x1="960" y1="0" x2="960" y2="630"/>
+    <line x1="1080" y1="0" x2="1080" y2="630"/>
+    <line x1="0" y1="126" x2="1200" y2="126"/>
+    <line x1="0" y1="252" x2="1200" y2="252"/>
+    <line x1="0" y1="378" x2="1200" y2="378"/>
+    <line x1="0" y1="504" x2="1200" y2="504"/>
+  </g>
+
+  <!-- Logo -->
+  <text x="80" y="220" font-family="monospace" font-size="72" font-weight="700" fill="#e8eaf0">loopctl</text>
+
+  <!-- Accent bar -->
+  <rect x="80" y="240" width="60" height="4" rx="2" fill="#3451a1"/>
+
+  <!-- Tagline -->
+  <text x="80" y="290" font-family="system-ui, sans-serif" font-size="32" fill="#b4b8c7">Structural trust for AI development loops</text>
+
+  <!-- Subtext -->
+  <text x="80" y="370" font-family="system-ui, sans-serif" font-size="22" fill="#5a5f72">Chain-of-custody verification  &#xb7;  Review enforcement  &#xb7;  Progress tracking</text>
+
+  <!-- Bottom info -->
+  <text x="80" y="540" font-family="monospace" font-size="18" fill="#5a5f72">loopctl.com</text>
+  <text x="280" y="540" font-family="monospace" font-size="18" fill="#3d4150">&#xb7;</text>
+  <text x="310" y="540" font-family="monospace" font-size="18" fill="#5a5f72">Free and open source</text>
+  <text x="600" y="540" font-family="monospace" font-size="18" fill="#3d4150">&#xb7;</text>
+  <text x="630" y="540" font-family="monospace" font-size="18" fill="#5a5f72">Built with Elixir and Phoenix</text>
+</svg>
