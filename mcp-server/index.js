@@ -61,7 +61,11 @@ async function apiCall(method, path, body, keyOverride) {
   try {
     response = await fetch(url, options);
   } catch (err) {
-    return { error: true, status: 0, body: `Network error: ${err.message}` };
+    if (err.name === "TimeoutError") {
+      return { error: true, status: 0, body: "Request timed out after 30s" };
+    }
+    const cause = err.cause?.message ? ` (${err.cause.message})` : "";
+    return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
   }
 
   if (response.status === 204) {
@@ -73,13 +77,24 @@ async function apiCall(method, path, body, keyOverride) {
   if (contentType.includes("application/json")) {
     responseBody = await response.json();
   } else {
-    responseBody = await response.text();
+    const text = await response.text();
+    try {
+      responseBody = JSON.parse(text);
+    } catch {
+      responseBody = text;
+    }
   }
 
   if (!response.ok) {
     let errorBody = responseBody;
     if (typeof errorBody === "string" && errorBody.length > 500) {
-      errorBody = errorBody.replace(/<[^>]+>/g, " ").trim().slice(0, 500) + "... (truncated)";
+      errorBody = errorBody
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 500) + "... (truncated)";
     }
     return { error: true, status: response.status, body: errorBody };
   }
@@ -88,6 +103,7 @@ async function apiCall(method, path, body, keyOverride) {
 }
 
 function toContent(result) {
+  const isErr = result && result.error === true;
   return {
     content: [
       {
@@ -95,6 +111,7 @@ function toContent(result) {
         text: JSON.stringify(result, null, 2),
       },
     ],
+    ...(isErr && { isError: true }),
   };
 }
 
