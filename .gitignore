@@ -14,5 +14,8 @@ erl_crash.dump
 .env
 deploy/certs/
 
+# MCP server
+mcp-server/node_modules/
+
 # Generated assets (built by esbuild/tailwind)
 /priv/static/assets/

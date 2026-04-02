@@ -1,13 +1,41 @@
 {
-  "name": "loopctl-mcp",
+  "name": "loopctl-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server wrapping the loopctl REST API for Claude Code agents",
+  "description": "MCP server for loopctl — structural trust for AI development loops",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "loopctl-mcp-server": "index.js"
+  },
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "claude-code",
+    "loopctl",
+    "model-context-protocol",
+    "ai-development"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mkreyman/loopctl.git",
+    "directory": "mcp-server"
+  },
+  "homepage": "https://loopctl.com",
+  "author": "Mark Kreyman",
+  "license": "MIT",
+  "exports": "./index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest"
+    "@modelcontextprotocol/sdk": "^1.28.0"
   }
 }
