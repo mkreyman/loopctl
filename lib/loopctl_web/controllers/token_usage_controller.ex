@@ -98,7 +98,8 @@ defmodule LoopctlWeb.TokenUsageController do
     tenant_id = api_key.tenant_id
     story_id = params["story_id"]
 
-    with {:ok, story_id} <- require_story_id(story_id),
+    with {:ok, _} <- require_agent_id(api_key.agent_id),
+         {:ok, story_id} <- require_story_id(story_id),
          {:ok, story} <- Stories.get_story(tenant_id, story_id) do
       do_create(conn, tenant_id, api_key, story, params)
     end
@@ -188,6 +189,13 @@ defmodule LoopctlWeb.TokenUsageController do
       report_count: totals.report_count
     }
   end
+
+  defp require_agent_id(nil),
+    do:
+      {:error, :unprocessable_entity,
+       "API key must be associated with an agent to report token usage"}
+
+  defp require_agent_id(agent_id), do: {:ok, agent_id}
 
   defp require_story_id(nil), do: {:error, :unprocessable_entity, "story_id is required"}
   defp require_story_id(story_id), do: {:ok, story_id}
