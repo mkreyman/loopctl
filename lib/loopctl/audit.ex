@@ -217,10 +217,9 @@ defmodule Loopctl.Audit do
 
   Used by the story history shortcut endpoint and similar entity history views.
 
-  Currently returns only direct audit entries for the given entity. It does
-  not include entries for related entities (e.g., artifact_reports or
-  verification_results referencing a story_id). Cross-entity history
-  requires schemas from Epics 6-8.
+  For `entity_type = "story"`, also includes token_usage_report audit entries
+  where `metadata->>'story_id' = entity_id`, interleaved chronologically.
+  This satisfies AC-21.8.6 (token usage events in story timeline).
 
   ## Options
 
@@ -240,13 +239,7 @@ defmodule Loopctl.Audit do
     page_size = opts |> Keyword.get(:page_size, 100) |> max(1) |> min(100)
     offset = (page - 1) * page_size
 
-    # NOTE(Epics 6-8): When artifact_reports and verification_results
-    # schemas with story_id references are added, extend this query to
-    # include related entity entries via UNION or OR-based entity_id matching.
-    base_query =
-      AuditLog
-      |> where([a], a.tenant_id == ^tenant_id)
-      |> where([a], a.entity_type == ^entity_type and a.entity_id == ^entity_id)
+    base_query = build_entity_history_query(tenant_id, entity_type, entity_id)
 
     total = AdminRepo.aggregate(base_query, :count, :id)
 
@@ -258,6 +251,25 @@ defmodule Loopctl.Audit do
       |> AdminRepo.all()
 
     {:ok, %{data: entries, total: total, page: page, page_size: page_size}}
+  end
+
+  # Builds the history query for an entity. For "story" entities, expands the
+  # query to include related token_usage_report entries via metadata->>'story_id'.
+  defp build_entity_history_query(tenant_id, "story", entity_id) do
+    AuditLog
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where(
+      [a],
+      (a.entity_type == "story" and a.entity_id == ^entity_id) or
+        (a.entity_type == "token_usage_report" and
+           fragment("?->>'story_id' = ?", a.metadata, ^entity_id))
+    )
+  end
+
+  defp build_entity_history_query(tenant_id, entity_type, entity_id) do
+    AuditLog
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> where([a], a.entity_type == ^entity_type and a.entity_id == ^entity_id)
   end
 
   # --- Private filter helpers ---

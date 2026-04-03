@@ -243,8 +243,11 @@ defmodule Loopctl.TokenUsageTest do
       audit = hd(result.data)
       assert audit.entity_type == "token_usage_report"
       assert audit.action == "created"
-      assert audit.new_state["input_tokens"] == 1000
+
+      # AC-21.8.1: new_state contains story_id, agent_id, model_name, cost_millicents, total_tokens
       assert audit.new_state["model_name"] == "claude-opus-4"
+      assert audit.new_state["total_tokens"] == 1500
+      assert audit.new_state["cost_millicents"] == 2500
     end
 
     test "accepts string keys in attrs" do

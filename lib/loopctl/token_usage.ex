@@ -88,7 +88,7 @@ defmodule Loopctl.TokenUsage do
         # Refetch to populate the DB-generated total_tokens column
         report = AdminRepo.get!(Report, report.id)
 
-        # Audit log the creation
+        # Audit log the creation (also serves as the change feed entry for AC-21.8.1)
         Audit.create_log_entry(tenant_id, %{
           entity_type: "token_usage_report",
           entity_id: report.id,
@@ -96,15 +96,20 @@ defmodule Loopctl.TokenUsage do
           actor_type: Keyword.get(opts, :actor_type, "api_key"),
           actor_id: Keyword.get(opts, :actor_id),
           actor_label: Keyword.get(opts, :actor_label),
+          project_id: report.project_id,
           new_state: %{
             "story_id" => report.story_id,
             "agent_id" => report.agent_id,
-            "project_id" => report.project_id,
-            "input_tokens" => report.input_tokens,
-            "output_tokens" => report.output_tokens,
             "model_name" => report.model_name,
             "cost_millicents" => report.cost_millicents,
-            "phase" => report.phase
+            "total_tokens" => report.total_tokens
+          },
+          metadata: %{
+            "story_id" => report.story_id,
+            "agent_id" => report.agent_id,
+            "model_name" => report.model_name,
+            "cost_millicents" => report.cost_millicents,
+            "total_tokens" => report.total_tokens
           }
         })
 
