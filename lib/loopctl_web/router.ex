@@ -209,6 +209,10 @@ defmodule LoopctlWeb.Router do
     resources "/token-budgets", TokenBudgetController,
       only: [:create, :index, :show, :update, :delete]
 
+    # Cost anomalies (Epic 21)
+    get "/cost-anomalies", CostAnomalyController, :index
+    patch "/cost-anomalies/:id", CostAnomalyController, :update
+
     # Skill results
     post "/skill_results", SkillResultController, :create
   end

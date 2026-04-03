@@ -69,6 +69,9 @@ config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 # DI: Use mock clock in tests
 config :loopctl, :clock, Loopctl.MockClock
 
+# DI: Use mock cost rollup in tests
+config :loopctl, :cost_rollup, Loopctl.MockCostRollup
+
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 
