@@ -368,7 +368,7 @@ defmodule Loopctl.TokenUsage do
       |> offset(^offset)
       |> AdminRepo.all()
 
-    budgets_with_spend = Enum.map(budgets, &attach_spend(tenant_id, &1))
+    budgets_with_spend = batch_attach_spend(tenant_id, budgets)
 
     {:ok, %{data: budgets_with_spend, total: total, page: page, page_size: page_size}}
   end
@@ -596,14 +596,25 @@ defmodule Loopctl.TokenUsage do
   defp validate_scope_entity(_tenant_id, _scope_type, nil), do: :ok
 
   defp validate_scope_entity(tenant_id, scope_type, scope_id) do
-    scope_type
-    |> to_scope_atom()
-    |> scope_schema()
-    |> check_entity_exists(scope_id, tenant_id)
+    case to_scope_atom(scope_type) do
+      nil ->
+        # Unknown scope type — skip entity validation, let changeset catch it
+        :ok
+
+      atom_type ->
+        atom_type
+        |> scope_schema()
+        |> check_entity_exists(scope_id, tenant_id)
+    end
   end
 
-  defp to_scope_atom(st) when is_binary(st), do: String.to_existing_atom(st)
-  defp to_scope_atom(st) when is_atom(st), do: st
+  @known_scope_types ~w(project epic story)
+  defp to_scope_atom(st) when is_binary(st) do
+    if st in @known_scope_types, do: String.to_existing_atom(st), else: nil
+  end
+
+  defp to_scope_atom(st) when st in [:project, :epic, :story], do: st
+  defp to_scope_atom(_), do: nil
 
   defp scope_schema(:project), do: Project
   defp scope_schema(:epic), do: Epic
@@ -653,23 +664,63 @@ defmodule Loopctl.TokenUsage do
     |> select([r], coalesce(sum(r.cost_millicents), 0))
   end
 
-  defp attach_spend(tenant_id, %Budget{} = budget) do
-    spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
-    remaining = max(budget.budget_millicents - spend, 0)
+  # Batch computes spend for all budgets in at most 3 queries (one per scope type)
+  # instead of N individual queries (N+1 pattern).
+  defp batch_attach_spend(tenant_id, budgets) do
+    spend_map =
+      budgets
+      |> Enum.group_by(& &1.scope_type)
+      |> Enum.flat_map(fn {scope_type, scope_budgets} ->
+        scope_ids = Enum.map(scope_budgets, & &1.scope_id)
+        batch_spend_query(tenant_id, scope_type, scope_ids)
+      end)
+      |> Map.new()
 
-    %{
-      budget: budget,
-      current_spend_millicents: spend,
-      remaining_millicents: remaining
-    }
+    Enum.map(budgets, fn budget ->
+      spend = Map.get(spend_map, {budget.scope_type, budget.scope_id}, 0)
+      remaining = max(budget.budget_millicents - spend, 0)
+
+      %{
+        budget: budget,
+        current_spend_millicents: spend,
+        remaining_millicents: remaining
+      }
+    end)
   end
 
-  defp get_explicit_budget(tenant_id, scope_type, scope_id) do
-    scope_type_string = to_string(scope_type)
+  defp batch_spend_query(tenant_id, :story, scope_ids) do
+    Report
+    |> where([r], r.tenant_id == ^tenant_id and r.story_id in ^scope_ids)
+    |> group_by([r], r.story_id)
+    |> select([r], {r.story_id, coalesce(sum(r.cost_millicents), 0)})
+    |> AdminRepo.all()
+    |> Enum.map(fn {scope_id, spend} -> {{:story, scope_id}, decimal_to_int(spend)} end)
+  end
 
+  defp batch_spend_query(tenant_id, :epic, scope_ids) do
+    Report
+    |> join(:inner, [r], s in Story, on: r.story_id == s.id)
+    |> where([r, s], r.tenant_id == ^tenant_id and s.epic_id in ^scope_ids)
+    |> group_by([r, s], s.epic_id)
+    |> select([r, s], {s.epic_id, coalesce(sum(r.cost_millicents), 0)})
+    |> AdminRepo.all()
+    |> Enum.map(fn {scope_id, spend} -> {{:epic, scope_id}, decimal_to_int(spend)} end)
+  end
+
+  defp batch_spend_query(tenant_id, :project, scope_ids) do
+    Report
+    |> where([r], r.tenant_id == ^tenant_id and r.project_id in ^scope_ids)
+    |> group_by([r], r.project_id)
+    |> select([r], {r.project_id, coalesce(sum(r.cost_millicents), 0)})
+    |> AdminRepo.all()
+    |> Enum.map(fn {scope_id, spend} -> {{:project, scope_id}, decimal_to_int(spend)} end)
+  end
+
+  defp get_explicit_budget(tenant_id, scope_type, scope_id)
+       when scope_type in [:project, :epic, :story] do
     case AdminRepo.get_by(Budget,
            tenant_id: tenant_id,
-           scope_type: scope_type_string,
+           scope_type: scope_type,
            scope_id: scope_id
          ) do
       nil -> :none
@@ -710,10 +761,6 @@ defmodule Loopctl.TokenUsage do
   defp resolve_inherited_budget(tenant_id, :project, _scope_id) do
     # Project -> tenant default
     check_tenant_default(tenant_id)
-  end
-
-  defp resolve_inherited_budget(_tenant_id, _scope_type, _scope_id) do
-    {:ok, nil}
   end
 
   defp check_tenant_default(tenant_id) do
