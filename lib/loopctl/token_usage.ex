@@ -867,18 +867,45 @@ defmodule Loopctl.TokenUsage do
   @doc """
   Marks a cost anomaly as resolved.
 
+  ## Options (keyword list)
+
+  - `:actor_id` -- audit actor ID
+  - `:actor_label` -- audit actor label
+  - `:actor_type` -- audit actor type (default "api_key")
+
   ## Returns
 
   - `{:ok, %CostAnomaly{}}` on success
   - `{:error, :not_found}` if anomaly not found
   """
-  @spec resolve_anomaly(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec resolve_anomaly(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, CostAnomaly.t()} | {:error, :not_found}
-  def resolve_anomaly(tenant_id, anomaly_id) do
+  def resolve_anomaly(tenant_id, anomaly_id, opts \\ []) do
     with {:ok, anomaly} <- get_anomaly(tenant_id, anomaly_id) do
-      anomaly
-      |> CostAnomaly.resolve_changeset()
-      |> AdminRepo.update()
+      changeset = CostAnomaly.resolve_changeset(anomaly)
+
+      multi =
+        Multi.new()
+        |> Multi.update(:anomaly, changeset)
+        |> Audit.log_in_multi(:audit, fn %{anomaly: resolved} ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "cost_anomaly",
+            entity_id: resolved.id,
+            action: "resolved",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            old_state: %{"resolved" => false},
+            new_state: %{"resolved" => true}
+          }
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{anomaly: anomaly}} -> {:ok, anomaly}
+        {:error, :anomaly, changeset, _} -> {:error, changeset}
+        {:error, _step, error, _} -> {:error, error}
+      end
     end
   end
 

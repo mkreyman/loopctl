@@ -97,6 +97,7 @@ defmodule Loopctl.Workers.CostRollupWorker do
         on_conflict:
           {:replace,
            [
+             :period_end,
              :total_input_tokens,
              :total_output_tokens,
              :total_cost_millicents,

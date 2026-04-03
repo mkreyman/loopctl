@@ -104,7 +104,13 @@ defmodule LoopctlWeb.CostAnomalyController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    with {:ok, anomaly} <- TokenUsage.resolve_anomaly(tenant_id, id) do
+    audit_opts = [
+      actor_id: api_key.id,
+      actor_label: api_key.name,
+      actor_type: "api_key"
+    ]
+
+    with {:ok, anomaly} <- TokenUsage.resolve_anomaly(tenant_id, id, audit_opts) do
       json(conn, %{
         cost_anomaly: %{
           id: anomaly.id,
