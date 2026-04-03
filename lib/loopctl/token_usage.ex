@@ -634,7 +634,11 @@ defmodule Loopctl.TokenUsage do
   defp apply_budget_filter(query, _field, ""), do: query
 
   defp apply_budget_filter(query, :scope_type, value) when is_binary(value) do
-    where(query, [b], b.scope_type == ^value)
+    # Convert string to atom for Ecto.Enum compatibility; unknown values return no results
+    case to_scope_atom(value) do
+      nil -> where(query, [_b], false)
+      atom_val -> where(query, [b], b.scope_type == ^atom_val)
+    end
   end
 
   defp apply_budget_filter(query, :scope_type, value) when is_atom(value) do
