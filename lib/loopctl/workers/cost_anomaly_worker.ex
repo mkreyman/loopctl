@@ -24,6 +24,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
@@ -137,14 +138,38 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       })
       |> AdminRepo.update!()
     else
-      %CostAnomaly{tenant_id: tenant_id, story_id: story_id}
-      |> CostAnomaly.create_changeset(%{
-        anomaly_type: anomaly_type,
-        story_cost_millicents: story_cost,
-        reference_avg_millicents: epic_avg,
-        deviation_factor: Decimal.round(factor, 2)
+      anomaly =
+        %CostAnomaly{tenant_id: tenant_id, story_id: story_id}
+        |> CostAnomaly.create_changeset(%{
+          anomaly_type: anomaly_type,
+          story_cost_millicents: story_cost,
+          reference_avg_millicents: epic_avg,
+          deviation_factor: Decimal.round(factor, 2)
+        })
+        |> AdminRepo.insert!()
+
+      # Emit change feed + audit log entry for the newly detected anomaly (AC-21.8.3, AC-21.8.5)
+      Audit.create_log_entry(tenant_id, %{
+        entity_type: "cost_anomaly",
+        entity_id: anomaly.id,
+        action: "detected",
+        actor_type: "system",
+        new_state: %{
+          "anomaly_type" => to_string(anomaly.anomaly_type),
+          "story_id" => anomaly.story_id,
+          "deviation_factor" => Decimal.to_string(anomaly.deviation_factor),
+          "story_cost_millicents" => anomaly.story_cost_millicents,
+          "reference_avg_millicents" => anomaly.reference_avg_millicents
+        },
+        metadata: %{
+          "anomaly_id" => anomaly.id,
+          "story_id" => anomaly.story_id,
+          "anomaly_type" => to_string(anomaly.anomaly_type),
+          "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
+        }
       })
-      |> AdminRepo.insert!()
+
+      anomaly
     end
   end
 
