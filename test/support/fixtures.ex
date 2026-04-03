@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.TokenUsage.Report, as: TokenUsageReport
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
@@ -246,6 +247,21 @@ defmodule Loopctl.Fixtures do
       %{
         guide_reference: "docs/user_guides/test_guide_#{System.unique_integer([:positive])}.md",
         started_at: DateTime.utc_now()
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:token_usage_report, attrs) do
+    Map.merge(
+      %{
+        input_tokens: 1000,
+        output_tokens: 500,
+        model_name: "claude-opus-4",
+        cost_millicents: 2500,
+        phase: "implementing",
+        session_id: nil,
+        metadata: %{}
       },
       Enum.into(attrs, %{})
     )
@@ -541,6 +557,59 @@ defmodule Loopctl.Fixtures do
         orchestrator_agent_id: orchestrator_agent_id
       }
       |> VerificationResult.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:token_usage_report, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {story, attrs} =
+      case Map.get(attrs, :story_id) do
+        nil ->
+          story = fixture(:story, %{tenant_id: tenant_id})
+          attrs = Map.put(attrs, :story_id, story.id)
+          attrs = Map.put_new(attrs, :project_id, story.project_id)
+          {story, attrs}
+
+        sid ->
+          story = AdminRepo.get!(Story, sid)
+          attrs = Map.put_new(attrs, :project_id, story.project_id)
+          {story, attrs}
+      end
+
+    {agent_id, attrs} =
+      case Map.get(attrs, :agent_id) do
+        nil ->
+          agent = fixture(:agent, %{tenant_id: tenant_id})
+          {agent.id, Map.put(attrs, :agent_id, agent.id)}
+
+        aid ->
+          {aid, attrs}
+      end
+
+    project_id = Map.get(attrs, :project_id, story.project_id)
+
+    data = build(:token_usage_report, attrs)
+
+    changeset =
+      %TokenUsageReport{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        agent_id: agent_id,
+        project_id: project_id
+      }
+      |> TokenUsageReport.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
