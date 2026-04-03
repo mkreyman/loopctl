@@ -77,6 +77,11 @@ defmodule Loopctl.DataCase do
       DateTime.utc_now()
     end)
 
+    # Default stub for cost rollup -- returns empty results
+    Mox.stub(Loopctl.MockCostRollup, :aggregate, fn _tenant_id, _start, _end ->
+      {:ok, []}
+    end)
+
     # Default Req.Test stub for webhook delivery -- allows Oban inline mode
     # to process delivery jobs without test-specific HTTP stub setup.
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->

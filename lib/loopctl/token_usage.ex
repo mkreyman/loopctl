@@ -38,6 +38,7 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget
+  alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.Report
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -789,5 +790,181 @@ defmodule Loopctl.TokenUsage do
       _ ->
         false
     end)
+  end
+
+  # --- Cost Anomaly functions ---
+
+  @doc """
+  Lists unresolved cost anomalies for a tenant with filtering and pagination.
+
+  Results include the story title and agent name for display purposes.
+
+  ## Options
+
+  - `:anomaly_type` -- filter by anomaly type (`:high_cost`, `:suspiciously_low`, `:budget_exceeded`)
+  - `:project_id` -- filter by project UUID
+  - `:resolved` -- filter by resolved status (default: false)
+  - `:page` -- page number (default 1)
+  - `:page_size` -- entries per page (default 20, max 100)
+
+  ## Returns
+
+  `{:ok, %{data: [map()], total: integer, page: integer, page_size: integer}}`
+  """
+  @spec list_anomalies(Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             data: [map()],
+             total: non_neg_integer(),
+             page: pos_integer(),
+             page_size: pos_integer()
+           }}
+  def list_anomalies(tenant_id, opts \\ []) do
+    page = max(Keyword.get(opts, :page, 1), 1)
+    page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
+    offset = (page - 1) * page_size
+    resolved = Keyword.get(opts, :resolved, false)
+
+    base_query =
+      CostAnomaly
+      |> where([a], a.tenant_id == ^tenant_id)
+      |> where([a], a.resolved == ^resolved)
+      |> apply_anomaly_filter(:anomaly_type, Keyword.get(opts, :anomaly_type))
+      |> apply_anomaly_filter(:project_id, Keyword.get(opts, :project_id), tenant_id)
+
+    total = AdminRepo.aggregate(base_query, :count, :id)
+
+    anomalies =
+      base_query
+      |> order_by([a], desc: a.inserted_at)
+      |> limit(^page_size)
+      |> offset(^offset)
+      |> AdminRepo.all()
+      |> AdminRepo.preload(story: [:assigned_agent])
+
+    data = Enum.map(anomalies, &format_anomaly/1)
+
+    {:ok, %{data: data, total: total, page: page, page_size: page_size}}
+  end
+
+  @doc """
+  Gets a single cost anomaly by ID, scoped to a tenant.
+
+  ## Returns
+
+  - `{:ok, %CostAnomaly{}}` if found
+  - `{:error, :not_found}` if not found or wrong tenant
+  """
+  @spec get_anomaly(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, CostAnomaly.t()} | {:error, :not_found}
+  def get_anomaly(tenant_id, anomaly_id) do
+    case AdminRepo.get_by(CostAnomaly, id: anomaly_id, tenant_id: tenant_id) do
+      nil -> {:error, :not_found}
+      anomaly -> {:ok, anomaly}
+    end
+  end
+
+  @doc """
+  Marks a cost anomaly as resolved.
+
+  ## Options (keyword list)
+
+  - `:actor_id` -- audit actor ID
+  - `:actor_label` -- audit actor label
+  - `:actor_type` -- audit actor type (default "api_key")
+
+  ## Returns
+
+  - `{:ok, %CostAnomaly{}}` on success
+  - `{:error, :not_found}` if anomaly not found
+  """
+  @spec resolve_anomaly(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, CostAnomaly.t()} | {:error, :not_found}
+  def resolve_anomaly(tenant_id, anomaly_id, opts \\ []) do
+    with {:ok, anomaly} <- get_anomaly(tenant_id, anomaly_id) do
+      changeset = CostAnomaly.resolve_changeset(anomaly)
+
+      multi =
+        Multi.new()
+        |> Multi.update(:anomaly, changeset)
+        |> Audit.log_in_multi(:audit, fn %{anomaly: resolved} ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "cost_anomaly",
+            entity_id: resolved.id,
+            action: "resolved",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            old_state: %{"resolved" => false},
+            new_state: %{"resolved" => true}
+          }
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{anomaly: anomaly}} -> {:ok, anomaly}
+        {:error, :anomaly, changeset, _} -> {:error, changeset}
+        {:error, _step, error, _} -> {:error, error}
+      end
+    end
+  end
+
+  # --- Anomaly private helpers ---
+
+  defp apply_anomaly_filter(query, _field, nil), do: query
+  defp apply_anomaly_filter(query, _field, ""), do: query
+
+  defp apply_anomaly_filter(query, :anomaly_type, value) when is_binary(value) do
+    known = ~w(high_cost suspiciously_low budget_exceeded)
+
+    if value in known do
+      atom_val = String.to_existing_atom(value)
+      where(query, [a], a.anomaly_type == ^atom_val)
+    else
+      where(query, [_a], false)
+    end
+  end
+
+  defp apply_anomaly_filter(query, :anomaly_type, value) when is_atom(value) do
+    where(query, [a], a.anomaly_type == ^value)
+  end
+
+  defp apply_anomaly_filter(query, :project_id, nil, _tenant_id), do: query
+  defp apply_anomaly_filter(query, :project_id, "", _tenant_id), do: query
+
+  defp apply_anomaly_filter(query, :project_id, project_id, _tenant_id) do
+    query
+    |> join(:inner, [a], s in Story, on: a.story_id == s.id)
+    |> where([_a, s], s.project_id == ^project_id)
+  end
+
+  defp format_anomaly(%CostAnomaly{} = anomaly) do
+    story_title =
+      if Ecto.assoc_loaded?(anomaly.story),
+        do: anomaly.story.title,
+        else: nil
+
+    agent_name =
+      if Ecto.assoc_loaded?(anomaly.story) and
+           anomaly.story.assigned_agent != nil and
+           Ecto.assoc_loaded?(anomaly.story.assigned_agent),
+         do: anomaly.story.assigned_agent.name,
+         else: nil
+
+    %{
+      id: anomaly.id,
+      tenant_id: anomaly.tenant_id,
+      story_id: anomaly.story_id,
+      story_title: story_title,
+      agent_name: agent_name,
+      anomaly_type: anomaly.anomaly_type,
+      story_cost_millicents: anomaly.story_cost_millicents,
+      reference_avg_millicents: anomaly.reference_avg_millicents,
+      deviation_factor: anomaly.deviation_factor,
+      resolved: anomaly.resolved,
+      metadata: anomaly.metadata,
+      inserted_at: anomaly.inserted_at,
+      updated_at: anomaly.updated_at
+    }
   end
 end

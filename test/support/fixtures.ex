@@ -24,6 +24,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
+  alias Loopctl.TokenUsage.CostAnomaly
+  alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report, as: TokenUsageReport
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -282,6 +284,37 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  def build(:cost_summary, attrs) do
+    Map.merge(
+      %{
+        scope_type: :project,
+        period_start: Date.add(Date.utc_today(), -1),
+        period_end: Date.add(Date.utc_today(), -1),
+        total_input_tokens: 10_000,
+        total_output_tokens: 5_000,
+        total_cost_millicents: 25_000,
+        report_count: 10,
+        model_breakdown: %{},
+        avg_cost_per_story_millicents: 2_500
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:cost_anomaly, attrs) do
+    Map.merge(
+      %{
+        anomaly_type: :high_cost,
+        story_cost_millicents: 75_000,
+        reference_avg_millicents: 25_000,
+        deviation_factor: Decimal.new("3.0"),
+        resolved: false,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   def build(:review_record, attrs) do
     Map.merge(
       %{
@@ -445,6 +478,7 @@ defmodule Loopctl.Fixtures do
     # Handle optional status overrides
     agent_status = Map.get(attrs, :agent_status, :pending)
     verified_status = Map.get(attrs, :verified_status, :unverified)
+    assigned_agent_id = Map.get(attrs, :assigned_agent_id)
 
     data = build(:story, attrs)
 
@@ -454,14 +488,7 @@ defmodule Loopctl.Fixtures do
 
     story = AdminRepo.insert!(changeset)
 
-    # Apply status overrides if non-default
-    if agent_status != :pending or verified_status != :unverified do
-      story
-      |> Ecto.Changeset.change(%{agent_status: agent_status, verified_status: verified_status})
-      |> AdminRepo.update!()
-    else
-      story
-    end
+    apply_story_overrides(story, agent_status, verified_status, assigned_agent_id)
   end
 
   def fixture(:epic_dependency, attrs) do
@@ -674,6 +701,54 @@ defmodule Loopctl.Fixtures do
     changeset =
       %TokenBudget{tenant_id: tenant_id}
       |> TokenBudget.create_changeset(Map.put(data, :scope_id, scope_id))
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:cost_summary, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} = ensure_tenant(attrs)
+    scope_type = Map.get(attrs, :scope_type, :project)
+    {scope_id, attrs} = ensure_scope_entity(attrs, scope_type, tenant_id)
+
+    data = build(:cost_summary, attrs)
+
+    changeset =
+      %CostSummary{tenant_id: tenant_id}
+      |> CostSummary.changeset(Map.put(data, :scope_id, scope_id))
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:cost_anomaly, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {story_id, attrs} =
+      case Map.get(attrs, :story_id) do
+        nil ->
+          story = fixture(:story, %{tenant_id: tenant_id})
+          {story.id, Map.put(attrs, :story_id, story.id)}
+
+        sid ->
+          {sid, attrs}
+      end
+
+    data = build(:cost_anomaly, attrs)
+
+    changeset =
+      %CostAnomaly{tenant_id: tenant_id, story_id: story_id}
+      |> CostAnomaly.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
@@ -1034,4 +1109,60 @@ defmodule Loopctl.Fixtures do
   Generates a fresh binary UUID for use in tests.
   """
   def uuid, do: Ecto.UUID.generate()
+
+  # --- Private helpers ---
+
+  defp apply_story_overrides(story, :pending, :unverified, nil), do: story
+
+  defp apply_story_overrides(story, agent_status, verified_status, assigned_agent_id) do
+    overrides =
+      %{agent_status: agent_status, verified_status: verified_status}
+      |> maybe_put(:assigned_agent_id, assigned_agent_id)
+
+    story
+    |> Ecto.Changeset.change(overrides)
+    |> AdminRepo.update!()
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp ensure_tenant(attrs) do
+    case Map.get(attrs, :tenant_id) do
+      nil ->
+        tenant = fixture(:tenant)
+        {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+      tid ->
+        {tid, attrs}
+    end
+  end
+
+  defp ensure_scope_entity(%{scope_id: sid} = attrs, _scope_type, _tenant_id) do
+    {sid, attrs}
+  end
+
+  defp ensure_scope_entity(attrs, :project, tenant_id) do
+    entity = fixture(:project, %{tenant_id: tenant_id})
+    {entity.id, Map.put(attrs, :scope_id, entity.id)}
+  end
+
+  defp ensure_scope_entity(attrs, :epic, tenant_id) do
+    entity = fixture(:epic, %{tenant_id: tenant_id})
+    {entity.id, Map.put(attrs, :scope_id, entity.id)}
+  end
+
+  defp ensure_scope_entity(attrs, :agent, tenant_id) do
+    entity = fixture(:agent, %{tenant_id: tenant_id})
+    {entity.id, Map.put(attrs, :scope_id, entity.id)}
+  end
+
+  defp ensure_scope_entity(attrs, :story, tenant_id) do
+    entity = fixture(:story, %{tenant_id: tenant_id})
+    {entity.id, Map.put(attrs, :scope_id, entity.id)}
+  end
+
+  defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
+    {Ecto.UUID.generate(), attrs}
+  end
 end
