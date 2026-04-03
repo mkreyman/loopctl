@@ -61,7 +61,8 @@ defmodule Loopctl.ApiSpec do
         %Tag{name: "Import/Export", description: "Bulk import/export of project data"},
         %Tag{name: "Skills", description: "Skill versioning and performance tracking"},
         %Tag{name: "Admin", description: "Superadmin tenant management and system stats"},
-        %Tag{name: "Audit", description: "Immutable audit log and change feed"}
+        %Tag{name: "Audit", description: "Immutable audit log and change feed"},
+        %Tag{name: "Analytics", description: "Token usage analytics and cost trend queries"}
       ],
       paths: Paths.from_router(LoopctlWeb.Router),
       components: %Components{
