@@ -115,6 +115,32 @@ function toContent(result) {
   };
 }
 
+/**
+ * Compact variant for list endpoints — strips bulky fields (acceptance_criteria,
+ * description) from each story to stay within token limits. Callers can use
+ * get_story for full details on individual stories.
+ */
+function toContentCompact(result) {
+  if (result && result.error === true) return toContent(result);
+
+  if (result && Array.isArray(result.data)) {
+    const compact = {
+      ...result,
+      data: result.data.map(({ acceptance_criteria, description, ...rest }) => rest),
+    };
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(compact, null, 2),
+        },
+      ],
+    };
+  }
+
+  return toContent(result);
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -162,19 +188,19 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
-  if (limit != null) params.set("limit", String(limit));
+  params.set("limit", String(limit ?? 20));
   if (offset != null) params.set("offset", String(offset));
 
   const result = await apiCall("GET", `/api/v1/stories?${params}`);
-  return toContent(result);
+  return toContentCompact(result);
 }
 
 async function listReadyStories({ project_id, limit }) {
   const params = new URLSearchParams({ project_id });
-  if (limit != null) params.set("limit", String(limit));
+  params.set("limit", String(limit ?? 20));
 
   const result = await apiCall("GET", `/api/v1/stories/ready?${params}`);
-  return toContent(result);
+  return toContentCompact(result);
 }
 
 async function getStory({ story_id }) {
@@ -391,7 +417,9 @@ const TOOLS = [
   {
     name: "list_stories",
     description:
-      "List stories for a project, optionally filtered by agent_status, verified_status, or epic_id.",
+      "List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. " +
+      "Returns compact results (no acceptance_criteria/description) — use get_story for full details. " +
+      "Defaults to 20 stories per page; use limit/offset to paginate.",
     inputSchema: {
       type: "object",
       properties: {
@@ -427,7 +455,8 @@ const TOOLS = [
   {
     name: "list_ready_stories",
     description:
-      "List stories that are ready to be worked on (contracted, dependencies met). These are the stories an agent should pick up next.",
+      "List stories that are ready to be worked on (contracted, dependencies met). " +
+      "Returns compact results — use get_story for full details. Defaults to 20 per page.",
     inputSchema: {
       type: "object",
       properties: {
