@@ -66,7 +66,6 @@ defmodule Loopctl.TokenUsage do
     story_id = Map.get(attrs, :story_id)
     agent_id = Map.get(attrs, :agent_id)
     project_id = Map.get(attrs, :project_id)
-    skill_version_id = Map.get(attrs, :skill_version_id)
 
     changeset =
       %Report{
@@ -75,10 +74,13 @@ defmodule Loopctl.TokenUsage do
         agent_id: agent_id,
         project_id: project_id
       }
-      |> Report.create_changeset(maybe_put_skill_version(attrs, skill_version_id))
+      |> Report.create_changeset(attrs)
 
     case AdminRepo.insert(changeset) do
       {:ok, report} ->
+        # Refetch to populate the DB-generated total_tokens column
+        report = AdminRepo.get!(Report, report.id)
+
         # Audit log the creation
         Audit.create_log_entry(tenant_id, %{
           entity_type: "token_usage_report",
@@ -130,7 +132,6 @@ defmodule Loopctl.TokenUsage do
     story_id = Map.get(attrs, :story_id)
     agent_id = Map.get(attrs, :agent_id)
     project_id = Map.get(attrs, :project_id)
-    skill_version_id = Map.get(attrs, :skill_version_id)
 
     Ecto.Multi.insert(multi, name, fn _changes ->
       %Report{
@@ -139,7 +140,7 @@ defmodule Loopctl.TokenUsage do
         agent_id: agent_id,
         project_id: project_id
       }
-      |> Report.create_changeset(maybe_put_skill_version(attrs, skill_version_id))
+      |> Report.create_changeset(attrs)
     end)
   end
 
@@ -228,25 +229,29 @@ defmodule Loopctl.TokenUsage do
 
   # --- Private helpers ---
 
+  @known_attrs ~w(
+    story_id agent_id project_id skill_version_id
+    input_tokens output_tokens model_name cost_millicents
+    phase session_id metadata
+  )a
+
   defp normalize_attrs(attrs) when is_map(attrs) do
+    known_strings = MapSet.new(@known_attrs, &Atom.to_string/1)
+
     Map.new(attrs, fn
-      {k, v} when is_binary(k) -> {String.to_existing_atom(k), v}
-      {k, v} when is_atom(k) -> {k, v}
+      {k, v} when is_atom(k) ->
+        {k, v}
+
+      {k, v} when is_binary(k) ->
+        if MapSet.member?(known_strings, k) do
+          {String.to_existing_atom(k), v}
+        else
+          # Discard unknown string keys to prevent atom table exhaustion
+          {:__discard__, v}
+        end
     end)
-  rescue
-    ArgumentError -> Map.new(attrs, fn {k, v} -> {safe_to_atom(k), v} end)
+    |> Map.delete(:__discard__)
   end
-
-  defp safe_to_atom(k) when is_atom(k), do: k
-
-  defp safe_to_atom(k) when is_binary(k) do
-    String.to_existing_atom(k)
-  rescue
-    ArgumentError -> String.to_atom(k)
-  end
-
-  defp maybe_put_skill_version(attrs, nil), do: attrs
-  defp maybe_put_skill_version(attrs, _), do: attrs
 
   defp decimal_to_int(%Decimal{} = val), do: Decimal.to_integer(val)
   defp decimal_to_int(val) when is_integer(val), do: val
