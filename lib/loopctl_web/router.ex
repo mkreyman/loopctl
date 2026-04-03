@@ -213,6 +213,13 @@ defmodule LoopctlWeb.Router do
     get "/cost-anomalies", CostAnomalyController, :index
     patch "/cost-anomalies/:id", CostAnomalyController, :update
 
+    # Token analytics (Epic 21)
+    get "/analytics/agents", AnalyticsController, :agents
+    get "/analytics/epics", AnalyticsController, :epics
+    get "/analytics/projects/:id", AnalyticsController, :project
+    get "/analytics/models", AnalyticsController, :models
+    get "/analytics/trends", AnalyticsController, :trends
+
     # Skill results
     post "/skill_results", SkillResultController, :create
   end
