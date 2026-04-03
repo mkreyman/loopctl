@@ -205,6 +205,10 @@ defmodule LoopctlWeb.Router do
     post "/token-usage", TokenUsageController, :create
     get "/stories/:story_id/token-usage", TokenUsageController, :index
 
+    # Token budgets (Epic 19)
+    resources "/token-budgets", TokenBudgetController,
+      only: [:create, :index, :show, :update, :delete]
+
     # Skill results
     post "/skill_results", SkillResultController, :create
   end

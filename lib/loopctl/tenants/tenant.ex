@@ -12,6 +12,7 @@ defmodule Loopctl.Tenants.Tenant do
   - `email` — contact email for the tenant
   - `settings` — jsonb map for tenant-level configuration
   - `status` — `:active`, `:suspended`, or `:deactivated`
+  - `default_story_budget_millicents` — nullable tenant-wide default budget for stories
   """
 
   use Loopctl.Schema, tenant_scoped: false
@@ -28,6 +29,7 @@ defmodule Loopctl.Tenants.Tenant do
     field :email, :string
     field :settings, :map, default: %{}
     field :status, Ecto.Enum, values: @statuses, default: :active
+    field :default_story_budget_millicents, :integer
 
     timestamps()
   end
@@ -52,10 +54,11 @@ defmodule Loopctl.Tenants.Tenant do
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(tenant, attrs) do
     tenant
-    |> cast(attrs, [:name, :slug, :email, :settings])
+    |> cast(attrs, [:name, :slug, :email, :settings, :default_story_budget_millicents])
     |> validate_slug()
     |> validate_email()
     |> validate_settings()
+    |> validate_number(:default_story_budget_millicents, greater_than: 0)
     |> unique_constraint(:slug)
   end
 
