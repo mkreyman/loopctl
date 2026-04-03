@@ -24,7 +24,6 @@ defmodule Loopctl.TokenUsage.Analytics do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.TokenUsage.Budget
-  alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -737,8 +736,8 @@ defmodule Loopctl.TokenUsage.Analytics do
   #    that include "today" must always use live aggregation anyway
   #
   # The cost_summaries preference can be layered in as an optimization:
-  # check if historical_query?(opts) && summaries_exist?(tenant_id, scope)
-  # and route to summary-backed queries when both are true.
+  # check if historical_query?(opts) and route to summary-backed queries
+  # when summaries exist for the relevant tenant/scope.
 
   @doc """
   Returns true if the query date range is entirely in the past
@@ -758,22 +757,6 @@ defmodule Loopctl.TokenUsage.Analytics do
       %Date{} = d -> Date.compare(d, today) == :lt
       _ -> false
     end
-  end
-
-  @doc """
-  Returns true if cost_summaries exist for the given scope_type and tenant.
-
-  Used by the cost_summaries optimization layer (AC-21.4.6) to decide
-  whether pre-computed summaries are available.
-  """
-  @spec summaries_exist?(Ecto.UUID.t(), atom()) :: boolean()
-  def summaries_exist?(tenant_id, scope_type) do
-    CostSummary
-    |> where([cs], cs.tenant_id == ^tenant_id and cs.scope_type == ^scope_type)
-    |> limit(1)
-    |> select([cs], cs.id)
-    |> AdminRepo.one()
-    |> is_binary()
   end
 
   # --- Shared helpers ---
