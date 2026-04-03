@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.TokenUsage.Budget, as: TokenBudget
   alias Loopctl.TokenUsage.Report, as: TokenUsageReport
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
@@ -261,6 +262,20 @@ defmodule Loopctl.Fixtures do
         cost_millicents: 2500,
         phase: "implementing",
         session_id: nil,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:token_budget, attrs) do
+    Map.merge(
+      %{
+        scope_type: :story,
+        budget_millicents: 500_000,
+        budget_input_tokens: nil,
+        budget_output_tokens: nil,
+        alert_threshold_pct: 80,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -610,6 +625,55 @@ defmodule Loopctl.Fixtures do
         project_id: project_id
       }
       |> TokenUsageReport.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:token_budget, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    # Auto-create the scope entity if scope_id is not provided
+    scope_type = Map.get(attrs, :scope_type, :story)
+
+    {scope_id, attrs} =
+      case Map.get(attrs, :scope_id) do
+        nil ->
+          case scope_type do
+            :project ->
+              project = fixture(:project, %{tenant_id: tenant_id})
+              {project.id, Map.put(attrs, :scope_id, project.id)}
+
+            :epic ->
+              epic = fixture(:epic, %{tenant_id: tenant_id})
+              {epic.id, Map.put(attrs, :scope_id, epic.id)}
+
+            :story ->
+              story = fixture(:story, %{tenant_id: tenant_id})
+              {story.id, Map.put(attrs, :scope_id, story.id)}
+
+            _ ->
+              {Ecto.UUID.generate(), attrs}
+          end
+
+        sid ->
+          {sid, attrs}
+      end
+
+    data = build(:token_budget, attrs)
+
+    changeset =
+      %TokenBudget{tenant_id: tenant_id}
+      |> TokenBudget.create_changeset(Map.put(data, :scope_id, scope_id))
 
     AdminRepo.insert!(changeset)
   end
