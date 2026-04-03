@@ -201,6 +201,10 @@ defmodule LoopctlWeb.Router do
     get "/skills/:id/stats", SkillController, :stats
     get "/skills/:id/versions/:version/results", SkillController, :version_results
 
+    # Token usage (Epic 19)
+    post "/token-usage", TokenUsageController, :create
+    get "/stories/:story_id/token-usage", TokenUsageController, :index
+
     # Skill results
     post "/skill_results", SkillResultController, :create
   end

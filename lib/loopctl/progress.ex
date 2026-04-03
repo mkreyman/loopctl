@@ -335,6 +335,7 @@ defmodule Loopctl.Progress do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    token_usage_params = Keyword.get(opts, :token_usage)
 
     multi =
       Multi.new()
@@ -359,6 +360,7 @@ defmodule Loopctl.Progress do
         |> AdminRepo.update()
       end)
       |> maybe_create_artifact(tenant_id, story_id, agent_id, artifact_params)
+      |> maybe_create_token_usage_report(tenant_id, story_id, agent_id, token_usage_params)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -376,6 +378,7 @@ defmodule Loopctl.Progress do
           }
         }
       end)
+      |> maybe_audit_token_usage(tenant_id, actor_id, actor_label, token_usage_params)
       |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -400,6 +403,7 @@ defmodule Loopctl.Progress do
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
       {:error, :artifact, changeset, _} -> {:error, changeset}
+      {:error, :token_usage_report, changeset, _} -> {:error, changeset}
     end
   end
 
@@ -1506,6 +1510,58 @@ defmodule Loopctl.Progress do
         |> ArtifactReport.create_changeset(params)
 
       AdminRepo.insert(changeset)
+    end)
+  end
+
+  defp maybe_create_token_usage_report(multi, _tenant_id, _story_id, _agent_id, nil), do: multi
+
+  defp maybe_create_token_usage_report(multi, tenant_id, story_id, agent_id, params) do
+    alias Loopctl.TokenUsage
+
+    Multi.run(multi, :token_usage_report, fn _repo, %{lock: story} ->
+      attrs =
+        params
+        |> Map.put("story_id", story_id)
+        |> Map.put("agent_id", agent_id)
+        |> Map.put("project_id", story.project_id)
+
+      changeset =
+        %TokenUsage.Report{
+          tenant_id: tenant_id,
+          story_id: story_id,
+          agent_id: agent_id,
+          project_id: story.project_id
+        }
+        |> TokenUsage.Report.create_changeset(attrs)
+
+      AdminRepo.insert(changeset)
+    end)
+  end
+
+  defp maybe_audit_token_usage(multi, _tenant_id, _actor_id, _actor_label, nil), do: multi
+
+  defp maybe_audit_token_usage(multi, tenant_id, actor_id, actor_label, _params) do
+    Audit.log_in_multi(multi, :audit_token_usage, fn changes ->
+      report = Map.get(changes, :token_usage_report)
+
+      %{
+        tenant_id: tenant_id,
+        entity_type: "token_usage_report",
+        entity_id: report.id,
+        action: "created",
+        actor_type: "api_key",
+        actor_id: actor_id,
+        actor_label: actor_label,
+        new_state: %{
+          "story_id" => report.story_id,
+          "agent_id" => report.agent_id,
+          "input_tokens" => report.input_tokens,
+          "output_tokens" => report.output_tokens,
+          "model_name" => report.model_name,
+          "cost_millicents" => report.cost_millicents,
+          "phase" => report.phase
+        }
+      }
     end)
   end
 

@@ -281,7 +281,11 @@ defmodule LoopctlWeb.StoryStatusController do
   end
 
   defp do_report(conn, tenant_id, api_key, story_id, params) do
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+    opts =
+      AuditContext.from_conn(conn)
+      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> maybe_add_token_usage(params)
+
     artifact_params = extract_artifact_params(params)
 
     case Progress.report_story(tenant_id, story_id, opts, artifact_params) do
@@ -345,4 +349,10 @@ defmodule LoopctlWeb.StoryStatusController do
   end
 
   defp extract_artifact_params(_), do: nil
+
+  defp maybe_add_token_usage(opts, %{"token_usage" => token_usage}) when is_map(token_usage) do
+    Keyword.put(opts, :token_usage, token_usage)
+  end
+
+  defp maybe_add_token_usage(opts, _params), do: opts
 end
