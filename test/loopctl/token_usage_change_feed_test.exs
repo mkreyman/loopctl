@@ -154,6 +154,230 @@ defmodule Loopctl.TokenUsageChangeFeedTest do
     end
   end
 
+  # --- AC-21.8.2: Budget threshold crossings generate change feed entries ---
+
+  describe "budget threshold crossing change feed (AC-21.8.2)" do
+    test "emits threshold_crossed with threshold_type='warning' when spend crosses alert_threshold_pct" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      # Create a budget with alert_threshold_pct=80 and budget of 10,000 millicents
+      {:ok, budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # Create a report that pushes spend to 85% (8,500 out of 10,000)
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 8_500
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      assert length(entries) == 1
+
+      [entry] = entries
+      assert entry.new_state["budget_id"] == budget.id
+      assert entry.new_state["scope_type"] == "story"
+      assert entry.new_state["scope_id"] == story.id
+      assert entry.new_state["threshold_type"] == "warning"
+      assert entry.new_state["utilization_pct"] >= 80
+    end
+
+    test "emits threshold_crossed with threshold_type='exceeded' when spend crosses 100%" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      # Create a report that pushes spend above 100% (6,000 out of 5,000)
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 6_000
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      assert length(entries) == 1
+
+      [entry] = entries
+      assert entry.new_state["threshold_type"] == "exceeded"
+      assert entry.new_state["utilization_pct"] >= 100
+    end
+
+    test "does NOT emit threshold_crossed when spend is below alert_threshold_pct" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 100_000,
+          alert_threshold_pct: 80
+        })
+
+      # Spend only 10% of budget
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 100,
+          output_tokens: 50,
+          model_name: "claude-opus-4",
+          cost_millicents: 10_000
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      assert entries == []
+    end
+
+    test "checks project-level budget threshold" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :project,
+          scope_id: project.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # Push project spend to 90%
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 9_000
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      assert length(entries) == 1
+      assert hd(entries).new_state["scope_type"] == "project"
+    end
+
+    test "checks epic-level budget threshold" do
+      %{tenant: tenant, story: story, agent: agent, project: project, epic: epic} =
+        setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :epic,
+          scope_id: epic.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # Push epic spend to 90%
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 9_000
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      assert length(entries) == 1
+      assert hd(entries).new_state["scope_type"] == "epic"
+    end
+
+    test "emits threshold_crossed for multiple budgets when applicable" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      # Create both story and project budgets
+      {:ok, _story_budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      {:ok, _project_budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :project,
+          scope_id: project.id,
+          budget_millicents: 8_000,
+          alert_threshold_pct: 80
+        })
+
+      # Push both over threshold
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 7_000
+        })
+
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      # Both budgets should be crossed (7000/5000 > 100%, 7000/8000 > 80%)
+      assert length(entries) == 2
+
+      scope_types = Enum.map(entries, & &1.new_state["scope_type"]) |> Enum.sort()
+      assert scope_types == ["project", "story"]
+    end
+
+    test "threshold_crossed entry includes metadata with budget_id and scope_id" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      {:ok, _report} =
+        TokenUsage.create_report(tenant.id, %{
+          story_id: story.id,
+          agent_id: agent.id,
+          project_id: project.id,
+          input_tokens: 1000,
+          output_tokens: 500,
+          model_name: "claude-opus-4",
+          cost_millicents: 5_500
+        })
+
+      [entry] = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+
+      assert entry.metadata["budget_id"] == budget.id
+      assert entry.metadata["scope_type"] == "story"
+      assert entry.metadata["scope_id"] == story.id
+      assert entry.metadata["threshold_type"] == "exceeded"
+    end
+  end
+
   # --- AC-21.8.5: Budget mutations are audited ---
 
   describe "budget mutation audit log (AC-21.8.5)" do

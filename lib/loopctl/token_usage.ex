@@ -113,6 +113,9 @@ defmodule Loopctl.TokenUsage do
           }
         })
 
+        # Check budget thresholds after report creation (AC-21.8.2)
+        check_budget_thresholds(tenant_id, report)
+
         {:ok, report}
 
       {:error, changeset} ->
@@ -531,6 +534,89 @@ defmodule Loopctl.TokenUsage do
 
     result = AdminRepo.one(query)
     decimal_to_int(result || 0)
+  end
+
+  # --- Budget threshold check (AC-21.8.2) ---
+
+  # After a token usage report is created, check all applicable budgets
+  # and emit threshold_crossed audit entries for any that have been crossed.
+  defp check_budget_thresholds(tenant_id, report) do
+    budgets = find_applicable_budgets(tenant_id, report)
+
+    Enum.each(budgets, fn budget ->
+      spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
+
+      utilization_pct =
+        if budget.budget_millicents > 0, do: spend * 100 / budget.budget_millicents, else: 0
+
+      cond do
+        utilization_pct >= 100 ->
+          emit_threshold_crossed(tenant_id, budget, utilization_pct, "exceeded")
+
+        utilization_pct >= budget.alert_threshold_pct ->
+          emit_threshold_crossed(tenant_id, budget, utilization_pct, "warning")
+
+        true ->
+          :ok
+      end
+    end)
+  end
+
+  # Finds all budgets applicable to a report: story-level, epic-level, project-level.
+  defp find_applicable_budgets(tenant_id, report) do
+    story_budget =
+      AdminRepo.get_by(Budget,
+        tenant_id: tenant_id,
+        scope_type: :story,
+        scope_id: report.story_id
+      )
+
+    # Look up the story's epic_id for epic-level budget check
+    epic_budget =
+      case AdminRepo.get_by(Story, id: report.story_id, tenant_id: tenant_id) do
+        nil ->
+          nil
+
+        story ->
+          AdminRepo.get_by(Budget,
+            tenant_id: tenant_id,
+            scope_type: :epic,
+            scope_id: story.epic_id
+          )
+      end
+
+    project_budget =
+      AdminRepo.get_by(Budget,
+        tenant_id: tenant_id,
+        scope_type: :project,
+        scope_id: report.project_id
+      )
+
+    [story_budget, epic_budget, project_budget]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp emit_threshold_crossed(tenant_id, budget, utilization_pct, threshold_type) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "token_budget",
+      entity_id: budget.id,
+      action: "threshold_crossed",
+      actor_type: "system",
+      new_state: %{
+        "budget_id" => budget.id,
+        "scope_type" => to_string(budget.scope_type),
+        "scope_id" => budget.scope_id,
+        "utilization_pct" => utilization_pct,
+        "threshold_type" => threshold_type,
+        "budget_millicents" => budget.budget_millicents
+      },
+      metadata: %{
+        "budget_id" => budget.id,
+        "scope_type" => to_string(budget.scope_type),
+        "scope_id" => budget.scope_id,
+        "threshold_type" => threshold_type
+      }
+    })
   end
 
   # --- Private helpers ---
