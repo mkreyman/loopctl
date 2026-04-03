@@ -142,7 +142,7 @@ defmodule Loopctl.TokenUsage.AnalyticsTest do
       assert agent2_entry.efficiency_rank == 1
     end
 
-    test "calculates efficiency_rank (1 = cheapest)" do
+    test "calculates efficiency_rank (1 = cheapest per story)" do
       ctx = setup_analytics_data()
 
       {:ok, result} = Analytics.agent_metrics(ctx.tenant.id)
@@ -151,7 +151,7 @@ defmodule Loopctl.TokenUsage.AnalyticsTest do
       assert ranks == [1, 2]
 
       cheapest = hd(result.data)
-      # Agent2 has total 2200 millicents, Agent1 has 12000
+      # Agent2 avg 1100/story (2200 over 2 stories), Agent1 avg 6000/story (12000 over 2 stories)
       assert cheapest.agent_id == ctx.agent2.id
     end
 

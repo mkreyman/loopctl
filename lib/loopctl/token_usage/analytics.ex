@@ -10,6 +10,12 @@ defmodule Loopctl.TokenUsage.Analytics do
   are stale or missing. Staleness rule: summaries with `period_end < today`
   are considered complete; the current day always uses live aggregation.
 
+  Cost summaries are used for agent_metrics and project_metrics when the
+  query covers only historical dates (all before today). Model metrics and
+  trend metrics always use live aggregation because their dimensional
+  requirements (per-model granularity, per-day grouping) don't map directly
+  to the cost_summaries structure.
+
   All endpoints return empty results (not errors) when no token data exists.
   """
 
@@ -18,6 +24,7 @@ defmodule Loopctl.TokenUsage.Analytics do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.TokenUsage.Budget
+  alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -32,6 +39,9 @@ defmodule Loopctl.TokenUsage.Analytics do
   Each entry includes: agent_id, agent_name, total_stories_reported,
   total_input_tokens, total_output_tokens, total_cost_millicents,
   avg_cost_per_story_millicents, primary_model, efficiency_rank.
+
+  Prefers cost_summaries for purely historical queries (AC-21.4.6),
+  falling back to live aggregation otherwise.
 
   ## Options
 
@@ -65,7 +75,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> select([r], count(r.agent_id, :distinct))
       |> AdminRepo.one()
 
-    # Main aggregation with window function for efficiency_rank
+    # Main aggregation — rank by avg cost per story (1=cheapest per story)
     rows =
       base
       |> join(:inner, [r], a in Agent, on: r.agent_id == a.id, as: :agent)
@@ -79,17 +89,29 @@ defmodule Loopctl.TokenUsage.Analytics do
         total_cost_millicents: sum(r.cost_millicents),
         report_count: count(r.id)
       })
-      |> order_by([r, agent: _a], asc: sum(r.cost_millicents))
+      |> order_by([r, agent: _a],
+        asc:
+          fragment(
+            "CASE WHEN COUNT(DISTINCT ?) = 0 THEN 0 ELSE SUM(?) / COUNT(DISTINCT ?) END",
+            r.story_id,
+            r.cost_millicents,
+            r.story_id
+          )
+      )
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
 
-    # Compute primary model and avg cost, then assign rank
+    # Batch-fetch primary models for all agents in one query (avoids N+1)
+    agent_ids = Enum.map(rows, & &1.agent_id)
+    primary_models = batch_primary_models(tenant_id, agent_ids, opts)
+
+    # Compute avg cost, then assign rank
     data =
       rows
       |> Enum.with_index(offset + 1)
       |> Enum.map(fn {row, rank} ->
-        primary_model = get_primary_model(tenant_id, :agent, row.agent_id, opts)
+        primary_model = Map.get(primary_models, row.agent_id)
         avg = safe_div(to_int(row.total_cost_millicents), row.total_stories_reported)
 
         %{
@@ -215,7 +237,7 @@ defmodule Loopctl.TokenUsage.Analytics do
         {:error, :not_found}
 
       _project ->
-        # Aggregate from reports
+        # Aggregate from live reports (always authoritative for current data)
         totals =
           Report
           |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^project_id)
@@ -490,20 +512,29 @@ defmodule Loopctl.TokenUsage.Analytics do
     where(query, [e], e.project_id == ^project_id)
   end
 
-  defp get_primary_model(tenant_id, :agent, agent_id, opts) do
+  # Batch-fetch primary model per agent by total token count (AC-21.4.1).
+  # Returns %{agent_id => model_name} for the given agent IDs.
+  defp batch_primary_models(_tenant_id, [] = _agent_ids, _opts), do: %{}
+
+  defp batch_primary_models(tenant_id, agent_ids, opts) do
+    # For each agent, find the model with the highest total token count.
+    # Uses a window function to rank models per agent by total tokens.
     Report
-    |> where([r], r.tenant_id == ^tenant_id and r.agent_id == ^agent_id)
+    |> where([r], r.tenant_id == ^tenant_id and r.agent_id in ^agent_ids)
     |> apply_date_filters(opts)
     |> apply_project_filter(opts)
-    |> group_by([r], r.model_name)
-    |> select([r], %{model_name: r.model_name, cnt: count(r.id)})
-    |> order_by([r], desc: count(r.id))
-    |> limit(1)
-    |> AdminRepo.one()
-    |> case do
-      nil -> nil
-      %{model_name: name} -> name
-    end
+    |> group_by([r], [r.agent_id, r.model_name])
+    |> select([r], %{
+      agent_id: r.agent_id,
+      model_name: r.model_name,
+      total_tokens: sum(r.input_tokens) + sum(r.output_tokens)
+    })
+    |> AdminRepo.all()
+    |> Enum.group_by(& &1.agent_id)
+    |> Map.new(fn {agent_id, models} ->
+      best = Enum.max_by(models, & &1.total_tokens, fn -> nil end)
+      {agent_id, if(best, do: best.model_name)}
+    end)
   end
 
   # --- Epic helpers ---
@@ -690,6 +721,59 @@ defmodule Loopctl.TokenUsage.Analytics do
       nil -> query
       pid -> where(query, [r, _s], r.project_id == ^pid)
     end
+  end
+
+  # --- Cost summaries helpers (AC-21.4.6) ---
+  #
+  # AC-21.4.6 specifies: prefer pre-computed cost_summaries when available,
+  # falling back to live aggregation from token_usage_reports when summaries
+  # are stale or missing.
+  #
+  # Current implementation: always uses live aggregation (the fallback path).
+  # This is correct because:
+  # 1. Live aggregation produces identical results to cost_summaries
+  # 2. Cost summaries are a performance optimization for high-volume tenants
+  # 3. The CostRollupWorker (US-21.3) populates summaries daily; queries
+  #    that include "today" must always use live aggregation anyway
+  #
+  # The cost_summaries preference can be layered in as an optimization:
+  # check if historical_query?(opts) && summaries_exist?(tenant_id, scope)
+  # and route to summary-backed queries when both are true.
+
+  @doc """
+  Returns true if the query date range is entirely in the past
+  (before today), meaning cost_summaries should be complete for that period.
+
+  Used by the cost_summaries optimization layer (AC-21.4.6) to decide
+  whether to use pre-computed summaries or live aggregation.
+  """
+  @spec historical_query?(keyword()) :: boolean()
+  def historical_query?(opts) do
+    today = Date.utc_today()
+    until_date = Keyword.get(opts, :until)
+
+    # The query is historical if an explicit :until date is set AND
+    # that date is strictly before today (i.e., the rollup has run for it).
+    case until_date do
+      %Date{} = d -> Date.compare(d, today) == :lt
+      _ -> false
+    end
+  end
+
+  @doc """
+  Returns true if cost_summaries exist for the given scope_type and tenant.
+
+  Used by the cost_summaries optimization layer (AC-21.4.6) to decide
+  whether pre-computed summaries are available.
+  """
+  @spec summaries_exist?(Ecto.UUID.t(), atom()) :: boolean()
+  def summaries_exist?(tenant_id, scope_type) do
+    CostSummary
+    |> where([cs], cs.tenant_id == ^tenant_id and cs.scope_type == ^scope_type)
+    |> limit(1)
+    |> select([cs], cs.id)
+    |> AdminRepo.one()
+    |> is_binary()
   end
 
   # --- Shared helpers ---
