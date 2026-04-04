@@ -136,6 +136,16 @@ loopctl state load --project $PROJECT
 
 Resume from the last known state. Re-poll for any changes since checkpoint.
 
+## CI Pipeline Rules
+
+**These rules are non-negotiable. Violations compound across stories and break the entire build.**
+
+1. **NEVER use `--admin` on `gh pr merge`** — if branch protection blocks the merge, investigate why. Do not bypass it.
+2. **Always wait for CI before merging**: run `gh pr checks <pr_number> --watch` and confirm all checks pass before merging any PR.
+3. **After every merge, verify master is green**: `gh run list --branch master --limit 1 --json conclusion -q '.[0].conclusion'` must return `success` before starting the next story.
+4. **If CI fails, fix it immediately** — do not proceed to the next story. Dispatch a fix agent, get a green pipeline, then continue.
+5. **Sub-agents must run `mix ecto.reset && mix test`** (not just `mix test`) to catch migration ordering issues on fresh databases.
+
 ## Rules
 
 1. **NEVER write code** — you dispatch agents that write code
