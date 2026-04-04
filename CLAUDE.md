@@ -55,6 +55,7 @@ lib/loopctl/
 ├── import_export/     # Bulk import/export
 ├── skills/            # Skill versioning and performance
 ├── quality_assurance/ # UI test runs and findings (project-level QA)
+├── token_usage/       # Token consumption tracking, budgets, cost anomalies
 ├── schema.ex          # Base schema macro
 └── repo.ex            # Ecto Repo
 

@@ -59,6 +59,12 @@
             Features
           </a>
           <a
+            href="#cost-intelligence"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            Cost
+          </a>
+          <a
             href="/docs"
             class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
           >
@@ -547,6 +553,94 @@
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <%!-- Cost Intelligence Section --%>
+      <section
+        id="cost-intelligence"
+        class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50"
+      >
+        <div class="max-w-5xl mx-auto px-6">
+          <h2 class="text-sm font-semibold text-accent-400">Cost Intelligence</h2>
+          <p class="mt-2 font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+            Agents can't hide their cost either
+          </p>
+          <p class="mt-4 text-base text-slate-400 max-w-2xl">
+            loopctl already ensures agents can't self-verify their work. Now it ensures they can't hide their cost either.
+          </p>
+
+          <div class="mt-10 grid grid-cols-1 gap-x-8 gap-y-8 sm:grid-cols-2 lg:grid-cols-4">
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Token usage reporting
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Agents report input and output token counts with every story completion. Usage is linked to the agent identity, not just the session.
+              </p>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Efficiency rankings + model mix
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Per-agent tokens-per-story rankings expose which agents are consuming disproportionate resources and which model choices are cost-effective.
+              </p>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Budgets and anomaly detection
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Set per-agent or per-project token budgets. Automatic anomaly detection flags stories where token consumption deviates significantly from baseline.
+              </p>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Skill cost regression detection
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Track token cost per skill version. When a prompt update causes a 2x spike in tokens consumed, loopctl surfaces it before it reaches production.
+              </p>
+            </div>
+          </div>
+
+          <%!-- Cost analytics table — static example, terminal aesthetic --%>
+          <div class="mt-10">
+            <div class="bg-slate-900 border border-slate-700 rounded-md overflow-hidden">
+              <div class="flex items-center justify-between bg-slate-900 border-b border-slate-700 px-4 py-2">
+                <span class="text-xs font-mono text-slate-400">
+                  cost-summary.sh
+                </span>
+                <span class="text-xs font-mono text-slate-600">
+                  project: my-app  ·  sprint: 2026-w14
+                </span>
+              </div>
+              <div class="p-4 overflow-x-auto" aria-label="Example cost analytics table">
+                {cost_intelligence_table(assigns)}
+              </div>
+              <div class="border-t border-slate-800 px-4 py-2 flex items-center gap-6">
+                <span class="text-xs font-mono text-slate-600">
+                  <span class="text-success-500">worker-4 budget exceeded</span>
+                  — anomaly flagged (4.1x above project mean)
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <%!-- Value proposition callout --%>
+          <div class="mt-8 bg-slate-900 border border-slate-700 rounded-md p-5">
+            <p class="text-sm font-mono text-accent-400">
+              "loopctl already ensures agents can't self-verify their work. Now it ensures they can't hide their cost either."
+            </p>
           </div>
         </div>
       </section>

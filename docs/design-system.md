@@ -342,6 +342,77 @@ A live code example showing a curl command or MCP tool call. Dark code block wit
 
 When available: logos of projects using loopctl, or a count of stories tracked. Until then, skip this section entirely — empty social proof is worse than none.
 
+### Cost Data Presentation
+
+Cost analytics and token usage tables follow the terminal aesthetic. All numbers are monospace. Color signals utilization severity — never decoration.
+
+#### Number Formatting
+
+| Value | Format | Class |
+|-------|--------|-------|
+| Token counts | `142,880` (comma-separated, no unit suffix) | `font-mono text-slate-300` |
+| Ratios (tokens/story) | `17,860` (same scale as raw counts) | `font-mono` + utilization color |
+| Budget utilization % | `43%`, `91%`, `102%` | `font-mono` + utilization color |
+| Cost estimates | `$0.43` (2 decimal places) | `font-mono text-slate-300` |
+| Model names | `sonnet`, `opus` (lowercase, short form) | `font-mono text-slate-400` |
+
+Always use `font-mono` for numeric data cells. Never use abbreviated suffixes like `142k` — precision matters in cost reporting.
+
+#### Utilization Color Coding
+
+| Utilization | Color token | Usage |
+|-------------|-------------|-------|
+| ≤ 60% | `text-success-500` | Under budget — good efficiency |
+| 61–85% | `text-slate-300` | Normal range — no action needed |
+| 86–99% | `text-warning-500` | Approaching budget — watch closely |
+| ≥ 100% | `text-danger-500` | Exceeded — flag for review |
+
+Example row class assignment:
+
+```elixir
+defp utilization_class(pct) when pct <= 60, do: "text-success-500"
+defp utilization_class(pct) when pct <= 85, do: "text-slate-300"
+defp utilization_class(pct) when pct <= 99, do: "text-warning-500"
+defp utilization_class(_), do: "text-danger-500"
+```
+
+#### Cost Analytics Table Structure
+
+```heex
+<div class="bg-slate-900 border border-slate-700 rounded-md overflow-hidden">
+  <div class="flex items-center justify-between bg-slate-900 border-b border-slate-700 px-4 py-2">
+    <span class="text-xs font-mono text-slate-400">cost-summary.sh</span>
+    <span class="text-xs font-mono text-slate-600">project: my-app · sprint: 2026-w14</span>
+  </div>
+  <div class="p-4 overflow-x-auto">
+    <table class="w-full text-xs font-mono border-collapse">
+      <thead>
+        <tr class="border-b border-slate-700">
+          <th class="text-left py-1.5 pr-4 text-slate-500 font-medium">agent</th>
+          <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">tokens</th>
+          <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">tok/story</th>
+          <th class="text-right py-1.5 text-slate-500 font-medium">budget%</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="border-b border-slate-800">
+          <td class="py-1.5 pr-4 text-accent-400">worker-3</td>
+          <td class="text-right py-1.5 pr-4 text-slate-300">142,880</td>
+          <td class="text-right py-1.5 pr-4 text-success-500">17,860</td>
+          <td class="text-right py-1.5 text-success-500">43%</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+```
+
+- Table header: `text-slate-500`, `font-medium` — subordinate to the data
+- Agent name: `text-accent-400` — identifies the subject (like a code variable)
+- Numbers right-aligned (`text-right`) — consistent digit alignment
+- Column headers match their data alignment
+- `border-b border-slate-800` between rows — lighter than the header separator
+
 ---
 
 ## 8. Responsive Design

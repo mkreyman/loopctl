@@ -103,6 +103,60 @@ defmodule LoopctlWeb.PageHTML do
   }</pre>
   """
 
+  @cost_intelligence_table ~S"""
+  <table class="w-full text-xs font-mono border-collapse">
+    <thead>
+      <tr class="border-b border-slate-700">
+        <th class="text-left py-1.5 pr-4 text-slate-500 font-medium">agent</th>
+        <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">tokens</th>
+        <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">stories</th>
+        <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">tok/story</th>
+        <th class="text-right py-1.5 pr-4 text-slate-500 font-medium">model</th>
+        <th class="text-right py-1.5 text-slate-500 font-medium">budget%</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="border-b border-slate-800">
+        <td class="py-1.5 pr-4 text-accent-400">worker-3</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">142,880</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">8</td>
+        <td class="text-right py-1.5 pr-4 text-success-500">17,860</td>
+        <td class="text-right py-1.5 pr-4 text-slate-400">sonnet</td>
+        <td class="text-right py-1.5 text-success-500">43%</td>
+      </tr>
+      <tr class="border-b border-slate-800">
+        <td class="py-1.5 pr-4 text-accent-400">worker-1</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">219,450</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">9</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">24,383</td>
+        <td class="text-right py-1.5 pr-4 text-slate-400">sonnet</td>
+        <td class="text-right py-1.5 text-slate-300">66%</td>
+      </tr>
+      <tr class="border-b border-slate-800">
+        <td class="py-1.5 pr-4 text-accent-400">worker-2</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">381,200</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">11</td>
+        <td class="text-right py-1.5 pr-4 text-warning-500">34,654</td>
+        <td class="text-right py-1.5 pr-4 text-slate-400">opus</td>
+        <td class="text-right py-1.5 text-warning-500">91%</td>
+      </tr>
+      <tr>
+        <td class="py-1.5 pr-4 text-accent-400">worker-4</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">512,000</td>
+        <td class="text-right py-1.5 pr-4 text-slate-300">7</td>
+        <td class="text-right py-1.5 pr-4 text-danger-500">73,142</td>
+        <td class="text-right py-1.5 pr-4 text-slate-400">opus</td>
+        <td class="text-right py-1.5 text-danger-500">102%</td>
+      </tr>
+    </tbody>
+  </table>
+  """
+
+  def cost_intelligence_table(assigns) do
+    _ = assigns
+    Phoenix.HTML.raw(@cost_intelligence_table)
+  end
+
   def step1_code_block(assigns),
     do:
       (
