@@ -359,10 +359,18 @@ async function reportTokenUsage({ story_id, input_tokens, output_tokens, model_n
 }
 
 async function getCostSummary({ project_id, breakdown }) {
-  const params = new URLSearchParams({ project_id });
-  if (breakdown) params.set("breakdown", breakdown);
+  let path;
+  if (breakdown === "agent") {
+    path = `/api/v1/analytics/agents?project_id=${project_id}`;
+  } else if (breakdown === "epic") {
+    path = `/api/v1/analytics/epics?project_id=${project_id}`;
+  } else if (breakdown === "model") {
+    path = `/api/v1/analytics/models?project_id=${project_id}`;
+  } else {
+    path = `/api/v1/analytics/projects/${project_id}`;
+  }
 
-  const result = await apiCall("GET", `/api/v1/projects/${project_id}/cost-summary?${params}`);
+  const result = await apiCall("GET", path);
   return toContent(result);
 }
 
@@ -840,7 +848,8 @@ const TOOLS = [
         },
         phase: {
           type: "string",
-          description: "Optional: phase of work (e.g. implement, review, verify).",
+          enum: ["planning", "implementing", "reviewing", "other"],
+          description: "Optional: phase of work.",
         },
         skill_version_id: {
           type: "string",
@@ -956,7 +965,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.1.0",
+    version: "1.1.1",
   },
   {
     capabilities: { tools: {} },

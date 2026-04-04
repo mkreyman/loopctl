@@ -2,7 +2,7 @@ defmodule LoopctlWeb.CostAnomalyController do
   @moduledoc """
   Controller for cost anomaly management.
 
-  - `GET /api/v1/cost-anomalies` -- list unresolved anomalies (user+)
+  - `GET /api/v1/cost-anomalies` -- list unresolved anomalies (orchestrator+)
   - `PATCH /api/v1/cost-anomalies/:id` -- mark anomaly as resolved (user+)
   """
 
@@ -14,7 +14,8 @@ defmodule LoopctlWeb.CostAnomalyController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, role: :user
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:index]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
 
   tags(["Token Efficiency"])
 
