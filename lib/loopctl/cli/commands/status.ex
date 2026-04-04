@@ -84,6 +84,7 @@ defmodule Loopctl.CLI.Commands.Status do
   end
 
   defp append_cost_summary_line(_project_id, "json"), do: :ok
+  defp append_cost_summary_line(_project_id, nil), do: :ok
 
   defp append_cost_summary_line(project_id, _format) do
     case Client.get("/api/v1/analytics/projects/#{project_id}") do
@@ -104,23 +105,24 @@ defmodule Loopctl.CLI.Commands.Status do
 
   defp cost_int(data) do
     val = data["total_cost_millicents"]
-
-    cond do
-      is_integer(val) -> val
-      is_binary(val) -> elem(Integer.parse(val), 0)
-      true -> 0
-    end
+    safe_parse_int(val)
   end
 
   defp token_int(data) do
     val = data["total_tokens"]
+    safe_parse_int(val)
+  end
 
-    cond do
-      is_integer(val) -> val
-      is_binary(val) -> elem(Integer.parse(val), 0)
-      true -> 0
+  defp safe_parse_int(val) when is_integer(val), do: val
+
+  defp safe_parse_int(val) when is_binary(val) do
+    case Integer.parse(val) do
+      {int, _rest} -> int
+      :error -> 0
     end
   end
+
+  defp safe_parse_int(_val), do: 0
 
   defp epic_status(epic_id, opts) do
     case Client.get("/api/v1/epics/#{epic_id}/progress") do
@@ -142,6 +144,10 @@ defmodule Loopctl.CLI.Commands.Status do
 
   defp handle_error({status, body}) do
     Output.error("Server returned #{status}: #{inspect(body)}")
+  end
+
+  defp handle_error(reason) do
+    Output.error("Request failed: #{inspect(reason)}")
   end
 
   defp parse_kv_args(args) do

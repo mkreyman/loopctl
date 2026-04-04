@@ -424,6 +424,13 @@ defmodule Loopctl.CLI.Commands.Token do
   defp get_int_field(_data, _keys), do: 0
 
   defp coerce_to_int(value) when is_integer(value), do: value
-  defp coerce_to_int(value) when is_binary(value), do: elem(Integer.parse(value), 0)
+
+  defp coerce_to_int(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _rest} -> int
+      :error -> 0
+    end
+  end
+
   defp coerce_to_int(_value), do: 0
 end
