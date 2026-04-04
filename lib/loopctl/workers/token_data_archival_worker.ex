@@ -138,24 +138,32 @@ defmodule Loopctl.Workers.TokenDataArchivalWorker do
         "soft_deleted=#{soft_deleted} hard_deleted=#{hard_deleted} anomalies_archived=#{archived}"
     )
 
-    Audit.create_log_entry(tenant_id, %{
-      entity_type: "token_data_archival",
-      entity_id: tenant_id,
-      action: "archival_run",
-      actor_type: "system",
-      new_state: %{
-        "retention_days" => retention_days,
-        "reports_soft_deleted" => soft_deleted,
-        "reports_hard_deleted" => hard_deleted,
-        "anomalies_archived" => archived
-      },
-      metadata: %{
-        "retention_days" => retention_days,
-        "reports_soft_deleted" => soft_deleted,
-        "reports_hard_deleted" => hard_deleted,
-        "anomalies_archived" => archived
-      }
-    })
+    case Audit.create_log_entry(tenant_id, %{
+           entity_type: "token_data_archival",
+           entity_id: tenant_id,
+           action: "archival_run",
+           actor_type: "system",
+           new_state: %{
+             "retention_days" => retention_days,
+             "reports_soft_deleted" => soft_deleted,
+             "reports_hard_deleted" => hard_deleted,
+             "anomalies_archived" => archived
+           },
+           metadata: %{
+             "retention_days" => retention_days,
+             "reports_soft_deleted" => soft_deleted,
+             "reports_hard_deleted" => hard_deleted,
+             "anomalies_archived" => archived
+           }
+         }) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "TokenDataArchivalWorker: audit log failed for tenant #{tenant_id}: #{inspect(reason)}"
+        )
+    end
   end
 
   defp list_active_tenants do

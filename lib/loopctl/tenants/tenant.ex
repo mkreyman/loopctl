@@ -107,12 +107,11 @@ defmodule Loopctl.Tenants.Tenant do
   end
 
   # AC-21.14.6: Minimum 30 days. nil disables retention.
+  # Note: validate_change/3 skips nil values (the callback is not invoked),
+  # so passing nil correctly results in no validation errors.
   defp validate_retention_days(changeset) do
     validate_change(changeset, :token_data_retention_days, fn :token_data_retention_days, value ->
       cond do
-        is_nil(value) ->
-          []
-
         not is_integer(value) ->
           [token_data_retention_days: "must be an integer"]
 

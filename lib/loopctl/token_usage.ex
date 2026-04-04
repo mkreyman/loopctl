@@ -1524,6 +1524,7 @@ defmodule Loopctl.TokenUsage do
       reference_avg_millicents: anomaly.reference_avg_millicents,
       deviation_factor: anomaly.deviation_factor,
       resolved: anomaly.resolved,
+      archived: anomaly.archived,
       metadata: anomaly.metadata,
       inserted_at: anomaly.inserted_at,
       updated_at: anomaly.updated_at
