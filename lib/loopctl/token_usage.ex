@@ -108,14 +108,16 @@ defmodule Loopctl.TokenUsage do
               "agent_id" => report.agent_id,
               "model_name" => report.model_name,
               "cost_millicents" => report.cost_millicents,
-              "total_tokens" => report.total_tokens
+              "total_tokens" => report.total_tokens,
+              "skill_version_id" => report.skill_version_id
             },
             metadata: %{
               "story_id" => report.story_id,
               "agent_id" => report.agent_id,
               "model_name" => report.model_name,
               "cost_millicents" => report.cost_millicents,
-              "total_tokens" => report.total_tokens
+              "total_tokens" => report.total_tokens,
+              "skill_version_id" => report.skill_version_id
             }
           })
 
