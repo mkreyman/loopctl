@@ -38,6 +38,7 @@ defmodule Loopctl.TokenUsage.CostAnomaly do
              :reference_avg_millicents,
              :deviation_factor,
              :resolved,
+             :archived,
              :metadata,
              :inserted_at,
              :updated_at
@@ -52,6 +53,8 @@ defmodule Loopctl.TokenUsage.CostAnomaly do
     field :reference_avg_millicents, :integer
     field :deviation_factor, :decimal
     field :resolved, :boolean, default: false
+    # AC-21.14.5: Archived anomalies are excluded from default list
+    field :archived, :boolean, default: false
     field :metadata, :map, default: %{}
 
     timestamps()

@@ -82,6 +82,19 @@ defmodule Loopctl.DataCase do
       {:ok, []}
     end)
 
+    # Default stub for token archival -- returns zero counts
+    Mox.stub(Loopctl.MockTokenArchival, :soft_delete_old_reports, fn _tenant_id, _days ->
+      {:ok, 0}
+    end)
+
+    Mox.stub(Loopctl.MockTokenArchival, :hard_delete_expired_reports, fn _tenant_id ->
+      {:ok, 0}
+    end)
+
+    Mox.stub(Loopctl.MockTokenArchival, :archive_old_anomalies, fn _tenant_id, _days ->
+      {:ok, 0}
+    end)
+
     # Default Req.Test stub for webhook delivery -- allows Oban inline mode
     # to process delivery jobs without test-specific HTTP stub setup.
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->

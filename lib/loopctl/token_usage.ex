@@ -1359,6 +1359,7 @@ defmodule Loopctl.TokenUsage do
   - `:anomaly_type` -- filter by anomaly type (`:high_cost`, `:suspiciously_low`, `:budget_exceeded`)
   - `:project_id` -- filter by project UUID
   - `:resolved` -- filter by resolved status (default: false)
+  - `:include_archived` -- when `true`, include archived anomalies (default: false)
   - `:page` -- page number (default 1)
   - `:page_size` -- entries per page (default 20, max 100)
 
@@ -1379,11 +1380,13 @@ defmodule Loopctl.TokenUsage do
     page_size = opts |> Keyword.get(:page_size, 20) |> max(1) |> min(100)
     offset = (page - 1) * page_size
     resolved = Keyword.get(opts, :resolved, false)
+    include_archived = Keyword.get(opts, :include_archived, false)
 
     base_query =
       CostAnomaly
       |> where([a], a.tenant_id == ^tenant_id)
       |> where([a], a.resolved == ^resolved)
+      |> apply_anomaly_archive_filter(include_archived)
       |> apply_anomaly_filter(:anomaly_type, Keyword.get(opts, :anomaly_type))
       |> apply_anomaly_filter(:project_id, Keyword.get(opts, :project_id), tenant_id)
 
@@ -1465,6 +1468,10 @@ defmodule Loopctl.TokenUsage do
   end
 
   # --- Anomaly private helpers ---
+
+  # AC-21.14.5: Exclude archived anomalies by default; include them when requested
+  defp apply_anomaly_archive_filter(query, true), do: query
+  defp apply_anomaly_archive_filter(query, _), do: where(query, [a], a.archived == false)
 
   defp apply_anomaly_filter(query, _field, nil), do: query
   defp apply_anomaly_filter(query, _field, ""), do: query

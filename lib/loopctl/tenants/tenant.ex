@@ -22,6 +22,7 @@ defmodule Loopctl.Tenants.Tenant do
   @statuses [:active, :suspended, :deactivated]
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   @email_format ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/
+  @min_retention_days 30
 
   schema "tenants" do
     field :name, :string
@@ -30,6 +31,8 @@ defmodule Loopctl.Tenants.Tenant do
     field :settings, :map, default: %{}
     field :status, Ecto.Enum, values: @statuses, default: :active
     field :default_story_budget_millicents, :integer
+    # AC-21.14.1: NULL means unlimited (no archival)
+    field :token_data_retention_days, :integer
 
     timestamps()
   end
@@ -50,15 +53,25 @@ defmodule Loopctl.Tenants.Tenant do
 
   @doc """
   Changeset for updating an existing tenant.
+
+  Accepts `token_data_retention_days` (integer >= 30, or nil to disable).
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(tenant, attrs) do
     tenant
-    |> cast(attrs, [:name, :slug, :email, :settings, :default_story_budget_millicents])
+    |> cast(attrs, [
+      :name,
+      :slug,
+      :email,
+      :settings,
+      :default_story_budget_millicents,
+      :token_data_retention_days
+    ])
     |> validate_slug()
     |> validate_email()
     |> validate_settings()
     |> validate_number(:default_story_budget_millicents, greater_than: 0)
+    |> validate_retention_days()
     |> unique_constraint(:slug)
   end
 
@@ -89,6 +102,27 @@ defmodule Loopctl.Tenants.Tenant do
         []
       else
         [settings: "must be a map"]
+      end
+    end)
+  end
+
+  # AC-21.14.6: Minimum 30 days. nil disables retention.
+  defp validate_retention_days(changeset) do
+    validate_change(changeset, :token_data_retention_days, fn :token_data_retention_days, value ->
+      cond do
+        is_nil(value) ->
+          []
+
+        not is_integer(value) ->
+          [token_data_retention_days: "must be an integer"]
+
+        value < @min_retention_days ->
+          [
+            token_data_retention_days: "must be at least #{@min_retention_days} days"
+          ]
+
+        true ->
+          []
       end
     end)
   end
