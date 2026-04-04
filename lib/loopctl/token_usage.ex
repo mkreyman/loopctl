@@ -554,7 +554,7 @@ defmodule Loopctl.TokenUsage do
     spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
 
     utilization_pct =
-      if budget.budget_millicents > 0, do: spend * 100 / budget.budget_millicents, else: 0
+      if budget.budget_millicents > 0, do: div(spend * 100, budget.budget_millicents), else: 0
 
     reset_attrs =
       %{}
@@ -898,7 +898,7 @@ defmodule Loopctl.TokenUsage do
       spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
 
       utilization_pct =
-        if budget.budget_millicents > 0, do: spend * 100 / budget.budget_millicents, else: 0
+        if budget.budget_millicents > 0, do: div(spend * 100, budget.budget_millicents), else: 0
 
       # Fire warning and exceeded independently so both fire when a single
       # report pushes past both thresholds at once.
@@ -914,9 +914,16 @@ defmodule Loopctl.TokenUsage do
     end)
   end
 
-  # Fires a budget_warning webhook event if not already fired (dedup via warning_fired flag).
+  # Fires a budget_warning webhook event using atomic CAS to prevent duplicate
+  # fires under concurrent requests. The UPDATE ... WHERE warning_fired = false
+  # atomically claims the right to fire; only the winner (count == 1) proceeds.
   defp maybe_fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report) do
-    if not budget.warning_fired do
+    {count, _} =
+      Budget
+      |> where([b], b.id == ^budget.id and b.warning_fired == false)
+      |> AdminRepo.update_all(set: [warning_fired: true, updated_at: DateTime.utc_now()])
+
+    if count == 1 do
       payload = %{
         "budget_id" => budget.id,
         "scope_type" => to_string(budget.scope_type),
@@ -929,13 +936,18 @@ defmodule Loopctl.TokenUsage do
       }
 
       fire_budget_event(tenant_id, "token.budget_warning", report.project_id, payload)
-      mark_budget_flag(budget, :warning_fired)
     end
   end
 
-  # Fires a budget_exceeded webhook event if not already fired (dedup via exceeded_fired flag).
+  # Fires a budget_exceeded webhook event using atomic CAS to prevent duplicate
+  # fires under concurrent requests. Same pattern as warning above.
   defp maybe_fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report) do
-    if not budget.exceeded_fired do
+    {count, _} =
+      Budget
+      |> where([b], b.id == ^budget.id and b.exceeded_fired == false)
+      |> AdminRepo.update_all(set: [exceeded_fired: true, updated_at: DateTime.utc_now()])
+
+    if count == 1 do
       overage = max(spend - budget.budget_millicents, 0)
 
       payload = %{
@@ -951,7 +963,6 @@ defmodule Loopctl.TokenUsage do
       }
 
       fire_budget_event(tenant_id, "token.budget_exceeded", report.project_id, payload)
-      mark_budget_flag(budget, :exceeded_fired)
     end
   end
 
@@ -986,17 +997,6 @@ defmodule Loopctl.TokenUsage do
           )
       end
     end)
-  end
-
-  # Updates a dedup flag on the budget. Logs failures instead of crashing.
-  defp mark_budget_flag(budget, flag) when flag in [:warning_fired, :exceeded_fired] do
-    case budget |> Ecto.Changeset.change(%{flag => true}) |> AdminRepo.update() do
-      {:ok, _} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Failed to set #{flag} on budget #{budget.id}: #{inspect(reason)}")
-    end
   end
 
   # Finds all budgets applicable to a report: story-level, epic-level, project-level.

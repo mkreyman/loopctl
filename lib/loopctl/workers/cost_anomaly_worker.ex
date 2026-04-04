@@ -46,13 +46,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
     Logger.info("CostAnomalyWorker: scanning #{length(tenants)} tenants for anomalies")
 
     Enum.each(tenants, fn tenant ->
-      case detect_anomalies(tenant.id, period_start, period_end) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("CostAnomalyWorker: failed for tenant #{tenant.id}: #{inspect(reason)}")
-      end
+      detect_anomalies(tenant.id, period_start, period_end)
     end)
 
     :ok
@@ -76,8 +70,6 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
     end)
 
     :ok
-  rescue
-    e -> {:error, Exception.message(e)}
   end
 
   defp check_epic_stories(tenant_id, epic_summary, period_start, period_end) do
@@ -135,15 +127,25 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
 
     if existing do
       # Update the existing anomaly with latest figures
-      existing
-      |> CostAnomaly.create_changeset(%{
-        story_cost_millicents: story_cost,
-        reference_avg_millicents: epic_avg,
-        deviation_factor: Decimal.round(factor, 2)
-      })
-      |> AdminRepo.update!()
+      case existing
+           |> CostAnomaly.create_changeset(%{
+             story_cost_millicents: story_cost,
+             reference_avg_millicents: epic_avg,
+             deviation_factor: Decimal.round(factor, 2)
+           })
+           |> AdminRepo.update() do
+        {:ok, updated} ->
+          updated
+
+        {:error, changeset} ->
+          Logger.warning(
+            "CostAnomalyWorker: failed to update anomaly #{existing.id}: #{inspect(changeset.errors)}"
+          )
+
+          existing
+      end
     else
-      anomaly =
+      changeset =
         %CostAnomaly{tenant_id: tenant_id, story_id: story_id}
         |> CostAnomaly.create_changeset(%{
           anomaly_type: anomaly_type,
@@ -151,33 +153,42 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
           reference_avg_millicents: epic_avg,
           deviation_factor: Decimal.round(factor, 2)
         })
-        |> AdminRepo.insert!()
 
-      # Emit change feed + audit log entry for the newly detected anomaly (AC-21.8.3, AC-21.8.5)
-      Audit.create_log_entry(tenant_id, %{
-        entity_type: "cost_anomaly",
-        entity_id: anomaly.id,
-        action: "detected",
-        actor_type: "system",
-        new_state: %{
-          "anomaly_type" => to_string(anomaly.anomaly_type),
-          "story_id" => anomaly.story_id,
-          "deviation_factor" => Decimal.to_string(anomaly.deviation_factor),
-          "story_cost_millicents" => anomaly.story_cost_millicents,
-          "reference_avg_millicents" => anomaly.reference_avg_millicents
-        },
-        metadata: %{
-          "anomaly_id" => anomaly.id,
-          "story_id" => anomaly.story_id,
-          "anomaly_type" => to_string(anomaly.anomaly_type),
-          "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
-        }
-      })
+      case AdminRepo.insert(changeset) do
+        {:ok, anomaly} ->
+          # Emit change feed + audit log entry for the newly detected anomaly (AC-21.8.3, AC-21.8.5)
+          Audit.create_log_entry(tenant_id, %{
+            entity_type: "cost_anomaly",
+            entity_id: anomaly.id,
+            action: "detected",
+            actor_type: "system",
+            new_state: %{
+              "anomaly_type" => to_string(anomaly.anomaly_type),
+              "story_id" => anomaly.story_id,
+              "deviation_factor" => Decimal.to_string(anomaly.deviation_factor),
+              "story_cost_millicents" => anomaly.story_cost_millicents,
+              "reference_avg_millicents" => anomaly.reference_avg_millicents
+            },
+            metadata: %{
+              "anomaly_id" => anomaly.id,
+              "story_id" => anomaly.story_id,
+              "anomaly_type" => to_string(anomaly.anomaly_type),
+              "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
+            }
+          })
 
-      # Fire token.anomaly_detected webhook event (AC-21.7.7)
-      fire_anomaly_webhook(tenant_id, anomaly)
+          # Fire token.anomaly_detected webhook event (AC-21.7.7)
+          fire_anomaly_webhook(tenant_id, anomaly)
 
-      anomaly
+          anomaly
+
+        {:error, changeset} ->
+          Logger.warning(
+            "CostAnomalyWorker: failed to insert anomaly for story #{story_id}: #{inspect(changeset.errors)}"
+          )
+
+          nil
+      end
     end
   end
 

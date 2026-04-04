@@ -423,7 +423,8 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> select([r], %{
         period: fragment("date(?)::date", r.inserted_at),
         total_cost_millicents: sum(r.cost_millicents),
-        total_tokens: sum(r.input_tokens) + sum(r.output_tokens),
+        total_tokens:
+          fragment("coalesce(sum(?), 0) + coalesce(sum(?), 0)", r.input_tokens, r.output_tokens),
         report_count: count(r.id),
         unique_agents: count(r.agent_id, :distinct)
       })
@@ -449,7 +450,8 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> select([r], %{
         period: fragment("date_trunc('week', ?)::date", r.inserted_at),
         total_cost_millicents: sum(r.cost_millicents),
-        total_tokens: sum(r.input_tokens) + sum(r.output_tokens),
+        total_tokens:
+          fragment("coalesce(sum(?), 0) + coalesce(sum(?), 0)", r.input_tokens, r.output_tokens),
         report_count: count(r.id),
         unique_agents: count(r.agent_id, :distinct)
       })
@@ -509,7 +511,8 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> select([r], %{
         model_name: r.model_name,
         phase: r.phase,
-        total_tokens: sum(r.input_tokens) + sum(r.output_tokens),
+        total_tokens:
+          fragment("coalesce(sum(?), 0) + coalesce(sum(?), 0)", r.input_tokens, r.output_tokens),
         total_cost_millicents: sum(r.cost_millicents),
         stories_count: count(r.story_id, :distinct)
       })
@@ -640,7 +643,8 @@ defmodule Loopctl.TokenUsage.Analytics do
     |> select([r], %{
       agent_id: r.agent_id,
       model_name: r.model_name,
-      total_tokens: sum(r.input_tokens) + sum(r.output_tokens)
+      total_tokens:
+        fragment("coalesce(sum(?), 0) + coalesce(sum(?), 0)", r.input_tokens, r.output_tokens)
     })
     |> AdminRepo.all()
     |> Enum.group_by(& &1.agent_id)
