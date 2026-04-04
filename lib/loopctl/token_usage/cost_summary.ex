@@ -41,6 +41,7 @@ defmodule Loopctl.TokenUsage.CostSummary do
              :report_count,
              :model_breakdown,
              :avg_cost_per_story_millicents,
+             :stale,
              :inserted_at,
              :updated_at
            ]}
@@ -58,6 +59,7 @@ defmodule Loopctl.TokenUsage.CostSummary do
     field :report_count, :integer, default: 0
     field :model_breakdown, :map, default: %{}
     field :avg_cost_per_story_millicents, :integer
+    field :stale, :boolean, default: false
 
     timestamps()
   end
@@ -80,7 +82,8 @@ defmodule Loopctl.TokenUsage.CostSummary do
       :total_cost_millicents,
       :report_count,
       :model_breakdown,
-      :avg_cost_per_story_millicents
+      :avg_cost_per_story_millicents,
+      :stale
     ])
     |> validate_required([
       :scope_type,

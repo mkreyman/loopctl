@@ -4,6 +4,8 @@ defmodule LoopctlWeb.TokenUsageController do
 
   - `POST /api/v1/token-usage` -- create a standalone token usage report (agent+)
   - `GET /api/v1/stories/:story_id/token-usage` -- list reports for a story (agent+)
+  - `DELETE /api/v1/token-usage/:id` -- soft-delete a report (user only)
+  - `POST /api/v1/token-usage/:id/correction` -- create correction report (user only)
   """
 
   use LoopctlWeb, :controller
@@ -18,6 +20,7 @@ defmodule LoopctlWeb.TokenUsageController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
+  plug LoopctlWeb.Plugs.RequireRole, [exact_role: :user] when action in [:delete, :correct]
 
   tags(["Token Usage"])
 
@@ -83,6 +86,64 @@ defmodule LoopctlWeb.TokenUsageController do
            }
          }},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:delete,
+    summary: "Soft-delete a token usage report",
+    description:
+      "Soft-deletes a token usage report by setting deleted_at. " <>
+        "Report is excluded from all queries and analytics. " <>
+        "Budget flags are reset if spend drops below threshold. " <>
+        "Only users (not agents) may delete reports.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Report UUID"]
+    ],
+    responses: %{
+      200 =>
+        {"Report deleted", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Report not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:correct,
+    summary: "Create a correction report",
+    description:
+      "Creates a correction report referencing the original. " <>
+        "Allows negative input_tokens, output_tokens, cost_millicents. " <>
+        "Returns 422 if the correction would make any total negative. " <>
+        "Only users (not agents) may create corrections.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Original report UUID"]
+    ],
+    request_body:
+      {"Correction params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           input_tokens: %OpenApiSpex.Schema{type: :integer},
+           output_tokens: %OpenApiSpex.Schema{type: :integer},
+           cost_millicents: %OpenApiSpex.Schema{type: :integer},
+           model_name: %OpenApiSpex.Schema{type: :string, minLength: 1},
+           phase: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["planning", "implementing", "reviewing", "other"]
+           },
+           session_id: %OpenApiSpex.Schema{type: :string, nullable: true},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Correction created", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Original report not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error or negative totals", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -158,6 +219,54 @@ defmodule LoopctlWeb.TokenUsageController do
     end
   end
 
+  @doc """
+  DELETE /api/v1/token-usage/:id
+
+  Soft-deletes a token usage report. Only users (not agents) can delete.
+  """
+  def delete(conn, %{"id" => report_id}) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    with {:ok, deleted_report} <- TokenUsage.delete_report(tenant_id, report_id, audit_opts) do
+      json(conn, %{token_usage_report: format_report(deleted_report)})
+    end
+  end
+
+  @doc """
+  POST /api/v1/token-usage/:id/correction
+
+  Creates a correction report for the given original report.
+  Allows negative token/cost values to subtract from the story total.
+  Returns 422 if the correction would make any field's total negative.
+  """
+  def correct(conn, %{"id" => report_id} = params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    correction_attrs =
+      params
+      |> Map.drop(["id"])
+
+    case TokenUsage.create_correction(tenant_id, report_id, correction_attrs, audit_opts) do
+      {:ok, correction} ->
+        conn
+        |> put_status(:created)
+        |> json(%{token_usage_report: format_report(correction)})
+
+      {:error, :not_found} ->
+        {:error, :not_found}
+
+      {:error, :unprocessable_entity, message} ->
+        {:error, :unprocessable_entity, message}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
   # --- Private helpers ---
 
   defp format_report(report) do
@@ -177,6 +286,8 @@ defmodule LoopctlWeb.TokenUsageController do
       session_id: report.session_id,
       skill_version_id: report.skill_version_id,
       metadata: report.metadata,
+      deleted_at: report.deleted_at,
+      corrects_report_id: report.corrects_report_id,
       inserted_at: report.inserted_at,
       updated_at: report.updated_at
     }

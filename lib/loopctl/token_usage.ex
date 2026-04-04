@@ -43,6 +43,7 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget
   alias Loopctl.TokenUsage.CostAnomaly
+  alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
@@ -213,6 +214,7 @@ defmodule Loopctl.TokenUsage do
     base_query =
       Report
       |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^story_id)
+      |> where([r], is_nil(r.deleted_at))
 
     total = AdminRepo.aggregate(base_query, :count, :id)
 
@@ -246,6 +248,7 @@ defmodule Loopctl.TokenUsage do
     query =
       Report
       |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^story_id)
+      |> where([r], is_nil(r.deleted_at))
       |> select([r], %{
         total_input_tokens: coalesce(sum(r.input_tokens), 0),
         total_output_tokens: coalesce(sum(r.output_tokens), 0),
@@ -265,6 +268,333 @@ defmodule Loopctl.TokenUsage do
        report_count: result.report_count
      }}
   end
+
+  # --- Report deletion and correction (US-21.13) ---
+
+  @doc """
+  Gets a single token usage report by ID, scoped to a tenant.
+
+  Only returns non-deleted reports.
+
+  ## Returns
+
+  - `{:ok, %Report{}}` if found and active
+  - `{:error, :not_found}` if not found, wrong tenant, or soft-deleted
+  """
+  @spec get_report(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, Report.t()} | {:error, :not_found}
+  def get_report(tenant_id, report_id) do
+    case AdminRepo.get_by(Report, id: report_id, tenant_id: tenant_id) do
+      nil -> {:error, :not_found}
+      %Report{deleted_at: nil} = report -> {:ok, report}
+      %Report{} -> {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Soft-deletes a token usage report by setting `deleted_at`.
+
+  The report is excluded from all queries and analytics after deletion.
+  Budget warning/exceeded flags are reset if the new spend drops below
+  their respective thresholds.
+
+  ## Options (keyword list)
+
+  - `:actor_id` -- audit actor ID
+  - `:actor_label` -- audit actor label
+  - `:actor_type` -- audit actor type (default "api_key")
+
+  ## Returns
+
+  - `{:ok, %Report{}}` on success
+  - `{:error, :not_found}` if not found, wrong tenant, or already deleted
+  """
+  @spec delete_report(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Report.t()} | {:error, :not_found}
+  def delete_report(tenant_id, report_id, opts \\ []) do
+    with {:ok, report} <- get_report(tenant_id, report_id) do
+      old_state = %{
+        "story_id" => report.story_id,
+        "cost_millicents" => report.cost_millicents,
+        "total_tokens" => report.total_tokens,
+        "model_name" => report.model_name
+      }
+
+      multi =
+        Multi.new()
+        |> Multi.update(:report, Loopctl.Schema.soft_delete_changeset(report))
+        |> Audit.log_in_multi(:audit, fn _changes ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "token_usage_report",
+            entity_id: report.id,
+            action: "deleted",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            old_state: old_state,
+            metadata: %{
+              "story_id" => report.story_id,
+              "project_id" => report.project_id,
+              "cost_millicents" => report.cost_millicents
+            }
+          }
+        end)
+        |> mark_affected_cost_summaries_stale_multi(tenant_id, report)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{report: deleted_report}} ->
+          # Reset budget flags if spend dropped below thresholds
+          try do
+            reset_budget_flags_if_needed(tenant_id, report)
+          rescue
+            e ->
+              Logger.warning(
+                "Budget flag reset failed after deleting report #{report.id}: " <>
+                  Exception.message(e)
+              )
+          end
+
+          {:ok, deleted_report}
+
+        {:error, _step, error, _} ->
+          {:error, error}
+      end
+    end
+  end
+
+  @doc """
+  Creates a correction report that references the original report.
+
+  Corrections allow negative `input_tokens`, `output_tokens`, and
+  `cost_millicents` to subtract from the story's running total.
+
+  ## Validation
+
+  The sum of the original report's fields plus the correction values must be
+  >= 0 for `input_tokens`, `output_tokens`, and `cost_millicents`. Returns
+  `{:error, :unprocessable_entity, message}` if the correction would make
+  any total negative.
+
+  ## Options (keyword list)
+
+  - `:actor_id` -- audit actor ID
+  - `:actor_label` -- audit actor label
+  - `:actor_type` -- audit actor type (default "api_key")
+
+  ## Returns
+
+  - `{:ok, %Report{}}` on success (the correction report)
+  - `{:error, :not_found}` if the original report not found or wrong tenant
+  - `{:error, :unprocessable_entity, message}` if the correction would produce
+    negative totals
+  - `{:error, %Ecto.Changeset{}}` on validation failure
+  """
+  @spec create_correction(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Report.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def create_correction(tenant_id, original_report_id, attrs, opts \\ []) do
+    attrs = normalize_attrs(attrs)
+
+    with {:ok, original} <- get_report(tenant_id, original_report_id),
+         :ok <- validate_correction_totals(tenant_id, original, attrs) do
+      correction_input_tokens = Map.get(attrs, :input_tokens, 0)
+      correction_output_tokens = Map.get(attrs, :output_tokens, 0)
+
+      changeset =
+        %Report{
+          tenant_id: tenant_id,
+          story_id: original.story_id,
+          agent_id: original.agent_id,
+          project_id: original.project_id,
+          corrects_report_id: original.id
+        }
+        |> Report.correction_changeset(
+          Map.merge(
+            %{
+              model_name: original.model_name,
+              phase: original.phase
+            },
+            attrs
+          )
+        )
+
+      multi =
+        Multi.new()
+        |> Multi.insert(:correction, changeset)
+        |> Audit.log_in_multi(:audit, fn %{correction: correction} ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "token_usage_report",
+            entity_id: correction.id,
+            action: "corrected",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            new_state: %{
+              "corrects_report_id" => original.id,
+              "story_id" => correction.story_id,
+              "input_tokens" => correction.input_tokens,
+              "output_tokens" => correction.output_tokens,
+              "cost_millicents" => correction.cost_millicents,
+              "model_name" => correction.model_name
+            },
+            metadata: %{
+              "corrects_report_id" => original.id,
+              "story_id" => correction.story_id,
+              "project_id" => correction.project_id,
+              "input_tokens" => correction_input_tokens,
+              "output_tokens" => correction_output_tokens,
+              "cost_millicents" => Map.get(attrs, :cost_millicents, 0)
+            }
+          }
+        end)
+        |> mark_affected_cost_summaries_stale_multi(tenant_id, original)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{correction: correction}} ->
+          # Refetch to populate the DB-generated total_tokens column
+          correction = AdminRepo.get!(Report, correction.id)
+
+          # Reset budget flags if spend dropped below thresholds
+          try do
+            reset_budget_flags_if_needed(tenant_id, original)
+          rescue
+            e ->
+              Logger.warning(
+                "Budget flag reset failed after correcting report #{original.id}: " <>
+                  Exception.message(e)
+              )
+          end
+
+          {:ok, correction}
+
+        {:error, :correction, %Ecto.Changeset{} = changeset, _} ->
+          {:error, changeset}
+
+        {:error, _step, error, _} ->
+          {:error, error}
+      end
+    end
+  end
+
+  # Validates that the sum of story totals + correction values >= 0.
+  # AC-21.13.3: Negative corrections are valid as long as the sum is non-negative.
+  defp validate_correction_totals(tenant_id, original, attrs) do
+    {:ok, totals} = get_story_totals(tenant_id, original.story_id)
+
+    correction_input = Map.get(attrs, :input_tokens, 0)
+    correction_output = Map.get(attrs, :output_tokens, 0)
+    correction_cost = Map.get(attrs, :cost_millicents, 0)
+
+    new_input = totals.total_input_tokens + correction_input
+    new_output = totals.total_output_tokens + correction_output
+    new_cost = totals.total_cost_millicents + correction_cost
+
+    cond do
+      new_input < 0 ->
+        {:error, :unprocessable_entity,
+         "correction would make total input_tokens negative (current: #{totals.total_input_tokens}, correction: #{correction_input})"}
+
+      new_output < 0 ->
+        {:error, :unprocessable_entity,
+         "correction would make total output_tokens negative (current: #{totals.total_output_tokens}, correction: #{correction_output})"}
+
+      new_cost < 0 ->
+        {:error, :unprocessable_entity,
+         "correction would make total cost_millicents negative (current: #{totals.total_cost_millicents}, correction: #{correction_cost})"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # Marks cost_summaries as stale for all scopes affected by a report change.
+  # AC-21.13.7: When a report is deleted or corrected, related summaries are stale.
+  defp mark_affected_cost_summaries_stale_multi(multi, tenant_id, report) do
+    Multi.run(multi, :mark_summaries_stale, fn _repo, _changes ->
+      story_scope_ids = [report.story_id]
+
+      epic_scope_ids =
+        case AdminRepo.get_by(Story, id: report.story_id, tenant_id: tenant_id) do
+          nil -> []
+          story -> [story.epic_id]
+        end
+
+      project_scope_ids = [report.project_id]
+
+      # Mark story-scope summaries stale
+      {_n, _} =
+        CostSummary
+        |> where([cs], cs.tenant_id == ^tenant_id)
+        |> where([cs], cs.scope_type == :story and cs.scope_id in ^story_scope_ids)
+        |> AdminRepo.update_all(set: [stale: true])
+
+      # Mark epic-scope summaries stale
+      if epic_scope_ids != [] do
+        CostSummary
+        |> where([cs], cs.tenant_id == ^tenant_id)
+        |> where([cs], cs.scope_type == :epic and cs.scope_id in ^epic_scope_ids)
+        |> AdminRepo.update_all(set: [stale: true])
+      end
+
+      # Mark project-scope summaries stale
+      {_n, _} =
+        CostSummary
+        |> where([cs], cs.tenant_id == ^tenant_id)
+        |> where([cs], cs.scope_type == :project and cs.scope_id in ^project_scope_ids)
+        |> AdminRepo.update_all(set: [stale: true])
+
+      {:ok, :ok}
+    end)
+  end
+
+  # Resets warning_fired/exceeded_fired on applicable budgets when spend
+  # drops below the threshold after a deletion or correction.
+  # AC-21.13.4.
+  defp reset_budget_flags_if_needed(tenant_id, report) do
+    budgets = find_applicable_budgets(tenant_id, report)
+    Enum.each(budgets, &maybe_reset_budget_flags(tenant_id, &1))
+  end
+
+  defp maybe_reset_budget_flags(tenant_id, budget) do
+    spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
+
+    utilization_pct =
+      if budget.budget_millicents > 0, do: spend * 100 / budget.budget_millicents, else: 0
+
+    reset_attrs =
+      %{}
+      |> maybe_reset_flag(budget, :warning_fired, utilization_pct < budget.alert_threshold_pct)
+      |> maybe_reset_flag(budget, :exceeded_fired, utilization_pct < 100)
+
+    apply_budget_flag_reset(budget, reset_attrs)
+  end
+
+  defp apply_budget_flag_reset(_budget, attrs) when attrs == %{}, do: :ok
+
+  defp apply_budget_flag_reset(budget, reset_attrs) do
+    case budget |> Ecto.Changeset.change(reset_attrs) |> AdminRepo.update() do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to reset budget flags on budget #{budget.id}: #{inspect(reason)}")
+    end
+  end
+
+  defp maybe_reset_flag(attrs, budget, :warning_fired, should_reset)
+       when should_reset and budget.warning_fired do
+    Map.put(attrs, :warning_fired, false)
+  end
+
+  defp maybe_reset_flag(attrs, budget, :exceeded_fired, should_reset)
+       when should_reset and budget.exceeded_fired do
+    Map.put(attrs, :exceeded_fired, false)
+  end
+
+  defp maybe_reset_flag(attrs, _budget, _flag, _should_reset), do: attrs
 
   # --- Budget functions ---
 
@@ -880,6 +1210,7 @@ defmodule Loopctl.TokenUsage do
   defp spend_query(tenant_id, :story, scope_id) do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^scope_id)
+    |> where([r], is_nil(r.deleted_at))
     |> select([r], coalesce(sum(r.cost_millicents), 0))
   end
 
@@ -887,12 +1218,14 @@ defmodule Loopctl.TokenUsage do
     Report
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, s], r.tenant_id == ^tenant_id and s.epic_id == ^scope_id)
+    |> where([r, _s], is_nil(r.deleted_at))
     |> select([r, _s], coalesce(sum(r.cost_millicents), 0))
   end
 
   defp spend_query(tenant_id, :project, scope_id) do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^scope_id)
+    |> where([r], is_nil(r.deleted_at))
     |> select([r], coalesce(sum(r.cost_millicents), 0))
   end
 
@@ -923,6 +1256,7 @@ defmodule Loopctl.TokenUsage do
   defp batch_spend_query(tenant_id, :story, scope_ids) do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.story_id in ^scope_ids)
+    |> where([r], is_nil(r.deleted_at))
     |> group_by([r], r.story_id)
     |> select([r], {r.story_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()
@@ -933,6 +1267,7 @@ defmodule Loopctl.TokenUsage do
     Report
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, s], r.tenant_id == ^tenant_id and s.epic_id in ^scope_ids)
+    |> where([r, _s], is_nil(r.deleted_at))
     |> group_by([r, s], s.epic_id)
     |> select([r, s], {s.epic_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()
@@ -942,6 +1277,7 @@ defmodule Loopctl.TokenUsage do
   defp batch_spend_query(tenant_id, :project, scope_ids) do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.project_id in ^scope_ids)
+    |> where([r], is_nil(r.deleted_at))
     |> group_by([r], r.project_id)
     |> select([r], {r.project_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()

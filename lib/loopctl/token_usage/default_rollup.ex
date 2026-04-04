@@ -37,6 +37,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
   defp aggregate_by_agent(tenant_id, start_dt, end_dt) do
     Report
     |> where([r], r.tenant_id == ^tenant_id)
+    |> where([r], is_nil(r.deleted_at))
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> where([r], not is_nil(r.agent_id))
     |> group_by([r], r.agent_id)
@@ -69,6 +70,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     Report
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, _s], r.tenant_id == ^tenant_id)
+    |> where([r, _s], is_nil(r.deleted_at))
     |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> group_by([_r, s], s.epic_id)
     |> select([r, s], %{
@@ -105,6 +107,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
   defp aggregate_by_project(tenant_id, start_dt, end_dt) do
     Report
     |> where([r], r.tenant_id == ^tenant_id)
+    |> where([r], is_nil(r.deleted_at))
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> where([r], not is_nil(r.project_id))
     |> group_by([r], r.project_id)
@@ -163,6 +166,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     Report
     |> where([r], r.agent_id == ^scope_id)
     |> where([r], r.tenant_id == ^tenant_id)
+    |> where([r], is_nil(r.deleted_at))
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> group_by([r], [r.model_name, r.phase])
     |> select([r], %{
@@ -178,6 +182,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     Report
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, _s], r.tenant_id == ^tenant_id)
+    |> where([r, _s], is_nil(r.deleted_at))
     |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> where([_r, s], s.epic_id == ^scope_id)
     |> group_by([r, _s], [r.model_name, r.phase])
@@ -194,6 +199,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     Report
     |> where([r], r.project_id == ^scope_id)
     |> where([r], r.tenant_id == ^tenant_id)
+    |> where([r], is_nil(r.deleted_at))
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> group_by([r], [r.model_name, r.phase])
     |> select([r], %{

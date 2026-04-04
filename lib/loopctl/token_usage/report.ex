@@ -8,18 +8,20 @@ defmodule Loopctl.TokenUsage.Report do
 
   ## Fields
 
-  - `input_tokens` -- number of input tokens consumed
-  - `output_tokens` -- number of output tokens consumed
+  - `input_tokens` -- number of input tokens consumed (may be negative for corrections)
+  - `output_tokens` -- number of output tokens consumed (may be negative for corrections)
   - `total_tokens` -- generated column: input_tokens + output_tokens (read-only)
   - `model_name` -- name of the LLM model used (e.g., "claude-opus-4")
-  - `cost_millicents` -- cost in 1/1000 of a cent (e.g., 2500 = $0.025)
+  - `cost_millicents` -- cost in 1/1000 of a cent (may be negative for corrections)
   - `phase` -- work phase: planning, implementing, reviewing, other
   - `session_id` -- optional session identifier
   - `skill_version_id` -- optional FK to skill_versions
   - `metadata` -- extensible JSONB map
+  - `deleted_at` -- soft-delete timestamp; nil means active (AC-21.13.1)
+  - `corrects_report_id` -- FK to the original report this corrects (AC-21.13.2)
   """
 
-  use Loopctl.Schema
+  use Loopctl.Schema, soft_delete: true
 
   @type t :: %__MODULE__{}
 
@@ -41,6 +43,8 @@ defmodule Loopctl.TokenUsage.Report do
              :session_id,
              :skill_version_id,
              :metadata,
+             :deleted_at,
+             :corrects_report_id,
              :inserted_at,
              :updated_at
            ]}
@@ -51,6 +55,7 @@ defmodule Loopctl.TokenUsage.Report do
     belongs_to :agent, Loopctl.Agents.Agent
     belongs_to :project, Loopctl.Projects.Project
     belongs_to :skill_version, Loopctl.Skills.SkillVersion
+    belongs_to :corrects_report, __MODULE__, foreign_key: :corrects_report_id
 
     field :input_tokens, :integer
     field :output_tokens, :integer
@@ -60,6 +65,7 @@ defmodule Loopctl.TokenUsage.Report do
     field :phase, :string, default: "other"
     field :session_id, :string
     field :metadata, :map, default: %{}
+    field :deleted_at, :utc_datetime_usec
 
     timestamps()
   end
@@ -94,5 +100,36 @@ defmodule Loopctl.TokenUsage.Report do
     |> foreign_key_constraint(:agent_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:skill_version_id)
+  end
+
+  @doc """
+  Changeset for creating a correction report.
+
+  Corrections allow negative `input_tokens`, `output_tokens`, and
+  `cost_millicents` (to subtract from the story's running total).
+  The `corrects_report_id` is set programmatically.
+  """
+  @spec correction_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def correction_changeset(report \\ %__MODULE__{}, attrs) do
+    report
+    |> cast(attrs, [
+      :input_tokens,
+      :output_tokens,
+      :model_name,
+      :cost_millicents,
+      :phase,
+      :session_id,
+      :skill_version_id,
+      :metadata
+    ])
+    |> validate_required([:input_tokens, :output_tokens, :model_name, :cost_millicents])
+    |> validate_inclusion(:phase, @phases)
+    |> validate_length(:model_name, min: 1)
+    |> foreign_key_constraint(:tenant_id)
+    |> foreign_key_constraint(:story_id)
+    |> foreign_key_constraint(:agent_id)
+    |> foreign_key_constraint(:project_id)
+    |> foreign_key_constraint(:skill_version_id)
+    |> foreign_key_constraint(:corrects_report_id)
   end
 end
