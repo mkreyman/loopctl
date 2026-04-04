@@ -44,10 +44,11 @@ defmodule Loopctl.Repo.RlsHelpers do
         "ALTER TABLE #{table_name} DISABLE ROW LEVEL SECURITY"
       )
 
-      Ecto.Migration.execute(
-        "ALTER TABLE #{table_name} FORCE ROW LEVEL SECURITY",
-        "SELECT 1"
-      )
+      # NOTE: We intentionally do NOT use FORCE ROW LEVEL SECURITY.
+      # In production, the DB role (schema_admin) is the table owner
+      # without BYPASSRLS. ENABLE alone enforces RLS for non-owner roles,
+      # while allowing the owner to write. FORCE would block the owner too.
+      # Older tables also omit FORCE, so this keeps the pattern consistent.
 
       Ecto.Migration.execute(
         """
