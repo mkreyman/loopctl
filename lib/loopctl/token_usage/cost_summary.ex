@@ -92,9 +92,6 @@ defmodule Loopctl.TokenUsage.CostSummary do
       :period_end
     ])
     |> validate_inclusion(:scope_type, @scope_types)
-    |> validate_number(:total_input_tokens, greater_than_or_equal_to: 0)
-    |> validate_number(:total_output_tokens, greater_than_or_equal_to: 0)
-    |> validate_number(:total_cost_millicents, greater_than_or_equal_to: 0)
     |> validate_number(:report_count, greater_than_or_equal_to: 0)
     |> foreign_key_constraint(:tenant_id)
     |> unique_constraint([:tenant_id, :scope_type, :scope_id, :period_start],

@@ -37,6 +37,12 @@ defmodule LoopctlWeb.CostAnomalyController do
         type: :boolean,
         description: "Include archived anomalies (default: false)"
       ],
+      resolved: [
+        in: :query,
+        type: :boolean,
+        description:
+          "Filter by resolved status. true = resolved only, false = unresolved only (default: false)"
+      ],
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"]
     ],
@@ -99,6 +105,7 @@ defmodule LoopctlWeb.CostAnomalyController do
       |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
       |> maybe_add_opt(:project_id, params["project_id"])
       |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
+      |> maybe_add_opt(:resolved, parse_bool(params["resolved"]))
       |> maybe_add_opt(:page, parse_int(params["page"]))
       |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 

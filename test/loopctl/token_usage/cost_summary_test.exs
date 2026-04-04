@@ -62,25 +62,35 @@ defmodule Loopctl.TokenUsage.CostSummaryTest do
       end
     end
 
-    test "validates non-negative numbers" do
+    test "validates report_count is non-negative" do
       changeset =
         CostSummary.changeset(%CostSummary{}, %{
           scope_type: :project,
           scope_id: Ecto.UUID.generate(),
           period_start: ~D[2026-04-01],
           period_end: ~D[2026-04-01],
-          total_input_tokens: -1,
-          total_output_tokens: -1,
-          total_cost_millicents: -1,
           report_count: -1
         })
 
       refute changeset.valid?
       errors = errors_on(changeset)
-      assert errors[:total_input_tokens]
-      assert errors[:total_output_tokens]
-      assert errors[:total_cost_millicents]
       assert errors[:report_count]
+    end
+
+    test "allows negative token and cost aggregates from corrections" do
+      changeset =
+        CostSummary.changeset(%CostSummary{}, %{
+          scope_type: :project,
+          scope_id: Ecto.UUID.generate(),
+          period_start: ~D[2026-04-01],
+          period_end: ~D[2026-04-01],
+          total_input_tokens: -100,
+          total_output_tokens: -50,
+          total_cost_millicents: -200,
+          report_count: 1
+        })
+
+      assert changeset.valid?
     end
   end
 

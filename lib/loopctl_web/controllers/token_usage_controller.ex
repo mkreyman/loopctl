@@ -20,7 +20,7 @@ defmodule LoopctlWeb.TokenUsageController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
-  plug LoopctlWeb.Plugs.RequireRole, [exact_role: :user] when action in [:delete, :correct]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete, :correct]
 
   tags(["Token Efficiency"])
 
