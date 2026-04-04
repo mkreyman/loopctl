@@ -126,8 +126,18 @@ defmodule Loopctl.TokenUsage do
             }
           })
 
-          # Check budget thresholds after report creation (AC-21.8.2)
-          check_budget_thresholds(tenant_id, report)
+          # Check budget thresholds after report creation (AC-21.8.2).
+          # Wrapped in try/rescue so a DB failure during threshold checking
+          # does not crash the report creation flow (the report is committed).
+          try do
+            check_budget_thresholds(tenant_id, report)
+          rescue
+            e ->
+              Logger.warning(
+                "Budget threshold check failed for report #{report.id}: " <>
+                  Exception.message(e)
+              )
+          end
 
           {:ok, report}
 
