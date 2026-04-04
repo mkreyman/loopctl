@@ -2,10 +2,10 @@ defmodule LoopctlWeb.ProjectController do
   @moduledoc """
   Controller for project CRUD operations and progress summary.
 
-  - `POST /api/v1/projects` -- user role, creates a project
+  - `POST /api/v1/projects` -- orchestrator+, creates a project
   - `GET /api/v1/projects` -- agent+, lists projects with pagination
   - `GET /api/v1/projects/:id` -- agent+, project detail
-  - `PATCH /api/v1/projects/:id` -- user role, updates a project
+  - `PATCH /api/v1/projects/:id` -- orchestrator+, updates a project
   - `DELETE /api/v1/projects/:id` -- user role, archives a project
   - `GET /api/v1/projects/:id/progress` -- agent+, progress summary
   """
@@ -19,7 +19,8 @@ defmodule LoopctlWeb.ProjectController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
 
   tags(["Projects"])
