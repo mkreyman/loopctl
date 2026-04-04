@@ -514,40 +514,32 @@ defmodule Loopctl.TokenUsage do
   # AC-21.13.7: When a report is deleted or corrected, related summaries are stale.
   defp mark_affected_cost_summaries_stale_multi(multi, tenant_id, report) do
     Multi.run(multi, :mark_summaries_stale, fn _repo, _changes ->
-      story_scope_ids = [report.story_id]
-
-      epic_scope_ids =
-        case AdminRepo.get_by(Story, id: report.story_id, tenant_id: tenant_id) do
-          nil -> []
-          story -> [story.epic_id]
-        end
-
-      project_scope_ids = [report.project_id]
-
-      # Mark story-scope summaries stale
-      {_n, _} =
-        CostSummary
-        |> where([cs], cs.tenant_id == ^tenant_id)
-        |> where([cs], cs.scope_type == :story and cs.scope_id in ^story_scope_ids)
-        |> AdminRepo.update_all(set: [stale: true])
-
-      # Mark epic-scope summaries stale
-      if epic_scope_ids != [] do
-        CostSummary
-        |> where([cs], cs.tenant_id == ^tenant_id)
-        |> where([cs], cs.scope_type == :epic and cs.scope_id in ^epic_scope_ids)
-        |> AdminRepo.update_all(set: [stale: true])
-      end
-
-      # Mark project-scope summaries stale
-      {_n, _} =
-        CostSummary
-        |> where([cs], cs.tenant_id == ^tenant_id)
-        |> where([cs], cs.scope_type == :project and cs.scope_id in ^project_scope_ids)
-        |> AdminRepo.update_all(set: [stale: true])
-
+      affected_scopes = collect_affected_scopes(tenant_id, report)
+      Enum.each(affected_scopes, &mark_scope_stale(tenant_id, &1))
       {:ok, :ok}
     end)
+  end
+
+  defp collect_affected_scopes(tenant_id, report) do
+    epic_id =
+      case AdminRepo.get_by(Story, id: report.story_id, tenant_id: tenant_id) do
+        nil -> nil
+        story -> story.epic_id
+      end
+
+    [{:story, report.story_id}, {:project, report.project_id}]
+    |> maybe_add_scope(:epic, epic_id)
+    |> maybe_add_scope(:agent, report.agent_id)
+  end
+
+  defp maybe_add_scope(scopes, _type, nil), do: scopes
+  defp maybe_add_scope(scopes, type, id), do: [{type, id} | scopes]
+
+  defp mark_scope_stale(tenant_id, {scope_type, scope_id}) do
+    CostSummary
+    |> where([cs], cs.tenant_id == ^tenant_id)
+    |> where([cs], cs.scope_type == ^scope_type and cs.scope_id == ^scope_id)
+    |> AdminRepo.update_all(set: [stale: true])
   end
 
   # Resets warning_fired/exceeded_fired on applicable budgets when spend
