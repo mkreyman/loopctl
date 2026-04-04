@@ -273,7 +273,22 @@ defmodule LoopctlWeb.TokenBudgetController do
     with {:ok, budget} <- TokenUsage.get_budget(tenant_id, id) do
       spend = TokenUsage.get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
 
-      json(conn, %{token_budget: format_budget_with_spend(budget, spend)})
+      {:ok, effective} =
+        TokenUsage.get_effective_budget(tenant_id, budget.scope_type, budget.scope_id)
+
+      {effective_budget_millicents, budget_source} =
+        case effective do
+          {millicents, source} -> {millicents, source}
+          nil -> {nil, nil}
+        end
+
+      json(conn, %{
+        token_budget:
+          budget
+          |> format_budget_with_spend(spend)
+          |> Map.put(:effective_budget_millicents, effective_budget_millicents)
+          |> Map.put(:budget_source, budget_source)
+      })
     end
   end
 
@@ -321,14 +336,16 @@ defmodule LoopctlWeb.TokenBudgetController do
 
   defp format_budget_with_spend(budget, spend) do
     remaining = max(budget.budget_millicents - spend, 0)
+    budget_millicents = budget.budget_millicents
+    utilization_pct = if budget_millicents > 0, do: div(spend * 100, budget_millicents), else: 0
 
     %{
       id: budget.id,
       tenant_id: budget.tenant_id,
       scope_type: budget.scope_type,
       scope_id: budget.scope_id,
-      budget_millicents: budget.budget_millicents,
-      budget_dollars: Formatting.millicents_to_dollars(budget.budget_millicents),
+      budget_millicents: budget_millicents,
+      budget_dollars: Formatting.millicents_to_dollars(budget_millicents),
       budget_input_tokens: budget.budget_input_tokens,
       budget_output_tokens: budget.budget_output_tokens,
       alert_threshold_pct: budget.alert_threshold_pct,
@@ -336,6 +353,7 @@ defmodule LoopctlWeb.TokenBudgetController do
       current_spend_dollars: Formatting.millicents_to_dollars(spend),
       remaining_millicents: remaining,
       remaining_dollars: Formatting.millicents_to_dollars(remaining),
+      utilization_pct: utilization_pct,
       metadata: budget.metadata,
       inserted_at: budget.inserted_at,
       updated_at: budget.updated_at
