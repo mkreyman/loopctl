@@ -23,7 +23,8 @@ defmodule LoopctlWeb.CostAnomalyController do
     description:
       "Returns unresolved cost anomalies for the tenant. " <>
         "Filterable by anomaly_type and project_id. " <>
-        "Includes story title and agent name.",
+        "Includes story title and agent name. " <>
+        "Archived anomalies are excluded by default; use ?include_archived=true to include them.",
     parameters: [
       anomaly_type: [
         in: :query,
@@ -31,6 +32,11 @@ defmodule LoopctlWeb.CostAnomalyController do
         description: "Filter by anomaly type: high_cost, suspiciously_low, budget_exceeded"
       ],
       project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      include_archived: [
+        in: :query,
+        type: :boolean,
+        description: "Include archived anomalies (default: false)"
+      ],
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"]
     ],
@@ -79,6 +85,7 @@ defmodule LoopctlWeb.CostAnomalyController do
       []
       |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
       |> maybe_add_opt(:project_id, params["project_id"])
+      |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
       |> maybe_add_opt(:page, parse_int(params["page"]))
       |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
@@ -122,6 +129,13 @@ defmodule LoopctlWeb.CostAnomalyController do
   end
 
   # --- Private helpers ---
+
+  defp parse_bool(nil), do: nil
+  defp parse_bool("true"), do: true
+  defp parse_bool("false"), do: false
+  defp parse_bool(true), do: true
+  defp parse_bool(false), do: false
+  defp parse_bool(_), do: nil
 
   defp parse_int(nil), do: nil
 

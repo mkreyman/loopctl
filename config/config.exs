@@ -76,14 +76,15 @@ config :hammer,
 # Oban background jobs
 config :loopctl, Oban,
   repo: Loopctl.Repo,
-  queues: [default: 10, webhooks: 5, cleanup: 2, analytics: 3],
+  queues: [default: 10, webhooks: 5, cleanup: 2, analytics: 3, maintenance: 2],
   plugins: [
     {Oban.Plugins.Cron,
      crontab: [
        {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
        {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
        {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
-       {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker}
+       {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
+       {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker}
      ]}
   ]
 
