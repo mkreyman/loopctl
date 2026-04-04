@@ -89,7 +89,8 @@ defmodule Loopctl.Workers.CostRollupWorker do
         |> CostSummary.changeset(
           Map.merge(row, %{
             period_start: period_start,
-            period_end: period_end
+            period_end: period_end,
+            stale: false
           })
         )
 
@@ -104,6 +105,7 @@ defmodule Loopctl.Workers.CostRollupWorker do
              :report_count,
              :model_breakdown,
              :avg_cost_per_story_millicents,
+             :stale,
              :updated_at
            ]},
         conflict_target: [:tenant_id, :scope_type, :scope_id, :period_start]
