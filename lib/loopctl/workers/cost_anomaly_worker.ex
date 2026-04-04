@@ -64,35 +64,43 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       |> where([cs], cs.avg_cost_per_story_millicents > 0)
       |> AdminRepo.all()
 
-    # For each epic, get per-story costs in this period
-    Enum.each(epic_summaries, fn summary ->
-      check_epic_stories(tenant_id, summary, period_start, period_end)
-    end)
+    if epic_summaries == [] do
+      :ok
+    else
+      # Build a map of epic_id => avg_cost_per_story_millicents for fast lookup
+      epic_avg_map =
+        Map.new(epic_summaries, fn cs -> {cs.scope_id, cs.avg_cost_per_story_millicents} end)
+
+      epic_ids = Map.keys(epic_avg_map)
+      check_all_epic_stories(tenant_id, epic_ids, epic_avg_map, period_start, period_end)
+    end
 
     :ok
   end
 
-  defp check_epic_stories(tenant_id, epic_summary, period_start, period_end) do
+  # Issues ONE query for per-story costs across ALL epics, then processes in memory.
+  defp check_all_epic_stories(tenant_id, epic_ids, epic_avg_map, period_start, period_end) do
     start_dt = NaiveDateTime.new!(period_start, ~T[00:00:00])
     end_dt = NaiveDateTime.new!(period_end, ~T[23:59:59.999999])
-    epic_avg = epic_summary.avg_cost_per_story_millicents
 
-    # Get per-story costs for this epic in the period (exclude soft-deleted reports)
+    # Single query: per-story costs grouped by (story_id, epic_id) for all epics
     story_costs =
       Report
       |> join(:inner, [r], s in Story, on: r.story_id == s.id)
-      |> where([r, s], r.tenant_id == ^tenant_id)
+      |> where([r, _s], r.tenant_id == ^tenant_id)
       |> where([r, _s], is_nil(r.deleted_at))
-      |> where([_r, s], s.epic_id == ^epic_summary.scope_id)
+      |> where([_r, s], s.epic_id in ^epic_ids)
       |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
-      |> group_by([r, _s], r.story_id)
-      |> select([r, _s], %{
+      |> group_by([r, s], [r.story_id, s.epic_id])
+      |> select([r, s], %{
         story_id: r.story_id,
+        epic_id: s.epic_id,
         total_cost: sum(r.cost_millicents)
       })
       |> AdminRepo.all()
 
-    Enum.each(story_costs, fn %{story_id: story_id, total_cost: total_cost} ->
+    Enum.each(story_costs, fn %{story_id: story_id, epic_id: epic_id, total_cost: total_cost} ->
+      epic_avg = Map.get(epic_avg_map, epic_id)
       cost = to_int(total_cost)
       check_and_flag_anomaly(tenant_id, story_id, cost, epic_avg)
     end)
@@ -268,8 +276,16 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         yesterday = Date.add(Date.utc_today(), -1)
         {yesterday, yesterday}
 
-      {start_str, end_str} ->
+      {start_str, end_str} when is_binary(start_str) and is_binary(end_str) ->
         {Date.from_iso8601!(start_str), Date.from_iso8601!(end_str)}
+
+      other ->
+        Logger.warning(
+          "CostAnomalyWorker: invalid period args #{inspect(other)}, defaulting to yesterday"
+        )
+
+        yesterday = Date.add(Date.utc_today(), -1)
+        {yesterday, yesterday}
     end
   end
 

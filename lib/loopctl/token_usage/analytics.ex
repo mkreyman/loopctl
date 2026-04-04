@@ -972,61 +972,48 @@ defmodule Loopctl.TokenUsage.Analytics do
 
   # AC-21.5.4: Comparative view — mixed-model vs single-model agents.
   # Returns avg verification rate and avg cost per story for each group.
+  # Uses a single query with a LEFT JOIN to stories and conditional aggregation
+  # to avoid two separate full-table scans of token_usage_reports.
   defp model_mix_comparative(tenant_id, opts) do
-    # Compute per-agent: model_count, total_cost, story_count, verified_count
+    # Single query: per-agent stats + verification counts via conditional aggregation
     agent_stats =
       Report
-      |> where([r], r.tenant_id == ^tenant_id)
-      |> where([r], is_nil(r.deleted_at))
-      |> where([r], not is_nil(r.agent_id))
-      |> apply_date_filters(opts)
-      |> apply_project_filter(opts)
-      |> group_by([r], r.agent_id)
-      |> select([r], %{
-        agent_id: r.agent_id,
-        model_count: count(r.model_name, :distinct),
-        total_cost_millicents: sum(r.cost_millicents),
-        stories_count: count(r.story_id, :distinct)
-      })
-      |> AdminRepo.all()
-
-    # Verification counts per agent (from verified/rejected stories)
-    agent_verification =
-      Report
-      |> join(:inner, [r], s in Story, on: r.story_id == s.id)
+      |> join(:left, [r], s in Story, on: r.story_id == s.id)
       |> where([r, _s], r.tenant_id == ^tenant_id)
       |> where([r, _s], is_nil(r.deleted_at))
       |> where([r, _s], not is_nil(r.agent_id))
-      |> where([_r, s], s.verified_status in [:verified, :rejected])
       |> apply_model_date_filters(opts)
       |> apply_model_project_filter(opts)
-      |> group_by([r, s], [r.agent_id, s.verified_status])
+      |> group_by([r, _s], r.agent_id)
       |> select([r, s], %{
         agent_id: r.agent_id,
-        verified_status: s.verified_status,
-        story_count: count(s.id, :distinct)
+        model_count: count(r.model_name, :distinct),
+        total_cost_millicents: sum(r.cost_millicents),
+        stories_count: count(r.story_id, :distinct),
+        verified_count:
+          fragment(
+            "COUNT(DISTINCT CASE WHEN ? = 'verified' THEN ? END)",
+            s.verified_status,
+            s.id
+          ),
+        rejected_count:
+          fragment(
+            "COUNT(DISTINCT CASE WHEN ? = 'rejected' THEN ? END)",
+            s.verified_status,
+            s.id
+          )
       })
       |> AdminRepo.all()
-      |> Enum.group_by(& &1.agent_id)
-      |> Map.new(fn {agent_id, rows} ->
-        verified = Enum.find(rows, &(&1.verified_status == :verified))
-        rejected = Enum.find(rows, &(&1.verified_status == :rejected))
-
-        {agent_id,
-         %{
-           verified: if(verified, do: verified.story_count, else: 0),
-           rejected: if(rejected, do: rejected.story_count, else: 0)
-         }}
-      end)
 
     # Build per-agent enriched data
     enriched =
       Enum.map(agent_stats, fn row ->
-        vd = Map.get(agent_verification, row.agent_id, %{verified: 0, rejected: 0})
-        total_verifiable = vd.verified + vd.rejected
+        verified = row.verified_count || 0
+        rejected = row.rejected_count || 0
+        total_verifiable = verified + rejected
 
         verification_rate =
-          if total_verifiable > 0, do: safe_div(vd.verified * 100, total_verifiable), else: nil
+          if total_verifiable > 0, do: safe_div(verified * 100, total_verifiable), else: nil
 
         cost = to_int(row.total_cost_millicents)
         avg_cost = safe_div(cost, row.stories_count)

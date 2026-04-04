@@ -32,7 +32,9 @@ defmodule Loopctl.TokenUsage.Formatting do
       iex> millicents_to_dollars(155)
       "0.00"
   """
-  @spec millicents_to_dollars(integer() | Decimal.t()) :: String.t()
+  @spec millicents_to_dollars(integer() | Decimal.t() | nil) :: String.t()
+  def millicents_to_dollars(nil), do: "0.00"
+
   def millicents_to_dollars(%Decimal{} = millicents) do
     millicents
     |> Decimal.div(100_000)
@@ -76,7 +78,9 @@ defmodule Loopctl.TokenUsage.Formatting do
       iex> format_tokens(2_500_000)
       "2.5M"
   """
-  @spec format_tokens(integer()) :: String.t()
+  @spec format_tokens(integer() | nil) :: String.t()
+  def format_tokens(nil), do: "0"
+
   def format_tokens(tokens) when is_integer(tokens) and tokens >= 1_000_000 do
     whole = div(tokens, 1_000_000)
     frac = div(rem(tokens, 1_000_000), 100_000)
