@@ -32,6 +32,8 @@ defmodule Loopctl.TokenUsage.Budget do
              :budget_input_tokens,
              :budget_output_tokens,
              :alert_threshold_pct,
+             :warning_fired,
+             :exceeded_fired,
              :metadata,
              :inserted_at,
              :updated_at
@@ -46,6 +48,8 @@ defmodule Loopctl.TokenUsage.Budget do
     field :budget_input_tokens, :integer
     field :budget_output_tokens, :integer
     field :alert_threshold_pct, :integer, default: 80
+    field :warning_fired, :boolean, default: false
+    field :exceeded_fired, :boolean, default: false
     field :metadata, :map, default: %{}
 
     timestamps()
@@ -88,6 +92,10 @@ defmodule Loopctl.TokenUsage.Budget do
   Changeset for updating an existing token budget.
 
   Cannot change `scope_type` or `scope_id`.
+
+  When `budget_millicents` or `alert_threshold_pct` changes, the
+  `warning_fired` and `exceeded_fired` deduplication flags are reset
+  to `false` so that webhook events will re-fire at the new threshold.
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(budget, attrs) do
@@ -106,5 +114,19 @@ defmodule Loopctl.TokenUsage.Budget do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 100
     )
+    |> maybe_reset_dedup_flags()
+  end
+
+  # If budget_millicents or alert_threshold_pct changed, reset the
+  # warning_fired / exceeded_fired flags so webhook events re-fire at the
+  # new threshold level (AC-21.7.6).
+  defp maybe_reset_dedup_flags(changeset) do
+    if get_change(changeset, :budget_millicents) || get_change(changeset, :alert_threshold_pct) do
+      changeset
+      |> put_change(:warning_fired, false)
+      |> put_change(:exceeded_fired, false)
+    else
+      changeset
+    end
   end
 end

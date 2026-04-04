@@ -30,6 +30,8 @@ defmodule Loopctl.TokenUsage do
       Loopctl.TokenUsage.get_story_totals(tenant_id, story_id)
   """
 
+  require Logger
+
   import Ecto.Query
 
   alias Ecto.Multi
@@ -42,8 +44,11 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.TokenUsage.Budget
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.Report
+  alias Loopctl.Webhooks.EventGenerator
+  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @doc """
   Creates a new token usage report.
@@ -121,8 +126,18 @@ defmodule Loopctl.TokenUsage do
             }
           })
 
-          # Check budget thresholds after report creation (AC-21.8.2)
-          check_budget_thresholds(tenant_id, report)
+          # Check budget thresholds after report creation (AC-21.8.2).
+          # Wrapped in try/rescue so a DB failure during threshold checking
+          # does not crash the report creation flow (the report is committed).
+          try do
+            check_budget_thresholds(tenant_id, report)
+          rescue
+            e ->
+              Logger.warning(
+                "Budget threshold check failed for report #{report.id}: " <>
+                  Exception.message(e)
+              )
+          end
 
           {:ok, report}
 
@@ -545,10 +560,15 @@ defmodule Loopctl.TokenUsage do
     decimal_to_int(result || 0)
   end
 
-  # --- Budget threshold check (AC-21.8.2) ---
+  # --- Budget threshold check (AC-21.8.2, AC-21.7.5, AC-21.7.6) ---
 
   # After a token usage report is created, check all applicable budgets
-  # and emit threshold_crossed audit entries for any that have been crossed.
+  # and emit threshold_crossed audit entries and webhook events for any
+  # that have been crossed. Deduplication is enforced via warning_fired
+  # and exceeded_fired boolean flags on the budget.
+  #
+  # When a single report pushes spend past both thresholds (e.g., from 50%
+  # to 120%), both the warning AND exceeded events fire independently.
   defp check_budget_thresholds(tenant_id, report) do
     budgets = find_applicable_budgets(tenant_id, report)
 
@@ -558,17 +578,103 @@ defmodule Loopctl.TokenUsage do
       utilization_pct =
         if budget.budget_millicents > 0, do: spend * 100 / budget.budget_millicents, else: 0
 
-      cond do
-        utilization_pct >= 100 ->
-          emit_threshold_crossed(tenant_id, budget, utilization_pct, "exceeded")
+      # Fire warning and exceeded independently so both fire when a single
+      # report pushes past both thresholds at once.
+      if utilization_pct >= budget.alert_threshold_pct do
+        emit_threshold_crossed(tenant_id, budget, utilization_pct, "warning")
+        maybe_fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report)
+      end
 
-        utilization_pct >= budget.alert_threshold_pct ->
-          emit_threshold_crossed(tenant_id, budget, utilization_pct, "warning")
-
-        true ->
-          :ok
+      if utilization_pct >= 100 do
+        emit_threshold_crossed(tenant_id, budget, utilization_pct, "exceeded")
+        maybe_fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report)
       end
     end)
+  end
+
+  # Fires a budget_warning webhook event if not already fired (dedup via warning_fired flag).
+  defp maybe_fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report) do
+    if not budget.warning_fired do
+      payload = %{
+        "budget_id" => budget.id,
+        "scope_type" => to_string(budget.scope_type),
+        "scope_id" => budget.scope_id,
+        "budget_millicents" => budget.budget_millicents,
+        "current_spend_millicents" => spend,
+        "utilization_pct" => utilization_pct,
+        "alert_threshold_pct" => budget.alert_threshold_pct,
+        "triggering_report_id" => report.id
+      }
+
+      fire_budget_event(tenant_id, "token.budget_warning", report.project_id, payload)
+      mark_budget_flag(budget, :warning_fired)
+    end
+  end
+
+  # Fires a budget_exceeded webhook event if not already fired (dedup via exceeded_fired flag).
+  defp maybe_fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report) do
+    if not budget.exceeded_fired do
+      overage = max(spend - budget.budget_millicents, 0)
+
+      payload = %{
+        "budget_id" => budget.id,
+        "scope_type" => to_string(budget.scope_type),
+        "scope_id" => budget.scope_id,
+        "budget_millicents" => budget.budget_millicents,
+        "current_spend_millicents" => spend,
+        "utilization_pct" => utilization_pct,
+        "alert_threshold_pct" => budget.alert_threshold_pct,
+        "triggering_report_id" => report.id,
+        "overage_millicents" => overage
+      }
+
+      fire_budget_event(tenant_id, "token.budget_exceeded", report.project_id, payload)
+      mark_budget_flag(budget, :exceeded_fired)
+    end
+  end
+
+  # Creates webhook events for matching subscriptions. Passes project_id so
+  # project-scoped webhooks also receive budget alerts. Errors are caught to
+  # avoid crashing the report creation flow (the report is already committed).
+  defp fire_budget_event(tenant_id, event_type, project_id, payload) do
+    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
+
+    Enum.each(webhooks, fn webhook ->
+      with {:ok, event} <-
+             %WebhookEvent{
+               tenant_id: tenant_id,
+               webhook_id: webhook.id
+             }
+             |> WebhookEvent.create_changeset(%{
+               event_type: event_type,
+               payload: payload
+             })
+             |> AdminRepo.insert(),
+           {:ok, _job} <-
+             WebhookDeliveryWorker.new(%{
+               webhook_event_id: event.id,
+               tenant_id: tenant_id
+             })
+             |> Oban.insert() do
+        :ok
+      else
+        {:error, reason} ->
+          Logger.warning(
+            "Failed to create #{event_type} webhook event for tenant #{tenant_id}: #{inspect(reason)}"
+          )
+      end
+    end)
+  end
+
+  # Updates a dedup flag on the budget. Logs failures instead of crashing.
+  defp mark_budget_flag(budget, flag) when flag in [:warning_fired, :exceeded_fired] do
+    case budget |> Ecto.Changeset.change(%{flag => true}) |> AdminRepo.update() do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to set #{flag} on budget #{budget.id}: #{inspect(reason)}")
+    end
   end
 
   # Finds all budgets applicable to a report: story-level, epic-level, project-level.

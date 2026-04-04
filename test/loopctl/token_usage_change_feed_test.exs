@@ -216,11 +216,14 @@ defmodule Loopctl.TokenUsageChangeFeedTest do
         })
 
       entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
-      assert length(entries) == 1
+      # Both warning and exceeded fire independently when spend jumps past both thresholds
+      assert length(entries) == 2
 
-      [entry] = entries
-      assert entry.new_state["threshold_type"] == "exceeded"
-      assert entry.new_state["utilization_pct"] >= 100
+      threshold_types = Enum.map(entries, & &1.new_state["threshold_type"]) |> Enum.sort()
+      assert threshold_types == ["exceeded", "warning"]
+
+      exceeded_entry = Enum.find(entries, &(&1.new_state["threshold_type"] == "exceeded"))
+      assert exceeded_entry.new_state["utilization_pct"] >= 100
     end
 
     test "does NOT emit threshold_crossed when spend is below alert_threshold_pct" do
@@ -340,11 +343,13 @@ defmodule Loopctl.TokenUsageChangeFeedTest do
         })
 
       entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
-      # Both budgets should be crossed (7000/5000 > 100%, 7000/8000 > 80%)
-      assert length(entries) == 2
+      # Story budget: 7000/5000 = 140% -> both warning + exceeded entries (2)
+      # Project budget: 7000/8000 = 87.5% -> warning entry only (1)
+      # Total: 3
+      assert length(entries) == 3
 
       scope_types = Enum.map(entries, & &1.new_state["scope_type"]) |> Enum.sort()
-      assert scope_types == ["project", "story"]
+      assert scope_types == ["project", "story", "story"]
     end
 
     test "threshold_crossed entry includes metadata with budget_id and scope_id" do
@@ -369,12 +374,17 @@ defmodule Loopctl.TokenUsageChangeFeedTest do
           cost_millicents: 5_500
         })
 
-      [entry] = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      entries = find_audit_entries(tenant.id, "token_budget", "threshold_crossed")
+      # Spend 5500/5000 = 110% -> both warning + exceeded audit entries fire
+      assert length(entries) == 2
 
-      assert entry.metadata["budget_id"] == budget.id
-      assert entry.metadata["scope_type"] == "story"
-      assert entry.metadata["scope_id"] == story.id
-      assert entry.metadata["threshold_type"] == "exceeded"
+      exceeded_entry =
+        Enum.find(entries, &(&1.new_state["threshold_type"] == "exceeded"))
+
+      assert exceeded_entry.metadata["budget_id"] == budget.id
+      assert exceeded_entry.metadata["scope_type"] == "story"
+      assert exceeded_entry.metadata["scope_id"] == story.id
+      assert exceeded_entry.metadata["threshold_type"] == "exceeded"
     end
   end
 

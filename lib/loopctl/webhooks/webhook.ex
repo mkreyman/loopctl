@@ -34,6 +34,9 @@ defmodule Loopctl.Webhooks.Webhook do
     agent.registered
     project.imported
     webhook.test
+    token.budget_warning
+    token.budget_exceeded
+    token.anomaly_detected
   )
 
   @doc """
