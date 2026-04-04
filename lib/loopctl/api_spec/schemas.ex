@@ -793,6 +793,9 @@ defmodule Loopctl.ApiSpec.Schemas do
               "artifact.reported",
               "agent.registered",
               "project.imported",
+              "token.budget_warning",
+              "token.budget_exceeded",
+              "token.anomaly_detected",
               "webhook.test"
             ]
           },
@@ -802,7 +805,7 @@ defmodule Loopctl.ApiSpec.Schemas do
       },
       example: %{
         url: "https://example.com/webhook",
-        events: ["story.verified", "story.rejected"],
+        events: ["story.verified", "story.rejected", "token.budget_warning"],
         project_id: nil
       }
     })
@@ -830,7 +833,7 @@ defmodule Loopctl.ApiSpec.Schemas do
       example: %{
         id: "a7b8c9d0-e1f2-3456-abcd-567890123456",
         url: "https://example.com/webhook",
-        events: ["story.verified", "story.rejected"],
+        events: ["story.verified", "story.rejected", "token.budget_warning"],
         project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
         active: true,
         consecutive_failures: 0,
@@ -1600,6 +1603,636 @@ defmodule Loopctl.ApiSpec.Schemas do
         status: "failed",
         summary:
           "Tested 12 flows. Found 2 critical issues in checkout. Cart and auth flows passed."
+      }
+    })
+  end
+
+  # ---------- Token Efficiency ----------
+
+  defmodule TokenUsageReport do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenUsageReport",
+      description:
+        "A token usage report for an agent story. Tracks input/output tokens, model name, " <>
+          "and cost in millicents (1/1000 of a cent). Corrections use negative values.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        project_id: %Schema{type: :string, format: :uuid, nullable: true},
+        input_tokens: %Schema{type: :integer, description: "Number of input tokens consumed"},
+        output_tokens: %Schema{type: :integer, description: "Number of output tokens consumed"},
+        total_tokens: %Schema{
+          type: :integer,
+          description: "DB-generated column: input_tokens + output_tokens"
+        },
+        model_name: %Schema{
+          type: :string,
+          description: "LLM model name",
+          example: "claude-opus-4-5"
+        },
+        cost_millicents: %Schema{
+          type: :integer,
+          description: "Cost in millicents (1/1000 of a cent)"
+        },
+        cost_dollars: %Schema{
+          type: :string,
+          description: "Cost formatted as dollars (e.g. \"1.23\")",
+          example: "1.23"
+        },
+        phase: %Schema{
+          type: :string,
+          enum: ["planning", "implementing", "reviewing", "other"],
+          description: "Work phase when tokens were consumed"
+        },
+        session_id: %Schema{type: :string, nullable: true},
+        skill_version_id: %Schema{type: :string, format: :uuid, nullable: true},
+        metadata: %Schema{type: :object, additionalProperties: true},
+        deleted_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        corrects_report_id: %Schema{type: :string, format: :uuid, nullable: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        tenant_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        story_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        agent_id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        project_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        input_tokens: 125_000,
+        output_tokens: 48_000,
+        total_tokens: 173_000,
+        model_name: "claude-opus-4-5",
+        cost_millicents: 187_500,
+        cost_dollars: "1.88",
+        phase: "implementing",
+        session_id: "sess_abc123",
+        skill_version_id: nil,
+        metadata: %{},
+        deleted_at: nil,
+        corrects_report_id: nil,
+        inserted_at: "2026-03-25T14:30:00Z",
+        updated_at: "2026-03-25T14:30:00Z"
+      }
+    })
+  end
+
+  defmodule TokenBudget do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenBudget",
+      description:
+        "A cost and token budget at project, epic, or story scope. " <>
+          "Tracks alert thresholds and firing state for budget webhooks.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        scope_type: %Schema{
+          type: :string,
+          enum: ["project", "epic", "story"],
+          description: "The scope level of the budget"
+        },
+        scope_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description: "UUID of the project, epic, or story"
+        },
+        budget_millicents: %Schema{
+          type: :integer,
+          description: "Total cost budget in millicents"
+        },
+        budget_dollars: %Schema{
+          type: :string,
+          description: "Budget formatted as dollars",
+          example: "50.00"
+        },
+        budget_input_tokens: %Schema{
+          type: :integer,
+          nullable: true,
+          description: "Optional input token budget"
+        },
+        budget_output_tokens: %Schema{
+          type: :integer,
+          nullable: true,
+          description: "Optional output token budget"
+        },
+        alert_threshold_pct: %Schema{
+          type: :integer,
+          description: "Percentage at which to fire a warning webhook (1-100)"
+        },
+        current_spend_millicents: %Schema{
+          type: :integer,
+          description: "Current spend in millicents (computed at query time)"
+        },
+        current_spend_dollars: %Schema{
+          type: :string,
+          description: "Current spend formatted as dollars"
+        },
+        remaining_millicents: %Schema{
+          type: :integer,
+          description: "Remaining budget in millicents (budget - spend, floored at 0)"
+        },
+        remaining_dollars: %Schema{type: :string, description: "Remaining budget as dollars"},
+        metadata: %Schema{type: :object, additionalProperties: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        tenant_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        scope_type: "project",
+        scope_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        budget_millicents: 5_000_000,
+        budget_dollars: "50.00",
+        budget_input_tokens: nil,
+        budget_output_tokens: nil,
+        alert_threshold_pct: 80,
+        current_spend_millicents: 3_750_000,
+        current_spend_dollars: "37.50",
+        remaining_millicents: 1_250_000,
+        remaining_dollars: "12.50",
+        metadata: %{},
+        inserted_at: "2026-01-15T10:00:00Z",
+        updated_at: "2026-03-25T14:30:00Z"
+      }
+    })
+  end
+
+  defmodule CostSummary do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "CostSummary",
+      description:
+        "Aggregated cost summary for a scope (story, epic, project) over a time period. " <>
+          "Used for analytics and budget utilization calculations.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        scope_type: %Schema{
+          type: :string,
+          enum: ["story", "epic", "project"],
+          description: "The aggregation scope"
+        },
+        scope_id: %Schema{type: :string, format: :uuid},
+        period_start: %Schema{type: :string, format: :date, description: "Period start date"},
+        period_end: %Schema{type: :string, format: :date, description: "Period end date"},
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        report_count: %Schema{type: :integer},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        tenant_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        scope_type: "project",
+        scope_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        period_start: "2026-03-01",
+        period_end: "2026-03-31",
+        total_input_tokens: 2_500_000,
+        total_output_tokens: 980_000,
+        total_tokens: 3_480_000,
+        total_cost_millicents: 3_720_000,
+        report_count: 142,
+        inserted_at: "2026-04-01T00:00:00Z",
+        updated_at: "2026-04-01T00:00:00Z"
+      }
+    })
+  end
+
+  defmodule CostAnomaly do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "CostAnomaly",
+      description:
+        "A detected cost anomaly for a story. Generated by the daily rollup worker. " <>
+          "Types: high_cost (>3x epic avg), suspiciously_low (<0.1x), " <>
+          "budget_exceeded (over configured budget).",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        anomaly_type: %Schema{
+          type: :string,
+          enum: ["high_cost", "suspiciously_low", "budget_exceeded"],
+          description: "Type of cost anomaly detected"
+        },
+        story_cost_millicents: %Schema{
+          type: :integer,
+          description: "The story's actual total cost in millicents"
+        },
+        reference_avg_millicents: %Schema{
+          type: :integer,
+          description: "The epic average cost used for comparison"
+        },
+        deviation_factor: %Schema{
+          type: :number,
+          description: "How many times the story cost deviates from the reference average"
+        },
+        resolved: %Schema{
+          type: :boolean,
+          description: "Whether the anomaly has been acknowledged and resolved"
+        },
+        archived: %Schema{
+          type: :boolean,
+          description: "Whether the anomaly is archived (excluded from default list)"
+        },
+        metadata: %Schema{type: :object, additionalProperties: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      },
+      example: %{
+        id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        tenant_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        story_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        anomaly_type: "high_cost",
+        story_cost_millicents: 450_000,
+        reference_avg_millicents: 125_000,
+        deviation_factor: 3.6,
+        resolved: false,
+        archived: false,
+        metadata: %{},
+        inserted_at: "2026-03-26T01:00:00Z",
+        updated_at: "2026-03-26T01:00:00Z"
+      }
+    })
+  end
+
+  defmodule TokenAnalyticsAgent do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenAnalyticsAgent",
+      description: "Per-agent cost and token metrics with efficiency ranking.",
+      type: :object,
+      properties: %{
+        agent_id: %Schema{type: :string, format: :uuid},
+        agent_name: %Schema{type: :string},
+        total_stories_reported: %Schema{type: :integer},
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        avg_cost_per_story_millicents: %Schema{type: :integer},
+        primary_model: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Most frequently used model",
+          example: "claude-sonnet-4-5"
+        },
+        efficiency_rank: %Schema{
+          type: :integer,
+          description: "Rank by avg cost per story (1 = most efficient)"
+        }
+      },
+      example: %{
+        agent_id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        agent_name: "worker-3",
+        total_stories_reported: 18,
+        total_input_tokens: 2_250_000,
+        total_output_tokens: 864_000,
+        total_cost_millicents: 2_943_000,
+        avg_cost_per_story_millicents: 163_500,
+        primary_model: "claude-sonnet-4-5",
+        efficiency_rank: 1
+      }
+    })
+  end
+
+  defmodule TokenAnalyticsEpic do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenAnalyticsEpic",
+      description: "Per-epic cost breakdown including budget utilization and model breakdown.",
+      type: :object,
+      properties: %{
+        epic_id: %Schema{type: :string, format: :uuid},
+        epic_title: %Schema{type: :string},
+        epic_number: %Schema{type: :integer},
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        story_count: %Schema{type: :integer},
+        avg_cost_per_story_millicents: %Schema{type: :integer},
+        budget_millicents: %Schema{
+          type: :integer,
+          nullable: true,
+          description: "Configured budget for this epic (nil if no budget)"
+        },
+        budget_utilization_pct: %Schema{
+          type: :number,
+          nullable: true,
+          description: "Percentage of budget consumed (nil if no budget)"
+        }
+      },
+      example: %{
+        epic_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        epic_title: "Token Efficiency",
+        epic_number: 21,
+        total_input_tokens: 1_875_000,
+        total_output_tokens: 720_000,
+        total_cost_millicents: 2_475_000,
+        story_count: 11,
+        avg_cost_per_story_millicents: 225_000,
+        budget_millicents: 3_000_000,
+        budget_utilization_pct: 82.5
+      }
+    })
+  end
+
+  defmodule TokenAnalyticsProject do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenAnalyticsProject",
+      description:
+        "Comprehensive cost overview for a single project including phase and model breakdown.",
+      type: :object,
+      properties: %{
+        project_id: %Schema{type: :string, format: :uuid},
+        project_name: %Schema{type: :string},
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        story_count: %Schema{type: :integer},
+        epic_count: %Schema{type: :integer},
+        avg_cost_per_story_millicents: %Schema{type: :integer},
+        phase_breakdown: %Schema{
+          type: :object,
+          description: "Cost breakdown by phase (planning, implementing, reviewing, other)",
+          additionalProperties: true
+        },
+        model_breakdown: %Schema{
+          type: :object,
+          description: "Cost breakdown by model name",
+          additionalProperties: true
+        },
+        budget_millicents: %Schema{type: :integer, nullable: true},
+        budget_utilization_pct: %Schema{type: :number, nullable: true}
+      },
+      example: %{
+        project_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        project_name: "loopctl",
+        total_input_tokens: 12_500_000,
+        total_output_tokens: 4_800_000,
+        total_cost_millicents: 16_650_000,
+        story_count: 60,
+        epic_count: 15,
+        avg_cost_per_story_millicents: 277_500,
+        phase_breakdown: %{
+          implementing: 9_800_000,
+          reviewing: 4_200_000,
+          planning: 1_900_000,
+          other: 750_000
+        },
+        model_breakdown: %{
+          "claude-opus-4-5": 12_300_000,
+          "claude-sonnet-4-5": 3_800_000,
+          "claude-haiku-3-5": 550_000
+        },
+        budget_millicents: 20_000_000,
+        budget_utilization_pct: 83.25
+      }
+    })
+  end
+
+  defmodule TokenAnalyticsModel do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenAnalyticsModel",
+      description: "Per-model token usage, cost, and verification correlation metrics.",
+      type: :object,
+      properties: %{
+        model_name: %Schema{type: :string, example: "claude-opus-4-5"},
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        story_count: %Schema{
+          type: :integer,
+          description: "Number of stories that used this model"
+        },
+        verified_count: %Schema{
+          type: :integer,
+          description: "Number of those stories that were verified"
+        },
+        verification_rate: %Schema{
+          type: :number,
+          description: "Fraction of stories verified (0.0 to 1.0)"
+        },
+        avg_cost_per_story_millicents: %Schema{type: :integer}
+      },
+      example: %{
+        model_name: "claude-opus-4-5",
+        total_input_tokens: 8_750_000,
+        total_output_tokens: 3_360_000,
+        total_cost_millicents: 11_880_000,
+        story_count: 42,
+        verified_count: 39,
+        verification_rate: 0.929,
+        avg_cost_per_story_millicents: 282_857
+      }
+    })
+  end
+
+  defmodule TokenAnalyticsTrend do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TokenAnalyticsTrend",
+      description: "A single data point in a daily or weekly cost trend series.",
+      type: :object,
+      properties: %{
+        period: %Schema{
+          type: :string,
+          description: "Period label: ISO date for daily, ISO week (YYYY-Www) for weekly",
+          example: "2026-03-25"
+        },
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        report_count: %Schema{type: :integer},
+        story_count: %Schema{
+          type: :integer,
+          description: "Number of distinct stories with reports in this period"
+        }
+      },
+      example: %{
+        period: "2026-03-25",
+        total_input_tokens: 487_000,
+        total_output_tokens: 189_000,
+        total_cost_millicents: 648_000,
+        report_count: 12,
+        story_count: 8
+      }
+    })
+  end
+
+  defmodule ModelMixEntry do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ModelMixEntry",
+      description:
+        "A (model_name, phase) correlation matrix entry with token totals, " <>
+          "cost, story count, and verification outcomes.",
+      type: :object,
+      properties: %{
+        model_name: %Schema{type: :string, example: "claude-opus-4-5"},
+        phase: %Schema{
+          type: :string,
+          enum: ["planning", "implementing", "reviewing", "other"]
+        },
+        total_input_tokens: %Schema{type: :integer},
+        total_output_tokens: %Schema{type: :integer},
+        total_cost_millicents: %Schema{type: :integer},
+        story_count: %Schema{type: :integer},
+        verified_count: %Schema{type: :integer},
+        verification_rate: %Schema{type: :number}
+      },
+      example: %{
+        model_name: "claude-opus-4-5",
+        phase: "implementing",
+        total_input_tokens: 6_250_000,
+        total_output_tokens: 2_400_000,
+        total_cost_millicents: 8_550_000,
+        story_count: 30,
+        verified_count: 28,
+        verification_rate: 0.933
+      }
+    })
+  end
+
+  defmodule WebhookTokenBudgetWarningPayload do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "WebhookTokenBudgetWarningPayload",
+      description:
+        "Payload for token.budget_warning webhook event. " <>
+          "Fired once when spend crosses the alert_threshold_pct. " <>
+          "Resets if budget_millicents or alert_threshold_pct is updated.",
+      type: :object,
+      properties: %{
+        budget_id: %Schema{type: :string, format: :uuid},
+        scope_type: %Schema{type: :string, enum: ["project", "epic", "story"]},
+        scope_id: %Schema{type: :string, format: :uuid},
+        budget_millicents: %Schema{type: :integer},
+        current_spend_millicents: %Schema{type: :integer},
+        utilization_pct: %Schema{type: :number},
+        alert_threshold_pct: %Schema{type: :integer},
+        triggering_report_id: %Schema{type: :string, format: :uuid}
+      },
+      example: %{
+        budget_id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        scope_type: "project",
+        scope_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        budget_millicents: 5_000_000,
+        current_spend_millicents: 4_050_000,
+        utilization_pct: 81.0,
+        alert_threshold_pct: 80,
+        triggering_report_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      }
+    })
+  end
+
+  defmodule WebhookTokenBudgetExceededPayload do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "WebhookTokenBudgetExceededPayload",
+      description:
+        "Payload for token.budget_exceeded webhook event. " <>
+          "Fired once when spend reaches or exceeds 100% of the budget. " <>
+          "Includes overage_millicents showing how far over budget.",
+      type: :object,
+      properties: %{
+        budget_id: %Schema{type: :string, format: :uuid},
+        scope_type: %Schema{type: :string, enum: ["project", "epic", "story"]},
+        scope_id: %Schema{type: :string, format: :uuid},
+        budget_millicents: %Schema{type: :integer},
+        current_spend_millicents: %Schema{type: :integer},
+        utilization_pct: %Schema{type: :number},
+        alert_threshold_pct: %Schema{type: :integer},
+        triggering_report_id: %Schema{type: :string, format: :uuid},
+        overage_millicents: %Schema{
+          type: :integer,
+          description: "Amount by which spend exceeded the budget"
+        }
+      },
+      example: %{
+        budget_id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        scope_type: "epic",
+        scope_id: "e5f6a7b8-c9d0-1234-efab-345678901234",
+        budget_millicents: 3_000_000,
+        current_spend_millicents: 3_187_500,
+        utilization_pct: 106.25,
+        alert_threshold_pct: 80,
+        triggering_report_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        overage_millicents: 187_500
+      }
+    })
+  end
+
+  defmodule WebhookTokenAnomalyDetectedPayload do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "WebhookTokenAnomalyDetectedPayload",
+      description:
+        "Payload for token.anomaly_detected webhook event. " <>
+          "Fired by the daily rollup worker when a story's cost deviates significantly " <>
+          "from the epic average. Includes story title and agent name for context.",
+      type: :object,
+      properties: %{
+        anomaly_id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        story_title: %Schema{type: :string, nullable: true},
+        agent_id: %Schema{type: :string, format: :uuid, nullable: true},
+        agent_name: %Schema{type: :string, nullable: true},
+        anomaly_type: %Schema{
+          type: :string,
+          enum: ["high_cost", "suspiciously_low", "budget_exceeded"]
+        },
+        story_cost_millicents: %Schema{type: :integer},
+        reference_avg_millicents: %Schema{type: :integer},
+        deviation_factor: %Schema{type: :string, description: "Decimal string (e.g. \"3.60\")"}
+      },
+      example: %{
+        anomaly_id: "d4e5f6a7-b8c9-0123-defa-234567890123",
+        story_id: "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        story_title: "Implement token analytics endpoints",
+        agent_id: "f6a7b8c9-d0e1-2345-fabc-456789012345",
+        agent_name: "worker-3",
+        anomaly_type: "high_cost",
+        story_cost_millicents: 450_000,
+        reference_avg_millicents: 125_000,
+        deviation_factor: "3.60"
       }
     })
   end

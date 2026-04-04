@@ -62,7 +62,14 @@ defmodule Loopctl.ApiSpec do
         %Tag{name: "Skills", description: "Skill versioning and performance tracking"},
         %Tag{name: "Admin", description: "Superadmin tenant management and system stats"},
         %Tag{name: "Audit", description: "Immutable audit log and change feed"},
-        %Tag{name: "Analytics", description: "Token usage analytics and cost trend queries"}
+        %Tag{
+          name: "Token Efficiency",
+          description:
+            "Token usage reporting, budget configuration, cost anomaly management, " <>
+              "and analytics. Includes per-agent, per-epic, per-project, per-model, " <>
+              "trend, and model-mix analytics. Webhook events: token.budget_warning, " <>
+              "token.budget_exceeded, token.anomaly_detected."
+        }
       ],
       paths: Paths.from_router(LoopctlWeb.Router),
       components: %Components{

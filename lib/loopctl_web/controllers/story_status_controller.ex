@@ -94,20 +94,60 @@ defmodule LoopctlWeb.StoryStatusController do
     description:
       "A DIFFERENT agent (reviewer) reports story as done. " <>
         "The implementing agent cannot call this (chain-of-custody). " <>
-        "Optionally includes an artifact report.",
+        "Optionally includes an artifact report and/or a token usage record.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
-      {"Report params (optional artifact)", "application/json",
+      {"Report params (optional artifact and token_usage)", "application/json",
        %OpenApiSpex.Schema{
          type: :object,
          properties: %{
            artifact: %OpenApiSpex.Schema{
              type: :object,
+             description: "Optional artifact report to attach to this story",
              properties: %{
                artifact_type: %OpenApiSpex.Schema{type: :string},
                path: %OpenApiSpex.Schema{type: :string},
                exists: %OpenApiSpex.Schema{type: :boolean},
                details: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             }
+           },
+           token_usage: %OpenApiSpex.Schema{
+             type: :object,
+             description:
+               "Optional token usage to report alongside the story completion. " <>
+                 "When provided, creates a token_usage_report record for this story.",
+             properties: %{
+               input_tokens: %OpenApiSpex.Schema{
+                 type: :integer,
+                 minimum: 0,
+                 description: "Input tokens consumed"
+               },
+               output_tokens: %OpenApiSpex.Schema{
+                 type: :integer,
+                 minimum: 0,
+                 description: "Output tokens consumed"
+               },
+               model_name: %OpenApiSpex.Schema{
+                 type: :string,
+                 minLength: 1,
+                 description: "LLM model name",
+                 example: "claude-opus-4-5"
+               },
+               cost_millicents: %OpenApiSpex.Schema{
+                 type: :integer,
+                 minimum: 0,
+                 description: "Cost in millicents (1/1000 of a cent)"
+               },
+               phase: %OpenApiSpex.Schema{
+                 type: :string,
+                 enum: ["planning", "implementing", "reviewing", "other"],
+                 description: "Work phase (default: other)"
+               },
+               session_id: %OpenApiSpex.Schema{
+                 type: :string,
+                 nullable: true,
+                 description: "Optional session identifier"
+               }
              }
            }
          }

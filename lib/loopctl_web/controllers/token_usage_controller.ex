@@ -22,7 +22,7 @@ defmodule LoopctlWeb.TokenUsageController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :user] when action in [:delete, :correct]
 
-  tags(["Token Usage"])
+  tags(["Token Efficiency"])
 
   operation(:create,
     summary: "Create token usage report",
@@ -55,7 +55,12 @@ defmodule LoopctlWeb.TokenUsageController do
     responses: %{
       201 =>
         {"Report created", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_usage_report: Schemas.TokenUsageReport
+           }
+         }},
       404 => {"Story not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -79,9 +84,20 @@ defmodule LoopctlWeb.TokenUsageController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :array,
-               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+               items: Schemas.TokenUsageReport
              },
-             totals: %OpenApiSpex.Schema{type: :object, additionalProperties: true},
+             totals: %OpenApiSpex.Schema{
+               type: :object,
+               description: "Aggregated totals for all reports in this story",
+               properties: %{
+                 total_input_tokens: %OpenApiSpex.Schema{type: :integer},
+                 total_output_tokens: %OpenApiSpex.Schema{type: :integer},
+                 total_tokens: %OpenApiSpex.Schema{type: :integer},
+                 total_cost_millicents: %OpenApiSpex.Schema{type: :integer},
+                 total_cost_dollars: %OpenApiSpex.Schema{type: :string},
+                 report_count: %OpenApiSpex.Schema{type: :integer}
+               }
+             },
              meta: Schemas.PaginationMeta
            }
          }},
@@ -102,8 +118,13 @@ defmodule LoopctlWeb.TokenUsageController do
     ],
     responses: %{
       200 =>
-        {"Report deleted", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+        {"Report soft-deleted", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_usage_report: Schemas.TokenUsageReport
+           }
+         }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Report not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -140,7 +161,12 @@ defmodule LoopctlWeb.TokenUsageController do
     responses: %{
       201 =>
         {"Correction created", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_usage_report: Schemas.TokenUsageReport
+           }
+         }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Original report not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error or negative totals", "application/json", Schemas.ErrorResponse},
