@@ -59,16 +59,15 @@ defmodule Loopctl.Workers.CostRollupWorker do
 
     errors = Enum.filter(results, &match?({:error, _, _}, &1))
 
-    if errors == [] do
-      # Chain the anomaly worker after successful rollup
-      chain_anomaly_worker(period_start, period_end)
-      :ok
-    else
+    if errors != [] do
       Logger.warning("CostRollupWorker: #{length(errors)} tenant(s) failed")
-      # Return :ok so the job is not retried for partial failures.
-      # Individual tenant failures are logged above.
-      :ok
     end
+
+    # Chain the anomaly worker regardless of partial failures so that
+    # successful tenants still get anomaly detection (ADV-11).
+    chain_anomaly_worker(period_start, period_end)
+
+    :ok
   end
 
   @doc false
@@ -122,7 +121,35 @@ defmodule Loopctl.Workers.CostRollupWorker do
         {yesterday, yesterday}
 
       {start_str, end_str} when is_binary(start_str) and is_binary(end_str) ->
-        {Date.from_iso8601!(start_str), Date.from_iso8601!(end_str)}
+        yesterday = Date.add(Date.utc_today(), -1)
+
+        start_date =
+          case Date.from_iso8601(start_str) do
+            {:ok, d} ->
+              d
+
+            {:error, _} ->
+              Logger.warning(
+                "CostRollupWorker: malformed period_start #{inspect(start_str)}, defaulting to yesterday"
+              )
+
+              yesterday
+          end
+
+        end_date =
+          case Date.from_iso8601(end_str) do
+            {:ok, d} ->
+              d
+
+            {:error, _} ->
+              Logger.warning(
+                "CostRollupWorker: malformed period_end #{inspect(end_str)}, defaulting to yesterday"
+              )
+
+              yesterday
+          end
+
+        {start_date, end_date}
 
       other ->
         Logger.warning(

@@ -517,6 +517,7 @@ defmodule Loopctl.TokenUsage.Analytics do
         stories_count: count(r.story_id, :distinct)
       })
       |> order_by([r], asc: r.model_name, asc: r.phase)
+      |> limit(1000)
       |> AdminRepo.all()
 
     # Verification data per (model_name, phase) pair
@@ -841,6 +842,7 @@ defmodule Loopctl.TokenUsage.Analytics do
         stories_count: count(r.story_id, :distinct)
       })
       |> order_by([r], asc: r.model_name, asc: r.phase)
+      |> limit(1000)
       |> AdminRepo.all()
 
     verification_map = agent_model_phase_verification_data(tenant_id, agent_id, opts)
@@ -1003,6 +1005,7 @@ defmodule Loopctl.TokenUsage.Analytics do
             s.id
           )
       })
+      |> limit(1000)
       |> AdminRepo.all()
 
     # Build per-agent enriched data

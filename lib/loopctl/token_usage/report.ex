@@ -95,6 +95,7 @@ defmodule Loopctl.TokenUsage.Report do
     |> validate_number(:cost_millicents, greater_than_or_equal_to: 0)
     |> validate_inclusion(:phase, @phases)
     |> validate_length(:model_name, min: 1)
+    |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:story_id)
     |> foreign_key_constraint(:agent_id)
@@ -125,11 +126,22 @@ defmodule Loopctl.TokenUsage.Report do
     |> validate_required([:input_tokens, :output_tokens, :model_name, :cost_millicents])
     |> validate_inclusion(:phase, @phases)
     |> validate_length(:model_name, min: 1)
+    |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:story_id)
     |> foreign_key_constraint(:agent_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:skill_version_id)
     |> foreign_key_constraint(:corrects_report_id)
+  end
+
+  @metadata_max_bytes 65_536
+
+  defp validate_metadata_size(changeset) do
+    validate_change(changeset, :metadata, fn :metadata, value ->
+      if byte_size(Jason.encode!(value)) > @metadata_max_bytes,
+        do: [metadata: "must be smaller than 64KB"],
+        else: []
+    end)
   end
 end
