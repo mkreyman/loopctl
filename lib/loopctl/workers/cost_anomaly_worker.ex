@@ -24,12 +24,16 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.Audit
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
+  alias Loopctl.Webhooks.EventGenerator
+  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @high_cost_threshold Decimal.new("3.0")
   @low_cost_threshold Decimal.new("0.1")
@@ -169,7 +173,71 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         }
       })
 
+      # Fire token.anomaly_detected webhook event (AC-21.7.7)
+      fire_anomaly_webhook(tenant_id, anomaly)
+
       anomaly
+    end
+  end
+
+  # Fires a token.anomaly_detected webhook for newly created anomalies.
+  # Looks up story title and agent name for a rich payload.
+  defp fire_anomaly_webhook(tenant_id, anomaly) do
+    webhooks = EventGenerator.matching_webhooks(tenant_id, "token.anomaly_detected", nil)
+
+    if webhooks != [] do
+      {story_title, agent_id, agent_name} = fetch_story_context(anomaly.story_id, tenant_id)
+
+      payload = %{
+        "anomaly_id" => anomaly.id,
+        "story_id" => anomaly.story_id,
+        "story_title" => story_title,
+        "agent_id" => agent_id,
+        "agent_name" => agent_name,
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "story_cost_millicents" => anomaly.story_cost_millicents,
+        "reference_avg_millicents" => anomaly.reference_avg_millicents,
+        "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
+      }
+
+      Enum.each(webhooks, fn webhook ->
+        {:ok, event} =
+          %WebhookEvent{
+            tenant_id: tenant_id,
+            webhook_id: webhook.id
+          }
+          |> WebhookEvent.create_changeset(%{
+            event_type: "token.anomaly_detected",
+            payload: payload
+          })
+          |> AdminRepo.insert()
+
+        {:ok, _job} =
+          WebhookDeliveryWorker.new(%{
+            webhook_event_id: event.id,
+            tenant_id: tenant_id
+          })
+          |> Oban.insert()
+      end)
+    end
+  end
+
+  # Fetches story title and assigned agent name for the anomaly webhook payload.
+  # Returns {story_title, agent_id, agent_name} with nil fallbacks.
+  defp fetch_story_context(story_id, tenant_id) do
+    story = AdminRepo.get_by(Story, id: story_id, tenant_id: tenant_id)
+
+    case story do
+      nil ->
+        {nil, nil, nil}
+
+      %Story{assigned_agent_id: nil} ->
+        {story.title, nil, nil}
+
+      %Story{assigned_agent_id: agent_id} ->
+        agent = AdminRepo.get(Agent, agent_id)
+        agent_name = if agent, do: agent.name, else: nil
+        {story.title, agent_id, agent_name}
     end
   end
 
