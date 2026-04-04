@@ -337,20 +337,13 @@ defmodule Loopctl.TokenUsage do
           }
         end)
         |> mark_affected_cost_summaries_stale_multi(tenant_id, report)
+        |> Multi.run(:reset_budget_flags, fn _repo, _changes ->
+          reset_budget_flags_if_needed(tenant_id, report)
+          {:ok, :ok}
+        end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{report: deleted_report}} ->
-          # Reset budget flags if spend dropped below thresholds
-          try do
-            reset_budget_flags_if_needed(tenant_id, report)
-          rescue
-            e ->
-              Logger.warning(
-                "Budget flag reset failed after deleting report #{report.id}: " <>
-                  Exception.message(e)
-              )
-          end
-
           {:ok, deleted_report}
 
         {:error, _step, error, _} ->
@@ -394,8 +387,7 @@ defmodule Loopctl.TokenUsage do
   def create_correction(tenant_id, original_report_id, attrs, opts \\ []) do
     attrs = normalize_attrs(attrs)
 
-    with {:ok, original} <- get_report(tenant_id, original_report_id),
-         :ok <- validate_correction_totals(tenant_id, original, attrs) do
+    with {:ok, original} <- get_report(tenant_id, original_report_id) do
       correction_input_tokens = Map.get(attrs, :input_tokens, 0)
       correction_output_tokens = Map.get(attrs, :output_tokens, 0)
 
@@ -419,6 +411,9 @@ defmodule Loopctl.TokenUsage do
 
       multi =
         Multi.new()
+        |> Multi.run(:validate_totals, fn _repo, _changes ->
+          validate_correction_totals(tenant_id, original, attrs)
+        end)
         |> Multi.insert(:correction, changeset, returning: [:total_tokens])
         |> Audit.log_in_multi(:audit, fn %{correction: correction} ->
           %{
@@ -448,21 +443,17 @@ defmodule Loopctl.TokenUsage do
           }
         end)
         |> mark_affected_cost_summaries_stale_multi(tenant_id, original)
+        |> Multi.run(:reset_budget_flags, fn _repo, _changes ->
+          reset_budget_flags_if_needed(tenant_id, original)
+          {:ok, :ok}
+        end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{correction: correction}} ->
-          # Reset budget flags if spend dropped below thresholds
-          try do
-            reset_budget_flags_if_needed(tenant_id, original)
-          rescue
-            e ->
-              Logger.warning(
-                "Budget flag reset failed after correcting report #{original.id}: " <>
-                  Exception.message(e)
-              )
-          end
-
           {:ok, correction}
+
+        {:error, :validate_totals, {:unprocessable_entity, message}, _} ->
+          {:error, :unprocessable_entity, message}
 
         {:error, :correction, %Ecto.Changeset{} = changeset, _} ->
           {:error, changeset}
@@ -488,19 +479,16 @@ defmodule Loopctl.TokenUsage do
 
     cond do
       new_input < 0 ->
-        {:error, :unprocessable_entity,
-         "correction would make total input_tokens negative (current: #{totals.total_input_tokens}, correction: #{correction_input})"}
+        {:error, {:unprocessable_entity, "correction would make total input_tokens negative"}}
 
       new_output < 0 ->
-        {:error, :unprocessable_entity,
-         "correction would make total output_tokens negative (current: #{totals.total_output_tokens}, correction: #{correction_output})"}
+        {:error, {:unprocessable_entity, "correction would make total output_tokens negative"}}
 
       new_cost < 0 ->
-        {:error, :unprocessable_entity,
-         "correction would make total cost_millicents negative (current: #{totals.total_cost_millicents}, correction: #{correction_cost})"}
+        {:error, {:unprocessable_entity, "correction would make total cost_millicents negative"}}
 
       true ->
-        :ok
+        {:ok, :ok}
     end
   end
 

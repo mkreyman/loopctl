@@ -85,6 +85,7 @@ defmodule Loopctl.TokenUsage.CostAnomaly do
     |> validate_inclusion(:anomaly_type, @anomaly_types)
     |> validate_number(:story_cost_millicents, greater_than_or_equal_to: 0)
     |> validate_number(:reference_avg_millicents, greater_than_or_equal_to: 0)
+    |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:story_id)
   end
@@ -95,5 +96,15 @@ defmodule Loopctl.TokenUsage.CostAnomaly do
   @spec resolve_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
   def resolve_changeset(anomaly) do
     change(anomaly, resolved: true)
+  end
+
+  @metadata_max_bytes 65_536
+
+  defp validate_metadata_size(changeset) do
+    validate_change(changeset, :metadata, fn :metadata, value ->
+      if byte_size(Jason.encode!(value)) > @metadata_max_bytes,
+        do: [metadata: "must be smaller than 64KB"],
+        else: []
+    end)
   end
 end

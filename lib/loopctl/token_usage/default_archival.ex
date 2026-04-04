@@ -119,7 +119,7 @@ defmodule Loopctl.TokenUsage.DefaultArchival do
           )
 
         {count, _} =
-          from(r in Report, where: r.id in subquery(subq))
+          from(r in Report, where: r.id in subquery(subq), where: r.tenant_id == ^tenant_id)
           |> Repo.delete_all()
 
         count

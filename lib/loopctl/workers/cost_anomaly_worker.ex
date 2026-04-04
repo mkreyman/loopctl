@@ -124,7 +124,9 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   defp check_and_flag_anomaly(_tenant_id, _story_id, _story_cost, _epic_avg), do: :ok
 
   defp create_anomaly(tenant_id, story_id, anomaly_type, story_cost, epic_avg, factor) do
-    # Check if an unresolved anomaly of this type already exists for this story
+    # Check if an unresolved anomaly of this type already exists for this story.
+    # The unique partial index (cost_anomalies_unresolved_unique) prevents races,
+    # but we still check first so that updates do NOT emit audit/webhook events.
     existing =
       CostAnomaly
       |> where([a], a.tenant_id == ^tenant_id)
@@ -134,7 +136,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       |> AdminRepo.one()
 
     if existing do
-      # Update the existing anomaly with latest figures
+      # Update the existing anomaly with latest figures (no audit/webhook)
       case existing
            |> CostAnomaly.create_changeset(%{
              story_cost_millicents: story_cost,
@@ -162,7 +164,14 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
           deviation_factor: Decimal.round(factor, 2)
         })
 
-      case AdminRepo.insert(changeset) do
+      # Use on_conflict: :nothing to gracefully handle a race with the unique
+      # partial index (cost_anomalies_unresolved_unique) -- ADV-3.
+      case AdminRepo.insert(changeset,
+             on_conflict: :nothing,
+             conflict_target:
+               {:unsafe_fragment,
+                ~s|("tenant_id","story_id","anomaly_type") WHERE resolved = false|}
+           ) do
         {:ok, anomaly} ->
           # Emit change feed + audit log entry for the newly detected anomaly (AC-21.8.3, AC-21.8.5)
           Audit.create_log_entry(tenant_id, %{
@@ -264,7 +273,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         {story.title, nil, nil, story.project_id}
 
       %Story{assigned_agent_id: agent_id} ->
-        agent = AdminRepo.get(Agent, agent_id)
+        agent = AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id)
         agent_name = if agent, do: agent.name, else: nil
         {story.title, agent_id, agent_name, story.project_id}
     end
@@ -277,7 +286,35 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         {yesterday, yesterday}
 
       {start_str, end_str} when is_binary(start_str) and is_binary(end_str) ->
-        {Date.from_iso8601!(start_str), Date.from_iso8601!(end_str)}
+        yesterday = Date.add(Date.utc_today(), -1)
+
+        start_date =
+          case Date.from_iso8601(start_str) do
+            {:ok, d} ->
+              d
+
+            {:error, _} ->
+              Logger.warning(
+                "CostAnomalyWorker: malformed period_start #{inspect(start_str)}, defaulting to yesterday"
+              )
+
+              yesterday
+          end
+
+        end_date =
+          case Date.from_iso8601(end_str) do
+            {:ok, d} ->
+              d
+
+            {:error, _} ->
+              Logger.warning(
+                "CostAnomalyWorker: malformed period_end #{inspect(end_str)}, defaulting to yesterday"
+              )
+
+              yesterday
+          end
+
+        {start_date, end_date}
 
       other ->
         Logger.warning(

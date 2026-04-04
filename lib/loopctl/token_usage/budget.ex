@@ -81,6 +81,7 @@ defmodule Loopctl.TokenUsage.Budget do
       less_than_or_equal_to: 100
     )
     |> validate_inclusion(:scope_type, @scope_types)
+    |> validate_metadata_size()
     |> foreign_key_constraint(:tenant_id)
     |> unique_constraint([:tenant_id, :scope_type, :scope_id],
       name: :token_budgets_tenant_id_scope_type_scope_id_index,
@@ -114,6 +115,7 @@ defmodule Loopctl.TokenUsage.Budget do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 100
     )
+    |> validate_metadata_size()
     |> maybe_reset_dedup_flags()
   end
 
@@ -128,5 +130,15 @@ defmodule Loopctl.TokenUsage.Budget do
     else
       changeset
     end
+  end
+
+  @metadata_max_bytes 65_536
+
+  defp validate_metadata_size(changeset) do
+    validate_change(changeset, :metadata, fn :metadata, value ->
+      if byte_size(Jason.encode!(value)) > @metadata_max_bytes,
+        do: [metadata: "must be smaller than 64KB"],
+        else: []
+    end)
   end
 end
