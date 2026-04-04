@@ -36,6 +36,8 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Projects.Project
+  alias Loopctl.Skills.Skill
+  alias Loopctl.Skills.SkillVersion
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget
   alias Loopctl.TokenUsage.CostAnomaly
@@ -66,60 +68,67 @@ defmodule Loopctl.TokenUsage do
   - `{:error, %Ecto.Changeset{}}` on validation failure
   """
   @spec create_report(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Report.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Report.t()}
+          | {:error, Ecto.Changeset.t()}
+          | {:error, :unprocessable_entity, String.t()}
   def create_report(tenant_id, attrs, opts \\ []) do
     attrs = normalize_attrs(attrs)
 
     story_id = Map.get(attrs, :story_id)
     agent_id = Map.get(attrs, :agent_id)
     project_id = Map.get(attrs, :project_id)
+    skill_version_id = Map.get(attrs, :skill_version_id)
 
-    changeset =
-      %Report{
-        tenant_id: tenant_id,
-        story_id: story_id,
-        agent_id: agent_id,
-        project_id: project_id
-      }
-      |> Report.create_changeset(attrs)
+    with :ok <- validate_skill_version_ownership(tenant_id, skill_version_id) do
+      changeset =
+        %Report{
+          tenant_id: tenant_id,
+          story_id: story_id,
+          agent_id: agent_id,
+          project_id: project_id
+        }
+        |> Report.create_changeset(attrs)
 
-    case AdminRepo.insert(changeset) do
-      {:ok, report} ->
-        # Refetch to populate the DB-generated total_tokens column
-        report = AdminRepo.get!(Report, report.id)
+      case AdminRepo.insert(changeset) do
+        {:ok, report} ->
+          # Refetch to populate the DB-generated total_tokens column
+          report = AdminRepo.get!(Report, report.id)
 
-        # Audit log the creation (also serves as the change feed entry for AC-21.8.1)
-        Audit.create_log_entry(tenant_id, %{
-          entity_type: "token_usage_report",
-          entity_id: report.id,
-          action: "created",
-          actor_type: Keyword.get(opts, :actor_type, "api_key"),
-          actor_id: Keyword.get(opts, :actor_id),
-          actor_label: Keyword.get(opts, :actor_label),
-          project_id: report.project_id,
-          new_state: %{
-            "story_id" => report.story_id,
-            "agent_id" => report.agent_id,
-            "model_name" => report.model_name,
-            "cost_millicents" => report.cost_millicents,
-            "total_tokens" => report.total_tokens
-          },
-          metadata: %{
-            "story_id" => report.story_id,
-            "agent_id" => report.agent_id,
-            "model_name" => report.model_name,
-            "cost_millicents" => report.cost_millicents,
-            "total_tokens" => report.total_tokens
-          }
-        })
+          # Audit log the creation (also serves as the change feed entry for AC-21.8.1)
+          Audit.create_log_entry(tenant_id, %{
+            entity_type: "token_usage_report",
+            entity_id: report.id,
+            action: "created",
+            actor_type: Keyword.get(opts, :actor_type, "api_key"),
+            actor_id: Keyword.get(opts, :actor_id),
+            actor_label: Keyword.get(opts, :actor_label),
+            project_id: report.project_id,
+            new_state: %{
+              "story_id" => report.story_id,
+              "agent_id" => report.agent_id,
+              "model_name" => report.model_name,
+              "cost_millicents" => report.cost_millicents,
+              "total_tokens" => report.total_tokens,
+              "skill_version_id" => report.skill_version_id
+            },
+            metadata: %{
+              "story_id" => report.story_id,
+              "agent_id" => report.agent_id,
+              "model_name" => report.model_name,
+              "cost_millicents" => report.cost_millicents,
+              "total_tokens" => report.total_tokens,
+              "skill_version_id" => report.skill_version_id
+            }
+          })
 
-        # Check budget thresholds after report creation (AC-21.8.2)
-        check_budget_thresholds(tenant_id, report)
+          # Check budget thresholds after report creation (AC-21.8.2)
+          check_budget_thresholds(tenant_id, report)
 
-        {:ok, report}
+          {:ok, report}
 
-      {:error, changeset} ->
-        {:error, changeset}
+        {:error, changeset} ->
+          {:error, changeset}
+      end
     end
   end
 
@@ -620,6 +629,27 @@ defmodule Loopctl.TokenUsage do
   end
 
   # --- Private helpers ---
+
+  # Validates that skill_version_id (if provided) exists and belongs to the tenant.
+  # The ownership chain is: skill_versions -> skills -> tenant_id.
+  @spec validate_skill_version_ownership(Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
+          :ok | {:error, :unprocessable_entity, String.t()}
+  defp validate_skill_version_ownership(_tenant_id, nil), do: :ok
+
+  defp validate_skill_version_ownership(tenant_id, skill_version_id) do
+    exists =
+      SkillVersion
+      |> join(:inner, [sv], s in Skill, on: sv.skill_id == s.id)
+      |> where([sv, s], sv.id == ^skill_version_id and s.tenant_id == ^tenant_id)
+      |> AdminRepo.exists?()
+
+    if exists do
+      :ok
+    else
+      {:error, :unprocessable_entity,
+       "skill_version_id does not exist or belongs to a different tenant"}
+    end
+  end
 
   @known_attrs ~w(
     story_id agent_id project_id skill_version_id

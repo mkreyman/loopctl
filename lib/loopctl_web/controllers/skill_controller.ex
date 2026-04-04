@@ -10,6 +10,7 @@ defmodule LoopctlWeb.SkillController do
   - `POST /api/v1/skills/:id/versions` -- create new version (user role)
   - `GET /api/v1/skills/:id/versions` -- list versions (agent+ role)
   - `GET /api/v1/skills/:id/versions/:version` -- get specific version (agent+ role)
+  - `GET /api/v1/skills/:id/cost-performance` -- cost metrics per version (user role)
   """
 
   use LoopctlWeb, :controller
@@ -22,7 +23,15 @@ defmodule LoopctlWeb.SkillController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:create, :update, :delete, :create_version, :import_skills]
+       [role: :user]
+       when action in [
+              :create,
+              :update,
+              :delete,
+              :create_version,
+              :import_skills,
+              :cost_performance
+            ]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
@@ -224,6 +233,28 @@ defmodule LoopctlWeb.SkillController do
     }
   )
 
+  operation(:cost_performance,
+    summary: "Get skill cost performance",
+    description:
+      "Returns cost metrics per version: invocations, total cost, average cost, verification rates, cost change vs previous version, and cost regression flag.",
+    parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
+    responses: %{
+      200 =>
+        {"Cost performance", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+             }
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   @doc "POST /api/v1/skills"
   def create(conn, params) do
     api_key = conn.assigns.current_api_key
@@ -364,9 +395,23 @@ defmodule LoopctlWeb.SkillController do
 
       version_num ->
         case Skills.get_version(tenant_id, skill_id, version_num) do
-          {:ok, version} -> json(conn, %{version: version_json(version)})
-          {:error, :not_found} -> {:error, :not_found}
+          {:ok, version} ->
+            {:ok, cost_summary} = Skills.version_cost_summary(tenant_id, skill_id, version_num)
+            json(conn, %{version: version_json(version), cost_summary: cost_summary})
+
+          {:error, :not_found} ->
+            {:error, :not_found}
         end
+    end
+  end
+
+  @doc "GET /api/v1/skills/:id/cost-performance"
+  def cost_performance(conn, %{"id" => skill_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    case Skills.cost_performance(tenant_id, skill_id) do
+      {:ok, data} -> json(conn, %{data: data})
+      {:error, :not_found} -> {:error, :not_found}
     end
   end
 

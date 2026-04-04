@@ -632,6 +632,60 @@ defmodule Loopctl.Skills do
     }
   end
 
+  # ===================================================================
+  # Skill Cost Performance (US-21.6)
+  # ===================================================================
+
+  @doc """
+  Returns cost performance metrics per version for a skill.
+
+  Requires token_usage_reports to have skill_version_id set. Versions
+  without any linked token usage reports are not included.
+
+  ## Metrics per version
+
+  - `version_number` -- integer version number
+  - `total_invocations` -- number of token usage reports linked to this version
+  - `total_cost_millicents` -- sum of cost_millicents
+  - `avg_cost_per_invocation_millicents` -- average cost per report (rounded integer)
+  - `stories_verified_count` -- distinct stories where verified_status = verified
+  - `stories_rejected_count` -- distinct stories where verified_status = rejected
+  - `verification_rate_pct` -- stories_verified / (stories_verified + stories_rejected) * 100
+  - `cost_change_pct` -- pct change vs previous version's avg_cost (nil for v1)
+  - `cost_regression` -- true when avg_cost > 2x previous version AND >= 3 invocations
+
+  ## Returns
+
+  - `{:ok, [map()]}` on success
+  - `{:error, :not_found}` if skill not found
+  """
+  @spec cost_performance(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, [map()]} | {:error, :not_found}
+  def cost_performance(tenant_id, skill_id) do
+    with {:ok, _skill} <- get_skill(tenant_id, skill_id) do
+      rows = query_cost_performance(tenant_id, skill_id)
+      {:ok, enrich_with_comparison(rows)}
+    end
+  end
+
+  @doc """
+  Returns a cost summary for a specific skill version.
+
+  Returns `nil` when no token usage reports are linked to this version.
+
+  ## Returns
+
+  - `{:ok, map() | nil}` on success
+  - `{:error, :not_found}` if skill or version not found
+  """
+  @spec version_cost_summary(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          {:ok, map() | nil} | {:error, :not_found}
+  def version_cost_summary(tenant_id, skill_id, version_number) do
+    with {:ok, version} <- get_version(tenant_id, skill_id, version_number) do
+      query_version_cost_summary(tenant_id, version.id, version_number)
+    end
+  end
+
   # --- Private helpers ---
 
   defp lock_skill_for_update(skill_id) do
@@ -672,4 +726,121 @@ defmodule Loopctl.Skills do
     like_pattern = "%#{pattern}%"
     where(query, [s], ilike(s.name, ^like_pattern))
   end
+
+  # --- Cost performance private helpers ---
+
+  defp query_cost_performance(tenant_id, skill_id) do
+    alias Loopctl.TokenUsage.Report
+    alias Loopctl.WorkBreakdown.Story
+
+    Report
+    |> join(:inner, [r], sv in SkillVersion, on: r.skill_version_id == sv.id)
+    |> join(:left, [r, _sv], s in Story, on: r.story_id == s.id)
+    |> where([r, sv, _s], sv.skill_id == ^skill_id and r.tenant_id == ^tenant_id)
+    |> group_by([_r, sv, _s], sv.version)
+    |> select([r, sv, s], %{
+      version_number: sv.version,
+      total_invocations: count(r.id),
+      total_cost_millicents: coalesce(sum(r.cost_millicents), 0),
+      avg_cost_per_invocation_millicents:
+        fragment("ROUND(AVG(?)::numeric, 0)::bigint", r.cost_millicents),
+      stories_verified_count:
+        fragment(
+          "count(DISTINCT CASE WHEN ? = 'verified' THEN ? END)",
+          s.verified_status,
+          s.id
+        ),
+      stories_rejected_count:
+        fragment(
+          "count(DISTINCT CASE WHEN ? = 'rejected' THEN ? END)",
+          s.verified_status,
+          s.id
+        )
+    })
+    |> order_by([_r, sv, _s], asc: sv.version)
+    |> AdminRepo.all()
+    |> Enum.map(fn row ->
+      verified = row.stories_verified_count
+      rejected = row.stories_rejected_count
+      total_verifiable = verified + rejected
+
+      verification_rate_pct =
+        if total_verifiable > 0,
+          do: round(verified * 100 / total_verifiable),
+          else: nil
+
+      %{
+        version_number: row.version_number,
+        total_invocations: row.total_invocations,
+        total_cost_millicents: decimal_to_int(row.total_cost_millicents),
+        avg_cost_per_invocation_millicents:
+          decimal_to_int(row.avg_cost_per_invocation_millicents),
+        stories_verified_count: row.stories_verified_count,
+        stories_rejected_count: row.stories_rejected_count,
+        verification_rate_pct: verification_rate_pct,
+        cost_change_pct: nil,
+        cost_regression: false
+      }
+    end)
+  end
+
+  defp enrich_with_comparison([]), do: []
+
+  defp enrich_with_comparison(rows) do
+    rows
+    |> Enum.with_index()
+    |> Enum.map(fn {row, idx} ->
+      prev = if idx > 0, do: Enum.at(rows, idx - 1), else: nil
+
+      {cost_change_pct, cost_regression} =
+        cond do
+          is_nil(prev) ->
+            {nil, false}
+
+          prev.avg_cost_per_invocation_millicents == 0 ->
+            {nil, false}
+
+          true ->
+            curr_avg = row.avg_cost_per_invocation_millicents
+            prev_avg = prev.avg_cost_per_invocation_millicents
+            change_pct = round((curr_avg - prev_avg) * 100 / prev_avg)
+            regression = curr_avg > 2 * prev_avg and row.total_invocations >= 3
+            {change_pct, regression}
+        end
+
+      %{row | cost_change_pct: cost_change_pct, cost_regression: cost_regression}
+    end)
+  end
+
+  defp query_version_cost_summary(tenant_id, skill_version_id, version_number) do
+    alias Loopctl.TokenUsage.Report
+
+    result =
+      Report
+      |> where([r], r.tenant_id == ^tenant_id and r.skill_version_id == ^skill_version_id)
+      |> select([r], %{
+        total_invocations: count(r.id),
+        total_cost_millicents: coalesce(sum(r.cost_millicents), 0),
+        avg_cost_per_invocation_millicents:
+          fragment("ROUND(AVG(?)::numeric, 0)::bigint", r.cost_millicents)
+      })
+      |> AdminRepo.one()
+
+    if result.total_invocations == 0 do
+      {:ok, nil}
+    else
+      {:ok,
+       %{
+         version_number: version_number,
+         total_invocations: result.total_invocations,
+         total_cost_millicents: decimal_to_int(result.total_cost_millicents),
+         avg_cost_per_invocation_millicents:
+           decimal_to_int(result.avg_cost_per_invocation_millicents)
+       }}
+    end
+  end
+
+  defp decimal_to_int(%Decimal{} = val), do: Decimal.to_integer(val)
+  defp decimal_to_int(val) when is_integer(val), do: val
+  defp decimal_to_int(nil), do: 0
 end

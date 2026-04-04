@@ -121,6 +121,9 @@ defmodule LoopctlWeb.TokenUsageController do
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
+
+      {:error, :unprocessable_entity, message} ->
+        {:error, :unprocessable_entity, message}
     end
   end
 

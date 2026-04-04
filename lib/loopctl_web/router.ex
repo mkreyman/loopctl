@@ -200,6 +200,8 @@ defmodule LoopctlWeb.Router do
     get "/skills/:id/versions/:version", SkillController, :get_version
     get "/skills/:id/stats", SkillController, :stats
     get "/skills/:id/versions/:version/results", SkillController, :version_results
+    # Skill cost performance (US-21.6)
+    get "/skills/:id/cost-performance", SkillController, :cost_performance
 
     # Token usage (Epic 19)
     post "/token-usage", TokenUsageController, :create
