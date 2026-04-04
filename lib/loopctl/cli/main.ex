@@ -34,7 +34,10 @@ defmodule Loopctl.CLI.Main do
     "changes" => Commands.Webhooks,
     "webhook" => Commands.Webhooks,
     "skill" => Commands.Skills,
-    "admin" => Commands.Admin
+    "admin" => Commands.Admin,
+    "cost-summary" => Commands.Token,
+    "token-report" => Commands.Token,
+    "anomalies" => Commands.Token
   }
 
   @doc """
@@ -124,8 +127,11 @@ defmodule Loopctl.CLI.Main do
       audit     Query audit log
       changes   Change feed
       webhook   Webhook management
-      skill     Skill management
-      admin     Superadmin operations
+      skill         Skill management
+      admin         Superadmin operations
+      cost-summary  Project/epic/agent cost overview
+      token-report  Detailed story token usage
+      anomalies     Cost anomaly listing
 
     Global options:
       --format json|human|csv  Output format (default: json)

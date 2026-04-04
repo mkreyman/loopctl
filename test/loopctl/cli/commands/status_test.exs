@@ -15,6 +15,29 @@ defmodule Loopctl.CLI.Commands.StatusTest do
             "progress_percent" => 80
           })
 
+        {"GET", "/api/v1/analytics/projects/p-1"} ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "total_cost_millicents" => 500_000,
+              "total_tokens" => 2_000_000
+            }
+          })
+
+        {"GET", "/api/v1/projects/p-nocost/progress"} ->
+          Req.Test.json(conn, %{
+            "total_stories" => 5,
+            "verified" => 2,
+            "progress_percent" => 40
+          })
+
+        {"GET", "/api/v1/analytics/projects/p-nocost"} ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "total_cost_millicents" => 0,
+              "total_tokens" => 0
+            }
+          })
+
         {"GET", "/api/v1/epics/e-1/progress"} ->
           Req.Test.json(conn, %{
             "total_stories" => 5,
@@ -123,6 +146,41 @@ defmodule Loopctl.CLI.Commands.StatusTest do
         end)
 
       assert output =~ "Usage:"
+    end
+  end
+
+  # AC-21.9.6: status --project extended with cost summary line
+  describe "status --project with cost summary" do
+    test "appends cost summary line in human format when cost data exists" do
+      output =
+        capture_io(fn ->
+          Status.run("status", ["--project", "p-1"], format: "human")
+        end)
+
+      assert output =~ "80"
+      assert output =~ "Cost:"
+      assert output =~ "$5.00"
+    end
+
+    test "does not append cost line in json format" do
+      output =
+        capture_io(fn ->
+          Status.run("status", ["--project", "p-1"], format: "json")
+        end)
+
+      # JSON format should not add a cost line
+      refute output =~ "Cost:"
+    end
+
+    test "does not append cost line when no cost data" do
+      # p-nocost returns 0 millicents, so no cost line is appended
+      output =
+        capture_io(fn ->
+          Status.run("status", ["--project", "p-nocost"], format: "human")
+        end)
+
+      assert output =~ "40"
+      refute output =~ "Cost:"
     end
   end
 end
