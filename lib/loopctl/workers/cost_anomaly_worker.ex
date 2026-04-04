@@ -181,13 +181,18 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   end
 
   # Fires a token.anomaly_detected webhook for newly created anomalies.
-  # Looks up story title and agent name for a rich payload.
+  # Looks up story title and agent name for a rich payload. Passes project_id
+  # so project-scoped webhooks also receive anomaly events.
+  # Errors are caught and logged rather than bubbling up (the anomaly record
+  # is already created; losing the webhook should not lose the anomaly).
   defp fire_anomaly_webhook(tenant_id, anomaly) do
-    webhooks = EventGenerator.matching_webhooks(tenant_id, "token.anomaly_detected", nil)
+    {story_title, agent_id, agent_name, project_id} =
+      fetch_story_context(anomaly.story_id, tenant_id)
+
+    webhooks =
+      EventGenerator.matching_webhooks(tenant_id, "token.anomaly_detected", project_id)
 
     if webhooks != [] do
-      {story_title, agent_id, agent_name} = fetch_story_context(anomaly.story_id, tenant_id)
-
       payload = %{
         "anomaly_id" => anomaly.id,
         "story_id" => anomaly.story_id,
@@ -200,44 +205,48 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
       }
 
-      Enum.each(webhooks, fn webhook ->
-        {:ok, event} =
-          %WebhookEvent{
-            tenant_id: tenant_id,
-            webhook_id: webhook.id
-          }
-          |> WebhookEvent.create_changeset(%{
-            event_type: "token.anomaly_detected",
-            payload: payload
-          })
-          |> AdminRepo.insert()
-
-        {:ok, _job} =
-          WebhookDeliveryWorker.new(%{
-            webhook_event_id: event.id,
-            tenant_id: tenant_id
-          })
-          |> Oban.insert()
-      end)
+      Enum.each(webhooks, &deliver_anomaly_event(tenant_id, &1, payload, anomaly.id))
     end
   end
 
-  # Fetches story title and assigned agent name for the anomaly webhook payload.
-  # Returns {story_title, agent_id, agent_name} with nil fallbacks.
+  # Delivers a single anomaly webhook event. Errors are logged, not raised.
+  defp deliver_anomaly_event(tenant_id, webhook, payload, anomaly_id) do
+    with {:ok, event} <-
+           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
+           |> WebhookEvent.create_changeset(%{
+             event_type: "token.anomaly_detected",
+             payload: payload
+           })
+           |> AdminRepo.insert(),
+         {:ok, _job} <-
+           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
+           |> Oban.insert() do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create token.anomaly_detected webhook event " <>
+            "for anomaly #{anomaly_id}: #{inspect(reason)}"
+        )
+    end
+  end
+
+  # Fetches story title, assigned agent name, and project_id for the anomaly webhook payload.
+  # Returns {story_title, agent_id, agent_name, project_id} with nil fallbacks.
   defp fetch_story_context(story_id, tenant_id) do
     story = AdminRepo.get_by(Story, id: story_id, tenant_id: tenant_id)
 
     case story do
       nil ->
-        {nil, nil, nil}
+        {nil, nil, nil, nil}
 
       %Story{assigned_agent_id: nil} ->
-        {story.title, nil, nil}
+        {story.title, nil, nil, story.project_id}
 
       %Story{assigned_agent_id: agent_id} ->
         agent = AdminRepo.get(Agent, agent_id)
         agent_name = if agent, do: agent.name, else: nil
-        {story.title, agent_id, agent_name}
+        {story.title, agent_id, agent_name, story.project_id}
     end
   end
 
