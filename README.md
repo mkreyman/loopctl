@@ -44,6 +44,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 - **Skill versioning** -- store, version, and track performance of orchestrator prompts
 - **Import/export** -- bulk import user stories from JSON, export for round-trip fidelity
 - **CLI** -- escript binary for all operations (`loopctl status`, `loopctl claim`, `loopctl verify`)
+- **Token cost intelligence** -- agents report token usage per story; per-agent efficiency rankings, configurable budgets, and anomaly detection prevent runaway costs across long sprints
 - **OpenAPI 3.0** -- self-documenting API with Swagger UI for agent discovery
 
 ## Concepts
@@ -59,6 +60,9 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | **Two-tier trust** | Implementing agents write `agent_status`; orchestrators write `verified_status`. Neither can write the other. |
 | **Contract** | An agent acknowledges a story's acceptance criteria before claiming it. |
 | **Skill** | A versioned prompt/instruction set used by orchestrators, with performance tracking. |
+| **Token Budget** | A configurable token-consumption limit scoped to a story, agent, epic, or project. Exceeding the limit can warn or block story reports. |
+| **Cost Summary** | An aggregated view of token usage per agent, with efficiency rankings and model mix breakdown. |
+| **Cost Anomaly** | A story whose token consumption deviates beyond a configurable multiplier from the project baseline, flagged automatically. |
 
 ## Tech Stack
 
@@ -98,6 +102,11 @@ mix phx.server       # Start server at localhost:4000
 # Verify it's working
 curl http://localhost:4000/health
 # Should return: {"status":"ok",...}
+
+# Token efficiency commands (after registering a tenant + project)
+loopctl token-usage --project my-app           # Project cost summary
+loopctl cost-anomalies --project my-app        # Open anomalies
+loopctl budget set --project my-app --scope per_story --limit 200000
 ```
 
 > **Note:** The `CLOAK_KEY` and `SECRET_KEY_BASE` environment variables are only required for production/Docker deployments. Dev uses defaults from `config/dev.exs` and `config/config.exs`.

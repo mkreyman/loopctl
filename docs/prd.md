@@ -1137,6 +1137,82 @@ These features are explicitly out of scope for v1 but the architecture should no
 
 ---
 
+## 14. Token Efficiency and Cost Intelligence
+
+### Overview
+
+loopctl tracks token consumption at the story level to provide cost accountability for multi-agent AI development loops. Agents report token usage when completing stories; the system aggregates this into per-agent efficiency rankings, per-project cost summaries, and anomaly alerts.
+
+The guiding principle is the same as the trust model: agents cannot self-verify their work, and they cannot hide their cost. Token budgets and anomaly detection are enforced at the API layer.
+
+### 14.1 Token Usage Reporting
+
+Agents include token counts when reporting a story done. The `POST /stories/:id/report` endpoint accepts:
+
+```json
+{
+  "token_usage": {
+    "input_tokens": 48200,
+    "output_tokens": 12400,
+    "model": "claude-sonnet-4-5"
+  }
+}
+```
+
+Token records are stored in `token_usage` rows linked to the story and the agent. Multiple reports per story are allowed (pre-report, final report). The orchestrator reads the most recent verified record.
+
+### 14.2 Cost Summary API
+
+`GET /api/v1/projects/:id/token-usage` returns a project-wide cost summary:
+
+- Total input/output tokens per agent
+- Tokens-per-story ratio per agent (efficiency ranking)
+- Model mix breakdown (e.g., sonnet vs. opus distribution)
+- Cost estimates based on configured per-token pricing
+- Sprint-level and all-time views via `?period=sprint` or `?period=all`
+
+### 14.3 Token Budgets
+
+Configured via `POST /api/v1/projects/:id/token-budgets`:
+
+```json
+{
+  "scope_type": "per_story",
+  "token_limit": 200000,
+  "warning_threshold": 0.80,
+  "enforcement": "warn"
+}
+```
+
+Supported `scope_type` values: `per_story`, `per_agent`, `per_epic`, `per_project`.
+Supported `enforcement` values: `warn` (flag only), `block` (reject story report if exceeded).
+
+When a story report is submitted and the budget is exceeded with `enforcement: block`, the API returns `429 token_budget_exceeded` with the overage details.
+
+### 14.4 Anomaly Detection
+
+The system computes a rolling per-project baseline (median tokens-per-story) and flags reports that deviate beyond a configurable multiplier (default: 3x). Anomalies are visible via:
+
+- `GET /api/v1/projects/:id/cost-anomalies` — list all open anomalies
+- Webhook event `token.anomaly_detected` — real-time push on new anomaly
+
+### 14.5 Skill Cost Regression Detection
+
+When a skill version changes and subsequent stories using that skill show a significant increase in token consumption (default threshold: 1.5x above the prior version's median), a `skill.cost_regression_detected` event is emitted. This allows orchestrators to roll back expensive prompt updates before they compound across a full sprint.
+
+Tracked via `GET /api/v1/skills/:id/cost-regression`.
+
+### 14.6 CLI Commands
+
+```bash
+loopctl token-usage --project my-app           # Project summary
+loopctl token-usage --project my-app --agent worker-2  # Single agent
+loopctl cost-anomalies --project my-app        # Open anomalies
+loopctl budget set --project my-app --scope per_story --limit 200000
+```
+
+---
+
 ## Appendix A: Glossary
 
 | Term | Definition |
