@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 19 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 24 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -65,7 +65,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (19)
+## Tools (24)
 
 ### Project Tools
 
@@ -74,14 +74,14 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `get_tenant` | Get current tenant info. Use to verify connectivity. |
 | `list_projects` | List all projects in the current tenant. |
 | `create_project` | Create a new project in the current tenant. |
-| `get_progress` | Get progress summary for a project, including story counts by status. |
+| `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
 | `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). |
 
 ### Story Tools
 
 | Tool | Description |
 |---|---|
-| `list_stories` | List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. |
+| `list_stories` | List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. Pass `include_token_totals=true` for per-story token data. |
 | `list_ready_stories` | List stories that are ready to be worked on (contracted, dependencies met). |
 | `get_story` | Get full details for a single story by ID. |
 
@@ -98,7 +98,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 | Tool | Description |
 |---|---|
-| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. |
+| `report_story` | Reviewer confirms the implementation is done. Transitions implementing -> reported_done. Accepts optional `token_usage` object. |
 | `review_complete` | Record that a review has been completed for a story. Required before verify. |
 
 ### Verification Tools (orchestrator key)
@@ -114,6 +114,16 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 |---|---|
 | `bulk_mark_complete` | Bulk mark multiple stories as complete in a single API call. |
 | `verify_all_in_epic` | Bulk verify all reported_done, unverified stories in an epic. |
+
+### Token Efficiency Tools
+
+| Tool | Auth Key | Description |
+|---|---|---|
+| `report_token_usage` | agent | Report input/output token counts, model name, and cost for a story session. Calls `POST /api/v1/token-usage`. |
+| `get_cost_summary` | orch | Get cost/token usage summary for a project, optionally broken down by `agent`, `epic`, or `model`. |
+| `get_story_token_usage` | orch | Get all token usage records for a single story. |
+| `get_cost_anomalies` | orch | Get cost anomaly alerts — stories or agents exceeding expected budgets. Optionally filter by project. |
+| `set_token_budget` | orch | Set a token budget (in millicents) for a project, epic, story, or agent scope. Requires orchestrator role. |
 
 ### Discovery Tools
 
