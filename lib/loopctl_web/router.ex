@@ -221,6 +221,9 @@ defmodule LoopctlWeb.Router do
     get "/analytics/projects/:id", AnalyticsController, :project
     get "/analytics/models", AnalyticsController, :models
     get "/analytics/trends", AnalyticsController, :trends
+    # Model-mix and agent model profile (US-21.5)
+    get "/analytics/model-mix", AnalyticsController, :model_mix
+    get "/analytics/agents/:id/model-profile", AnalyticsController, :agent_model_profile
 
     # Skill results
     post "/skill_results", SkillResultController, :create

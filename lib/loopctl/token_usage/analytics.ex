@@ -2,7 +2,8 @@ defmodule Loopctl.TokenUsage.Analytics do
   @moduledoc """
   Analytics queries for token usage data.
 
-  Provides per-agent, per-epic, per-project, per-model, and trend analytics.
+  Provides per-agent, per-epic, per-project, per-model, trend, model-mix
+  correlation, and agent model profile analytics.
   All functions take `tenant_id` as the first argument for multi-tenant scoping.
 
   Queries prefer pre-computed `cost_summaries` when available and fresh,
@@ -468,6 +469,113 @@ defmodule Loopctl.TokenUsage.Analytics do
   end
 
   # ---------------------------------------------------------------------------
+  # AC-21.5.2: Model-mix correlation matrix
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns a model-mix correlation matrix for the given tenant.
+
+  For each (model_name, phase) pair: total_tokens, total_cost_millicents,
+  stories_count, verified_count, rejected_count, verification_rate_pct.
+
+  Also includes a comparative view: mixed-model vs single-model agent
+  averages for verification rate and cost per story.
+
+  ## Options
+
+  - `:project_id` -- filter by project UUID
+  - `:agent_id` -- filter by agent UUID
+  - `:since` -- only reports inserted on or after this date (Date)
+  - `:until` -- only reports inserted on or before this date (Date)
+  """
+  @spec model_mix(Ecto.UUID.t(), keyword()) :: {:ok, map()}
+  def model_mix(tenant_id, opts \\ []) do
+    base =
+      Report
+      |> where([r], r.tenant_id == ^tenant_id)
+      |> apply_date_filters(opts)
+      |> apply_project_filter(opts)
+      |> apply_agent_filter(opts)
+
+    # (model_name, phase) matrix
+    matrix_rows =
+      base
+      |> group_by([r], [r.model_name, r.phase])
+      |> select([r], %{
+        model_name: r.model_name,
+        phase: r.phase,
+        total_tokens: sum(r.input_tokens) + sum(r.output_tokens),
+        total_cost_millicents: sum(r.cost_millicents),
+        stories_count: count(r.story_id, :distinct)
+      })
+      |> order_by([r], asc: r.model_name, asc: r.phase)
+      |> AdminRepo.all()
+
+    # Verification data per (model_name, phase) pair
+    verification_map = model_phase_verification_data(tenant_id, opts)
+
+    matrix =
+      Enum.map(matrix_rows, fn row ->
+        phase_key = row.phase || "other"
+        vd = Map.get(verification_map, {row.model_name, phase_key}, %{verified: 0, rejected: 0})
+
+        total_verifiable = vd.verified + vd.rejected
+
+        verification_rate =
+          if total_verifiable > 0, do: safe_div(vd.verified * 100, total_verifiable), else: nil
+
+        %{
+          model_name: row.model_name,
+          phase: phase_key,
+          total_tokens: to_int(row.total_tokens),
+          total_cost_millicents: to_int(row.total_cost_millicents),
+          stories_count: row.stories_count,
+          verified_count: vd.verified,
+          rejected_count: vd.rejected,
+          verification_rate_pct: verification_rate
+        }
+      end)
+
+    comparative = model_mix_comparative(tenant_id, opts)
+
+    {:ok, %{matrix: matrix, comparative: comparative}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # AC-21.5.3: Agent model profile
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns a specific agent's model usage profile.
+
+  Includes: models used, phases, cost breakdown, verification outcomes,
+  model_count, and is_model_blender (true if model_count > 1).
+
+  ## Options
+
+  - `:project_id` -- filter by project UUID
+  - `:since` -- only reports inserted on or after this date (Date)
+  - `:until` -- only reports inserted on or before this date (Date)
+  """
+  @spec agent_model_profile(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, map()} | {:error, :not_found}
+  def agent_model_profile(tenant_id, agent_id, opts \\ []) do
+    # Verify the agent exists in this tenant
+    agent_query =
+      from(a in Agent,
+        where: a.id == ^agent_id and a.tenant_id == ^tenant_id
+      )
+
+    case AdminRepo.one(agent_query) do
+      nil ->
+        {:error, :not_found}
+
+      agent ->
+        {:ok, build_agent_model_profile(agent, tenant_id, agent_id, opts)}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -695,6 +803,267 @@ defmodule Loopctl.TokenUsage.Analytics do
   end
 
   # Date filters for the joined query (reports joined with stories)
+  # Builds the agent model profile payload from raw DB rows.
+  # Extracted to avoid exceeding the nesting depth limit in agent_model_profile/3.
+  defp build_agent_model_profile(agent, tenant_id, agent_id, opts) do
+    base =
+      Report
+      |> where([r], r.tenant_id == ^tenant_id and r.agent_id == ^agent_id)
+      |> apply_date_filters(opts)
+      |> apply_project_filter(opts)
+
+    usage_rows =
+      base
+      |> group_by([r], [r.model_name, r.phase])
+      |> select([r], %{
+        model_name: r.model_name,
+        phase: r.phase,
+        total_input_tokens: sum(r.input_tokens),
+        total_output_tokens: sum(r.output_tokens),
+        total_cost_millicents: sum(r.cost_millicents),
+        report_count: count(r.id),
+        stories_count: count(r.story_id, :distinct)
+      })
+      |> order_by([r], asc: r.model_name, asc: r.phase)
+      |> AdminRepo.all()
+
+    verification_map = agent_model_phase_verification_data(tenant_id, agent_id, opts)
+
+    model_names =
+      usage_rows
+      |> Enum.map(& &1.model_name)
+      |> Enum.uniq()
+
+    model_count = length(model_names)
+
+    total_cost =
+      Enum.reduce(usage_rows, 0, fn row, acc -> acc + to_int(row.total_cost_millicents) end)
+
+    usage = Enum.map(usage_rows, &build_usage_entry(&1, verification_map, total_cost))
+
+    %{
+      agent_id: agent.id,
+      agent_name: agent.name,
+      model_count: model_count,
+      is_model_blender: model_count > 1,
+      models_used: model_names,
+      total_cost_millicents: total_cost,
+      usage: usage
+    }
+  end
+
+  defp build_usage_entry(row, verification_map, total_cost) do
+    phase_key = row.phase || "other"
+    vd = Map.get(verification_map, {row.model_name, phase_key}, %{verified: 0, rejected: 0})
+    total_verifiable = vd.verified + vd.rejected
+
+    verification_rate =
+      if total_verifiable > 0, do: safe_div(vd.verified * 100, total_verifiable), else: nil
+
+    cost = to_int(row.total_cost_millicents)
+    cost_share_pct = if total_cost > 0, do: safe_div(cost * 100, total_cost), else: nil
+
+    %{
+      model_name: row.model_name,
+      phase: phase_key,
+      total_input_tokens: to_int(row.total_input_tokens),
+      total_output_tokens: to_int(row.total_output_tokens),
+      total_cost_millicents: cost,
+      report_count: row.report_count,
+      stories_count: row.stories_count,
+      verified_count: vd.verified,
+      rejected_count: vd.rejected,
+      verification_rate_pct: verification_rate,
+      cost_share_pct: cost_share_pct
+    }
+  end
+
+  defp apply_agent_filter(query, opts) do
+    case Keyword.get(opts, :agent_id) do
+      nil -> query
+      aid -> where(query, [r], r.agent_id == ^aid)
+    end
+  end
+
+  # Model-phase verification data for the matrix query.
+  # Returns %{{model_name, phase} => %{verified: n, rejected: n}}
+  defp model_phase_verification_data(tenant_id, opts) do
+    base =
+      Report
+      |> join(:inner, [r], s in Story, on: r.story_id == s.id)
+      |> where([r, _s], r.tenant_id == ^tenant_id)
+      |> where([_r, s], s.verified_status in [:verified, :rejected])
+      |> apply_model_date_filters(opts)
+      |> apply_model_project_filter(opts)
+      |> apply_model_agent_filter(opts)
+
+    base
+    |> group_by([r, s], [r.model_name, r.phase, s.verified_status])
+    |> select([r, s], %{
+      model_name: r.model_name,
+      phase: r.phase,
+      verified_status: s.verified_status,
+      story_count: count(s.id, :distinct)
+    })
+    |> AdminRepo.all()
+    |> Enum.group_by(fn row -> {row.model_name, row.phase || "other"} end)
+    |> Map.new(fn {key, rows} ->
+      verified = Enum.find(rows, &(&1.verified_status == :verified))
+      rejected = Enum.find(rows, &(&1.verified_status == :rejected))
+
+      {key,
+       %{
+         verified: if(verified, do: verified.story_count, else: 0),
+         rejected: if(rejected, do: rejected.story_count, else: 0)
+       }}
+    end)
+  end
+
+  # Agent-specific model-phase verification data.
+  # Returns %{{model_name, phase} => %{verified: n, rejected: n}}
+  defp agent_model_phase_verification_data(tenant_id, agent_id, opts) do
+    base =
+      Report
+      |> join(:inner, [r], s in Story, on: r.story_id == s.id)
+      |> where([r, _s], r.tenant_id == ^tenant_id and r.agent_id == ^agent_id)
+      |> where([_r, s], s.verified_status in [:verified, :rejected])
+      |> apply_model_date_filters(opts)
+      |> apply_model_project_filter(opts)
+
+    base
+    |> group_by([r, s], [r.model_name, r.phase, s.verified_status])
+    |> select([r, s], %{
+      model_name: r.model_name,
+      phase: r.phase,
+      verified_status: s.verified_status,
+      story_count: count(s.id, :distinct)
+    })
+    |> AdminRepo.all()
+    |> Enum.group_by(fn row -> {row.model_name, row.phase || "other"} end)
+    |> Map.new(fn {key, rows} ->
+      verified = Enum.find(rows, &(&1.verified_status == :verified))
+      rejected = Enum.find(rows, &(&1.verified_status == :rejected))
+
+      {key,
+       %{
+         verified: if(verified, do: verified.story_count, else: 0),
+         rejected: if(rejected, do: rejected.story_count, else: 0)
+       }}
+    end)
+  end
+
+  # AC-21.5.4: Comparative view — mixed-model vs single-model agents.
+  # Returns avg verification rate and avg cost per story for each group.
+  defp model_mix_comparative(tenant_id, opts) do
+    # Compute per-agent: model_count, total_cost, story_count, verified_count
+    agent_stats =
+      Report
+      |> where([r], r.tenant_id == ^tenant_id)
+      |> where([r], not is_nil(r.agent_id))
+      |> apply_date_filters(opts)
+      |> apply_project_filter(opts)
+      |> group_by([r], r.agent_id)
+      |> select([r], %{
+        agent_id: r.agent_id,
+        model_count: count(r.model_name, :distinct),
+        total_cost_millicents: sum(r.cost_millicents),
+        stories_count: count(r.story_id, :distinct)
+      })
+      |> AdminRepo.all()
+
+    # Verification counts per agent (from verified/rejected stories)
+    agent_verification =
+      Report
+      |> join(:inner, [r], s in Story, on: r.story_id == s.id)
+      |> where([r, _s], r.tenant_id == ^tenant_id)
+      |> where([r, _s], not is_nil(r.agent_id))
+      |> where([_r, s], s.verified_status in [:verified, :rejected])
+      |> apply_model_date_filters(opts)
+      |> apply_model_project_filter(opts)
+      |> group_by([r, s], [r.agent_id, s.verified_status])
+      |> select([r, s], %{
+        agent_id: r.agent_id,
+        verified_status: s.verified_status,
+        story_count: count(s.id, :distinct)
+      })
+      |> AdminRepo.all()
+      |> Enum.group_by(& &1.agent_id)
+      |> Map.new(fn {agent_id, rows} ->
+        verified = Enum.find(rows, &(&1.verified_status == :verified))
+        rejected = Enum.find(rows, &(&1.verified_status == :rejected))
+
+        {agent_id,
+         %{
+           verified: if(verified, do: verified.story_count, else: 0),
+           rejected: if(rejected, do: rejected.story_count, else: 0)
+         }}
+      end)
+
+    # Build per-agent enriched data
+    enriched =
+      Enum.map(agent_stats, fn row ->
+        vd = Map.get(agent_verification, row.agent_id, %{verified: 0, rejected: 0})
+        total_verifiable = vd.verified + vd.rejected
+
+        verification_rate =
+          if total_verifiable > 0, do: safe_div(vd.verified * 100, total_verifiable), else: nil
+
+        cost = to_int(row.total_cost_millicents)
+        avg_cost = safe_div(cost, row.stories_count)
+
+        %{
+          model_count: row.model_count,
+          is_model_blender: row.model_count > 1,
+          avg_cost_per_story_millicents: avg_cost,
+          verification_rate_pct: verification_rate
+        }
+      end)
+
+    # Split into blender / single groups
+    {blenders, singles} = Enum.split_with(enriched, & &1.is_model_blender)
+
+    %{
+      mixed_model: aggregate_comparative_group(blenders),
+      single_model: aggregate_comparative_group(singles)
+    }
+  end
+
+  defp aggregate_comparative_group([]) do
+    %{agent_count: 0, avg_verification_rate_pct: nil, avg_cost_per_story_millicents: nil}
+  end
+
+  defp aggregate_comparative_group(agents) do
+    count = length(agents)
+
+    rates = Enum.reject(agents, &is_nil(&1.verification_rate_pct))
+
+    avg_rate =
+      if rates != [] do
+        total = Enum.reduce(rates, 0, &(&1.verification_rate_pct + &2))
+        safe_div(total, length(rates))
+      else
+        nil
+      end
+
+    avg_cost =
+      agents
+      |> Enum.reject(&(&1.avg_cost_per_story_millicents == 0))
+      |> then(fn non_zero ->
+        if non_zero != [] do
+          total = Enum.reduce(non_zero, 0, &(&1.avg_cost_per_story_millicents + &2))
+          safe_div(total, length(non_zero))
+        else
+          0
+        end
+      end)
+
+    %{
+      agent_count: count,
+      avg_verification_rate_pct: avg_rate,
+      avg_cost_per_story_millicents: avg_cost
+    }
+  end
+
   defp apply_model_date_filters(query, opts) do
     query
     |> maybe_model_since(Keyword.get(opts, :since))
@@ -719,6 +1088,13 @@ defmodule Loopctl.TokenUsage.Analytics do
     case Keyword.get(opts, :project_id) do
       nil -> query
       pid -> where(query, [r, _s], r.project_id == ^pid)
+    end
+  end
+
+  defp apply_model_agent_filter(query, opts) do
+    case Keyword.get(opts, :agent_id) do
+      nil -> query
+      aid -> where(query, [r, _s], r.agent_id == ^aid)
     end
   end
 

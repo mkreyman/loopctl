@@ -7,6 +7,8 @@ defmodule LoopctlWeb.AnalyticsController do
   - `GET /api/v1/analytics/projects/:id` -- single project cost overview (agent+)
   - `GET /api/v1/analytics/models` -- model mix analysis (agent+)
   - `GET /api/v1/analytics/trends` -- daily/weekly cost trend (orchestrator+)
+  - `GET /api/v1/analytics/model-mix` -- model-mix correlation matrix (orchestrator+)
+  - `GET /api/v1/analytics/agents/:id/model-profile` -- agent model profile (orchestrator+)
 
   All endpoints are read-only and return empty results when no data exists.
   """
@@ -19,7 +21,9 @@ defmodule LoopctlWeb.AnalyticsController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:agents, :trends]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :orchestrator] when action in [:agents, :trends, :model_mix, :agent_model_profile]
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:epics, :project, :models]
 
   tags(["Analytics"])
@@ -128,6 +132,48 @@ defmodule LoopctlWeb.AnalyticsController do
     }
   )
 
+  operation(:model_mix,
+    summary: "Model-mix correlation matrix",
+    description:
+      "Returns a (model_name, phase) correlation matrix with token totals, cost, " <>
+        "stories count, and verification outcomes. Includes comparative view: " <>
+        "mixed-model vs single-model agent averages. " <>
+        "Filterable by project_id, agent_id, and date range.",
+    parameters: [
+      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      agent_id: [in: :query, type: :string, description: "Filter by agent UUID"],
+      since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
+      until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"]
+    ],
+    responses: %{
+      200 =>
+        {"Model-mix matrix", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:agent_model_profile,
+    summary: "Agent model usage profile",
+    description:
+      "Returns a specific agent's model usage profile across phases. " <>
+        "Includes model_count and is_model_blender (true if agent uses more than one model). " <>
+        "Filterable by project_id and date range.",
+    parameters: [
+      id: [in: :path, type: :string, description: "Agent UUID"],
+      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
+      until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"]
+    ],
+    responses: %{
+      200 =>
+        {"Agent model profile", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Agent not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   # ---------------------------------------------------------------------------
   # Actions
   # ---------------------------------------------------------------------------
@@ -215,26 +261,55 @@ defmodule LoopctlWeb.AnalyticsController do
     })
   end
 
+  @doc """
+  GET /api/v1/analytics/model-mix
+
+  Returns model-mix correlation matrix with comparative view.
+  """
+  def model_mix(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    opts = build_opts(params, [:project_id, :agent_id, :since, :until])
+
+    {:ok, result} = Analytics.model_mix(tenant_id, opts)
+
+    json(conn, %{data: result})
+  end
+
+  @doc """
+  GET /api/v1/analytics/agents/:id/model-profile
+
+  Returns a specific agent's model usage profile.
+  """
+  def agent_model_profile(conn, %{"id" => agent_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    opts = build_opts(params, [:project_id, :since, :until])
+
+    with {:ok, profile} <- Analytics.agent_model_profile(tenant_id, agent_id, opts) do
+      json(conn, %{data: profile})
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
   defp build_opts(params, allowed_keys) do
     Enum.reduce(allowed_keys, [], fn key, acc ->
-      str_key = Atom.to_string(key)
-
-      case {key, Map.get(params, str_key)} do
-        {_, nil} -> acc
-        {:page, val} -> maybe_add_opt(acc, :page, parse_int(val))
-        {:page_size, val} -> maybe_add_opt(acc, :page_size, parse_int(val))
-        {:since, val} -> maybe_add_opt(acc, :since, parse_date(val))
-        {:until, val} -> maybe_add_opt(acc, :until, parse_date(val))
-        {:project_id, val} -> maybe_add_opt(acc, :project_id, val)
-        {:granularity, val} -> maybe_add_opt(acc, :granularity, val)
-        _ -> acc
-      end
+      val = Map.get(params, Atom.to_string(key))
+      maybe_add_opt(acc, key, parse_opt(key, val))
     end)
   end
+
+  # String passthrough keys
+  @string_keys [:project_id, :agent_id, :granularity]
+
+  defp parse_opt(_key, nil), do: nil
+  defp parse_opt(key, val) when key in @string_keys, do: val
+  defp parse_opt(:page, val), do: parse_int(val)
+  defp parse_opt(:page_size, val), do: parse_int(val)
+  defp parse_opt(:since, val), do: parse_date(val)
+  defp parse_opt(:until, val), do: parse_date(val)
+  defp parse_opt(_key, _val), do: nil
 
   defp pagination_meta(result) do
     %{
