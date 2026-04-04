@@ -2,10 +2,10 @@ defmodule LoopctlWeb.TokenBudgetController do
   @moduledoc """
   Controller for token budget configuration.
 
-  - `POST /api/v1/token-budgets` -- create a budget (user+)
+  - `POST /api/v1/token-budgets` -- create a budget (orchestrator+)
   - `GET /api/v1/token-budgets` -- list budgets for tenant (agent+)
   - `GET /api/v1/token-budgets/:id` -- get a single budget (agent+)
-  - `PATCH /api/v1/token-budgets/:id` -- update a budget (user+)
+  - `PATCH /api/v1/token-budgets/:id` -- update a budget (orchestrator+)
   - `DELETE /api/v1/token-budgets/:id` -- delete a budget (user+)
   """
 
@@ -19,7 +19,8 @@ defmodule LoopctlWeb.TokenBudgetController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show]
 
   tags(["Token Efficiency"])
