@@ -116,10 +116,12 @@ function toContent(result) {
 }
 
 /**
- * Compact variant for list endpoints — strips bulky fields (acceptance_criteria,
- * description) from each story to stay within token limits. Callers can use
- * get_story for full details on individual stories.
+ * Compact variant for list endpoints — strips acceptance_criteria and
+ * description (use get_story for full details). Keeps all other fields.
+ * Enforces a max page size to prevent MCP response token overflow.
  */
+const MAX_PAGE_SIZE = 20;
+
 function toContentCompact(result) {
   if (result && result.error === true) return toContent(result);
 
@@ -191,7 +193,7 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
-  params.set("limit", String(limit ?? 20));
+  params.set("limit", String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE)));
   if (offset != null) params.set("offset", String(offset));
   if (include_token_totals) params.set("include_token_totals", "true");
 
@@ -201,7 +203,7 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
 
 async function listReadyStories({ project_id, limit }) {
   const params = new URLSearchParams({ project_id });
-  params.set("limit", String(limit ?? 20));
+  params.set("limit", String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE)));
 
   const result = await apiCall("GET", `/api/v1/stories/ready?${params}`);
   return toContentCompact(result);
@@ -490,7 +492,8 @@ const TOOLS = [
     description:
       "List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. " +
       "Returns compact results (no acceptance_criteria/description) — use get_story for full details. " +
-      "Defaults to 20 stories per page; use limit/offset to paginate.",
+      "Max 20 per page. Use offset to paginate (response includes total_count). " +
+      "Filter by epic_id or agent_status to reduce result size.",
     inputSchema: {
       type: "object",
       properties: {
@@ -531,7 +534,8 @@ const TOOLS = [
     name: "list_ready_stories",
     description:
       "List stories that are ready to be worked on (contracted, dependencies met). " +
-      "Returns compact results — use get_story for full details. Defaults to 20 per page.",
+      "Returns compact results — use get_story for full details. " +
+      "Max 20 per page. Response includes total_count for pagination.",
     inputSchema: {
       type: "object",
       properties: {
@@ -965,7 +969,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.1.1",
+    version: "1.1.2",
   },
   {
     capabilities: { tools: {} },
