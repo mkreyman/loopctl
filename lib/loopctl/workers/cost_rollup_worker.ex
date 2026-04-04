@@ -121,8 +121,16 @@ defmodule Loopctl.Workers.CostRollupWorker do
         yesterday = Date.add(Date.utc_today(), -1)
         {yesterday, yesterday}
 
-      {start_str, end_str} ->
+      {start_str, end_str} when is_binary(start_str) and is_binary(end_str) ->
         {Date.from_iso8601!(start_str), Date.from_iso8601!(end_str)}
+
+      other ->
+        Logger.warning(
+          "CostRollupWorker: invalid period args #{inspect(other)}, defaulting to yesterday"
+        )
+
+        yesterday = Date.add(Date.utc_today(), -1)
+        {yesterday, yesterday}
     end
   end
 

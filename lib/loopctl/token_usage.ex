@@ -95,11 +95,8 @@ defmodule Loopctl.TokenUsage do
         }
         |> Report.create_changeset(attrs)
 
-      case AdminRepo.insert(changeset) do
+      case AdminRepo.insert(changeset, returning: [:total_tokens]) do
         {:ok, report} ->
-          # Refetch to populate the DB-generated total_tokens column
-          report = AdminRepo.get!(Report, report.id)
-
           # Audit log the creation (also serves as the change feed entry for AC-21.8.1)
           Audit.create_log_entry(tenant_id, %{
             entity_type: "token_usage_report",
@@ -422,7 +419,7 @@ defmodule Loopctl.TokenUsage do
 
       multi =
         Multi.new()
-        |> Multi.insert(:correction, changeset)
+        |> Multi.insert(:correction, changeset, returning: [:total_tokens])
         |> Audit.log_in_multi(:audit, fn %{correction: correction} ->
           %{
             tenant_id: tenant_id,
@@ -454,9 +451,6 @@ defmodule Loopctl.TokenUsage do
 
       case AdminRepo.transaction(multi) do
         {:ok, %{correction: correction}} ->
-          # Refetch to populate the DB-generated total_tokens column
-          correction = AdminRepo.get!(Report, correction.id)
-
           # Reset budget flags if spend dropped below thresholds
           try do
             reset_budget_flags_if_needed(tenant_id, original)
@@ -1000,37 +994,34 @@ defmodule Loopctl.TokenUsage do
   end
 
   # Finds all budgets applicable to a report: story-level, epic-level, project-level.
+  # Uses two queries instead of up to four:
+  #   1. Fetch the story to resolve its epic_id.
+  #   2. Fetch all matching budgets in a single query using OR conditions.
   defp find_applicable_budgets(tenant_id, report) do
-    story_budget =
-      AdminRepo.get_by(Budget,
-        tenant_id: tenant_id,
-        scope_type: :story,
-        scope_id: report.story_id
-      )
-
-    # Look up the story's epic_id for epic-level budget check
-    epic_budget =
+    epic_id =
       case AdminRepo.get_by(Story, id: report.story_id, tenant_id: tenant_id) do
-        nil ->
-          nil
-
-        story ->
-          AdminRepo.get_by(Budget,
-            tenant_id: tenant_id,
-            scope_type: :epic,
-            scope_id: story.epic_id
-          )
+        nil -> nil
+        story -> story.epic_id
       end
 
-    project_budget =
-      AdminRepo.get_by(Budget,
-        tenant_id: tenant_id,
-        scope_type: :project,
-        scope_id: report.project_id
+    scope_filter =
+      dynamic(
+        [b],
+        (b.scope_type == :story and b.scope_id == ^report.story_id) or
+          (b.scope_type == :project and b.scope_id == ^report.project_id)
       )
 
-    [story_budget, epic_budget, project_budget]
-    |> Enum.reject(&is_nil/1)
+    scope_filter =
+      if epic_id do
+        dynamic([b], ^scope_filter or (b.scope_type == :epic and b.scope_id == ^epic_id))
+      else
+        scope_filter
+      end
+
+    Budget
+    |> where([b], b.tenant_id == ^tenant_id)
+    |> where(^scope_filter)
+    |> AdminRepo.all()
   end
 
   defp emit_threshold_crossed(tenant_id, budget, utilization_pct, threshold_type) do
