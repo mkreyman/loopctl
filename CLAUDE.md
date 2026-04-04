@@ -85,6 +85,41 @@ lib/loopctl_web/
 5. **EVERY** test includes a tenant isolation test case
 6. Two Repos: `Loopctl.Repo` (RLS enforced) and `Loopctl.AdminRepo` (BYPASSRLS for superadmin)
 
+## Security & Trust Model — Mandatory Review Checklist
+
+**EVERY change to loopctl must be evaluated against this checklist before merging.**
+
+### Role Hierarchy
+
+`superadmin (4) > user (3) > orchestrator (2) > agent (1)`
+
+Higher roles can access lower-role endpoints. The hierarchy is enforced by `RequireRole` plug.
+
+### Chain-of-Custody Enforcement
+
+The API enforces that nobody marks their own work as done:
+- `POST /stories/:id/report` — `409 self_report_blocked` if caller == assigned_agent_id
+- `POST /stories/:id/review-complete` — `409 self_review_blocked` if caller == assigned_agent_id
+- `POST /stories/:id/verify` — `409 self_verify_blocked` if caller == assigned_agent_id
+
+**The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
+
+### Before Changing Any Role Requirement
+
+Ask these questions:
+
+1. **Does this weaken chain-of-custody?** If a single session could now both implement and verify/report, the change is WRONG.
+2. **Does this give agents destructive capabilities?** Destructive operations (DELETE, archive) must stay at `role: :user`. Agents and orchestrators should not be able to delete projects, budgets, or resolve anomalies via MCP tools.
+3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
+4. **Does this affect RLS?** New tables must use `ENABLE ROW LEVEL SECURITY` (not `FORCE`) since the production role (`schema_admin`) is the table owner without BYPASSRLS.
+
+### Key Distribution Rules
+
+- `LOOPCTL_AGENT_KEY` — agent role, used by implementation agents
+- `LOOPCTL_ORCH_KEY` — orchestrator role, used by the orchestrator for reads and non-custody operations
+- `LOOPCTL_REVIEWER_KEY` — separate agent identity, used ONLY via curl by review agents (never in the same MCP server as the agent key)
+- `LOOPCTL_USER_KEY` — user role, used ONLY via curl for destructive/admin operations
+
 ## Dependency Injection — Config-Based (NOT Opts-Based)
 
 **All external dependencies use behaviours + config-based DI:**
@@ -155,19 +190,7 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (19 total). See `mcp-server/README.md` for the full list.
-
-## Chain-of-Custody Enforcement
-
-The API enforces that nobody marks their own work as done. Three identity gates check that the
-caller's agent ID differs from the story's assigned agent ID:
-
-- `POST /stories/:id/report` — returns `409 self_report_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/review-complete` — returns `409 self_review_blocked` if caller == assigned_agent_id
-- `POST /stories/:id/verify` — returns `409 self_verify_blocked` if caller == assigned_agent_id
-
-The implementer's final action is `POST /stories/:id/request-review`. All three subsequent steps
-(report, review-complete, verify) must come from different agents.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (24 total). See `mcp-server/README.md` for the full list.
 
 ---
 
