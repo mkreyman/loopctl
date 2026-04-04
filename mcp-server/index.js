@@ -166,8 +166,11 @@ async function createProject({ name, slug, repo_url, description, tech_stack }) 
   return toContent(result);
 }
 
-async function getProgress({ project_id }) {
-  const result = await apiCall("GET", `/api/v1/projects/${project_id}/progress`);
+async function getProgress({ project_id, include_cost }) {
+  const params = new URLSearchParams();
+  if (include_cost) params.set("include_cost", "true");
+  const query = params.toString() ? `?${params}` : "";
+  const result = await apiCall("GET", `/api/v1/projects/${project_id}/progress${query}`);
   return toContent(result);
 }
 
@@ -183,13 +186,14 @@ async function importStories({ project_id, payload }) {
 
 // --- Story Tools ---
 
-async function listStories({ project_id, agent_status, verified_status, epic_id, limit, offset }) {
+async function listStories({ project_id, agent_status, verified_status, epic_id, limit, offset, include_token_totals }) {
   const params = new URLSearchParams({ project_id });
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
   params.set("limit", String(limit ?? 20));
   if (offset != null) params.set("offset", String(offset));
+  if (include_token_totals) params.set("include_token_totals", "true");
 
   const result = await apiCall("GET", `/api/v1/stories?${params}`);
   return toContentCompact(result);
@@ -252,12 +256,15 @@ async function requestReview({ story_id }) {
 
 // --- Reviewer Tools (orch key — reviewer uses orchestrator role) ---
 
-async function reportStory({ story_id, artifact_type, artifact_path }) {
+async function reportStory({ story_id, artifact_type, artifact_path, token_usage }) {
   const body = {};
   if (artifact_type || artifact_path) {
     body.artifact = {};
     if (artifact_type) body.artifact.artifact_type = artifact_type;
     if (artifact_path) body.artifact.path = artifact_path;
+  }
+  if (token_usage) {
+    body.token_usage = token_usage;
   }
 
   const result = await apiCall(
@@ -334,6 +341,58 @@ async function verifyAllInEpic({ epic_id, review_type, summary }) {
   return toContent(result);
 }
 
+// --- Token Efficiency Tools ---
+
+async function reportTokenUsage({ story_id, input_tokens, output_tokens, model_name, cost_millicents, phase, skill_version_id, session_id }) {
+  const body = { story_id, input_tokens, output_tokens, model_name, cost_millicents };
+  if (phase) body.phase = phase;
+  if (skill_version_id) body.skill_version_id = skill_version_id;
+  if (session_id) body.session_id = session_id;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/token-usage",
+    body,
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
+async function getCostSummary({ project_id, breakdown }) {
+  const params = new URLSearchParams({ project_id });
+  if (breakdown) params.set("breakdown", breakdown);
+
+  const result = await apiCall("GET", `/api/v1/projects/${project_id}/cost-summary?${params}`);
+  return toContent(result);
+}
+
+async function getStoryTokenUsage({ story_id }) {
+  const result = await apiCall("GET", `/api/v1/stories/${story_id}/token-usage`);
+  return toContent(result);
+}
+
+async function getCostAnomalies({ project_id }) {
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+
+  const query = params.toString() ? `?${params}` : "";
+  const result = await apiCall("GET", `/api/v1/cost-anomalies${query}`);
+  return toContent(result);
+}
+
+async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_threshold_pct }) {
+  const body = { scope_type, scope_id, budget_millicents };
+  if (alert_threshold_pct != null) body.alert_threshold_pct = alert_threshold_pct;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/token-budgets",
+    body,
+    process.env.LOOPCTL_ORCH_KEY
+  );
+  return toContent(result);
+}
+
 // --- Discovery Tools ---
 
 async function listRoutes() {
@@ -382,13 +441,17 @@ const TOOLS = [
   },
   {
     name: "get_progress",
-    description: "Get progress summary for a project, including story counts by status.",
+    description: "Get progress summary for a project, including story counts by status. Pass include_cost=true to include cost data when available.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: {
           type: "string",
           description: "The UUID of the project.",
+        },
+        include_cost: {
+          type: "boolean",
+          description: "Optional: include cost/token summary data in the response.",
         },
       },
       required: ["project_id"],
@@ -447,6 +510,10 @@ const TOOLS = [
         offset: {
           type: "integer",
           description: "Number of stories to skip (for pagination).",
+        },
+        include_token_totals: {
+          type: "boolean",
+          description: "Optional: include per-story token usage totals when available.",
         },
       },
       required: ["project_id"],
@@ -582,6 +649,16 @@ const TOOLS = [
         artifact_path: {
           type: "string",
           description: "Optional: path or URL of the artifact.",
+        },
+        token_usage: {
+          type: "object",
+          description: "Optional: token usage summary for the implementation work.",
+          properties: {
+            input_tokens: { type: "integer", description: "Total input tokens consumed." },
+            output_tokens: { type: "integer", description: "Total output tokens consumed." },
+            model_name: { type: "string", description: "Model name (e.g. claude-sonnet-4-5)." },
+            cost_millicents: { type: "integer", description: "Total cost in millicents (1/1000 of a cent)." },
+          },
         },
       },
       required: ["story_id"],
@@ -732,6 +809,134 @@ const TOOLS = [
     },
   },
 
+  // Token Efficiency Tools
+  {
+    name: "report_token_usage",
+    description:
+      "Report token usage for a story implementation session. " +
+      "Stores input/output token counts, model name, and cost. Uses the AGENT key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story this usage is attributed to.",
+        },
+        input_tokens: {
+          type: "integer",
+          description: "Number of input (prompt) tokens consumed.",
+        },
+        output_tokens: {
+          type: "integer",
+          description: "Number of output (completion) tokens consumed.",
+        },
+        model_name: {
+          type: "string",
+          description: "Name of the model used (e.g. claude-sonnet-4-5, gpt-4o).",
+        },
+        cost_millicents: {
+          type: "integer",
+          description: "Total cost in millicents (1/1000 of a cent).",
+        },
+        phase: {
+          type: "string",
+          description: "Optional: phase of work (e.g. implement, review, verify).",
+        },
+        skill_version_id: {
+          type: "string",
+          description: "Optional: UUID of the skill version used.",
+        },
+        session_id: {
+          type: "string",
+          description: "Optional: agent session identifier for grouping records.",
+        },
+      },
+      required: ["story_id", "input_tokens", "output_tokens", "model_name", "cost_millicents"],
+    },
+  },
+  {
+    name: "get_cost_summary",
+    description:
+      "Get cost/token usage summary for a project. " +
+      "Optionally break down by agent, epic, or model.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "The UUID of the project.",
+        },
+        breakdown: {
+          type: "string",
+          enum: ["agent", "epic", "model"],
+          description: "Optional: dimension to group the summary by (agent, epic, or model).",
+        },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "get_story_token_usage",
+    description: "Get token usage records for a single story.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story.",
+        },
+      },
+      required: ["story_id"],
+    },
+  },
+  {
+    name: "get_cost_anomalies",
+    description:
+      "Get cost anomaly alerts — stories or agents that exceed expected token budgets. " +
+      "Optionally filter by project.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: filter anomalies to a specific project UUID.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "set_token_budget",
+    description:
+      "Set a token budget for a scope (project, epic, story, or agent). " +
+      "Requires orchestrator or user role. Uses the ORCH key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope_type: {
+          type: "string",
+          enum: ["project", "epic", "story", "agent"],
+          description: "The type of scope to apply the budget to.",
+        },
+        scope_id: {
+          type: "string",
+          description: "The UUID of the scoped resource (project_id, epic_id, story_id, or agent_id).",
+        },
+        budget_millicents: {
+          type: "integer",
+          description: "Maximum allowed cost in millicents (1/1000 of a cent).",
+        },
+        alert_threshold_pct: {
+          type: "number",
+          description: "Optional: percentage of budget at which to trigger an alert (0–100).",
+          minimum: 0,
+          maximum: 100,
+        },
+      },
+      required: ["scope_type", "scope_id", "budget_millicents"],
+    },
+  },
+
   // Discovery Tools
   {
     name: "list_routes",
@@ -751,7 +956,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: { tools: {} },
@@ -825,6 +1030,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "verify_all_in_epic":
       return await verifyAllInEpic(args);
+
+    // Token Efficiency Tools
+    case "report_token_usage":
+      return await reportTokenUsage(args);
+
+    case "get_cost_summary":
+      return await getCostSummary(args);
+
+    case "get_story_token_usage":
+      return await getStoryTokenUsage(args);
+
+    case "get_cost_anomalies":
+      return await getCostAnomalies(args);
+
+    case "set_token_budget":
+      return await setTokenBudget(args);
 
     // Discovery Tools
     case "list_routes":
