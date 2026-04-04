@@ -203,8 +203,10 @@ defmodule LoopctlWeb.Router do
     # Skill cost performance (US-21.6)
     get "/skills/:id/cost-performance", SkillController, :cost_performance
 
-    # Token usage (Epic 19)
+    # Token usage (Epic 19, US-21.13)
     post "/token-usage", TokenUsageController, :create
+    delete "/token-usage/:id", TokenUsageController, :delete
+    post "/token-usage/:id/correction", TokenUsageController, :correct
     get "/stories/:story_id/token-usage", TokenUsageController, :index
 
     # Token budgets (Epic 19)

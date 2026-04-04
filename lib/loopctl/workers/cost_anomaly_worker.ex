@@ -85,11 +85,12 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
     end_dt = NaiveDateTime.new!(period_end, ~T[23:59:59.999999])
     epic_avg = epic_summary.avg_cost_per_story_millicents
 
-    # Get per-story costs for this epic in the period
+    # Get per-story costs for this epic in the period (exclude soft-deleted reports)
     story_costs =
       Report
       |> join(:inner, [r], s in Story, on: r.story_id == s.id)
       |> where([r, s], r.tenant_id == ^tenant_id)
+      |> where([r, _s], is_nil(r.deleted_at))
       |> where([_r, s], s.epic_id == ^epic_summary.scope_id)
       |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> group_by([r, _s], r.story_id)

@@ -737,6 +737,7 @@ defmodule Loopctl.Skills do
     |> join(:inner, [r], sv in SkillVersion, on: r.skill_version_id == sv.id)
     |> join(:left, [r, _sv], s in Story, on: r.story_id == s.id)
     |> where([r, sv, _s], sv.skill_id == ^skill_id and r.tenant_id == ^tenant_id)
+    |> where([r, _sv, _s], is_nil(r.deleted_at))
     |> group_by([_r, sv, _s], sv.version)
     |> select([r, sv, s], %{
       version_number: sv.version,
@@ -818,6 +819,7 @@ defmodule Loopctl.Skills do
     result =
       Report
       |> where([r], r.tenant_id == ^tenant_id and r.skill_version_id == ^skill_version_id)
+      |> where([r], is_nil(r.deleted_at))
       |> select([r], %{
         total_invocations: count(r.id),
         total_cost_millicents: coalesce(sum(r.cost_millicents), 0),
