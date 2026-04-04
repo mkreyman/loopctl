@@ -236,7 +236,9 @@ defmodule LoopctlWeb.SkillController do
   operation(:cost_performance,
     summary: "Get skill cost performance",
     description:
-      "Returns cost metrics per version: invocations, total cost, average cost, verification rates, cost change vs previous version, and cost regression flag.",
+      "Returns cost metrics per skill version: invocations, total cost, average cost per story, " <>
+        "verification rate, cost change vs previous version, and cost regression flag. " <>
+        "Requires 'Token Efficiency' context: tagged under both Skills and Token Efficiency.",
     parameters: [id: [in: :path, type: :string, description: "Skill UUID"]],
     responses: %{
       200 =>
@@ -246,7 +248,39 @@ defmodule LoopctlWeb.SkillController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :array,
-               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+               description: "Cost metrics per skill version",
+               items: %OpenApiSpex.Schema{
+                 type: :object,
+                 properties: %{
+                   version: %OpenApiSpex.Schema{
+                     type: :integer,
+                     description: "Skill version number"
+                   },
+                   invocations: %OpenApiSpex.Schema{
+                     type: :integer,
+                     description: "Number of stories that used this version"
+                   },
+                   total_cost_millicents: %OpenApiSpex.Schema{type: :integer},
+                   avg_cost_per_story_millicents: %OpenApiSpex.Schema{
+                     type: :integer,
+                     nullable: true
+                   },
+                   verification_rate: %OpenApiSpex.Schema{
+                     type: :number,
+                     nullable: true,
+                     description: "Fraction of stories verified (0.0 to 1.0)"
+                   },
+                   cost_change_pct: %OpenApiSpex.Schema{
+                     type: :number,
+                     nullable: true,
+                     description: "Percentage cost change vs previous version (nil for v1)"
+                   },
+                   cost_regression: %OpenApiSpex.Schema{
+                     type: :boolean,
+                     description: "True if this version costs more than the previous version"
+                   }
+                 }
+               }
              }
            }
          }},

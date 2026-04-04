@@ -22,7 +22,7 @@ defmodule LoopctlWeb.TokenBudgetController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show]
 
-  tags(["Token Budgets"])
+  tags(["Token Efficiency"])
 
   operation(:create,
     summary: "Create token budget",
@@ -63,7 +63,12 @@ defmodule LoopctlWeb.TokenBudgetController do
     responses: %{
       201 =>
         {"Budget created", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_budget: Schemas.TokenBudget
+           }
+         }},
       404 => {"Scope entity not found", "application/json", Schemas.ErrorResponse},
       409 => {"Budget already exists for scope", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
@@ -94,7 +99,7 @@ defmodule LoopctlWeb.TokenBudgetController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :array,
-               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+               items: Schemas.TokenBudget
              },
              meta: Schemas.PaginationMeta
            }
@@ -113,7 +118,12 @@ defmodule LoopctlWeb.TokenBudgetController do
     responses: %{
       200 =>
         {"Budget details", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_budget: Schemas.TokenBudget
+           }
+         }},
       404 => {"Budget not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -154,7 +164,12 @@ defmodule LoopctlWeb.TokenBudgetController do
     responses: %{
       200 =>
         {"Budget updated", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             token_budget: Schemas.TokenBudget
+           }
+         }},
       404 => {"Budget not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -170,7 +185,19 @@ defmodule LoopctlWeb.TokenBudgetController do
     responses: %{
       200 =>
         {"Budget deleted", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           description: "Confirmation of deletion",
+           properties: %{
+             token_budget: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+                 deleted: %OpenApiSpex.Schema{type: :boolean, example: true}
+               }
+             }
+           }
+         }},
       404 => {"Budget not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }

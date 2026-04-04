@@ -26,7 +26,7 @@ defmodule LoopctlWeb.AnalyticsController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:epics, :project, :models]
 
-  tags(["Analytics"])
+  tags(["Token Efficiency"])
 
   # ---------------------------------------------------------------------------
   # OpenAPI operations
@@ -47,7 +47,16 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Agent metrics", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: Schemas.TokenAnalyticsAgent
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -65,7 +74,16 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Epic metrics", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: Schemas.TokenAnalyticsEpic
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -81,7 +99,12 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Project metrics", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: Schemas.TokenAnalyticsProject
+           }
+         }},
       404 => {"Project not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -102,7 +125,16 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Model metrics", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: Schemas.TokenAnalyticsModel
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -127,7 +159,16 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Trend metrics", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               items: Schemas.TokenAnalyticsTrend
+             },
+             meta: Schemas.PaginationMeta
+           }
+         }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -148,7 +189,28 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Model-mix matrix", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :object,
+               description:
+                 "Model-mix correlation matrix keyed by (model_name, phase). " <>
+                   "Includes comparative view: mixed-model vs single-model agent averages.",
+               properties: %{
+                 matrix: %OpenApiSpex.Schema{
+                   type: :array,
+                   items: Schemas.ModelMixEntry
+                 },
+                 comparative: %OpenApiSpex.Schema{
+                   type: :object,
+                   additionalProperties: true,
+                   description: "Mixed-model vs single-model agent average cost comparison"
+                 }
+               }
+             }
+           }
+         }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -168,7 +230,34 @@ defmodule LoopctlWeb.AnalyticsController do
     responses: %{
       200 =>
         {"Agent model profile", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           description:
+             "Agent's model usage profile across phases. " <>
+               "Includes model_count and is_model_blender flag.",
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 agent_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+                 agent_name: %OpenApiSpex.Schema{type: :string},
+                 model_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Number of distinct models used"
+                 },
+                 is_model_blender: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description: "True if agent uses more than one model"
+                 },
+                 models: %OpenApiSpex.Schema{
+                   type: :array,
+                   items: %OpenApiSpex.Schema{type: :object, additionalProperties: true},
+                   description: "Per-model usage breakdown across phases"
+                 }
+               }
+             }
+           }
+         }},
       404 => {"Agent not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }

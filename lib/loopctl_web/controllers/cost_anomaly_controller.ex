@@ -16,7 +16,7 @@ defmodule LoopctlWeb.CostAnomalyController do
 
   plug LoopctlWeb.Plugs.RequireRole, role: :user
 
-  tags(["Cost Anomalies"])
+  tags(["Token Efficiency"])
 
   operation(:index,
     summary: "List cost anomalies",
@@ -48,7 +48,7 @@ defmodule LoopctlWeb.CostAnomalyController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :array,
-               items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+               items: Schemas.CostAnomaly
              },
              meta: Schemas.PaginationMeta
            }
@@ -66,7 +66,20 @@ defmodule LoopctlWeb.CostAnomalyController do
     responses: %{
       200 =>
         {"Anomaly resolved", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+         %OpenApiSpex.Schema{
+           type: :object,
+           description: "Confirmation of resolution",
+           properties: %{
+             cost_anomaly: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+                 resolved: %OpenApiSpex.Schema{type: :boolean, example: true},
+                 updated_at: %OpenApiSpex.Schema{type: :string, format: :"date-time"}
+               }
+             }
+           }
+         }},
       404 => {"Anomaly not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
