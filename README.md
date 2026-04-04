@@ -781,28 +781,33 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (19)
+### Available Tools (24)
 
 | Tool | Description | API Key Used |
 |------|------------|-------------|
 | `get_tenant` | Verify connectivity (current tenant info) | orchestrator |
 | `list_projects` | List all projects | orchestrator |
 | `create_project` | Create a new project | orchestrator |
-| `get_progress` | Project progress summary | orchestrator |
+| `get_progress` | Project progress summary (supports `include_cost`) | orchestrator |
 | `import_stories` | Import epics and stories | orchestrator |
-| `list_stories` | List stories with filters | orchestrator |
+| `list_stories` | List stories with filters (supports `include_token_totals`) | orchestrator |
 | `list_ready_stories` | Stories ready for work | orchestrator |
 | `get_story` | Get story details | orchestrator |
 | `contract_story` | Contract a story | agent |
 | `claim_story` | Claim a story | agent |
 | `start_story` | Start implementation | agent |
 | `request_review` | Signal readiness for review | agent |
-| `report_story` | Mark implementation done (reviewer only) | orchestrator |
+| `report_story` | Mark implementation done (supports `token_usage`) | orchestrator |
 | `review_complete` | Record review completion | orchestrator |
 | `verify_story` | Verify a story | orchestrator |
 | `reject_story` | Reject a story | orchestrator |
 | `bulk_mark_complete` | Bulk mark stories complete | orchestrator |
 | `verify_all_in_epic` | Verify all in an epic | orchestrator |
+| `report_token_usage` | Report token consumption for a story session | agent |
+| `get_cost_summary` | Project cost summary with optional breakdown | orchestrator |
+| `get_story_token_usage` | Token usage records for a story | orchestrator |
+| `get_cost_anomalies` | Cost anomaly alerts | orchestrator |
+| `set_token_budget` | Set token budget for a scope | orchestrator |
 | `list_routes` | Discover all API endpoints | orchestrator |
 
 Agents call tools directly: `mcp__loopctl__get_tenant()`, `mcp__loopctl__list_projects()`, `mcp__loopctl__create_project({name: "MyApp", slug: "myapp"})`. No curl or bash needed.
@@ -824,6 +829,8 @@ lib/loopctl/
   import_export/   # Bulk import/export
   bulk_operations/ # Bulk claim/verify/reject
   skills/          # Skill versioning + performance
+  token_usage/     # Token consumption tracking, budgets, cost anomalies, analytics
+  quality_assurance/ # UI test runs and findings
   cli/             # Escript CLI commands
 
 lib/loopctl_web/
@@ -835,7 +842,7 @@ lib/loopctl_web/
 
 ```bash
 mix precommit       # Full quality gate: compile, format, credo, dialyzer, test
-mix test            # Run 942 tests
+mix test            # Run 1582 tests
 mix test --failed   # Re-run failures
 mix ecto.reset      # Drop, create, migrate
 mix escript.build   # Build CLI binary
@@ -845,7 +852,7 @@ mix escript.build   # Build CLI binary
 
 - **[Orchestration Guide](docs/orchestration-guide.md)** -- How to use loopctl to manage AI development projects (methodology, skills, step-by-step walkthrough)
 - **[PRD](docs/prd.md)** -- Full product requirements document
-- **[User Stories](docs/user_stories/)** -- 61 stories across 16 epics
+- **[User Stories](docs/user_stories/)** -- 75 stories across 17 epics
 - **[Skills](skills/)** -- 6 orchestration skill definitions (read by the orchestrator during the loop)
 - **[OpenAPI Spec](https://loopctl.local:8443/api/v1/openapi)** -- Machine-readable API spec (when running)
 
