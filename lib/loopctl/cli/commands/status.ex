@@ -12,6 +12,7 @@ defmodule Loopctl.CLI.Commands.Status do
 
   alias Loopctl.CLI.Client
   alias Loopctl.CLI.Output
+  alias Loopctl.TokenUsage.Formatting
 
   @doc """
   Dispatches status, next, and blocked commands.
@@ -70,9 +71,54 @@ defmodule Loopctl.CLI.Commands.Status do
   end
 
   defp project_status(project_id, opts) do
+    format = Keyword.get(opts, :format)
+
     case Client.get("/api/v1/projects/#{project_id}/progress") do
-      {:ok, result} -> Output.render(result, format: Keyword.get(opts, :format))
-      {:error, reason} -> handle_error(reason)
+      {:ok, result} ->
+        Output.render(result, format: format)
+        append_cost_summary_line(project_id, format)
+
+      {:error, reason} ->
+        handle_error(reason)
+    end
+  end
+
+  defp append_cost_summary_line(_project_id, "json"), do: :ok
+
+  defp append_cost_summary_line(project_id, _format) do
+    case Client.get("/api/v1/analytics/projects/#{project_id}") do
+      {:ok, %{"data" => data}} when is_map(data) ->
+        millicents = cost_int(data)
+
+        if millicents > 0 do
+          cost_str = Formatting.millicents_to_dollars(millicents)
+          total_tokens = token_int(data)
+          tokens_str = Formatting.format_tokens(total_tokens)
+          IO.puts("\nCost: $#{cost_str}  |  Tokens: #{tokens_str}")
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp cost_int(data) do
+    val = data["total_cost_millicents"]
+
+    cond do
+      is_integer(val) -> val
+      is_binary(val) -> elem(Integer.parse(val), 0)
+      true -> 0
+    end
+  end
+
+  defp token_int(data) do
+    val = data["total_tokens"]
+
+    cond do
+      is_integer(val) -> val
+      is_binary(val) -> elem(Integer.parse(val), 0)
+      true -> 0
     end
   end
 

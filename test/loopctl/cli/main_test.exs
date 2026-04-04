@@ -46,6 +46,33 @@ defmodule Loopctl.CLI.MainTest do
 
       assert output =~ "Unknown command: bogus"
     end
+
+    test "routes cost-summary to Token module" do
+      output =
+        capture_io(:stderr, fn ->
+          Main.dispatch("cost-summary", [], [])
+        end)
+
+      assert output =~ "Usage: loopctl cost-summary"
+    end
+
+    test "routes token-report to Token module" do
+      output =
+        capture_io(:stderr, fn ->
+          Main.dispatch("token-report", [], [])
+        end)
+
+      assert output =~ "Usage: loopctl token-report"
+    end
+
+    test "routes anomalies to Token module" do
+      output =
+        capture_io(:stderr, fn ->
+          Main.dispatch("anomalies", [], [])
+        end)
+
+      assert output =~ "Usage: loopctl anomalies"
+    end
   end
 
   describe "global options" do
