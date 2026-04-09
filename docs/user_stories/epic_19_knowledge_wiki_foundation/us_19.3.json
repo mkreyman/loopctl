@@ -1,0 +1,244 @@
+{
+  "id": "US-19.3",
+  "title": "Knowledge Context CRUD",
+  "epic": {
+    "id": "epic_19",
+    "name": "Knowledge Wiki Foundation"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "developer",
+    "i_want_to": "have a comprehensive Knowledge context module with CRUD operations, filtering, and audit logging",
+    "so_that": "all knowledge wiki operations are centralized, tenant-scoped, and auditable"
+  },
+  "rationale": "A well-structured context module is the backbone of any Phoenix domain. The Knowledge context centralizes all article and link operations behind a clean API, ensuring every mutation is tenant-scoped, wrapped in an Ecto.Multi transaction with audit logging, and consistently returns {:ok, result} or {:error, reason} tuples. The filtering capabilities (by project, category, status, tags) enable agents to efficiently search the knowledge base, while audit logging creates a complete history of knowledge evolution for compliance and debugging.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-19.3.1",
+      "description": "A Loopctl.Knowledge context module exists with public functions: create_article/3, get_article/2, list_articles/2, update_article/3, archive_article/2 (with optional opts), create_link/2, delete_link/2, list_links_for_article/2.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.2",
+      "description": "create_article(tenant_id, attrs, opts) creates an article in an Ecto.Multi transaction. Sets tenant_id programmatically (never from attrs). Logs creation in audit log via Audit.log_in_multi/3. Returns {:ok, article} or {:error, changeset}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.3",
+      "description": "get_article(tenant_id, article_id) returns {:ok, article} with outgoing and incoming links preloaded, or {:error, :not_found}. Query is scoped by tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.4",
+      "description": "list_articles(tenant_id, opts) returns a paginated list of articles. Supports filtering by: project_id (exact match, including nil for tenant-wide), category (exact match on enum value), status (exact match on enum value), tags (ANY overlap via PostgreSQL && operator). Supports limit/offset pagination with defaults (limit: 20, max: 100).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.5",
+      "description": "update_article(tenant_id, article_id, attrs, opts) updates an article in an Ecto.Multi transaction. Uses update_changeset for partial updates. Logs update in audit log. Returns {:ok, article} or {:error, changeset} or {:error, :not_found}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.6",
+      "description": "archive_article(tenant_id, article_id, opts) sets the article status to :archived. Uses Ecto.Multi with audit logging. Returns {:ok, article} or {:error, :not_found}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.7",
+      "description": "create_link(tenant_id, attrs) creates an article link in an Ecto.Multi transaction. Sets tenant_id programmatically. Validates both source and target articles exist and belong to the same tenant. Logs in audit log. Returns {:ok, link} or {:error, changeset}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.8",
+      "description": "delete_link(tenant_id, link_id) deletes an article link. Scoped by tenant_id. Logs deletion in audit log via Ecto.Multi. Returns {:ok, link} or {:error, :not_found}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.9",
+      "description": "list_links_for_article(tenant_id, article_id) returns all links where the article is either source or target, with the linked article preloaded. Scoped by tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.10",
+      "description": "All queries use AdminRepo with explicit `where(tenant_id: ^tenant_id)` clause for tenant scoping.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.11",
+      "description": "All mutations are wrapped in Ecto.Multi transactions with Audit.log_in_multi/3 to ensure atomicity and auditability.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.12",
+      "description": "All context functions return {:ok, result} or {:error, reason} tuples. Never raise exceptions for expected error cases.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-19.3.1",
+      "name": "Create article with valid attrs and verify audit log",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant"
+      ],
+      "steps": [
+        "Call Knowledge.create_article(tenant.id, %{title: \"Pattern: GenServer DI\", body: \"Use behaviours...\", category: :pattern})"
+      ],
+      "expected_results": [
+        "Returns {:ok, article} with correct fields",
+        "Article has tenant_id set to tenant.id",
+        "Article has status :draft by default",
+        "Audit log entry exists for the creation event"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.2",
+      "name": "List articles with tag overlap filtering",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, tags: [\"elixir\", \"otp\"]}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id, tags: [\"elixir\", \"ecto\"]}) as article_b",
+        "fixture(:article, %{tenant_id: tenant.id, tags: [\"javascript\"]}) as article_c"
+      ],
+      "steps": [
+        "Call Knowledge.list_articles(tenant.id, tags: [\"elixir\"])"
+      ],
+      "expected_results": [
+        "Returns article_a and article_b (both have 'elixir' tag)",
+        "Does NOT return article_c (no overlap with requested tags)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.3",
+      "name": "List articles filtered by category and project_id",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: :pattern}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: :decision}) as article_b",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, category: :pattern}) as article_c"
+      ],
+      "steps": [
+        "Call Knowledge.list_articles(tenant.id, project_id: project.id, category: :pattern)"
+      ],
+      "expected_results": [
+        "Returns only article_a (matches both project_id and category)",
+        "Does NOT return article_b (wrong category) or article_c (wrong project_id)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.4",
+      "name": "Get article preloads outgoing and incoming links",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_b",
+        "fixture(:article_link, %{tenant_id: tenant.id, source_article_id: article_a.id, target_article_id: article_b.id, relationship_type: :relates_to})"
+      ],
+      "steps": [
+        "Call Knowledge.get_article(tenant.id, article_a.id)"
+      ],
+      "expected_results": [
+        "Returns {:ok, article} with outgoing links containing the relates_to link to article_b",
+        "article_b also visible as incoming link when fetched via get_article"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.5",
+      "name": "Archive article sets status to archived",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article"
+      ],
+      "steps": [
+        "Call Knowledge.archive_article(tenant.id, article.id)"
+      ],
+      "expected_results": [
+        "Returns {:ok, article} with status :archived",
+        "Audit log entry exists for the archive event"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.6",
+      "name": "Tenant isolation: tenant A cannot access tenant B articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a"
+      ],
+      "steps": [
+        "Call Knowledge.get_article(tenant_b.id, article_a.id)",
+        "Call Knowledge.list_articles(tenant_b.id, [])"
+      ],
+      "expected_results": [
+        "get_article returns {:error, :not_found}",
+        "list_articles returns empty list -- tenant_b cannot see tenant_a's articles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.7",
+      "name": "Create link validates both articles belong to same tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant_b.id}) as article_b"
+      ],
+      "steps": [
+        "Call Knowledge.create_link(tenant_a.id, %{source_article_id: article_a.id, target_article_id: article_b.id, relationship_type: :relates_to})"
+      ],
+      "expected_results": [
+        "Returns {:error, _} -- target article not found in tenant_a's scope"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.3.8",
+      "name": "Pagination defaults and limits enforced",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "25 articles created for tenant via fixture"
+      ],
+      "steps": [
+        "Call Knowledge.list_articles(tenant.id, []) with no pagination opts",
+        "Call Knowledge.list_articles(tenant.id, limit: 200)"
+      ],
+      "expected_results": [
+        "Default call returns 20 articles (default limit)",
+        "limit: 200 call returns max 100 articles (max limit enforced)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Context module: `defmodule Loopctl.Knowledge do`. All functions take tenant_id as the first argument per multi-tenant rules.",
+    "Use AdminRepo with explicit `where(tenant_id: ^tenant_id)` clause. Do not rely solely on RLS for application-level tenant scoping.",
+    "All mutations use Ecto.Multi with Audit.log_in_multi/3 for transactional audit logging. Pattern: `Multi.new() |> Multi.insert(:article, changeset) |> Audit.log_in_multi(:article, \"article.created\") |> AdminRepo.transaction()`.",
+    "Tag filtering uses PostgreSQL array overlap operator: `where(fragment(\"? && ?\", a.tags, ^tags))`. This leverages the GIN index from US-19.1.",
+    "Pagination: limit/offset with defaults (limit: 20, max: 100). Extract from opts with `min(Keyword.get(opts, :limit, 20), 100)` and `Keyword.get(opts, :offset, 0)`.",
+    "get_article preloads: `Repo.preload(article, [outgoing_links: :target_article, incoming_links: :source_article])`. Define the associations in the Article schema.",
+    "create_link must verify both articles exist in the tenant before inserting. Use a Multi step to fetch both articles, then insert the link.",
+    "All context functions MUST return {:ok, result} or {:error, reason} tuples. Never raise exceptions for expected error cases.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+  ],
+  "dependencies": [
+    "US-19.1",
+    "US-19.2"
+  ],
+  "estimated_hours": 5
+}

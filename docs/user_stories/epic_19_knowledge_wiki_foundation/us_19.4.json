@@ -1,0 +1,242 @@
+{
+  "id": "US-19.4",
+  "title": "Article REST API Endpoints",
+  "epic": {
+    "id": "epic_19",
+    "name": "Knowledge Wiki Foundation"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent or tenant administrator",
+    "i_want_to": "manage knowledge articles through REST API endpoints",
+    "so_that": "agents can create articles from findings and administrators can curate the knowledge wiki via API"
+  },
+  "rationale": "The Knowledge context module provides the domain logic, but agents and administrators need HTTP endpoints to interact with it. The Article REST API exposes CRUD operations with appropriate role-based access control -- agents can create and read articles (capturing findings during implementation loops), while users/admins have full update and delete capabilities. Project-scoped routes enable agents to work within their assigned project context without needing to specify project_id in every request body.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-19.4.1",
+      "description": "POST /api/v1/articles creates a tenant-wide article. Requires role: agent or higher. Request body includes title, body, category, and optional fields (status, tags, source_type, source_id, metadata). Returns 201 with the created article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.2",
+      "description": "POST /api/v1/projects/:project_id/articles creates a project-scoped article. The project_id from the URL path is set on the article. Requires role: agent or higher. Returns 201 with the created article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.3",
+      "description": "GET /api/v1/articles lists all articles for the authenticated tenant. Supports query params: category, status, tags (comma-separated), limit, offset. Requires role: agent or higher. Returns 200 with paginated article list.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.4",
+      "description": "GET /api/v1/projects/:project_id/articles lists articles scoped to a specific project. Supports the same query params as the tenant-wide list. Requires role: agent or higher. Returns 200 with paginated article list.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.5",
+      "description": "GET /api/v1/articles/:id returns a single article with its outgoing and incoming links preloaded. Requires role: agent or higher. Returns 200 with the article or 404 if not found.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.6",
+      "description": "PATCH /api/v1/articles/:id updates an article. Requires role: user or higher (agents cannot update). Accepts partial updates to title, body, category, status, tags, metadata. Returns 200 with the updated article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.7",
+      "description": "DELETE /api/v1/articles/:id archives an article (sets status to :archived, does not hard delete). Requires role: user or higher. Returns 200 with the archived article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.8",
+      "description": "Controller uses `action_fallback LoopctlWeb.FallbackController` for consistent error rendering. Uses RequireRole plug for role-based access control.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.9",
+      "description": "Routes are added to router.ex under the authenticated API pipeline (/api/v1/). Both tenant-wide and project-scoped routes are registered.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.10",
+      "description": "JSON responses use a consistent structure with article fields serialized. Links in the show response include id, relationship_type, and the linked article's id and title.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.4.11",
+      "description": "All endpoints enforce tenant isolation -- a request authenticated as tenant A cannot access tenant B's articles. Cross-tenant access returns 404.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-19.4.1",
+      "name": "Create tenant-wide article via POST /api/v1/articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/articles with body {\"title\": \"Pattern: Config-based DI\", \"body\": \"Use behaviours + Application.get_env...\", \"category\": \"pattern\", \"tags\": [\"elixir\", \"di\"]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has article with id, title, category='pattern', status='draft', tags=['elixir', 'di']",
+        "Article has no project_id (tenant-wide)",
+        "Article exists in database with correct tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.2",
+      "name": "Create project-scoped article via POST /api/v1/projects/:project_id/articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/projects/:project_id/articles with body {\"title\": \"Convention: snake_case modules\", \"body\": \"All modules use snake_case...\", \"category\": \"convention\"}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Response body has article with project_id matching the URL param",
+        "Article exists in database with correct tenant_id and project_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.3",
+      "name": "List articles with filtering by category and tags",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, category: :pattern, tags: [\"elixir\"]})",
+        "fixture(:article, %{tenant_id: tenant.id, category: :decision, tags: [\"elixir\"]})",
+        "fixture(:article, %{tenant_id: tenant.id, category: :pattern, tags: [\"javascript\"]})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/articles?category=pattern&tags=elixir"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Returns only the article matching both category=pattern AND tags containing 'elixir'",
+        "Response includes pagination metadata"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.4",
+      "name": "Show article includes preloaded links",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_b",
+        "fixture(:article_link, %{tenant_id: tenant.id, source_article_id: article_a.id, target_article_id: article_b.id, relationship_type: :relates_to})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/articles/:article_a_id"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response includes outgoing_links array with the relates_to link to article_b",
+        "Each link includes id, relationship_type, and linked article id and title"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.5",
+      "name": "Agent role cannot update or delete articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "PATCH /api/v1/articles/:id with agent API key",
+        "DELETE /api/v1/articles/:id with agent API key"
+      ],
+      "expected_results": [
+        "Both PATCH and DELETE return 403 Forbidden (agent role insufficient for user-level endpoints)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.6",
+      "name": "Tenant isolation: cross-tenant article access returns 404",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/articles/:article_a_id with tenant_b API key"
+      ],
+      "expected_results": [
+        "Response is 404 Not Found",
+        "Tenant A's article is not visible to Tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.7",
+      "name": "Delete (archive) article sets status to archived",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "DELETE /api/v1/articles/:id with user API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Article status is :archived in the response and database",
+        "Article record still exists (not hard deleted)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.4.8",
+      "name": "Invalid article creation returns 422 with errors",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/articles with body {\"title\": \"\", \"body\": \"\", \"category\": \"invalid\"}"
+      ],
+      "expected_results": [
+        "Response status is 422 Unprocessable Entity",
+        "Response body includes validation errors for title, body, and category"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controller: `defmodule LoopctlWeb.ArticleController do use LoopctlWeb, :controller`. Use `action_fallback LoopctlWeb.FallbackController`.",
+    "Role enforcement: `plug LoopctlWeb.Plugs.RequireRole, :agent when action in [:create, :index, :show]` and `plug LoopctlWeb.Plugs.RequireRole, :user when action in [:update, :delete]`.",
+    "Routes in router.ex under authenticated pipeline: `resources \"/articles\", ArticleController, except: [:new, :edit]` for tenant-wide, and nested `resources \"/articles\", ArticleController, only: [:create, :index]` under `/projects/:project_id` for project-scoped.",
+    "The create action for project-scoped route should merge project_id from conn.params into the article attrs before calling Knowledge.create_article/3.",
+    "JSON view should serialize: id, tenant_id, project_id, title, body, category, status, tags, source_type, source_id, metadata, inserted_at, updated_at. For show action, also include outgoing_links and incoming_links.",
+    "Tags query param should be comma-separated in the URL: ?tags=elixir,otp. Parse to list in the controller before passing to context.",
+    "All list endpoints MUST use consistent pagination: limit/offset with defaults (limit: 20, max: 100).",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+  ],
+  "dependencies": [
+    "US-19.3"
+  ],
+  "estimated_hours": 5
+}

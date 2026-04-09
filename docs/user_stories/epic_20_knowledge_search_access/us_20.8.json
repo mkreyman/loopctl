@@ -1,0 +1,215 @@
+{
+  "id": "US-20.8",
+  "title": "MCP Tools for Read Operations",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent using Claude Code",
+    "i_want_to": "query and contribute to the knowledge wiki using native MCP tools",
+    "so_that": "I can access institutional knowledge without making raw HTTP calls"
+  },
+  "rationale": "Claude Code agents interact with loopctl through MCP tools, not curl commands. Without MCP tools for knowledge operations, agents would need to construct raw HTTP requests with correct auth headers, URL encoding, and response parsing. MCP tools provide type-safe, discoverable interfaces that integrate natively with the Claude Code tool-use flow. Adding 5 knowledge tools (index, search, get, context, create) covers the full agent workflow: discover what exists, search for specifics, read in full, get contextual bundles, and file findings back.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.8.1",
+      "description": "A `knowledge_index` MCP tool is added to mcp-server/index.js. It calls GET /api/v1/knowledge/index (or GET /api/v1/projects/:project_id/knowledge/index when project_id is provided). Input schema: { project_id?: string }. Returns the lightweight article catalog.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.2",
+      "description": "A `knowledge_search` MCP tool is added. It calls GET /api/v1/knowledge/search. Input schema: { q: string, project_id?: string, category?: string, tags?: string, mode?: 'keyword'|'semantic'|'combined', limit?: number }. Returns search results with snippets.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.3",
+      "description": "A `knowledge_get` MCP tool is added. It calls GET /api/v1/articles/:id (the existing article show endpoint from US-19.4). Input schema: { article_id: string }. Returns the full article content including body.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.4",
+      "description": "A `knowledge_context` MCP tool is added. It calls GET /api/v1/knowledge/context. Input schema: { query: string, project_id?: string, limit?: number, recency_weight?: number }. Returns full article bodies with relevance and recency scoring.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.5",
+      "description": "A `knowledge_create` MCP tool is added. It calls POST /api/v1/articles (the existing article create endpoint from US-19.4). Input schema: { title: string, body: string, category?: string, tags?: string[], project_id?: string }. Allows agents to file findings and new knowledge.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.6",
+      "description": "All read tools (knowledge_index, knowledge_search, knowledge_get, knowledge_context) use the AGENT_KEY for authentication. The knowledge_create tool also uses AGENT_KEY (agents can file findings).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.7",
+      "description": "Each tool follows the existing MCP tool pattern: (1) tool function that makes the HTTP call, (2) entry in the TOOLS array with name, description, and inputSchema, (3) case in the switch statement of the tool call handler.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.8",
+      "description": "All tools return structured JSON responses. Error responses include the HTTP status code and error message from the API.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.8.9",
+      "description": "Tool descriptions are clear and actionable: they tell agents WHEN to use each tool (e.g., 'Use at session start to discover available knowledge' for knowledge_index, 'Use after index to search for specific topics' for knowledge_search).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.8.1",
+      "name": "knowledge_index tool returns article catalog",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid LOOPCTL_SERVER and LOOPCTL_AGENT_KEY",
+        "At least 2 published articles exist in the tenant"
+      ],
+      "steps": [
+        "Call knowledge_index tool with no arguments",
+        "Call knowledge_index tool with {project_id: valid_project_id}"
+      ],
+      "expected_results": [
+        "First call returns all published articles grouped by category",
+        "Second call returns only project-scoped and tenant-wide articles",
+        "Response includes total_count and categories map"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.2",
+      "name": "knowledge_search tool with all modes",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid credentials",
+        "Published articles with embeddings exist"
+      ],
+      "steps": [
+        "Call knowledge_search with {q: 'testing', mode: 'keyword'}",
+        "Call knowledge_search with {q: 'testing', mode: 'semantic'}",
+        "Call knowledge_search with {q: 'testing', mode: 'combined'}",
+        "Call knowledge_search with {q: 'testing'} (default mode)"
+      ],
+      "expected_results": [
+        "All calls return search results with snippets",
+        "Default mode uses combined search",
+        "Results include relevance_score for each article",
+        "No full body content in any response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.3",
+      "name": "knowledge_get tool returns full article",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid credentials",
+        "A published article exists with known ID"
+      ],
+      "steps": [
+        "Call knowledge_get with {article_id: known_article_id}"
+      ],
+      "expected_results": [
+        "Returns full article including body content",
+        "Response includes id, title, body, category, tags, status, timestamps"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.4",
+      "name": "knowledge_context tool returns ranked full articles",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid credentials",
+        "Multiple published articles with embeddings exist"
+      ],
+      "steps": [
+        "Call knowledge_context with {query: 'deployment patterns', limit: 3}"
+      ],
+      "expected_results": [
+        "Returns at most 3 articles with full body content",
+        "Each article has relevance_score, recency_score, combined_score",
+        "Articles are ordered by combined_score descending"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.5",
+      "name": "knowledge_create tool creates a new article",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid LOOPCTL_AGENT_KEY"
+      ],
+      "steps": [
+        "Call knowledge_create with {title: 'Agent Finding', body: 'Discovered a pattern...', category: 'findings', tags: ['review']}"
+      ],
+      "expected_results": [
+        "Returns 201 with the created article",
+        "Article exists in the database with correct fields",
+        "Article is associated with the agent's tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.6",
+      "name": "tools handle API errors gracefully",
+      "type": "integration",
+      "preconditions": [
+        "MCP server configured with valid credentials"
+      ],
+      "steps": [
+        "Call knowledge_get with {article_id: 'nonexistent-uuid'}",
+        "Call knowledge_search with {} (missing q parameter)",
+        "Call knowledge_create with {} (missing required fields)"
+      ],
+      "expected_results": [
+        "knowledge_get returns error with 404 status",
+        "knowledge_search returns error with 400 status indicating missing q",
+        "knowledge_create returns error with 422 status indicating validation failures",
+        "All error responses include descriptive error messages"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.8.7",
+      "name": "TOOLS array includes all 5 knowledge tools with correct schemas",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server/index.js source file"
+      ],
+      "steps": [
+        "Verify TOOLS array contains entries for knowledge_index, knowledge_search, knowledge_get, knowledge_context, knowledge_create",
+        "Verify each entry has name, description, and inputSchema"
+      ],
+      "expected_results": [
+        "All 5 tools are present in TOOLS array",
+        "Each tool has a descriptive description explaining when to use it",
+        "Input schemas match the accepted parameters for each endpoint",
+        "Required parameters are marked as required in the schema"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "All tools go in mcp-server/index.js following the existing pattern. Each tool needs: (1) an async function that makes the HTTP call, (2) an entry in the TOOLS array, (3) a case in the switch statement of callTool.",
+    "HTTP calls use the existing `apiCall` or `fetch` helper with AGENT_KEY in the Authorization header. Follow the pattern of existing tools like `list_stories` or `get_story`.",
+    "knowledge_index: `GET ${SERVER}/api/v1/knowledge/index` or `GET ${SERVER}/api/v1/projects/${project_id}/knowledge/index`. Use AGENT_KEY.",
+    "knowledge_search: `GET ${SERVER}/api/v1/knowledge/search?q=${encodeURIComponent(q)}&mode=${mode}&...`. Build query string from provided params, omit undefined ones.",
+    "knowledge_get: `GET ${SERVER}/api/v1/articles/${article_id}`. Reuses the existing article show endpoint.",
+    "knowledge_context: `GET ${SERVER}/api/v1/knowledge/context?query=${encodeURIComponent(query)}&...`.",
+    "knowledge_create: `POST ${SERVER}/api/v1/articles` with JSON body. Uses AGENT_KEY.",
+    "Tool descriptions should guide agent usage: knowledge_index = 'Load at session start', knowledge_search = 'Find specific articles by topic', knowledge_get = 'Read full article by ID', knowledge_context = 'Get relevance-ranked articles with full content for a task', knowledge_create = 'File a new knowledge article (findings, patterns, decisions)'.",
+    "Input schemas use JSON Schema format consistent with MCP spec. Mark `q`/`query`/`article_id`/`title`/`body` as required; all others optional."
+  ],
+  "dependencies": [
+    "US-20.5",
+    "US-20.6",
+    "US-20.7",
+    "US-19.4"
+  ],
+  "estimated_hours": 3
+}
