@@ -1,0 +1,247 @@
+{
+  "id": "US-20.6",
+  "title": "Search API Endpoint",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent or developer",
+    "i_want_to": "search the knowledge wiki through a REST endpoint with multiple search modes",
+    "so_that": "I can find relevant knowledge articles efficiently using the most appropriate search strategy"
+  },
+  "rationale": "The context functions built in US-20.1 and US-20.4 need an HTTP interface for agents and developers to use. A unified search endpoint with a `mode` parameter lets callers choose keyword search (fast, exact), semantic search (conceptual matching), or combined (best of both). Returning snippets instead of full bodies keeps responses small and fast, letting agents decide which articles to fetch in full. The on-the-fly query embedding for semantic/combined modes means callers only need to send a text query, not pre-compute embeddings.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.6.1",
+      "description": "GET /api/v1/knowledge/search is accessible with role agent+. Returns 401/403 for unauthenticated or insufficient role.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.2",
+      "description": "Required query parameter: `q` (search query text). Returns 400 with error message if `q` is missing or empty.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.3",
+      "description": "Optional query parameters: `project_id` (UUID), `category` (string), `tags` (comma-separated string, split into list), `mode` (keyword|semantic|combined, default: combined), `limit` (integer, default 10, max 50), `offset` (integer, default 0).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.4",
+      "description": "When mode=keyword, calls `Knowledge.search_keyword/3`. When mode=semantic, generates query embedding on-the-fly and calls `Knowledge.search_semantic/3`. When mode=combined, calls `Knowledge.search_combined/3`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.5",
+      "description": "Each result includes: `id`, `title`, `category`, `tags`, `relevance_score` (from the search function), and `snippet` (first 300 characters of body or ts_headline for keyword mode). Does NOT include full body content.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.6",
+      "description": "For semantic and combined modes, the query embedding is generated on-the-fly by calling `@embedding_client.generate_embedding/1` with the `q` parameter. If embedding generation fails in combined mode, falls back to keyword-only with `meta.fallback: true`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.7",
+      "description": "For semantic mode only, if embedding generation fails, returns 503 Service Unavailable with an error message indicating the embedding service is down.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.8",
+      "description": "Response includes pagination meta: `total_count`, `limit`, `offset`. Response shape: `{\"data\": [...], \"meta\": {...}}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.9",
+      "description": "Invalid `mode` parameter returns 400 with error listing valid modes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.10",
+      "description": "All results are scoped to the current tenant. The endpoint respects RLS.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.6.11",
+      "description": "The q parameter is validated to max 500 characters. Returns 400 if exceeded.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.6.1",
+      "name": "keyword search via API returns snippets without body",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Testing Patterns', body: 'Use ExUnit for unit tests. Property-based testing with StreamData...', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=testing&mode=keyword with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response data includes article with title 'Testing Patterns'",
+        "Article has relevance_score, snippet, id, title, category, tags",
+        "Article does NOT have full body content",
+        "Snippet is at most 300 characters"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.2",
+      "name": "combined search mode is the default",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) with embedding",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns valid embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=patterns (no mode param) with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Combined search was executed (both keyword and semantic)",
+        "Results include final_score (combined relevance)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.3",
+      "name": "missing q parameter returns 400",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search (no q param) with agent API key",
+        "GET /api/v1/knowledge/search?q= (empty q) with agent API key"
+      ],
+      "expected_results": [
+        "Both return 400 Bad Request",
+        "Error message indicates q parameter is required"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.4",
+      "name": "semantic mode returns 503 when embedding service is down",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns {:error, :service_unavailable}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=patterns&mode=semantic with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 503 Service Unavailable",
+        "Error message indicates embedding service is unavailable"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.5",
+      "name": "filters by project_id, category, and tags",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: 'guides', tags: ['elixir', 'phoenix'], title: 'Phoenix Guide', body: 'LiveView patterns...', status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, category: 'ops', tags: ['docker'], title: 'Docker Guide', body: 'Container patterns...', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=patterns&project_id=:project_id&mode=keyword",
+        "GET /api/v1/knowledge/search?q=patterns&category=guides&mode=keyword",
+        "GET /api/v1/knowledge/search?q=patterns&tags=docker&mode=keyword"
+      ],
+      "expected_results": [
+        "project_id filter returns only the Phoenix Guide",
+        "category filter returns only the Phoenix Guide",
+        "tags filter returns only the Docker Guide"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.6",
+      "name": "invalid mode returns 400",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=test&mode=fuzzy with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 400",
+        "Error message lists valid modes: keyword, semantic, combined"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.7",
+      "name": "pagination with limit and offset",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Create 15 published articles with 'pattern' in the body",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=pattern&mode=keyword&limit=5&offset=0",
+        "GET /api/v1/knowledge/search?q=pattern&mode=keyword&limit=5&offset=5"
+      ],
+      "expected_results": [
+        "First call returns 5 results with meta.total_count=15",
+        "Second call returns 5 different results with meta.total_count=15",
+        "meta.limit=5 and meta.offset matches the request"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.6.8",
+      "name": "tenant isolation in search API",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id, title: 'Secret Knowledge', body: 'Proprietary patterns...', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/search?q=proprietary&mode=keyword with tenant_b API key"
+      ],
+      "expected_results": [
+        "Returns empty results",
+        "Tenant A's articles are not searchable by Tenant B"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controller: `LoopctlWeb.KnowledgeSearchController` with `search/2` action. Route: `get \"/knowledge/search\", KnowledgeSearchController, :search`.",
+    "Tags parsing: `String.split(tags_param, \",\") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == \"\"))` to handle comma-separated input.",
+    "Mode validation: use a simple case statement or enum check — `mode in [\"keyword\", \"semantic\", \"combined\"]`. Default to \"combined\" when not specified.",
+    "Snippet generation: for keyword mode, ts_headline already provides highlighted snippets. For semantic/combined modes, truncate body to 300 characters: `String.slice(body, 0, 300)`.",
+    "On-the-fly embedding: `@embedding_client.generate_embedding(q)` — same compile-time DI pattern. For semantic-only mode, embedding failure is fatal (503). For combined mode, it triggers fallback to keyword-only.",
+    "Response view: create `LoopctlWeb.KnowledgeSearchJSON` module that renders the search results with the standardized shape.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "The controller (or context function) resolves the embedding client via @embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient) — same config key as the Oban worker in US-20.3."
+  ],
+  "dependencies": [
+    "US-20.4",
+    "US-20.5"
+  ],
+  "estimated_hours": 4
+}

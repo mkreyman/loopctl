@@ -1,0 +1,233 @@
+{
+  "id": "US-19.1",
+  "title": "Article Schema & Migration",
+  "epic": {
+    "id": "epic_19",
+    "name": "Knowledge Wiki Foundation"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "developer or AI agent",
+    "i_want_to": "store development knowledge articles (patterns, conventions, decisions, findings) in a structured, tenant-scoped schema",
+    "so_that": "institutional knowledge is persisted in the database and available for search and retrieval across projects"
+  },
+  "rationale": "Development teams and AI agents accumulate institutional knowledge during implementation loops -- patterns that work, decisions made, findings from reviews. Without a structured place to store this knowledge, it gets lost between sessions or buried in chat logs. The Article schema provides a first-class entity for capturing this knowledge with proper categorization (pattern, convention, decision, finding, reference), tenant scoping via RLS, and optional project association so knowledge can be either tenant-wide or project-specific.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-19.1.1",
+      "description": "A Loopctl.Knowledge.Article schema exists with fields: id (binary_id PK), tenant_id (binary_id FK to tenants), project_id (binary_id FK to projects, nullable -- null means tenant-wide), title (string, max 500), body (text), category (Ecto.Enum: :pattern, :convention, :decision, :finding, :reference), status (Ecto.Enum: :draft, :published, :archived, :superseded), tags ({:array, :string}), source_type (string, nullable), source_id (binary_id, nullable), metadata (map/jsonb, default %{}), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.2",
+      "description": "The schema uses `use Loopctl.Schema` and `tenant_field()` macro. The tenant_id field is NEVER included in cast -- it is always set programmatically.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.3",
+      "description": "A create_changeset/2 validates required fields: title, body, category. It casts title, body, category, status, tags, source_type, source_id, metadata, project_id. It validates title max length of 500 characters. Article body has validate_length(:body, max: 100_000) (100KB). This prevents resource exhaustion via large payloads and bounds tsvector computation, in-memory export, and context retrieval response sizes. It defaults status to :draft if not provided.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.4",
+      "description": "An update_changeset/2 allows partial updates to title, body, category, status, tags, metadata, project_id. It validates the same constraints as create_changeset where applicable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.5",
+      "description": "Migration creates the articles table with all specified columns and correct types. Includes a GIN index on the tags column for efficient array containment queries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.6",
+      "description": "Migration adds a composite index on (tenant_id, project_id, category) for efficient filtered listing queries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.7",
+      "description": "Migration adds a unique index on (tenant_id, title) with WHERE clause: WHERE status NOT IN ('archived', 'superseded'). This allows title reuse when articles are archived or superseded, preventing duplicate titles only among active articles within a tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.8",
+      "description": "Migration enables RLS on the articles table via `import Loopctl.Repo.RlsHelpers` then `enable_rls(:articles)`. RLS policies enforce tenant isolation for SELECT, INSERT, UPDATE, DELETE.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.9",
+      "description": "The source_type field accepts known string values: \"review_finding\", \"manual\", \"agent\", \"session_log\". Validation is advisory (not enforced as Ecto.Enum) to allow future extensibility.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.10",
+      "description": "The category Ecto.Enum values map to the five core knowledge types: :pattern (reusable implementation pattern), :convention (team/project convention), :decision (architectural or design decision), :finding (review finding or discovery), :reference (reference material or documentation link).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.11",
+      "description": "The status Ecto.Enum values support the full article lifecycle: :draft (work in progress), :published (visible and active), :archived (soft-deleted), :superseded (replaced by a newer article via ArticleLink).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.12",
+      "description": "The Article schema declares has_many associations for link traversal: `has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id` and `has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id`. These are required by Knowledge context preloading (US-19.3 AC-19.3.3), context retrieval (US-20.7), and export (US-21.4).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.13",
+      "description": "Tags are validated: maximum 20 tags per article, each tag maximum 100 characters, matching ~r/^[a-zA-Z0-9_-]+$/ (alphanumeric, hyphens, underscores only). Invalid tags are rejected with descriptive changeset errors.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-19.1.1",
+      "name": "Create article with valid required fields",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.Article module is compiled and available"
+      ],
+      "steps": [
+        "Build a changeset with valid title, body, category, and tenant_id set programmatically",
+        "Assert changeset is valid"
+      ],
+      "expected_results": [
+        "Changeset is valid with no errors",
+        "status defaults to :draft",
+        "tags defaults to empty list",
+        "metadata defaults to %{}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.2",
+      "name": "Reject article missing required fields",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.Article module is compiled and available"
+      ],
+      "steps": [
+        "Build a create_changeset with empty attrs (no title, body, or category)"
+      ],
+      "expected_results": [
+        "Changeset is invalid",
+        "Errors present on :title, :body, and :category fields"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.3",
+      "name": "Reject title exceeding 500 characters",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.Article module is compiled and available"
+      ],
+      "steps": [
+        "Build a create_changeset with a title of 501 characters"
+      ],
+      "expected_results": [
+        "Changeset is invalid",
+        "Error on :title indicates max length exceeded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.4",
+      "name": "Reject invalid category value",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.Article module is compiled and available"
+      ],
+      "steps": [
+        "Build a create_changeset with category set to :invalid_category"
+      ],
+      "expected_results": [
+        "Changeset is invalid",
+        "Error on :category indicates invalid enum value"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.5",
+      "name": "Insert article and enforce unique title per tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: \"Existing Article\"}) as existing_article"
+      ],
+      "steps": [
+        "Attempt to insert a second article with the same title and tenant_id"
+      ],
+      "expected_results": [
+        "Insert fails with unique constraint error on (tenant_id, title)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.6",
+      "name": "Allow same title across different tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id, title: \"Shared Title\"})"
+      ],
+      "steps": [
+        "Insert an article with title \"Shared Title\" for tenant_b"
+      ],
+      "expected_results": [
+        "Insert succeeds -- title uniqueness is scoped to tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.7",
+      "name": "Update changeset allows partial updates",
+      "type": "unit",
+      "preconditions": [
+        "An existing article struct with all fields populated"
+      ],
+      "steps": [
+        "Build an update_changeset with only body changed"
+      ],
+      "expected_results": [
+        "Changeset is valid",
+        "Only body field is changed; other fields remain unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.1.8",
+      "name": "Tenant isolation via RLS prevents cross-tenant reads",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a"
+      ],
+      "steps": [
+        "Set RLS context to tenant_b",
+        "Query for article_a by id"
+      ],
+      "expected_results": [
+        "Query returns nil -- tenant_b cannot see tenant_a's articles via RLS"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Schema MUST use `use Loopctl.Schema` which provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`.",
+    "Use `tenant_field()` macro in the schema block to add the tenant_id field with correct FK and index.",
+    "Category enum: Ecto.Enum with values [:pattern, :convention, :decision, :finding, :reference]. Status enum: Ecto.Enum with values [:draft, :published, :archived, :superseded].",
+    "GIN index on tags: `create index(:articles, [:tags], using: :gin)` for efficient @> (array contains) and && (array overlap) queries.",
+    "Unique index on title per tenant: consider a partial index excluding archived/superseded status, or use a simple (tenant_id, title) unique index. The exact scoping ('non-deleted') should use a WHERE clause: `where: \"status NOT IN ('archived')\"` or similar.",
+    "The source_type and source_id fields enable provenance tracking -- linking an article back to the review finding, agent session, or manual entry that created it. These are intentionally loose (string + binary_id) rather than polymorphic FKs for extensibility.",
+    "Migration file: `priv/repo/migrations/TIMESTAMP_create_articles.exs`. Import `Loopctl.Repo.RlsHelpers` and call `enable_rls(:articles)` after table creation.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests.",
+    "Add build(:article, attrs) and fixture(:article, attrs) to test/support/fixtures.ex with auto-dependency resolution for tenant_id (and optionally project_id). Follow the existing pattern seen in fixture(:skill) or fixture(:project).",
+    "The partial unique index WHERE status NOT IN ('archived', 'superseded') cannot be expressed with Ecto's migration DSL. Use raw SQL: execute(\"CREATE UNIQUE INDEX articles_tenant_title_active_idx ON articles (tenant_id, title) WHERE status NOT IN ('archived', 'superseded')\")"
+  ],
+  "dependencies": [],
+  "estimated_hours": 4
+}

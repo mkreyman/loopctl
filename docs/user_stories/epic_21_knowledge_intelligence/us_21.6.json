@@ -1,0 +1,220 @@
+{
+  "id": "US-21.6",
+  "title": "Self-Learning Pipeline Integration",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "high",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "have the self-learning pipeline automatically trigger on every code review with visibility into its status",
+    "so_that": "the knowledge wiki compounds automatically while I can monitor and control the pipeline"
+  },
+  "rationale": "The ReviewKnowledgeWorker (US-21.1) and publish workflow (US-21.3) are building blocks, but they need to be wired into the existing review flow to form a complete self-learning pipeline. This story connects the worker to Progress.record_review/4 by enqueuing the knowledge worker after successful review record creation, adds a tenant-level opt-in/opt-out setting, and provides a pipeline status endpoint so administrators can monitor extraction health. Together these pieces transform the review loop into a knowledge-compounding system with full observability.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.6.1",
+      "description": "After Progress.record_review/4 successfully returns {:ok, review_record}, the controller (or a thin wrapper) enqueues the ReviewKnowledgeWorker via Oban.insert(%{review_record_id: review_record.id, tenant_id: tenant_id}). Atomicity with the review_record is not required because the worker's duplicate detection (US-21.1 AC-21.1.5) makes it idempotent — if the review_record exists but the worker hasn't run, retry is safe.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.2",
+      "description": "A tenant-level setting `settings.knowledge_auto_extract` (boolean, default true) controls whether the worker is enqueued. If false, the Multi step that enqueues the worker is skipped. The setting is read from the tenant record at review time.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.3",
+      "description": "The tenant settings field (jsonb) on the tenants table accommodates `knowledge_auto_extract`. If the settings field does not exist, a migration adds it as a jsonb column with default `{}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.4",
+      "description": "GET /api/v1/knowledge/pipeline endpoint exists (role: user+). Returns a JSON object with pipeline status metrics.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.5",
+      "description": "Pipeline status includes `pending_extractions`: count of ReviewKnowledgeWorker jobs in 'available' or 'scheduled' state for the tenant (queried from Oban jobs table).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.6",
+      "description": "Pipeline status includes `recent_drafts`: the 20 most recent draft articles with source_type: \"review_finding\", ordered by inserted_at desc. Each entry includes id, title, source_id, inserted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.7",
+      "description": "Pipeline status includes `publish_rate`: ratio of published articles to total articles (published + draft) with source_type: \"review_finding\". Expressed as a float between 0.0 and 1.0. Returns 0.0 if no articles exist.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.8",
+      "description": "Pipeline status includes `extraction_errors`: count and most recent 5 failed/discarded ReviewKnowledgeWorker jobs for the tenant, including error reason and attempted_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.9",
+      "description": "Pipeline status includes `auto_extract_enabled`: the current value of the tenant's knowledge_auto_extract setting.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.10",
+      "description": "Idempotent: re-processing the same review_record does not create duplicate articles (enforced by the duplicate detection in US-21.1). Re-enqueuing the same job (e.g., via retry) is safe.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.11",
+      "description": "PUT /api/v1/tenant/settings endpoint (or PATCH to existing tenant endpoint) allows updating knowledge_auto_extract. Validates boolean type. Returns updated settings.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.12",
+      "description": "Pipeline endpoint enforces tenant scoping via RLS. Metrics reflect only the requesting tenant's data.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.6.1",
+      "name": "Review recording enqueues knowledge worker when auto_extract enabled",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{knowledge_auto_extract: true}}) as tenant",
+        "fixture(:story, %{tenant_id: tenant.id}) as story"
+      ],
+      "steps": [
+        "Call Progress.record_review/4 for the story",
+        "Check Oban jobs for the :knowledge queue"
+      ],
+      "expected_results": [
+        "The MockExtractor.extract_articles/1 was called (verified via Mox.verify!/0)",
+        "Articles with source_type 'review_finding' exist in the database (created by the inline-executed worker)",
+        "Review record is created in the same transaction"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.2",
+      "name": "Review recording skips worker when auto_extract disabled",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{knowledge_auto_extract: false}}) as tenant",
+        "fixture(:story, %{tenant_id: tenant.id}) as story"
+      ],
+      "steps": [
+        "Call Progress.record_review/4 for the story",
+        "Check Oban jobs for the :knowledge queue"
+      ],
+      "expected_results": [
+        "No ReviewKnowledgeWorker job enqueued",
+        "Review record is still created successfully"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.3",
+      "name": "Pipeline status returns correct metrics",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant with auto_extract enabled",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) as api_key",
+        "3 draft articles with source_type: \"review_finding\"",
+        "1 published article with source_type: \"review_finding\""
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/pipeline with valid auth"
+      ],
+      "expected_results": [
+        "recent_drafts contains 3 articles",
+        "publish_rate is 0.25 (1 published / 4 total)",
+        "auto_extract_enabled is true"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.4",
+      "name": "Pipeline status shows extraction errors",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Discarded Oban jobs for ReviewKnowledgeWorker in the tenant"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/pipeline with valid auth"
+      ],
+      "expected_results": [
+        "extraction_errors includes count and recent failed jobs",
+        "Each error entry includes error reason and attempted_at"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.5",
+      "name": "Tenant isolation: pipeline metrics only reflect own data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "Draft articles for tenant_b only"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/pipeline with tenant_a's auth"
+      ],
+      "expected_results": [
+        "recent_drafts is empty",
+        "publish_rate is 0.0",
+        "pending_extractions is 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.6",
+      "name": "Update auto_extract setting via tenant settings endpoint",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{settings: %{knowledge_auto_extract: true}}) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) as api_key"
+      ],
+      "steps": [
+        "PUT /api/v1/tenant/settings with {\"knowledge_auto_extract\": false}",
+        "GET /api/v1/knowledge/pipeline to verify"
+      ],
+      "expected_results": [
+        "Settings update returns 200 with updated settings",
+        "Pipeline status shows auto_extract_enabled: false"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.7",
+      "name": "Default auto_extract is true for new tenants",
+      "type": "unit",
+      "preconditions": [
+        "A newly created tenant with no explicit settings"
+      ],
+      "steps": [
+        "Check the tenant's knowledge_auto_extract setting"
+      ],
+      "expected_results": [
+        "Setting defaults to true",
+        "Record review enqueues the knowledge worker"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Progress.record_review/4 uses AdminRepo.insert (not Ecto.Multi). Do NOT refactor it to Multi — instead, enqueue the knowledge worker as a separate step after successful review record creation. This avoids modifying a shipped, tested function. The worker job changeset uses `ReviewKnowledgeWorker.new(%{review_record_id: id, tenant_id: tenant_id})`.",
+    "Tenant settings: if a `settings` jsonb column already exists on tenants, simply add `knowledge_auto_extract` to it. If not, add a migration for the column. Access via `tenant.settings[\"knowledge_auto_extract\"]` with a default of true when the key is missing.",
+    "Pipeline status queries Oban's `oban_jobs` table directly for job counts. Filter by worker name and tenant_id in the args. Use Oban.Job schema for queries.",
+    "Publish rate calculation: `published_count / (published_count + draft_count)`. Guard against division by zero by returning 0.0 when total is 0.",
+    "The pipeline endpoint is read-only and performs multiple queries. Consider combining them efficiently or accepting the N-query cost since this is a dashboard endpoint, not a hot path.",
+    "Testing: async: true, ConnCase for controller tests, DataCase for context tests, Mox for ExtractorBehaviour, fixture(:tenant) with settings, tenant isolation test, setup :verify_on_exit!.",
+    "In config/test.exs with Oban testing: :inline, workers execute synchronously when enqueued. Tests should verify side effects (mock was called, articles were created) rather than checking the job queue. Use Mox.expect on the MockExtractor to verify the worker ran.",
+    "With Oban testing: :inline, creating a review record triggers: (1) ReviewKnowledgeWorker runs synchronously, (2) which creates articles, (3) which may trigger ArticleEmbeddingWorker (if published). All mocks in the chain must be stubbed: MockExtractor AND MockEmbeddingClient. Ensure stub_all_defaults/0 in DataCase covers both with permissive defaults.",
+    "Pipeline status queries MUST filter by tenant_id in the SQL query (args->>'tenant_id' = $1), NOT in application code. This prevents cross-tenant job data from being loaded into process memory. Add a time bound: WHERE inserted_at > NOW() - INTERVAL '7 days' to keep queries fast regardless of job history size."
+  ],
+  "dependencies": ["US-21.1", "US-21.3"],
+  "estimated_hours": 4
+}

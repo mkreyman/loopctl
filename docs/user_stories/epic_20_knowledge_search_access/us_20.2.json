@@ -1,0 +1,209 @@
+{
+  "id": "US-20.2",
+  "title": "pgvector Setup & Embedding Storage",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "system",
+    "i_want_to": "store vector embeddings for knowledge articles using pgvector",
+    "so_that": "semantic similarity search can find conceptually related articles even when keywords don't match"
+  },
+  "rationale": "Keyword search fails when agents use different terminology than what appears in articles. Vector embeddings capture semantic meaning, enabling conceptual matches like finding 'error handling' articles when searching for 'fault tolerance'. pgvector keeps embeddings in PostgreSQL alongside the data, eliminating the need for a separate vector database. The HNSW index provides sub-millisecond approximate nearest neighbor lookups at scale. Making dimensions configurable via application config future-proofs the system for different embedding models.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.2.1",
+      "description": "The `{:pgvector, \"~> 0.3\"}` dependency is added to mix.exs and fetched successfully.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.2",
+      "description": "A migration enables the `vector` extension in PostgreSQL via `execute \"CREATE EXTENSION IF NOT EXISTS vector\"`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.3",
+      "description": "A migration adds an `embedding vector(1536)` column to the articles table. The column is nullable (null means embedding not yet generated).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.4",
+      "description": "An HNSW index is created on the embedding column with cosine distance operator class: `CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops)`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.5",
+      "description": "The Ecto schema for Article includes the embedding field using `Pgvector.Ecto.Vector` type (or a custom Ecto type wrapping pgvector serialization).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.6",
+      "description": "`Knowledge.update_embedding/3` accepts `(tenant_id, article_id, embedding_vector)` and updates the article's embedding column. Returns `{:ok, article}` or `{:error, changeset}`. Validates that the vector dimension matches the configured dimension.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.7",
+      "description": "`Knowledge.clear_embedding/2` accepts `(tenant_id, article_id)` and sets the embedding column to null. Returns `{:ok, article}` or `{:error, :not_found}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.8",
+      "description": "Embedding dimensions are configurable via `config :loopctl, :embedding_dimensions, 1536`. The update_embedding function validates incoming vector length against this config value. The database column is fixed at 1536 dimensions at migration time. The config value :embedding_dimensions is used for input validation only. Changing embedding models or dimensions requires a new migration to ALTER the column type and rebuild the HNSW index.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.9",
+      "description": "The embedding column is NOT included in the default article changeset cast fields. It is only set via the dedicated `update_embedding/3` function to prevent accidental overwrites during normal article edits.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.2.10",
+      "description": "All embedding operations are scoped to the current tenant via both application-level WHERE clause and RLS policy.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.2.1",
+      "name": "update_embedding stores a valid vector",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article",
+        "Generate a 1536-dimensional test vector"
+      ],
+      "steps": [
+        "Call Knowledge.update_embedding(tenant.id, article.id, test_vector)"
+      ],
+      "expected_results": [
+        "Returns {:ok, article} with embedding set",
+        "Reloading the article from DB shows the embedding is persisted",
+        "Embedding vector has exactly 1536 dimensions"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.2",
+      "name": "update_embedding rejects wrong dimension vector",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article",
+        "config :loopctl, :embedding_dimensions is 1536"
+      ],
+      "steps": [
+        "Call Knowledge.update_embedding(tenant.id, article.id, vector_of_768_dims)"
+      ],
+      "expected_results": [
+        "Returns {:error, changeset} with error on embedding field",
+        "Error message indicates dimension mismatch (expected 1536, got 768)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.3",
+      "name": "clear_embedding sets embedding to null",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article",
+        "Article has an existing embedding stored"
+      ],
+      "steps": [
+        "Call Knowledge.clear_embedding(tenant.id, article.id)"
+      ],
+      "expected_results": [
+        "Returns {:ok, article} with embedding set to nil",
+        "Reloading from DB confirms embedding is null"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.4",
+      "name": "clear_embedding returns not_found for missing article",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant"
+      ],
+      "steps": [
+        "Call Knowledge.clear_embedding(tenant.id, Ecto.UUID.generate())"
+      ],
+      "expected_results": [
+        "Returns {:error, :not_found}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.5",
+      "name": "normal article update does not overwrite embedding",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article",
+        "Article has an existing embedding stored"
+      ],
+      "steps": [
+        "Call Knowledge.update_article(tenant.id, article.id, %{title: 'New Title'})"
+      ],
+      "expected_results": [
+        "Article title is updated",
+        "Embedding remains unchanged (not nullified or overwritten)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.6",
+      "name": "tenant isolation for embedding operations",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a"
+      ],
+      "steps": [
+        "Call Knowledge.update_embedding(tenant_b.id, article_a.id, valid_vector)"
+      ],
+      "expected_results": [
+        "Returns {:error, :not_found}",
+        "Tenant B cannot update embeddings on Tenant A's articles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.2.7",
+      "name": "HNSW index is used for cosine similarity queries",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "3 articles with embeddings stored",
+        "A query vector"
+      ],
+      "steps": [
+        "Run EXPLAIN ANALYZE on a cosine distance query against the articles table"
+      ],
+      "expected_results": [
+        "Query plan shows Index Scan using the HNSW index (articles_embedding_idx)",
+        "Query does not fall back to sequential scan"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add `{:pgvector, \"~> 0.3\"}` to mix.exs deps. This provides `Pgvector.Ecto.Vector` type and Ecto integration.",
+    "Migration order: (1) CREATE EXTENSION IF NOT EXISTS vector, (2) ALTER TABLE articles ADD COLUMN embedding vector(1536), (3) CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops). The HNSW index migration MUST use CREATE INDEX CONCURRENTLY to avoid locking the articles table during index build. Use @disable_ddl_transaction true and @disable_migration_lock true in the migration module. Split extension creation, column addition, and index creation into separate migrations so a failed index doesn't block the column add.",
+    "Schema field: `field :embedding, Pgvector.Ecto.Vector` — this handles serialization/deserialization of the vector data between Elixir lists and PostgreSQL vector type.",
+    "The embedding field must NOT appear in the standard article changeset `cast/3` call. Create a separate `embedding_changeset/2` used only by `update_embedding/3`.",
+    "Dimension validation: `defp validate_embedding_dimensions(changeset)` checks `length(get_field(changeset, :embedding)) == Application.get_env(:loopctl, :embedding_dimensions, 1536)`.",
+    "Config: `config :loopctl, :embedding_dimensions, 1536` in config/config.exs. Override in test.exs if needed for faster test vectors.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "For test vectors, use small deterministic vectors (e.g., List.duplicate(0.1, 1536)) rather than random values to make assertions predictable.",
+    "The Article schema already uses use Loopctl.Schema with binary IDs and tenant_field(). The new field :embedding, Pgvector.Ecto.Vector is added alongside existing fields in the schema module."
+  ],
+  "dependencies": [
+    "US-19.1"
+  ],
+  "estimated_hours": 4
+}

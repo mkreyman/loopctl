@@ -1,0 +1,217 @@
+{
+  "id": "US-21.2",
+  "title": "Article Auto-Linking Worker",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "medium",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "system",
+    "i_want_to": "automatically discover and create relationships between knowledge articles based on semantic similarity",
+    "so_that": "the knowledge graph builds itself as new articles are added, without manual curation"
+  },
+  "rationale": "A knowledge wiki without links is just a list. Manually curating relationships between articles is tedious and scales poorly as the wiki grows. By comparing article embeddings when new articles are stored, the system can automatically discover semantically related articles and create `relates_to` links. This transforms the flat article collection into a connected knowledge graph that surfaces related context automatically. Contradiction detection is deferred to a future story.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.2.1",
+      "description": "A `Loopctl.Workers.ArticleLinkingWorker` Oban worker exists in the `:knowledge` queue with max_attempts: 3. It receives article_id and tenant_id in the job args.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.2",
+      "description": "The worker is triggered after an embedding is stored for a new article. It is enqueued from the embedding storage callback or pipeline (following the pattern established in US-20.3/US-20.4).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.3",
+      "description": "The worker fetches the new article's embedding and compares it via cosine similarity against all other article embeddings in the same tenant. If project_id is set on the article, comparison is scoped to the same project; if project_id is nil (tenant-wide), comparison runs against all tenant articles. For project-scoped articles, the worker compares against articles in the same project AND tenant-wide articles (project_id IS NULL OR project_id = article.project_id). This ensures project-scoped knowledge links to relevant tenant-wide patterns.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.4",
+      "description": "A configurable similarity threshold (default 0.8) is read from Application config: `Application.get_env(:loopctl, :article_link_threshold, 0.8)`. Articles exceeding the threshold get `relates_to` links created.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.5",
+      "description": "Created ArticleLinks have relationship_type: :relates_to and metadata: %{auto_generated: true, similarity_score: float}. The similarity score is stored for transparency.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.6",
+      "description": "No duplicate links: before creating a link, the worker checks if a link already exists between the two articles (in either direction). If so, it skips creation.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.7",
+      "description": "Contradiction detection is deferred to a future story. For v1, the worker only creates :relates_to links based on similarity threshold. A future story will extend ExtractorBehaviour with an optional detect_contradiction/2 callback.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.8",
+      "description": "Rate limiting: the worker processes at most 50 similarity comparisons per execution. If there are more candidate articles, it logs a warning and processes the top 50 by recency.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.9",
+      "description": "The worker is idempotent: re-running for the same article_id does not create duplicate links. Existing links are detected and skipped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.10",
+      "description": "An audit event is created on completion: event_type \"knowledge.articles_linked\", payload includes article_id and count of new links created.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.11",
+      "description": "[REMOVED] The ArticleLinkingWorker reads pre-computed embeddings from the database via pgvector's <=> operator. It never calls the embedding client directly — embeddings are already stored by the ArticleEmbeddingWorker (US-20.3). No @embedding_client compile-time DI is needed.",
+      "status": "removed"
+    },
+    {
+      "id": "AC-21.2.12",
+      "description": "[REMOVED] Contradiction detection is deferred (see AC-21.2.7). No @extractor compile-time DI is needed for this worker.",
+      "status": "removed"
+    },
+    {
+      "id": "AC-21.2.13",
+      "description": "The worker implements a custom backoff: @impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.14",
+      "description": "The worker uses Oban unique option: unique: [period: 300, keys: [:article_id]] to prevent duplicate linking jobs for the same article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.15",
+      "description": "The maximum number of comparison articles is configurable via Application.get_env(:loopctl, :article_link_max_comparisons, 50).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.2.1",
+      "name": "Worker creates relates_to links for similar articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as existing_article with embedding stored",
+        "fixture(:article, %{tenant_id: tenant.id}) as new_article with embedding stored",
+        "Cosine similarity between embeddings exceeds 0.8 threshold"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 with new_article.id",
+        "Query article_links for new_article"
+      ],
+      "expected_results": [
+        "One ArticleLink created with relationship_type: :relates_to",
+        "Link metadata contains auto_generated: true and similarity_score as float",
+        "Link connects new_article to existing_article"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.2",
+      "name": "Worker skips articles below similarity threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as existing_article with dissimilar embedding",
+        "fixture(:article, %{tenant_id: tenant.id}) as new_article with embedding stored",
+        "Cosine similarity between embeddings is below 0.8"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 with new_article.id"
+      ],
+      "expected_results": [
+        "No ArticleLinks created",
+        "Worker returns :ok"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.3",
+      "name": "Worker does not create duplicate links on re-run",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Two articles with high similarity and an existing relates_to link between them"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 for the article",
+        "Count article_links"
+      ],
+      "expected_results": [
+        "No new links created",
+        "Link count unchanged",
+        "Worker returns :ok"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.4",
+      "name": "Tenant isolation: worker does not link across tenants",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a with embedding",
+        "fixture(:article, %{tenant_id: tenant_b.id}) as article_b with similar embedding"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 with article_a.id"
+      ],
+      "expected_results": [
+        "No links created to tenant_b's articles",
+        "Similarity comparison only includes tenant_a articles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.5",
+      "name": "Worker respects rate limit of 50 comparisons",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "60 articles exist with embeddings for the tenant"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 for a new article"
+      ],
+      "expected_results": [
+        "Only top 50 articles by recency are compared",
+        "Warning logged about exceeding comparison limit"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.6",
+      "name": "Worker handles article with no embedding gracefully",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article with no embedding stored"
+      ],
+      "steps": [
+        "Execute ArticleLinkingWorker.perform/1 with article.id"
+      ],
+      "expected_results": [
+        "Worker returns {:error, :no_embedding} or :ok with no links created",
+        "No crash or unhandled exception"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Cosine similarity can be computed in PostgreSQL using pgvector's `<=>` operator or in Elixir. Prefer the database query for efficiency: `SELECT id, 1 - (embedding <=> $1) as similarity FROM article_embeddings WHERE tenant_id = $2 AND article_id != $3 ORDER BY similarity DESC LIMIT 50`.",
+    "The similarity threshold should be configurable via Application config, NOT hardcoded. Default 0.8 is a reasonable starting point but may need tuning per deployment.",
+    "Duplicate link detection must check both directions: article_a -> article_b AND article_b -> article_a, since ArticleLinks are directional but relates_to is semantically bidirectional.",
+    "Contradiction detection is deferred to a future story. For v1, the worker only creates :relates_to links. No ExtractorBehaviour DI is needed in this worker.",
+    "Testing: async: true, fixture(:article) with embeddings, tenant isolation test, setup :verify_on_exit!. No Mox needed since the worker only reads embeddings from the database.",
+    "Rate limiting at 50 comparisons prevents runaway compute on tenants with large article collections. The limit should be configurable via Application config."
+  ],
+  "dependencies": ["US-19.2", "US-20.3", "US-20.4"],
+  "estimated_hours": 5
+}

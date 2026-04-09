@@ -1,0 +1,202 @@
+{
+  "id": "US-19.2",
+  "title": "ArticleLink Schema & Migration",
+  "epic": {
+    "id": "epic_19",
+    "name": "Knowledge Wiki Foundation"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "developer or AI agent",
+    "i_want_to": "create typed relationships between knowledge articles",
+    "so_that": "agents can traverse the knowledge graph and discover related patterns, contradictions, and superseded knowledge"
+  },
+  "rationale": "Knowledge articles rarely exist in isolation. A pattern may be derived from a review finding, a convention may contradict an older decision, and a new article may supersede an outdated one. Typed, directional links between articles create a traversable knowledge graph that agents can use to discover related context, identify contradictions before making decisions, and follow the evolution chain of superseded knowledge. The immutable design (insert-only, no updated_at) ensures the link history is preserved.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-19.2.1",
+      "description": "A Loopctl.Knowledge.ArticleLink schema exists with fields: id (binary_id PK), tenant_id (binary_id FK to tenants), source_article_id (binary_id FK to articles), target_article_id (binary_id FK to articles), relationship_type (Ecto.Enum: :relates_to, :derived_from, :contradicts, :supersedes), metadata (map/jsonb, default %{}), inserted_at (utc_datetime_usec). No updated_at field -- article links are immutable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.2",
+      "description": "The schema uses `use Loopctl.Schema` and `tenant_field()` macro. The tenant_id field is NEVER included in cast.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.3",
+      "description": "A changeset validates required fields: source_article_id, target_article_id, relationship_type. It validates that source_article_id != target_article_id (no self-links).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.4",
+      "description": "Migration creates the article_links table with all specified columns and correct foreign key references to articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.5",
+      "description": "Migration adds a unique composite index on (tenant_id, source_article_id, target_article_id, relationship_type) preventing duplicate links of the same type between the same pair of articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.6",
+      "description": "Migration enables RLS on the article_links table via `import Loopctl.Repo.RlsHelpers` then `enable_rls(:article_links)`. RLS policies enforce tenant isolation.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.7",
+      "description": "The relationship_type Ecto.Enum values represent the four core link types: :relates_to (general association), :derived_from (source was created based on target), :contradicts (source conflicts with target), :supersedes (source replaces target).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.8",
+      "description": "The timestamps override only includes :inserted_at (no :updated_at) since article links are immutable after creation.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.2.9",
+      "description": "Foreign key constraints on source_article_id and target_article_id reference the articles table with ON DELETE RESTRICT. RESTRICT is safer with the soft-delete pattern -- prevents accidental destruction of the link graph. Articles must have their links explicitly removed before deletion.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-19.2.1",
+      "name": "Create article link with valid data",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.ArticleLink module is compiled and available",
+        "Two valid article IDs available"
+      ],
+      "steps": [
+        "Build a changeset with valid source_article_id, target_article_id, and relationship_type :relates_to"
+      ],
+      "expected_results": [
+        "Changeset is valid with no errors",
+        "metadata defaults to %{}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.2",
+      "name": "Reject self-link where source equals target",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.ArticleLink module is compiled and available"
+      ],
+      "steps": [
+        "Build a changeset where source_article_id and target_article_id are the same UUID"
+      ],
+      "expected_results": [
+        "Changeset is invalid",
+        "Error indicates self-links are not allowed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.3",
+      "name": "Reject duplicate link of same type between same articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_b",
+        "fixture(:article_link, %{tenant_id: tenant.id, source_article_id: article_a.id, target_article_id: article_b.id, relationship_type: :relates_to})"
+      ],
+      "steps": [
+        "Attempt to insert a second link with the same source, target, and relationship_type"
+      ],
+      "expected_results": [
+        "Insert fails with unique constraint error on the composite index"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.4",
+      "name": "Allow different relationship types between same articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_b",
+        "fixture(:article_link, %{tenant_id: tenant.id, source_article_id: article_a.id, target_article_id: article_b.id, relationship_type: :relates_to})"
+      ],
+      "steps": [
+        "Insert a link with relationship_type :derived_from between the same articles"
+      ],
+      "expected_results": [
+        "Insert succeeds -- different relationship_type makes the link unique"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.5",
+      "name": "Reject missing required fields",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.ArticleLink module is compiled and available"
+      ],
+      "steps": [
+        "Build a changeset with empty attrs (no source_article_id, target_article_id, or relationship_type)"
+      ],
+      "expected_results": [
+        "Changeset is invalid",
+        "Errors present on :source_article_id, :target_article_id, and :relationship_type"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.6",
+      "name": "Tenant isolation via RLS prevents cross-tenant link access",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a1",
+        "fixture(:article, %{tenant_id: tenant_a.id}) as article_a2",
+        "fixture(:article_link, %{tenant_id: tenant_a.id, source_article_id: article_a1.id, target_article_id: article_a2.id})"
+      ],
+      "steps": [
+        "Set RLS context to tenant_b",
+        "Query for article_links belonging to tenant_a"
+      ],
+      "expected_results": [
+        "Query returns empty list -- tenant_b cannot see tenant_a's article links"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.2.7",
+      "name": "Article link is immutable -- no updated_at field",
+      "type": "unit",
+      "preconditions": [
+        "Loopctl.Knowledge.ArticleLink module is compiled and available"
+      ],
+      "steps": [
+        "Inspect the schema fields of ArticleLink"
+      ],
+      "expected_results": [
+        "Schema includes :inserted_at timestamp",
+        "Schema does NOT include :updated_at timestamp"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Schema MUST use `use Loopctl.Schema` which provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`.",
+    "Override timestamps to only include inserted_at: `timestamps(updated_at: false)` in the schema block.",
+    "Use `tenant_field()` macro in the schema block to add the tenant_id field with correct FK and index.",
+    "Relationship type enum: Ecto.Enum with values [:relates_to, :derived_from, :contradicts, :supersedes].",
+    "Self-link validation in changeset: `validate_change(:target_article_id, fn :target_article_id, target_id -> if target_id == get_field(changeset, :source_article_id), do: [target_article_id: \"cannot link an article to itself\"], else: [] end)`.",
+    "Composite unique index: `create unique_index(:article_links, [:tenant_id, :source_article_id, :target_article_id, :relationship_type], name: :article_links_tenant_src_tgt_rel_index)`.",
+    "Foreign keys should use `on_delete: :restrict` to prevent accidental destruction of the link graph. RESTRICT is safer with the soft-delete pattern -- articles must have their links explicitly removed before deletion.",
+    "Migration file: `priv/repo/migrations/TIMESTAMP_create_article_links.exs`. Import `Loopctl.Repo.RlsHelpers` and call `enable_rls(:article_links)` after table creation.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests.",
+    "Add build(:article_link, attrs) and fixture(:article_link, attrs) to test/support/fixtures.ex with auto-dependency resolution for tenant_id, source_article_id, and target_article_id."
+  ],
+  "dependencies": [
+    "US-19.1"
+  ],
+  "estimated_hours": 3
+}

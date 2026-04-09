@@ -1,0 +1,160 @@
+{
+  "id": "US-21.7",
+  "title": "MCP Tools for Knowledge Write Operations",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "low",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "orchestrator agent",
+    "i_want_to": "manage the knowledge wiki lifecycle through MCP tools",
+    "so_that": "the orchestration loop can publish articles, review drafts, run lint checks, and trigger exports programmatically"
+  },
+  "rationale": "The orchestrator agent manages the development loop through MCP tools rather than direct curl calls. Without MCP tools for knowledge management, the orchestrator cannot programmatically publish vetted articles, review the draft queue, run lint checks for wiki health, or trigger exports. Adding these four tools completes the knowledge intelligence loop by giving the orchestrator the same wiki management capabilities available through the REST API, following the established MCP tool patterns in mcp-server/index.js.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.7.1",
+      "description": "A `knowledge_publish` MCP tool exists in mcp-server/index.js. It calls POST /api/v1/articles/:id/publish using ORCH_KEY. Accepts article_id as required parameter. Returns the published article JSON on success, or error details on failure.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.2",
+      "description": "A `knowledge_drafts` MCP tool exists in mcp-server/index.js. It calls GET /api/v1/knowledge/drafts using ORCH_KEY. Accepts optional limit and offset parameters. Returns the list of draft articles with source traceability.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.3",
+      "description": "A `knowledge_lint` MCP tool exists in mcp-server/index.js. It calls GET /api/v1/knowledge/lint (or GET /api/v1/projects/:project_id/knowledge/lint if project_id provided) using ORCH_KEY. Accepts optional project_id, stale_days, and min_coverage parameters. Returns the structured lint report.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.4",
+      "description": "The knowledge_export tool calls GET /knowledge/export and saves the ZIP response to a temporary file, returning the file path. If the response is too large or the endpoint returns an error, it returns a structured error message with the curl command for direct download.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.5",
+      "description": "All four tools use ORCH_KEY (not AGENT_KEY) for authentication, consistent with other management-level MCP tools.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.6",
+      "description": "Each tool follows the existing MCP pattern: (1) tool function defined, (2) entry added to TOOLS array with name, description, and inputSchema, (3) switch case added in the tool dispatch handler.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.7",
+      "description": "Tool descriptions are clear and include the expected use case. inputSchema validates required vs optional parameters with correct JSON Schema types.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.8",
+      "description": "Error responses from the API are surfaced as structured MCP tool errors with meaningful messages (not raw HTTP error bodies).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.9",
+      "description": "The tools are documented in mcp-server/README.md with usage examples, parameter descriptions, and expected responses.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.7.1",
+      "name": "knowledge_publish tool publishes a draft article",
+      "type": "integration",
+      "preconditions": [
+        "Running loopctl server with a tenant and draft article",
+        "ORCH_KEY configured in MCP environment"
+      ],
+      "steps": [
+        "Call knowledge_publish MCP tool with article_id of a draft article"
+      ],
+      "expected_results": [
+        "Tool returns success with article status: \"published\"",
+        "Article is published in the database"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.2",
+      "name": "knowledge_drafts tool lists draft articles",
+      "type": "integration",
+      "preconditions": [
+        "Running loopctl server with tenant having draft articles",
+        "ORCH_KEY configured"
+      ],
+      "steps": [
+        "Call knowledge_drafts MCP tool with default params"
+      ],
+      "expected_results": [
+        "Tool returns list of draft articles",
+        "Each article includes source_type for traceability",
+        "Articles ordered by inserted_at desc"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.3",
+      "name": "knowledge_lint tool returns structured health report",
+      "type": "integration",
+      "preconditions": [
+        "Running loopctl server with tenant having articles in various states",
+        "ORCH_KEY configured"
+      ],
+      "steps": [
+        "Call knowledge_lint MCP tool with project_id and custom thresholds"
+      ],
+      "expected_results": [
+        "Tool returns lint report with stale_articles, orphan_articles, contradiction_clusters, coverage_gaps, broken_sources sections",
+        "Summary includes total_issues and issues_by_severity"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.4",
+      "name": "knowledge_export tool triggers export",
+      "type": "integration",
+      "preconditions": [
+        "Running loopctl server with tenant having published articles",
+        "ORCH_KEY configured"
+      ],
+      "steps": [
+        "Call knowledge_export MCP tool"
+      ],
+      "expected_results": [
+        "Tool returns success message or download URL",
+        "Does not return raw binary data"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.5",
+      "name": "Tools handle API errors gracefully",
+      "type": "unit",
+      "preconditions": [
+        "ORCH_KEY configured but server returns 422 for invalid operation"
+      ],
+      "steps": [
+        "Call knowledge_publish with an already-published article_id"
+      ],
+      "expected_results": [
+        "Tool returns structured error message, not raw HTTP error",
+        "Error message explains the invalid status transition"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Follow the existing MCP tool pattern in mcp-server/index.js exactly: (1) async function for each tool, (2) TOOLS array entry with name/description/inputSchema, (3) switch case in the callTool handler.",
+    "Use ORCH_KEY for all four tools since these are management operations. Pattern: `headers: { 'Authorization': `Bearer ${process.env.LOOPCTL_ORCH_KEY}` }`.",
+    "knowledge_export should NOT try to return the raw ZIP binary as MCP tool output. Instead, either save to a temp file and return the path, or return a message indicating the export endpoint URL for direct download.",
+    "inputSchema for knowledge_lint should include optional properties: project_id (string), stale_days (integer), min_coverage (integer). knowledge_publish requires article_id (string). knowledge_drafts accepts optional limit (integer) and offset (integer).",
+    "Error handling: wrap API calls in try/catch, parse error responses, and return structured `{content: [{type: 'text', text: error_message}], isError: true}` per MCP protocol.",
+    "Update mcp-server/README.md with the four new tools in the existing tools documentation section."
+  ],
+  "dependencies": ["US-20.8", "US-21.3", "US-21.4", "US-21.5"],
+  "estimated_hours": 3
+}

@@ -1,0 +1,211 @@
+{
+  "id": "US-21.5",
+  "title": "Knowledge Lint Operation",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "medium",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "run health checks on the knowledge wiki to find stale, orphaned, or contradictory articles",
+    "so_that": "I can maintain wiki quality and identify areas that need attention or additional knowledge"
+  },
+  "rationale": "A knowledge wiki degrades over time without maintenance. Articles become stale as code evolves, orphaned articles lose their connections, contradictions accumulate as different reviews produce conflicting guidance, and coverage gaps leave important areas undocumented. A lint operation provides a structured health report that surfaces these issues with actionable severity levels and suggestions, enabling proactive wiki maintenance rather than reactive discovery of outdated or conflicting knowledge.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.5.1",
+      "description": "GET /api/v1/projects/:project_id/knowledge/lint endpoint exists (role: user+). Analyzes published articles scoped to the specified project (including tenant-wide articles with project_id: nil). Returns a structured JSON report.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.2",
+      "description": "GET /api/v1/knowledge/lint endpoint exists (role: user+). Analyzes all published articles across the tenant. Returns the same structured JSON report format.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.3",
+      "description": "Report includes `stale_articles`: articles not updated in N days (default 90, configurable via `?stale_days=N` query param). Each entry includes article_id, title, last_updated, days_since_update, severity: \"warning\", suggested_action: \"Review and update or archive this article\".",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.4",
+      "description": "Report includes `orphan_articles`: published articles with zero ArticleLinks (neither source nor target of any link). Each entry includes article_id, title, category, severity: \"info\", suggested_action: \"Consider linking to related articles or reviewing for relevance\".",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.5",
+      "description": "Report includes `contradiction_clusters`: groups of articles linked with link_type: :contradicts. Each cluster includes the article_ids, titles, and the contradicting link_ids. Severity: \"warning\", suggested_action: \"Resolve contradiction by updating or superseding one article\".",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.6",
+      "description": "Report includes `coverage_gaps`: categories with fewer than N published articles (default 3, configurable via `?min_coverage=N` query param). Each entry includes category, current_count, threshold, severity: \"info\", suggested_action: \"Add more articles in this category\".",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.7",
+      "description": "Report includes `broken_sources`: articles whose source_id references an entity that no longer exists (e.g., deleted review_record). Each entry includes article_id, title, source_type, source_id, severity: \"warning\", suggested_action: \"Source entity was deleted; consider updating or removing source reference\".",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.8",
+      "description": "Report includes a top-level `summary` object: total_articles (published count), total_issues (sum of all issue arrays), issues_by_severity (%{warning: N, info: N}), generated_at (ISO 8601 timestamp).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.9",
+      "description": "All analysis is read-only. No data is modified by the lint operation. The endpoint performs queries and returns results only.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.10",
+      "description": "Both endpoints enforce tenant scoping via RLS. A tenant's lint report only includes their own articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.11",
+      "description": "Configurable thresholds via query params: stale_days (integer, default 90), min_coverage (integer, default 3). Invalid params return 400 with descriptive error.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.5.1",
+      "name": "Lint detects stale articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) as api_key",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published, updated_at: 100 days ago}) as stale_article"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint with valid auth"
+      ],
+      "expected_results": [
+        "Response 200",
+        "stale_articles array contains the stale article with severity: \"warning\"",
+        "days_since_update >= 100"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.2",
+      "name": "Lint detects orphan articles with no links",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as orphan (no ArticleLinks)"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint with valid auth"
+      ],
+      "expected_results": [
+        "orphan_articles array contains the orphan article",
+        "severity is \"info\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.3",
+      "name": "Lint detects contradiction clusters",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Two published articles linked with link_type: :contradicts"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint with valid auth"
+      ],
+      "expected_results": [
+        "contradiction_clusters array contains one cluster with both article IDs",
+        "severity is \"warning\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.4",
+      "name": "Lint detects coverage gaps by category",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "One published article with category: :pattern",
+        "Zero articles in :convention category"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint?min_coverage=2 with valid auth"
+      ],
+      "expected_results": [
+        "coverage_gaps includes :pattern (count 1, threshold 2) and :convention (count 0, threshold 2)",
+        "severity is \"info\" for each gap"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.5",
+      "name": "Lint respects configurable stale_days threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published, updated_at: 50 days ago})"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint?stale_days=30 with valid auth",
+        "GET /api/v1/knowledge/lint?stale_days=90 with valid auth"
+      ],
+      "expected_results": [
+        "With stale_days=30: article appears in stale_articles",
+        "With stale_days=90: article does not appear in stale_articles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.6",
+      "name": "Tenant isolation: lint only reports own articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_b.id, status: :published, updated_at: 100 days ago})"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint with tenant_a's auth"
+      ],
+      "expected_results": [
+        "stale_articles array is empty (tenant_b's article not visible)",
+        "Report reflects only tenant_a's data"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.7",
+      "name": "Summary correctly aggregates issue counts",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) with a mix of stale, orphan, and contradictory articles"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/lint with valid auth"
+      ],
+      "expected_results": [
+        "summary.total_issues equals sum of all issue arrays",
+        "summary.issues_by_severity correctly counts warnings and infos",
+        "summary.generated_at is a valid ISO 8601 timestamp"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "All lint checks should be implemented as separate private functions in the Knowledge context that return their issue lists. The controller assembles the final report from these components.",
+    "Stale article detection: `from a in Article, where: a.status == :published and a.updated_at < ^cutoff_date`. The cutoff is `DateTime.add(DateTime.utc_now(), -stale_days, :day)`.",
+    "Orphan detection: LEFT JOIN on article_links (as source or target), WHERE both joins are nil. This finds articles with zero links in either direction.",
+    "Contradiction clusters: query ArticleLinks where link_type: :contradicts, group connected articles into clusters. A simple approach is to return pairs; graph clustering is overkill for v1.",
+    "Coverage gaps: `GROUP BY category HAVING count(*) < threshold` on published articles. Include categories with zero articles by checking all enum values.",
+    "Broken sources: for each source_type, query the corresponding table to check if source_id exists. Start with \"review_finding\" source_type checking against review_records table. Use LEFT JOIN pattern for efficiency.",
+    "Testing: async: true, ConnCase, fixture articles with specific updated_at timestamps (use Ecto insert with explicit timestamps), tenant isolation test, setup :verify_on_exit!.",
+    "For extensible broken-source checking, define a @source_type_queries map: %{\"review_finding\" => {Loopctl.Progress, :get_review_record}, ...} so new source types can be added without modifying the core lint logic. Each entry maps source_type to a {module, function} tuple that checks existence."
+  ],
+  "dependencies": ["US-19.3", "US-19.2"],
+  "estimated_hours": 4
+}

@@ -1,0 +1,234 @@
+{
+  "id": "US-20.7",
+  "title": "Context Retrieval for Agents",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "medium",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent",
+    "i_want_to": "retrieve full knowledge articles ranked by relevance and recency with linked context",
+    "so_that": "I get the most pertinent and up-to-date knowledge for my current task in a single API call"
+  },
+  "rationale": "The search endpoint returns snippets for discovery, but agents need full article content to actually apply the knowledge. This endpoint is the 'deep read' that agents call after identifying relevant articles via the index or search. Weighting by both semantic relevance and recency ensures agents get current information rather than outdated patterns that happen to match well. Including one-hop linked articles as lightweight references gives agents awareness of related context without the token cost of loading everything.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.7.1",
+      "description": "GET /api/v1/knowledge/context is accessible with role agent+. Returns 401/403 for unauthenticated or insufficient role.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.2",
+      "description": "Required query parameter: `query` (text string). Returns 400 if missing or empty.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.3",
+      "description": "Optional query parameters: `project_id` (UUID), `limit` (integer, default 5, max 20), `recency_weight` (float, default 0.3, range 0.0-1.0).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.4",
+      "description": "Returns FULL article bodies for top matches. Each result includes: id, title, category, tags, body, updated_at, relevance_score, recency_score, combined_score.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.5",
+      "description": "Articles are ranked by combined_score = (1 - recency_weight) * relevance_score + recency_weight * recency_score. Relevance comes from combined keyword+semantic search. Recency uses exponential decay: recency_score = exp(-age_in_days / 30), so articles ~90 days old score ~0.05 and articles updated today score ~1.0.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.6",
+      "description": "The recency decay formula ensures recently updated articles are boosted. With default recency_weight=0.3, a perfectly relevant but 90-day-old article scores lower than a moderately relevant article updated today.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.7",
+      "description": "Each result includes a `linked_articles` array containing one-hop references: articles that are linked to/from the matched article. Linked articles are lightweight: id, title, category only. Maximum 5 linked articles per result.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.8",
+      "description": "If embedding generation for the query fails, falls back to keyword-only search with recency weighting. Response meta includes `fallback: true`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.9",
+      "description": "Only published articles are returned. All queries are scoped to the current tenant via RLS.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.10",
+      "description": "The underlying context function is `Knowledge.get_context/3` accepting `(tenant_id, query_string, opts)`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.7.11",
+      "description": "Agent-role API keys can only search published articles. The status filter parameter is ignored for agent-role requests — it is always forced to :published. User-role keys can override the status filter to search drafts or archived articles.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.7.1",
+      "name": "context retrieval returns full article bodies with combined scoring",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Fresh Convention', body: 'Detailed Elixir patterns...', status: :published, updated_at: ~U[2026-04-08 00:00:00Z]}) with embedding",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Old Convention', body: 'Legacy Elixir patterns...', status: :published, updated_at: ~U[2025-12-01 00:00:00Z]}) with embedding",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=elixir+patterns with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Both articles returned with full body content",
+        "'Fresh Convention' ranks higher due to recency boost",
+        "Each result has relevance_score, recency_score, and combined_score",
+        "combined_score reflects the weighting formula"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.2",
+      "name": "linked articles included as lightweight references",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Main Article', status: :published}) as main with embedding",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Related Article', status: :published}) as related",
+        "Link main -> related via article_links table",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=relevant+topic with agent API key"
+      ],
+      "expected_results": [
+        "'Main Article' result includes linked_articles with 'Related Article'",
+        "Linked article has only id, title, category (no body)",
+        "At most 5 linked articles per result"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.3",
+      "name": "custom recency_weight affects ranking",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Highly Relevant Old', body: 'Exact match content...', status: :published, updated_at: ~U[2025-06-01 00:00:00Z]}) with very high relevance embedding",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Moderately Relevant New', body: 'Somewhat related...', status: :published, updated_at: ~U[2026-04-08 00:00:00Z]}) with moderate relevance embedding",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=content&recency_weight=0.8",
+        "GET /api/v1/knowledge/context?query=content&recency_weight=0.1"
+      ],
+      "expected_results": [
+        "With recency_weight=0.8, the newer article ranks first",
+        "With recency_weight=0.1, the more relevant older article ranks first"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.4",
+      "name": "fallback to keyword-only when embedding fails",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Keyword Match', body: 'Testing patterns guide...', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns {:error, :service_unavailable}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=testing+patterns with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200 (not 503)",
+        "Results found via keyword search",
+        "meta.fallback is true",
+        "Full body content included in results"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.5",
+      "name": "missing query parameter returns 400",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context (no query param) with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 400 Bad Request",
+        "Error message indicates query parameter is required"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.6",
+      "name": "tenant isolation in context retrieval",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id, title: 'Tenant A Secret', body: 'Proprietary knowledge...', status: :published}) with embedding",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=proprietary with tenant_b API key"
+      ],
+      "expected_results": [
+        "Returns empty results",
+        "Tenant A's articles are not accessible to Tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.7.7",
+      "name": "limit parameter caps the number of results",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Create 10 published articles with embeddings matching the query",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}",
+        "MockEmbeddingClient returns embedding for query"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/context?query=test&limit=3 with agent API key"
+      ],
+      "expected_results": [
+        "Exactly 3 results returned",
+        "Results are the top 3 by combined_score"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controller: `LoopctlWeb.KnowledgeContextController` with `context/2` action. Route: `get \"/knowledge/context\", KnowledgeContextController, :context`.",
+    "Recency score formula: `recency_score = :math.exp(-age_in_days / 30)`. With half-life ~21 days: score at 0 days = 1.0, 30 days = 0.37, 60 days = 0.14, 90 days = 0.05.",
+    "Combined scoring: first run `Knowledge.search_combined/3` to get relevance-ranked results, then compute recency_score for each and re-rank by `(1 - recency_weight) * normalized_relevance + recency_weight * recency_score`.",
+    "Linked articles: query the article_links join table (from US-19.3 if it exists) to find one-hop links. `from l in ArticleLink, where: l.source_article_id == ^id or l.target_article_id == ^id, preload: [:target_article, :source_article]`. If no article_links table exists yet, return empty linked_articles arrays.",
+    "This endpoint returns full body content, so it should NOT be cached aggressively. Consider adding Cache-Control: no-store header.",
+    "Response view: `LoopctlWeb.KnowledgeContextJSON` renders full articles with scoring metadata and linked references.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs."
+  ],
+  "dependencies": [
+    "US-19.2",
+    "US-20.4",
+    "US-20.5"
+  ],
+  "estimated_hours": 4
+}

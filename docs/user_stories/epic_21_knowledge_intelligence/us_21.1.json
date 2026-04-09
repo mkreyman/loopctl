@@ -1,0 +1,213 @@
+{
+  "id": "US-21.1",
+  "title": "Review-to-Knowledge Worker",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "high",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "system",
+    "i_want_to": "automatically extract knowledge articles from review findings via a background worker",
+    "so_that": "the knowledge wiki grows organically from every code review, creating a compounding learning loop"
+  },
+  "rationale": "Code reviews surface patterns, conventions, and decisions that represent valuable institutional knowledge, but this knowledge typically evaporates after the review is complete. By automatically extracting knowledge article candidates from review findings via an Oban worker, the system transforms ephemeral review feedback into durable, searchable knowledge. The worker uses compile-time DI for the LLM extractor, enabling deterministic testing with Mox while allowing the production implementation to call whatever extraction service is configured.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.1.1",
+      "description": "A `Loopctl.Workers.ReviewKnowledgeWorker` Oban worker exists in the `:knowledge` queue with max_attempts: 3. It receives a review_record_id in the job args.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.2",
+      "description": "The worker reads the review record and its findings, then builds a context map: %{summary: review_record.summary, review_type: review_record.review_type, findings_count: review_record.findings_count, story_id: review_record.story_id, tenant_id: tenant_id}. It calls `@extractor.extract_articles/1` (resolved via compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`) passing this context map.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.3",
+      "description": "A `Loopctl.Knowledge.ExtractorBehaviour` behaviour exists defining `@callback extract_articles(context :: map()) :: {:ok, [%{title: String.t(), body: String.t(), category: atom(), tags: [String.t()]}]} | {:error, term()}`. The context map shape is: %{summary: String.t(), review_type: atom(), findings_count: non_neg_integer(), story_id: binary(), tenant_id: binary()}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.4",
+      "description": "The extractor returns structured article candidates as `[%{title: string, body: string, category: atom, tags: [string]}]`. The worker creates Article records with source_type: \"review_finding\", source_id: review_record.id, status: :draft, and the tenant_id from the review record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.5",
+      "description": "Duplicate detection and atomicity: all article creations from a single extraction are wrapped in one Ecto.Multi transaction — they either all succeed or all fail. This prevents partial extraction where some articles are created but others are lost on retry. Duplicate detection checks source_type + source_id for any existing article; if found, the entire extraction is skipped and the worker logs a warning. This makes the worker idempotent across retries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.6",
+      "description": "Circuit breaker on LLM failures: if the extractor returns `{:error, term()}`, the worker returns `{:error, reason}` to let Oban handle retries up to max_attempts. After max_attempts exhausted, the job moves to the discarded state.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.7",
+      "description": "The worker is enqueued within the same Ecto.Multi that creates the review_record (following the EventGenerator pattern). The job args include review_record_id and tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.8",
+      "description": "An audit event is created when articles are successfully extracted: event_type \"knowledge.articles_extracted\", payload includes review_record_id and count of articles created.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.9",
+      "description": "config/test.exs maps `:knowledge_extractor` to `Loopctl.MockExtractor`. The mock is defined in test/support/mocks.ex via `Mox.defmock(Loopctl.MockExtractor, for: Loopctl.Knowledge.ExtractorBehaviour)`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.10",
+      "description": "The `:knowledge` Oban queue is configured in config/config.exs with appropriate concurrency (default: 5).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.11",
+      "description": "The worker implements a custom backoff: @impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt). This provides exponential backoff with jitter matching the project convention.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.12",
+      "description": "The worker uses Oban unique option: unique: [period: 300, keys: [:review_record_id]] to prevent duplicate job enqueue for the same review record within a 5-minute window.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.13",
+      "description": "The worker validates extractor output before creating articles: (a) maximum 5 articles per extraction, (b) each article body validated against the same length limits as manual creation (max 100KB), (c) category must be a valid enum value, (d) tags validated per tag rules (max 20, alphanumeric). Invalid articles are logged and skipped. The full extractor output is logged at :info level for audit before any articles are created.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.1.1",
+      "name": "Worker extracts articles from review findings successfully",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:review_record, %{tenant_id: tenant.id}) as review_record",
+        "MockExtractor stubbed to return {:ok, [%{title: \"Pattern: GenServer Pooling\", body: \"...\", category: :pattern, tags: [\"otp\", \"genserver\"]}]}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id",
+        "Query articles for tenant"
+      ],
+      "expected_results": [
+        "One article created with status: :draft",
+        "Article has source_type: \"review_finding\" and source_id: review_record.id",
+        "Article title, body, category, tags match extractor output"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.2",
+      "name": "Worker skips duplicate extraction",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:review_record, %{tenant_id: tenant.id}) as review_record",
+        "fixture(:article, %{tenant_id: tenant.id, source_type: \"review_finding\", source_id: review_record.id})",
+        "MockExtractor stubbed to return {:ok, [%{title: \"...\", body: \"...\", category: :finding, tags: []}]}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id"
+      ],
+      "expected_results": [
+        "No new articles created",
+        "Worker returns :ok (idempotent success)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.3",
+      "name": "Worker handles extractor failure gracefully",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:review_record, %{tenant_id: tenant.id}) as review_record",
+        "MockExtractor stubbed to return {:error, :llm_timeout}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id"
+      ],
+      "expected_results": [
+        "Worker returns {:error, :llm_timeout}",
+        "No articles created",
+        "Oban will retry up to max_attempts: 3"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.4",
+      "name": "Worker creates multiple articles from single review",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:review_record, %{tenant_id: tenant.id}) as review_record",
+        "MockExtractor stubbed to return {:ok, [article_1, article_2, article_3]}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id"
+      ],
+      "expected_results": [
+        "Three articles created, all with status: :draft",
+        "All articles share the same source_type and source_id",
+        "Each article has distinct title and content"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.5",
+      "name": "Tenant isolation: worker only creates articles for correct tenant",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:review_record, %{tenant_id: tenant_a.id}) as review_record",
+        "MockExtractor stubbed to return {:ok, [%{title: \"Pattern\", body: \"...\", category: :pattern, tags: []}]}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id",
+        "Query articles for tenant_b"
+      ],
+      "expected_results": [
+        "Article created under tenant_a only",
+        "tenant_b has zero articles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.6",
+      "name": "Worker returns :ok when extractor returns empty list",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:review_record, %{tenant_id: tenant.id}) as review_record",
+        "MockExtractor stubbed to return {:ok, []}"
+      ],
+      "steps": [
+        "Execute ReviewKnowledgeWorker.perform/1 with review_record_id"
+      ],
+      "expected_results": [
+        "Worker returns :ok",
+        "No articles created",
+        "No errors logged"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Worker MUST use compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`. NEVER use opts-based DI.",
+    "Follow the EventGenerator pattern for enqueuing: the Oban.insert is part of the same Ecto.Multi that creates the review_record, ensuring atomicity.",
+    "The `:knowledge` Oban queue should be added to config/config.exs alongside existing queues like `:webhooks` and `:embeddings`.",
+    "Duplicate detection query: `Repo.exists?(from a in Article, where: a.source_type == ^source_type and a.source_id == ^source_id and a.tenant_id == ^tenant_id)`.",
+    "Testing: async: true, Mox.set_mox_from_context in setup, setup :verify_on_exit!, MockExtractor in test/support/mocks.ex, fixture(:review_record) in test/support/fixtures.ex.",
+    "The ExtractorBehaviour is intentionally thin -- it receives review data and returns article candidates. The production LlmExtractor implementation is a separate concern (not part of this story).",
+    "Use build(:article_candidate, attrs) in test/support/fixtures.ex for mock extractor return values. Example: build(:article_candidate, %{title: \"DI Pattern\", body: \"Always use behaviours...\", category: :pattern, tags: [\"di\", \"testing\"]})",
+    "When adding MockExtractor to test/support/mocks.ex, also update stub_all_defaults/0 in DataCase with a permissive default: Mox.stub(Loopctl.MockExtractor, :extract_articles, fn _context -> {:ok, []} end). This prevents cascading failures in integration tests where Oban inline mode triggers the worker unexpectedly."
+  ],
+  "dependencies": ["US-19.3", "US-20.3"],
+  "estimated_hours": 6
+}

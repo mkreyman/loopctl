@@ -1,0 +1,193 @@
+{
+  "id": "US-19.6",
+  "title": "Knowledge Webhook Events",
+  "epic": {
+    "id": "epic_19",
+    "name": "Knowledge Wiki Foundation"
+  },
+  "priority": "low",
+  "phase": "core",
+  "story": {
+    "as_a": "external system or monitoring tool",
+    "i_want_to": "receive webhook notifications when knowledge articles are created, updated, or linked",
+    "so_that": "external dashboards and tools can react to knowledge wiki changes in real-time"
+  },
+  "rationale": "The webhook system (Epic 10) provides push-based event delivery to external systems. Extending it to cover knowledge wiki events enables external tools to react in real-time when new patterns are documented, conventions are updated, or articles are superseded. This is especially valuable for AI orchestration dashboards that need to track knowledge accumulation metrics, and for notification systems that alert team members when important decisions or findings are recorded. Reusing the existing EventGenerator infrastructure keeps the implementation minimal.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-19.6.1",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article creation, producing an 'article.created' event with payload including article id, title, category, project_id, and status.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.2",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article update, producing an 'article.updated' event with payload including article id, title, category, project_id, changed fields, and new status.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.3",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article archival, producing an 'article.archived' event with payload including article id, title, and category.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.4",
+      "description": "When an article's status is set to :superseded (via a supersedes link), an 'article.superseded' event is generated with payload including the superseded article id and title, plus the superseding article id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.5",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article link creation, producing an 'article_link.created' event with payload including link id, source_article_id, target_article_id, relationship_type, and both article titles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.6",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article link deletion, producing an 'article_link.deleted' event with payload including link id, source_article_id, target_article_id, and relationship_type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.7",
+      "description": "The new event types (article.created, article.updated, article.archived, article.superseded, article_link.created, article_link.deleted) are added to the list of allowed webhook subscription event types, so tenants can subscribe to them.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.8",
+      "description": "Events are generated within the same Ecto.Multi transaction as the entity mutation, ensuring events are only created when the mutation succeeds.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.9",
+      "description": "Event payloads include tenant_id for routing and the article's project_id for project-scoped webhook filtering.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.6.10",
+      "description": "Knowledge webhook event payloads include ONLY: id, title, category, project_id, status, and tags. Never include body, metadata, or embedding in webhook payloads. For article.updated events, include the list of changed field names only, not their values.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-19.6.1",
+      "name": "Article creation generates article.created event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"article.created\"]})"
+      ],
+      "steps": [
+        "Call Knowledge.create_article(tenant.id, %{title: \"New Pattern\", body: \"...\", category: :pattern})"
+      ],
+      "expected_results": [
+        "A webhook_event record is created with event_type 'article.created'",
+        "Event payload includes article id, title='New Pattern', category='pattern', project_id=nil"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.6.2",
+      "name": "Article update generates article.updated event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: \"Old Title\"}) as article",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"article.updated\"]})"
+      ],
+      "steps": [
+        "Call Knowledge.update_article(tenant.id, article.id, %{title: \"New Title\"})"
+      ],
+      "expected_results": [
+        "A webhook_event record is created with event_type 'article.updated'",
+        "Event payload includes article id and new title"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.6.3",
+      "name": "Supersedes link generates both article_link.created and article.superseded events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as new_article",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as old_article",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"article_link.created\", \"article.superseded\"]})"
+      ],
+      "steps": [
+        "Call Knowledge.create_link(tenant.id, %{source_article_id: new_article.id, target_article_id: old_article.id, relationship_type: :supersedes})"
+      ],
+      "expected_results": [
+        "A webhook_event with event_type 'article_link.created' is created",
+        "A webhook_event with event_type 'article.superseded' is created",
+        "The superseded event payload includes both the superseded and superseding article ids"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.6.4",
+      "name": "Article archival generates article.archived event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"article.archived\"]})"
+      ],
+      "steps": [
+        "Call Knowledge.archive_article(tenant.id, article.id)"
+      ],
+      "expected_results": [
+        "A webhook_event record is created with event_type 'article.archived'",
+        "Event payload includes article id, title, and category"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.6.5",
+      "name": "Link deletion generates article_link.deleted event",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_a",
+        "fixture(:article, %{tenant_id: tenant.id}) as article_b",
+        "fixture(:article_link, %{tenant_id: tenant.id, source_article_id: article_a.id, target_article_id: article_b.id}) as link",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: [\"article_link.deleted\"]})"
+      ],
+      "steps": [
+        "Call Knowledge.delete_link(tenant.id, link.id)"
+      ],
+      "expected_results": [
+        "A webhook_event record is created with event_type 'article_link.deleted'",
+        "Event payload includes link id, source_article_id, target_article_id, and relationship_type"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-19.6.6",
+      "name": "New event types are valid for webhook subscriptions",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "POST /api/v1/webhooks with body {\"url\": \"https://example.com/hooks\", \"events\": [\"article.created\", \"article.updated\", \"article.archived\", \"article.superseded\", \"article_link.created\", \"article_link.deleted\"]}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "All six knowledge event types are accepted as valid webhook events"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Wire events into the existing Knowledge context mutations (US-19.3). Add EventGenerator.generate_events/3 calls within the Ecto.Multi pipelines.",
+    "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline (not called standalone). Correct pattern: Multi.new() |> Multi.insert(:article, changeset) |> Audit.log_in_multi(:article, \"article.created\") |> EventGenerator.generate_events(:webhook_events, fn %{article: article} -> %{tenant_id: tenant_id, event_type: \"article.created\", project_id: article.project_id, payload: %{id: article.id, title: article.title, category: article.category}} end)",
+    "Add the six new event types to the known event types list used for webhook subscription validation (defined in US-10.1). This is likely a module attribute or constant list in the Webhooks context.",
+    "The article.superseded event is generated as a side-effect of the supersedes link creation (US-19.5 AC-19.5.4). It should be generated in the same Multi transaction.",
+    "Event payloads should include tenant_id and project_id for webhook routing and filtering. The existing webhook delivery system uses project_id to match project-scoped webhook subscriptions.",
+    "EventGenerator is a plain module called directly (not via behaviour/DI). No mock is needed — it operates within the Ecto.Multi transaction and uses AdminRepo directly. In tests, webhook delivery workers execute via Oban inline mode.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+  ],
+  "dependencies": [
+    "US-19.3"
+  ],
+  "estimated_hours": 3
+}

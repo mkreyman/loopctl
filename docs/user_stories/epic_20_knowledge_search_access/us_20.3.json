@@ -1,0 +1,228 @@
+{
+  "id": "US-20.3",
+  "title": "Embedding Worker (Oban)",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "system",
+    "i_want_to": "automatically generate vector embeddings for articles via background Oban jobs",
+    "so_that": "semantic search stays current without blocking article creation"
+  },
+  "rationale": "Embedding generation requires an external API call (OpenAI, Anthropic, or similar) that takes 200-2000ms. Running this synchronously during article creation would degrade the API response time and couple article writes to embedding provider availability. An Oban worker decouples these concerns: articles are created instantly, and embeddings are generated asynchronously. The circuit breaker pattern (snooze on consecutive failures) prevents hammering a down provider, while compile-time DI via Application.compile_env makes the embedding provider trivially mockable in tests.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.3.1",
+      "description": "A `Loopctl.Workers.ArticleEmbeddingWorker` Oban worker exists in the `:embeddings` queue. It accepts `%{\"article_id\" => id, \"tenant_id\" => tenant_id}` as job args.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.2",
+      "description": "The worker is enqueued within the same Ecto.Multi transaction that creates or updates an article. Uses `Oban.insert/2` within the Multi to ensure the job is only enqueued if the article write succeeds.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.3",
+      "description": "The worker calls `@embedding_client.generate_embedding/1` where `@embedding_client` is resolved via `Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. The input is `\"{title}\\n\\n{body}\"` truncated to 32,000 characters.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.4",
+      "description": "A `Loopctl.Knowledge.EmbeddingBehaviour` behaviour defines `@callback generate_embedding(text :: String.t()) :: {:ok, [float()]} | {:error, term()}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.5",
+      "description": "On success, the worker calls `Knowledge.update_embedding/3` to persist the vector. On failure, the worker returns `{:error, reason}` (not `{:snooze, N}`), and implements a custom `backoff/1` callback: `@impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. This ensures the attempt counter increments correctly and max_attempts is respected.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.6",
+      "description": "Max attempts is 4. Backoff uses a custom `backoff/1` callback with polynomial delay: `trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. After 4 failures the job is discarded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.7",
+      "description": "If the article has been deleted between job enqueue and execution, the worker returns `:ok` (no-op) without raising an error.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.8",
+      "description": "The Oban queue `:embeddings` is configured with concurrency of 5 (configurable). Added to the Oban queues config in config/config.exs.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.9",
+      "description": "The worker uses `unique: [keys: [:article_id], period: 300, on_conflict: :replace]` so that rapid edits replace the queued job rather than deduplicating it away. This ensures the final content is always embedded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.10",
+      "description": "config/test.exs maps `:embedding_client` to a Mox mock: `config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient`. The mock is defined in test/support/mocks.ex.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.11",
+      "description": "Implementation requires modifying Knowledge.create_article/3 and Knowledge.update_article/4 (from US-19.3) to add Oban.insert for the ArticleEmbeddingWorker as a named Multi step. Only enqueue when title or body fields change — status, tags, or metadata-only updates do not trigger re-embedding. Check which fields changed using Map.has_key?(changeset.changes, :title) or Map.has_key?(changeset.changes, :body). Compute this BEFORE the Multi begins (the changeset is consumed by Multi.insert/update and not available in subsequent steps).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.12",
+      "description": "Embedding jobs are only enqueued for articles with status :published. When an article transitions from :draft to :published (via US-21.3 publish workflow), an embedding job is enqueued at that point. This avoids wasting embedding API calls on drafts that may never be published.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.13",
+      "description": "On successful embedding storage, the ArticleEmbeddingWorker enqueues an ArticleLinkingWorker job (from US-21.2) for the same article_id. This is the trigger mechanism for auto-linking.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.3.1",
+      "name": "worker generates and stores embedding on success",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Test Article', body: 'Some content...', embedding: nil}) as article",
+        "MockEmbeddingClient expects generate_embedding/1 and returns {:ok, List.duplicate(0.1, 1536)}"
+      ],
+      "steps": [
+        "Execute ArticleEmbeddingWorker.perform/1 with %{article_id: article.id, tenant_id: tenant.id}"
+      ],
+      "expected_results": [
+        "MockEmbeddingClient.generate_embedding/1 was called with 'Test Article\\n\\nSome content...'",
+        "Article embedding is now stored in the database",
+        "Worker returns :ok"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.2",
+      "name": "worker returns error on embedding generation failure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article",
+        "MockEmbeddingClient expects generate_embedding/1 and returns {:error, :rate_limited}"
+      ],
+      "steps": [
+        "Execute ArticleEmbeddingWorker.perform/1 with %{article_id: article.id, tenant_id: tenant.id}"
+      ],
+      "expected_results": [
+        "Worker returns {:error, :rate_limited} so Oban increments the attempt counter and uses the custom backoff/1 for retry delay",
+        "Article embedding remains nil"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.3",
+      "name": "worker handles deleted article gracefully",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "non_existent_article_id = Ecto.UUID.generate()"
+      ],
+      "steps": [
+        "Execute ArticleEmbeddingWorker.perform/1 with %{article_id: non_existent_article_id, tenant_id: tenant.id}"
+      ],
+      "expected_results": [
+        "Worker returns :ok without raising",
+        "No embedding client call is made"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.4",
+      "name": "article creation enqueues embedding worker",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project"
+      ],
+      "steps": [
+        "Call Knowledge.create_article(tenant.id, %{title: 'New Article', body: 'Content...', project_id: project.id})"
+      ],
+      "expected_results": [
+        "Article is created successfully",
+        "An Oban job exists in the :embeddings queue for the new article's ID",
+        "Job args include article_id and tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.5",
+      "name": "article update enqueues embedding worker",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id}) as article"
+      ],
+      "steps": [
+        "Call Knowledge.update_article(tenant.id, article.id, %{body: 'Updated content...'})"
+      ],
+      "expected_results": [
+        "Article body is updated",
+        "An Oban job exists in the :embeddings queue for the article's ID"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.6",
+      "name": "input text is truncated to 32K characters",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Title', body: String.duplicate('x', 40_000)}) as article",
+        "MockEmbeddingClient expects generate_embedding/1 and captures the input"
+      ],
+      "steps": [
+        "Execute ArticleEmbeddingWorker.perform/1 with the article"
+      ],
+      "expected_results": [
+        "The text passed to generate_embedding/1 is at most 32,000 characters",
+        "Text starts with 'Title\\n\\n' followed by truncated body"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.3.7",
+      "name": "custom backoff/1 increases retry delay per attempt",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "Call ArticleEmbeddingWorker.backoff/1 with Oban.Job structs for attempt numbers 1 through 4"
+      ],
+      "expected_results": [
+        "Delay increases polynomially with each attempt (attempt^4 + 15 + rand*attempt)",
+        "Attempt 1 returns a value in the range 16..46",
+        "Attempt 2 returns a value in the range 31..76",
+        "Attempt 3 returns a value in the range 96..171",
+        "All values are integers (truncated)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Worker module: `use Oban.Worker, queue: :embeddings, max_attempts: 4, unique: [keys: [:article_id], period: 300, on_conflict: :replace]`. Use unique: [keys: [:article_id], period: 300, on_conflict: :replace] so that rapid edits replace the queued job rather than deduplicating it away. This ensures the final content is always embedded.",
+    "Compile-time DI: `@embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. The default implementation wraps an HTTP call to the embedding provider.",
+    "config/test.exs: `config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient`. Mock defined in test/support/mocks.ex: `Mox.defmock(Loopctl.MockEmbeddingClient, for: Loopctl.Knowledge.EmbeddingBehaviour)`.",
+    "Input construction: `\"#{article.title}\\n\\n#{article.body}\" |> String.slice(0, 32_000)` — truncation prevents exceeding embedding model token limits.",
+    "Enqueue pattern: within Ecto.Multi, use `Oban.insert(multi, :embedding_job, ArticleEmbeddingWorker.new(%{article_id: id, tenant_id: tenant_id}))` so the job is only inserted if the transaction commits.",
+    "Custom backoff: `@impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. Returns polynomial delays that increase with each attempt.",
+    "The :embeddings queue config goes in config/config.exs: add `embeddings: 5` to the Oban queues list. Set to `embeddings: 0` in test.exs if Oban is in :manual mode for testing.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "The default EmbeddingClient implementation must use Req for HTTP calls with retry: :transient, following the pattern in Loopctl.Webhooks.ReqDelivery. Example: Req.new(base_url: config[:openai_url], headers: [{\"authorization\", \"Bearer \" <> config[:api_key]}]) |> Req.post(json: %{input: text, model: config[:model]})",
+    "For Oban job enqueue verification in tests, use assert_enqueued(worker: Loopctl.Workers.ArticleEmbeddingWorker, args: %{article_id: article.id, tenant_id: tenant.id}) from Oban.Testing.",
+    "The worker uses {:error, reason} with custom backoff/1 (not {:snooze, N}) because snooze does not increment Oban's attempt counter. Using {:error, reason} ensures max_attempts is respected and the job is eventually discarded.",
+    "Selective re-embedding: check which fields changed before enqueuing. Re-embed only when title or body changes. Check which fields changed using Map.has_key?(changeset.changes, :title) or Map.has_key?(changeset.changes, :body). Compute this BEFORE the Multi begins (the changeset is consumed by Multi.insert/update and not available in subsequent steps)."
+  ],
+  "dependencies": [
+    "US-20.2",
+    "US-19.3"
+  ],
+  "estimated_hours": 5
+}

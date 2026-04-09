@@ -1,0 +1,223 @@
+{
+  "id": "US-21.4",
+  "title": "Obsidian Export",
+  "epic": {
+    "id": "epic_21",
+    "name": "Knowledge Intelligence"
+  },
+  "priority": "medium",
+  "phase": "orchestration",
+  "story": {
+    "as_a": "developer",
+    "i_want_to": "export the knowledge wiki as Obsidian-compatible linked markdown files",
+    "so_that": "I can browse the knowledge graph locally in Obsidian with full backlink navigation and graph view"
+  },
+  "rationale": "Obsidian is the de facto standard for interlinked markdown knowledge bases among developers. Exporting the knowledge wiki as Obsidian-compatible files with YAML frontmatter and [[wikilink]] backlinks lets developers leverage Obsidian's powerful graph view, backlink navigation, and local-first search. This bridges the API-native loopctl knowledge store with the developer's preferred knowledge management tool, making the accumulated knowledge immediately useful outside the API.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.4.1",
+      "description": "GET /api/v1/projects/:project_id/knowledge/export endpoint exists (role: user+). Returns a ZIP file (Content-Type: application/zip) containing markdown files for all published articles in the specified project.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.2",
+      "description": "GET /api/v1/knowledge/export endpoint exists (role: user+). Returns a ZIP file containing markdown files for all published articles across the tenant (tenant-wide export).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.3",
+      "description": "ZIP file structure organizes files by category: `{category}/{slugified-title}.md`. Category directories use lowercase names matching the enum values (pattern/, convention/, decision/, finding/, reference/).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.4",
+      "description": "Each markdown file includes YAML frontmatter with fields: title, category, tags (as YAML list), status, source_type (if present), created_at (ISO 8601), updated_at (ISO 8601).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.5",
+      "description": "ArticleLinks are rendered as Obsidian [[wikilinks]] in a '## Related Articles' section at the end of each file. The link text uses the target article's title: `[[Target Title]]`. Link types are annotated: `[[Target Title]] (contradicts)` for contradiction links.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.6",
+      "description": "A `_index.md` file is included at the root of the ZIP listing all articles grouped by category, with [[wikilinks]] to each article. Format: category heading, then bulleted list of article links.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.7",
+      "description": "Only published articles are included in the export. Draft, archived, and superseded articles are excluded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.8",
+      "description": "Special characters in filenames are handled: slashes, colons, question marks, asterisks, quotes, angle brackets, pipes are stripped or replaced with hyphens in the slugified title. Multiple consecutive hyphens are collapsed to one.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.9",
+      "description": "The ZIP is generated in-memory using Erlang's :zip module (no temp files on disk). Response includes Content-Disposition header with filename `knowledge-export-{date}.zip`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.10",
+      "description": "Both endpoints enforce tenant scoping via RLS. A tenant can only export their own articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.11",
+      "description": "Returns 200 with empty ZIP (containing only _index.md) if no published articles exist, rather than 404.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.4.1",
+      "name": "Export project knowledge as ZIP with correct structure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) as api_key",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, status: :published, category: :pattern, title: \"GenServer Pooling\"}) as article"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:project_id/knowledge/export with valid auth",
+        "Unzip the response body",
+        "Read the pattern/genserver-pooling.md file"
+      ],
+      "expected_results": [
+        "Response 200 with Content-Type: application/zip",
+        "ZIP contains pattern/genserver-pooling.md",
+        "File has YAML frontmatter with title, category, tags, status, created_at, updated_at",
+        "File body contains the article body text"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.2",
+      "name": "Export includes Obsidian backlinks for related articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Two published articles with a relates_to ArticleLink between them"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with valid auth",
+        "Unzip and read both markdown files"
+      ],
+      "expected_results": [
+        "Each file has a '## Related Articles' section",
+        "Section contains [[Target Title]] wikilink to the other article",
+        "Wikilink text matches the target article's exact title"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.3",
+      "name": "Export excludes non-published articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as published",
+        "fixture(:article, %{tenant_id: tenant.id, status: :draft}) as draft",
+        "fixture(:article, %{tenant_id: tenant.id, status: :archived}) as archived"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with valid auth",
+        "List all files in the ZIP"
+      ],
+      "expected_results": [
+        "ZIP contains only one article file (plus _index.md)",
+        "Draft and archived articles are not present"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.4",
+      "name": "Export handles special characters in titles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published, title: \"What/Why: Decision? *Important*\"})"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with valid auth",
+        "Check the filename in the ZIP"
+      ],
+      "expected_results": [
+        "Filename is slugified: what-why-decision-important.md",
+        "No illegal filesystem characters in the path",
+        "YAML frontmatter title preserves the original title"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.5",
+      "name": "Tenant isolation: cannot export another tenant's articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:api_key, %{tenant_id: tenant_a.id, role: :user}) as api_key_a",
+        "fixture(:article, %{tenant_id: tenant_b.id, status: :published})"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with tenant_a's auth"
+      ],
+      "expected_results": [
+        "ZIP contains only _index.md (no article files)",
+        "tenant_b's articles are not included"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.6",
+      "name": "Index file groups articles by category",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Published articles in :pattern, :convention, and :decision categories"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with valid auth",
+        "Read _index.md from the ZIP"
+      ],
+      "expected_results": [
+        "_index.md contains category headings: Pattern, Convention, Decision",
+        "Each heading has bulleted [[wikilinks]] to articles in that category",
+        "Categories with no articles are omitted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.7",
+      "name": "Empty export returns ZIP with only index file",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant with no published articles",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user}) as api_key"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/export with valid auth"
+      ],
+      "expected_results": [
+        "Response 200 with valid ZIP",
+        "ZIP contains only _index.md",
+        "_index.md indicates no articles available"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Use Erlang's `:zip.create/3` with the `:memory` option to generate ZIPs in-memory without temp files. Pattern: `{:ok, {_filename, zip_binary}} = :zip.create('export.zip', file_list, [:memory])` where file_list is `[{'path/file.md', binary_content}, ...]`.",
+    "Slugification: downcase, replace spaces and special chars with hyphens, collapse multiple hyphens, trim leading/trailing hyphens. Consider using a simple regex-based approach rather than adding a slugify dependency.",
+    "YAML frontmatter format: `---\\ntitle: \"#{title}\"\\ncategory: #{category}\\ntags:\\n#{tags_yaml}\\nstatus: #{status}\\ncreated_at: #{iso8601}\\nupdated_at: #{iso8601}\\n---\\n\\n#{body}`.",
+    "ArticleLinks must be preloaded with their target articles to render [[wikilinks]]. Use a single query with joins rather than N+1 queries.",
+    "For the project-scoped endpoint, include articles where project_id matches OR project_id is nil (tenant-wide articles are included in all project exports).",
+    "Testing: async: true, ConnCase, use Erlang's :zip.unzip/2 to verify ZIP contents in tests, fixture(:article) with various statuses and categories, tenant isolation test.",
+    "Guard against excessively large exports. If the published article count exceeds 5000, return a 413 Payload Too Large error with a message suggesting filtering by project_id. In-memory ZIP generation for thousands of articles could consume significant RAM."
+  ],
+  "dependencies": ["US-19.3", "US-19.2"],
+  "estimated_hours": 5
+}

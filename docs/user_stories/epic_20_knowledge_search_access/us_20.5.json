@@ -1,0 +1,203 @@
+{
+  "id": "US-20.5",
+  "title": "Knowledge Index Endpoint",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent",
+    "i_want_to": "get a lightweight index of all available knowledge articles at session start",
+    "so_that": "I know what knowledge exists and can decide which articles to read without consuming tokens on full content"
+  },
+  "rationale": "AI agents have limited context windows and pay per token. Loading full article bodies at session start would waste thousands of tokens on content that may not be relevant to the current task. A lightweight index with just titles, categories, and tags lets agents build a mental map of available knowledge in under 500 tokens, then selectively retrieve only what they need. Grouping by category mirrors how humans organize reference material and helps agents navigate large knowledge bases efficiently.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.5.1",
+      "description": "GET /api/v1/knowledge/index returns a lightweight catalog of all published articles for the current tenant. Role required: agent+.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.2",
+      "description": "GET /api/v1/projects/:project_id/knowledge/index returns the same catalog filtered to a specific project. Includes tenant-wide articles (project_id=null) AND project-specific articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.3",
+      "description": "Each article in the response includes ONLY: id, title, category, tags, status, updated_at. No body content, no embedding, no full metadata.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.4",
+      "description": "Response includes `total_count` (total published articles) and `categories` (a map of category name to article count within that category).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.5",
+      "description": "Articles are grouped by category in the response. Each category group is sorted by updated_at descending (most recently updated first).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.6",
+      "description": "Only published articles are included. Draft, archived, or other non-published statuses are excluded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.7",
+      "description": "The endpoint executes as a single efficient query with no N+1 problems. Uses a single SELECT with GROUP BY or application-level grouping from one query.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.8",
+      "description": "Response is scoped to the current tenant via both application-level WHERE clause and RLS policy.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.9",
+      "description": "The underlying context function is `Knowledge.list_index/2` accepting `(tenant_id, opts)` where opts supports `:project_id` filter.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.5.10",
+      "description": "Response is capped at 1000 articles. If the tenant's published article count exceeds 1000, the response includes the 1000 most recently updated articles with meta.truncated: true and meta.total_count indicating the full count. For large tenants, recommend using the project-scoped index endpoint.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.5.1",
+      "name": "knowledge index returns lightweight article catalog grouped by category",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Coding Standards', category: :convention, tags: ['elixir'], status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Deploy Guide', category: :reference, tags: ['fly'], status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Draft Article', category: :convention, status: :draft})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/index with agent API key"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response includes 2 articles (draft excluded)",
+        "total_count is 2",
+        "categories map shows convention: 1, reference: 1",
+        "Each article has only id, title, category, tags, status, updated_at fields",
+        "No body content in any article"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.5.2",
+      "name": "project-scoped index includes tenant-wide and project-specific articles",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, title: 'Global Convention', status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, title: 'Project Pattern', status: :published})",
+        "fixture(:project, %{tenant_id: tenant.id}) as other_project",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: other_project.id, title: 'Other Project', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/projects/:project_id/knowledge/index with agent API key"
+      ],
+      "expected_results": [
+        "Response includes 'Global Convention' (tenant-wide) and 'Project Pattern' (project-specific)",
+        "Response does NOT include 'Other Project' (different project)",
+        "total_count is 2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.5.3",
+      "name": "tenant isolation: cross-tenant articles not visible",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id, title: 'Tenant A Knowledge', status: :published})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/index with tenant_b API key"
+      ],
+      "expected_results": [
+        "Response includes 0 articles",
+        "Tenant A's articles are not visible to Tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.5.4",
+      "name": "articles sorted by updated_at descending within each category",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Old Article', category: 'guides', status: :published, updated_at: ~U[2025-01-01 00:00:00Z]})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'New Article', category: 'guides', status: :published, updated_at: ~U[2025-06-01 00:00:00Z]})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/index with agent API key"
+      ],
+      "expected_results": [
+        "Within the 'guides' category, 'New Article' appears before 'Old Article'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.5.5",
+      "name": "unauthorized role gets 403",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "No API key or an API key with insufficient role"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/index without authentication"
+      ],
+      "expected_results": [
+        "Response status is 401 or 403"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.5.6",
+      "name": "single query execution (no N+1)",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Create 20 published articles across 5 categories"
+      ],
+      "steps": [
+        "Call Knowledge.list_index(tenant.id, %{}) with Ecto query logging enabled"
+      ],
+      "expected_results": [
+        "Only 1 SQL query is executed (no N+1)",
+        "All 20 articles returned with correct category grouping"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controller: `LoopctlWeb.KnowledgeIndexController` with `index/2` action. Route: `get \"/knowledge/index\", KnowledgeIndexController, :index` and `get \"/projects/:project_id/knowledge/index\", KnowledgeIndexController, :index`.",
+    "Context function: `Knowledge.list_index/2` runs a single query: `from a in Article, where: a.tenant_id == ^tenant_id and a.status == :published, select: %{id: a.id, title: a.title, category: a.category, tags: a.tags, status: a.status, updated_at: a.updated_at}, order_by: [asc: a.category, desc: a.updated_at]`.",
+    "Application-level grouping: `Enum.group_by(articles, & &1.category)` — simpler than SQL GROUP BY since we need the full list anyway.",
+    "Category counts: `Enum.map(grouped, fn {cat, arts} -> {cat, length(arts)} end) |> Map.new()`.",
+    "Project-scoped query: `where: (is_nil(a.project_id) or a.project_id == ^project_id)` — includes both tenant-wide and project-specific articles.",
+    "This endpoint returns published articles as a lightweight catalog, capped at 1000 articles (most recently updated). If the count exceeds 1000, set meta.truncated: true and meta.total_count to the full count. For large tenants, recommend using the project-scoped index endpoint.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Response rendering uses LoopctlWeb.KnowledgeJSON module following Phoenix 1.8 JSON view pattern (plain module with render functions, not legacy Phoenix.View)."
+  ],
+  "dependencies": [
+    "US-19.3",
+    "US-19.4"
+  ],
+  "estimated_hours": 3
+}

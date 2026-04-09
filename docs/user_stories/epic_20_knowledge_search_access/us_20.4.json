@@ -1,0 +1,230 @@
+{
+  "id": "US-20.4",
+  "title": "Semantic Search",
+  "epic": {
+    "id": "epic_20",
+    "name": "Knowledge Search & Agent Access"
+  },
+  "priority": "high",
+  "phase": "core",
+  "story": {
+    "as_a": "AI agent",
+    "i_want_to": "search knowledge articles by semantic similarity and combined keyword+semantic modes",
+    "so_that": "I can find conceptually related articles even when exact keywords don't appear in the text"
+  },
+  "rationale": "Keyword search requires exact term matches, which fails when agents describe problems differently than article authors wrote about solutions. Semantic search uses vector embeddings to find conceptually similar content regardless of vocabulary. The combined mode merges both approaches with configurable weighting, giving the best of both worlds: precision from keyword matching and recall from semantic similarity. Falling back to keyword-only when embeddings are unavailable ensures the system degrades gracefully rather than failing.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-20.4.1",
+      "description": "`Knowledge.search_semantic/3` accepts `(tenant_id, query_embedding, opts)` where query_embedding is a float list. Returns top-K results ordered by cosine similarity (ascending distance via `<=>` operator). Each result includes a `similarity_score` (1 - cosine_distance).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.2",
+      "description": "Semantic search only considers articles with non-null embeddings. Articles without embeddings are excluded from results.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.3",
+      "description": "Results are filterable via opts: `:project_id`, `:category`, `:tags`, `:status` (default: `:published`). Same filter behavior as keyword search.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.4",
+      "description": "Pagination via `opts[:limit]` (default 10, max 50) and `opts[:offset]` (default 0).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.5",
+      "description": "`Knowledge.search_combined/3` accepts `(tenant_id, query_string, opts)` and runs both keyword search and semantic search. Opts include `:keyword_weight` (default 0.5) and `:semantic_weight` (default 0.5) which must sum to 1.0.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.6",
+      "description": "Combined search generates the query embedding on-the-fly by calling `@embedding_client.generate_embedding/1` with the query string. If embedding generation fails, falls back to keyword-only search and includes a `fallback: true` flag in the response meta.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.7",
+      "description": "Combined search merges results by normalizing scores from each search to 0-1 range, then computing `final_score = keyword_weight * normalized_keyword_score + semantic_weight * normalized_semantic_score`. When all scores in a result set are equal (max == min), normalize all to 1.0 to avoid division by zero. Duplicate articles (present in both result sets) are merged, keeping the higher combined score.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.8",
+      "description": "Combined search deduplicates results by article ID. The final result set is sorted by `final_score` descending and paginated.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.9",
+      "description": "All search functions are scoped to the current tenant via both application-level WHERE clause and RLS policy.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.10",
+      "description": "If keyword_weight + semantic_weight do not sum to 1.0, the function returns `{:error, :invalid_weights}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.4.11",
+      "description": "When generating query embeddings for search, the embedding client call has an explicit 5-second timeout. If the timeout is exceeded or the call fails, combined search automatically falls back to keyword-only mode. After 3 consecutive failures within 60 seconds, a circuit breaker activates and all searches fall back to keyword-only for a 30-second cooldown. Add meta.search_mode to the response indicating which mode was actually used.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-20.4.1",
+      "name": "semantic search returns results ordered by cosine similarity",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article_a with embedding close to query_vector",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article_b with embedding far from query_vector",
+        "fixture(:article, %{tenant_id: tenant.id, status: :published}) as article_c with no embedding (nil)"
+      ],
+      "steps": [
+        "Call Knowledge.search_semantic(tenant.id, query_vector, %{})"
+      ],
+      "expected_results": [
+        "article_a appears first (highest similarity_score)",
+        "article_b appears second (lower similarity_score)",
+        "article_c is excluded (no embedding)",
+        "Each result has a similarity_score between 0 and 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.2",
+      "name": "combined search merges keyword and semantic results with deduplication",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Error Handling', body: 'Try rescue patterns...', status: :published}) with embedding",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Fault Tolerance', body: 'Supervisor trees prevent cascading...', status: :published}) with embedding semantically close to 'error handling'",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Deployment', body: 'Error-free deploys...', status: :published}) with unrelated embedding",
+        "MockEmbeddingClient returns embedding for query 'error handling'"
+      ],
+      "steps": [
+        "Call Knowledge.search_combined(tenant.id, 'error handling', %{})"
+      ],
+      "expected_results": [
+        "'Error Handling' article appears (matched by both keyword and semantic)",
+        "'Fault Tolerance' article appears (matched by semantic similarity)",
+        "'Deployment' article may appear with lower score (keyword match on 'error')",
+        "No duplicate article IDs in results",
+        "Results ordered by final_score descending"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.3",
+      "name": "combined search falls back to keyword-only on embedding failure",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Testing Guide', body: 'Unit test patterns...', status: :published})",
+        "MockEmbeddingClient expects generate_embedding/1 and returns {:error, :service_unavailable}"
+      ],
+      "steps": [
+        "Call Knowledge.search_combined(tenant.id, 'testing', %{})"
+      ],
+      "expected_results": [
+        "Returns {:ok, result} with results from keyword search only",
+        "result.meta includes fallback: true",
+        "The 'Testing Guide' article is found via keyword match"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.4",
+      "name": "combined search rejects invalid weights",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant"
+      ],
+      "steps": [
+        "Call Knowledge.search_combined(tenant.id, 'test', %{keyword_weight: 0.7, semantic_weight: 0.7})"
+      ],
+      "expected_results": [
+        "Returns {:error, :invalid_weights}",
+        "No search is executed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.5",
+      "name": "semantic search filters by project_id and category",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: :pattern, status: :published}) with embedding",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, category: :reference, status: :published}) with embedding"
+      ],
+      "steps": [
+        "Call Knowledge.search_semantic(tenant.id, query_vector, %{project_id: project.id})",
+        "Call Knowledge.search_semantic(tenant.id, query_vector, %{category: :pattern})"
+      ],
+      "expected_results": [
+        "project_id filter returns only the project-scoped article",
+        "category filter returns only the :pattern article"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.6",
+      "name": "tenant isolation in semantic search",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:article, %{tenant_id: tenant_a.id, status: :published}) with embedding"
+      ],
+      "steps": [
+        "Call Knowledge.search_semantic(tenant_b.id, query_vector, %{})"
+      ],
+      "expected_results": [
+        "Returns empty results",
+        "Tenant A's article is not visible to tenant B"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-20.4.7",
+      "name": "combined search with custom weights",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Exact Match', body: 'deployment pipeline...', status: :published}) with low semantic similarity",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Conceptual Match', body: 'CI/CD workflow...', status: :published}) with high semantic similarity to 'deployment'",
+        "MockEmbeddingClient returns embedding for query 'deployment'"
+      ],
+      "steps": [
+        "Call Knowledge.search_combined(tenant.id, 'deployment', %{keyword_weight: 0.2, semantic_weight: 0.8})",
+        "Call Knowledge.search_combined(tenant.id, 'deployment', %{keyword_weight: 0.8, semantic_weight: 0.2})"
+      ],
+      "expected_results": [
+        "With semantic_weight=0.8, 'Conceptual Match' ranks higher",
+        "With keyword_weight=0.8, 'Exact Match' ranks higher",
+        "Weight configuration meaningfully affects ranking order"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Cosine distance query: `from a in Article, where: not is_nil(a.embedding), order_by: fragment(\"embedding <=> ?\", ^query_embedding), select_merge: %{similarity_score: fragment(\"1 - (embedding <=> ?)\", ^query_embedding)}`.",
+    "Score normalization for combined search: `normalized = (score - min_score) / (max_score - min_score)`. When all scores in a result set are equal (max == min), normalize all to 1.0 to avoid division by zero.",
+    "Deduplication: build a map keyed by article_id, merge entries keeping the higher combined score, then sort and paginate the merged list.",
+    "Run keyword search in parallel with embedding generation using Task.Supervisor.async_nolink, then run semantic search once embedding is available. Pattern: keyword_task = Task.Supervisor.async_nolink(Loopctl.TaskSupervisor, fn -> search_keyword(...) end); {:ok, embedding} = @embedding_client.generate_embedding(query); semantic = search_semantic(..., embedding); keyword = Task.await(keyword_task). If full parallelism is not needed, sequential execution is acceptable since keyword search is sub-ms.",
+    "Embedding generation for query: uses the same `@embedding_client` compile-time DI as the worker. In tests, MockEmbeddingClient is already configured.",
+    "All three search functions (keyword, semantic, combined) should return the same response shape: `{:ok, %{results: [%{id, title, category, tags, relevance_score | similarity_score | final_score, snippet}], meta: %{total_count, limit, offset, ...}}}`.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Config-based DI: The Knowledge context module uses Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient) at RUNTIME (not compile_env). Compile-time DI is appropriate for Oban workers (separate processes) but not for context modules which are called from the Phoenix request path. Runtime get_env ensures test config is always respected.",
+    "The @embedding_client implements Loopctl.Knowledge.EmbeddingBehaviour (defined in US-20.3). The real implementation uses Req for HTTP calls. In tests, use Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text -> {:ok, List.duplicate(0.1, 1536)} end)."
+  ],
+  "dependencies": [
+    "US-20.1",
+    "US-20.2",
+    "US-20.3"
+  ],
+  "estimated_hours": 5
+}
