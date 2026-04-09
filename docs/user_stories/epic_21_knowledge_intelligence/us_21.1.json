@@ -63,6 +63,16 @@
       "id": "AC-21.1.10",
       "description": "The `:knowledge` Oban queue is configured in config/config.exs with appropriate concurrency (default: 5).",
       "status": "pending"
+    },
+    {
+      "id": "AC-21.1.11",
+      "description": "The worker implements a custom backoff: @impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt). This provides exponential backoff with jitter matching the project convention.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.12",
+      "description": "The worker uses Oban unique option: unique: [period: 300, keys: [:review_record_id]] to prevent duplicate job enqueue for the same review record within a 5-minute window.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -189,7 +199,8 @@
     "The `:knowledge` Oban queue should be added to config/config.exs alongside existing queues like `:webhooks` and `:embeddings`.",
     "Duplicate detection query: `Repo.exists?(from a in Article, where: a.source_type == ^source_type and a.source_id == ^source_id and a.tenant_id == ^tenant_id)`.",
     "Testing: async: true, Mox.set_mox_from_context in setup, setup :verify_on_exit!, MockExtractor in test/support/mocks.ex, fixture(:review_record) in test/support/fixtures.ex.",
-    "The ExtractorBehaviour is intentionally thin -- it receives review data and returns article candidates. The production LlmExtractor implementation is a separate concern (not part of this story)."
+    "The ExtractorBehaviour is intentionally thin -- it receives review data and returns article candidates. The production LlmExtractor implementation is a separate concern (not part of this story).",
+    "Use build(:article_candidate, attrs) in test/support/fixtures.ex for mock extractor return values. Example: build(:article_candidate, %{title: \"DI Pattern\", body: \"Always use behaviours...\", category: :pattern, tags: [\"di\", \"testing\"]})"
   ],
   "dependencies": ["US-19.3", "US-20.3"],
   "estimated_hours": 6

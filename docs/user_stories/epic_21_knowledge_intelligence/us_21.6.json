@@ -89,8 +89,8 @@
         "Check Oban jobs for the :knowledge queue"
       ],
       "expected_results": [
-        "ReviewKnowledgeWorker job enqueued with correct review_record_id",
-        "Job is in the :knowledge queue",
+        "The MockExtractor.extract_articles/1 was called (verified via Mox.verify!/0)",
+        "Articles with source_type 'review_finding' exist in the database (created by the inline-executed worker)",
         "Review record is created in the same transaction"
       ],
       "status": "pending"
@@ -210,7 +210,9 @@
     "Pipeline status queries Oban's `oban_jobs` table directly for job counts. Filter by worker name and tenant_id in the args. Use Oban.Job schema for queries.",
     "Publish rate calculation: `published_count / (published_count + draft_count)`. Guard against division by zero by returning 0.0 when total is 0.",
     "The pipeline endpoint is read-only and performs multiple queries. Consider combining them efficiently or accepting the N-query cost since this is a dashboard endpoint, not a hot path.",
-    "Testing: async: true, ConnCase for controller tests, DataCase for context tests, Mox for ExtractorBehaviour, fixture(:tenant) with settings, tenant isolation test, setup :verify_on_exit!."
+    "Testing: async: true, ConnCase for controller tests, DataCase for context tests, Mox for ExtractorBehaviour, fixture(:tenant) with settings, tenant isolation test, setup :verify_on_exit!.",
+    "In config/test.exs with Oban testing: :inline, workers execute synchronously when enqueued. Tests should verify side effects (mock was called, articles were created) rather than checking the job queue. Use Mox.expect on the MockExtractor to verify the worker ran.",
+    "The pipeline status endpoint queries oban_jobs by worker name (indexed by default) and then filters by tenant_id in args. For performance at scale, filter by worker name first (indexed), fetch recent jobs, then filter in Elixir by args.tenant_id rather than using a JSONB query on args."
   ],
   "dependencies": ["US-21.1", "US-21.3"],
   "estimated_hours": 4

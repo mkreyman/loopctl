@@ -216,7 +216,9 @@
     "Tenant validation for link creation: before inserting, verify both articles exist with matching tenant_id. This can be done in the Knowledge context's create_link/2 function (US-19.3).",
     "The index action (GET /articles/:id/links) delegates to Knowledge.list_links_for_article/2 from US-19.3.",
     "JSON view should serialize link fields: id, source_article_id, target_article_id, relationship_type, metadata, inserted_at. For the index action, include linked article id and title.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests.",
+    "JSON rendering via LoopctlWeb.ArticleLinkJSON module (Phoenix 1.8 pattern).",
+    "The supersedes side-effect (target article status -> :superseded) is handled in Knowledge.create_link/2 (US-19.3), not in the controller. The controller simply calls Knowledge.create_link/2 and the domain logic handles the status transition atomically."
   ],
   "dependencies": [
     "US-19.3",

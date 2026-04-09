@@ -215,7 +215,8 @@
     "YAML frontmatter format: `---\\ntitle: \"#{title}\"\\ncategory: #{category}\\ntags:\\n#{tags_yaml}\\nstatus: #{status}\\ncreated_at: #{iso8601}\\nupdated_at: #{iso8601}\\n---\\n\\n#{body}`.",
     "ArticleLinks must be preloaded with their target articles to render [[wikilinks]]. Use a single query with joins rather than N+1 queries.",
     "For the project-scoped endpoint, include articles where project_id matches OR project_id is nil (tenant-wide articles are included in all project exports).",
-    "Testing: async: true, ConnCase, use Erlang's :zip.unzip/2 to verify ZIP contents in tests, fixture(:article) with various statuses and categories, tenant isolation test."
+    "Testing: async: true, ConnCase, use Erlang's :zip.unzip/2 to verify ZIP contents in tests, fixture(:article) with various statuses and categories, tenant isolation test.",
+    "Guard against excessively large exports. If the published article count exceeds 5000, return a 413 Payload Too Large error with a message suggesting filtering by project_id. In-memory ZIP generation for thousands of articles could consume significant RAM."
   ],
   "dependencies": ["US-19.3", "US-19.2"],
   "estimated_hours": 5

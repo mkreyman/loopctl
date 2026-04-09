@@ -231,7 +231,8 @@
     "On-the-fly embedding: `@embedding_client.generate_embedding(q)` — same compile-time DI pattern. For semantic-only mode, embedding failure is fatal (503). For combined mode, it triggers fallback to keyword-only.",
     "Response view: create `LoopctlWeb.KnowledgeSearchJSON` module that renders the search results with the standardized shape.",
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "The controller (or context function) resolves the embedding client via @embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient) — same config key as the Oban worker in US-20.3."
   ],
   "dependencies": [
     "US-20.4",

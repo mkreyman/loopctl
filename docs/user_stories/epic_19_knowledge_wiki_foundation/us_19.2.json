@@ -192,7 +192,8 @@
     "Composite unique index: `create unique_index(:article_links, [:tenant_id, :source_article_id, :target_article_id, :relationship_type], name: :article_links_tenant_src_tgt_rel_index)`.",
     "Foreign keys should use `on_delete: :delete_all` so cascading article deletion cleans up links.",
     "Migration file: `priv/repo/migrations/TIMESTAMP_create_article_links.exs`. Import `Loopctl.Repo.RlsHelpers` and call `enable_rls(:article_links)` after table creation.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests.",
+    "Add build(:article_link, attrs) and fixture(:article_link, attrs) to test/support/fixtures.ex with auto-dependency resolution for tenant_id, source_article_id, and target_article_id."
   ],
   "dependencies": [
     "US-19.1"

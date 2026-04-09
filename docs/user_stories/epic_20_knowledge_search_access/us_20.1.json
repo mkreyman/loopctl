@@ -216,7 +216,8 @@
     "Snippet generation: `ts_headline('english', body, query, 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')` — use ** delimiters for markdown-friendly bold highlighting.",
     "The search_vector column should NOT be in the Ecto schema (it's a generated column). Use `Ecto.Query.select_merge` or raw fragment to include rank and snippet in results.",
     "Opts validation: limit clamped to 1..100, offset must be >= 0. Invalid values return {:error, changeset}.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "The Article schema (from US-19.1) uses use Loopctl.Schema with tenant_field(), binary IDs, and microsecond timestamps. No schema changes needed for this story — only the migration adds the generated tsvector column."
   ],
   "dependencies": [
     "US-19.1",

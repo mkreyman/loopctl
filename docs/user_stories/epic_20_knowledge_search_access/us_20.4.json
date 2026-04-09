@@ -213,7 +213,8 @@
     "Embedding generation for query: uses the same `@embedding_client` compile-time DI as the worker. In tests, MockEmbeddingClient is already configured.",
     "All three search functions (keyword, semantic, combined) should return the same response shape: `{:ok, %{results: [%{id, title, category, tags, relevance_score | similarity_score | final_score, snippet}], meta: %{total_count, limit, offset, ...}}}`.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
-    "Config-based DI: `@embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. Same compile-time DI pattern as the Oban worker."
+    "Config-based DI: `@embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. Same compile-time DI pattern as the Oban worker.",
+    "The @embedding_client implements Loopctl.Knowledge.EmbeddingBehaviour (defined in US-20.3). The real implementation uses Req for HTTP calls. In tests, use Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text -> {:ok, List.duplicate(0.1, 1536)} end)."
   ],
   "dependencies": [
     "US-20.1",

@@ -233,7 +233,8 @@
     "JSON view should serialize: id, tenant_id, project_id, title, body, category, status, tags, source_type, source_id, metadata, inserted_at, updated_at. For show action, also include outgoing_links and incoming_links.",
     "Tags query param should be comma-separated in the URL: ?tags=elixir,otp. Parse to list in the controller before passing to context.",
     "All list endpoints MUST use consistent pagination: limit/offset with defaults (limit: 20, max: 100).",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests.",
+    "JSON rendering via LoopctlWeb.ArticleJSON module (Phoenix 1.8 pattern, not legacy View). Define article(%{article: article}) and index(%{articles: articles, meta: meta}) functions."
   ],
   "dependencies": [
     "US-19.3"

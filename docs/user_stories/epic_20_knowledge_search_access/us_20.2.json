@@ -199,7 +199,8 @@
     "Dimension validation: `defp validate_embedding_dimensions(changeset)` checks `length(get_field(changeset, :embedding)) == Application.get_env(:loopctl, :embedding_dimensions, 1536)`.",
     "Config: `config :loopctl, :embedding_dimensions, 1536` in config/config.exs. Override in test.exs if needed for faster test vectors.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
-    "For test vectors, use small deterministic vectors (e.g., List.duplicate(0.1, 1536)) rather than random values to make assertions predictable."
+    "For test vectors, use small deterministic vectors (e.g., List.duplicate(0.1, 1536)) rather than random values to make assertions predictable.",
+    "The Article schema already uses use Loopctl.Schema with binary IDs and tenant_field(). The new field :embedding, Pgvector.Ecto.Vector is added alongside existing fields in the schema module."
   ],
   "dependencies": [
     "US-19.1"

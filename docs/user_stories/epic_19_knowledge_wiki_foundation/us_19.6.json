@@ -16,17 +16,17 @@
   "acceptance_criteria": [
     {
       "id": "AC-19.6.1",
-      "description": "EventGenerator.generate_events/3 is called in the Knowledge context after article creation, producing an 'article.created' event with payload including article id, title, category, project_id, and status.",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article creation, producing an 'article.created' event with payload including article id, title, category, project_id, and status.",
       "status": "pending"
     },
     {
       "id": "AC-19.6.2",
-      "description": "EventGenerator.generate_events/3 is called after article update, producing an 'article.updated' event with payload including article id, title, category, project_id, changed fields, and new status.",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article update, producing an 'article.updated' event with payload including article id, title, category, project_id, changed fields, and new status.",
       "status": "pending"
     },
     {
       "id": "AC-19.6.3",
-      "description": "EventGenerator.generate_events/3 is called after article archival, producing an 'article.archived' event with payload including article id, title, and category.",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article archival, producing an 'article.archived' event with payload including article id, title, and category.",
       "status": "pending"
     },
     {
@@ -36,12 +36,12 @@
     },
     {
       "id": "AC-19.6.5",
-      "description": "EventGenerator.generate_events/3 is called after article link creation, producing an 'article_link.created' event with payload including link id, source_article_id, target_article_id, relationship_type, and both article titles.",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article link creation, producing an 'article_link.created' event with payload including link id, source_article_id, target_article_id, relationship_type, and both article titles.",
       "status": "pending"
     },
     {
       "id": "AC-19.6.6",
-      "description": "EventGenerator.generate_events/3 is called after article link deletion, producing an 'article_link.deleted' event with payload including link id, source_article_id, target_article_id, and relationship_type.",
+      "description": "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline in the Knowledge context mutation for article link deletion, producing an 'article_link.deleted' event with payload including link id, source_article_id, target_article_id, and relationship_type.",
       "status": "pending"
     },
     {
@@ -174,11 +174,11 @@
   ],
   "technical_notes": [
     "Wire events into the existing Knowledge context mutations (US-19.3). Add EventGenerator.generate_events/3 calls within the Ecto.Multi pipelines.",
-    "Event generation pattern: `Multi.new() |> Multi.insert(:article, changeset) |> Audit.log_in_multi(:article, \"article.created\") |> Multi.run(:events, fn _repo, %{article: article} -> EventGenerator.generate_events(tenant_id, \"article.created\", article) end)`.",
+    "EventGenerator.generate_events/3 is appended to the Ecto.Multi pipeline (not called standalone). Correct pattern: Multi.new() |> Multi.insert(:article, changeset) |> Audit.log_in_multi(:article, \"article.created\") |> EventGenerator.generate_events(:webhook_events, fn %{article: article} -> %{tenant_id: tenant_id, event_type: \"article.created\", project_id: article.project_id, payload: %{id: article.id, title: article.title, category: article.category}} end)",
     "Add the six new event types to the known event types list used for webhook subscription validation (defined in US-10.1). This is likely a module attribute or constant list in the Webhooks context.",
     "The article.superseded event is generated as a side-effect of the supersedes link creation (US-19.5 AC-19.5.4). It should be generated in the same Multi transaction.",
     "Event payloads should include tenant_id and project_id for webhook routing and filtering. The existing webhook delivery system uses project_id to match project-scoped webhook subscriptions.",
-    "Config-based DI: EventGenerator is likely accessed via a behaviour. Check the existing webhook infrastructure for the correct DI pattern and mock in config/test.exs.",
+    "EventGenerator is a plain module called directly (not via behaviour/DI). No mock is needed — it operates within the Ecto.Multi transaction and uses AdminRepo directly. In tests, webhook delivery workers execute via Oban inline mode.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests."
   ],
   "dependencies": [

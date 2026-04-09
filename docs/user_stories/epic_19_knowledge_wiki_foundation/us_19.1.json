@@ -214,7 +214,8 @@
     "Unique index on title per tenant: consider a partial index excluding archived/superseded status, or use a simple (tenant_id, title) unique index. The exact scoping ('non-deleted') should use a WHERE clause: `where: \"status NOT IN ('archived')\"` or similar.",
     "The source_type and source_id fields enable provenance tracking -- linking an article back to the review finding, agent session, or manual entry that created it. These are intentionally loose (string + binary_id) rather than polymorphic FKs for extensibility.",
     "Migration file: `priv/repo/migrations/TIMESTAMP_create_articles.exs`. Import `Loopctl.Repo.RlsHelpers` and call `enable_rls(:articles)` after table creation.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests."
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests.",
+    "Add build(:article, attrs) and fixture(:article, attrs) to test/support/fixtures.ex with auto-dependency resolution for tenant_id (and optionally project_id). Follow the existing pattern seen in fixture(:skill) or fixture(:project)."
   ],
   "dependencies": [],
   "estimated_hours": 4

@@ -203,7 +203,8 @@
     "Contradiction clusters: query ArticleLinks where link_type: :contradicts, group connected articles into clusters. A simple approach is to return pairs; graph clustering is overkill for v1.",
     "Coverage gaps: `GROUP BY category HAVING count(*) < threshold` on published articles. Include categories with zero articles by checking all enum values.",
     "Broken sources: for each source_type, query the corresponding table to check if source_id exists. Start with \"review_finding\" source_type checking against review_records table. Use LEFT JOIN pattern for efficiency.",
-    "Testing: async: true, ConnCase, fixture articles with specific updated_at timestamps (use Ecto insert with explicit timestamps), tenant isolation test, setup :verify_on_exit!."
+    "Testing: async: true, ConnCase, fixture articles with specific updated_at timestamps (use Ecto insert with explicit timestamps), tenant isolation test, setup :verify_on_exit!.",
+    "For extensible broken-source checking, define a @source_type_queries map: %{\"review_finding\" => {Loopctl.Progress, :get_review_record}, ...} so new source types can be added without modifying the core lint logic. Each entry maps source_type to a {module, function} tuple that checks existence."
   ],
   "dependencies": ["US-19.3", "US-19.2"],
   "estimated_hours": 4

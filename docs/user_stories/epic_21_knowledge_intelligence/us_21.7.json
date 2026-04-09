@@ -31,7 +31,7 @@
     },
     {
       "id": "AC-21.7.4",
-      "description": "A `knowledge_export` MCP tool exists in mcp-server/index.js. It calls GET /api/v1/knowledge/export (or GET /api/v1/projects/:project_id/knowledge/export if project_id provided) using ORCH_KEY. Returns the download URL or a message indicating the ZIP was generated. Does NOT return raw binary ZIP data.",
+      "description": "The knowledge_export tool calls GET /knowledge/export and saves the ZIP response to a temporary file, returning the file path. If the response is too large or the endpoint returns an error, it returns a structured error message with the curl command for direct download.",
       "status": "pending"
     },
     {

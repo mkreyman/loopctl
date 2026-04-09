@@ -68,6 +68,11 @@
       "id": "AC-21.3.11",
       "description": "Routes are added to the router under the existing /api/v1 scope with appropriate auth pipeline.",
       "status": "pending"
+    },
+    {
+      "id": "AC-21.3.12",
+      "description": "A Loopctl.Knowledge.Article.valid_transition?/2 function exists that validates status transitions. Valid transitions: draft->published, published->draft, published->archived, draft->archived. Any status can transition to :superseded (via ArticleLink only, not direct API). The function is tested independently with unit tests.",
+      "status": "pending"
     }
   ],
   "test_cases": [

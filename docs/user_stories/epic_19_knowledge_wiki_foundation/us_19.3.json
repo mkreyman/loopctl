@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-19.3.1",
-      "description": "A Loopctl.Knowledge context module exists with public functions: create_article/3, get_article/2, list_articles/2, update_article/3, archive_article/2 (with optional opts), create_link/2, delete_link/2, list_links_for_article/2.",
+      "description": "A Loopctl.Knowledge context module exists with public functions: create_article(tenant_id, attrs, opts \\\\ []) (max arity /3), get_article/2, list_articles/2, update_article(tenant_id, article_id, attrs, opts \\\\ []) (max arity /4), archive_article(tenant_id, article_id, opts \\\\ []) (max arity /3), create_link/2, delete_link/2, list_links_for_article/2.",
       "status": "pending"
     },
     {
@@ -72,6 +72,11 @@
     {
       "id": "AC-19.3.12",
       "description": "All context functions return {:ok, result} or {:error, reason} tuples. Never raise exceptions for expected error cases.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.13",
+      "description": "When create_link/2 is called with relationship_type :supersedes, the target article's status is set to :superseded within the same Ecto.Multi transaction.",
       "status": "pending"
     }
   ],

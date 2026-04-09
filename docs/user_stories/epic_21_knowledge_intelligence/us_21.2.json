@@ -63,6 +63,31 @@
       "id": "AC-21.2.10",
       "description": "An audit event is created on completion: event_type \"knowledge.articles_linked\", payload includes article_id and count of new links created.",
       "status": "pending"
+    },
+    {
+      "id": "AC-21.2.11",
+      "description": "The worker resolves the embedding provider via compile-time DI: @embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient). The same config key and behaviour from US-20.3 is reused.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.12",
+      "description": "The worker resolves the extractor for contradiction detection via compile-time DI: @extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor). The same config key and behaviour from US-21.1 is reused.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.13",
+      "description": "The worker implements a custom backoff: @impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.14",
+      "description": "The worker uses Oban unique option: unique: [period: 300, keys: [:article_id]] to prevent duplicate linking jobs for the same article.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.15",
+      "description": "The maximum number of comparison articles is configurable via Application.get_env(:loopctl, :article_link_max_comparisons, 50).",
+      "status": "pending"
     }
   ],
   "test_cases": [
