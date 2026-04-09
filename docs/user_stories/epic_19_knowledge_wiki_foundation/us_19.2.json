@@ -56,7 +56,7 @@
     },
     {
       "id": "AC-19.2.9",
-      "description": "Foreign key constraints on source_article_id and target_article_id reference the articles table with ON DELETE CASCADE, so deleting an article removes its links.",
+      "description": "Foreign key constraints on source_article_id and target_article_id reference the articles table with ON DELETE RESTRICT. RESTRICT is safer with the soft-delete pattern -- prevents accidental destruction of the link graph. Articles must have their links explicitly removed before deletion.",
       "status": "pending"
     }
   ],
@@ -190,7 +190,7 @@
     "Relationship type enum: Ecto.Enum with values [:relates_to, :derived_from, :contradicts, :supersedes].",
     "Self-link validation in changeset: `validate_change(:target_article_id, fn :target_article_id, target_id -> if target_id == get_field(changeset, :source_article_id), do: [target_article_id: \"cannot link an article to itself\"], else: [] end)`.",
     "Composite unique index: `create unique_index(:article_links, [:tenant_id, :source_article_id, :target_article_id, :relationship_type], name: :article_links_tenant_src_tgt_rel_index)`.",
-    "Foreign keys should use `on_delete: :delete_all` so cascading article deletion cleans up links.",
+    "Foreign keys should use `on_delete: :restrict` to prevent accidental destruction of the link graph. RESTRICT is safer with the soft-delete pattern -- articles must have their links explicitly removed before deletion.",
     "Migration file: `priv/repo/migrations/TIMESTAMP_create_article_links.exs`. Import `Loopctl.Repo.RlsHelpers` and call `enable_rls(:article_links)` after table creation.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs in DataCase/ConnCase setup, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex, (6) NEVER Application.put_env in tests.",
     "Add build(:article_link, attrs) and fixture(:article_link, attrs) to test/support/fixtures.ex with auto-dependency resolution for tenant_id, source_article_id, and target_article_id."

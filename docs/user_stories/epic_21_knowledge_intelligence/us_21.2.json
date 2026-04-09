@@ -12,7 +12,7 @@
     "i_want_to": "automatically discover and create relationships between knowledge articles based on semantic similarity",
     "so_that": "the knowledge graph builds itself as new articles are added, without manual curation"
   },
-  "rationale": "A knowledge wiki without links is just a list. Manually curating relationships between articles is tedious and scales poorly as the wiki grows. By comparing article embeddings when new articles are stored, the system can automatically discover semantically related articles and create `relates_to` links. Optionally, it can detect contradictions by calling the ExtractorBehaviour. This transforms the flat article collection into a connected knowledge graph that surfaces related context automatically.",
+  "rationale": "A knowledge wiki without links is just a list. Manually curating relationships between articles is tedious and scales poorly as the wiki grows. By comparing article embeddings when new articles are stored, the system can automatically discover semantically related articles and create `relates_to` links. This transforms the flat article collection into a connected knowledge graph that surfaces related context automatically. Contradiction detection is deferred to a future story.",
   "acceptance_criteria": [
     {
       "id": "AC-21.2.1",
@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-21.2.5",
-      "description": "Created ArticleLinks have link_type: :relates_to and metadata: %{auto_generated: true, similarity_score: float}. The similarity score is stored for transparency.",
+      "description": "Created ArticleLinks have relationship_type: :relates_to and metadata: %{auto_generated: true, similarity_score: float}. The similarity score is stored for transparency.",
       "status": "pending"
     },
     {
@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-21.2.7",
-      "description": "Optionally, the worker calls `ExtractorBehaviour.detect_contradiction/2` (if the callback is defined) to check if high-similarity articles actually contradict each other. If so, the link is created with link_type: :contradicts instead of :relates_to.",
+      "description": "Contradiction detection is deferred to a future story. For v1, the worker only creates :relates_to links based on similarity threshold. A future story will extend ExtractorBehaviour with an optional detect_contradiction/2 callback.",
       "status": "pending"
     },
     {
@@ -66,13 +66,13 @@
     },
     {
       "id": "AC-21.2.11",
-      "description": "The worker resolves the embedding provider via compile-time DI: @embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient). The same config key and behaviour from US-20.3 is reused.",
-      "status": "pending"
+      "description": "[REMOVED] The ArticleLinkingWorker reads pre-computed embeddings from the database via pgvector's <=> operator. It never calls the embedding client directly — embeddings are already stored by the ArticleEmbeddingWorker (US-20.3). No @embedding_client compile-time DI is needed.",
+      "status": "removed"
     },
     {
       "id": "AC-21.2.12",
-      "description": "The worker resolves the extractor for contradiction detection via compile-time DI: @extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor). The same config key and behaviour from US-21.1 is reused.",
-      "status": "pending"
+      "description": "[REMOVED] Contradiction detection is deferred (see AC-21.2.7). No @extractor compile-time DI is needed for this worker.",
+      "status": "removed"
     },
     {
       "id": "AC-21.2.13",
@@ -106,7 +106,7 @@
         "Query article_links for new_article"
       ],
       "expected_results": [
-        "One ArticleLink created with link_type: :relates_to",
+        "One ArticleLink created with relationship_type: :relates_to",
         "Link metadata contains auto_generated: true and similarity_score as float",
         "Link connects new_article to existing_article"
       ],
@@ -208,8 +208,8 @@
     "Cosine similarity can be computed in PostgreSQL using pgvector's `<=>` operator or in Elixir. Prefer the database query for efficiency: `SELECT id, 1 - (embedding <=> $1) as similarity FROM article_embeddings WHERE tenant_id = $2 AND article_id != $3 ORDER BY similarity DESC LIMIT 50`.",
     "The similarity threshold should be configurable via Application config, NOT hardcoded. Default 0.8 is a reasonable starting point but may need tuning per deployment.",
     "Duplicate link detection must check both directions: article_a -> article_b AND article_b -> article_a, since ArticleLinks are directional but relates_to is semantically bidirectional.",
-    "The contradiction detection callback is optional -- if ExtractorBehaviour does not define detect_contradiction/2, the worker should skip that step. Use `function_exported?/3` or a separate optional callback behaviour.",
-    "Testing: async: true, Mox for EmbeddingBehaviour and ExtractorBehaviour, fixture(:article) with embeddings, tenant isolation test, setup :verify_on_exit!.",
+    "Contradiction detection is deferred to a future story. For v1, the worker only creates :relates_to links. No ExtractorBehaviour DI is needed in this worker.",
+    "Testing: async: true, fixture(:article) with embeddings, tenant isolation test, setup :verify_on_exit!. No Mox needed since the worker only reads embeddings from the database.",
     "Rate limiting at 50 comparisons prevents runaway compute on tenants with large article collections. The limit should be configurable via Application config."
   ],
   "dependencies": ["US-19.2", "US-20.3", "US-20.4"],

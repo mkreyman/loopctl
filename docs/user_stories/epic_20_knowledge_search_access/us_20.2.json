@@ -51,7 +51,7 @@
     },
     {
       "id": "AC-20.2.8",
-      "description": "Embedding dimensions are configurable via `config :loopctl, :embedding_dimensions, 1536`. The update_embedding function validates incoming vector length against this config value.",
+      "description": "Embedding dimensions are configurable via `config :loopctl, :embedding_dimensions, 1536`. The update_embedding function validates incoming vector length against this config value. The database column is fixed at 1536 dimensions at migration time. The config value :embedding_dimensions is used for input validation only. Changing embedding models or dimensions requires a new migration to ALTER the column type and rebuild the HNSW index.",
       "status": "pending"
     },
     {

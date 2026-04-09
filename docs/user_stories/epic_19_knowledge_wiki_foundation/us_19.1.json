@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-19.1.7",
-      "description": "Migration adds a unique index on (tenant_id, title) scoped to non-deleted articles, preventing duplicate titles within a tenant.",
+      "description": "Migration adds a unique index on (tenant_id, title) with WHERE clause: WHERE status NOT IN ('archived', 'superseded'). This allows title reuse when articles are archived or superseded, preventing duplicate titles only among active articles within a tenant.",
       "status": "pending"
     },
     {
@@ -67,6 +67,11 @@
     {
       "id": "AC-19.1.11",
       "description": "The status Ecto.Enum values support the full article lifecycle: :draft (work in progress), :published (visible and active), :archived (soft-deleted), :superseded (replaced by a newer article via ArticleLink).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.1.12",
+      "description": "The Article schema declares has_many associations for link traversal: `has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id` and `has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id`. These are required by Knowledge context preloading (US-19.3 AC-19.3.3), context retrieval (US-20.7), and export (US-21.4).",
       "status": "pending"
     }
   ],

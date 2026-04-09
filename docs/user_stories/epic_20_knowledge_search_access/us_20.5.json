@@ -58,6 +58,11 @@
       "id": "AC-20.5.9",
       "description": "The underlying context function is `Knowledge.list_index/2` accepting `(tenant_id, opts)` where opts supports `:project_id` filter.",
       "status": "pending"
+    },
+    {
+      "id": "AC-20.5.10",
+      "description": "Response is capped at 1000 articles. If the tenant's published article count exceeds 1000, the response includes the 1000 most recently updated articles with meta.truncated: true and meta.total_count indicating the full count. For large tenants, recommend using the project-scoped index endpoint.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -185,7 +190,7 @@
     "Application-level grouping: `Enum.group_by(articles, & &1.category)` — simpler than SQL GROUP BY since we need the full list anyway.",
     "Category counts: `Enum.map(grouped, fn {cat, arts} -> {cat, length(arts)} end) |> Map.new()`.",
     "Project-scoped query: `where: (is_nil(a.project_id) or a.project_id == ^project_id)` — includes both tenant-wide and project-specific articles.",
-    "This endpoint intentionally has no pagination — it returns ALL published articles for the tenant as a lightweight catalog. If a tenant has thousands of articles, consider adding pagination in a future iteration.",
+    "This endpoint returns published articles as a lightweight catalog, capped at 1000 articles (most recently updated). If the count exceeds 1000, set meta.truncated: true and meta.total_count to the full count. For large tenants, recommend using the project-scoped index endpoint.",
     "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
     "Response rendering uses LoopctlWeb.KnowledgeJSON module following Phoenix 1.8 JSON view pattern (plain module with render functions, not legacy Phoenix.View)."

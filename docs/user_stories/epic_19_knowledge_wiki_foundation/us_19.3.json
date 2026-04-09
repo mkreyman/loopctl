@@ -21,7 +21,7 @@
     },
     {
       "id": "AC-19.3.2",
-      "description": "create_article(tenant_id, attrs, opts) creates an article in an Ecto.Multi transaction. Sets tenant_id programmatically (never from attrs). Logs creation in audit log via Audit.log_in_multi/3. Returns {:ok, article} or {:error, changeset}.",
+      "description": "create_article(tenant_id, attrs, opts) creates an article in an Ecto.Multi transaction. Sets tenant_id programmatically (never from attrs). Logs creation in audit log via Audit.log_in_multi/3. Returns {:ok, article} or {:error, changeset}. opts accepts :actor_id (binary_id), :actor_label (string), and :actor_type (string, e.g. 'api_key' or 'system') for audit log attribution, matching the established QualityAssurance and Progress context patterns.",
       "status": "pending"
     },
     {
@@ -77,6 +77,11 @@
     {
       "id": "AC-19.3.13",
       "description": "When create_link/2 is called with relationship_type :supersedes, the target article's status is set to :superseded within the same Ecto.Multi transaction.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-19.3.14",
+      "description": "list_articles/2 returns a result map %{data: [Article.t()], meta: %{total_count: integer, limit: integer, offset: integer}} to support pagination metadata in the API layer.",
       "status": "pending"
     }
   ],

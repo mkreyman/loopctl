@@ -36,12 +36,12 @@
     },
     {
       "id": "AC-20.3.5",
-      "description": "On success, the worker calls `Knowledge.update_embedding/3` to persist the vector. On failure, the worker returns `{:snooze, 30}` to retry after 30 seconds.",
+      "description": "On success, the worker calls `Knowledge.update_embedding/3` to persist the vector. On failure, the worker returns `{:error, reason}` (not `{:snooze, N}`), and implements a custom `backoff/1` callback: `@impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. This ensures the attempt counter increments correctly and max_attempts is respected.",
       "status": "pending"
     },
     {
       "id": "AC-20.3.6",
-      "description": "Max attempts is 4. Backoff uses exponential delay via snooze: attempt 1 retries at +30s, attempt 2 at +60s, attempt 3 at +120s. After 4 failures the job is discarded.",
+      "description": "Max attempts is 4. Backoff uses a custom `backoff/1` callback with polynomial delay: `trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. After 4 failures the job is discarded.",
       "status": "pending"
     },
     {
@@ -62,6 +62,11 @@
     {
       "id": "AC-20.3.10",
       "description": "config/test.exs maps `:embedding_client` to a Mox mock: `config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient`. The mock is defined in test/support/mocks.ex.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.11",
+      "description": "Implementation requires modifying Knowledge.create_article/3 and Knowledge.update_article/4 (from US-19.3) to add Oban.insert for the ArticleEmbeddingWorker as a named Multi step. Only enqueue when title or body fields change — status, tags, or metadata-only updates do not trigger re-embedding.",
       "status": "pending"
     }
   ],
@@ -87,7 +92,7 @@
     },
     {
       "id": "TC-20.3.2",
-      "name": "worker snoozes on embedding generation failure",
+      "name": "worker returns error on embedding generation failure",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant) as tenant",
@@ -98,7 +103,7 @@
         "Execute ArticleEmbeddingWorker.perform/1 with %{article_id: article.id, tenant_id: tenant.id}"
       ],
       "expected_results": [
-        "Worker returns {:snooze, snooze_seconds} where snooze_seconds is based on attempt number",
+        "Worker returns {:error, :rate_limited} so Oban increments the attempt counter and uses the custom backoff/1 for retry delay",
         "Article embedding remains nil"
       ],
       "status": "pending"
@@ -175,17 +180,18 @@
     },
     {
       "id": "TC-20.3.7",
-      "name": "exponential backoff increases snooze duration per attempt",
+      "name": "custom backoff/1 increases retry delay per attempt",
       "type": "unit",
       "preconditions": [],
       "steps": [
-        "Call ArticleEmbeddingWorker.snooze_seconds/1 with attempt numbers 1 through 4"
+        "Call ArticleEmbeddingWorker.backoff/1 with Oban.Job structs for attempt numbers 1 through 4"
       ],
       "expected_results": [
-        "Attempt 1 returns 30",
-        "Attempt 2 returns 60",
-        "Attempt 3 returns 120",
-        "Snooze duration doubles with each attempt"
+        "Delay increases polynomially with each attempt (attempt^4 + 15 + rand*attempt)",
+        "Attempt 1 returns a value in the range 16..46",
+        "Attempt 2 returns a value in the range 31..76",
+        "Attempt 3 returns a value in the range 96..171",
+        "All values are integers (truncated)"
       ],
       "status": "pending"
     }
@@ -196,12 +202,13 @@
     "config/test.exs: `config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient`. Mock defined in test/support/mocks.ex: `Mox.defmock(Loopctl.MockEmbeddingClient, for: Loopctl.Knowledge.EmbeddingBehaviour)`.",
     "Input construction: `\"#{article.title}\\n\\n#{article.body}\" |> String.slice(0, 32_000)` — truncation prevents exceeding embedding model token limits.",
     "Enqueue pattern: within Ecto.Multi, use `Oban.insert(multi, :embedding_job, ArticleEmbeddingWorker.new(%{article_id: id, tenant_id: tenant_id}))` so the job is only inserted if the transaction commits.",
-    "Snooze backoff: `def snooze_seconds(attempt), do: 30 * :math.pow(2, attempt - 1) |> round()`. Returns 30, 60, 120, 240 for attempts 1-4.",
+    "Custom backoff: `@impl Oban.Worker def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)`. Returns polynomial delays that increase with each attempt.",
     "The :embeddings queue config goes in config/config.exs: add `embeddings: 5` to the Oban queues list. Set to `embeddings: 0` in test.exs if Oban is in :manual mode for testing.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
     "The default EmbeddingClient implementation must use Req for HTTP calls with retry: :transient, following the pattern in Loopctl.Webhooks.ReqDelivery. Example: Req.new(base_url: config[:openai_url], headers: [{\"authorization\", \"Bearer \" <> config[:api_key]}]) |> Req.post(json: %{input: text, model: config[:model]})",
     "For Oban job enqueue verification in tests, use assert_enqueued(worker: Loopctl.Workers.ArticleEmbeddingWorker, args: %{article_id: article.id, tenant_id: tenant.id}) from Oban.Testing.",
-    "This worker uses snooze-based retry ({:snooze, 30} with doubling) rather than Oban's built-in backoff because snooze provides more predictable delay when dealing with rate-limited external embedding APIs. This is a deliberate choice matching the WebhookDeliveryWorker pattern."
+    "The worker uses {:error, reason} with custom backoff/1 (not {:snooze, N}) because snooze does not increment Oban's attempt counter. Using {:error, reason} ensures max_attempts is respected and the job is eventually discarded.",
+    "Selective re-embedding: check which fields changed before enqueuing. Re-embed only when title or body changes. Use Ecto.Changeset.changed?(changeset, :title) or Ecto.Changeset.changed?(changeset, :body) to gate the Oban.insert step in the Multi."
   ],
   "dependencies": [
     "US-20.2",

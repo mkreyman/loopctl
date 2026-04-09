@@ -12,11 +12,11 @@
     "i_want_to": "have the self-learning pipeline automatically trigger on every code review with visibility into its status",
     "so_that": "the knowledge wiki compounds automatically while I can monitor and control the pipeline"
   },
-  "rationale": "The ReviewKnowledgeWorker (US-21.1) and publish workflow (US-21.3) are building blocks, but they need to be wired into the existing review flow to form a complete self-learning pipeline. This story connects the worker to Progress.record_review/4 via Ecto.Multi (following the EventGenerator pattern), adds a tenant-level opt-in/opt-out setting, and provides a pipeline status endpoint so administrators can monitor extraction health. Together these pieces transform the review loop into a knowledge-compounding system with full observability.",
+  "rationale": "The ReviewKnowledgeWorker (US-21.1) and publish workflow (US-21.3) are building blocks, but they need to be wired into the existing review flow to form a complete self-learning pipeline. This story connects the worker to Progress.record_review/4 by enqueuing the knowledge worker after successful review record creation, adds a tenant-level opt-in/opt-out setting, and provides a pipeline status endpoint so administrators can monitor extraction health. Together these pieces transform the review loop into a knowledge-compounding system with full observability.",
   "acceptance_criteria": [
     {
       "id": "AC-21.6.1",
-      "description": "Progress.record_review/4 (or the equivalent review recording function) enqueues ReviewKnowledgeWorker in the same Ecto.Multi that creates the review_record. This follows the EventGenerator pattern already used for webhook events.",
+      "description": "After Progress.record_review/4 successfully returns {:ok, review_record}, the controller (or a thin wrapper) enqueues the ReviewKnowledgeWorker via Oban.insert(%{review_record_id: review_record.id, tenant_id: tenant_id}). Atomicity with the review_record is not required because the worker's duplicate detection (US-21.1 AC-21.1.5) makes it idempotent — if the review_record exists but the worker hasn't run, retry is safe.",
       "status": "pending"
     },
     {
@@ -205,7 +205,7 @@
     }
   ],
   "technical_notes": [
-    "Follow the EventGenerator pattern exactly: add `Oban.insert(changeset)` as a named Multi step alongside the review_record insert. The worker job changeset uses `ReviewKnowledgeWorker.new(%{review_record_id: id, tenant_id: tenant_id})`.",
+    "Progress.record_review/4 uses AdminRepo.insert (not Ecto.Multi). Do NOT refactor it to Multi — instead, enqueue the knowledge worker as a separate step after successful review record creation. This avoids modifying a shipped, tested function. The worker job changeset uses `ReviewKnowledgeWorker.new(%{review_record_id: id, tenant_id: tenant_id})`.",
     "Tenant settings: if a `settings` jsonb column already exists on tenants, simply add `knowledge_auto_extract` to it. If not, add a migration for the column. Access via `tenant.settings[\"knowledge_auto_extract\"]` with a default of true when the key is missing.",
     "Pipeline status queries Oban's `oban_jobs` table directly for job counts. Filter by worker name and tenant_id in the args. Use Oban.Job schema for queries.",
     "Publish rate calculation: `published_count / (published_count + draft_count)`. Guard against division by zero by returning 0.0 when total is 0.",

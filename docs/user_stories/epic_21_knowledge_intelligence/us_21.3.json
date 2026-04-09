@@ -51,7 +51,7 @@
     },
     {
       "id": "AC-21.3.8",
-      "description": "POST /api/v1/articles/:id/archive endpoint exists (role: user+). Transitions article from :published to :archived. Returns 422 if article is not in :published status.",
+      "description": "POST /api/v1/articles/:id/archive endpoint exists (role: user+). Transitions article to :archived. Returns 422 if the article is in :superseded status. Articles in :draft or :published status can be archived.",
       "status": "pending"
     },
     {

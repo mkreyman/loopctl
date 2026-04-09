@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-20.1.1",
-      "description": "A migration adds a generated tsvector column `search_vector` to the articles table, computed from title (weight A) and body (weight B) using `to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body,''))`.",
+      "description": "A migration adds a generated tsvector column `search_vector` to the articles table, computed as setweight(to_tsvector('english', coalesce(title, '')), 'A') || setweight(to_tsvector('english', coalesce(body, '')), 'B') so title matches rank higher than body matches.",
       "status": "pending"
     },
     {
@@ -96,18 +96,18 @@
         "fixture(:tenant) as tenant",
         "fixture(:project, %{tenant_id: tenant.id}) as project_a",
         "fixture(:project, %{tenant_id: tenant.id}) as project_b",
-        "fixture(:article, %{tenant_id: tenant.id, project_id: project_a.id, category: 'conventions', tags: ['elixir'], title: 'Elixir Conventions', body: 'Use pipe operator...', status: :published})",
-        "fixture(:article, %{tenant_id: tenant.id, project_id: project_b.id, category: 'deployment', tags: ['docker'], title: 'Elixir Deployment', body: 'Use Docker for Elixir deploys...', status: :published})"
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project_a.id, category: :convention, tags: ['elixir'], title: 'Elixir Conventions', body: 'Use pipe operator...', status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project_b.id, category: :reference, tags: ['docker'], title: 'Elixir Deployment', body: 'Use Docker for Elixir deploys...', status: :published})"
       ],
       "steps": [
         "Call Knowledge.search_keyword(tenant.id, 'elixir', %{project_id: project_a.id})",
-        "Call Knowledge.search_keyword(tenant.id, 'elixir', %{category: 'conventions'})",
+        "Call Knowledge.search_keyword(tenant.id, 'elixir', %{category: :convention})",
         "Call Knowledge.search_keyword(tenant.id, 'elixir', %{tags: ['docker']})"
       ],
       "expected_results": [
         "project_id filter returns only the project_a article",
-        "category filter returns only the 'conventions' article",
-        "tags filter returns only the 'deployment' article with 'docker' tag"
+        "category filter returns only the :convention article",
+        "tags filter returns only the :reference article with 'docker' tag"
       ],
       "status": "pending"
     },

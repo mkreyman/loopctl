@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-20.4.7",
-      "description": "Combined search merges results by normalizing scores from each search to 0-1 range, then computing `final_score = keyword_weight * normalized_keyword_score + semantic_weight * normalized_semantic_score`. Duplicate articles (present in both result sets) are merged, keeping the higher combined score.",
+      "description": "Combined search merges results by normalizing scores from each search to 0-1 range, then computing `final_score = keyword_weight * normalized_keyword_score + semantic_weight * normalized_semantic_score`. When all scores in a result set are equal (max == min), normalize all to 1.0 to avoid division by zero. Duplicate articles (present in both result sets) are merged, keeping the higher combined score.",
       "status": "pending"
     },
     {
@@ -152,16 +152,16 @@
       "preconditions": [
         "fixture(:tenant) as tenant",
         "fixture(:project, %{tenant_id: tenant.id}) as project",
-        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: 'patterns', status: :published}) with embedding",
-        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, category: 'guides', status: :published}) with embedding"
+        "fixture(:article, %{tenant_id: tenant.id, project_id: project.id, category: :pattern, status: :published}) with embedding",
+        "fixture(:article, %{tenant_id: tenant.id, project_id: nil, category: :reference, status: :published}) with embedding"
       ],
       "steps": [
         "Call Knowledge.search_semantic(tenant.id, query_vector, %{project_id: project.id})",
-        "Call Knowledge.search_semantic(tenant.id, query_vector, %{category: 'patterns'})"
+        "Call Knowledge.search_semantic(tenant.id, query_vector, %{category: :pattern})"
       ],
       "expected_results": [
         "project_id filter returns only the project-scoped article",
-        "category filter returns only the 'patterns' article"
+        "category filter returns only the :pattern article"
       ],
       "status": "pending"
     },
@@ -207,9 +207,9 @@
   ],
   "technical_notes": [
     "Cosine distance query: `from a in Article, where: not is_nil(a.embedding), order_by: fragment(\"embedding <=> ?\", ^query_embedding), select_merge: %{similarity_score: fragment(\"1 - (embedding <=> ?)\", ^query_embedding)}`.",
-    "Score normalization for combined search: `normalized = (score - min_score) / (max_score - min_score)`. Handle edge case where all scores are equal (set normalized to 1.0).",
+    "Score normalization for combined search: `normalized = (score - min_score) / (max_score - min_score)`. When all scores in a result set are equal (max == min), normalize all to 1.0 to avoid division by zero.",
     "Deduplication: build a map keyed by article_id, merge entries keeping the higher combined score, then sort and paginate the merged list.",
-    "The `search_combined/3` function should use `Task.async` to run keyword and semantic searches in parallel, then merge results. Use `Task.await/2` with a reasonable timeout (5 seconds).",
+    "Run keyword search in parallel with embedding generation using Task.Supervisor.async_nolink, then run semantic search once embedding is available. Pattern: keyword_task = Task.Supervisor.async_nolink(Loopctl.TaskSupervisor, fn -> search_keyword(...) end); {:ok, embedding} = @embedding_client.generate_embedding(query); semantic = search_semantic(..., embedding); keyword = Task.await(keyword_task). If full parallelism is not needed, sequential execution is acceptable since keyword search is sub-ms.",
     "Embedding generation for query: uses the same `@embedding_client` compile-time DI as the worker. In tests, MockEmbeddingClient is already configured.",
     "All three search functions (keyword, semantic, combined) should return the same response shape: `{:ok, %{results: [%{id, title, category, tags, relevance_score | similarity_score | final_score, snippet}], meta: %{total_count, limit, offset, ...}}}`.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",

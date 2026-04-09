@@ -31,7 +31,7 @@
     },
     {
       "id": "AC-19.5.4",
-      "description": "When a link with relationship_type :supersedes is created, the target article's status is automatically set to :superseded in the same Ecto.Multi transaction. This ensures consistency -- a superseded article is always marked as such.",
+      "description": "When a :supersedes link is created via the API, the target article's status is automatically set to :superseded. This is handled by Knowledge.create_link/2 (AC-19.3.13) -- the controller delegates to the context function. This AC verifies the end-to-end behavior through the API.",
       "status": "pending"
     },
     {

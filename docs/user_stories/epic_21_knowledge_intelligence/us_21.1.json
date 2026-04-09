@@ -21,12 +21,12 @@
     },
     {
       "id": "AC-21.1.2",
-      "description": "The worker reads the review record and its findings, then calls `Loopctl.Knowledge.ExtractorBehaviour.extract_articles/1` (resolved via compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`) passing the review findings.",
+      "description": "The worker reads the review record and its findings, then builds a context map: %{summary: review_record.summary, review_type: review_record.review_type, findings_count: review_record.findings_count, story_id: review_record.story_id, tenant_id: tenant_id}. It calls `@extractor.extract_articles/1` (resolved via compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`) passing this context map.",
       "status": "pending"
     },
     {
       "id": "AC-21.1.3",
-      "description": "A `Loopctl.Knowledge.ExtractorBehaviour` behaviour exists defining `@callback extract_articles(map()) :: {:ok, [map()]} | {:error, term()}`. Each returned map has keys: title (string), body (string), category (atom), tags (list of strings).",
+      "description": "A `Loopctl.Knowledge.ExtractorBehaviour` behaviour exists defining `@callback extract_articles(context :: map()) :: {:ok, [%{title: String.t(), body: String.t(), category: atom(), tags: [String.t()]}]} | {:error, term()}`. The context map shape is: %{summary: String.t(), review_type: atom(), findings_count: non_neg_integer(), story_id: binary(), tenant_id: binary()}.",
       "status": "pending"
     },
     {
@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-21.1.5",
-      "description": "Duplicate detection: before creating an article, the worker checks if an article with the same source_type and source_id already exists for the tenant. If so, the worker skips creation and logs a warning. This makes the worker idempotent across retries.",
+      "description": "Duplicate detection and atomicity: all article creations from a single extraction are wrapped in one Ecto.Multi transaction — they either all succeed or all fail. This prevents partial extraction where some articles are created but others are lost on retry. Duplicate detection checks source_type + source_id for any existing article; if found, the entire extraction is skipped and the worker logs a warning. This makes the worker idempotent across retries.",
       "status": "pending"
     },
     {
