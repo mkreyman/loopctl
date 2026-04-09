@@ -58,6 +58,11 @@
       "id": "AC-19.6.9",
       "description": "Event payloads include tenant_id for routing and the article's project_id for project-scoped webhook filtering.",
       "status": "pending"
+    },
+    {
+      "id": "AC-19.6.10",
+      "description": "Knowledge webhook event payloads include ONLY: id, title, category, project_id, status, and tags. Never include body, metadata, or embedding in webhook payloads. For article.updated events, include the list of changed field names only, not their values.",
+      "status": "pending"
     }
   ],
   "test_cases": [

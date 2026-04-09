@@ -68,6 +68,11 @@
       "id": "AC-19.4.11",
       "description": "All endpoints enforce tenant isolation -- a request authenticated as tenant A cannot access tenant B's articles. Cross-tenant access returns 404.",
       "status": "pending"
+    },
+    {
+      "id": "AC-19.4.12",
+      "description": "New error atoms used by the Knowledge context (:empty_query, :invalid_search_mode, :invalid_supersession_target) are either added to FallbackController or the context uses existing atoms with the 3-tuple pattern {:error, :bad_request, message}. Prefer the 3-tuple pattern to avoid modifying FallbackController.",
+      "status": "pending"
     }
   ],
   "test_cases": [

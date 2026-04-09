@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-21.3.3",
-      "description": "POST /api/v1/knowledge/bulk-publish endpoint exists (role: user+). Accepts JSON body `{\"article_ids\": [\"id1\", \"id2\", ...]}`. Publishes all specified articles atomically (Ecto.Multi -- all succeed or all fail). Returns 200 with `{\"published_count\": N, \"articles\": [...]}`. Returns 422 if any article is not in :draft status, with error identifying which article(s) failed.",
+      "description": "POST /api/v1/knowledge/bulk-publish endpoint exists (role: user+). Accepts JSON body `{\"article_ids\": [\"id1\", \"id2\", ...]}`. Maximum 100 article_ids per request. Returns 422 if the array exceeds 100 elements. This prevents database connection pool exhaustion from a single massive transaction. Publishes all specified articles atomically (Ecto.Multi -- all succeed or all fail). Returns 200 with `{\"published_count\": N, \"articles\": [...]}`. Returns 422 if any article is not in :draft status, with error identifying which article(s) failed.",
       "status": "pending"
     },
     {
@@ -71,7 +71,7 @@
     },
     {
       "id": "AC-21.3.12",
-      "description": "A Loopctl.Knowledge.Article.valid_transition?/2 function exists that validates status transitions. Valid transitions: draft->published, published->draft, published->archived, draft->archived. Any status can transition to :superseded (via ArticleLink only, not direct API). The function is tested independently with unit tests.",
+      "description": "A Loopctl.Knowledge.Article.valid_transition?/2 function exists that validates status transitions. Valid transitions: draft->published, published->draft, published->archived, draft->archived, superseded->draft. Any status can transition to :superseded (via ArticleLink only, not direct API). superseded->draft is valid (enables recovery when a superseding article is later found incorrect). When a supersedes link is deleted, the administrator can manually restore the target article to :draft status for re-review. The function is tested independently with unit tests.",
       "status": "pending"
     }
   ],

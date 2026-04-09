@@ -145,7 +145,7 @@
         "MCP server configured with valid LOOPCTL_AGENT_KEY"
       ],
       "steps": [
-        "Call knowledge_create with {title: 'Agent Finding', body: 'Discovered a pattern...', category: 'findings', tags: ['review']}"
+        "Call knowledge_create with {title: 'Agent Finding', body: 'Discovered a pattern...', category: 'finding', tags: ['review']}"
       ],
       "expected_results": [
         "Returns 201 with the created article",

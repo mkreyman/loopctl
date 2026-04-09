@@ -63,6 +63,11 @@
       "id": "AC-20.1.10",
       "description": "All queries are scoped to the current tenant via both application-level WHERE clause and RLS policy on the articles table.",
       "status": "pending"
+    },
+    {
+      "id": "AC-20.1.11",
+      "description": "The q parameter is validated to max 500 characters before being passed to websearch_to_tsquery. Returns {:error, :bad_request, \"Query too long (max 500 characters)\"} if exceeded. Empty tsquery results (e.g., stop-word-only queries) short-circuit to empty results.",
+      "status": "pending"
     }
   ],
   "test_cases": [

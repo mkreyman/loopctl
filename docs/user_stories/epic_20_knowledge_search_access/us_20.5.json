@@ -72,9 +72,9 @@
       "type": "integration",
       "preconditions": [
         "fixture(:tenant) as tenant",
-        "fixture(:article, %{tenant_id: tenant.id, title: 'Coding Standards', category: 'conventions', tags: ['elixir'], status: :published})",
-        "fixture(:article, %{tenant_id: tenant.id, title: 'Deploy Guide', category: 'operations', tags: ['fly'], status: :published})",
-        "fixture(:article, %{tenant_id: tenant.id, title: 'Draft Article', category: 'conventions', status: :draft})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Coding Standards', category: :convention, tags: ['elixir'], status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Deploy Guide', category: :reference, tags: ['fly'], status: :published})",
+        "fixture(:article, %{tenant_id: tenant.id, title: 'Draft Article', category: :convention, status: :draft})",
         "fixture(:api_key, %{tenant_id: tenant.id, role: :agent}) returns {raw_key, _}"
       ],
       "steps": [
@@ -84,7 +84,7 @@
         "Response status is 200",
         "Response includes 2 articles (draft excluded)",
         "total_count is 2",
-        "categories map shows conventions: 1, operations: 1",
+        "categories map shows convention: 1, reference: 1",
         "Each article has only id, title, category, tags, status, updated_at fields",
         "No body content in any article"
       ],

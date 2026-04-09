@@ -63,6 +63,11 @@
       "id": "AC-20.6.10",
       "description": "All results are scoped to the current tenant. The endpoint respects RLS.",
       "status": "pending"
+    },
+    {
+      "id": "AC-20.6.11",
+      "description": "The q parameter is validated to max 500 characters. Returns 400 if exceeded.",
+      "status": "pending"
     }
   ],
   "test_cases": [

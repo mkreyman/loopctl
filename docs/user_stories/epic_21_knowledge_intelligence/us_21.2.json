@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-21.2.3",
-      "description": "The worker fetches the new article's embedding and compares it via cosine similarity against all other article embeddings in the same tenant. If project_id is set on the article, comparison is scoped to the same project; if project_id is nil (tenant-wide), comparison runs against all tenant articles.",
+      "description": "The worker fetches the new article's embedding and compares it via cosine similarity against all other article embeddings in the same tenant. If project_id is set on the article, comparison is scoped to the same project; if project_id is nil (tenant-wide), comparison runs against all tenant articles. For project-scoped articles, the worker compares against articles in the same project AND tenant-wide articles (project_id IS NULL OR project_id = article.project_id). This ensures project-scoped knowledge links to relevant tenant-wide patterns.",
       "status": "pending"
     },
     {

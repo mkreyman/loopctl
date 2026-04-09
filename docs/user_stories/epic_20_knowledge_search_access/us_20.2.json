@@ -193,7 +193,7 @@
   ],
   "technical_notes": [
     "Add `{:pgvector, \"~> 0.3\"}` to mix.exs deps. This provides `Pgvector.Ecto.Vector` type and Ecto integration.",
-    "Migration order: (1) CREATE EXTENSION IF NOT EXISTS vector, (2) ALTER TABLE articles ADD COLUMN embedding vector(1536), (3) CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops). The HNSW index build can be slow on large tables; consider CONCURRENTLY for production.",
+    "Migration order: (1) CREATE EXTENSION IF NOT EXISTS vector, (2) ALTER TABLE articles ADD COLUMN embedding vector(1536), (3) CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops). The HNSW index migration MUST use CREATE INDEX CONCURRENTLY to avoid locking the articles table during index build. Use @disable_ddl_transaction true and @disable_migration_lock true in the migration module. Split extension creation, column addition, and index creation into separate migrations so a failed index doesn't block the column add.",
     "Schema field: `field :embedding, Pgvector.Ecto.Vector` — this handles serialization/deserialization of the vector data between Elixir lists and PostgreSQL vector type.",
     "The embedding field must NOT appear in the standard article changeset `cast/3` call. Create a separate `embedding_changeset/2` used only by `update_embedding/3`.",
     "Dimension validation: `defp validate_embedding_dimensions(changeset)` checks `length(get_field(changeset, :embedding)) == Application.get_env(:loopctl, :embedding_dimensions, 1536)`.",

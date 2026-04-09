@@ -63,6 +63,11 @@
       "id": "AC-20.4.10",
       "description": "If keyword_weight + semantic_weight do not sum to 1.0, the function returns `{:error, :invalid_weights}`.",
       "status": "pending"
+    },
+    {
+      "id": "AC-20.4.11",
+      "description": "When generating query embeddings for search, the embedding client call has an explicit 5-second timeout. If the timeout is exceeded or the call fails, combined search automatically falls back to keyword-only mode. After 3 consecutive failures within 60 seconds, a circuit breaker activates and all searches fall back to keyword-only for a 30-second cooldown. Add meta.search_mode to the response indicating which mode was actually used.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -213,7 +218,7 @@
     "Embedding generation for query: uses the same `@embedding_client` compile-time DI as the worker. In tests, MockEmbeddingClient is already configured.",
     "All three search functions (keyword, semantic, combined) should return the same response shape: `{:ok, %{results: [%{id, title, category, tags, relevance_score | similarity_score | final_score, snippet}], meta: %{total_count, limit, offset, ...}}}`.",
     "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
-    "Config-based DI: `@embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. Same compile-time DI pattern as the Oban worker.",
+    "Config-based DI: The Knowledge context module uses Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient) at RUNTIME (not compile_env). Compile-time DI is appropriate for Oban workers (separate processes) but not for context modules which are called from the Phoenix request path. Runtime get_env ensures test config is always respected.",
     "The @embedding_client implements Loopctl.Knowledge.EmbeddingBehaviour (defined in US-20.3). The real implementation uses Req for HTTP calls. In tests, use Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text -> {:ok, List.duplicate(0.1, 1536)} end)."
   ],
   "dependencies": [

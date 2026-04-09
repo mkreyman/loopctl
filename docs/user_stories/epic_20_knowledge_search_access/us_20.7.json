@@ -63,6 +63,11 @@
       "id": "AC-20.7.10",
       "description": "The underlying context function is `Knowledge.get_context/3` accepting `(tenant_id, query_string, opts)`.",
       "status": "pending"
+    },
+    {
+      "id": "AC-20.7.11",
+      "description": "Agent-role API keys can only search published articles. The status filter parameter is ignored for agent-role requests — it is always forced to :published. User-role keys can override the status filter to search drafts or archived articles.",
+      "status": "pending"
     }
   ],
   "test_cases": [

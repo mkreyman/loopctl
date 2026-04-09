@@ -56,7 +56,7 @@
     },
     {
       "id": "AC-20.3.9",
-      "description": "The worker uses `unique: [keys: [:article_id], period: 60]` to deduplicate rapid successive updates to the same article within a 60-second window.",
+      "description": "The worker uses `unique: [keys: [:article_id], period: 300, on_conflict: :replace]` so that rapid edits replace the queued job rather than deduplicating it away. This ensures the final content is always embedded.",
       "status": "pending"
     },
     {
@@ -66,7 +66,17 @@
     },
     {
       "id": "AC-20.3.11",
-      "description": "Implementation requires modifying Knowledge.create_article/3 and Knowledge.update_article/4 (from US-19.3) to add Oban.insert for the ArticleEmbeddingWorker as a named Multi step. Only enqueue when title or body fields change — status, tags, or metadata-only updates do not trigger re-embedding.",
+      "description": "Implementation requires modifying Knowledge.create_article/3 and Knowledge.update_article/4 (from US-19.3) to add Oban.insert for the ArticleEmbeddingWorker as a named Multi step. Only enqueue when title or body fields change — status, tags, or metadata-only updates do not trigger re-embedding. Check which fields changed using Map.has_key?(changeset.changes, :title) or Map.has_key?(changeset.changes, :body). Compute this BEFORE the Multi begins (the changeset is consumed by Multi.insert/update and not available in subsequent steps).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.12",
+      "description": "Embedding jobs are only enqueued for articles with status :published. When an article transitions from :draft to :published (via US-21.3 publish workflow), an embedding job is enqueued at that point. This avoids wasting embedding API calls on drafts that may never be published.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-20.3.13",
+      "description": "On successful embedding storage, the ArticleEmbeddingWorker enqueues an ArticleLinkingWorker job (from US-21.2) for the same article_id. This is the trigger mechanism for auto-linking.",
       "status": "pending"
     }
   ],
@@ -197,7 +207,7 @@
     }
   ],
   "technical_notes": [
-    "Worker module: `use Oban.Worker, queue: :embeddings, max_attempts: 4, unique: [keys: [:article_id], period: 60]`.",
+    "Worker module: `use Oban.Worker, queue: :embeddings, max_attempts: 4, unique: [keys: [:article_id], period: 300, on_conflict: :replace]`. Use unique: [keys: [:article_id], period: 300, on_conflict: :replace] so that rapid edits replace the queued job rather than deduplicating it away. This ensures the final content is always embedded.",
     "Compile-time DI: `@embedding_client Application.compile_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)`. The default implementation wraps an HTTP call to the embedding provider.",
     "config/test.exs: `config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient`. Mock defined in test/support/mocks.ex: `Mox.defmock(Loopctl.MockEmbeddingClient, for: Loopctl.Knowledge.EmbeddingBehaviour)`.",
     "Input construction: `\"#{article.title}\\n\\n#{article.body}\" |> String.slice(0, 32_000)` — truncation prevents exceeding embedding model token limits.",
@@ -208,7 +218,7 @@
     "The default EmbeddingClient implementation must use Req for HTTP calls with retry: :transient, following the pattern in Loopctl.Webhooks.ReqDelivery. Example: Req.new(base_url: config[:openai_url], headers: [{\"authorization\", \"Bearer \" <> config[:api_key]}]) |> Req.post(json: %{input: text, model: config[:model]})",
     "For Oban job enqueue verification in tests, use assert_enqueued(worker: Loopctl.Workers.ArticleEmbeddingWorker, args: %{article_id: article.id, tenant_id: tenant.id}) from Oban.Testing.",
     "The worker uses {:error, reason} with custom backoff/1 (not {:snooze, N}) because snooze does not increment Oban's attempt counter. Using {:error, reason} ensures max_attempts is respected and the job is eventually discarded.",
-    "Selective re-embedding: check which fields changed before enqueuing. Re-embed only when title or body changes. Use Ecto.Changeset.changed?(changeset, :title) or Ecto.Changeset.changed?(changeset, :body) to gate the Oban.insert step in the Multi."
+    "Selective re-embedding: check which fields changed before enqueuing. Re-embed only when title or body changes. Check which fields changed using Map.has_key?(changeset.changes, :title) or Map.has_key?(changeset.changes, :body). Compute this BEFORE the Multi begins (the changeset is consumed by Multi.insert/update and not available in subsequent steps)."
   ],
   "dependencies": [
     "US-20.2",

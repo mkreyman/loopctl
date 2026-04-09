@@ -212,7 +212,8 @@
     "The pipeline endpoint is read-only and performs multiple queries. Consider combining them efficiently or accepting the N-query cost since this is a dashboard endpoint, not a hot path.",
     "Testing: async: true, ConnCase for controller tests, DataCase for context tests, Mox for ExtractorBehaviour, fixture(:tenant) with settings, tenant isolation test, setup :verify_on_exit!.",
     "In config/test.exs with Oban testing: :inline, workers execute synchronously when enqueued. Tests should verify side effects (mock was called, articles were created) rather than checking the job queue. Use Mox.expect on the MockExtractor to verify the worker ran.",
-    "The pipeline status endpoint queries oban_jobs by worker name (indexed by default) and then filters by tenant_id in args. For performance at scale, filter by worker name first (indexed), fetch recent jobs, then filter in Elixir by args.tenant_id rather than using a JSONB query on args."
+    "With Oban testing: :inline, creating a review record triggers: (1) ReviewKnowledgeWorker runs synchronously, (2) which creates articles, (3) which may trigger ArticleEmbeddingWorker (if published). All mocks in the chain must be stubbed: MockExtractor AND MockEmbeddingClient. Ensure stub_all_defaults/0 in DataCase covers both with permissive defaults.",
+    "Pipeline status queries MUST filter by tenant_id in the SQL query (args->>'tenant_id' = $1), NOT in application code. This prevents cross-tenant job data from being loaded into process memory. Add a time bound: WHERE inserted_at > NOW() - INTERVAL '7 days' to keep queries fast regardless of job history size."
   ],
   "dependencies": ["US-21.1", "US-21.3"],
   "estimated_hours": 4
