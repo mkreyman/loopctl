@@ -48,9 +48,8 @@ defmodule Loopctl.Knowledge.Article do
     field :source_id, :binary_id
     field :metadata, :map, default: %{}
 
-    # Added in US-19.2 when ArticleLink schema is created:
-    # has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
-    # has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id
+    has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
+    has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id
 
     timestamps()
   end

@@ -375,22 +375,21 @@ defmodule Loopctl.Knowledge.ArticleTest do
     end
   end
 
-  # Added in US-19.2 when ArticleLink schema is created:
-  # describe "schema associations" do
-  #   test "declares outgoing_links association" do
-  #     assoc = Article.__schema__(:association, :outgoing_links)
-  #     assert assoc.related == Loopctl.Knowledge.ArticleLink
-  #     assert assoc.owner_key == :id
-  #     assert assoc.related_key == :source_article_id
-  #   end
-  #
-  #   test "declares incoming_links association" do
-  #     assoc = Article.__schema__(:association, :incoming_links)
-  #     assert assoc.related == Loopctl.Knowledge.ArticleLink
-  #     assert assoc.owner_key == :id
-  #     assert assoc.related_key == :target_article_id
-  #   end
-  # end
+  describe "schema associations" do
+    test "declares outgoing_links association" do
+      assoc = Article.__schema__(:association, :outgoing_links)
+      assert assoc.related == Loopctl.Knowledge.ArticleLink
+      assert assoc.owner_key == :id
+      assert assoc.related_key == :source_article_id
+    end
+
+    test "declares incoming_links association" do
+      assoc = Article.__schema__(:association, :incoming_links)
+      assert assoc.related == Loopctl.Knowledge.ArticleLink
+      assert assoc.owner_key == :id
+      assert assoc.related_key == :target_article_id
+    end
+  end
 
   describe "integration: insert and unique constraint" do
     test "inserts article with valid data" do
