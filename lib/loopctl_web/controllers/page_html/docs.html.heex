@@ -780,7 +780,31 @@
                 <span class="text-accent-400">POST</span> /api/v1/knowledge/bulk-publish
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Publish multiple draft articles in a single request. Accepts an array of article IDs.
+                Publish multiple draft articles in a single request. Accepts an array of article IDs. Role: user+.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/knowledge/ingest
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Submit a URL or raw content for LLM-powered knowledge extraction. Queues an Oban job that fetches, extracts, and creates draft articles. Role: orchestrator+.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/knowledge/ingest/batch
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Submit up to 50 content items for batch ingestion in a single request. Each item is processed independently. Role: orchestrator+.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">GET</span> /api/v1/knowledge/ingestion-jobs
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                List recent ingestion jobs with status, errors, and article counts. Role: orchestrator+.
               </p>
             </div>
             <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
@@ -801,7 +825,7 @@
           <h2 class="font-display text-xl font-semibold text-slate-100">MCP Tools</h2>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The loopctl MCP server provides 33 typed tools for Claude Code agents.
+              The loopctl MCP server provides 37 typed tools for Claude Code agents.
               Install via
               <span class="font-mono text-slate-300">npm install loopctl-mcp-server</span>
               and configure in <span class="font-mono text-slate-300">.mcp.json</span>.
@@ -848,6 +872,40 @@
                 Export the knowledge wiki as an Obsidian-compatible ZIP file. Contains Markdown articles with YAML frontmatter, backlinks between articles, and an index file.
               </p>
             </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_bulk_publish</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Publish up to 100 draft articles in a single call. Requires
+                <span class="font-mono text-slate-300">LOOPCTL_USER_KEY</span>
+                env var (destructive operation).
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_ingest</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Submit a URL or raw content for LLM-powered knowledge extraction. Queues an async Oban job that fetches, extracts, and creates draft articles.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_ingest_batch</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Batch-submit up to 50 content items for ingestion in a single call. Each item is processed independently with per-item result tracking.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_ingestion_jobs</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                List recent content ingestion jobs with state, errors, and article counts. Useful for monitoring the self-learning pipeline.
+              </p>
+            </div>
           </div>
 
           <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
@@ -855,7 +913,7 @@
           </h3>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The full set of 33 tools covers projects, stories, epics, verification,
+              The full set of 37 tools covers projects, stories, epics, verification,
               artifacts, orchestrator state, webhooks, skills, token usage, analytics,
               and knowledge. See the
               <a
