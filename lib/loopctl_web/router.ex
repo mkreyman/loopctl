@@ -233,8 +233,12 @@ defmodule LoopctlWeb.Router do
     # Knowledge Wiki (Epic 19)
     resources "/articles", ArticleController, except: [:new, :edit]
 
+    # Knowledge Index (lightweight catalog)
+    get "/knowledge/index", KnowledgeIndexController, :index
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
+      get "/knowledge/index", KnowledgeIndexController, :index
     end
 
     # ArticleLink management
