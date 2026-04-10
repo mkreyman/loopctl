@@ -253,10 +253,14 @@ defmodule LoopctlWeb.Router do
     # Knowledge Export (Obsidian-compatible ZIP)
     get "/knowledge/export", KnowledgeExportController, :export
 
+    # Knowledge Lint (quality analysis report)
+    get "/knowledge/lint", KnowledgeLintController, :lint
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
       get "/knowledge/export", KnowledgeExportController, :export
+      get "/knowledge/lint", KnowledgeLintController, :lint
     end
 
     # ArticleLink management
