@@ -108,16 +108,27 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
           )
         end
 
-        {:ok, Enum.take(articles, @max_articles)}
+        {:ok, articles |> dedup_articles() |> Enum.take(@max_articles)}
 
       errors != [] ->
         # All chunks failed — propagate the first error so Oban retries
         {:error, List.first(errors)}
 
       true ->
-        # No chunks produced anything but no errors either (empty content)
+        # All chunks succeeded but extracted no articles — legitimately
+        # nothing reusable in the content.
         {:ok, []}
     end
+  end
+
+  # When content is split into chunks, the same article may be extracted
+  # from two overlapping chunks. Dedup by normalized title before capping.
+  defp dedup_articles(articles) do
+    Enum.uniq_by(articles, fn article ->
+      (Map.get(article, :title) || Map.get(article, "title") || "")
+      |> String.trim()
+      |> String.downcase()
+    end)
   end
 
   defp resolve_content(nil, content) when is_binary(content) and content != "" do
