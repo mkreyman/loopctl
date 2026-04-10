@@ -82,6 +82,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_length(:body, max: 100_000)
     |> validate_tags()
     |> validate_source_type()
+    |> validate_metadata()
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
       message: "has already been taken for this tenant"
@@ -101,6 +102,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_length(:title, max: 500)
     |> validate_length(:body, max: 100_000)
     |> validate_tags()
+    |> validate_metadata()
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
       message: "has already been taken for this tenant"
@@ -148,6 +150,16 @@ defmodule Loopctl.Knowledge.Article do
 
         true ->
           cs
+      end
+    end)
+  end
+
+  defp validate_metadata(changeset) do
+    validate_change(changeset, :metadata, fn :metadata, value ->
+      if is_map(value) and not is_struct(value) do
+        []
+      else
+        [metadata: "must be a map"]
       end
     end)
   end

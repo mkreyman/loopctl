@@ -168,6 +168,31 @@ defmodule Loopctl.Knowledge.ArticleTest do
       end
     end
 
+    test "rejects non-map metadata" do
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Article",
+          body: "Content",
+          category: :pattern,
+          metadata: "not a map"
+        })
+
+      refute changeset.valid?
+      assert errors_on(changeset)[:metadata]
+    end
+
+    test "accepts valid map metadata" do
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Article",
+          body: "Content",
+          category: :pattern,
+          metadata: %{"key" => "value"}
+        })
+
+      assert changeset.valid?
+    end
+
     test "tenant_id is never in cast fields" do
       changeset =
         Article.create_changeset(%Article{}, %{
