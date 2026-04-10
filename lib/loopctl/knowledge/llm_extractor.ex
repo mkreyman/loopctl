@@ -97,6 +97,8 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   end
 
   defp parse_articles(text) do
+    text = strip_markdown_fences(text)
+
     case JSON.decode(text) do
       {:ok, articles} when is_list(articles) ->
         normalized =
@@ -148,6 +150,20 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   end
 
   defp normalize_article(_), do: nil
+
+  defp strip_markdown_fences(text) do
+    text
+    |> String.trim()
+    |> then(fn t ->
+      if String.starts_with?(t, "```") do
+        t
+        |> String.replace(~r/\A```(?:json)?\s*\n?/, "")
+        |> String.replace(~r/\n?```\s*\z/, "")
+      else
+        t
+      end
+    end)
+  end
 
   defp normalize_tags(tags) when is_list(tags) do
     tags
