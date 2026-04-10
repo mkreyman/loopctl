@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 33 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 35 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -65,7 +65,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (33)
+## Tools (35)
 
 ### Project Tools
 
@@ -143,6 +143,8 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_drafts` | List all draft (unpublished) knowledge articles. Optional: `limit`, `offset`. |
 | `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`. |
 | `knowledge_export` | Export all knowledge articles as a ZIP archive. Returns a curl command for direct download (ZIP binary cannot be returned as MCP content). Optional: `project_id`. |
+| `knowledge_ingest` | Submit a URL or raw content for knowledge extraction. Enqueues an Oban job. Required: `source_type`. One of: `url` or `content`. Optional: `project_id`. |
+| `knowledge_ingestion_jobs` | List recent content ingestion jobs (last 7 days, max 50). |
 
 ### Discovery Tools
 

@@ -105,6 +105,16 @@ defmodule Loopctl.DataCase do
       {:ok, []}
     end)
 
+    # Default stub for content extractor -- returns empty list (no articles)
+    Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      {:ok, []}
+    end)
+
+    # Default Req.Test stub for content ingestion URL fetching
+    Req.Test.stub(Loopctl.Workers.ContentIngestionWorker, fn conn ->
+      Req.Test.text(conn, "Default ingestion stub content")
+    end)
+
     # Default Req.Test stub for webhook delivery -- allows Oban inline mode
     # to process delivery jobs without test-specific HTTP stub setup.
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->

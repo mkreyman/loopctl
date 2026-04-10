@@ -30,7 +30,7 @@ defmodule Loopctl.Knowledge.Article do
 
   @category_values [:pattern, :convention, :decision, :finding, :reference]
   @status_values [:draft, :published, :archived, :superseded]
-  @known_source_types ~w(review_finding manual agent session_log)
+  @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
   @max_tags 20
   @max_tag_length 100

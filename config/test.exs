@@ -81,6 +81,12 @@ config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
 # DI: Use mock knowledge extractor in tests
 config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 
+# DI: Use mock content extractor in tests
+config :loopctl, :content_extractor, Loopctl.MockContentExtractor
+
+# DI: Use Req.Test plug for content ingestion URL fetching in tests
+config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
+
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 

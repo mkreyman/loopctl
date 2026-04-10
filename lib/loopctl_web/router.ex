@@ -259,6 +259,10 @@ defmodule LoopctlWeb.Router do
     # Knowledge Pipeline (self-learning pipeline status)
     get "/knowledge/pipeline", KnowledgePipelineController, :status
 
+    # Knowledge Ingestion (content extraction pipeline)
+    post "/knowledge/ingest", KnowledgeIngestionController, :create
+    get "/knowledge/ingestion-jobs", KnowledgeIngestionController, :index
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index

@@ -112,6 +112,9 @@ config :loopctl, Loopctl.Vault,
     # {Cloak.Ciphers.AES.GCM, tag: "AES.GCM.V0", key: Base.decode64!("OLD_KEY"), iv_length: 12}
   ]
 
+# DI: Content extractor for knowledge ingestion
+config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
