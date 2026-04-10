@@ -11,7 +11,10 @@ config :loopctl,
   ecto_repos: [Loopctl.Repo],
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   embedding_dimensions: 1536,
-  article_link_threshold: 0.8,
+  # Cosine similarity threshold for auto-linking articles.
+  # 0.6 is calibrated for relationship discovery (related topics).
+  # 0.8+ is only useful for near-duplicate detection.
+  article_link_threshold: 0.6,
   article_link_max_comparisons: 50
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.

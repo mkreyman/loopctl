@@ -86,7 +86,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       link = hd(links)
       assert link.metadata["auto_generated"] == true
       assert is_float(link.metadata["similarity_score"])
-      assert link.metadata["similarity_score"] >= 0.8
+      assert link.metadata["similarity_score"] >= 0.6
     end
   end
 
