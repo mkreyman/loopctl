@@ -264,6 +264,23 @@ defmodule LoopctlWeb.Router do
     post "/knowledge/ingest/batch", KnowledgeIngestionController, :create_batch
     get "/knowledge/ingestion-jobs", KnowledgeIngestionController, :index
 
+    # Knowledge Analytics (article usage tracking — orchestrator+)
+    get "/knowledge/analytics/top-articles",
+        KnowledgeAnalyticsController,
+        :top_articles
+
+    get "/knowledge/analytics/unused-articles",
+        KnowledgeAnalyticsController,
+        :unused_articles
+
+    get "/knowledge/analytics/agents/:agent_id",
+        KnowledgeAnalyticsController,
+        :agent_usage
+
+    get "/knowledge/articles/:id/stats",
+        KnowledgeAnalyticsController,
+        :article_stats
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index

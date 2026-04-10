@@ -93,6 +93,10 @@ config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 # DI: Use Req.Test plug for CLI HTTP client in tests
 config :loopctl, :cli_req_plug, {Req.Test, Loopctl.CLI.Client}
 
+# Knowledge analytics: record access events synchronously in tests so the
+# inserts run inside the test process and share its sandbox connection.
+config :loopctl, :analytics_recording_mode, :sync
+
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.
 config :loopctl, :rls_role, "loopctl_app"

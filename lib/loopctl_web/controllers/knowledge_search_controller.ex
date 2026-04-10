@@ -120,10 +120,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   @doc "GET /api/v1/knowledge/search"
   def search(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key_id = conn.assigns.current_api_key.id
 
     with {:ok, q} <- validate_query(params),
          {:ok, mode} <- validate_mode(params),
-         {:ok, opts} <- build_opts(params) do
+         {:ok, base_opts} <- build_opts(params) do
+      opts = Keyword.put(base_opts, :api_key_id, api_key_id)
+
       case execute_search(tenant_id, q, mode, opts) do
         {:ok, result} ->
           json(conn, LoopctlWeb.KnowledgeSearchJSON.search(result, mode))

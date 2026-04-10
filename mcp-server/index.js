@@ -528,6 +528,55 @@ async function knowledgeIngestionJobs() {
   return toContent(result);
 }
 
+// --- Knowledge Analytics Tools (orch key) ---
+
+async function knowledgeAnalyticsTop({ limit, since_days, access_type } = {}) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (since_days != null) params.set("since_days", String(since_days));
+  if (access_type) params.set("access_type", access_type);
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/analytics/top-articles?${qs}`
+    : "/api/v1/knowledge/analytics/top-articles";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeArticleStats({ article_id }) {
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/articles/${article_id}/stats`,
+    null,
+    process.env.LOOPCTL_ORCH_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeAgentUsage({ agent_id, limit, since_days } = {}) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (since_days != null) params.set("since_days", String(since_days));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/analytics/agents/${agent_id}?${qs}`
+    : `/api/v1/knowledge/analytics/agents/${agent_id}`;
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeUnusedArticles({ days_unused, limit } = {}) {
+  const params = new URLSearchParams();
+  if (days_unused != null) params.set("days_unused", String(days_unused));
+  if (limit != null) params.set("limit", String(limit));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/analytics/unused-articles?${qs}`
+    : "/api/v1/knowledge/analytics/unused-articles";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeExport({ project_id }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/export`
@@ -1437,6 +1486,106 @@ const TOOLS = [
     },
   },
 
+  // Knowledge Analytics Tools (orchestrator key)
+  {
+    name: "knowledge_analytics_top",
+    description:
+      "Return the top accessed knowledge articles for the tenant. " +
+      "Use to identify which articles agents actually read. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          description: "Max rows to return. Default 20, max 100.",
+          minimum: 1,
+          maximum: 100,
+        },
+        since_days: {
+          type: "integer",
+          description: "Look back this many days. Default 7.",
+          minimum: 1,
+          maximum: 365,
+        },
+        access_type: {
+          type: "string",
+          enum: ["search", "get", "context", "index"],
+          description: "Optional: restrict to a single access type.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_article_stats",
+    description:
+      "Return per-article usage statistics: total accesses, unique agents, " +
+      "by-type breakdown, and the 10 most recent events. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to inspect.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_agent_usage",
+    description:
+      "Return knowledge usage for a specific agent (api_key): total reads, " +
+      "unique articles, access type breakdown, and top read articles. " +
+      "Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "API key UUID identifying the agent identity.",
+        },
+        limit: {
+          type: "integer",
+          description: "Max top articles to return. Default 20, max 100.",
+          minimum: 1,
+          maximum: 100,
+        },
+        since_days: {
+          type: "integer",
+          description: "Look back this many days. Default 7.",
+          minimum: 1,
+          maximum: 365,
+        },
+      },
+      required: ["agent_id"],
+    },
+  },
+  {
+    name: "knowledge_unused_articles",
+    description:
+      "Return published articles that have not been accessed in the configured " +
+      "time window. Use to identify dead-weight knowledge. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days_unused: {
+          type: "integer",
+          description: "Window length in days. Default 30.",
+          minimum: 1,
+          maximum: 365,
+        },
+        limit: {
+          type: "integer",
+          description: "Max rows to return. Default 50, max 200.",
+          minimum: 1,
+          maximum: 200,
+        },
+      },
+      required: [],
+    },
+  },
+
   // Discovery Tools
   {
     name: "list_routes",
@@ -1588,6 +1737,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_ingestion_jobs":
       return await knowledgeIngestionJobs();
+
+    // Knowledge Analytics Tools
+    case "knowledge_analytics_top":
+      return await knowledgeAnalyticsTop(args);
+
+    case "knowledge_article_stats":
+      return await knowledgeArticleStats(args);
+
+    case "knowledge_agent_usage":
+      return await knowledgeAgentUsage(args);
+
+    case "knowledge_unused_articles":
+      return await knowledgeUnusedArticles(args);
 
     // Discovery Tools
     case "list_routes":
