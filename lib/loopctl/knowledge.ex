@@ -195,6 +195,113 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
+  Full-text keyword search on articles using PostgreSQL tsvector.
+
+  Uses `websearch_to_tsquery` for parsing the query string, weighted
+  `ts_rank_cd` for relevance ranking, and `ts_headline` for snippet
+  generation.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `query_string` -- the search query (max 500 characters)
+  - `opts` -- keyword list with:
+    - `:project_id` -- filter by project UUID (optional)
+    - `:category` -- filter by category atom (optional)
+    - `:status` -- filter by status atom (default: `:published`)
+    - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
+    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:offset` -- results to skip for pagination (default 0)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}` on success
+  - `{:error, :empty_query}` when query is empty or nil
+  - `{:error, :bad_request, String.t()}` when query exceeds 500 characters
+  """
+  @spec search_keyword(Ecto.UUID.t(), String.t() | nil, keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+          | {:error, atom()}
+          | {:error, atom(), String.t()}
+  def search_keyword(tenant_id, query_string, opts \\ [])
+
+  def search_keyword(_tenant_id, nil, _opts), do: {:error, :empty_query}
+  def search_keyword(_tenant_id, "", _opts), do: {:error, :empty_query}
+
+  def search_keyword(tenant_id, query_string, opts) do
+    query_string = String.trim(query_string)
+
+    cond do
+      query_string == "" ->
+        {:error, :empty_query}
+
+      String.length(query_string) > 500 ->
+        {:error, :bad_request, "Query too long (max 500 characters)"}
+
+      true ->
+        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+        offset = opts |> Keyword.get(:offset, 0) |> max(0)
+        status = Keyword.get(opts, :status, :published)
+
+        base_query =
+          from(a in Article,
+            where: a.tenant_id == ^tenant_id,
+            where: fragment("search_vector @@ websearch_to_tsquery('english', ?)", ^query_string),
+            select: %{
+              id: a.id,
+              tenant_id: a.tenant_id,
+              project_id: a.project_id,
+              title: a.title,
+              category: a.category,
+              status: a.status,
+              tags: a.tags,
+              inserted_at: a.inserted_at,
+              updated_at: a.updated_at,
+              relevance_score:
+                fragment(
+                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  ^query_string
+                ),
+              snippet:
+                fragment(
+                  "ts_headline('english', body, websearch_to_tsquery('english', ?), 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')",
+                  ^query_string
+                )
+            },
+            order_by: [
+              desc:
+                fragment(
+                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  ^query_string
+                )
+            ]
+          )
+
+        filtered_query = apply_search_filters(base_query, status, opts)
+
+        count_query = from(q in subquery(filtered_query), select: count())
+        total_count = AdminRepo.one(count_query)
+
+        results =
+          filtered_query
+          |> limit(^limit)
+          |> offset(^offset)
+          |> AdminRepo.all()
+
+        {:ok,
+         %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
+    end
+  end
+
+  defp apply_search_filters(query, status, opts) do
+    query
+    |> maybe_filter_by_status(status)
+    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> maybe_filter_by_category(Keyword.get(opts, :category))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+  end
+
+  @doc """
   Updates an existing article.
 
   Uses `update_changeset` and records the `article.updated` audit event.
