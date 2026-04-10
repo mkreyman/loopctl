@@ -39,6 +39,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Projects.Project
+  alias Loopctl.Webhooks.EventGenerator
 
   # --- Articles ---
 
@@ -93,6 +94,14 @@ defmodule Loopctl.Knowledge do
               "tags" => article.tags,
               "project_id" => article.project_id
             }
+          }
+        end)
+        |> EventGenerator.generate_events(:webhook_events, fn %{article: article} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "article.created",
+            project_id: article.project_id,
+            payload: article_event_payload(article)
           }
         end)
 
@@ -216,6 +225,8 @@ defmodule Loopctl.Knowledge do
       old_state = article_state_snapshot(article)
       changeset = Article.update_changeset(article, attrs)
 
+      changed_fields = changeset.changes |> Map.keys() |> Enum.map(&to_string/1)
+
       multi =
         Multi.new()
         |> Multi.update(:article, changeset)
@@ -230,6 +241,17 @@ defmodule Loopctl.Knowledge do
             actor_label: actor_label,
             old_state: old_state,
             new_state: article_state_snapshot(updated)
+          }
+        end)
+        |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "article.updated",
+            project_id: updated.project_id,
+            payload:
+              updated
+              |> article_event_payload()
+              |> Map.put("changed_fields", changed_fields)
           }
         end)
 
@@ -283,6 +305,18 @@ defmodule Loopctl.Knowledge do
             new_state: %{"status" => to_string(updated.status)}
           }
         end)
+        |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "article.archived",
+            project_id: updated.project_id,
+            payload: %{
+              "id" => updated.id,
+              "title" => updated.title,
+              "category" => to_string(updated.category)
+            }
+          }
+        end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{article: updated}} -> {:ok, updated}
@@ -331,6 +365,7 @@ defmodule Loopctl.Knowledge do
         |> Multi.insert(:link, changeset)
         |> maybe_supersede_target(tenant_id, target_id, rel_type)
         |> Audit.log_in_multi(:audit, &build_link_audit(tenant_id, &1, opts))
+        |> generate_link_created_events(tenant_id, source_id, target_id, rel_type)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{link: link}} -> {:ok, link}
@@ -382,6 +417,18 @@ defmodule Loopctl.Knowledge do
               old_state: %{
                 "source_article_id" => to_string(deleted.source_article_id),
                 "target_article_id" => to_string(deleted.target_article_id),
+                "relationship_type" => to_string(deleted.relationship_type)
+              }
+            }
+          end)
+          |> EventGenerator.generate_events(:webhook_events, fn %{link: deleted} ->
+            %{
+              tenant_id: tenant_id,
+              event_type: "article_link.deleted",
+              payload: %{
+                "id" => deleted.id,
+                "source_article_id" => deleted.source_article_id,
+                "target_article_id" => deleted.target_article_id,
                 "relationship_type" => to_string(deleted.relationship_type)
               }
             }
@@ -570,4 +617,60 @@ defmodule Loopctl.Knowledge do
       "metadata" => article.metadata
     }
   end
+
+  defp article_event_payload(article) do
+    %{
+      "id" => article.id,
+      "title" => article.title,
+      "category" => to_string(article.category),
+      "project_id" => article.project_id,
+      "status" => to_string(article.status),
+      "tags" => article.tags
+    }
+  end
+
+  defp generate_link_created_events(multi, tenant_id, source_id, target_id, rel_type) do
+    multi
+    |> EventGenerator.generate_events(:webhook_events, fn %{link: link} ->
+      source = AdminRepo.get!(Article, source_id)
+      target = AdminRepo.get!(Article, target_id)
+
+      %{
+        tenant_id: tenant_id,
+        event_type: "article_link.created",
+        payload: %{
+          "id" => link.id,
+          "source_article_id" => link.source_article_id,
+          "target_article_id" => link.target_article_id,
+          "relationship_type" => to_string(link.relationship_type),
+          "source_title" => source.title,
+          "target_title" => target.title
+        }
+      }
+    end)
+    |> maybe_generate_superseded_event(tenant_id, source_id, target_id, rel_type)
+  end
+
+  defp maybe_generate_superseded_event(multi, tenant_id, source_id, target_id, rel_type)
+       when rel_type in [:supersedes, "supersedes"] do
+    EventGenerator.generate_events(multi, :webhook_events_superseded, fn _changes ->
+      source = AdminRepo.get!(Article, source_id)
+      target = AdminRepo.get!(Article, target_id)
+
+      %{
+        tenant_id: tenant_id,
+        event_type: "article.superseded",
+        project_id: target.project_id,
+        payload: %{
+          "superseded_article_id" => target_id,
+          "superseded_title" => target.title,
+          "superseding_article_id" => source_id,
+          "superseding_title" => source.title
+        }
+      }
+    end)
+  end
+
+  defp maybe_generate_superseded_event(multi, _tenant_id, _source_id, _target_id, _rel_type),
+    do: multi
 end
