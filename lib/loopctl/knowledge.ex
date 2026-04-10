@@ -455,7 +455,6 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  @doc false
   # Batch-fetches linked article refs for all given article IDs in a single query.
   # Returns a map of article_id => [%{id, title, category}], capped at 5 per article.
   defp batch_linked_refs(_tenant_id, []), do: %{}
