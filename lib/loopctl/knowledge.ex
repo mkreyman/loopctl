@@ -2426,7 +2426,7 @@ defmodule Loopctl.Knowledge do
       from(a in base,
         where: a.source_type == "review_finding" and not is_nil(a.source_id),
         left_join: rr in ReviewRecord,
-        on: rr.id == a.source_id,
+        on: rr.id == a.source_id and rr.tenant_id == a.tenant_id,
         where: is_nil(rr.id),
         select: %{
           id: a.id,
