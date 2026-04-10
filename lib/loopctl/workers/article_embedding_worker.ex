@@ -43,6 +43,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   require Logger
 
   alias Loopctl.Knowledge
+  alias Loopctl.Workers.ArticleLinkingWorker
 
   @embedding_client Application.compile_env(
                       :loopctl,
@@ -74,8 +75,17 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
     with {:ok, embedding} <- @embedding_client.generate_embedding(text),
          {:ok, _article} <- Knowledge.update_embedding(tenant_id, article_id, embedding) do
+      enqueue_linking(article_id, tenant_id)
       :ok
     end
+  end
+
+  defp enqueue_linking(article_id, tenant_id) do
+    ArticleLinkingWorker.new(%{
+      article_id: article_id,
+      tenant_id: tenant_id
+    })
+    |> Oban.insert()
   end
 
   defp build_embedding_text(article) do
