@@ -201,6 +201,94 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
+  Returns a lightweight knowledge index of published articles.
+
+  The index includes only metadata fields (no body, embedding, or metadata)
+  and groups results by category, sorted by `updated_at` descending within
+  each group.
+
+  Results are capped at 1000 articles. When the total exceeds 1000,
+  `meta.truncated` is set to `true` and `meta.total_count` reflects the
+  full count.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list with:
+    - `:project_id` -- when provided, includes both tenant-wide (nil project_id)
+      and project-specific articles
+
+  ## Returns
+
+  - `{:ok, %{articles: %{category => [map()]}, meta: map()}}`
+  """
+  @spec list_index(Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             articles: %{optional(String.t()) => [map()]},
+             meta: %{
+               total_count: non_neg_integer(),
+               categories: %{optional(String.t()) => non_neg_integer()},
+               truncated: boolean()
+             }
+           }}
+  def list_index(tenant_id, opts \\ []) do
+    project_id = Keyword.get(opts, :project_id)
+
+    query =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published,
+        select: %{
+          id: a.id,
+          title: a.title,
+          category: a.category,
+          tags: a.tags,
+          status: a.status,
+          updated_at: a.updated_at
+        },
+        order_by: [asc: a.category, desc: a.updated_at]
+      )
+
+    query =
+      if project_id do
+        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+      else
+        query
+      end
+
+    # Get total count via subquery
+    count_query = from(q in subquery(query), select: count())
+    total_count = AdminRepo.one(count_query)
+
+    # Cap at 1000
+    results =
+      query
+      |> limit(1000)
+      |> AdminRepo.all()
+
+    truncated = total_count > 1000
+
+    # Group by category (convert enum atoms to strings for JSON)
+    grouped =
+      Enum.group_by(results, fn article ->
+        to_string(article.category)
+      end)
+
+    categories = Map.new(grouped, fn {cat, arts} -> {cat, length(arts)} end)
+
+    {:ok,
+     %{
+       articles: grouped,
+       meta: %{
+         total_count: total_count,
+         categories: categories,
+         truncated: truncated
+       }
+     }}
+  end
+
+  @doc """
   Full-text keyword search on articles using PostgreSQL tsvector.
 
   Uses `websearch_to_tsquery` for parsing the query string, weighted
