@@ -38,6 +38,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Projects.Project
 
   # --- Articles ---
 
@@ -62,39 +63,43 @@ defmodule Loopctl.Knowledge do
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Article.t()} | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
-    actor_id = Keyword.get(opts, :actor_id)
-    actor_label = Keyword.get(opts, :actor_label)
-    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    project_id = attrs[:project_id] || attrs["project_id"]
 
-    changeset =
-      %Article{tenant_id: tenant_id}
-      |> Article.create_changeset(attrs)
+    with :ok <- validate_project_ownership(tenant_id, project_id) do
+      actor_id = Keyword.get(opts, :actor_id)
+      actor_label = Keyword.get(opts, :actor_label)
+      actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    multi =
-      Multi.new()
-      |> Multi.insert(:article, changeset)
-      |> Audit.log_in_multi(:audit, fn %{article: article} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "article",
-          entity_id: article.id,
-          action: "article.created",
-          actor_type: actor_type,
-          actor_id: actor_id,
-          actor_label: actor_label,
-          new_state: %{
-            "title" => article.title,
-            "category" => to_string(article.category),
-            "status" => to_string(article.status),
-            "tags" => article.tags,
-            "project_id" => article.project_id
+      changeset =
+        %Article{tenant_id: tenant_id}
+        |> Article.create_changeset(attrs)
+
+      multi =
+        Multi.new()
+        |> Multi.insert(:article, changeset)
+        |> Audit.log_in_multi(:audit, fn %{article: article} ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "article",
+            entity_id: article.id,
+            action: "article.created",
+            actor_type: actor_type,
+            actor_id: actor_id,
+            actor_label: actor_label,
+            new_state: %{
+              "title" => article.title,
+              "category" => to_string(article.category),
+              "status" => to_string(article.status),
+              "tags" => article.tags,
+              "project_id" => article.project_id
+            }
           }
-        }
-      end)
+        end)
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{article: article}} -> {:ok, article}
-      {:error, :article, changeset, _} -> {:error, changeset}
+      case AdminRepo.transaction(multi) do
+        {:ok, %{article: article}} -> {:ok, article}
+        {:error, :article, changeset, _} -> {:error, changeset}
+      end
     end
   end
 
@@ -201,11 +206,13 @@ defmodule Loopctl.Knowledge do
   @spec update_article(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
   def update_article(tenant_id, article_id, attrs, opts \\ []) do
-    actor_id = Keyword.get(opts, :actor_id)
-    actor_label = Keyword.get(opts, :actor_label)
-    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    project_id = attrs[:project_id] || attrs["project_id"]
 
-    with {:ok, article} <- fetch_article(tenant_id, article_id) do
+    with :ok <- validate_project_ownership(tenant_id, project_id),
+         {:ok, article} <- fetch_article(tenant_id, article_id) do
+      actor_id = Keyword.get(opts, :actor_id)
+      actor_label = Keyword.get(opts, :actor_label)
+      actor_type = Keyword.get(opts, :actor_type, "api_key")
       old_state = article_state_snapshot(article)
       changeset = Article.update_changeset(article, attrs)
 
@@ -414,6 +421,21 @@ defmodule Loopctl.Knowledge do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
       nil -> {:error, :not_found}
       article -> {:ok, article}
+    end
+  end
+
+  defp validate_project_ownership(_tenant_id, nil), do: :ok
+
+  defp validate_project_ownership(tenant_id, project_id) do
+    case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
+      nil ->
+        {:error,
+         %Article{}
+         |> Ecto.Changeset.change()
+         |> Ecto.Changeset.add_error(:project_id, "does not belong to this tenant")}
+
+      _project ->
+        :ok
     end
   end
 

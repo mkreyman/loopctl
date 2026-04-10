@@ -229,6 +229,13 @@ defmodule LoopctlWeb.Router do
 
     # Skill results
     post "/skill_results", SkillResultController, :create
+
+    # Knowledge Wiki (Epic 19)
+    resources "/articles", ArticleController, except: [:new, :edit]
+
+    scope "/projects/:project_id" do
+      resources "/articles", ArticleController, only: [:create, :index], as: :project_article
+    end
   end
 
   # Superadmin endpoints (Epic 11)
