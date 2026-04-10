@@ -618,9 +618,21 @@ defmodule Loopctl.Progress do
 
   defp enqueue_knowledge_extraction(multi, tenant_id) do
     Multi.run(multi, :enqueue_knowledge_worker, fn _repo, %{review_record: rr} ->
-      ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
-      |> Oban.insert()
+      tenant = AdminRepo.get(Tenants.Tenant, tenant_id)
+
+      if knowledge_auto_extract_enabled?(tenant) do
+        ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
+        |> Oban.insert()
+      else
+        {:ok, :skipped}
+      end
     end)
+  end
+
+  defp knowledge_auto_extract_enabled?(nil), do: true
+
+  defp knowledge_auto_extract_enabled?(%Tenants.Tenant{settings: settings}) do
+    Map.get(settings || %{}, "knowledge_auto_extract", true) != false
   end
 
   defp handle_review_transaction(

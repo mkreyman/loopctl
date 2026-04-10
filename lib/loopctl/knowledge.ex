@@ -2417,6 +2417,134 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
+  # --- Pipeline Status ---
+
+  @doc """
+  Returns knowledge pipeline status for a tenant.
+
+  Includes:
+  - `pending_extractions` -- count of available/scheduled ReviewKnowledgeWorker jobs
+  - `recent_drafts` -- 20 most recent draft articles with source_type "review_finding"
+  - `publish_rate` -- ratio of published to total (published + draft) review_finding articles
+  - `extraction_errors` -- count and 5 most recent failed/discarded extraction jobs
+  - `auto_extract_enabled` -- current tenant setting (default true)
+
+  All queries filter by tenant_id in SQL via the Oban job args JSONB field.
+  """
+  @spec pipeline_status(Ecto.UUID.t()) :: {:ok, map()}
+  def pipeline_status(tenant_id) do
+    tenant = AdminRepo.get(Loopctl.Tenants.Tenant, tenant_id)
+
+    auto_extract_enabled =
+      case tenant do
+        nil -> true
+        %{settings: settings} -> Map.get(settings || %{}, "knowledge_auto_extract", true) != false
+      end
+
+    pending = count_pending_extractions(tenant_id)
+    drafts = list_recent_drafts(tenant_id)
+    rate = calculate_publish_rate(tenant_id)
+    errors = list_extraction_errors(tenant_id)
+
+    {:ok,
+     %{
+       pending_extractions: pending,
+       recent_drafts: drafts,
+       publish_rate: rate,
+       extraction_errors: errors,
+       auto_extract_enabled: auto_extract_enabled
+     }}
+  end
+
+  defp count_pending_extractions(tenant_id) do
+    seven_days_ago = DateTime.add(DateTime.utc_now(), -7, :day)
+    tenant_id_str = to_string(tenant_id)
+
+    from(j in "oban_jobs",
+      where:
+        j.worker == "Loopctl.Workers.ReviewKnowledgeWorker" and
+          j.state in ["available", "scheduled"] and
+          j.inserted_at > ^seven_days_ago and
+          fragment("? ->> 'tenant_id' = ?", j.args, ^tenant_id_str),
+      select: count(j.id)
+    )
+    |> AdminRepo.one()
+  end
+
+  defp list_recent_drafts(tenant_id) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and
+          a.status == :draft and
+          a.source_type == "review_finding",
+      order_by: [desc: a.inserted_at],
+      limit: 20,
+      select: %{
+        id: a.id,
+        title: a.title,
+        source_id: a.source_id,
+        inserted_at: a.inserted_at
+      }
+    )
+    |> AdminRepo.all()
+  end
+
+  defp calculate_publish_rate(tenant_id) do
+    counts =
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and
+            a.source_type == "review_finding" and
+            a.status in [:draft, :published],
+        group_by: a.status,
+        select: {a.status, count(a.id)}
+      )
+      |> AdminRepo.all()
+      |> Map.new()
+
+    published = Map.get(counts, :published, 0)
+    draft = Map.get(counts, :draft, 0)
+    total = published + draft
+
+    if total == 0, do: 0.0, else: published / total
+  end
+
+  defp list_extraction_errors(tenant_id) do
+    tenant_id_str = to_string(tenant_id)
+
+    error_count =
+      from(j in "oban_jobs",
+        where:
+          j.worker == "Loopctl.Workers.ReviewKnowledgeWorker" and
+            j.state in ["retryable", "discarded"] and
+            fragment("? ->> 'tenant_id' = ?", j.args, ^tenant_id_str),
+        select: count(j.id)
+      )
+      |> AdminRepo.one()
+
+    recent_errors =
+      from(j in "oban_jobs",
+        where:
+          j.worker == "Loopctl.Workers.ReviewKnowledgeWorker" and
+            j.state in ["retryable", "discarded"] and
+            fragment("? ->> 'tenant_id' = ?", j.args, ^tenant_id_str),
+        order_by: [desc: j.attempted_at],
+        limit: 5,
+        select: %{
+          id: j.id,
+          state: j.state,
+          error_reason: fragment("?[array_length(?, 1)]", j.errors, j.errors),
+          attempted_at: j.attempted_at
+        }
+      )
+      |> AdminRepo.all()
+
+    %{
+      count: error_count,
+      recent: recent_errors
+    }
+  end
+
   defp find_broken_sources(base) do
     # Find articles with source_type "review_finding" whose source_id
     # no longer exists in the review_records table

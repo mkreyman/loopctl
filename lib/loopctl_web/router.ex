@@ -256,6 +256,9 @@ defmodule LoopctlWeb.Router do
     # Knowledge Lint (quality analysis report)
     get "/knowledge/lint", KnowledgeLintController, :lint
 
+    # Knowledge Pipeline (self-learning pipeline status)
+    get "/knowledge/pipeline", KnowledgePipelineController, :status
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
