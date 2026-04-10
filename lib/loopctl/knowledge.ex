@@ -228,66 +228,68 @@ defmodule Loopctl.Knowledge do
   def search_keyword(_tenant_id, nil, _opts), do: {:error, :empty_query}
   def search_keyword(_tenant_id, "", _opts), do: {:error, :empty_query}
 
-  def search_keyword(_tenant_id, query_string, _opts) when byte_size(query_string) > 500 do
-    {:error, :bad_request, "Query too long (max 500 characters)"}
-  end
-
   def search_keyword(tenant_id, query_string, opts) do
     query_string = String.trim(query_string)
 
-    if query_string == "" do
-      {:error, :empty_query}
-    else
-      limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
-      offset = opts |> Keyword.get(:offset, 0) |> max(0)
-      status = Keyword.get(opts, :status, :published)
+    cond do
+      query_string == "" ->
+        {:error, :empty_query}
 
-      base_query =
-        from(a in Article,
-          where: a.tenant_id == ^tenant_id,
-          where: fragment("search_vector @@ websearch_to_tsquery('english', ?)", ^query_string),
-          select: %{
-            id: a.id,
-            tenant_id: a.tenant_id,
-            project_id: a.project_id,
-            title: a.title,
-            category: a.category,
-            status: a.status,
-            tags: a.tags,
-            inserted_at: a.inserted_at,
-            updated_at: a.updated_at,
-            relevance_score:
-              fragment(
-                "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
-                ^query_string
-              ),
-            snippet:
-              fragment(
-                "ts_headline('english', body, websearch_to_tsquery('english', ?), 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')",
-                ^query_string
-              )
-          },
-          order_by: [
-            desc:
-              fragment(
-                "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
-                ^query_string
-              )
-          ]
-        )
+      String.length(query_string) > 500 ->
+        {:error, :bad_request, "Query too long (max 500 characters)"}
 
-      filtered_query = apply_search_filters(base_query, status, opts)
+      true ->
+        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+        offset = opts |> Keyword.get(:offset, 0) |> max(0)
+        status = Keyword.get(opts, :status, :published)
 
-      count_query = from(q in subquery(filtered_query), select: count())
-      total_count = AdminRepo.one(count_query)
+        base_query =
+          from(a in Article,
+            where: a.tenant_id == ^tenant_id,
+            where: fragment("search_vector @@ websearch_to_tsquery('english', ?)", ^query_string),
+            select: %{
+              id: a.id,
+              tenant_id: a.tenant_id,
+              project_id: a.project_id,
+              title: a.title,
+              category: a.category,
+              status: a.status,
+              tags: a.tags,
+              inserted_at: a.inserted_at,
+              updated_at: a.updated_at,
+              relevance_score:
+                fragment(
+                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  ^query_string
+                ),
+              snippet:
+                fragment(
+                  "ts_headline('english', body, websearch_to_tsquery('english', ?), 'StartSel=**, StopSel=**, MaxWords=35, MinWords=15')",
+                  ^query_string
+                )
+            },
+            order_by: [
+              desc:
+                fragment(
+                  "ts_rank_cd(search_vector, websearch_to_tsquery('english', ?))",
+                  ^query_string
+                )
+            ]
+          )
 
-      results =
-        filtered_query
-        |> limit(^limit)
-        |> offset(^offset)
-        |> AdminRepo.all()
+        filtered_query = apply_search_filters(base_query, status, opts)
 
-      {:ok, %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
+        count_query = from(q in subquery(filtered_query), select: count())
+        total_count = AdminRepo.one(count_query)
+
+        results =
+          filtered_query
+          |> limit(^limit)
+          |> offset(^offset)
+          |> AdminRepo.all()
+
+        {:ok,
+         %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
     end
   end
 
