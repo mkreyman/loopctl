@@ -26,6 +26,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.WorkBreakdown.StoryDependency
+  alias Loopctl.Workers.ReviewKnowledgeWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
 
   # --- Agent Status Transitions (US-7.1) ---
@@ -578,20 +579,7 @@ defmodule Loopctl.Progress do
     with {:ok, story} <- fetch_story_for_review(tenant_id, story_id),
          :ok <- validate_story_reported_done(story),
          :ok <- validate_not_self_review(story, reviewer_agent_id) do
-      completed_at =
-        Map.get(params, "completed_at") ||
-          Map.get(params, :completed_at) ||
-          DateTime.utc_now()
-
-      attrs = %{
-        review_type: Map.get(params, "review_type") || Map.get(params, :review_type),
-        findings_count: Map.get(params, "findings_count") || Map.get(params, :findings_count, 0),
-        fixes_count: Map.get(params, "fixes_count") || Map.get(params, :fixes_count, 0),
-        disproved_count:
-          Map.get(params, "disproved_count") || Map.get(params, :disproved_count, 0),
-        summary: Map.get(params, "summary") || Map.get(params, :summary),
-        completed_at: completed_at
-      }
+      attrs = build_review_attrs(params)
 
       changeset =
         %ReviewRecord{
@@ -601,21 +589,67 @@ defmodule Loopctl.Progress do
         }
         |> ReviewRecord.create_changeset(attrs)
 
-      with {:ok, review_record} <- AdminRepo.insert(changeset) do
-        insert_events_with_delivery(tenant_id, "story.review_completed", story.project_id, %{
-          "event" => "story.review_completed",
-          "story_id" => story_id,
-          "project_id" => story.project_id,
-          "epic_id" => story.epic_id,
-          "reviewer_agent_id" => reviewer_agent_id,
-          "review_type" => attrs.review_type,
-          "findings_count" => attrs.findings_count,
-          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-        })
+      multi =
+        Multi.new()
+        |> Multi.insert(:review_record, changeset)
+        |> enqueue_knowledge_extraction(tenant_id)
 
-        {:ok, review_record}
-      end
+      handle_review_transaction(
+        AdminRepo.transaction(multi),
+        tenant_id,
+        story,
+        attrs,
+        reviewer_agent_id
+      )
     end
+  end
+
+  defp build_review_attrs(params) do
+    %{
+      review_type: Map.get(params, "review_type") || Map.get(params, :review_type),
+      findings_count: Map.get(params, "findings_count") || Map.get(params, :findings_count, 0),
+      fixes_count: Map.get(params, "fixes_count") || Map.get(params, :fixes_count, 0),
+      disproved_count: Map.get(params, "disproved_count") || Map.get(params, :disproved_count, 0),
+      summary: Map.get(params, "summary") || Map.get(params, :summary),
+      completed_at:
+        Map.get(params, "completed_at") || Map.get(params, :completed_at) || DateTime.utc_now()
+    }
+  end
+
+  defp enqueue_knowledge_extraction(multi, tenant_id) do
+    Multi.run(multi, :enqueue_knowledge_worker, fn _repo, %{review_record: rr} ->
+      ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
+      |> Oban.insert()
+    end)
+  end
+
+  defp handle_review_transaction(
+         {:ok, %{review_record: review_record}},
+         tenant_id,
+         story,
+         attrs,
+         reviewer_agent_id
+       ) do
+    insert_events_with_delivery(tenant_id, "story.review_completed", story.project_id, %{
+      "event" => "story.review_completed",
+      "story_id" => story.id,
+      "project_id" => story.project_id,
+      "epic_id" => story.epic_id,
+      "reviewer_agent_id" => reviewer_agent_id,
+      "review_type" => attrs.review_type,
+      "findings_count" => attrs.findings_count,
+      "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+    })
+
+    {:ok, review_record}
+  end
+
+  defp handle_review_transaction({:error, :review_record, changeset, _}, _, _, _, _) do
+    {:error, changeset}
+  end
+
+  defp handle_review_transaction({:error, :enqueue_knowledge_worker, reason, _}, _, _, _, _) do
+    {:error, reason}
   end
 
   defp fetch_story_for_review(tenant_id, story_id) do

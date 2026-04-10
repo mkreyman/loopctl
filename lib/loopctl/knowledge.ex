@@ -163,6 +163,7 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (optional)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
+    - `:source_type` -- filter by source_type string (optional)
     - `:limit` -- max records to return (default 20, max 100)
     - `:offset` -- records to skip for pagination (default 0)
 
@@ -964,6 +965,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_status(Keyword.get(opts, :status))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+    |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
   end
 
   defp maybe_filter_by_project_id(query, nil), do: query
@@ -989,6 +991,12 @@ defmodule Loopctl.Knowledge do
 
   defp maybe_filter_by_tags(query, tags) when is_list(tags) do
     where(query, [a], fragment("? && ?", a.tags, ^tags))
+  end
+
+  defp maybe_filter_by_source_type(query, nil), do: query
+
+  defp maybe_filter_by_source_type(query, source_type) do
+    where(query, [a], a.source_type == ^source_type)
   end
 
   defp validate_articles_exist(tenant_id, source_id, target_id) do
