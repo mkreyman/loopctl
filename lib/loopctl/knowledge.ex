@@ -40,6 +40,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
+  alias Loopctl.Workers.ArticleEmbeddingWorker
 
   # --- Articles ---
 
@@ -75,6 +76,10 @@ defmodule Loopctl.Knowledge do
         %Article{tenant_id: tenant_id}
         |> Article.create_changeset(attrs)
 
+      # Content is always "changed" on create (title + body are required).
+      # Only enqueue embedding if the article will be published.
+      needs_embedding? = content_or_publish_changed?(changeset)
+
       multi =
         Multi.new()
         |> Multi.insert(:article, changeset)
@@ -104,6 +109,7 @@ defmodule Loopctl.Knowledge do
             payload: article_event_payload(article)
           }
         end)
+        |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{article: article}} -> {:ok, article}
@@ -334,6 +340,10 @@ defmodule Loopctl.Knowledge do
 
       changed_fields = changeset.changes |> Map.keys() |> Enum.map(&to_string/1)
 
+      # Check changeset BEFORE Multi: only enqueue embedding when
+      # title/body changed OR status transitions to :published.
+      needs_embedding? = content_or_publish_changed?(changeset)
+
       multi =
         Multi.new()
         |> Multi.update(:article, changeset)
@@ -361,6 +371,7 @@ defmodule Loopctl.Knowledge do
               |> Map.put("changed_fields", changed_fields)
           }
         end)
+        |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{article: updated}} -> {:ok, updated}
@@ -839,4 +850,31 @@ defmodule Loopctl.Knowledge do
 
   defp maybe_generate_superseded_event(multi, _tenant_id, _source_id, _target_id, _rel_type),
     do: multi
+
+  # --- Embedding helpers ---
+
+  # Returns true when the changeset includes title/body changes or a
+  # status transition to :published. Used BEFORE the Multi executes so
+  # the decision is based on the changeset, not the DB result.
+  defp content_or_publish_changed?(changeset) do
+    content_changed? =
+      Map.has_key?(changeset.changes, :title) or Map.has_key?(changeset.changes, :body)
+
+    status_changed_to_published? = changeset.changes[:status] == :published
+
+    content_changed? or status_changed_to_published?
+  end
+
+  defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi
+
+  defp maybe_enqueue_embedding(multi, tenant_id, true) do
+    Multi.run(multi, :embedding_job, fn _repo, %{article: article} ->
+      if article.status == :published do
+        ArticleEmbeddingWorker.new(%{article_id: article.id, tenant_id: tenant_id})
+        |> Oban.insert()
+      else
+        {:ok, :skipped}
+      end
+    end)
+  end
 end

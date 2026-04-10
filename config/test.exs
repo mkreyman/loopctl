@@ -75,6 +75,9 @@ config :loopctl, :cost_rollup, Loopctl.MockCostRollup
 # DI: Use mock token archival in tests
 config :loopctl, :token_archival, Loopctl.MockTokenArchival
 
+# DI: Use mock embedding client in tests
+config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
+
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 
