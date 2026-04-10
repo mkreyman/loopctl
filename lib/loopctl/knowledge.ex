@@ -1439,9 +1439,30 @@ defmodule Loopctl.Knowledge do
         {:error, :not_found}
 
       article ->
-        article
-        |> Article.embedding_changeset(embedding_vector)
-        |> AdminRepo.update()
+        changeset = Article.embedding_changeset(article, embedding_vector)
+
+        multi =
+          Multi.new()
+          |> Multi.update(:article, changeset)
+          |> Audit.log_in_multi(:audit, fn %{article: updated} ->
+            %{
+              tenant_id: tenant_id,
+              entity_type: "article",
+              entity_id: updated.id,
+              action: "article.embedding_updated",
+              actor_type: "system",
+              actor_id: nil,
+              actor_label: "worker:embedding",
+              new_state: %{
+                "embedding_dimensions" => embedding_dimensions(updated.embedding)
+              }
+            }
+          end)
+
+        case AdminRepo.transaction(multi) do
+          {:ok, %{article: article}} -> {:ok, article}
+          {:error, :article, changeset, _} -> {:error, changeset}
+        end
     end
   end
 
@@ -1466,13 +1487,36 @@ defmodule Loopctl.Knowledge do
         {:error, :not_found}
 
       article ->
-        article
-        |> Ecto.Changeset.change(embedding: nil)
-        |> AdminRepo.update()
+        changeset = Ecto.Changeset.change(article, embedding: nil)
+
+        multi =
+          Multi.new()
+          |> Multi.update(:article, changeset)
+          |> Audit.log_in_multi(:audit, fn %{article: updated} ->
+            %{
+              tenant_id: tenant_id,
+              entity_type: "article",
+              entity_id: updated.id,
+              action: "article.embedding_cleared",
+              actor_type: "system",
+              actor_id: nil,
+              actor_label: "worker:embedding",
+              new_state: %{"embedding_dimensions" => nil}
+            }
+          end)
+
+        case AdminRepo.transaction(multi) do
+          {:ok, %{article: article}} -> {:ok, article}
+          {:error, :article, changeset, _} -> {:error, changeset}
+        end
     end
   end
 
   # --- Private helpers ---
+
+  defp embedding_dimensions(nil), do: nil
+  defp embedding_dimensions(embedding) when is_list(embedding), do: length(embedding)
+  defp embedding_dimensions(%Pgvector{} = vector), do: length(Pgvector.to_list(vector))
 
   defp fetch_article(tenant_id, article_id) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
