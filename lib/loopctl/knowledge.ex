@@ -628,8 +628,8 @@ defmodule Loopctl.Knowledge do
   defp generate_link_created_events(multi, tenant_id, source_id, target_id, rel_type) do
     multi
     |> EventGenerator.generate_events(:webhook_events, fn %{link: link} ->
-      source = AdminRepo.get!(Article, source_id)
-      target = AdminRepo.get!(Article, target_id)
+      source = AdminRepo.get_by!(Article, id: source_id, tenant_id: tenant_id)
+      target = AdminRepo.get_by!(Article, id: target_id, tenant_id: tenant_id)
 
       %{
         tenant_id: tenant_id,
@@ -650,8 +650,8 @@ defmodule Loopctl.Knowledge do
   defp maybe_generate_superseded_event(multi, tenant_id, source_id, target_id, rel_type)
        when rel_type in [:supersedes, "supersedes"] do
     EventGenerator.generate_events(multi, :webhook_events_superseded, fn _changes ->
-      source = AdminRepo.get!(Article, source_id)
-      target = AdminRepo.get!(Article, target_id)
+      source = AdminRepo.get_by!(Article, id: source_id, tenant_id: tenant_id)
+      target = AdminRepo.get_by!(Article, id: target_id, tenant_id: tenant_id)
 
       %{
         tenant_id: tenant_id,
