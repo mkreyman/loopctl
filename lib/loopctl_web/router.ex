@@ -236,6 +236,9 @@ defmodule LoopctlWeb.Router do
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index
 
+    # Knowledge Search (unified keyword / semantic / combined)
+    get "/knowledge/search", KnowledgeSearchController, :search
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
