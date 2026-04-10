@@ -153,6 +153,34 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
+  Fetches a single article by tenant and ID, including the embedding vector.
+
+  The `embedding` field uses `load_in_query: false` to avoid loading the
+  (potentially large) vector on every query. This function explicitly
+  selects the embedding for callers that need it (e.g., embedding and
+  linking workers).
+
+  ## Returns
+
+  - `{:ok, %Article{}}` with the `embedding` field populated
+  - `{:error, :not_found}` if not found or belongs to another tenant
+  """
+  @spec get_article_with_embedding(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Article.t()} | {:error, :not_found}
+  def get_article_with_embedding(tenant_id, article_id) do
+    query =
+      from(a in Article,
+        where: a.id == ^article_id and a.tenant_id == ^tenant_id,
+        select_merge: %{embedding: a.embedding}
+      )
+
+    case AdminRepo.one(query) do
+      nil -> {:error, :not_found}
+      article -> {:ok, article}
+    end
+  end
+
+  @doc """
   Lists articles for a tenant with optional filtering and pagination.
 
   ## Parameters

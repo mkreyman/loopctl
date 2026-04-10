@@ -29,8 +29,8 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
       assert updated.id == article.id
       assert updated.embedding != nil
 
-      # Reload from DB to verify the stored vector has correct dimensions
-      assert {:ok, reloaded} = Knowledge.get_article(tenant.id, article.id)
+      # Reload from DB with embedding explicitly selected (load_in_query: false)
+      assert {:ok, reloaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       stored = Pgvector.to_list(reloaded.embedding)
       assert length(stored) == 1536
       assert Enum.all?(stored, &(abs(&1 - 0.1) < 0.001))
@@ -66,8 +66,8 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
       assert {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, first_embedding)
       assert {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, second_embedding)
 
-      # Reload from DB to verify the overwritten value
-      assert {:ok, reloaded} = Knowledge.get_article(tenant.id, article.id)
+      # Reload from DB with embedding explicitly selected (load_in_query: false)
+      assert {:ok, reloaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       stored = Pgvector.to_list(reloaded.embedding)
       assert Enum.all?(stored, &(abs(&1 - 0.9) < 0.001))
     end
@@ -127,8 +127,8 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
 
       assert updated.title == "Updated Title"
 
-      # Reload to verify embedding is preserved
-      assert {:ok, reloaded} = Knowledge.get_article(tenant.id, article.id)
+      # Reload with embedding explicitly selected (load_in_query: false)
+      assert {:ok, reloaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert reloaded.embedding != nil
       assert length(Pgvector.to_list(reloaded.embedding)) == 1536
     end
