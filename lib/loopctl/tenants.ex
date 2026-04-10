@@ -59,9 +59,14 @@ defmodule Loopctl.Tenants do
 
   @doc """
   Updates a tenant with the given attributes.
+
+  When `settings` is provided in attrs, it is merged into the existing
+  settings map (provided keys override, unspecified keys preserved).
   """
   @spec update_tenant(Tenant.t(), map()) :: {:ok, Tenant.t()} | {:error, Ecto.Changeset.t()}
   def update_tenant(%Tenant{} = tenant, attrs) do
+    attrs = merge_settings(tenant, attrs)
+
     tenant
     |> Tenant.update_changeset(attrs)
     |> AdminRepo.update()

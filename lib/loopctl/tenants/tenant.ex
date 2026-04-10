@@ -98,12 +98,25 @@ defmodule Loopctl.Tenants.Tenant do
 
   defp validate_settings(changeset) do
     validate_change(changeset, :settings, fn :settings, value ->
-      if is_map(value) and not is_struct(value) do
-        []
-      else
-        [settings: "must be a map"]
+      cond do
+        not is_map(value) or is_struct(value) ->
+          [settings: "must be a map"]
+
+        not valid_knowledge_auto_extract?(value) ->
+          [settings: "knowledge_auto_extract must be a boolean"]
+
+        true ->
+          []
       end
     end)
+  end
+
+  defp valid_knowledge_auto_extract?(settings) do
+    case Map.get(settings, "knowledge_auto_extract") do
+      nil -> true
+      val when is_boolean(val) -> true
+      _ -> false
+    end
   end
 
   # AC-21.14.6: Minimum 30 days. nil disables retention.
