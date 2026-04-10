@@ -907,51 +907,74 @@ defmodule Loopctl.Knowledge do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    with {:ok, article} <- fetch_article(tenant_id, article_id),
-         :ok <- validate_transition(article.status, target_status) do
-      old_status = to_string(article.status)
-      changeset = Article.update_changeset(article, %{status: target_status})
+    needs_embedding? = target_status == :published
 
-      needs_embedding? = target_status == :published
+    # Fetch-and-lock inside the transaction to eliminate TOCTOU races where
+    # concurrent requests could change the status between validation and update.
+    multi =
+      Multi.new()
+      |> Multi.run(:fetch, fn _repo, _changes ->
+        query =
+          from(a in Article,
+            where: a.id == ^article_id and a.tenant_id == ^tenant_id,
+            lock: "FOR UPDATE"
+          )
 
-      multi =
-        Multi.new()
-        |> Multi.update(:article, changeset)
-        |> Audit.log_in_multi(:audit, fn %{article: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "article",
-            entity_id: updated.id,
-            action: audit_action,
-            actor_type: actor_type,
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{"status" => old_status},
-            new_state: %{"status" => to_string(updated.status)}
-          }
-        end)
-        |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
-          %{
-            tenant_id: tenant_id,
-            event_type: audit_action,
-            project_id: updated.project_id,
-            payload: article_event_payload(updated)
-          }
-        end)
-        |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+        case AdminRepo.one(query) do
+          nil -> {:error, {:not_found, nil}}
+          article -> validate_transition_and_wrap(article, target_status)
+        end
+      end)
+      |> Multi.run(:article, fn _repo, %{fetch: {article, _old_status}} ->
+        changeset = Article.update_changeset(article, %{status: target_status})
+        AdminRepo.update(changeset)
+      end)
+      |> Audit.log_in_multi(:audit, fn %{fetch: {_article, old_status}, article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "article",
+          entity_id: updated.id,
+          action: audit_action,
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"status" => old_status},
+          new_state: %{"status" => to_string(updated.status)}
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: audit_action,
+          project_id: updated.project_id,
+          payload: article_event_payload(updated)
+        }
+      end)
+      |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{article: updated}} -> {:ok, updated}
-        {:error, :article, changeset, _} -> {:error, changeset}
-      end
+    case AdminRepo.transaction(multi) do
+      {:ok, %{article: updated}} ->
+        {:ok, updated}
+
+      {:error, :fetch, {:not_found, _}, _} ->
+        {:error, :not_found}
+
+      {:error, :fetch, {:unprocessable_entity, message}, _} ->
+        {:error, :unprocessable_entity, message}
+
+      {:error, :article, changeset, _} ->
+        {:error, changeset}
     end
   end
 
-  defp validate_transition(from, to) do
-    if Article.valid_transition?(from, to) do
-      :ok
+  # Validates the transition and wraps the result for Multi.run compatibility.
+  # Returns {:ok, {article, old_status_string}} or {:error, {error_type, detail}}.
+  defp validate_transition_and_wrap(article, target_status) do
+    if Article.valid_transition?(article.status, target_status) do
+      {:ok, {article, to_string(article.status)}}
     else
-      {:error, :unprocessable_entity, "Cannot transition from #{from} to #{to}"}
+      {:error,
+       {:unprocessable_entity, "Cannot transition from #{article.status} to #{target_status}"}}
     end
   end
 
