@@ -1403,7 +1403,8 @@ defmodule Loopctl.Knowledge do
       where: l.tenant_id == ^tenant_id,
       where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
       preload: [:source_article, :target_article],
-      order_by: [desc: l.inserted_at]
+      order_by: [desc: l.inserted_at],
+      limit: 100
     )
     |> AdminRepo.all()
   end

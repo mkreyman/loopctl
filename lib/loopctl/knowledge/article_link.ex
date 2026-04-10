@@ -57,6 +57,7 @@ defmodule Loopctl.Knowledge.ArticleLink do
     |> cast(attrs, @cast_fields)
     |> validate_required([:source_article_id, :target_article_id, :relationship_type])
     |> validate_no_self_link()
+    |> validate_metadata()
     |> foreign_key_constraint(:source_article_id)
     |> foreign_key_constraint(:target_article_id)
     |> unique_constraint(
@@ -64,6 +65,16 @@ defmodule Loopctl.Knowledge.ArticleLink do
       name: :article_links_tenant_src_tgt_rel_index,
       message: "link already exists between these articles with this relationship type"
     )
+  end
+
+  defp validate_metadata(changeset) do
+    validate_change(changeset, :metadata, fn :metadata, value ->
+      if is_map(value) and not is_struct(value) do
+        []
+      else
+        [metadata: "must be a map"]
+      end
+    end)
   end
 
   defp validate_no_self_link(changeset) do
