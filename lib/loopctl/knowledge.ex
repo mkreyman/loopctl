@@ -155,8 +155,8 @@ defmodule Loopctl.Knowledge do
           meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
         }
   def list_articles(tenant_id, opts \\ []) do
-    limit = min(Keyword.get(opts, :limit, 20), 100)
-    offset = Keyword.get(opts, :offset, 0)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =
       from(a in Article,
