@@ -288,6 +288,209 @@ defmodule Loopctl.Knowledge do
      }}
   end
 
+  # --- Context Retrieval ---
+
+  @doc """
+  Retrieves full article bodies ranked by combined relevance + recency.
+
+  Runs a combined (keyword + semantic) search, fetches full article records,
+  computes recency scores using exponential decay, and re-ranks by a weighted
+  combination of relevance and recency. Each result includes one-hop linked
+  article references (max 5 per result).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `query_string` -- the search query (required, max 500 characters)
+  - `opts` -- keyword list with:
+    - `:project_id` -- filter by project UUID (optional)
+    - `:status` -- filter by status atom (default: `:published`)
+    - `:limit` -- max results to return (default 5, max 20, min 1)
+    - `:recency_weight` -- float between 0.0 and 1.0 (default 0.3)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}` on success
+  - `{:error, :empty_query}` when query is empty or nil
+  - `{:error, :bad_request, String.t()}` when query exceeds 500 characters
+
+  ## Scoring
+
+  `combined_score = (1 - recency_weight) * relevance + recency_weight * recency_score`
+
+  where `recency_score = exp(-age_in_days / 30.0)`.
+  """
+  @spec get_context(Ecto.UUID.t(), String.t() | nil, keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+          | {:error, :empty_query}
+          | {:error, atom(), String.t()}
+  def get_context(tenant_id, query_string, opts \\ []) do
+    query_string = to_string(query_string) |> String.trim()
+
+    if query_string == "" do
+      {:error, :empty_query}
+    else
+      do_get_context(tenant_id, query_string, opts)
+    end
+  end
+
+  defp do_get_context(tenant_id, query_string, opts) do
+    limit = opts |> Keyword.get(:limit, 5) |> max(1) |> min(20)
+    recency_weight = opts |> Keyword.get(:recency_weight, 0.3) |> max(0.0) |> min(1.0)
+    status = Keyword.get(opts, :status, :published)
+
+    # Run combined search with a wider internal limit to get candidate pool
+    search_opts =
+      opts
+      |> Keyword.take([:project_id])
+      |> Keyword.merge(limit: limit * 3, offset: 0, status: status)
+
+    {search_result, fallback?} = run_context_search(tenant_id, query_string, search_opts)
+
+    case search_result do
+      {:ok, search} ->
+        build_context_results(tenant_id, search, limit, recency_weight, fallback?)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_context_search(tenant_id, query_string, search_opts) do
+    case search_combined(tenant_id, query_string, search_opts) do
+      {:ok, result} ->
+        fallback? = result.meta[:fallback] == true
+        {{:ok, result}, fallback?}
+
+      {:error, _} ->
+        # If combined fails entirely, try keyword-only
+        case search_keyword(tenant_id, query_string, search_opts) do
+          {:ok, result} -> {{:ok, result}, true}
+          error -> {error, true}
+        end
+    end
+  end
+
+  defp build_context_results(tenant_id, search, limit, recency_weight, fallback?) do
+    article_ids =
+      search.results
+      |> Enum.map(& &1[:id])
+      |> Enum.reject(&is_nil/1)
+      |> Enum.take(limit * 2)
+
+    if article_ids == [] do
+      {:ok,
+       %{
+         results: [],
+         meta: %{
+           total_count: 0,
+           limit: limit,
+           fallback: fallback?,
+           recency_weight: recency_weight
+         }
+       }}
+    else
+      articles = fetch_full_context_articles(tenant_id, article_ids)
+      now = DateTime.utc_now()
+
+      article_ids_for_links = Enum.map(articles, & &1.id)
+      linked_map = batch_linked_refs(tenant_id, article_ids_for_links)
+
+      scored =
+        articles
+        |> Enum.map(fn article ->
+          relevance = find_relevance_score(search.results, article.id)
+          age_days = DateTime.diff(now, article.updated_at, :second) / 86_400.0
+          recency_score = :math.exp(-age_days / 30.0)
+          combined = (1.0 - recency_weight) * relevance + recency_weight * recency_score
+
+          linked = Map.get(linked_map, article.id, [])
+
+          %{
+            id: article.id,
+            title: article.title,
+            category: to_string(article.category),
+            tags: article.tags || [],
+            body: article.body,
+            updated_at: article.updated_at,
+            relevance_score: Float.round(relevance + 0.0, 4),
+            recency_score: Float.round(recency_score, 4),
+            combined_score: Float.round(combined, 4),
+            linked_articles: linked
+          }
+        end)
+        |> Enum.sort_by(& &1.combined_score, :desc)
+        |> Enum.take(limit)
+
+      {:ok,
+       %{
+         results: scored,
+         meta: %{
+           total_count: length(scored),
+           limit: limit,
+           fallback: fallback?,
+           recency_weight: recency_weight
+         }
+       }}
+    end
+  end
+
+  defp fetch_full_context_articles(tenant_id, article_ids) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.id in ^article_ids
+    )
+    |> AdminRepo.all()
+  end
+
+  defp find_relevance_score(results, article_id) do
+    case Enum.find(results, fn r -> r[:id] == article_id end) do
+      nil ->
+        0.0
+
+      r ->
+        Map.get(r, :final_score) ||
+          Map.get(r, :relevance_score) ||
+          Map.get(r, :similarity_score) ||
+          0.0
+    end
+  end
+
+  # Batch-fetches linked article refs for all given article IDs in a single query.
+  # Returns a map of article_id => [%{id, title, category}], capped at 5 per article.
+  defp batch_linked_refs(_tenant_id, []), do: %{}
+
+  defp batch_linked_refs(tenant_id, article_ids) do
+    links =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.source_article_id in ^article_ids or l.target_article_id in ^article_ids,
+        preload: [:source_article, :target_article]
+      )
+      |> AdminRepo.all()
+
+    # Group links by the article they belong to (could be source or target)
+    Enum.reduce(article_ids, %{}, fn article_id, acc ->
+      relevant_links =
+        Enum.filter(links, fn link ->
+          link.source_article_id == article_id or link.target_article_id == article_id
+        end)
+
+      linked =
+        relevant_links
+        |> Enum.flat_map(fn link ->
+          [link.source_article, link.target_article]
+          |> Enum.reject(&(is_nil(&1) or &1.id == article_id))
+        end)
+        |> Enum.uniq_by(& &1.id)
+        |> Enum.take(5)
+        |> Enum.map(fn article ->
+          %{id: article.id, title: article.title, category: to_string(article.category)}
+        end)
+
+      Map.put(acc, article_id, linked)
+    end)
+  end
+
   @doc """
   Full-text keyword search on articles using PostgreSQL tsvector.
 

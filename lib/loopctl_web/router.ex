@@ -239,6 +239,9 @@ defmodule LoopctlWeb.Router do
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 
+    # Knowledge Context (deep-read with recency scoring and linked refs)
+    get "/knowledge/context", KnowledgeContextController, :context
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
