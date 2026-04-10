@@ -2033,6 +2033,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp record_failure do
+    ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
 
     failures =
@@ -2055,6 +2056,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp record_success do
+    ensure_circuit_breaker_table()
     :ets.insert(@circuit_breaker_table, {:failures, []})
     :ets.delete(@circuit_breaker_table, :circuit_open_until)
   end

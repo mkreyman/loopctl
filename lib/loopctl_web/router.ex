@@ -183,8 +183,8 @@ defmodule LoopctlWeb.Router do
 
     # Orchestrator state
     put "/orchestrator/state/:project_id", OrchestratorStateController, :save
-    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
     get "/orchestrator/state/:project_id", OrchestratorStateController, :show
+    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
 
     # Webhooks (Epic 10)
     resources "/webhooks", WebhookController, only: [:create, :index, :update, :delete]

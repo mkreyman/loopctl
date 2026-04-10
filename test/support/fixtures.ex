@@ -1035,6 +1035,7 @@ defmodule Loopctl.Fixtures do
   def fixture(:orchestrator_state, attrs) do
     attrs = Enum.into(attrs, %{})
 
+    # Auto-create tenant if not provided
     {tenant_id, attrs} =
       case Map.get(attrs, :tenant_id) do
         nil ->
@@ -1045,6 +1046,7 @@ defmodule Loopctl.Fixtures do
           {tid, attrs}
       end
 
+    # Auto-create project if not provided
     {project_id, attrs} =
       case Map.get(attrs, :project_id) do
         nil ->
@@ -1058,14 +1060,10 @@ defmodule Loopctl.Fixtures do
     data = build(:orchestrator_state, attrs)
 
     changeset =
-      %{
-        state_key: data.state_key,
-        state_data: data.state_data
-      }
-      |> OrchestratorState.create_changeset()
-      |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
-      |> Ecto.Changeset.put_change(:project_id, project_id)
+      %OrchestratorState{tenant_id: tenant_id, project_id: project_id}
+      |> OrchestratorState.create_changeset(data)
 
+    # Allow overriding version after creation
     version = Map.get(data, :version, 1)
 
     state = AdminRepo.insert!(changeset)
