@@ -47,8 +47,8 @@ defmodule LoopctlWeb.ArticleJSON do
   @doc "Serializes article with outgoing and incoming links."
   def article_data_with_links(article) do
     article_data(article)
-    |> Map.put(:outgoing_links, Enum.map(article.outgoing_links || [], &link_data/1))
-    |> Map.put(:incoming_links, Enum.map(article.incoming_links || [], &link_data/1))
+    |> Map.put(:outgoing_links, Enum.map(loaded_links(article.outgoing_links), &link_data/1))
+    |> Map.put(:incoming_links, Enum.map(loaded_links(article.incoming_links), &link_data/1))
   end
 
   defp link_data(link) do
@@ -65,6 +65,10 @@ defmodule LoopctlWeb.ArticleJSON do
       }
     }
   end
+
+  defp loaded_links(%Ecto.Association.NotLoaded{}), do: []
+  defp loaded_links(nil), do: []
+  defp loaded_links(links) when is_list(links), do: links
 
   defp loaded_title(%Ecto.Association.NotLoaded{}), do: nil
   defp loaded_title(nil), do: nil
