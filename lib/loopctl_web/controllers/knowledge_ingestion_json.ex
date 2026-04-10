@@ -34,6 +34,36 @@ defmodule LoopctlWeb.KnowledgeIngestionJSON do
     }
   end
 
+  @doc """
+  Renders a batch ingestion response. `results` is a list of per-item result
+  maps produced by `KnowledgeIngestionController.enqueue_item_result/2`.
+  """
+  def batch(results) when is_list(results) do
+    %{data: Enum.map(results, &render_batch_result/1)}
+  end
+
+  defp render_batch_result(%{status: "queued"} = r) do
+    %{
+      status: "queued",
+      id: r.id,
+      content_hash: r.content_hash,
+      source_type: r.source_type,
+      inserted_at: r.inserted_at
+    }
+  end
+
+  defp render_batch_result(%{status: "already_queued"} = r) do
+    %{
+      status: "already_queued",
+      id: r.id,
+      content_hash: r.content_hash
+    }
+  end
+
+  defp render_batch_result(%{status: "error", error: error}) do
+    %{status: "error", error: error}
+  end
+
   defp render_job(job) do
     args = job.args || %{}
 

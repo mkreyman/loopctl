@@ -2176,6 +2176,8 @@ defmodule Loopctl.Knowledge do
   @all_categories [:pattern, :convention, :decision, :finding, :reference]
   @default_stale_days 90
   @default_min_coverage 3
+  @default_max_per_category 50
+  @hard_max_per_category 500
 
   @doc """
   Analyzes published articles and returns a structured lint report.
@@ -2195,6 +2197,9 @@ defmodule Loopctl.Knowledge do
     - `:project_id` — scope to a specific project (includes tenant-wide articles)
     - `:stale_days` — threshold in days for stale detection (default 90)
     - `:min_coverage` — minimum published articles per category (default 3)
+    - `:max_per_category` — cap for items returned in each issue array (default 50,
+      max 500). Total counts before capping are returned in the summary under
+      `:total_per_category`, and per-category truncation flags under `:truncated`.
 
   ## Returns
 
@@ -2207,6 +2212,12 @@ defmodule Loopctl.Knowledge do
     stale_days = Keyword.get(opts, :stale_days, @default_stale_days)
     min_coverage = Keyword.get(opts, :min_coverage, @default_min_coverage)
 
+    max_per_category =
+      opts
+      |> Keyword.get(:max_per_category, @default_max_per_category)
+      |> max(1)
+      |> min(@hard_max_per_category)
+
     # Base query for published articles scoped to tenant (+ optional project)
     base = published_base_query(tenant_id, project_id)
 
@@ -2218,6 +2229,36 @@ defmodule Loopctl.Knowledge do
 
     total_articles = AdminRepo.one(from(a in base, select: count(a.id)))
 
+    # Capture totals BEFORE capping so callers know the true size.
+    total_per_category = %{
+      stale_articles: length(stale),
+      orphan_articles: length(orphans),
+      contradiction_clusters: length(contradictions),
+      coverage_gaps: length(gaps),
+      broken_sources: length(broken)
+    }
+
+    truncated = %{
+      stale_articles: length(stale) > max_per_category,
+      orphan_articles: length(orphans) > max_per_category,
+      contradiction_clusters: length(contradictions) > max_per_category,
+      coverage_gaps: length(gaps) > max_per_category,
+      broken_sources: length(broken) > max_per_category
+    }
+
+    stale_capped = Enum.take(stale, max_per_category)
+    orphans_capped = Enum.take(orphans, max_per_category)
+    contradictions_capped = Enum.take(contradictions, max_per_category)
+    gaps_capped = Enum.take(gaps, max_per_category)
+    broken_capped = Enum.take(broken, max_per_category)
+
+    # total_issues reflects the TRUE total before capping, so callers know the
+    # full issue count even when arrays are truncated.
+    total_issues =
+      total_per_category.stale_articles + total_per_category.orphan_articles +
+        total_per_category.contradiction_clusters + total_per_category.coverage_gaps +
+        total_per_category.broken_sources
+
     all_issues = stale ++ orphans ++ contradictions ++ gaps ++ broken
 
     issues_by_severity =
@@ -2227,18 +2268,20 @@ defmodule Loopctl.Knowledge do
 
     summary = %{
       total_articles: total_articles,
-      total_issues: length(all_issues),
+      total_issues: total_issues,
       issues_by_severity: issues_by_severity,
+      total_per_category: total_per_category,
+      truncated: truncated,
       generated_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
     {:ok,
      %{
-       stale_articles: stale,
-       orphan_articles: orphans,
-       contradiction_clusters: contradictions,
-       coverage_gaps: gaps,
-       broken_sources: broken,
+       stale_articles: stale_capped,
+       orphan_articles: orphans_capped,
+       contradiction_clusters: contradictions_capped,
+       coverage_gaps: gaps_capped,
+       broken_sources: broken_capped,
        summary: summary
      }}
   end

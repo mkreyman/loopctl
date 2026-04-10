@@ -261,6 +261,7 @@ defmodule LoopctlWeb.Router do
 
     # Knowledge Ingestion (content extraction pipeline)
     post "/knowledge/ingest", KnowledgeIngestionController, :create
+    post "/knowledge/ingest/batch", KnowledgeIngestionController, :create_batch
     get "/knowledge/ingestion-jobs", KnowledgeIngestionController, :index
 
     scope "/projects/:project_id" do

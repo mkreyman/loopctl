@@ -26,6 +26,8 @@ defmodule LoopctlWeb.KnowledgeLintJSON do
         total_articles: summary.total_articles,
         total_issues: summary.total_issues,
         issues_by_severity: summary.issues_by_severity,
+        total_per_category: Map.get(summary, :total_per_category, %{}),
+        truncated: Map.get(summary, :truncated, %{}),
         generated_at: summary.generated_at
       }
     }

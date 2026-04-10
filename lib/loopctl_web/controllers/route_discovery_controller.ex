@@ -523,6 +523,13 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "Params: url (or content), source_type (required), project_id (optional)"
       },
       %{
+        method: "POST",
+        path: "/api/v1/knowledge/ingest/batch",
+        description:
+          "Batch-submit up to 50 ingestion items in a single request. " <>
+            "Each item has the same shape as /knowledge/ingest. Returns per-item results."
+      },
+      %{
         method: "GET",
         path: "/api/v1/knowledge/ingestion-jobs",
         description: "List recent ingestion jobs (last 7 days, max 50)"
