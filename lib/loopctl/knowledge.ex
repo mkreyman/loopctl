@@ -851,6 +851,375 @@ defmodule Loopctl.Knowledge do
   defp maybe_generate_superseded_event(multi, _tenant_id, _source_id, _target_id, _rel_type),
     do: multi
 
+  # --- Semantic Search ---
+
+  @doc """
+  Searches articles by cosine similarity against a query embedding vector.
+
+  Returns top-K results ordered by cosine similarity (ascending distance
+  via the `<=>` operator). Each result includes a `similarity_score` computed
+  as `1 - cosine_distance`.
+
+  Only articles with non-null embeddings are considered.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `query_embedding` -- a list of floats (the query vector)
+  - `opts` -- keyword list with:
+    - `:project_id` -- filter by project UUID (optional)
+    - `:category` -- filter by category atom (optional)
+    - `:status` -- filter by status atom (default: `:published`)
+    - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
+    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:offset` -- results to skip for pagination (default 0)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}` on success
+  """
+  @spec search_semantic(Ecto.UUID.t(), [float()], keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+  def search_semantic(tenant_id, query_embedding, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    status = Keyword.get(opts, :status, :published)
+
+    base_query =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: not is_nil(a.embedding),
+        select: %{
+          id: a.id,
+          tenant_id: a.tenant_id,
+          project_id: a.project_id,
+          title: a.title,
+          category: a.category,
+          status: a.status,
+          tags: a.tags,
+          inserted_at: a.inserted_at,
+          updated_at: a.updated_at,
+          similarity_score: fragment("1 - (embedding <=> ?)", ^query_embedding)
+        },
+        order_by: fragment("embedding <=> ?", ^query_embedding)
+      )
+
+    filtered_query = apply_search_filters(base_query, status, opts)
+
+    count_query = from(q in subquery(filtered_query), select: count())
+    total_count = AdminRepo.one(count_query)
+
+    results =
+      filtered_query
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    {:ok,
+     %{
+       results: results,
+       meta: %{
+         total_count: total_count,
+         limit: limit,
+         offset: offset,
+         search_mode: "semantic_only"
+       }
+     }}
+  end
+
+  @doc """
+  Combined keyword + semantic search with configurable weighting.
+
+  Runs both `search_keyword/3` and `search_semantic/3`, normalizes their
+  scores to a 0-1 range, then computes a weighted `final_score` for each
+  article. Results are deduplicated by article ID and sorted by `final_score`
+  descending.
+
+  The query embedding is generated on-the-fly via the configured embedding
+  client. If embedding generation fails (timeout, error, or circuit breaker),
+  falls back to keyword-only search with `fallback: true` in the response meta.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `query_string` -- the search query text
+  - `opts` -- keyword list with:
+    - `:keyword_weight` -- weight for keyword scores (default 0.5)
+    - `:semantic_weight` -- weight for semantic scores (default 0.5)
+    - `:project_id`, `:category`, `:status`, `:tags` -- standard filters
+    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:offset` -- results to skip for pagination (default 0)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}` on success
+  - `{:error, :invalid_weights}` when weights don't sum to 1.0
+  - `{:error, :empty_query}` when query is empty
+  """
+  @spec search_combined(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+          | {:error, :invalid_weights}
+          | {:error, :empty_query}
+          | {:error, atom(), String.t()}
+  def search_combined(tenant_id, query_string, opts \\ []) do
+    keyword_weight = Keyword.get(opts, :keyword_weight, 0.5)
+    semantic_weight = Keyword.get(opts, :semantic_weight, 0.5)
+
+    with :ok <- validate_weights(keyword_weight, semantic_weight),
+         {:ok, trimmed} <- validate_query_string(query_string) do
+      do_combined_search(tenant_id, trimmed, keyword_weight, semantic_weight, opts)
+    end
+  end
+
+  defp validate_weights(keyword_weight, semantic_weight) do
+    if keyword_weight >= 0 and semantic_weight >= 0 and
+         abs(keyword_weight + semantic_weight - 1.0) < 0.01 do
+      :ok
+    else
+      {:error, :invalid_weights}
+    end
+  end
+
+  defp validate_query_string(nil), do: {:error, :empty_query}
+  defp validate_query_string(""), do: {:error, :empty_query}
+
+  defp validate_query_string(query_string) do
+    trimmed = String.trim(query_string)
+
+    cond do
+      trimmed == "" ->
+        {:error, :empty_query}
+
+      String.length(trimmed) > 500 ->
+        {:error, :bad_request, "Query too long (max 500 characters)"}
+
+      true ->
+        {:ok, trimmed}
+    end
+  end
+
+  defp do_combined_search(tenant_id, query_string, keyword_weight, semantic_weight, opts) do
+    # Use wide limits for sub-searches to get comprehensive score pools
+    sub_opts = Keyword.merge(opts, limit: 50, offset: 0)
+
+    keyword_result = search_keyword(tenant_id, query_string, sub_opts)
+    embedding_result = try_generate_embedding(query_string)
+
+    case {keyword_result, embedding_result} do
+      {{:ok, kw}, {:ok, embedding}} ->
+        {:ok, semantic} = search_semantic(tenant_id, embedding, sub_opts)
+        merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
+
+      {{:ok, kw}, {:error, _reason}} ->
+        # Fallback to keyword-only
+        paginated = paginate_results(kw.results, opts)
+
+        {:ok,
+         %{
+           results: paginated.results,
+           meta:
+             Map.merge(kw.meta, %{
+               fallback: true,
+               search_mode: "keyword_only",
+               total_count: kw.meta.total_count,
+               limit: paginated.limit,
+               offset: paginated.offset
+             })
+         }}
+
+      {kw_error, _} ->
+        kw_error
+    end
+  end
+
+  defp merge_results(keyword_result, semantic_result, kw_weight, sem_weight, opts) do
+    kw_normalized = normalize_scores(keyword_result.results, :relevance_score)
+    sem_normalized = normalize_scores(semantic_result.results, :similarity_score)
+
+    # Build merged map by article ID
+    kw_map =
+      Map.new(kw_normalized, fn r ->
+        {r.id, Map.put(r, :final_score, kw_weight * r.normalized_score)}
+      end)
+
+    sem_map =
+      Map.new(sem_normalized, fn r ->
+        {r.id, Map.put(r, :final_score, sem_weight * r.normalized_score)}
+      end)
+
+    merged =
+      Map.merge(kw_map, sem_map, fn _id, kw, sem ->
+        Map.put(kw, :final_score, kw.final_score + sem.final_score)
+      end)
+
+    sorted =
+      merged
+      |> Map.values()
+      |> Enum.sort_by(& &1.final_score, :desc)
+
+    paginated = paginate_results(sorted, opts)
+
+    {:ok,
+     %{
+       results: paginated.results,
+       meta: %{
+         total_count: length(sorted),
+         limit: paginated.limit,
+         offset: paginated.offset,
+         search_mode: "combined"
+       }
+     }}
+  end
+
+  defp normalize_scores([], _score_key), do: []
+
+  defp normalize_scores(results, score_key) do
+    scores = Enum.map(results, &Map.get(&1, score_key, 0))
+    min_s = Enum.min(scores)
+    max_s = Enum.max(scores)
+    range = max_s - min_s
+
+    Enum.map(results, fn r ->
+      score = Map.get(r, score_key, 0)
+      normalized = if range == 0, do: 1.0, else: (score - min_s) / range
+      Map.put(r, :normalized_score, normalized)
+    end)
+  end
+
+  defp paginate_results(results, opts) do
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+
+    paginated =
+      results
+      |> Enum.drop(offset)
+      |> Enum.take(limit)
+
+    %{results: paginated, limit: limit, offset: offset}
+  end
+
+  # --- Circuit breaker for embedding generation ---
+
+  @circuit_breaker_table :loopctl_embedding_circuit_breaker
+  @failure_threshold 3
+  @failure_window_seconds 60
+  @cooldown_seconds 30
+
+  @doc false
+  def init_circuit_breaker do
+    if :ets.whereis(@circuit_breaker_table) == :undefined do
+      try do
+        :ets.new(@circuit_breaker_table, [
+          :set,
+          :named_table,
+          :public,
+          read_concurrency: true,
+          write_concurrency: true
+        ])
+      rescue
+        ArgumentError -> :already_exists
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  def reset_circuit_breaker do
+    if :ets.whereis(@circuit_breaker_table) != :undefined do
+      :ets.delete_all_objects(@circuit_breaker_table)
+    end
+
+    :ok
+  end
+
+  defp try_generate_embedding(query_string) do
+    ensure_circuit_breaker_table()
+
+    if circuit_open?() do
+      {:error, :circuit_open}
+    else
+      task =
+        Task.async(fn ->
+          try do
+            embedding_client().generate_embedding(query_string)
+          rescue
+            e -> {:error, {:embedding_crash, Exception.message(e)}}
+          end
+        end)
+
+      case Task.yield(task, 5_000) || Task.shutdown(task) do
+        {:ok, {:ok, embedding}} ->
+          record_success()
+          {:ok, embedding}
+
+        {:ok, {:error, reason}} ->
+          record_failure()
+          {:error, reason}
+
+        nil ->
+          record_failure()
+          {:error, :timeout}
+      end
+    end
+  end
+
+  defp circuit_open? do
+    case :ets.lookup(@circuit_breaker_table, :circuit_open_until) do
+      [{:circuit_open_until, open_until}] ->
+        now = System.monotonic_time(:second)
+
+        if now < open_until do
+          true
+        else
+          # Cooldown expired, reset
+          :ets.delete(@circuit_breaker_table, :circuit_open_until)
+          :ets.delete(@circuit_breaker_table, :failures)
+          false
+        end
+
+      [] ->
+        false
+    end
+  end
+
+  defp record_failure do
+    now = System.monotonic_time(:second)
+
+    failures =
+      case :ets.lookup(@circuit_breaker_table, :failures) do
+        [{:failures, existing}] -> existing
+        [] -> []
+      end
+
+    # Keep only failures within the window
+    recent = Enum.filter(failures, fn t -> now - t < @failure_window_seconds end)
+    updated = [now | recent]
+    :ets.insert(@circuit_breaker_table, {:failures, updated})
+
+    if length(updated) >= @failure_threshold do
+      :ets.insert(
+        @circuit_breaker_table,
+        {:circuit_open_until, now + @cooldown_seconds}
+      )
+    end
+  end
+
+  defp record_success do
+    :ets.insert(@circuit_breaker_table, {:failures, []})
+    :ets.delete(@circuit_breaker_table, :circuit_open_until)
+  end
+
+  defp ensure_circuit_breaker_table do
+    if :ets.whereis(@circuit_breaker_table) == :undefined do
+      init_circuit_breaker()
+    end
+  end
+
+  defp embedding_client do
+    Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)
+  end
+
   # --- Embedding helpers ---
 
   # Returns true when the changeset includes title/body changes or a
