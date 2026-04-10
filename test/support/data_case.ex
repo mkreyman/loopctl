@@ -100,6 +100,11 @@ defmodule Loopctl.DataCase do
       {:ok, List.duplicate(0.1, 1536)}
     end)
 
+    # Default stub for knowledge extractor -- returns empty list (no articles)
+    Mox.stub(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      {:ok, []}
+    end)
+
     # Default Req.Test stub for webhook delivery -- allows Oban inline mode
     # to process delivery jobs without test-specific HTTP stub setup.
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
