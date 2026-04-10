@@ -239,5 +239,11 @@ defmodule Loopctl.KnowledgeExportTest do
       assert Knowledge.slugify("UPPERCASE Title") == "uppercase-title"
       assert Knowledge.slugify("special!@#$chars") == "specialchars"
     end
+
+    test "returns 'untitled' for all-special-character titles" do
+      assert Knowledge.slugify("!!!") == "untitled"
+      assert Knowledge.slugify("@#$%") == "untitled"
+      assert Knowledge.slugify("...") == "untitled"
+    end
   end
 end

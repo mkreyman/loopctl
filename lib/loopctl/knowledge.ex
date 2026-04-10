@@ -1116,32 +1116,36 @@ defmodule Loopctl.Knowledge do
 
   def export_obsidian(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
-    articles = fetch_published_for_export(tenant_id, project_id)
 
-    if length(articles) > @max_export_articles do
+    if count_published_for_export(tenant_id, project_id) > @max_export_articles do
       {:error, :payload_too_large}
     else
+      articles = fetch_published_for_export(tenant_id, project_id)
       zip_binary = build_obsidian_zip(articles)
       {:ok, zip_binary}
     end
   end
 
+  defp count_published_for_export(tenant_id, project_id) do
+    export_base_query(tenant_id, project_id)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
   defp fetch_published_for_export(tenant_id, project_id) do
-    query =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published,
-        preload: [outgoing_links: :target_article, incoming_links: :source_article],
-        order_by: [asc: a.category, asc: a.title]
-      )
+    export_base_query(tenant_id, project_id)
+    |> preload(outgoing_links: :target_article, incoming_links: :source_article)
+    |> order_by([a], asc: a.category, asc: a.title)
+    |> AdminRepo.all()
+  end
 
-    query =
-      if project_id do
-        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-      else
-        query
-      end
+  defp export_base_query(tenant_id, project_id) do
+    query = from(a in Article, where: a.tenant_id == ^tenant_id and a.status == :published)
 
-    AdminRepo.all(query)
+    if project_id do
+      where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+    else
+      query
+    end
   end
 
   defp build_obsidian_zip(articles) do
@@ -1216,7 +1220,7 @@ defmodule Loopctl.Knowledge do
         "- [[#{link.source_article.title}]] (#{link.relationship_type})"
       end)
 
-    all_links = outgoing ++ incoming
+    all_links = Enum.uniq(outgoing ++ incoming)
 
     case all_links do
       [] -> ""
@@ -1246,12 +1250,15 @@ defmodule Loopctl.Knowledge do
 
   @doc false
   def slugify(title) do
-    title
-    |> String.downcase()
-    |> String.replace(~r/[^\w\s-]/u, "")
-    |> String.replace(~r/\s+/, "-")
-    |> String.replace(~r/-+/, "-")
-    |> String.trim("-")
+    slug =
+      title
+      |> String.downcase()
+      |> String.replace(~r/[^\w\s-]/u, "")
+      |> String.replace(~r/\s+/, "-")
+      |> String.replace(~r/-+/, "-")
+      |> String.trim("-")
+
+    if slug == "", do: "untitled", else: slug
   end
 
   defp escape_yaml_string(str) do
