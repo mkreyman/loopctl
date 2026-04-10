@@ -250,9 +250,13 @@ defmodule LoopctlWeb.Router do
     # Knowledge Context (deep-read with recency scoring and linked refs)
     get "/knowledge/context", KnowledgeContextController, :context
 
+    # Knowledge Export (Obsidian-compatible ZIP)
+    get "/knowledge/export", KnowledgeExportController, :export
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
+      get "/knowledge/export", KnowledgeExportController, :export
     end
 
     # ArticleLink management

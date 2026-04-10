@@ -1085,6 +1085,170 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
+  # --- Obsidian Export ---
+
+  @doc """
+  Exports published articles as an Obsidian-compatible ZIP archive.
+
+  The ZIP contains:
+  - One `.md` file per published article, organized as `{category}/{slug}.md`
+  - YAML frontmatter with title, category, tags, status, source_type, created_at, updated_at
+  - A `## Related Articles` section with [[wikilinks]] for article links
+  - A root `_index.md` listing all articles grouped by category with [[wikilinks]]
+
+  Only published articles are included. If no published articles exist,
+  the ZIP contains only `_index.md` (empty index).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list:
+    - `:project_id` -- optional project UUID to scope export
+
+  ## Returns
+
+  - `{:ok, zip_binary}` on success
+  """
+  @spec export_obsidian(Ecto.UUID.t(), keyword()) :: {:ok, binary()}
+  def export_obsidian(tenant_id, opts \\ []) do
+    project_id = Keyword.get(opts, :project_id)
+    articles = fetch_published_for_export(tenant_id, project_id)
+    zip_binary = build_obsidian_zip(articles)
+    {:ok, zip_binary}
+  end
+
+  defp fetch_published_for_export(tenant_id, project_id) do
+    query =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.status == :published,
+        preload: [outgoing_links: :target_article, incoming_links: :source_article],
+        order_by: [asc: a.category, asc: a.title]
+      )
+
+    query =
+      if project_id do
+        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+      else
+        query
+      end
+
+    AdminRepo.all(query)
+  end
+
+  defp build_obsidian_zip(articles) do
+    grouped = Enum.group_by(articles, &to_string(&1.category))
+
+    article_files =
+      Enum.flat_map(grouped, fn {category, arts} ->
+        Enum.map(arts, fn article ->
+          path = "#{category}/#{slugify(article.title)}.md"
+          content = build_obsidian_markdown(article)
+          {String.to_charlist(path), content}
+        end)
+      end)
+
+    index = build_obsidian_index(grouped)
+    files = [{~c"_index.md", index} | article_files]
+
+    {:ok, {_filename, zip_binary}} = :zip.create(~c"export.zip", files, [:memory])
+    zip_binary
+  end
+
+  defp build_obsidian_markdown(article) do
+    frontmatter = build_frontmatter(article)
+    body = article.body || ""
+    related = build_related_section(article)
+
+    content = "#{frontmatter}\n#{body}"
+
+    if related != "" do
+      "#{content}\n\n#{related}\n"
+    else
+      "#{content}\n"
+    end
+  end
+
+  defp build_frontmatter(article) do
+    tags_yaml =
+      case article.tags do
+        [] -> ""
+        tags -> "\ntags:\n" <> Enum.map_join(tags, "\n", &"  - #{&1}")
+      end
+
+    source_type_yaml =
+      case article.source_type do
+        nil -> ""
+        st -> "\nsource_type: #{st}"
+      end
+
+    """
+    ---
+    title: "#{escape_yaml_string(article.title)}"
+    category: #{article.category}#{tags_yaml}
+    status: #{article.status}#{source_type_yaml}
+    created_at: "#{DateTime.to_iso8601(article.inserted_at)}"
+    updated_at: "#{DateTime.to_iso8601(article.updated_at)}"
+    ---
+    """
+  end
+
+  defp build_related_section(article) do
+    outgoing =
+      (article.outgoing_links || [])
+      |> Enum.filter(&(&1.target_article != nil))
+      |> Enum.map(fn link ->
+        "- [[#{link.target_article.title}]] (#{link.relationship_type})"
+      end)
+
+    incoming =
+      (article.incoming_links || [])
+      |> Enum.filter(&(&1.source_article != nil))
+      |> Enum.map(fn link ->
+        "- [[#{link.source_article.title}]] (#{link.relationship_type})"
+      end)
+
+    all_links = outgoing ++ incoming
+
+    case all_links do
+      [] -> ""
+      links -> "## Related Articles\n\n" <> Enum.join(links, "\n")
+    end
+  end
+
+  defp build_obsidian_index(grouped) do
+    header = "# Knowledge Base Index\n\n"
+
+    body =
+      grouped
+      |> Enum.sort_by(fn {category, _} -> category end)
+      |> Enum.map_join("\n\n", fn {category, articles} ->
+        article_list =
+          articles
+          |> Enum.sort_by(& &1.title)
+          |> Enum.map_join("\n", fn article ->
+            "- [[#{article.title}]]"
+          end)
+
+        "## #{String.capitalize(category)}\n\n#{article_list}"
+      end)
+
+    header <> body <> "\n"
+  end
+
+  @doc false
+  def slugify(title) do
+    title
+    |> String.downcase()
+    |> String.replace(~r/[^\w\s-]/u, "")
+    |> String.replace(~r/\s+/, "-")
+    |> String.replace(~r/-+/, "-")
+    |> String.trim("-")
+  end
+
+  defp escape_yaml_string(str) do
+    String.replace(str, "\"", "\\\"")
+  end
+
   # --- Article Links ---
 
   @doc """
