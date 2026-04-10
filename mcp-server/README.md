@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 29 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 33 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -65,7 +65,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (29)
+## Tools (33)
 
 ### Project Tools
 
@@ -134,6 +134,15 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. |
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. |
+
+### Knowledge Management Tools (orchestrator key)
+
+| Tool | Description |
+|---|---|
+| `knowledge_publish` | Publish a draft article, making it visible to all agents. Required: `article_id`. |
+| `knowledge_drafts` | List all draft (unpublished) knowledge articles. Optional: `limit`, `offset`. |
+| `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`. |
+| `knowledge_export` | Export all knowledge articles as a ZIP archive. Returns a curl command for direct download (ZIP binary cannot be returned as MCP content). Optional: `project_id`. |
 
 ### Discovery Tools
 
