@@ -37,6 +37,12 @@ defmodule Loopctl.Webhooks.Webhook do
     token.budget_warning
     token.budget_exceeded
     token.anomaly_detected
+    article.created
+    article.updated
+    article.archived
+    article.superseded
+    article_link.created
+    article_link.deleted
   )
 
   @doc """
