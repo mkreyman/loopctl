@@ -59,8 +59,8 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
                  args: %{"article_id" => article.id, "tenant_id" => tenant.id}
                })
 
-      # Verify embedding was stored
-      {:ok, updated} = Knowledge.get_article(tenant.id, article.id)
+      # Verify embedding was stored (use explicit select since load_in_query: false)
+      {:ok, updated} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert updated.embedding != nil
     end
   end
@@ -129,7 +129,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         })
 
       # In inline mode, the job executes synchronously. Verify embedding was stored.
-      {:ok, loaded} = Knowledge.get_article(tenant.id, article.id)
+      {:ok, loaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert loaded.embedding != nil
     end
 
@@ -145,7 +145,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
           status: :draft
         })
 
-      {:ok, loaded} = Knowledge.get_article(tenant.id, article.id)
+      {:ok, loaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert loaded.embedding == nil
     end
   end
@@ -294,7 +294,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       # Verify tenant_a's article embedding was NOT modified by the wrong-tenant worker.
       # The embedding from create_published_article should remain unchanged.
-      {:ok, loaded} = Knowledge.get_article(tenant_a.id, article.id)
+      {:ok, loaded} = Knowledge.get_article_with_embedding(tenant_a.id, article.id)
       assert loaded.embedding != nil
     end
   end

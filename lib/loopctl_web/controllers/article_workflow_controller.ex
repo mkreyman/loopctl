@@ -2,11 +2,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   @moduledoc """
   Controller for article publish workflow operations.
 
-  - `POST /api/v1/articles/:id/publish` -- publish a draft article (user+)
+  - `POST /api/v1/articles/:id/publish` -- publish a draft article (orchestrator+)
   - `POST /api/v1/articles/:id/unpublish` -- unpublish a published article (user+)
   - `POST /api/v1/articles/:id/archive` -- archive an article (user+)
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
-  - `GET /api/v1/knowledge/drafts` -- list draft articles (user+)
+  - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
   """
 
   use LoopctlWeb, :controller
@@ -19,7 +19,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, role: :user
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:drafts, :publish]
+
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :user] when action in [:unpublish, :archive, :bulk_publish]
 
   tags(["Knowledge Wiki"])
 
@@ -27,7 +30,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     summary: "Publish article",
     description:
       "Transitions article from draft to published. " <>
-        "Returns 422 if the transition is invalid. Role: user+.",
+        "Returns 422 if the transition is invalid. Role: orchestrator+.",
     parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
     responses: %{
       200 =>
@@ -111,7 +114,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     summary: "List draft articles",
     description:
       "Lists draft articles ordered by inserted_at desc. " <>
-        "Includes source_type and source_id for review queue visibility. Role: user+.",
+        "Includes source_type and source_id for review queue visibility. Role: orchestrator+.",
     parameters: [
       project_id: [in: :query, type: :string, description: "Filter by project UUID"],
       limit: [in: :query, type: :integer, description: "Max results (default 20, max 100)"],

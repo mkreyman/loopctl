@@ -48,7 +48,7 @@ defmodule Loopctl.Knowledge.Article do
     field :source_id, :binary_id
     field :metadata, :map, default: %{}
 
-    field :embedding, Pgvector.Ecto.Vector
+    field :embedding, Pgvector.Ecto.Vector, load_in_query: false
 
     has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
     has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id

@@ -2,7 +2,7 @@ defmodule LoopctlWeb.KnowledgePipelineController do
   @moduledoc """
   Controller for the knowledge pipeline status endpoint.
 
-  - `GET /api/v1/knowledge/pipeline` -- pipeline status (user+)
+  - `GET /api/v1/knowledge/pipeline` -- pipeline status (orchestrator+)
 
   Returns metrics about the self-learning knowledge extraction pipeline:
   pending extractions, recent drafts, publish rate, extraction errors,
@@ -17,7 +17,7 @@ defmodule LoopctlWeb.KnowledgePipelineController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, role: :user
+  plug LoopctlWeb.Plugs.RequireRole, role: :orchestrator
 
   tags(["Knowledge Wiki"])
 
@@ -26,7 +26,7 @@ defmodule LoopctlWeb.KnowledgePipelineController do
     description:
       "Returns metrics about the self-learning knowledge extraction pipeline " <>
         "including pending extractions, recent drafts, publish rate, extraction " <>
-        "errors, and the auto_extract_enabled setting. Role: user+.",
+        "errors, and the auto_extract_enabled setting. Role: orchestrator+.",
     responses: %{
       200 =>
         {"Pipeline status", "application/json",

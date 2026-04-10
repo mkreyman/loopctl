@@ -53,21 +53,22 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
-    case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
-      nil ->
+    case Knowledge.get_article_with_embedding(tenant_id, article_id) do
+      {:error, :not_found} ->
         # Article deleted -- no-op
         :ok
 
-      %Article{embedding: nil} ->
+      {:ok, %Article{embedding: nil}} ->
         # No embedding yet -- no-op
         :ok
 
-      %Article{} = article ->
+      {:ok, %Article{} = article} ->
         threshold = Application.get_env(:loopctl, :article_link_threshold, 0.8)
         max_comparisons = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
         find_and_link_similar(article, tenant_id, threshold, max_comparisons)

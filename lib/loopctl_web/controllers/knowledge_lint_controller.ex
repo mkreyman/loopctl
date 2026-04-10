@@ -2,8 +2,8 @@ defmodule LoopctlWeb.KnowledgeLintController do
   @moduledoc """
   Controller for the knowledge lint operation.
 
-  - `GET /api/v1/knowledge/lint` -- tenant-wide lint report (user+)
-  - `GET /api/v1/projects/:project_id/knowledge/lint` -- project-scoped lint report (user+)
+  - `GET /api/v1/knowledge/lint` -- tenant-wide lint report (orchestrator+)
+  - `GET /api/v1/projects/:project_id/knowledge/lint` -- project-scoped lint report (orchestrator+)
 
   Analyzes published articles and returns a structured report of potential
   issues: stale articles, orphaned articles, contradiction clusters,
@@ -20,7 +20,7 @@ defmodule LoopctlWeb.KnowledgeLintController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, role: :user
+  plug LoopctlWeb.Plugs.RequireRole, role: :orchestrator
 
   tags(["Knowledge Wiki"])
 
@@ -31,7 +31,7 @@ defmodule LoopctlWeb.KnowledgeLintController do
         "issues including stale articles, orphaned articles, contradiction clusters, " <>
         "coverage gaps, and broken source references. Read-only operation. " <>
         "When called via GET /projects/:project_id/knowledge/lint, scopes analysis " <>
-        "to project-specific and tenant-wide articles. Role: user+.",
+        "to project-specific and tenant-wide articles. Role: orchestrator+.",
     parameters: [
       project_id: [
         in: :path,
