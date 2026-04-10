@@ -12,7 +12,7 @@ defmodule Loopctl.Knowledge.Article do
   - `body` -- full article content (text, max 100KB)
   - `category` -- knowledge type: pattern, convention, decision, finding, reference
   - `status` -- lifecycle state: draft, published, archived, superseded
-  - `tags` -- array of lowercase tag strings for categorization
+  - `tags` -- array of alphanumeric tag strings for categorization
   - `source_type` -- advisory origin type: "review_finding", "manual", "agent", "session_log"
   - `source_id` -- optional FK to the originating entity
   - `project_id` -- optional FK to projects (null = tenant-wide)
