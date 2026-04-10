@@ -41,7 +41,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
 
     body = %{
       model: model,
-      max_tokens: 16_384,
+      max_tokens: 8192,
       system: @system_prompt,
       messages: [
         %{

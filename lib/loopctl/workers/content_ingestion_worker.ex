@@ -36,6 +36,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ContentChunker
 
   @content_extractor Application.compile_env(
                        :loopctl,
@@ -81,24 +82,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   # --- Private ---
 
-  # Content chunking threshold: ~8KB. Content larger than this is split
-  # into chunks and each chunk is extracted separately to avoid LLM
-  # response truncation from max_tokens limits.
-  @chunk_threshold 8_000
-
-  defp extract_with_chunking(content, source_type) when byte_size(content) <= @chunk_threshold do
-    case @content_extractor.extract_from_content(content, source_type: source_type) do
-      {:ok, articles} -> {:ok, articles}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   defp extract_with_chunking(content, source_type) do
-    chunks = chunk_content(content)
+    chunks = ContentChunker.chunk(content)
 
-    Logger.info(
-      "ContentIngestionWorker: splitting #{byte_size(content)} bytes into #{length(chunks)} chunks"
-    )
+    if length(chunks) > 1 do
+      Logger.info(
+        "ContentIngestionWorker: splitting #{byte_size(content)} bytes into #{length(chunks)} chunks"
+      )
+    end
 
     {articles, errors} =
       Enum.reduce(chunks, {[], []}, fn chunk, {arts, errs} ->
@@ -126,38 +117,6 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       true ->
         # No chunks produced anything but no errors either (empty content)
         {:ok, []}
-    end
-  end
-
-  # Split content into chunks at logical boundaries (headings, blank lines).
-  # Each chunk stays under @chunk_threshold bytes.
-  defp chunk_content(content) do
-    # Split on markdown headings (## or #) as primary boundaries
-    sections =
-      content
-      |> String.split(~r/(?=^\#{1,3}\s)/m)
-      |> Enum.reject(&(String.trim(&1) == ""))
-
-    # Merge small sections together until we approach the threshold
-    merge_sections(sections, [], "")
-  end
-
-  defp merge_sections([], acc, current) do
-    if String.trim(current) != "" do
-      Enum.reverse([current | acc])
-    else
-      Enum.reverse(acc)
-    end
-  end
-
-  defp merge_sections([section | rest], acc, current) do
-    candidate = current <> "\n" <> section
-
-    if byte_size(candidate) > @chunk_threshold and String.trim(current) != "" do
-      # Current chunk is full, start a new one
-      merge_sections(rest, [current | acc], section)
-    else
-      merge_sections(rest, acc, candidate)
     end
   end
 
