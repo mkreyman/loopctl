@@ -752,7 +752,10 @@ defmodule Loopctl.Knowledge do
   - `{:error, :unprocessable_entity, message}` on invalid transition
   """
   @spec publish_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Article.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
   def publish_article(tenant_id, article_id, opts \\ []) do
     transition_article(tenant_id, article_id, :published, "article.published", opts)
   end
@@ -776,7 +779,10 @@ defmodule Loopctl.Knowledge do
   - `{:error, :unprocessable_entity, message}` on invalid transition
   """
   @spec unpublish_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Article.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
   def unpublish_article(tenant_id, article_id, opts \\ []) do
     transition_article(tenant_id, article_id, :draft, "article.unpublished", opts)
   end
@@ -801,7 +807,10 @@ defmodule Loopctl.Knowledge do
   - `{:error, :unprocessable_entity, message}` on invalid transition
   """
   @spec archive_article_workflow(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Article.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
   def archive_article_workflow(tenant_id, article_id, opts \\ []) do
     transition_article(tenant_id, article_id, :archived, "article.archived", opts)
   end
@@ -988,22 +997,24 @@ defmodule Loopctl.Knowledge do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    multi =
-      articles
-      |> Enum.reduce(Multi.new(), fn article, multi ->
-        key = String.to_atom("publish_#{article.id}")
-        changeset = Article.update_changeset(article, %{status: :published})
+    # Use {action, index} tuples as Multi keys to avoid atom exhaustion.
+    # String.to_atom with dynamic UUIDs would leak atoms (never GC'd).
+    indexed_articles = Enum.with_index(articles)
 
-        Multi.update(multi, key, changeset)
+    multi =
+      indexed_articles
+      |> Enum.reduce(Multi.new(), fn {article, idx}, multi ->
+        changeset = Article.update_changeset(article, %{status: :published})
+        Multi.update(multi, {:publish, idx}, changeset)
       end)
-      |> add_bulk_audit_entries(tenant_id, articles, actor_id, actor_label, actor_type)
+      |> add_bulk_audit_entries(tenant_id, indexed_articles, actor_id, actor_label, actor_type)
       |> add_bulk_embedding_jobs(tenant_id, article_ids)
 
     case AdminRepo.transaction(multi) do
       {:ok, results} ->
         published =
-          article_ids
-          |> Enum.map(fn id -> Map.get(results, String.to_atom("publish_#{id}")) end)
+          indexed_articles
+          |> Enum.map(fn {_article, idx} -> Map.get(results, {:publish, idx}) end)
           |> Enum.reject(&is_nil/1)
 
         {:ok, %{published: published, count: length(published)}}
@@ -1013,12 +1024,17 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp add_bulk_audit_entries(multi, tenant_id, articles, actor_id, actor_label, actor_type) do
-    Enum.reduce(articles, multi, fn article, multi ->
-      audit_key = String.to_atom("audit_#{article.id}")
-
-      Audit.log_in_multi(multi, audit_key, fn changes ->
-        updated = Map.get(changes, String.to_atom("publish_#{article.id}"))
+  defp add_bulk_audit_entries(
+         multi,
+         tenant_id,
+         indexed_articles,
+         actor_id,
+         actor_label,
+         actor_type
+       ) do
+    Enum.reduce(indexed_articles, multi, fn {_article, idx}, multi ->
+      Audit.log_in_multi(multi, {:audit, idx}, fn changes ->
+        updated = Map.get(changes, {:publish, idx})
 
         %{
           tenant_id: tenant_id,

@@ -99,7 +99,7 @@ defmodule Loopctl.Audit do
         }
       end)
   """
-  @spec log_in_multi(Multi.t(), atom(), (map() -> map())) :: Multi.t()
+  @spec log_in_multi(Multi.t(), Multi.name(), (map() -> map())) :: Multi.t()
   def log_in_multi(%Multi{} = multi, name, fun) when is_function(fun, 1) do
     Multi.insert(multi, name, fn changes ->
       attrs = fun.(changes)
