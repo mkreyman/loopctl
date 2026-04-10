@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ArticleLinkController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias LoopctlWeb.ArticleLinkJSON
+  alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -88,8 +89,9 @@ defmodule LoopctlWeb.ArticleLinkController do
   @doc "POST /api/v1/article_links"
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
-    case Knowledge.create_link(tenant_id, params) do
+    case Knowledge.create_link(tenant_id, params, audit_opts) do
       {:ok, link} ->
         conn
         |> put_status(:created)
@@ -103,13 +105,17 @@ defmodule LoopctlWeb.ArticleLinkController do
   @doc "DELETE /api/v1/article_links/:id"
   def delete(conn, %{"id" => link_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
 
-    case Knowledge.delete_link(tenant_id, link_id) do
+    case Knowledge.delete_link(tenant_id, link_id, audit_opts) do
       {:ok, _link} ->
         send_resp(conn, :no_content, "")
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
     end
   end
 

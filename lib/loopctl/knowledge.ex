@@ -314,9 +314,9 @@ defmodule Loopctl.Knowledge do
   - `{:ok, %ArticleLink{}}` on success
   - `{:error, changeset}` on validation failure
   """
-  @spec create_link(Ecto.UUID.t(), map()) ::
+  @spec create_link(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ArticleLink.t()} | {:error, Ecto.Changeset.t()}
-  def create_link(tenant_id, attrs) do
+  def create_link(tenant_id, attrs, opts \\ []) do
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]
     rel_type = attrs[:relationship_type] || attrs["relationship_type"]
@@ -330,7 +330,7 @@ defmodule Loopctl.Knowledge do
         Multi.new()
         |> Multi.insert(:link, changeset)
         |> maybe_supersede_target(tenant_id, target_id, rel_type)
-        |> Audit.log_in_multi(:audit, &build_link_audit(tenant_id, &1))
+        |> Audit.log_in_multi(:audit, &build_link_audit(tenant_id, &1, opts))
 
       case AdminRepo.transaction(multi) do
         {:ok, %{link: link}} -> {:ok, link}
@@ -355,9 +355,13 @@ defmodule Loopctl.Knowledge do
   - `{:ok, %ArticleLink{}}` on success
   - `{:error, :not_found}` if not found or belongs to another tenant
   """
-  @spec delete_link(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, ArticleLink.t()} | {:error, :not_found}
-  def delete_link(tenant_id, link_id) do
+  @spec delete_link(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, ArticleLink.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def delete_link(tenant_id, link_id, opts \\ []) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
     case AdminRepo.get_by(ArticleLink, id: link_id, tenant_id: tenant_id) do
       nil ->
         {:error, :not_found}
@@ -372,9 +376,9 @@ defmodule Loopctl.Knowledge do
               entity_type: "article_link",
               entity_id: deleted.id,
               action: "article_link.deleted",
-              actor_type: "api_key",
-              actor_id: nil,
-              actor_label: nil,
+              actor_type: actor_type,
+              actor_id: actor_id,
+              actor_label: actor_label,
               old_state: %{
                 "source_article_id" => to_string(deleted.source_article_id),
                 "target_article_id" => to_string(deleted.target_article_id),
@@ -525,7 +529,11 @@ defmodule Loopctl.Knowledge do
 
   defp maybe_supersede_target(multi, _tenant_id, _target_id, _rel_type), do: multi
 
-  defp build_link_audit(tenant_id, changes) do
+  defp build_link_audit(tenant_id, changes, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
     new_state = %{
       "source_article_id" => to_string(changes.link.source_article_id),
       "target_article_id" => to_string(changes.link.target_article_id),
@@ -544,9 +552,9 @@ defmodule Loopctl.Knowledge do
       entity_type: "article_link",
       entity_id: changes.link.id,
       action: "article_link.created",
-      actor_type: "api_key",
-      actor_id: nil,
-      actor_label: nil,
+      actor_type: actor_type,
+      actor_id: actor_id,
+      actor_label: actor_label,
       new_state: new_state
     }
   end

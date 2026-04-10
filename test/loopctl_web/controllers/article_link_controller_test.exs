@@ -206,5 +206,26 @@ defmodule LoopctlWeb.ArticleLinkControllerTest do
 
       assert json_response(conn, 404)
     end
+
+    test "cross-tenant index returns empty list", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})
+      article_a = fixture(:article, %{tenant_id: tenant_a.id})
+
+      fixture(:article_link, %{
+        tenant_id: tenant_a.id,
+        source_article_id: article_a.id,
+        relationship_type: :relates_to
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article_a.id}/links")
+
+      body = json_response(conn, 200)
+      assert body["data"] == []
+    end
   end
 end
