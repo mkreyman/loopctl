@@ -429,6 +429,16 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
                )
     end
 
+    test "returns {:error, :invalid_weights} for negative weights" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:error, :invalid_weights} =
+               Knowledge.search_combined(tenant.id, "test",
+                 keyword_weight: -0.5,
+                 semantic_weight: 1.5
+               )
+    end
+
     test "accepts weights that sum to 1.0 within tolerance" do
       %{tenant: tenant} = setup_tenant()
 

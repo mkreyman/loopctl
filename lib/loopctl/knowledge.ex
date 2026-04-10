@@ -972,7 +972,8 @@ defmodule Loopctl.Knowledge do
   end
 
   defp validate_weights(keyword_weight, semantic_weight) do
-    if abs(keyword_weight + semantic_weight - 1.0) < 0.01 do
+    if keyword_weight >= 0 and semantic_weight >= 0 and
+         abs(keyword_weight + semantic_weight - 1.0) < 0.01 do
       :ok
     else
       {:error, :invalid_weights}
@@ -1020,7 +1021,7 @@ defmodule Loopctl.Knowledge do
              Map.merge(kw.meta, %{
                fallback: true,
                search_mode: "keyword_only",
-               total_count: length(kw.results),
+               total_count: kw.meta.total_count,
                limit: paginated.limit,
                offset: paginated.offset
              })
@@ -1107,13 +1108,17 @@ defmodule Loopctl.Knowledge do
   @doc false
   def init_circuit_breaker do
     if :ets.whereis(@circuit_breaker_table) == :undefined do
-      :ets.new(@circuit_breaker_table, [
-        :set,
-        :named_table,
-        :public,
-        read_concurrency: true,
-        write_concurrency: true
-      ])
+      try do
+        :ets.new(@circuit_breaker_table, [
+          :set,
+          :named_table,
+          :public,
+          read_concurrency: true,
+          write_concurrency: true
+        ])
+      rescue
+        ArgumentError -> :already_exists
+      end
     end
 
     :ok
@@ -1134,7 +1139,14 @@ defmodule Loopctl.Knowledge do
     if circuit_open?() do
       {:error, :circuit_open}
     else
-      task = Task.async(fn -> embedding_client().generate_embedding(query_string) end)
+      task =
+        Task.async(fn ->
+          try do
+            embedding_client().generate_embedding(query_string)
+          rescue
+            e -> {:error, {:embedding_crash, Exception.message(e)}}
+          end
+        end)
 
       case Task.yield(task, 5_000) || Task.shutdown(task) do
         {:ok, {:ok, embedding}} ->
