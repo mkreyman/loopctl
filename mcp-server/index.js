@@ -457,20 +457,34 @@ async function knowledgePublish({ article_id }) {
   return toContent(result);
 }
 
-async function knowledgeDrafts({ limit, offset }) {
+async function knowledgeBulkPublish({ article_ids }) {
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/bulk-publish",
+    { article_ids },
+    process.env.LOOPCTL_USER_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeDrafts({ limit, offset, project_id }) {
   const params = new URLSearchParams();
-  if (limit != null) params.set("limit", String(limit));
+  params.set(
+    "limit",
+    String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE))
+  );
   if (offset != null) params.set("offset", String(offset));
-  const qs = params.toString();
-  const path = qs ? `/api/v1/knowledge/drafts?${qs}` : "/api/v1/knowledge/drafts";
+  if (project_id) params.set("project_id", project_id);
+  const path = `/api/v1/knowledge/drafts?${params.toString()}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
 
-async function knowledgeLint({ project_id, stale_days, min_coverage }) {
+async function knowledgeLint({ project_id, stale_days, min_coverage, max_per_category }) {
   const params = new URLSearchParams();
   if (stale_days != null) params.set("stale_days", String(stale_days));
   if (min_coverage != null) params.set("min_coverage", String(min_coverage));
+  if (max_per_category != null) params.set("max_per_category", String(max_per_category));
   const qs = params.toString();
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/lint`
@@ -486,6 +500,26 @@ async function knowledgeIngest({ url, content, source_type, project_id }) {
   if (content) body.content = content;
   if (project_id) body.project_id = project_id;
   const result = await apiCall("POST", "/api/v1/knowledge/ingest", body, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeIngestBatch({ items, project_id }) {
+  // If a batch-level project_id is supplied, apply it as a default to every
+  // item that doesn't already set its own.
+  const resolvedItems = Array.isArray(items)
+    ? items.map((item) =>
+        project_id && item && item.project_id == null
+          ? { ...item, project_id }
+          : item
+      )
+    : items;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/ingest/batch",
+    { items: resolvedItems },
+    process.env.LOOPCTL_ORCH_KEY
+  );
   return toContent(result);
 }
 
@@ -1209,19 +1243,50 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_bulk_publish",
+    description:
+      "Atomically publish up to 100 draft articles in a single call. " +
+      "REQUIRES LOOPCTL_USER_KEY to be set in the MCP server env (user role — " +
+      "orchestrator role is NOT sufficient for this destructive operation). " +
+      "All articles must be drafts belonging to the tenant; if any fail validation, " +
+      "the entire operation rolls back.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of draft article UUIDs to publish (max 100).",
+          maxItems: 100,
+        },
+      },
+      required: ["article_ids"],
+    },
+  },
+  {
     name: "knowledge_drafts",
     description:
-      "List all draft (unpublished) knowledge articles. Requires orchestrator role. Use to review pending articles before publishing.",
+      "List draft (unpublished) knowledge articles. Requires orchestrator role. " +
+      "Returns paginated drafts with total_count in meta. Max 20 per page.",
     inputSchema: {
       type: "object",
       properties: {
         limit: {
           type: "integer",
-          description: "Optional: maximum number of drafts to return.",
+          description: "Max drafts per page. Default 20, hard max 20.",
+          default: 20,
+          minimum: 1,
+          maximum: 20,
         },
         offset: {
           type: "integer",
-          description: "Optional: pagination offset.",
+          description: "Pagination offset. Default 0.",
+          default: 0,
+          minimum: 0,
+        },
+        project_id: {
+          type: "string",
+          description: "Optional: filter drafts to a specific project UUID.",
         },
       },
       required: [],
@@ -1231,7 +1296,9 @@ const TOOLS = [
     name: "knowledge_lint",
     description:
       "Run a lint check on the knowledge wiki to identify stale, low-coverage, or broken articles. " +
-      "Requires orchestrator role. Optionally scoped to a project.",
+      "Requires orchestrator role. Optionally scoped to a project. " +
+      "Each issue category is capped at max_per_category (default 50) with true totals " +
+      "exposed in summary.total_per_category and per-category truncated flags.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1244,10 +1311,18 @@ const TOOLS = [
           description: "Optional: flag articles not updated in this many days as stale.",
         },
         min_coverage: {
-          type: "number",
-          description: "Optional: minimum required coverage score (0.0-1.0) to flag under-covered articles.",
-          minimum: 0,
-          maximum: 1,
+          type: "integer",
+          description:
+            "Optional: minimum published articles per category below which a coverage gap is reported (default 3).",
+          minimum: 1,
+        },
+        max_per_category: {
+          type: "integer",
+          description:
+            "Max items per category to return. Default 50, max 500. True totals are still reported in summary.total_per_category.",
+          default: 50,
+          minimum: 1,
+          maximum: 500,
         },
       },
       required: [],
@@ -1298,6 +1373,56 @@ const TOOLS = [
         },
       },
       required: ["source_type"],
+    },
+  },
+  {
+    name: "knowledge_ingest_batch",
+    description:
+      "Submit up to 50 ingestion items in a single request. Each item follows the same " +
+      "shape as knowledge_ingest (url OR content, source_type required). Returns a " +
+      "per-item result array — individual failures do not abort the batch. " +
+      "Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          description: "Array of ingestion items (1-50). Each item must include source_type and exactly one of url or content.",
+          minItems: 1,
+          maxItems: 50,
+          items: {
+            type: "object",
+            properties: {
+              url: {
+                type: "string",
+                description: "URL to fetch content from (exactly one of url or content required).",
+              },
+              content: {
+                type: "string",
+                description: "Raw content to extract from (exactly one of url or content required).",
+              },
+              source_type: {
+                type: "string",
+                description: "Source type (e.g., newsletter, skill, web_article, ingestion). Required.",
+              },
+              project_id: {
+                type: "string",
+                description: "Optional: scope the item to a specific project UUID.",
+              },
+              metadata: {
+                type: "object",
+                description: "Optional metadata map.",
+              },
+            },
+            required: ["source_type"],
+          },
+        },
+        project_id: {
+          type: "string",
+          description: "Optional batch-level default project UUID applied to items that don't specify their own.",
+        },
+      },
+      required: ["items"],
     },
   },
   {
@@ -1442,6 +1567,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "knowledge_publish":
       return await knowledgePublish(args);
 
+    case "knowledge_bulk_publish":
+      return await knowledgeBulkPublish(args);
+
     case "knowledge_drafts":
       return await knowledgeDrafts(args);
 
@@ -1454,6 +1582,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Knowledge Ingestion Tools
     case "knowledge_ingest":
       return await knowledgeIngest(args);
+
+    case "knowledge_ingest_batch":
+      return await knowledgeIngestBatch(args);
 
     case "knowledge_ingestion_jobs":
       return await knowledgeIngestionJobs();

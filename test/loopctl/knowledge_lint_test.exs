@@ -353,6 +353,73 @@ defmodule Loopctl.KnowledgeLintTest do
       assert result.summary.total_articles == 2
     end
 
+    test "max_per_category caps each issue array but preserves totals in summary" do
+      tenant = fixture(:tenant)
+
+      # Create 5 stale articles (each orphaned and will land in orphan_articles
+      # and stale_articles buckets).
+      past = DateTime.utc_now() |> DateTime.add(-200 * 86_400, :second)
+
+      for i <- 1..5 do
+        article =
+          fixture(:article, %{
+            tenant_id: tenant.id,
+            title: "Stale #{i}",
+            category: :pattern,
+            status: :published
+          })
+
+        import Ecto.Query
+
+        Loopctl.AdminRepo.update_all(
+          from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
+          set: [updated_at: past]
+        )
+      end
+
+      {:ok, result} = Knowledge.lint(tenant.id, max_per_category: 2)
+
+      # Capped to 2
+      assert length(result.stale_articles) == 2
+      assert length(result.orphan_articles) == 2
+
+      # Summary records true totals BEFORE capping
+      assert result.summary.total_per_category.stale_articles == 5
+      assert result.summary.total_per_category.orphan_articles == 5
+      assert result.summary.truncated.stale_articles == true
+      assert result.summary.truncated.orphan_articles == true
+      # No items in these categories -> not truncated
+      assert result.summary.truncated.contradiction_clusters == false
+      assert result.summary.truncated.broken_sources == false
+    end
+
+    test "max_per_category does not truncate when count is below the cap" do
+      tenant = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Only Article",
+        category: :pattern,
+        status: :published
+      })
+
+      {:ok, result} = Knowledge.lint(tenant.id, max_per_category: 50)
+
+      assert result.summary.truncated.stale_articles == false
+      assert result.summary.truncated.orphan_articles == false
+      assert result.summary.total_per_category.stale_articles == 0
+    end
+
+    test "max_per_category clamps to [1, 500]" do
+      tenant = fixture(:tenant)
+
+      # 0 -> clamped to 1 (still succeeds; just caps arrays hard)
+      {:ok, _result} = Knowledge.lint(tenant.id, max_per_category: 0)
+
+      # Very large -> clamped to 500 (no crash)
+      {:ok, _result} = Knowledge.lint(tenant.id, max_per_category: 10_000)
+    end
+
     test "tenant isolation: tenant A's lint does not include tenant B's data" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)

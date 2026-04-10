@@ -95,52 +95,86 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    url = params["url"]
-    content = params["content"]
-    source_type = params["source_type"]
-    project_id = params["project_id"]
-    metadata = params["metadata"]
+    case enqueue_item(tenant_id, params) do
+      {:ok, :queued, %{job: job, content_hash: content_hash, source_type: source_type}} ->
+        conn
+        |> put_status(202)
+        |> json(
+          LoopctlWeb.KnowledgeIngestionJSON.queued(%{
+            job: job,
+            content_hash: content_hash,
+            source_type: source_type
+          })
+        )
 
-    with :ok <- validate_content_source(url, content),
-         :ok <- validate_source_type(source_type) do
-      content_hash = compute_content_hash(url || content)
+      {:ok, :already_queued, %{job: job, content_hash: content_hash}} ->
+        conn
+        |> put_status(200)
+        |> json(
+          LoopctlWeb.KnowledgeIngestionJSON.already_queued(%{
+            content_hash: content_hash,
+            job: job
+          })
+        )
 
-      job_args =
-        %{
-          "tenant_id" => tenant_id,
-          "content_hash" => content_hash,
-          "source_type" => source_type
-        }
-        |> maybe_put("url", url)
-        |> maybe_put("content", content)
-        |> maybe_put("project_id", project_id)
-        |> maybe_put("metadata", metadata)
+      # Pass validation / changeset errors through to the FallbackController
+      # which renders 4xx responses with the provided message.
+      {:error, _status, _message} = err ->
+        err
 
-      case ContentIngestionWorker.new(job_args) |> Oban.insert() do
-        {:ok, %Oban.Job{conflict?: true} = job} ->
-          conn
-          |> put_status(200)
-          |> json(
-            LoopctlWeb.KnowledgeIngestionJSON.already_queued(%{
-              content_hash: content_hash,
-              job: job
-            })
-          )
+      {:error, %Ecto.Changeset{}} = err ->
+        err
+    end
+  end
 
-        {:ok, job} ->
-          conn
-          |> put_status(202)
-          |> json(
-            LoopctlWeb.KnowledgeIngestionJSON.queued(%{
-              job: job,
-              content_hash: content_hash,
-              source_type: source_type
-            })
-          )
+  operation(:create_batch,
+    summary: "Batch ingest content for knowledge extraction",
+    description:
+      "Submit multiple URLs or raw content items for knowledge extraction in a single " <>
+        "request. Each item is validated and enqueued independently. " <>
+        "Max 50 items per batch. Role: orchestrator+.",
+    request_body:
+      {"Batch ingestion request", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           items: %OpenApiSpex.Schema{
+             type: :array,
+             description:
+               "Array of ingestion items (max 50). Each item has the same shape as " <>
+                 "POST /knowledge/ingest: url or content, source_type (required), " <>
+                 "project_id (optional), metadata (optional).",
+             maxItems: 50
+           }
+         },
+         required: ["items"]
+       }},
+    responses: %{
+      200 =>
+        {"Batch ingestion results", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               description: "Per-item results, one entry per submitted item."
+             }
+           }
+         }},
+      401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
 
-        {:error, changeset} ->
-          {:error, changeset}
-      end
+  @doc "POST /api/v1/knowledge/ingest/batch"
+  def create_batch(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    items = params["items"]
+
+    with :ok <- validate_batch_items(items) do
+      results = Enum.map(items, &enqueue_item_result(tenant_id, &1))
+      json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
   end
 
@@ -175,6 +209,109 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   end
 
   # --- Private ---
+
+  # Max batch size for POST /knowledge/ingest/batch
+  @batch_max 50
+
+  defp validate_batch_items(items) when is_list(items) and items != [] do
+    if length(items) > @batch_max do
+      {:error, :unprocessable_entity,
+       "Batch exceeds max of #{@batch_max} items (got #{length(items)})"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_batch_items([]) do
+    {:error, :unprocessable_entity, "'items' must be a non-empty array"}
+  end
+
+  defp validate_batch_items(_) do
+    {:error, :unprocessable_entity, "'items' must be a non-empty array"}
+  end
+
+  # Enqueue a single item and return {:ok, :queued | :already_queued, map} or
+  # {:error, ...}. Used by both single-item create/2 and batch create_batch/2.
+  defp enqueue_item(tenant_id, params) do
+    url = params["url"]
+    content = params["content"]
+    source_type = params["source_type"]
+    project_id = params["project_id"]
+    metadata = params["metadata"]
+
+    with :ok <- validate_content_source(url, content),
+         :ok <- validate_source_type(source_type) do
+      content_hash = compute_content_hash(url || content)
+
+      job_args =
+        %{
+          "tenant_id" => tenant_id,
+          "content_hash" => content_hash,
+          "source_type" => source_type
+        }
+        |> maybe_put("url", url)
+        |> maybe_put("content", content)
+        |> maybe_put("project_id", project_id)
+        |> maybe_put("metadata", metadata)
+
+      case ContentIngestionWorker.new(job_args) |> Oban.insert() do
+        {:ok, %Oban.Job{conflict?: true} = job} ->
+          {:ok, :already_queued, %{job: job, content_hash: content_hash}}
+
+        {:ok, job} ->
+          {:ok, :queued, %{job: job, content_hash: content_hash, source_type: source_type}}
+
+        {:error, changeset} ->
+          {:error, changeset}
+      end
+    end
+  end
+
+  # Wrap enqueue_item/2 to always return a per-item result map for batch mode.
+  # Batch mode never fails the whole request for a single invalid item — every
+  # item gets a result entry so the caller sees exactly what happened.
+  defp enqueue_item_result(tenant_id, params) when is_map(params) do
+    case enqueue_item(tenant_id, params) do
+      {:ok, :queued, %{job: job, content_hash: content_hash, source_type: source_type}} ->
+        %{
+          status: "queued",
+          id: job.id,
+          content_hash: content_hash,
+          source_type: source_type,
+          inserted_at: job.inserted_at
+        }
+
+      {:ok, :already_queued, %{job: job, content_hash: content_hash}} ->
+        %{
+          status: "already_queued",
+          id: job.id,
+          content_hash: content_hash
+        }
+
+      {:error, :unprocessable_entity, message} ->
+        %{status: "error", error: message}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        %{status: "error", error: format_changeset_errors(changeset)}
+
+      {:error, other} ->
+        %{status: "error", error: inspect(other)}
+    end
+  end
+
+  defp enqueue_item_result(_tenant_id, _params) do
+    %{status: "error", error: "item must be an object"}
+  end
+
+  defp format_changeset_errors(changeset) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
+      Enum.reduce(opts, msg, fn {k, v}, acc ->
+        String.replace(acc, "%{#{k}}", to_string(v))
+      end)
+    end)
+    |> Enum.map_join("; ", fn {field, errors} -> "#{field}: #{Enum.join(errors, ", ")}" end)
+  end
 
   defp validate_content_source(nil, nil) do
     {:error, :unprocessable_entity, "Exactly one of 'url' or 'content' is required"}

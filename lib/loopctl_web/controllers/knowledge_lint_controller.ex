@@ -52,6 +52,14 @@ defmodule LoopctlWeb.KnowledgeLintController do
         description:
           "Minimum published articles per category to avoid a coverage gap (default 3)",
         required: false
+      ],
+      max_per_category: [
+        in: :query,
+        type: :integer,
+        description:
+          "Maximum items returned per issue category (default 50, max 500). " <>
+            "Totals before capping are returned in summary.total_per_category.",
+        required: false
       ]
     ],
     responses: %{
@@ -99,8 +107,9 @@ defmodule LoopctlWeb.KnowledgeLintController do
         project_id -> Keyword.put(opts, :project_id, project_id)
       end
 
-    with {:ok, opts} <- parse_stale_days(params, opts) do
-      parse_min_coverage(params, opts)
+    with {:ok, opts} <- parse_stale_days(params, opts),
+         {:ok, opts} <- parse_min_coverage(params, opts) do
+      parse_max_per_category(params, opts)
     end
   end
 
@@ -143,4 +152,29 @@ defmodule LoopctlWeb.KnowledgeLintController do
   end
 
   defp parse_min_coverage(_params, opts), do: {:ok, opts}
+
+  @max_per_category_ceiling 500
+
+  defp parse_max_per_category(%{"max_per_category" => raw}, opts) when is_binary(raw) do
+    case Integer.parse(raw) do
+      {n, ""} when n > 0 and n <= @max_per_category_ceiling ->
+        {:ok, Keyword.put(opts, :max_per_category, n)}
+
+      _ ->
+        {:error, :bad_request,
+         "max_per_category must be a positive integer <= #{@max_per_category_ceiling}"}
+    end
+  end
+
+  defp parse_max_per_category(%{"max_per_category" => n}, opts)
+       when is_integer(n) and n > 0 and n <= @max_per_category_ceiling do
+    {:ok, Keyword.put(opts, :max_per_category, n)}
+  end
+
+  defp parse_max_per_category(%{"max_per_category" => _}, _opts) do
+    {:error, :bad_request,
+     "max_per_category must be a positive integer <= #{@max_per_category_ceiling}"}
+  end
+
+  defp parse_max_per_category(_params, opts), do: {:ok, opts}
 end

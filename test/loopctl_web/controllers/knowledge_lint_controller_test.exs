@@ -576,6 +576,97 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
       body = json_response(conn, 400)
       assert body["error"]["message"] =~ "min_coverage must be a positive integer"
     end
+
+    test "invalid max_per_category returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint?max_per_category=abc")
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "max_per_category"
+    end
+
+    test "zero max_per_category returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint?max_per_category=0")
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "max_per_category"
+    end
+
+    test "negative max_per_category returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint?max_per_category=-1")
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "max_per_category"
+    end
+
+    test "max_per_category over ceiling returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint?max_per_category=501")
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "max_per_category"
+    end
+
+    test "max_per_category caps returned arrays and exposes truncated flags", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      # Create 4 stale orphan articles
+      past = DateTime.utc_now() |> DateTime.add(-200 * 86_400, :second)
+
+      for i <- 1..4 do
+        article =
+          fixture(:article, %{
+            tenant_id: tenant.id,
+            title: "Stale Orphan #{i}",
+            category: :pattern,
+            status: :published
+          })
+
+        import Ecto.Query
+
+        Loopctl.AdminRepo.update_all(
+          from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
+          set: [updated_at: past]
+        )
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint?max_per_category=2")
+
+      body = json_response(conn, 200)
+
+      assert length(body["data"]["stale_articles"]) == 2
+      assert length(body["data"]["orphan_articles"]) == 2
+      assert body["summary"]["total_per_category"]["stale_articles"] == 4
+      assert body["summary"]["total_per_category"]["orphan_articles"] == 4
+      assert body["summary"]["truncated"]["stale_articles"] == true
+      assert body["summary"]["truncated"]["orphan_articles"] == true
+    end
   end
 
   describe "summary (AC-21.5.8)" do

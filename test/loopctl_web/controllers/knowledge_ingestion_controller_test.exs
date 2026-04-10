@@ -152,6 +152,168 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
   end
 
+  # --- POST /api/v1/knowledge/ingest/batch ---
+
+  describe "POST /api/v1/knowledge/ingest/batch" do
+    test "queues all three items successfully", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      items = [
+        %{content: "Batch item one content", source_type: "newsletter"},
+        %{content: "Batch item two content", source_type: "newsletter"},
+        %{content: "Batch item three content", source_type: "newsletter"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert is_list(body["data"])
+      assert length(body["data"]) == 3
+      assert Enum.all?(body["data"], fn r -> r["status"] == "queued" end)
+      assert Enum.all?(body["data"], fn r -> is_binary(r["content_hash"]) end)
+    end
+
+    test "returns per-item results for duplicate items within the same batch", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      items = [
+        %{content: "Duplicate content", source_type: "newsletter"},
+        %{content: "Duplicate content", source_type: "newsletter"},
+        %{content: "Unique content", source_type: "newsletter"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 3
+
+      statuses = Enum.map(body["data"], & &1["status"])
+      # In inline test mode jobs complete synchronously, so Oban uniqueness
+      # (which excludes completed jobs) cannot flag duplicates within the same
+      # request. The important batch-endpoint guarantee we assert here is that
+      # every item receives a per-item result (queued or already_queued), never
+      # error, and that duplicate content_hashes produce identical hashes.
+      assert Enum.all?(statuses, &(&1 in ["queued", "already_queued"]))
+
+      hashes =
+        body["data"]
+        |> Enum.take(2)
+        |> Enum.map(& &1["content_hash"])
+
+      [h1, h2] = hashes
+      assert h1 == h2
+    end
+
+    test "returns 422 when batch exceeds 50 items", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      items =
+        Enum.map(1..51, fn i ->
+          %{content: "Item #{i}", source_type: "newsletter"}
+        end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "50"
+    end
+
+    test "returns 422 when items is empty", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: []})
+
+      assert json_response(conn, 422)
+    end
+
+    test "mixed valid and invalid items produce per-item results", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      items = [
+        %{content: "Valid content", source_type: "newsletter"},
+        # missing source_type
+        %{content: "Invalid — no source_type"},
+        # neither url nor content
+        %{source_type: "newsletter"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 3
+
+      statuses = Enum.map(body["data"], & &1["status"])
+      assert "queued" in statuses
+      assert Enum.count(statuses, &(&1 == "error")) == 2
+    end
+
+    test "agent role is rejected (requires orchestrator)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "x", source_type: "newsletter"}]
+        })
+
+      assert json_response(conn, 403)
+    end
+
+    test "tenant isolation: tenant A cannot see tenant B's batch jobs", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+      {raw_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})
+
+      # Tenant B batches two items
+      build_conn()
+      |> auth_conn(raw_key_b)
+      |> post(~p"/api/v1/knowledge/ingest/batch", %{
+        items: [
+          %{content: "B batch 1", source_type: "newsletter"},
+          %{content: "B batch 2", source_type: "newsletter"}
+        ]
+      })
+
+      # Tenant A should not see tenant B's jobs
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs")
+
+      body = json_response(conn, 200)
+
+      tenant_b_jobs =
+        Enum.filter(body["data"], fn job ->
+          job["args"]["tenant_id"] == tenant_b.id
+        end)
+
+      assert tenant_b_jobs == []
+    end
+  end
+
   # --- GET /api/v1/knowledge/ingestion-jobs ---
 
   describe "GET /api/v1/knowledge/ingestion-jobs" do

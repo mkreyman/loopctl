@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 35 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 37 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -62,10 +62,11 @@ Or if installed locally:
 | `LOOPCTL_API_KEY` | Global API key override (if set, always used) | -- |
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (verify, reject, review, import) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
+| `LOOPCTL_USER_KEY` | User role API key. Required ONLY for destructive admin tools like `knowledge_bulk_publish`. Leave unset if you don't use those tools. | -- |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (35)
+## Tools (37)
 
 ### Project Tools
 
@@ -140,10 +141,12 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | Tool | Description |
 |---|---|
 | `knowledge_publish` | Publish a draft article, making it visible to all agents. Required: `article_id`. |
-| `knowledge_drafts` | List all draft (unpublished) knowledge articles. Optional: `limit`, `offset`. |
-| `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`. |
+| `knowledge_bulk_publish` | **Requires `LOOPCTL_USER_KEY`.** Atomically publish up to 100 drafts in a single call. Required: `article_ids` (array). |
+| `knowledge_drafts` | List draft (unpublished) knowledge articles with pagination. Optional: `limit` (default 20, max 20), `offset` (default 0), `project_id`. Returns `meta.total_count`. |
+| `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`, `max_per_category` (default 50, max 500). True totals returned in `summary.total_per_category`. |
 | `knowledge_export` | Export all knowledge articles as a ZIP archive. Returns a curl command for direct download (ZIP binary cannot be returned as MCP content). Optional: `project_id`. |
 | `knowledge_ingest` | Submit a URL or raw content for knowledge extraction. Enqueues an Oban job. Required: `source_type`. One of: `url` or `content`. Optional: `project_id`. |
+| `knowledge_ingest_batch` | Submit up to 50 ingestion items in a single request. Each item has the same shape as `knowledge_ingest`. Returns per-item results. Required: `items`. Optional: batch-level `project_id` default. |
 | `knowledge_ingestion_jobs` | List recent content ingestion jobs (last 7 days, max 50). |
 
 ### Discovery Tools
