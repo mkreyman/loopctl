@@ -15,6 +15,10 @@ defmodule Loopctl.Projects.Project do
   - `description` -- freeform text description
   - `tech_stack` -- e.g., "elixir/phoenix", "typescript/fastify"
   - `status` -- `:active` or `:archived`
+  - `mission` -- optional project mission/goal statement that agents can
+    cascade into story context (e.g., "Build the #1 AI note-taking app
+    to $1M MRR"). Surfaces in get_story responses so every story carries
+    the project's why without a separate fetch.
   - `metadata` -- JSONB map for extensibility
   """
 
@@ -24,6 +28,7 @@ defmodule Loopctl.Projects.Project do
 
   @statuses [:active, :archived]
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
+  @mission_max_length 2_000
 
   @derive {Jason.Encoder,
            only: [
@@ -35,6 +40,7 @@ defmodule Loopctl.Projects.Project do
              :description,
              :tech_stack,
              :status,
+             :mission,
              :metadata,
              :inserted_at,
              :updated_at
@@ -48,6 +54,7 @@ defmodule Loopctl.Projects.Project do
     field :description, :string
     field :tech_stack, :string
     field :status, Ecto.Enum, values: @statuses, default: :active
+    field :mission, :string
     field :metadata, :map, default: %{}
 
     timestamps()
@@ -61,9 +68,10 @@ defmodule Loopctl.Projects.Project do
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(project \\ %__MODULE__{}, attrs) do
     project
-    |> cast(attrs, [:name, :slug, :repo_url, :description, :tech_stack, :metadata])
+    |> cast(attrs, [:name, :slug, :repo_url, :description, :tech_stack, :mission, :metadata])
     |> validate_required([:name, :slug])
     |> validate_slug()
+    |> validate_mission()
     |> validate_metadata()
     |> unique_constraint([:tenant_id, :slug],
       message: "has already been taken for this tenant",
@@ -79,8 +87,9 @@ defmodule Loopctl.Projects.Project do
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(project, attrs) do
     project
-    |> cast(attrs, [:name, :repo_url, :description, :tech_stack, :status, :metadata])
+    |> cast(attrs, [:name, :repo_url, :description, :tech_stack, :status, :mission, :metadata])
     |> validate_inclusion(:status, @statuses)
+    |> validate_mission()
     |> validate_metadata()
   end
 
@@ -105,6 +114,19 @@ defmodule Loopctl.Projects.Project do
         "must be lowercase alphanumeric with hyphens, starting and ending with alphanumeric"
     )
     |> validate_length(:slug, min: 2, max: 63)
+  end
+
+  defp validate_mission(changeset) do
+    changeset
+    |> update_change(:mission, fn
+      nil -> nil
+      value when is_binary(value) -> String.trim(value)
+    end)
+    |> update_change(:mission, fn
+      "" -> nil
+      value -> value
+    end)
+    |> validate_length(:mission, max: @mission_max_length)
   end
 
   defp validate_metadata(changeset) do

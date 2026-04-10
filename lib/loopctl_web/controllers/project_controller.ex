@@ -122,6 +122,7 @@ defmodule LoopctlWeb.ProjectController do
       repo_url: params["repo_url"],
       description: params["description"],
       tech_stack: params["tech_stack"],
+      mission: params["mission"],
       metadata: params["metadata"] || %{}
     }
 
@@ -209,10 +210,13 @@ defmodule LoopctlWeb.ProjectController do
         description: params["description"],
         tech_stack: params["tech_stack"],
         status: safe_to_status(params["status"]),
+        mission: params["mission"],
         metadata: params["metadata"]
       }
 
-      # Remove nil values so we only update provided fields
+      # Remove nil values so we only update provided fields. Mission can
+      # still be cleared by sending an empty string, which the changeset
+      # normalizes back to nil.
       attrs = Map.reject(attrs, fn {_k, v} -> is_nil(v) end)
 
       case Projects.update_project(tenant_id, project, attrs, audit_opts) do
@@ -274,6 +278,7 @@ defmodule LoopctlWeb.ProjectController do
       description: project.description,
       tech_stack: project.tech_stack,
       status: project.status,
+      mission: project.mission,
       metadata: project.metadata,
       inserted_at: project.inserted_at,
       updated_at: project.updated_at

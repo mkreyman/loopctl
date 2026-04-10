@@ -210,6 +210,38 @@ defmodule LoopctlWeb.StoryControllerTest do
 
       assert json_response(conn, 404)
     end
+
+    test "embeds project_mission when project has one", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          mission: "Build the #1 AI dev loop tool by 2027."
+        })
+
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/stories/#{story.id}")
+
+      body = json_response(conn, 200)
+      assert body["story"]["project_mission"] == "Build the #1 AI dev loop tool by 2027."
+    end
+
+    test "omits project_mission key when project has no mission", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/stories/#{story.id}")
+
+      body = json_response(conn, 200)
+      refute Map.has_key?(body["story"], "project_mission")
+    end
   end
 
   describe "PATCH /api/v1/stories/:id" do
