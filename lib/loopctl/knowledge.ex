@@ -310,11 +310,7 @@ defmodule Loopctl.Knowledge do
             tenant_id: tenant_id,
             event_type: "article.archived",
             project_id: updated.project_id,
-            payload: %{
-              "id" => updated.id,
-              "title" => updated.title,
-              "category" => to_string(updated.category)
-            }
+            payload: article_event_payload(updated)
           }
         end)
 

@@ -249,6 +249,9 @@ defmodule Loopctl.KnowledgeWebhookEventsTest do
       assert payload["id"] == article.id
       assert payload["title"] == "Article to Archive"
       assert payload["category"] == "decision"
+      assert payload["status"] == "archived"
+      assert payload["project_id"] == nil
+      assert payload["tags"] == []
 
       # AC-19.6.10: Must NOT include body, metadata, or embedding
       refute Map.has_key?(payload, "body")
