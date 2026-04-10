@@ -36,6 +36,7 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Projects.Project
@@ -124,19 +125,24 @@ defmodule Loopctl.Knowledge do
   Preloads outgoing links (with target articles) and incoming links
   (with source articles).
 
+  Records a `"get"` access event when an `:api_key_id` is supplied
+  via `opts`. Recording is fire-and-forget and never affects the read.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `article_id` -- the article UUID
+  - `opts` -- keyword list with optional `:api_key_id` for access tracking
+    and `:access_metadata` for extra context attached to the event
 
   ## Returns
 
   - `{:ok, %Article{}}` with preloaded links
   - `{:error, :not_found}` if not found or belongs to another tenant
   """
-  @spec get_article(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec get_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
-  def get_article(tenant_id, article_id) do
+  def get_article(tenant_id, article_id, opts \\ []) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
       nil ->
         {:error, :not_found}
@@ -147,6 +153,14 @@ defmodule Loopctl.Knowledge do
             outgoing_links: :target_article,
             incoming_links: :source_article
           )
+
+        Analytics.record_access(
+          tenant_id,
+          article.id,
+          Keyword.get(opts, :api_key_id),
+          "get",
+          Keyword.get(opts, :access_metadata, %{})
+        )
 
         {:ok, article}
     end
@@ -367,18 +381,38 @@ defmodule Loopctl.Knowledge do
     limit = opts |> Keyword.get(:limit, 5) |> max(1) |> min(20)
     recency_weight = opts |> Keyword.get(:recency_weight, 0.3) |> max(0.0) |> min(1.0)
     status = Keyword.get(opts, :status, :published)
+    api_key_id = Keyword.get(opts, :api_key_id)
 
-    # Run combined search with a wider internal limit to get candidate pool
+    # Run combined search with a wider internal limit to get candidate pool.
+    # Suppress sub-search recording so context access is recorded once with
+    # access_type="context" rather than duplicating as "search".
     search_opts =
       opts
       |> Keyword.take([:project_id])
-      |> Keyword.merge(limit: limit * 3, offset: 0, status: status)
+      |> Keyword.merge(
+        limit: limit * 3,
+        offset: 0,
+        status: status,
+        _skip_record_access: true
+      )
 
     {search_result, fallback?} = run_context_search(tenant_id, query_string, search_opts)
 
     case search_result do
       {:ok, search} ->
-        build_context_results(tenant_id, search, limit, recency_weight, fallback?)
+        {:ok, context} =
+          build_context_results(tenant_id, search, limit, recency_weight, fallback?)
+
+        context_ids = Enum.map(context.results, & &1.id)
+
+        Analytics.record_context_access(
+          tenant_id,
+          context_ids,
+          api_key_id,
+          %{"query" => query_string}
+        )
+
+        {:ok, context}
 
       {:error, reason} ->
         {:error, reason}
@@ -614,6 +648,8 @@ defmodule Loopctl.Knowledge do
           |> offset(^offset)
           |> AdminRepo.all()
 
+        maybe_record_search_access(tenant_id, results, query_string, opts, "keyword")
+
         {:ok,
          %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
     end
@@ -625,6 +661,39 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+  end
+
+  # Fire-and-forget recording of search access for the result list.
+  # Skips when there is no api_key_id, no results, or the caller passed
+  # `_skip_record_access: true` (used by combined search to dedupe).
+  defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
+    cond do
+      Keyword.get(opts, :_skip_record_access, false) ->
+        :ok
+
+      results in [nil, []] ->
+        :ok
+
+      is_nil(Keyword.get(opts, :api_key_id)) ->
+        :ok
+
+      true ->
+        api_key_id = Keyword.fetch!(opts, :api_key_id)
+
+        article_ids =
+          results
+          |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.take(20)
+
+        Analytics.record_search_access(
+          tenant_id,
+          article_ids,
+          api_key_id,
+          query_string,
+          %{"mode" => mode}
+        )
+    end
   end
 
   @doc """
@@ -1823,6 +1892,8 @@ defmodule Loopctl.Knowledge do
       |> offset(^offset)
       |> AdminRepo.all()
 
+    maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+
     {:ok,
      %{
        results: results,
@@ -1907,8 +1978,13 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_combined_search(tenant_id, query_string, keyword_weight, semantic_weight, opts) do
-    # Use wide limits for sub-searches to get comprehensive score pools
-    sub_opts = Keyword.merge(opts, limit: 50, offset: 0)
+    # Use wide limits for sub-searches to get comprehensive score pools.
+    # Suppress sub-search access recording so we only record once at the
+    # merged result (otherwise each article would be tracked twice).
+    sub_opts =
+      opts
+      |> Keyword.merge(limit: 50, offset: 0)
+      |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
     embedding_result = try_generate_embedding(query_string)
@@ -1916,11 +1992,30 @@ defmodule Loopctl.Knowledge do
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->
         {:ok, semantic} = search_semantic(tenant_id, embedding, sub_opts)
-        merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
+
+        {:ok, merged} = merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
+
+        maybe_record_search_access(
+          tenant_id,
+          merged.results,
+          query_string,
+          opts,
+          "combined"
+        )
+
+        {:ok, merged}
 
       {{:ok, kw}, {:error, _reason}} ->
         # Fallback to keyword-only
         paginated = paginate_results(kw.results, opts)
+
+        maybe_record_search_access(
+          tenant_id,
+          paginated.results,
+          query_string,
+          opts,
+          "combined_fallback"
+        )
 
         {:ok,
          %{
@@ -2693,5 +2788,73 @@ defmodule Loopctl.Knowledge do
           "Source entity was deleted; consider updating or removing source reference"
       }
     end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Analytics — article usage tracking
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Records a fire-and-forget article access event.
+
+  See `Loopctl.Knowledge.Analytics.record_access/5` for full semantics.
+  """
+  @spec record_access(
+          Ecto.UUID.t(),
+          Ecto.UUID.t() | nil,
+          Ecto.UUID.t() | nil,
+          String.t(),
+          map()
+        ) :: :ok
+  def record_access(tenant_id, article_id, api_key_id, access_type, metadata \\ %{}) do
+    Analytics.record_access(tenant_id, article_id, api_key_id, access_type, metadata)
+  end
+
+  @doc """
+  Records fire-and-forget search access for a list of article ids.
+  """
+  @spec record_search_access(
+          Ecto.UUID.t(),
+          [Ecto.UUID.t()],
+          Ecto.UUID.t() | nil,
+          String.t() | nil,
+          map()
+        ) :: :ok
+  def record_search_access(tenant_id, article_ids, api_key_id, query, metadata \\ %{}) do
+    Analytics.record_search_access(tenant_id, article_ids, api_key_id, query, metadata)
+  end
+
+  @doc """
+  Returns aggregated usage statistics for a single article.
+
+  See `Loopctl.Knowledge.Analytics.get_article_stats/2` for the response shape.
+  """
+  @spec get_article_stats(Ecto.UUID.t(), Ecto.UUID.t()) :: map()
+  def get_article_stats(tenant_id, article_id) do
+    Analytics.get_article_stats(tenant_id, article_id)
+  end
+
+  @doc """
+  Returns the top accessed articles for a tenant in a time window.
+  """
+  @spec list_top_articles(Ecto.UUID.t(), keyword()) :: [map()]
+  def list_top_articles(tenant_id, opts \\ []) do
+    Analytics.list_top_articles(tenant_id, opts)
+  end
+
+  @doc """
+  Returns usage statistics for a single api_key (agent identity).
+  """
+  @spec get_agent_usage(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: map()
+  def get_agent_usage(tenant_id, api_key_id, opts \\ []) do
+    Analytics.get_agent_usage(tenant_id, api_key_id, opts)
+  end
+
+  @doc """
+  Returns published articles with zero accesses in the configured window.
+  """
+  @spec list_unused_articles(Ecto.UUID.t(), keyword()) :: [map()]
+  def list_unused_articles(tenant_id, opts \\ []) do
+    Analytics.list_unused_articles(tenant_id, opts)
   end
 end

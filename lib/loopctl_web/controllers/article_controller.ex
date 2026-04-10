@@ -186,8 +186,9 @@ defmodule LoopctlWeb.ArticleController do
   @doc "GET /api/v1/articles/:id"
   def show(conn, %{"id" => article_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key_id = conn.assigns.current_api_key.id
 
-    case Knowledge.get_article(tenant_id, article_id) do
+    case Knowledge.get_article(tenant_id, article_id, api_key_id: api_key_id) do
       {:ok, article} ->
         json(conn, ArticleJSON.show(%{article: article}))
 

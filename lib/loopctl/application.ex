@@ -14,6 +14,7 @@ defmodule Loopctl.Application do
       Loopctl.AdminRepo,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
+      {Task.Supervisor, name: Loopctl.TaskSupervisor},
       {Oban, Application.fetch_env!(:loopctl, Oban)},
       Loopctl.RateLimiter.Server,
       LoopctlWeb.Endpoint

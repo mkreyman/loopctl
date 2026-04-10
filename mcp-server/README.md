@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 37 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 41 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (37)
+## Tools (41)
 
 ### Project Tools
 
@@ -148,6 +148,15 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_ingest` | Submit a URL or raw content for knowledge extraction. Enqueues an Oban job. Required: `source_type`. One of: `url` or `content`. Optional: `project_id`. |
 | `knowledge_ingest_batch` | Submit up to 50 ingestion items in a single request. Each item has the same shape as `knowledge_ingest`. Returns per-item results. Required: `items`. Optional: batch-level `project_id` default. |
 | `knowledge_ingestion_jobs` | List recent content ingestion jobs (last 7 days, max 50). |
+
+### Knowledge Analytics Tools (orchestrator key)
+
+| Tool | Description |
+|---|---|
+| `knowledge_analytics_top` | Top accessed knowledge articles for the tenant. Optional: `limit` (default 20, max 100), `since_days` (default 7), `access_type` (`search`, `get`, `context`, `index`). |
+| `knowledge_article_stats` | Per-article usage stats: total accesses, unique agents, by-type breakdown, recent events. Required: `article_id`. |
+| `knowledge_agent_usage` | Per-agent (api_key) knowledge usage: total reads, unique articles, top read articles. Required: `agent_id`. Optional: `limit`, `since_days`. |
+| `knowledge_unused_articles` | Published articles with zero accesses in the window. Optional: `days_unused` (default 30), `limit` (default 50, max 200). |
 
 ### Discovery Tools
 

@@ -825,7 +825,7 @@
           <h2 class="font-display text-xl font-semibold text-slate-100">MCP Tools</h2>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The loopctl MCP server provides 37 typed tools for Claude Code agents.
+              The loopctl MCP server provides 41 typed tools for Claude Code agents.
               Install via
               <span class="font-mono text-slate-300">npm install loopctl-mcp-server</span>
               and configure in <span class="font-mono text-slate-300">.mcp.json</span>.
@@ -909,11 +909,78 @@
           </div>
 
           <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
+            Knowledge Analytics Tools
+          </h3>
+          <div class="mt-4 space-y-3">
+            <p class="text-sm text-slate-400">
+              Article usage tracking surfaces which knowledge agents actually
+              read. Every search hit, direct fetch, and context retrieval is
+              recorded as an immutable access event. Analytics endpoints
+              aggregate those events into top-articles, per-article stats,
+              per-agent usage, and unused-articles reports. All four endpoints
+              and MCP tools require <span class="font-mono text-slate-300">orchestrator+</span>.
+            </p>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_analytics_top</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                <span class="font-mono text-slate-300">
+                  GET /api/v1/knowledge/analytics/top-articles
+                </span>
+                — Top accessed articles for the tenant. Optional params:
+                <span class="font-mono text-slate-300">limit</span>
+                (default 20, max 100), <span class="font-mono text-slate-300">since_days</span>
+                (default 7), <span class="font-mono text-slate-300">access_type</span>
+                (search, get, context, index).
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_article_stats</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                <span class="font-mono text-slate-300">
+                  GET /api/v1/knowledge/articles/:id/stats
+                </span>
+                — Per-article counts: total accesses, unique agents, by-type
+                breakdown, last access time, and the 10 most recent events.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_agent_usage</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                <span class="font-mono text-slate-300">
+                  GET /api/v1/knowledge/analytics/agents/:agent_id
+                </span>
+                — What a specific api_key reads: total reads, unique articles,
+                access type breakdown, and top read articles.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">knowledge_unused_articles</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                <span class="font-mono text-slate-300">
+                  GET /api/v1/knowledge/analytics/unused-articles
+                </span>
+                — Published articles with zero accesses in the window. Optional
+                params: <span class="font-mono text-slate-300">days_unused</span>
+                (default 30), <span class="font-mono text-slate-300">limit</span>
+                (default 50, max 200).
+              </p>
+            </div>
+          </div>
+
+          <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
             Other Notable Tools
           </h3>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The full set of 37 tools covers projects, stories, epics, verification,
+              The full set of 41 tools covers projects, stories, epics, verification,
               artifacts, orchestrator state, webhooks, skills, token usage, analytics,
               and knowledge. See the
               <a
