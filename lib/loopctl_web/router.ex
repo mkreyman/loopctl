@@ -231,7 +231,15 @@ defmodule LoopctlWeb.Router do
     post "/skill_results", SkillResultController, :create
 
     # Knowledge Wiki (Epic 19)
+    # Publish workflow routes (must precede resources to avoid route conflicts)
+    post "/articles/:id/publish", ArticleWorkflowController, :publish
+    post "/articles/:id/unpublish", ArticleWorkflowController, :unpublish
+    post "/articles/:id/archive", ArticleWorkflowController, :archive
     resources "/articles", ArticleController, except: [:new, :edit]
+
+    # Knowledge bulk-publish and drafts queue
+    post "/knowledge/bulk-publish", ArticleWorkflowController, :bulk_publish
+    get "/knowledge/drafts", ArticleWorkflowController, :drafts
 
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index

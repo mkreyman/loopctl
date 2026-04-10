@@ -125,13 +125,11 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     }
   end
 
-  defp validate_and_filter(raw_articles) when is_list(raw_articles) do
+  defp validate_and_filter(raw_articles) do
     raw_articles
     |> Enum.take(@max_articles)
     |> Enum.filter(&valid_article?/1)
   end
-
-  defp validate_and_filter(_), do: []
 
   defp valid_article?(attrs) when is_map(attrs) do
     valid_title?(attrs) and valid_body?(attrs) and valid_category?(attrs) and valid_tags?(attrs)

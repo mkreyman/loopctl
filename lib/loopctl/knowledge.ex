@@ -731,6 +731,360 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # --- Publish Workflow ---
+
+  @doc """
+  Publishes an article by transitioning its status from `:draft` to `:published`.
+
+  Validates the transition via `Article.valid_transition?/2` and records
+  the `article.published` audit event. Enqueues embedding generation.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if not found or belongs to another tenant
+  - `{:error, :unprocessable_entity, message}` on invalid transition
+  """
+  @spec publish_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def publish_article(tenant_id, article_id, opts \\ []) do
+    transition_article(tenant_id, article_id, :published, "article.published", opts)
+  end
+
+  @doc """
+  Unpublishes an article by transitioning its status from `:published` to `:draft`.
+
+  Validates the transition via `Article.valid_transition?/2` and records
+  the `article.unpublished` audit event.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if not found or belongs to another tenant
+  - `{:error, :unprocessable_entity, message}` on invalid transition
+  """
+  @spec unpublish_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def unpublish_article(tenant_id, article_id, opts \\ []) do
+    transition_article(tenant_id, article_id, :draft, "article.unpublished", opts)
+  end
+
+  @doc """
+  Archives an article via the publish workflow.
+
+  Unlike `archive_article/3` (called by DELETE), this function validates
+  the status transition. Only `:draft` and `:published` articles can be
+  archived. `:superseded` articles return a 422 error.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if not found or belongs to another tenant
+  - `{:error, :unprocessable_entity, message}` on invalid transition
+  """
+  @spec archive_article_workflow(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def archive_article_workflow(tenant_id, article_id, opts \\ []) do
+    transition_article(tenant_id, article_id, :archived, "article.archived", opts)
+  end
+
+  @doc """
+  Atomically publishes multiple draft articles.
+
+  Validates that all article IDs belong to the tenant and that all
+  articles are in `:draft` status. If any article fails validation,
+  the entire operation is rolled back (atomic Multi).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_ids` -- list of article UUIDs (max 100)
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+
+  ## Returns
+
+  - `{:ok, %{published: [%Article{}], count: integer}}` on success
+  - `{:error, :bad_request, message}` when article_ids exceeds 100
+  - `{:error, :bad_request, message}` when article_ids is empty
+  - `{:error, :unprocessable_entity, message}` when any article is not a draft
+  - `{:error, :not_found}` when any article ID is not found in the tenant
+  """
+  @spec bulk_publish(Ecto.UUID.t(), [Ecto.UUID.t()], keyword()) ::
+          {:ok, %{published: [Article.t()], count: non_neg_integer()}}
+          | {:error, atom(), String.t()}
+          | {:error, :not_found}
+  def bulk_publish(tenant_id, article_ids, opts \\ []) do
+    cond do
+      article_ids == [] or is_nil(article_ids) ->
+        {:error, :bad_request, "article_ids must not be empty"}
+
+      length(article_ids) > 100 ->
+        {:error, :bad_request, "Maximum 100 articles per bulk publish"}
+
+      true ->
+        do_bulk_publish(tenant_id, article_ids, opts)
+    end
+  end
+
+  @doc """
+  Lists draft articles for a tenant, ordered by inserted_at desc.
+
+  Returns source_type and source_id for review queue visibility.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list with:
+    - `:project_id` -- filter by project UUID (optional)
+    - `:limit` -- max records to return (default 20, max 100)
+    - `:offset` -- records to skip for pagination (default 0)
+
+  ## Returns
+
+  - `%{data: [%Article{}], meta: %{total_count: integer, limit: integer, offset: integer}}`
+  """
+  @spec list_drafts(Ecto.UUID.t(), keyword()) :: %{
+          data: [Article.t()],
+          meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
+        }
+  def list_drafts(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :draft,
+        order_by: [desc: a.inserted_at]
+      )
+
+    base = maybe_filter_by_project_id(base, Keyword.get(opts, :project_id))
+
+    total_count = AdminRepo.aggregate(base, :count, :id)
+
+    articles =
+      base
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    %{
+      data: articles,
+      meta: %{total_count: total_count, limit: limit, offset: offset}
+    }
+  end
+
+  # Shared transition logic for publish/unpublish/archive workflow
+  defp transition_article(tenant_id, article_id, target_status, audit_action, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
+    needs_embedding? = target_status == :published
+
+    # Fetch-and-lock inside the transaction to eliminate TOCTOU races where
+    # concurrent requests could change the status between validation and update.
+    multi =
+      Multi.new()
+      |> Multi.run(:fetch, fn _repo, _changes ->
+        query =
+          from(a in Article,
+            where: a.id == ^article_id and a.tenant_id == ^tenant_id,
+            lock: "FOR UPDATE"
+          )
+
+        case AdminRepo.one(query) do
+          nil -> {:error, {:not_found, nil}}
+          article -> validate_transition_and_wrap(article, target_status)
+        end
+      end)
+      |> Multi.run(:article, fn _repo, %{fetch: {article, _old_status}} ->
+        changeset = Article.update_changeset(article, %{status: target_status})
+        AdminRepo.update(changeset)
+      end)
+      |> Audit.log_in_multi(:audit, fn %{fetch: {_article, old_status}, article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "article",
+          entity_id: updated.id,
+          action: audit_action,
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"status" => old_status},
+          new_state: %{"status" => to_string(updated.status)}
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: audit_action,
+          project_id: updated.project_id,
+          payload: article_event_payload(updated)
+        }
+      end)
+      |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{article: updated}} ->
+        {:ok, updated}
+
+      {:error, :fetch, {:not_found, _}, _} ->
+        {:error, :not_found}
+
+      {:error, :fetch, {:unprocessable_entity, message}, _} ->
+        {:error, :unprocessable_entity, message}
+
+      {:error, :article, changeset, _} ->
+        {:error, changeset}
+    end
+  end
+
+  # Validates the transition and wraps the result for Multi.run compatibility.
+  # Returns {:ok, {article, old_status_string}} or {:error, {error_type, detail}}.
+  defp validate_transition_and_wrap(article, target_status) do
+    if Article.valid_transition?(article.status, target_status) do
+      {:ok, {article, to_string(article.status)}}
+    else
+      {:error,
+       {:unprocessable_entity, "Cannot transition from #{article.status} to #{target_status}"}}
+    end
+  end
+
+  defp do_bulk_publish(tenant_id, article_ids, opts) do
+    # Fetch all articles up front and validate
+    articles =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id in ^article_ids
+      )
+      |> AdminRepo.all()
+
+    with :ok <- validate_bulk_all_found(articles, article_ids),
+         :ok <- validate_bulk_all_drafts(articles) do
+      execute_bulk_publish(tenant_id, articles, article_ids, opts)
+    end
+  end
+
+  defp validate_bulk_all_found(articles, article_ids) do
+    found_ids = MapSet.new(articles, & &1.id)
+    requested_ids = MapSet.new(article_ids)
+
+    if MapSet.subset?(requested_ids, found_ids) do
+      :ok
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp validate_bulk_all_drafts(articles) do
+    case Enum.find(articles, &(&1.status != :draft)) do
+      nil ->
+        :ok
+
+      non_draft ->
+        {:error, :unprocessable_entity,
+         "Article #{non_draft.id} is in status #{non_draft.status}, expected draft"}
+    end
+  end
+
+  defp execute_bulk_publish(tenant_id, articles, article_ids, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
+    # Use {action, index} tuples as Multi keys to avoid atom exhaustion.
+    # String.to_atom with dynamic UUIDs would leak atoms (never GC'd).
+    indexed_articles = Enum.with_index(articles)
+
+    multi =
+      indexed_articles
+      |> Enum.reduce(Multi.new(), fn {article, idx}, multi ->
+        changeset = Article.update_changeset(article, %{status: :published})
+        Multi.update(multi, {:publish, idx}, changeset)
+      end)
+      |> add_bulk_audit_entries(tenant_id, indexed_articles, actor_id, actor_label, actor_type)
+      |> add_bulk_embedding_jobs(tenant_id, article_ids)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, results} ->
+        published =
+          indexed_articles
+          |> Enum.map(fn {_article, idx} -> Map.get(results, {:publish, idx}) end)
+          |> Enum.reject(&is_nil/1)
+
+        {:ok, %{published: published, count: length(published)}}
+
+      {:error, _key, changeset, _completed} ->
+        {:error, changeset}
+    end
+  end
+
+  defp add_bulk_audit_entries(
+         multi,
+         tenant_id,
+         indexed_articles,
+         actor_id,
+         actor_label,
+         actor_type
+       ) do
+    Enum.reduce(indexed_articles, multi, fn {_article, idx}, multi ->
+      Audit.log_in_multi(multi, {:audit, idx}, fn changes ->
+        updated = Map.get(changes, {:publish, idx})
+
+        %{
+          tenant_id: tenant_id,
+          entity_type: "article",
+          entity_id: updated.id,
+          action: "article.published",
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{"status" => "draft"},
+          new_state: %{"status" => to_string(updated.status)}
+        }
+      end)
+    end)
+  end
+
+  defp add_bulk_embedding_jobs(multi, tenant_id, article_ids) do
+    Multi.run(multi, :embedding_jobs, fn _repo, _changes ->
+      Enum.each(article_ids, fn article_id ->
+        ArticleEmbeddingWorker.new(%{article_id: article_id, tenant_id: tenant_id})
+        |> Oban.insert()
+      end)
+
+      {:ok, :enqueued}
+    end)
+  end
+
   # --- Article Links ---
 
   @doc """
