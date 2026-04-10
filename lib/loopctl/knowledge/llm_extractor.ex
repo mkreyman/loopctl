@@ -57,7 +57,7 @@ defmodule Loopctl.Knowledge.LlmExtractor do
 
     body = %{
       model: model,
-      max_tokens: 2048,
+      max_tokens: 16_384,
       system: @system_prompt,
       messages: [%{role: "user", content: user_message}]
     }
