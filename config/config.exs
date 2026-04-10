@@ -10,7 +10,9 @@ import Config
 config :loopctl,
   ecto_repos: [Loopctl.Repo],
   generators: [timestamp_type: :utc_datetime, binary_id: true],
-  embedding_dimensions: 1536
+  embedding_dimensions: 1536,
+  article_link_threshold: 0.8,
+  article_link_max_comparisons: 50
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
