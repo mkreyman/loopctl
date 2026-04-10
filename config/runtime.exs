@@ -83,6 +83,15 @@ if config_env() == :prod do
     queue_target: 5_000,
     queue_interval: 10_000
 
+  # OpenAI embedding provider for semantic search (Knowledge Wiki)
+  if openai_key = System.get_env("OPENAI_API_KEY") do
+    config :loopctl, :embedding_provider, %{
+      api_key: openai_key,
+      base_url: System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1",
+      model: System.get_env("OPENAI_EMBEDDING_MODEL") || "text-embedding-3-small"
+    }
+  end
+
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
   # want to use a different value for prod and you most likely don't want
