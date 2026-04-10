@@ -480,6 +480,20 @@ async function knowledgeLint({ project_id, stale_days, min_coverage }) {
   return toContent(result);
 }
 
+async function knowledgeIngest({ url, content, source_type, project_id }) {
+  const body = { source_type };
+  if (url) body.url = url;
+  if (content) body.content = content;
+  if (project_id) body.project_id = project_id;
+  const result = await apiCall("POST", "/api/v1/knowledge/ingest", body, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeIngestionJobs() {
+  const result = await apiCall("GET", "/api/v1/knowledge/ingestion-jobs", null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeExport({ project_id }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/export`
@@ -1256,6 +1270,48 @@ const TOOLS = [
     },
   },
 
+  // Knowledge Ingestion Tools
+  {
+    name: "knowledge_ingest",
+    description:
+      "Submit a URL or raw content for knowledge extraction. " +
+      "Enqueues an Oban job that fetches the content (if URL), extracts knowledge articles via LLM, " +
+      "and inserts them as draft articles. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "URL to fetch content from (exactly one of url or content required).",
+        },
+        content: {
+          type: "string",
+          description: "Raw content to extract knowledge from (exactly one of url or content required).",
+        },
+        source_type: {
+          type: "string",
+          description: "Source type (e.g., newsletter, skill, web_article, ingestion). Required.",
+        },
+        project_id: {
+          type: "string",
+          description: "Optional: scope extracted articles to a specific project UUID.",
+        },
+      },
+      required: ["source_type"],
+    },
+  },
+  {
+    name: "knowledge_ingestion_jobs",
+    description:
+      "List recent content ingestion jobs for the current tenant. " +
+      "Returns jobs from the last 7 days, max 50 results. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+
   // Discovery Tools
   {
     name: "list_routes",
@@ -1394,6 +1450,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_export":
       return await knowledgeExport(args);
+
+    // Knowledge Ingestion Tools
+    case "knowledge_ingest":
+      return await knowledgeIngest(args);
+
+    case "knowledge_ingestion_jobs":
+      return await knowledgeIngestionJobs();
 
     // Discovery Tools
     case "list_routes":

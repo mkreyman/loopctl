@@ -514,6 +514,20 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description: "Self-learning pipeline status (extraction health, publish rates)"
       },
 
+      # Knowledge Ingestion
+      %{
+        method: "POST",
+        path: "/api/v1/knowledge/ingest",
+        description:
+          "Submit URL or raw content for knowledge extraction. " <>
+            "Params: url (or content), source_type (required), project_id (optional)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/ingestion-jobs",
+        description: "List recent ingestion jobs (last 7 days, max 50)"
+      },
+
       # Knowledge Wiki — project-scoped
       %{
         method: "GET",
