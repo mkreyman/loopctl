@@ -450,6 +450,54 @@ async function knowledgeCreate({ title, body, category, tags, project_id }) {
   return toContent(result);
 }
 
+// --- Knowledge Management Tools (orch key) ---
+
+async function knowledgePublish({ article_id }) {
+  const result = await apiCall("POST", `/api/v1/articles/${article_id}/publish`, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeDrafts({ limit, offset }) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs ? `/api/v1/knowledge/drafts?${qs}` : "/api/v1/knowledge/drafts";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeLint({ project_id, stale_days, min_coverage }) {
+  const params = new URLSearchParams();
+  if (stale_days != null) params.set("stale_days", String(stale_days));
+  if (min_coverage != null) params.set("min_coverage", String(min_coverage));
+  const qs = params.toString();
+  const basePath = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/lint`
+    : "/api/v1/knowledge/lint";
+  const path = qs ? `${basePath}?${qs}` : basePath;
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeExport({ project_id }) {
+  const basePath = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/export`
+    : "/api/v1/knowledge/export";
+  const baseUrl = getBaseUrl();
+  const downloadCmd = `curl -H "Authorization: Bearer $LOOPCTL_ORCH_KEY" "${baseUrl}${basePath}" -o knowledge-export.zip`;
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({
+        message: "Knowledge export produces a ZIP file. Use the curl command below to download it directly.",
+        command: downloadCmd,
+        endpoint: `${baseUrl}${basePath}`,
+      }, null, 2),
+    }],
+  };
+}
+
 // --- Discovery Tools ---
 
 async function listRoutes() {
@@ -1130,6 +1178,84 @@ const TOOLS = [
     },
   },
 
+  // Knowledge Management Tools (orchestrator key)
+  {
+    name: "knowledge_publish",
+    description:
+      "Publish a draft knowledge article, making it visible to all agents. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the draft article to publish.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_drafts",
+    description:
+      "List all draft (unpublished) knowledge articles. Requires orchestrator role. Use to review pending articles before publishing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          description: "Optional: maximum number of drafts to return.",
+        },
+        offset: {
+          type: "integer",
+          description: "Optional: pagination offset.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_lint",
+    description:
+      "Run a lint check on the knowledge wiki to identify stale, low-coverage, or broken articles. " +
+      "Requires orchestrator role. Optionally scoped to a project.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: scope lint to a specific project UUID.",
+        },
+        stale_days: {
+          type: "integer",
+          description: "Optional: flag articles not updated in this many days as stale.",
+        },
+        min_coverage: {
+          type: "number",
+          description: "Optional: minimum required coverage score (0.0-1.0) to flag under-covered articles.",
+          minimum: 0,
+          maximum: 1,
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_export",
+    description:
+      "Export all knowledge articles as a ZIP archive. Because ZIP binary cannot be returned as MCP content, " +
+      "this tool returns a curl command you can run directly to download the archive.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: scope export to a specific project UUID.",
+        },
+      },
+      required: [],
+    },
+  },
+
   // Discovery Tools
   {
     name: "list_routes",
@@ -1255,6 +1381,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_create":
       return await knowledgeCreate(args);
+
+    // Knowledge Management Tools
+    case "knowledge_publish":
+      return await knowledgePublish(args);
+
+    case "knowledge_drafts":
+      return await knowledgeDrafts(args);
+
+    case "knowledge_lint":
+      return await knowledgeLint(args);
+
+    case "knowledge_export":
+      return await knowledgeExport(args);
 
     // Discovery Tools
     case "list_routes":
