@@ -95,6 +95,9 @@ defmodule Loopctl.MixProject do
       # Remote IP resolution behind reverse proxy
       {:remote_ip, "~> 1.2"},
 
+      # Vector similarity search (pgvector)
+      {:pgvector, "~> 0.3"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
 

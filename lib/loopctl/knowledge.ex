@@ -569,6 +569,69 @@ defmodule Loopctl.Knowledge do
     |> AdminRepo.all()
   end
 
+  # --- Embeddings ---
+
+  @doc """
+  Updates the embedding vector for an article.
+
+  Validates that the embedding dimension matches the configured
+  `:embedding_dimensions` (default 1536). The embedding is set via
+  a dedicated `embedding_changeset/2`, not the standard update changeset,
+  ensuring separation of concerns.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+  - `embedding_vector` -- a list of floats matching the configured dimension
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, changeset}` on dimension mismatch
+  - `{:error, :not_found}` if the article does not exist in this tenant
+  """
+  @spec update_embedding(Ecto.UUID.t(), Ecto.UUID.t(), list(number())) ::
+          {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
+  def update_embedding(tenant_id, article_id, embedding_vector) do
+    case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :not_found}
+
+      article ->
+        article
+        |> Article.embedding_changeset(embedding_vector)
+        |> AdminRepo.update()
+    end
+  end
+
+  @doc """
+  Clears the embedding vector for an article by setting it to nil.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if the article does not exist in this tenant
+  """
+  @spec clear_embedding(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Article.t()} | {:error, :not_found}
+  def clear_embedding(tenant_id, article_id) do
+    case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :not_found}
+
+      article ->
+        article
+        |> Ecto.Changeset.change(embedding: nil)
+        |> AdminRepo.update()
+    end
+  end
+
   # --- Private helpers ---
 
   defp fetch_article(tenant_id, article_id) do
