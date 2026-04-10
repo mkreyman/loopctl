@@ -82,6 +82,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_tags()
     |> validate_source_type()
     |> validate_metadata()
+    |> foreign_key_constraint(:project_id)
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
       message: "has already been taken for this tenant"
@@ -102,6 +103,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_length(:body, max: 100_000)
     |> validate_tags()
     |> validate_metadata()
+    |> foreign_key_constraint(:project_id)
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
       message: "has already been taken for this tenant"
