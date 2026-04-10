@@ -276,6 +276,19 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
       assert changeset.valid?
     end
+
+    test "rejects nil elements in tags array" do
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Nil Tag Article",
+          body: "Content",
+          category: :pattern,
+          tags: ["valid", nil]
+        })
+
+      refute changeset.valid?
+      assert "each tag must be a string" in errors_on(changeset)[:tags]
+    end
   end
 
   describe "update_changeset/2" do

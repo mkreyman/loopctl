@@ -140,6 +140,9 @@ defmodule Loopctl.Knowledge.Article do
   defp validate_tag_format(changeset, tags) do
     Enum.reduce(tags, changeset, fn tag, cs ->
       cond do
+        not is_binary(tag) ->
+          add_error(cs, :tags, "each tag must be a string")
+
         String.length(tag) > @max_tag_length ->
           add_error(cs, :tags, "tag %{tag} exceeds maximum length of #{@max_tag_length}",
             tag: tag
