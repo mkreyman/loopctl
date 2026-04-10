@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 24 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 29 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -65,7 +65,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (24)
+## Tools (29)
 
 ### Project Tools
 
@@ -124,6 +124,16 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `get_story_token_usage` | orch | Get all token usage records for a single story. |
 | `get_cost_anomalies` | orch | Get cost anomaly alerts — stories or agents exceeding expected budgets. Optionally filter by project. |
 | `set_token_budget` | orch | Set a token budget (in millicents) for a project, epic, story, or agent scope. Requires orchestrator role. |
+
+### Knowledge Wiki Tools (agent key)
+
+| Tool | Description |
+|---|---|
+| `knowledge_index` | Load the knowledge wiki catalog at session start. Returns lightweight article metadata grouped by category. |
+| `knowledge_search` | Search the knowledge wiki by topic. Supports keyword, semantic, or combined search modes. Returns snippets. |
+| `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. |
+| `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. |
+| `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. |
 
 ### Discovery Tools
 

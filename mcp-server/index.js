@@ -403,6 +403,53 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
   return toContent(result);
 }
 
+// --- Knowledge Wiki Tools (agent key) ---
+
+async function knowledgeIndex({ project_id }) {
+  const path = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/index`
+    : "/api/v1/knowledge/index";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeSearch({ q, project_id, category, tags, mode, limit }) {
+  const params = new URLSearchParams({ q });
+  if (project_id) params.set("project_id", project_id);
+  if (category) params.set("category", category);
+  if (tags) params.set("tags", tags);
+  if (mode) params.set("mode", mode);
+  if (limit != null) params.set("limit", String(limit));
+
+  const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeGet({ article_id }) {
+  const result = await apiCall("GET", `/api/v1/articles/${article_id}`, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeContext({ query, project_id, limit, recency_weight }) {
+  const params = new URLSearchParams({ query });
+  if (project_id) params.set("project_id", project_id);
+  if (limit != null) params.set("limit", String(limit));
+  if (recency_weight != null) params.set("recency_weight", String(recency_weight));
+
+  const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeCreate({ title, body, category, tags, project_id }) {
+  const payload = { title, body };
+  if (category) payload.category = category;
+  if (tags) payload.tags = tags;
+  if (project_id) payload.project_id = project_id;
+
+  const result = await apiCall("POST", "/api/v1/articles", payload, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
 // --- Discovery Tools ---
 
 async function listRoutes() {
@@ -950,6 +997,139 @@ const TOOLS = [
     },
   },
 
+  // Knowledge Wiki Tools (agent key)
+  {
+    name: "knowledge_index",
+    description:
+      "Load the knowledge wiki catalog at session start. Returns lightweight article metadata " +
+      "(titles, categories, tags) grouped by category. Use this to discover available knowledge before searching.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: scope the index to a specific project UUID.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_search",
+    description:
+      "Search the knowledge wiki by topic. Supports keyword, semantic, or combined search modes. " +
+      "Returns snippets, not full bodies. Use after index to find specific articles.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: {
+          type: "string",
+          description: "Search query string.",
+        },
+        project_id: {
+          type: "string",
+          description: "Optional: scope search to a specific project UUID.",
+        },
+        category: {
+          type: "string",
+          description: "Optional: filter results by category.",
+        },
+        tags: {
+          type: "string",
+          description: "Optional: comma-separated tags to filter by.",
+        },
+        mode: {
+          type: "string",
+          enum: ["keyword", "semantic", "combined"],
+          description: "Optional: search mode (keyword, semantic, or combined).",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: maximum number of results to return.",
+        },
+      },
+      required: ["q"],
+    },
+  },
+  {
+    name: "knowledge_get",
+    description:
+      "Get full article content by ID. Use after search to read an article in detail.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_context",
+    description:
+      "Get relevance-and-recency-ranked full articles for a task query. Returns the best knowledge " +
+      "for your current context with linked references. Use when starting a task that needs domain knowledge.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "The task or topic query to find relevant knowledge for.",
+        },
+        project_id: {
+          type: "string",
+          description: "Optional: scope context to a specific project UUID.",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: maximum number of articles to return.",
+        },
+        recency_weight: {
+          type: "number",
+          description: "Optional: weight for recency scoring (0.0-1.0).",
+          minimum: 0,
+          maximum: 1,
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "knowledge_create",
+    description:
+      "Create a new knowledge article. Use to file findings, document patterns, or record decisions " +
+      "discovered during implementation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Article title.",
+        },
+        body: {
+          type: "string",
+          description: "Article body content (Markdown supported).",
+        },
+        category: {
+          type: "string",
+          description: "Optional: article category.",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional: list of tags.",
+        },
+        project_id: {
+          type: "string",
+          description: "Optional: associate the article with a project UUID.",
+        },
+      },
+      required: ["title", "body"],
+    },
+  },
+
   // Discovery Tools
   {
     name: "list_routes",
@@ -1059,6 +1239,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "set_token_budget":
       return await setTokenBudget(args);
+
+    // Knowledge Wiki Tools
+    case "knowledge_index":
+      return await knowledgeIndex(args);
+
+    case "knowledge_search":
+      return await knowledgeSearch(args);
+
+    case "knowledge_get":
+      return await knowledgeGet(args);
+
+    case "knowledge_context":
+      return await knowledgeContext(args);
+
+    case "knowledge_create":
+      return await knowledgeCreate(args);
 
     // Discovery Tools
     case "list_routes":
