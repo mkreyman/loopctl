@@ -55,15 +55,29 @@ defmodule LoopctlWeb.KnowledgeExportController do
         project_id -> [project_id: project_id]
       end
 
-    {:ok, zip_binary} = Knowledge.export_obsidian(tenant_id, opts)
-    date = Date.utc_today() |> Date.to_iso8601()
+    case Knowledge.export_obsidian(tenant_id, opts) do
+      {:ok, zip_binary} ->
+        date = Date.utc_today() |> Date.to_iso8601()
 
-    conn
-    |> put_resp_content_type("application/zip")
-    |> put_resp_header(
-      "content-disposition",
-      "attachment; filename=\"knowledge-export-#{date}.zip\""
-    )
-    |> send_resp(200, zip_binary)
+        conn
+        |> put_resp_content_type("application/zip")
+        |> put_resp_header(
+          "content-disposition",
+          "attachment; filename=\"knowledge-export-#{date}.zip\""
+        )
+        |> send_resp(200, zip_binary)
+
+      {:error, :payload_too_large} ->
+        conn
+        |> put_status(413)
+        |> json(%{
+          error: %{
+            status: 413,
+            message:
+              "Export exceeds 5,000 articles. Use project-scoped export " <>
+                "(GET /projects/:id/knowledge/export) to reduce scope."
+          }
+        })
+    end
   end
 end

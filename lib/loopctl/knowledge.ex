@@ -1108,13 +1108,22 @@ defmodule Loopctl.Knowledge do
   ## Returns
 
   - `{:ok, zip_binary}` on success
+  - `{:error, :payload_too_large}` if published article count exceeds 5,000
   """
-  @spec export_obsidian(Ecto.UUID.t(), keyword()) :: {:ok, binary()}
+  @spec export_obsidian(Ecto.UUID.t(), keyword()) ::
+          {:ok, binary()} | {:error, :payload_too_large}
+  @max_export_articles 5_000
+
   def export_obsidian(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
     articles = fetch_published_for_export(tenant_id, project_id)
-    zip_binary = build_obsidian_zip(articles)
-    {:ok, zip_binary}
+
+    if length(articles) > @max_export_articles do
+      {:error, :payload_too_large}
+    else
+      zip_binary = build_obsidian_zip(articles)
+      {:ok, zip_binary}
+    end
   end
 
   defp fetch_published_for_export(tenant_id, project_id) do
@@ -1195,14 +1204,14 @@ defmodule Loopctl.Knowledge do
   defp build_related_section(article) do
     outgoing =
       (article.outgoing_links || [])
-      |> Enum.filter(&(&1.target_article != nil))
+      |> Enum.filter(&(&1.target_article != nil and &1.target_article.status == :published))
       |> Enum.map(fn link ->
         "- [[#{link.target_article.title}]] (#{link.relationship_type})"
       end)
 
     incoming =
       (article.incoming_links || [])
-      |> Enum.filter(&(&1.source_article != nil))
+      |> Enum.filter(&(&1.source_article != nil and &1.source_article.status == :published))
       |> Enum.map(fn link ->
         "- [[#{link.source_article.title}]] (#{link.relationship_type})"
       end)
@@ -1246,7 +1255,9 @@ defmodule Loopctl.Knowledge do
   end
 
   defp escape_yaml_string(str) do
-    String.replace(str, "\"", "\\\"")
+    str
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
   end
 
   # --- Article Links ---
