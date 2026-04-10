@@ -236,6 +236,10 @@ defmodule LoopctlWeb.Router do
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
     end
+
+    # ArticleLink management
+    resources "/article_links", ArticleLinkController, only: [:create, :delete]
+    get "/articles/:article_id/links", ArticleLinkController, :index
   end
 
   # Superadmin endpoints (Epic 11)
