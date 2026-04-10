@@ -328,6 +328,7 @@ defmodule Loopctl.Knowledge do
       case AdminRepo.transaction(multi) do
         {:ok, %{link: link}} -> {:ok, link}
         {:error, :link, changeset, _} -> {:error, changeset}
+        {:error, :superseded_target, reason, _} -> {:error, reason}
       end
     end
   end
@@ -377,6 +378,8 @@ defmodule Loopctl.Knowledge do
 
         case AdminRepo.transaction(multi) do
           {:ok, %{link: deleted}} -> {:ok, deleted}
+          {:error, :link, changeset, _} -> {:error, changeset}
+          {:error, :audit, changeset, _} -> {:error, changeset}
         end
     end
   end
@@ -480,10 +483,13 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp maybe_supersede_target(multi, _tenant_id, _target_id, rel_type)
+  defp maybe_supersede_target(multi, tenant_id, _target_id, rel_type)
        when rel_type in [:supersedes, "supersedes"] do
     Multi.run(multi, :superseded_target, fn _repo, changes ->
-      case AdminRepo.get(Article, changes.link.target_article_id) do
+      case AdminRepo.get_by(Article,
+             id: changes.link.target_article_id,
+             tenant_id: tenant_id
+           ) do
         nil ->
           {:error, :target_not_found}
 
