@@ -17,6 +17,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
@@ -94,6 +95,16 @@ defmodule Loopctl.Fixtures do
         tags: [],
         source_type: nil,
         source_id: nil,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:article_link, attrs) do
+    Map.merge(
+      %{
+        relationship_type: :relates_to,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -417,6 +428,56 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Article{tenant_id: tenant_id, project_id: project_id}
       |> Article.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:article_link, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    # Auto-create source article if not provided
+    {source_article_id, attrs} =
+      case Map.get(attrs, :source_article_id) do
+        nil ->
+          article = fixture(:article, %{tenant_id: tenant_id})
+          {article.id, Map.put(attrs, :source_article_id, article.id)}
+
+        id ->
+          {id, attrs}
+      end
+
+    # Auto-create target article if not provided
+    {target_article_id, attrs} =
+      case Map.get(attrs, :target_article_id) do
+        nil ->
+          article = fixture(:article, %{tenant_id: tenant_id})
+          {article.id, Map.put(attrs, :target_article_id, article.id)}
+
+        id ->
+          {id, attrs}
+      end
+
+    data = build(:article_link, attrs)
+
+    changeset =
+      %ArticleLink{tenant_id: tenant_id}
+      |> ArticleLink.changeset(%{
+        source_article_id: source_article_id,
+        target_article_id: target_article_id,
+        relationship_type: data.relationship_type,
+        metadata: data.metadata
+      })
 
     AdminRepo.insert!(changeset)
   end
