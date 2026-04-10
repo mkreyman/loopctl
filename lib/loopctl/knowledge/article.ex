@@ -48,6 +48,8 @@ defmodule Loopctl.Knowledge.Article do
     field :source_id, :binary_id
     field :metadata, :map, default: %{}
 
+    field :embedding, Pgvector.Ecto.Vector
+
     has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
     has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id
 
@@ -112,6 +114,30 @@ defmodule Loopctl.Knowledge.Article do
 
   @doc false
   def known_source_types, do: @known_source_types
+
+  @doc """
+  Changeset for setting or clearing an article's embedding vector.
+
+  This is the only changeset that may modify the `:embedding` field.
+  The standard `create_changeset/2` and `update_changeset/2` do not
+  include `:embedding` in their cast fields, ensuring embeddings are
+  only set via dedicated functions.
+
+  ## Parameters
+
+  - `article` -- an existing `%Article{}` struct
+  - `embedding` -- a list of floats (must match configured dimensions) or `nil` to clear
+
+  ## Returns
+
+  An `Ecto.Changeset` with dimension validation applied when `embedding` is not nil.
+  """
+  @spec embedding_changeset(%__MODULE__{}, list(number()) | nil) :: Ecto.Changeset.t()
+  def embedding_changeset(article, embedding) do
+    article
+    |> change(%{embedding: embedding})
+    |> validate_embedding_dimensions()
+  end
 
   # --- Private validations ---
 
@@ -181,6 +207,48 @@ defmodule Loopctl.Knowledge.Article do
           type: unknown,
           validation: :source_type_advisory
         )
+    end
+  end
+
+  defp validate_embedding_dimensions(changeset) do
+    case get_change(changeset, :embedding) do
+      nil ->
+        changeset
+
+      %Pgvector{} = vector ->
+        expected = Application.get_env(:loopctl, :embedding_dimensions, 1536)
+        actual = length(Pgvector.to_list(vector))
+
+        if actual == expected do
+          changeset
+        else
+          add_error(
+            changeset,
+            :embedding,
+            "dimension mismatch: expected %{expected}, got %{actual}",
+            expected: expected,
+            actual: actual
+          )
+        end
+
+      embedding when is_list(embedding) ->
+        expected = Application.get_env(:loopctl, :embedding_dimensions, 1536)
+        actual = length(embedding)
+
+        if actual == expected do
+          changeset
+        else
+          add_error(
+            changeset,
+            :embedding,
+            "dimension mismatch: expected %{expected}, got %{actual}",
+            expected: expected,
+            actual: actual
+          )
+        end
+
+      _ ->
+        changeset
     end
   end
 end
