@@ -61,6 +61,15 @@ defmodule LoopctlWeb.KnowledgeContextController do
           "Weight for recency scoring, 0.0-1.0 (default 0.3). " <>
             "Higher values boost recently-updated articles.",
         required: false
+      ],
+      status: [
+        in: :query,
+        type: :string,
+        description:
+          "Article status filter (published, draft, archived). " <>
+            "Only effective for user/superadmin roles. " <>
+            "Agent/orchestrator roles are forced to published.",
+        required: false
       ]
     ],
     responses: %{
@@ -133,19 +142,33 @@ defmodule LoopctlWeb.KnowledgeContextController do
       |> maybe_add_limit(params["limit"])
       |> maybe_add_recency_weight(params["recency_weight"])
 
-    # Agent role forced to published; user role can override
+    # Agent role forced to published; user role can override via ?status= param
     role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
 
     if role_atom in [:agent, :orchestrator] do
       [{:status, :published} | opts]
     else
-      opts
+      maybe_add_status(opts, params["status"])
     end
   end
 
   defp maybe_add_project_id(opts, nil), do: opts
   defp maybe_add_project_id(opts, ""), do: opts
   defp maybe_add_project_id(opts, project_id), do: [{:project_id, project_id} | opts]
+
+  @valid_statuses ~w(published draft archived)
+  defp maybe_add_status(opts, nil), do: opts
+  defp maybe_add_status(opts, ""), do: opts
+
+  defp maybe_add_status(opts, value) when is_binary(value) do
+    if value in @valid_statuses do
+      [{:status, String.to_existing_atom(value)} | opts]
+    else
+      opts
+    end
+  end
+
+  defp maybe_add_status(opts, _), do: opts
 
   defp maybe_add_limit(opts, nil), do: opts
 

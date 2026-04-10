@@ -393,6 +393,9 @@ defmodule Loopctl.Knowledge do
       articles = fetch_full_context_articles(tenant_id, article_ids)
       now = DateTime.utc_now()
 
+      article_ids_for_links = Enum.map(articles, & &1.id)
+      linked_map = batch_linked_refs(tenant_id, article_ids_for_links)
+
       scored =
         articles
         |> Enum.map(fn article ->
@@ -401,7 +404,7 @@ defmodule Loopctl.Knowledge do
           recency_score = :math.exp(-age_days / 30.0)
           combined = (1.0 - recency_weight) * relevance + recency_weight * recency_score
 
-          linked = get_linked_refs(tenant_id, article.id)
+          linked = Map.get(linked_map, article.id, [])
 
           %{
             id: article.id,
@@ -452,16 +455,40 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp get_linked_refs(tenant_id, article_id) do
-    list_links_for_article(tenant_id, article_id)
-    |> Enum.flat_map(fn link ->
-      [link.source_article, link.target_article]
-      |> Enum.reject(&(is_nil(&1) or &1.id == article_id))
-    end)
-    |> Enum.uniq_by(& &1.id)
-    |> Enum.take(5)
-    |> Enum.map(fn article ->
-      %{id: article.id, title: article.title, category: to_string(article.category)}
+  @doc false
+  # Batch-fetches linked article refs for all given article IDs in a single query.
+  # Returns a map of article_id => [%{id, title, category}], capped at 5 per article.
+  defp batch_linked_refs(_tenant_id, []), do: %{}
+
+  defp batch_linked_refs(tenant_id, article_ids) do
+    links =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.source_article_id in ^article_ids or l.target_article_id in ^article_ids,
+        preload: [:source_article, :target_article]
+      )
+      |> AdminRepo.all()
+
+    # Group links by the article they belong to (could be source or target)
+    Enum.reduce(article_ids, %{}, fn article_id, acc ->
+      relevant_links =
+        Enum.filter(links, fn link ->
+          link.source_article_id == article_id or link.target_article_id == article_id
+        end)
+
+      linked =
+        relevant_links
+        |> Enum.flat_map(fn link ->
+          [link.source_article, link.target_article]
+          |> Enum.reject(&(is_nil(&1) or &1.id == article_id))
+        end)
+        |> Enum.uniq_by(& &1.id)
+        |> Enum.take(5)
+        |> Enum.map(fn article ->
+          %{id: article.id, title: article.title, category: to_string(article.category)}
+        end)
+
+      Map.put(acc, article_id, linked)
     end)
   end
 

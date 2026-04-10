@@ -415,5 +415,80 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
       assert body["error"]["status"] == 400
       assert body["error"]["message"] =~ "500"
     end
+
+    test "user role can override status to search drafts", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Draft User Override Article",
+        body: "Draft content visible to user role via status override.",
+        category: :pattern,
+        status: :draft,
+        tags: ["override"]
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Published User Override Article",
+        body: "Published content visible to user role.",
+        category: :pattern,
+        status: :published,
+        tags: ["override"]
+      })
+
+      # User with status=draft should see draft articles
+      conn_draft =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/context", %{query: "override", status: "draft"})
+
+      body_draft = json_response(conn_draft, 200)
+
+      draft_titles = Enum.map(body_draft["data"], & &1["title"])
+
+      if draft_titles != [] do
+        assert "Draft User Override Article" in draft_titles
+        refute "Published User Override Article" in draft_titles
+      end
+    end
+
+    test "agent role ignores status parameter (forced to published)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Draft Agent Forced Article",
+        body: "Draft content that agent should not see.",
+        category: :pattern,
+        status: :draft,
+        tags: ["forced"]
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Published Agent Forced Article",
+        body: "Published content that agent should see.",
+        category: :pattern,
+        status: :published,
+        tags: ["forced"]
+      })
+
+      # Agent with status=draft should still only get published
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/context", %{query: "forced", status: "draft"})
+
+      body = json_response(conn, 200)
+
+      titles = Enum.map(body["data"], & &1["title"])
+
+      if titles != [] do
+        refute "Draft Agent Forced Article" in titles
+      end
+    end
   end
 end
