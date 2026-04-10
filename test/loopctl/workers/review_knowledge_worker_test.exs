@@ -227,6 +227,37 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       assert hd(articles).title == "Valid"
     end
 
+    test "skips articles with invalid category string without crashing" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+        {:ok,
+         [
+           %{"title" => "Valid string keys", "body" => "Valid body.", "category" => "pattern"},
+           %{
+             "title" => "Bad category string",
+             "body" => "Body.",
+             "category" => "totally_unknown_category"
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{
+                   "review_record_id" => review_record.id,
+                   "tenant_id" => tenant.id
+                 }
+               })
+
+      %{data: articles} =
+        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+
+      assert length(articles) == 1
+      assert hd(articles).title == "Valid string keys"
+    end
+
     test "skips articles with body exceeding 100KB" do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)

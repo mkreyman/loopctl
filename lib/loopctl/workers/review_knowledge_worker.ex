@@ -154,8 +154,10 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     normalize_category(category) in @valid_categories
   end
 
+  @category_string_map Map.new(@valid_categories, fn cat -> {Atom.to_string(cat), cat} end)
+
   defp normalize_category(cat) when is_atom(cat), do: cat
-  defp normalize_category(cat) when is_binary(cat), do: String.to_existing_atom(cat)
+  defp normalize_category(cat) when is_binary(cat), do: Map.get(@category_string_map, cat)
   defp normalize_category(_), do: nil
 
   defp valid_tags?(attrs) when is_map(attrs) do
