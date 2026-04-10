@@ -315,7 +315,7 @@ defmodule Loopctl.Knowledge do
   - `{:error, changeset}` on validation failure
   """
   @spec create_link(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, ArticleLink.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, ArticleLink.t()} | {:error, Ecto.Changeset.t() | :target_not_found}
   def create_link(tenant_id, attrs, opts \\ []) do
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]

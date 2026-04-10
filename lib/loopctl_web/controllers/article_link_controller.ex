@@ -99,6 +99,9 @@ defmodule LoopctlWeb.ArticleLinkController do
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
+
+      {:error, :target_not_found} ->
+        {:error, :not_found}
     end
   end
 
