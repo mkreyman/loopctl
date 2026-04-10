@@ -248,7 +248,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   # --- Extractor failure ---
 
   describe "perform/1 extractor failure" do
-    test "returns {:error, reason} when extractor fails" do
+    test "propagates error when extractor fails" do
       %{tenant: tenant} = setup_tenant()
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->

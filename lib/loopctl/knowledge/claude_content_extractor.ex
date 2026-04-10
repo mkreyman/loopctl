@@ -41,7 +41,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
 
     body = %{
       model: model,
-      max_tokens: 4096,
+      max_tokens: 16_384,
       system: @system_prompt,
       messages: [
         %{
@@ -106,9 +106,20 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
         {:ok, []}
 
       {:error, reason} ->
-        Logger.warning("ClaudeContentExtractor: JSON parse error (error=#{inspect(reason)})")
+        # Attempt truncated JSON recovery before giving up
+        case recover_truncated_json(text) do
+          {:ok, articles} ->
+            Logger.info(
+              "ClaudeContentExtractor: recovered #{length(articles)} articles from truncated JSON"
+            )
 
-        {:error, {:json_parse_error, reason}}
+            {:ok, articles}
+
+          :error ->
+            Logger.warning("ClaudeContentExtractor: JSON parse error (error=#{inspect(reason)})")
+
+            {:error, {:json_parse_error, reason}}
+        end
     end
   end
 
@@ -134,6 +145,59 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   end
 
   defp normalize_article(_), do: nil
+
+  # Attempt to recover articles from truncated JSON by finding the last
+  # complete object in the array. Works when the LLM response was cut off
+  # mid-JSON due to max_tokens limit.
+  defp recover_truncated_json(text) do
+    # Find the last complete "}" that could end an article object
+    # by progressively trimming from the end until we get valid JSON
+    text = String.trim(text)
+
+    # Ensure it starts with [ (an array)
+    text =
+      if String.starts_with?(text, "[") do
+        text
+      else
+        # Maybe wrapped in {"articles": [...]}
+        case Regex.run(~r/\[.*$/s, text) do
+          [match] -> match
+          _ -> text
+        end
+      end
+
+    recover_by_closing_array(text)
+  end
+
+  defp recover_by_closing_array(text) do
+    # Find positions of all "}" characters (potential object endings)
+    # Try closing the array after each one, from last to first
+    brace_positions =
+      Regex.scan(~r/\}/, text, return: :index)
+      |> Enum.map(fn [{pos, _}] -> pos end)
+      |> Enum.reverse()
+
+    Enum.find_value(brace_positions, :error, fn pos ->
+      candidate = String.slice(text, 0, pos + 1) <> "]"
+      try_parse_candidate(candidate)
+    end)
+  end
+
+  defp try_parse_candidate(candidate) do
+    case JSON.decode(candidate) do
+      {:ok, articles} when is_list(articles) and articles != [] ->
+        normalized =
+          articles
+          |> Enum.take(10)
+          |> Enum.map(&normalize_article/1)
+          |> Enum.filter(&(&1 != nil))
+
+        if normalized != [], do: {:ok, normalized}
+
+      _ ->
+        nil
+    end
+  end
 
   # Strip markdown code fences that Claude often wraps JSON in
   defp strip_markdown_fences(text) do
