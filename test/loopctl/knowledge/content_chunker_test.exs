@@ -139,6 +139,78 @@ defmodule Loopctl.Knowledge.ContentChunkerTest do
     end
   end
 
+  describe "chunk/1 — adversarial inputs" do
+    test "oversized section with early newline does not produce tiny orphan chunks" do
+      # Regression test for the round-2 bug where `# A\n` + long body split
+      # at the first newline (position 4), emitting "# A" as a 3-byte chunk
+      # followed by the body. The fix is to prefer a LATEST boundary within
+      # a reasonable range.
+      content = "# A\n" <> String.duplicate("alpha ", 1700)
+      chunks = ContentChunker.chunk(content)
+
+      for chunk <- chunks do
+        assert byte_size(chunk) >= 100,
+               "tiny orphan chunk produced: #{byte_size(chunk)} bytes = #{inspect(chunk)}"
+      end
+    end
+
+    test "handles all-continuation-byte input without infinite loop" do
+      # Regression test for the round-2 bug where a stream of UTF-8
+      # continuation bytes (0x80) caused safe_utf8_boundary to return 0,
+      # which then caused chunk_by_bytes to infinitely recurse on the
+      # same input because String.trim_leading doesn't trim 0x80.
+      content = :binary.copy(<<0x80>>, 10_000)
+
+      task = Task.async(fn -> ContentChunker.chunk(content) end)
+
+      result =
+        case Task.yield(task, 3_000) || Task.shutdown(task, :brutal_kill) do
+          {:ok, chunks} -> {:ok, chunks}
+          nil -> :infinite_loop
+          {:exit, _} -> :crashed
+        end
+
+      assert {:ok, chunks} = result, "expected completion, got #{inspect(result)}"
+      # Every chunk must respect the threshold
+      for chunk <- chunks do
+        assert byte_size(chunk) <= @threshold
+      end
+    end
+
+    test "splits H4/H5/H6 headings (not only H1-H3)" do
+      # Regression test: the original regex was #{1,3} which missed deeper
+      # markdown heading levels, so long-form documents using `####` and
+      # below would fall through to byte-level chunking.
+      content =
+        "#### Deep heading\n" <>
+          String.duplicate("deep ", 2000) <>
+          "\n##### Deeper heading\n" <>
+          String.duplicate("text ", 2000)
+
+      chunks = ContentChunker.chunk(content)
+
+      for chunk <- chunks do
+        assert byte_size(chunk) <= @threshold
+        assert byte_size(chunk) >= 100
+      end
+    end
+
+    test "normalizes missing newline before heading" do
+      # Regression test: sections without a newline preceding the next
+      # heading were previously merged together because the multiline
+      # `^#` anchor would not match mid-line.
+      content =
+        "# A\nAlpha content.## B\nBeta content. ### C\nGamma content."
+
+      chunks = ContentChunker.chunk(content)
+
+      joined = Enum.join(chunks, "\n")
+      assert String.contains?(joined, "Alpha")
+      assert String.contains?(joined, "Beta")
+      assert String.contains?(joined, "Gamma")
+    end
+  end
+
   describe "chunk/1 — invariants" do
     test "all chunks under or equal to threshold for realistic mixed content" do
       # Mix of markdown sections, paragraphs, and long code blocks

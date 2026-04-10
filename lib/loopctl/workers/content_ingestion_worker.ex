@@ -123,12 +123,41 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   # When content is split into chunks, the same article may be extracted
   # from two overlapping chunks. Dedup by normalized title before capping.
+  #
+  # Two rules:
+  #   1. Articles with blank/missing titles are NEVER merged together (each
+  #      gets a unique sentinel key). They'll be rejected later by schema
+  #      validation anyway, but collapsing them here would silently drop
+  #      distinct articles.
+  #   2. When duplicates exist, keep the one with the LONGEST body (the
+  #      more complete extraction, vs a truncated partial from a chunk
+  #      boundary). Enum.uniq_by keeps first-occurrence, so we sort by
+  #      body length descending first.
   defp dedup_articles(articles) do
-    Enum.uniq_by(articles, fn article ->
+    articles
+    |> Enum.sort_by(&article_body_length/1, :desc)
+    |> Enum.uniq_by(&article_dedup_key/1)
+  end
+
+  defp article_dedup_key(article) do
+    title =
       (Map.get(article, :title) || Map.get(article, "title") || "")
       |> String.trim()
       |> String.downcase()
-    end)
+
+    if title == "" do
+      # Unique sentinel so blank-title articles are never merged together.
+      # They'll be filtered by downstream validation, but don't collapse
+      # them here.
+      {:no_title, System.unique_integer([:positive])}
+    else
+      title
+    end
+  end
+
+  defp article_body_length(article) do
+    body = Map.get(article, :body) || Map.get(article, "body") || ""
+    byte_size(body)
   end
 
   defp resolve_content(nil, content) when is_binary(content) and content != "" do
