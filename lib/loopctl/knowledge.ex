@@ -2097,4 +2097,357 @@ defmodule Loopctl.Knowledge do
       end
     end)
   end
+
+  # --- Lint ---
+
+  @all_categories [:pattern, :convention, :decision, :finding, :reference]
+  @default_stale_days 90
+  @default_min_coverage 3
+
+  @doc """
+  Analyzes published articles and returns a structured lint report.
+
+  The lint operation is read-only — no data is modified. It identifies:
+
+  - **stale_articles** — articles not updated in N days (configurable via `:stale_days`)
+  - **orphan_articles** — published articles with zero ArticleLinks (neither source nor target)
+  - **contradiction_clusters** — groups of articles linked with `contradicts` relationship
+  - **coverage_gaps** — categories with fewer than N published articles (configurable via `:min_coverage`)
+  - **broken_sources** — articles whose `source_id` references a deleted entity
+
+  ## Parameters
+
+  - `tenant_id` — the tenant UUID
+  - `opts` — keyword list with:
+    - `:project_id` — scope to a specific project (includes tenant-wide articles)
+    - `:stale_days` — threshold in days for stale detection (default 90)
+    - `:min_coverage` — minimum published articles per category (default 3)
+
+  ## Returns
+
+  - `{:ok, map()}` with `:stale_articles`, `:orphan_articles`, `:contradiction_clusters`,
+    `:coverage_gaps`, `:broken_sources`, and `:summary`
+  """
+  @spec lint(Ecto.UUID.t(), keyword()) :: {:ok, map()}
+  def lint(tenant_id, opts \\ []) do
+    project_id = Keyword.get(opts, :project_id)
+    stale_days = Keyword.get(opts, :stale_days, @default_stale_days)
+    min_coverage = Keyword.get(opts, :min_coverage, @default_min_coverage)
+
+    # Base query for published articles scoped to tenant (+ optional project)
+    base = published_base_query(tenant_id, project_id)
+
+    stale = find_stale_articles(base, stale_days)
+    orphans = find_orphan_articles(base, tenant_id, project_id)
+    contradictions = find_contradiction_clusters(tenant_id, project_id)
+    gaps = find_coverage_gaps(base, min_coverage)
+    broken = find_broken_sources(base)
+
+    total_articles = AdminRepo.one(from(a in base, select: count(a.id)))
+
+    all_issues = stale ++ orphans ++ contradictions ++ gaps ++ broken
+
+    issues_by_severity =
+      all_issues
+      |> Enum.group_by(& &1.severity)
+      |> Map.new(fn {severity, items} -> {severity, length(items)} end)
+
+    summary = %{
+      total_articles: total_articles,
+      total_issues: length(all_issues),
+      issues_by_severity: issues_by_severity,
+      generated_at: DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    {:ok,
+     %{
+       stale_articles: stale,
+       orphan_articles: orphans,
+       contradiction_clusters: contradictions,
+       coverage_gaps: gaps,
+       broken_sources: broken,
+       summary: summary
+     }}
+  end
+
+  defp published_base_query(tenant_id, nil) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.status == :published
+    )
+  end
+
+  defp published_base_query(tenant_id, project_id) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.status == :published,
+      where: is_nil(a.project_id) or a.project_id == ^project_id
+    )
+  end
+
+  defp find_stale_articles(base, stale_days) do
+    cutoff = DateTime.utc_now() |> DateTime.add(-stale_days * 86_400, :second)
+
+    query =
+      from(a in base,
+        where: a.updated_at < ^cutoff,
+        select: %{
+          id: a.id,
+          title: a.title,
+          updated_at: a.updated_at
+        },
+        order_by: [asc: a.updated_at]
+      )
+
+    now = DateTime.utc_now()
+
+    AdminRepo.all(query)
+    |> Enum.map(fn article ->
+      days_since = DateTime.diff(now, article.updated_at, :day)
+
+      %{
+        article_id: article.id,
+        title: article.title,
+        last_updated: article.updated_at,
+        days_since_update: days_since,
+        severity: "warning",
+        suggested_action: "Review and update or archive this article"
+      }
+    end)
+  end
+
+  defp find_orphan_articles(base, tenant_id, project_id) do
+    # Subquery: article IDs that appear in any link (source or target)
+    linked_ids_subquery =
+      from(al in ArticleLink,
+        where: al.tenant_id == ^tenant_id,
+        select: %{id: al.source_article_id}
+      )
+      |> maybe_scope_links_to_project(project_id)
+
+    linked_target_ids_subquery =
+      from(al in ArticleLink,
+        where: al.tenant_id == ^tenant_id,
+        select: %{id: al.target_article_id}
+      )
+      |> maybe_scope_links_to_project(project_id)
+
+    query =
+      from(a in base,
+        where: a.id not in subquery(linked_ids_subquery),
+        where: a.id not in subquery(linked_target_ids_subquery),
+        select: %{
+          id: a.id,
+          title: a.title,
+          category: a.category
+        },
+        order_by: [asc: a.title]
+      )
+
+    AdminRepo.all(query)
+    |> Enum.map(fn article ->
+      %{
+        article_id: article.id,
+        title: article.title,
+        category: to_string(article.category),
+        severity: "info",
+        suggested_action: "Consider linking to related articles or reviewing for relevance"
+      }
+    end)
+  end
+
+  defp maybe_scope_links_to_project(query, nil), do: query
+
+  defp maybe_scope_links_to_project(query, _project_id) do
+    # Links don't have project_id — we keep all links within the tenant.
+    # The orphan check is scoped via the base query (published articles for
+    # the project). A link to/from articles outside this project scope is
+    # still valid and means the article is NOT orphaned.
+    query
+  end
+
+  defp find_contradiction_clusters(tenant_id, project_id) do
+    # Find all :contradicts links within the tenant
+    links_query =
+      from(al in ArticleLink,
+        where: al.tenant_id == ^tenant_id,
+        where: al.relationship_type == :contradicts,
+        join: src in Article,
+        on: src.id == al.source_article_id and src.status == :published,
+        join: tgt in Article,
+        on: tgt.id == al.target_article_id and tgt.status == :published,
+        select: %{
+          link_id: al.id,
+          source_article_id: al.source_article_id,
+          source_title: src.title,
+          target_article_id: al.target_article_id,
+          target_title: tgt.title
+        }
+      )
+
+    links_query =
+      if project_id do
+        from([al, src, tgt] in links_query,
+          where:
+            (is_nil(src.project_id) or src.project_id == ^project_id) and
+              (is_nil(tgt.project_id) or tgt.project_id == ^project_id)
+        )
+      else
+        links_query
+      end
+
+    links = AdminRepo.all(links_query)
+
+    # Build clusters using union-find approach (group connected articles)
+    build_contradiction_clusters(links)
+  end
+
+  defp build_contradiction_clusters([]), do: []
+
+  defp build_contradiction_clusters(links) do
+    # Group links into connected clusters via a simple union-find
+    {clusters, _parent} =
+      Enum.reduce(links, {%{}, %{}}, fn link, {clusters, parent} ->
+        src_id = link.source_article_id
+        tgt_id = link.target_article_id
+
+        src_root = find_root(parent, src_id)
+        tgt_root = find_root(parent, tgt_id)
+
+        # Merge into the same cluster
+        root = min(src_root, tgt_root)
+        parent = Map.put(parent, src_root, root)
+        parent = Map.put(parent, tgt_root, root)
+        parent = Map.put(parent, src_id, root)
+        parent = Map.put(parent, tgt_id, root)
+
+        # Track link in cluster keyed by root
+        cluster_links = Map.get(clusters, root, [])
+        clusters = Map.put(clusters, root, [link | cluster_links])
+
+        # Re-key any existing clusters to new root
+        clusters =
+          if src_root != root and Map.has_key?(clusters, src_root) do
+            existing = Map.get(clusters, src_root, [])
+            clusters = Map.delete(clusters, src_root)
+            Map.update(clusters, root, existing, &(existing ++ &1))
+          else
+            clusters
+          end
+
+        clusters =
+          if tgt_root != root and Map.has_key?(clusters, tgt_root) do
+            existing = Map.get(clusters, tgt_root, [])
+            clusters = Map.delete(clusters, tgt_root)
+            Map.update(clusters, root, existing, &(existing ++ &1))
+          else
+            clusters
+          end
+
+        {clusters, parent}
+      end)
+
+    # Normalize clusters: re-root all entries using current parent map
+    normalized =
+      Enum.reduce(clusters, %{}, fn {_key, links}, acc ->
+        all_ids =
+          links
+          |> Enum.flat_map(fn l -> [l.source_article_id, l.target_article_id] end)
+          |> Enum.uniq()
+
+        root = Enum.min(all_ids)
+        Map.update(acc, root, links, &(links ++ &1))
+      end)
+
+    normalized
+    |> Enum.map(fn {_root, links} ->
+      links = Enum.uniq_by(links, & &1.link_id)
+
+      # Collect all unique articles in the cluster
+      articles =
+        links
+        |> Enum.flat_map(fn l ->
+          [
+            %{id: l.source_article_id, title: l.source_title},
+            %{id: l.target_article_id, title: l.target_title}
+          ]
+        end)
+        |> Enum.uniq_by(& &1.id)
+
+      %{
+        article_ids: Enum.map(articles, & &1.id),
+        titles: Enum.map(articles, & &1.title),
+        link_ids: Enum.map(links, & &1.link_id),
+        severity: "warning",
+        suggested_action: "Resolve contradiction by updating or superseding one article"
+      }
+    end)
+  end
+
+  defp find_root(parent, id) do
+    case Map.get(parent, id) do
+      nil -> id
+      ^id -> id
+      other -> find_root(parent, other)
+    end
+  end
+
+  defp find_coverage_gaps(base, min_coverage) do
+    # Count published articles per category
+    counts_query =
+      from(a in base,
+        group_by: a.category,
+        select: {a.category, count(a.id)}
+      )
+
+    counts = AdminRepo.all(counts_query) |> Map.new()
+
+    @all_categories
+    |> Enum.filter(fn cat -> Map.get(counts, cat, 0) < min_coverage end)
+    |> Enum.map(fn cat ->
+      current = Map.get(counts, cat, 0)
+
+      %{
+        category: to_string(cat),
+        current_count: current,
+        threshold: min_coverage,
+        severity: "info",
+        suggested_action: "Add more articles in this category"
+      }
+    end)
+  end
+
+  defp find_broken_sources(base) do
+    # Find articles with source_type "review_finding" whose source_id
+    # no longer exists in the review_records table
+    alias Loopctl.Artifacts.ReviewRecord
+
+    query =
+      from(a in base,
+        where: a.source_type == "review_finding" and not is_nil(a.source_id),
+        left_join: rr in ReviewRecord,
+        on: rr.id == a.source_id,
+        where: is_nil(rr.id),
+        select: %{
+          id: a.id,
+          title: a.title,
+          source_type: a.source_type,
+          source_id: a.source_id
+        },
+        order_by: [asc: a.title]
+      )
+
+    AdminRepo.all(query)
+    |> Enum.map(fn article ->
+      %{
+        article_id: article.id,
+        title: article.title,
+        source_type: article.source_type,
+        source_id: article.source_id,
+        severity: "warning",
+        suggested_action:
+          "Source entity was deleted; consider updating or removing source reference"
+      }
+    end)
+  end
 end
