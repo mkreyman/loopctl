@@ -1221,6 +1221,20 @@ defmodule Loopctl.Knowledge do
     :ok
   end
 
+  @doc """
+  Generate an embedding for the given text with circuit breaker and timeout protection.
+
+  Wraps the configured embedding client with:
+  - Circuit breaker (opens after #{@failure_threshold} failures within #{@failure_window_seconds}s)
+  - 5-second Task.async timeout
+  - Crash rescue handler
+
+  Returns `{:ok, embedding}` or `{:error, reason}`.
+  """
+  def generate_embedding(query_string) do
+    try_generate_embedding(query_string)
+  end
+
   defp try_generate_embedding(query_string) do
     ensure_circuit_breaker_table()
 

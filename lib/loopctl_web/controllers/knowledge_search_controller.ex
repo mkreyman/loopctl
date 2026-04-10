@@ -242,9 +242,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   end
 
   defp execute_search(tenant_id, q, "semantic", opts) do
-    client = embedding_client()
-
-    case client.generate_embedding(q) do
+    case Knowledge.generate_embedding(q) do
       {:ok, embedding} -> Knowledge.search_semantic(tenant_id, embedding, opts)
       {:error, _} -> {:error, :embedding_unavailable}
     end
@@ -252,9 +250,5 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   defp execute_search(tenant_id, q, "combined", opts) do
     Knowledge.search_combined(tenant_id, q, opts)
-  end
-
-  defp embedding_client do
-    Application.get_env(:loopctl, :embedding_client, Loopctl.Knowledge.EmbeddingClient)
   end
 end
