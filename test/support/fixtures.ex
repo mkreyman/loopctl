@@ -17,6 +17,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
@@ -106,6 +107,17 @@ defmodule Loopctl.Fixtures do
       %{
         relationship_type: :relates_to,
         metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:article_access_event, attrs) do
+    Map.merge(
+      %{
+        access_type: "get",
+        metadata: %{},
+        accessed_at: DateTime.utc_now()
       },
       Enum.into(attrs, %{})
     )
@@ -477,6 +489,57 @@ defmodule Loopctl.Fixtures do
         target_article_id: target_article_id,
         relationship_type: data.relationship_type,
         metadata: data.metadata
+      })
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:article_access_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    # Auto-create a tenant if not provided
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    # Auto-create the article if not provided
+    {article_id, attrs} =
+      case Map.get(attrs, :article_id) do
+        nil ->
+          article = fixture(:article, %{tenant_id: tenant_id})
+          {article.id, Map.put(attrs, :article_id, article.id)}
+
+        id ->
+          {id, attrs}
+      end
+
+    # Auto-create the api_key if not provided
+    {api_key_id, attrs} =
+      case Map.get(attrs, :api_key_id) do
+        nil ->
+          {_raw, api_key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent})
+          {api_key.id, Map.put(attrs, :api_key_id, api_key.id)}
+
+        id ->
+          {id, attrs}
+      end
+
+    data = build(:article_access_event, attrs)
+
+    changeset =
+      %ArticleAccessEvent{tenant_id: tenant_id}
+      |> ArticleAccessEvent.create_changeset(%{
+        article_id: article_id,
+        api_key_id: api_key_id,
+        access_type: data.access_type,
+        metadata: data.metadata,
+        accessed_at: data.accessed_at
       })
 
     AdminRepo.insert!(changeset)

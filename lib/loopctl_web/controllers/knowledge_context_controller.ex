@@ -101,10 +101,11 @@ defmodule LoopctlWeb.KnowledgeContextController do
   @doc "GET /api/v1/knowledge/context"
   def context(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key_id = conn.assigns.current_api_key.id
     role = conn.assigns.current_api_key.role
 
     with {:ok, query} <- validate_query(params) do
-      opts = build_opts(params, role)
+      opts = params |> build_opts(role) |> Keyword.put(:api_key_id, api_key_id)
 
       case Knowledge.get_context(tenant_id, query, opts) do
         {:ok, result} ->

@@ -535,6 +535,32 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description: "List recent ingestion jobs (last 7 days, max 50)"
       },
 
+      # Knowledge Analytics (orchestrator+)
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/analytics/top-articles",
+        description:
+          "Top accessed articles for the tenant. " <>
+            "Params: limit, since_days, access_type. Role: orchestrator+."
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/articles/:id/stats",
+        description: "Per-article usage stats (counts, unique agents, recent events)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/analytics/agents/:agent_id",
+        description:
+          "Per-agent (api_key) knowledge usage. Params: limit, since_days. Role: orchestrator+."
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/analytics/unused-articles",
+        description:
+          "Published articles with zero accesses. Params: days_unused, limit. Role: orchestrator+."
+      },
+
       # Knowledge Wiki — project-scoped
       %{
         method: "GET",
