@@ -115,6 +115,36 @@ defmodule Loopctl.Knowledge.Article do
   @doc false
   def known_source_types, do: @known_source_types
 
+  @valid_transitions [
+    {:draft, :published},
+    {:published, :draft},
+    {:published, :archived},
+    {:draft, :archived},
+    {:superseded, :draft}
+  ]
+
+  @doc """
+  Returns whether a status transition is valid.
+
+  ## Valid transitions
+
+  - draft -> published
+  - published -> draft
+  - published -> archived
+  - draft -> archived
+  - superseded -> draft
+
+  ## Examples
+
+      iex> Article.valid_transition?(:draft, :published)
+      true
+
+      iex> Article.valid_transition?(:archived, :published)
+      false
+  """
+  @spec valid_transition?(atom(), atom()) :: boolean()
+  def valid_transition?(from, to), do: {from, to} in @valid_transitions
+
   @doc """
   Changeset for setting or clearing an article's embedding vector.
 
