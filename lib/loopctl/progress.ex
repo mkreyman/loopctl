@@ -631,8 +631,8 @@ defmodule Loopctl.Progress do
 
   defp knowledge_auto_extract_enabled?(nil), do: true
 
-  defp knowledge_auto_extract_enabled?(%Tenants.Tenant{settings: settings}) do
-    Map.get(settings || %{}, "knowledge_auto_extract", true) != false
+  defp knowledge_auto_extract_enabled?(%Tenants.Tenant{} = tenant) do
+    Tenants.get_tenant_settings(tenant, "knowledge_auto_extract", true) != false
   end
 
   defp handle_review_transaction(

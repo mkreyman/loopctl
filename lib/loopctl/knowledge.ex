@@ -2438,7 +2438,7 @@ defmodule Loopctl.Knowledge do
     auto_extract_enabled =
       case tenant do
         nil -> true
-        %{settings: settings} -> Map.get(settings || %{}, "knowledge_auto_extract", true) != false
+        t -> Loopctl.Tenants.get_tenant_settings(t, "knowledge_auto_extract", true) != false
       end
 
     pending = count_pending_extractions(tenant_id)
