@@ -289,6 +289,37 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       assert hd(articles).title == "Valid"
     end
 
+    test "skips articles with title exceeding 500 characters" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+        {:ok,
+         [
+           %{title: "Valid", body: "Short body.", category: :pattern},
+           %{
+             title: String.duplicate("x", 501),
+             body: "Body for oversized title.",
+             category: :pattern
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{
+                   "review_record_id" => review_record.id,
+                   "tenant_id" => tenant.id
+                 }
+               })
+
+      %{data: articles} =
+        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+
+      assert length(articles) == 1
+      assert hd(articles).title == "Valid"
+    end
+
     test "skips articles with invalid tags" do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)

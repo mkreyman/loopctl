@@ -139,7 +139,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
 
   defp valid_title?(attrs) do
     title = Map.get(attrs, :title) || Map.get(attrs, "title")
-    is_binary(title) and title != ""
+    is_binary(title) and title != "" and String.length(title) <= 500
   end
 
   defp valid_body?(attrs) do
