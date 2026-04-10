@@ -30,7 +30,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   ## Threshold (AC-21.2.4)
 
-  Configurable via `Application.get_env(:loopctl, :article_link_threshold, 0.8)`.
+  Configurable via `Application.get_env(:loopctl, :article_link_threshold, 0.6)`.
   Only articles with cosine similarity >= threshold get linked.
 
   ## Retry Strategy (AC-21.2.13)
@@ -69,7 +69,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         :ok
 
       {:ok, %Article{} = article} ->
-        threshold = Application.get_env(:loopctl, :article_link_threshold, 0.8)
+        threshold = Application.get_env(:loopctl, :article_link_threshold, 0.6)
         max_comparisons = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
         find_and_link_similar(article, tenant_id, threshold, max_comparisons)
     end
