@@ -183,8 +183,8 @@ defmodule LoopctlWeb.Router do
 
     # Orchestrator state
     put "/orchestrator/state/:project_id", OrchestratorStateController, :save
-    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
     get "/orchestrator/state/:project_id", OrchestratorStateController, :show
+    get "/orchestrator/state/:project_id/history", OrchestratorStateController, :history
 
     # Webhooks (Epic 10)
     resources "/webhooks", WebhookController, only: [:create, :index, :update, :delete]
@@ -250,9 +250,13 @@ defmodule LoopctlWeb.Router do
     # Knowledge Context (deep-read with recency scoring and linked refs)
     get "/knowledge/context", KnowledgeContextController, :context
 
+    # Knowledge Export (Obsidian-compatible ZIP)
+    get "/knowledge/export", KnowledgeExportController, :export
+
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
+      get "/knowledge/export", KnowledgeExportController, :export
     end
 
     # ArticleLink management
