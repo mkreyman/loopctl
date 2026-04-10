@@ -16,6 +16,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
@@ -75,6 +76,24 @@ defmodule Loopctl.Fixtures do
       %{
         name: "agent-#{System.unique_integer([:positive])}",
         agent_type: :implementer,
+        metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:article, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        title: "Article #{seq}",
+        body: "Test article body content for article #{seq}.",
+        category: :pattern,
+        status: :draft,
+        tags: [],
+        source_type: nil,
+        source_id: nil,
         metadata: %{}
       },
       Enum.into(attrs, %{})
@@ -375,6 +394,29 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Agent{tenant_id: tenant_id}
       |> Agent.register_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:article, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    project_id = Map.get(attrs, :project_id)
+    data = build(:article, attrs)
+
+    changeset =
+      %Article{tenant_id: tenant_id, project_id: project_id}
+      |> Article.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
