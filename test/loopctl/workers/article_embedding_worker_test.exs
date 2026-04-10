@@ -210,10 +210,13 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
 
-      # Only a tags update -- should NOT trigger a new embedding call.
-      # The default stub is set up but should not be called for this update.
-      # Since Oban inline mode would call the client if enqueued, we verify
-      # by checking that no new embedding job runs (embedding remains from create).
+      # After create (which uses the default stub), set expect with 0 calls.
+      # If update_article incorrectly enqueues an embedding job for a
+      # tags-only change, Mox will fail because the mock was called.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _text ->
+        {:ok, List.duplicate(0.1, 1536)}
+      end)
+
       {:ok, updated} =
         Knowledge.update_article(tenant.id, article.id, %{tags: ["new-tag"]})
 
@@ -223,6 +226,12 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
     test "does not enqueue embedding for metadata-only changes" do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
+
+      # After create (which uses the default stub), set expect with 0 calls.
+      # Ensures no embedding job is enqueued for metadata-only changes.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _text ->
+        {:ok, List.duplicate(0.1, 1536)}
+      end)
 
       {:ok, updated} =
         Knowledge.update_article(tenant.id, article.id, %{metadata: %{"key" => "value"}})
@@ -263,6 +272,30 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
                ArticleEmbeddingWorker.perform(%Oban.Job{
                  args: %{"article_id" => article.id, "tenant_id" => tenant.id}
                })
+    end
+  end
+
+  # --- TC-20.3.8: Tenant isolation ---
+
+  describe "tenant isolation" do
+    test "worker with wrong tenant_id returns :ok (article not visible)" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+
+      article = create_published_article(tenant_a.id)
+
+      # Worker runs with tenant_b's tenant_id but tenant_a's article_id.
+      # Knowledge.get_article scopes by tenant_id, so it returns :not_found.
+      # The worker should treat this as a deleted article and return :ok.
+      assert :ok =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant_b.id}
+               })
+
+      # Verify tenant_a's article embedding was NOT modified by the wrong-tenant worker.
+      # The embedding from create_published_article should remain unchanged.
+      {:ok, loaded} = Knowledge.get_article(tenant_a.id, article.id)
+      assert loaded.embedding != nil
     end
   end
 
