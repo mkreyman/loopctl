@@ -1,0 +1,145 @@
+{
+  "id": "US-21.5",
+  "title": "Model Mix Tracking & Verification Correlation",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "orchestrator agent",
+    "i_want_to": "see which models each agent uses across different phases of work and how model choice correlates with verification outcomes",
+    "so_that": "I can identify patterns like 'agents using Opus for reasoning and Sonnet for execution pass verification 90% of the time, while agents using Haiku for everything get rejected 40% of the time' and route work accordingly"
+  },
+  "rationale": "The token efficiency research emphasizes that model selection per task phase is one of the highest-leverage optimizations: 'Don't bring a Ferrari to the grocery store.' But today, orchestrators have no data to evaluate model strategy. By tracking model usage per story phase (contracting, implementing, reporting) and correlating with verification outcomes, loopctl enables data-driven model routing. This turns model selection from a guess into a measurable, improvable practice.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.5.1",
+      "description": "POST /api/v1/token-usage and the report endpoint's token_usage object accept an optional phase field (enum: 'planning', 'implementing', 'reviewing', 'other') describing what phase the tokens were used in. Defaults to 'other' if omitted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.2",
+      "description": "GET /api/v1/analytics/model-mix (role: orchestrator+) returns a correlation matrix: for each (model_name, phase) pair, returns total_tokens, total_cost_millicents, stories_count, verified_count, rejected_count, verification_rate_pct. Filterable by project_id, agent_id, date range.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.3",
+      "description": "GET /api/v1/analytics/agents/:id/model-profile (role: orchestrator+) returns a specific agent's model usage profile: which models they use, in which phases, at what cost, and with what verification outcomes. Includes model_count (number of distinct models used) and is_model_blender (boolean, true if model_count > 1) for classification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.4",
+      "description": "The model-mix analytics endpoint includes a comparative view: for agents that use mixed models vs single-model, compare avg verification rate and avg cost. This quantifies the 'model blending' advantage.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.5",
+      "description": "The phase column and skill_version_id FK are already included in the token_usage_reports table schema (added in US-21.1). This story activates phase tracking by accepting phase values in the POST endpoints and using them in analytics queries. No additional migration required.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.5.6",
+      "description": "The CostRollupWorker (US-21.3) is extended to include phase-level breakdown in the model_breakdown jsonb field of cost_summaries.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.5.1",
+      "name": "Token usage report with phase field stored correctly",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with body including phase: 'implementing'"
+      ],
+      "expected_results": [
+        "token_usage_report created with phase='implementing'",
+        "Response includes phase field"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.2",
+      "name": "Model mix correlation shows verification rate by model+phase",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "3 stories: implemented with opus in 'implementing' phase, all verified",
+        "3 stories: implemented with haiku in 'implementing' phase, 1 verified, 2 rejected",
+        "token_usage_reports with corresponding model_name and phase values",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/model-mix"
+      ],
+      "expected_results": [
+        "opus+implementing: verification_rate_pct=100, stories_count=3",
+        "haiku+implementing: verification_rate_pct=33, stories_count=3, rejected_count=2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.3",
+      "name": "Agent model profile shows mixed vs single model comparison",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "agent_a uses opus+sonnet blend (3 models across phases)",
+        "agent_b uses only opus for everything",
+        "Both have 5 completed stories with token reports and verification outcomes",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/agents/:agent_a_id/model-profile",
+        "GET /api/v1/analytics/agents/:agent_b_id/model-profile"
+      ],
+      "expected_results": [
+        "agent_a profile shows multiple models with phase distribution",
+        "agent_b profile shows single model usage",
+        "Both include verification rate and cost metrics"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.5.4",
+      "name": "Phase defaults to 'other' when omitted",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, assigned_agent_id: agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage without phase field"
+      ],
+      "expected_results": [
+        "token_usage_report created with phase='other'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "No migration needed -- phase column is already in the token_usage_reports table from US-21.1 with default 'other'.",
+    "Phase enum as Ecto.Enum: [:planning, :implementing, :reviewing, :other]. Already defined in Loopctl.TokenUsage.Report schema from US-21.1.",
+    "Model-mix correlation query: JOIN token_usage_reports with stories on story_id, GROUP BY (model_name, phase), aggregate verification outcomes from stories.verified_status.",
+    "Agent model profile: complex query grouping by (model_name, phase) for a single agent, with window functions for relative cost ranking.",
+    "is_model_blender field: boolean computed as COUNT(DISTINCT model_name) > 1 for the agent. model_count is COUNT(DISTINCT model_name).",
+    "The comparative view (mixed vs single model) can be computed as a CTE: agents grouped by COUNT(DISTINCT model_name), then avg metrics per group.",
+    "Extend CostRollupWorker to include phase in the model_breakdown jsonb structure. New format: {\"claude-opus-4-6\": {\"implementing\": {tokens, cost}, \"reviewing\": {tokens, cost}}}.",
+    "Controller: extend LoopctlWeb.AnalyticsController with model_mix and agent_model_profile actions."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-21.4",
+    "US-7.1"
+  ],
+  "estimated_hours": 6
+}

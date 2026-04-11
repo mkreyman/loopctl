@@ -1,0 +1,179 @@
+{
+  "id": "US-21.4",
+  "title": "Token Analytics Query Endpoints",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "orchestrator agent",
+    "i_want_to": "query token analytics with flexible dimensions -- per-agent efficiency, per-epic cost breakdown, per-project cost overview, and efficiency trends over time",
+    "so_that": "I can make data-driven decisions about which agents to assign to which stories and identify cost trends before they become problems"
+  },
+  "rationale": "Raw token reports (US-21.1) and pre-computed rollups (US-21.3) provide the data layer. This story exposes that data through queryable analytics endpoints that orchestrators and dashboards can consume. The key insight from token efficiency research is that cost patterns are predictive: an agent that consistently burns 3x the average will continue to do so. Surfacing these patterns enables orchestrators to route complex stories to efficient agents and simple stories to cheaper models.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.4.1",
+      "description": "GET /api/v1/analytics/agents (role: orchestrator+) returns per-agent cost metrics for the tenant. Each entry includes: agent_id, agent_name, total_stories_reported, total_input_tokens, total_output_tokens, total_cost_millicents, avg_cost_per_story_millicents, primary_model (most-used model by token count), efficiency_rank (1=cheapest per story within project). Filterable by project_id and date range (since, until).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.2",
+      "description": "GET /api/v1/analytics/epics (role: agent+) returns per-epic cost breakdown. Each entry includes: epic_id, epic_name, story_count, completed_story_count, total_cost_millicents, avg_cost_per_story_millicents, budget_millicents (if set), utilization_pct, model_breakdown (map of model to cost). Filterable by project_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.3",
+      "description": "GET /api/v1/analytics/projects/:id (role: agent+) returns a single project's cost overview: total_cost_millicents, total_input_tokens, total_output_tokens, budget_millicents (if set), utilization_pct, cost_by_phase (map of agent_status phase to cost), model_breakdown, agent_count, story_count, avg_cost_per_story_millicents.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.4",
+      "description": "GET /api/v1/analytics/models (role: agent+) returns model mix analysis for the tenant. Each entry includes: model_name, total_input_tokens, total_output_tokens, total_cost_millicents, report_count, avg_cost_per_report_millicents, stories_verified_count, stories_rejected_count, verification_rate_pct. Filterable by project_id and date range. Verification counts use the story's CURRENT verified_status (not historical). If a story is rejected, re-implemented, and later verified, it counts as 1 verified story (final status wins). verification_rate_pct = verified_count / (verified_count + rejected_count) * 100.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.5",
+      "description": "GET /api/v1/analytics/trends (role: orchestrator+) returns daily/weekly cost trend data. Each entry includes: period (date), total_cost_millicents, total_tokens, report_count, unique_agents. Accepts granularity param ('daily' or 'weekly'). Filterable by project_id and date range.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.6",
+      "description": "All analytics endpoints prefer pre-computed cost_summaries when available, falling back to live aggregation from token_usage_reports when summaries are stale or missing. Staleness definition: cost_summaries with period_end < Date.utc_today() are considered complete and always used. For the current day (period not yet rolled up), live aggregation from token_usage_reports is used. At midnight UTC, the daily rollup finalizes the previous day's summaries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.7",
+      "description": "All analytics endpoints are tenant-scoped via RLS. An orchestrator in tenant A cannot see tenant B's analytics.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.4.8",
+      "description": "Analytics endpoints return empty results (not errors) when no token data exists for the requested scope. This supports projects that haven't adopted token reporting yet.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.4.1",
+      "name": "Agent analytics returns ranked efficiency data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:agent, %{tenant_id: tenant.id, name: 'efficient-agent'}) as agent_a",
+        "fixture(:agent, %{tenant_id: tenant.id, name: 'expensive-agent'}) as agent_b",
+        "3 token_usage_reports for agent_a totaling 300000 millicents across 3 stories",
+        "3 token_usage_reports for agent_b totaling 900000 millicents across 3 stories",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/agents?project_id=project.id"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Returns 2 agent entries",
+        "agent_a has avg_cost_per_story_millicents=100000, efficiency_rank=1",
+        "agent_b has avg_cost_per_story_millicents=300000, efficiency_rank=2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.2",
+      "name": "Model mix analysis correlates with verification outcomes",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "3 stories verified, all using 'claude-opus-4-6'",
+        "2 stories rejected, all using 'claude-haiku-4-5'",
+        "token_usage_reports for each story with appropriate model_name",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/models"
+      ],
+      "expected_results": [
+        "claude-opus-4-6 entry has stories_verified_count=3, verification_rate_pct=100",
+        "claude-haiku-4-5 entry has stories_rejected_count=2, verification_rate_pct=0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.3",
+      "name": "Trends endpoint returns daily cost data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "token_usage_reports spread across 3 different dates",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/trends?granularity=daily&since=2026-03-01&until=2026-03-31"
+      ],
+      "expected_results": [
+        "Response contains 3 data points, one per day with reports",
+        "Each point includes total_cost_millicents, total_tokens, report_count"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.4",
+      "name": "Analytics return empty results when no token data exists",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) with no token_usage_reports",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/agents",
+        "GET /api/v1/analytics/epics",
+        "GET /api/v1/analytics/projects/:id",
+        "GET /api/v1/analytics/models"
+      ],
+      "expected_results": [
+        "All return 200 with empty data arrays or zero-value summaries",
+        "No 404 or 500 errors"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.4.5",
+      "name": "Tenant isolation: cross-tenant analytics returns empty",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a with token data",
+        "fixture(:tenant) as tenant_b with no token data",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/analytics/agents with tenant_b key"
+      ],
+      "expected_results": [
+        "Returns 200 with empty agents array",
+        "No tenant_a data visible"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controller: LoopctlWeb.AnalyticsController with agents, epics, project, models, trends actions.",
+    "Routes under /api/v1/analytics/. Consider a dedicated router scope with its own pipe_through for analytics-specific middleware (e.g., caching headers).",
+    "Analytics queries should prefer cost_summaries table when data is fresh (period_end >= Date.utc_today() - 1). Fall back to live aggregation from token_usage_reports when summaries are stale.",
+    "efficiency_rank: computed with a window function RANK() OVER (PARTITION BY project_id ORDER BY avg_cost_per_story ASC).",
+    "model_breakdown is a JSON map keyed by model_name. Build with GROUP BY model_name subquery.",
+    "verification_rate correlation (AC-21.4.4): JOIN token_usage_reports with stories on story_id, GROUP BY model_name, COUNT where verified_status = 'verified' vs total.",
+    "Trends granularity: daily = GROUP BY DATE(inserted_at), weekly = GROUP BY DATE_TRUNC('week', inserted_at).",
+    "All endpoints are read-only. No mutations. No audit log entries needed for reads.",
+    "Context module: Loopctl.TokenUsage.Analytics with agent_metrics/2, epic_metrics/2, project_metrics/2, model_metrics/2, trend_metrics/2.",
+    "All list endpoints MUST use consistent page-based pagination where applicable.",
+    "Testing: fixtures need to set up realistic multi-agent, multi-model data sets. Consider a helper function that creates a complete token usage scenario."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-21.3"
+  ],
+  "estimated_hours": 8
+}

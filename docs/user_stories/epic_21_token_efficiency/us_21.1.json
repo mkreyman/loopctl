@@ -1,0 +1,231 @@
+{
+  "id": "US-21.1",
+  "title": "Token Usage Reporting Schema & Ingestion",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "AI implementation agent",
+    "i_want_to": "report token usage data (input tokens, output tokens, model used, cost) alongside my story status report",
+    "so_that": "the orchestrator and tenant administrators can track how efficiently I completed the work and compare cost across agents and stories"
+  },
+  "rationale": "loopctl currently tracks what agents do but not how efficiently they do it. An agent that completes a story in 50K tokens and one that burns 800K tokens for the same result look identical today. Token usage is the foundational data point for all cost observability features. By capturing it at the report step (the natural end-of-work boundary), we get accurate per-story cost data without requiring agents to instrument every API call. This is the data ingestion layer that all analytics, budgets, and alerts build on.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.1.1",
+      "description": "A token_usage_reports table exists with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), story_id (uuid FK NOT NULL), agent_id (uuid FK NOT NULL), project_id (uuid FK NOT NULL), input_tokens (bigint NOT NULL), output_tokens (bigint NOT NULL), total_tokens (bigint, generated always as input_tokens + output_tokens, stored), model_name (string NOT NULL), cost_millicents (bigint NOT NULL, cost in 1/1000 of a cent for precision), phase (varchar enum: 'planning', 'implementing', 'reviewing', 'other', default 'other'), session_id (string, nullable, for correlating multi-call sessions), skill_version_id (uuid FK, nullable, references skill_versions), metadata (jsonb, default {}), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.2",
+      "description": "RLS policies on token_usage_reports: INSERT requires tenant_id match, SELECT/UPDATE/DELETE scoped by tenant_id. Same pattern as all other tenant-scoped tables.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.3",
+      "description": "POST /api/v1/stories/:id/report accepts an optional token_usage object in the request body: {input_tokens: integer, output_tokens: integer, model_name: string, cost_millicents: integer, session_id: string (optional), metadata: map (optional)}. When present, a token_usage_report record is created atomically within the same Ecto.Multi transaction as the status transition.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.4",
+      "description": "POST /api/v1/token-usage (role: agent+) creates a standalone token usage report for a story without triggering a status transition. This supports agents that want to report incremental token usage during implementation, not just at report time. Requires story_id, input_tokens, output_tokens, model_name, cost_millicents.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.5",
+      "description": "GET /api/v1/stories/:id/token-usage (role: agent+) returns all token usage reports for a story, ordered by inserted_at descending. Includes totals: sum of input_tokens, sum of output_tokens, sum of cost_millicents across all reports.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.6",
+      "description": "Validation: input_tokens and output_tokens must be >= 0. cost_millicents must be >= 0. model_name must be a non-empty string. Returns 422 with descriptive errors on validation failure.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.7",
+      "description": "The token_usage_report is tenant-scoped. agent_id is set from the authenticated agent (never from request body). project_id is derived from the story's epic's project_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.8",
+      "description": "A Loopctl.TokenUsage context module exists with: create_report/2, list_reports_for_story/2, get_story_totals/2. All functions take tenant_id as first argument.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.8a",
+      "description": "The existing Loopctl.Progress.report_story/4 (tenant_id, story_id, opts, artifact_params) is extended to accept an optional :token_usage key in the opts keyword list. When token_usage params are provided, a token_usage_report is created within the same Ecto.Multi transaction. The function continues to return {:ok, updated_story} for backward compatibility. The token_usage_report is created as a side effect within the Multi. Callers that need the report can query it separately via Loopctl.TokenUsage.list_reports_for_story/2.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.9",
+      "description": "Every token usage report creation is recorded in the audit log with entity_type='token_usage_report', action='created'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.1.10",
+      "description": "Indexes: (tenant_id, story_id), (tenant_id, agent_id), (tenant_id, project_id), (tenant_id, inserted_at) for efficient aggregation queries.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.1.1",
+      "name": "Report story with token usage creates both status transition and token report atomically",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/report with body {token_usage: {input_tokens: 150000, output_tokens: 45000, model_name: 'claude-opus-4-6', cost_millicents: 1875}}"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Story agent_status is 'reported_done'",
+        "A token_usage_report record exists with input_tokens=150000, output_tokens=45000, model_name='claude-opus-4-6', cost_millicents=1875",
+        "token_usage_report.agent_id matches the calling agent",
+        "token_usage_report.project_id matches the story's project",
+        "Audit log entries created for both status change and token report"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.2",
+      "name": "Report story without token usage still works (backward compatible)",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/stories/:id/report with empty body (no token_usage key)"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Story agent_status is 'reported_done'",
+        "No token_usage_report record created",
+        "Existing report behavior unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.3",
+      "name": "Standalone token usage report via POST /token-usage",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with body {story_id: story.id, input_tokens: 50000, output_tokens: 12000, model_name: 'claude-sonnet-4-6', cost_millicents: 390, session_id: 'session-abc-123'}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "token_usage_report record created with all provided fields",
+        "agent_id set from authenticated agent, not request body",
+        "project_id derived from story's epic's project"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.4",
+      "name": "Validation rejects negative token counts and missing fields",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, agent_status: :implementing, assigned_agent_id: agent.id})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with body {story_id: story.id, input_tokens: -100, output_tokens: 500, model_name: 'opus', cost_millicents: 50}",
+        "POST /api/v1/token-usage with body {story_id: story.id, input_tokens: 100, output_tokens: 500, model_name: '', cost_millicents: 50}",
+        "POST /api/v1/token-usage with body {story_id: story.id, input_tokens: 100}"
+      ],
+      "expected_results": [
+        "All three return 422 with descriptive validation errors",
+        "No token_usage_report records created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.5",
+      "name": "GET story token usage returns reports with totals",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, story_id: story.id, agent_id: agent.id, input_tokens: 50000, output_tokens: 10000, cost_millicents: 500})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, story_id: story.id, agent_id: agent.id, input_tokens: 30000, output_tokens: 8000, cost_millicents: 300})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:id/token-usage"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response contains array of 2 token_usage_report objects ordered by inserted_at desc",
+        "Response includes totals: {total_input_tokens: 80000, total_output_tokens: 18000, total_cost_millicents: 800}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.1.6",
+      "name": "Tenant isolation: cannot see other tenant's token usage",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:story, %{tenant_id: tenant_a.id}) as story_a",
+        "fixture(:token_usage_report, %{tenant_id: tenant_a.id, story_id: story_a.id})",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:story_a_id/token-usage with tenant_b API key",
+        "POST /api/v1/token-usage with tenant_b API key and story_id=story_a.id"
+      ],
+      "expected_results": [
+        "GET returns 404",
+        "POST returns 404",
+        "No cross-tenant data leakage"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Create migration for token_usage_reports table. Use generated column for total_tokens: add :total_tokens, :bigint, generated: \"ALWAYS AS (input_tokens + output_tokens) STORED\".",
+    "Cost is stored as millicents (1/1000 of a cent) to avoid floating point issues while supporting sub-cent precision. Example: $0.025 = 2500 millicents.",
+    "Schema module: Loopctl.TokenUsage.Report. MUST use `use Loopctl.Schema`.",
+    "Context module: Loopctl.TokenUsage with create_report/2, list_reports_for_story/2, get_story_totals/2. POST /api/v1/stories/:id/report with token_usage is for story completion (status transition + token data atomically). POST /api/v1/token-usage is for incremental token tracking during implementation without status transition. Both create token_usage_report records.",
+    "A shared Loopctl.TokenUsage.Formatting module MUST be created with millicents_to_dollars/1 (always round to 2 decimal places using round-half-up) and format_tokens/1 (use K for 1000+, M for 1M+). All CLI, MCP, and API endpoints use these shared functions for consistent formatting.",
+    "Extend the existing Loopctl.Progress.report_story/2 function to accept optional token_usage params and create the report within the same Ecto.Multi transaction. Returns {:ok, %{story: story, token_usage_report: report}} when token_usage is provided.",
+    "New fixtures MUST be added to test/support/fixtures.ex: fixture(:token_usage_report, attrs) with auto-dependency resolution for tenant, story, agent, and project. Use the same AdminRepo.insert! pattern as existing fixtures.",
+    "Controller: LoopctlWeb.TokenUsageController with create (standalone), index (per-story). Routes: POST /api/v1/token-usage, GET /api/v1/stories/:story_id/token-usage.",
+    "agent_id MUST be set from conn.assigns, never from request body (same pattern as other agent endpoints).",
+    "project_id derivation: story -> epic -> project. Preload or join to get project_id when creating the report.",
+    "RLS policies: same pattern as all tenant-scoped tables. INSERT/SELECT/UPDATE/DELETE where tenant_id = current_setting('app.current_tenant_id').",
+    "Schema module MUST use `use Loopctl.Schema` (provides `@primary_key {:id, :binary_id, autogenerate: true}`, `@foreign_key_type :binary_id`, `@timestamps_opts [type: :utc_datetime_usec]`)",
+    "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController` for error rendering.",
+    "All list endpoints MUST use consistent page-based pagination: ?page=N&page_size=M (default page=1, page_size=20, max page_size=100).",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests."
+  ],
+  "dependencies": [
+    "US-7.1",
+    "US-3.1",
+    "US-2.4"
+  ],
+  "estimated_hours": 8
+}

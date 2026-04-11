@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "loopctl": {
+      "command": "npx",
+      "args": ["loopctl-mcp-server"],
+      "env": {
+        "LOOPCTL_SERVER": "https://loopctl.com",
+        "LOOPCTL_ORCH_KEY": "lc_replace_with_orchestrator_key",
+        "LOOPCTL_AGENT_KEY": "lc_replace_with_agent_key",
+        "LOOPCTL_REVIEWER_KEY": "lc_replace_with_reviewer_key"
+      }
+    }
+  }
+}

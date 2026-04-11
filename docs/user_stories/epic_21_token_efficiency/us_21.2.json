@@ -1,0 +1,208 @@
+{
+  "id": "US-21.2",
+  "title": "Token Budget Configuration",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "set token budgets at the project, epic, and story level so that I can define expected cost ceilings for work units",
+    "so_that": "orchestrators can make cost-aware scheduling decisions and I receive alerts when agents exceed budgets, preventing runaway token spending before it compounds"
+  },
+  "rationale": "Without budgets, token usage data is purely retrospective -- you can see what was spent but cannot prevent overspending. Budgets create a forward-looking cost control mechanism. By allowing budgets at multiple granularities (project, epic, story), tenants can set broad guardrails at the project level while fine-tuning expectations for complex vs simple stories. This directly addresses the video's core argument: 'your mistakes scale with the price of intelligence' -- budgets catch mistakes early.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.2.1",
+      "description": "A token_budgets table exists with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), scope_type (enum: 'project', 'epic', 'story'), scope_id (uuid NOT NULL, references the scoped entity), budget_millicents (bigint NOT NULL), budget_input_tokens (bigint, nullable -- optional token-count budget), budget_output_tokens (bigint, nullable), alert_threshold_pct (integer, default 80 -- fire alert at this % of budget), metadata (jsonb, default {}), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.2",
+      "description": "RLS policies on token_budgets scoped by tenant_id. Same pattern as all tenant-scoped tables.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.3",
+      "description": "POST /api/v1/token-budgets (role: user) creates a budget. Requires scope_type, scope_id, budget_millicents. Optional: budget_input_tokens, budget_output_tokens, alert_threshold_pct, metadata. Validates that scope_id references an existing entity of the correct type within the tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.4",
+      "description": "GET /api/v1/token-budgets (role: agent+) lists all budgets for the tenant. Filterable by scope_type and scope_id. Includes current spend (sum of token_usage_reports for the scoped entity) and remaining budget.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.5",
+      "description": "GET /api/v1/token-budgets/:id (role: agent+) returns a single budget with current spend and remaining budget calculated in real-time.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.6",
+      "description": "PATCH /api/v1/token-budgets/:id (role: user) updates budget_millicents, budget_input_tokens, budget_output_tokens, alert_threshold_pct. Cannot change scope_type or scope_id after creation.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.7",
+      "description": "DELETE /api/v1/token-budgets/:id (role: user) deletes a budget. Does not delete associated token usage reports.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.8",
+      "description": "A composite unique index on (tenant_id, scope_type, scope_id) prevents duplicate budgets for the same entity. Returns 409 on conflict.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.9",
+      "description": "Tenant-level default budgets: the tenants table gains a default_story_budget_millicents column (nullable). When set, stories without explicit budgets inherit this default. get_effective_budget/3 returns {:ok, {budget_millicents, source}} where source is :explicit, :epic_inherited, :project_inherited, or :tenant_default. Returns {:ok, nil} when no budget exists at any level. The GET budget endpoint includes effective_budget_millicents and budget_source fields.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.2.10",
+      "description": "All budget mutations (create, update, delete) are recorded in the audit log via Ecto.Multi.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.2.1",
+      "name": "Create project-level token budget",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/token-budgets with body {scope_type: 'project', scope_id: project.id, budget_millicents: 5000000, alert_threshold_pct: 75}"
+      ],
+      "expected_results": [
+        "Response status is 201",
+        "Budget created with scope_type='project', scope_id=project.id",
+        "alert_threshold_pct is 75",
+        "Audit log entry created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.2",
+      "name": "Duplicate budget for same scope returns 409",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:token_budget, %{tenant_id: tenant.id, scope_type: :project, scope_id: project.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/token-budgets with body {scope_type: 'project', scope_id: project.id, budget_millicents: 9999}"
+      ],
+      "expected_results": [
+        "Response status is 409 Conflict",
+        "Original budget unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.3",
+      "name": "GET budget includes current spend and remaining",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:token_budget, %{tenant_id: tenant.id, scope_type: :project, scope_id: project.id, budget_millicents: 1000000})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, project_id: project.id, cost_millicents: 350000})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, project_id: project.id, cost_millicents: 150000})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/token-budgets/:id"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Response includes current_spend_millicents: 500000",
+        "Response includes remaining_millicents: 500000",
+        "Response includes utilization_pct: 50"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.4",
+      "name": "Agent role can read but not create budgets",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "GET /api/v1/token-budgets with agent API key",
+        "POST /api/v1/token-budgets with agent API key"
+      ],
+      "expected_results": [
+        "GET returns 200 with budget list",
+        "POST returns 403 Forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.5",
+      "name": "Tenant isolation: cannot access other tenant's budgets",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:token_budget, %{tenant_id: tenant_a.id}) as budget_a",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/token-budgets with tenant_b API key",
+        "GET /api/v1/token-budgets/:budget_a_id with tenant_b API key"
+      ],
+      "expected_results": [
+        "List returns empty (no tenant_a budgets visible)",
+        "Show returns 404"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.2.6",
+      "name": "Story inherits tenant default budget when no explicit budget set",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant, %{default_story_budget_millicents: 100000}) as tenant",
+        "fixture(:story, %{tenant_id: tenant.id}) as story",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/token-budgets?scope_type=story&scope_id=story.id"
+      ],
+      "expected_results": [
+        "Response includes effective_budget_millicents: 100000",
+        "Response includes budget_source: 'tenant_default'"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Schema module: Loopctl.TokenUsage.Budget. MUST use `use Loopctl.Schema`.",
+    "Context functions in Loopctl.TokenUsage: create_budget/2, get_budget/2, list_budgets/2, update_budget/2, delete_budget/2, get_effective_budget/3 (for inheritance).",
+    "scope_type as Ecto.Enum with values [:project, :epic, :story].",
+    "Current spend calculation: subquery summing cost_millicents from token_usage_reports WHERE project_id/epic_id/story_id matches scope_id. Use a database view or inline subquery, not application-level aggregation.",
+    "Composite unique index: create unique_index(:token_budgets, [:tenant_id, :scope_type, :scope_id]).",
+    "Migration to add default_story_budget_millicents to tenants table (nullable bigint).",
+    "Budget inheritance resolution order: explicit story budget > explicit epic budget > explicit project budget > tenant default. Implement as Loopctl.TokenUsage.get_effective_budget/3 in the TokenUsage context module taking (tenant_id, scope_type, scope_id). The function traverses: story_id -> epic_id (via story.epic_id) -> project_id (via epic.project_id) -> tenant default. Use a single query with LEFT JOINs and COALESCE for efficiency, not multiple round-trips. Effective budget is calculated at read time (GET endpoint) and at report time (budget threshold checks). If default_story_budget_millicents changes, all stories immediately inherit the new default on next query.",
+    "Spend aggregation scope: for scope_type='story', sum token_usage_reports WHERE story_id = scope_id. For scope_type='epic', sum WHERE story.epic_id = scope_id (direct stories only, no nesting). For scope_type='project', sum WHERE story.epic.project_id = scope_id.",
+    "Controller: LoopctlWeb.TokenBudgetController. Routes under /api/v1/token-budgets.",
+    "All list endpoints MUST use consistent page-based pagination.",
+    "New fixtures MUST be added to test/support/fixtures.ex: fixture(:token_budget, attrs) with auto-dependency resolution for tenant, scope entity. fixture(:api_key) returns {raw_key, api_key} tuple -- test preconditions MUST destructure this.",
+    "Testing infrastructure: (1) async: true, (2) Mox in test/support/mocks.ex, (3) stub_all_defaults/0, (4) verify_on_exit!, (5) fixture/2 in test/support/fixtures.ex, (6) NEVER Application.put_env."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-5.1"
+  ],
+  "estimated_hours": 6
+}

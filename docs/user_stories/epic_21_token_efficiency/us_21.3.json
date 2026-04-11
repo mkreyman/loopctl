@@ -1,0 +1,206 @@
+{
+  "id": "US-21.3",
+  "title": "Cost Aggregation Oban Workers & Anomaly Detection",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "orchestrator agent",
+    "i_want_to": "query pre-computed cost summaries per agent, per epic, and per project rather than aggregating raw token reports on every request",
+    "so_that": "analytics queries are fast even with millions of token reports, and cost anomalies are automatically detected and flagged without manual monitoring"
+  },
+  "rationale": "Raw token usage reports will grow linearly with the number of agent calls. Aggregating on read would degrade performance quickly for active projects. Pre-computed rollups (materialized periodically by Oban workers) keep analytics queries constant-time. Anomaly detection (flagging stories that cost significantly more or less than their peers) catches both wasteful agents and suspiciously cheap reports that may indicate skipped work -- extending loopctl's 'trust nothing' philosophy from correctness into efficiency.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.3.1",
+      "description": "A cost_summaries table exists with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), scope_type (enum: 'agent', 'epic', 'project', 'story'), scope_id (uuid NOT NULL), period_start (date NOT NULL), period_end (date NOT NULL), total_input_tokens (bigint), total_output_tokens (bigint), total_cost_millicents (bigint), report_count (integer), model_breakdown (jsonb -- map of model_name to {input_tokens, output_tokens, cost_millicents}), avg_cost_per_story_millicents (bigint, nullable -- only for agent/epic/project scopes), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.2",
+      "description": "RLS policies on cost_summaries scoped by tenant_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.3",
+      "description": "A Loopctl.Workers.CostRollupWorker Oban worker runs daily via Oban.Cron (e.g., '0 2 * * *' for 2 AM UTC). All tenants use the same schedule in v1; per-tenant scheduling is out of scope. It computes cost summaries for each active project across all tenants, aggregating token_usage_reports inserted since the last rollup. It creates or updates cost_summary records for each scope (agent, epic, project) for the current period. When creating cost_summary records, tenant_id is derived from the scoped entity (story->tenant_id, epic->tenant_id, project->tenant_id, agent->tenant_id).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.4",
+      "description": "The rollup worker is idempotent. Running it twice for the same period produces the same result. It uses UPSERT (ON CONFLICT UPDATE) keyed on (tenant_id, scope_type, scope_id, period_start).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.5",
+      "description": "A Loopctl.Workers.CostAnomalyWorker Oban worker runs after each rollup. It compares each story's total cost to the average cost of stories in the same epic. Stories exceeding 3x the average are flagged with anomaly_type='high_cost'. Stories below 0.1x the average are flagged with anomaly_type='suspiciously_low'. Anomalies are stored in a cost_anomalies table.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.6",
+      "description": "A cost_anomalies table exists with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), story_id (uuid FK NOT NULL), anomaly_type (enum: 'high_cost', 'suspiciously_low', 'budget_exceeded'), story_cost_millicents (bigint), reference_avg_millicents (bigint), deviation_factor (decimal), resolved (boolean, default false), metadata (jsonb), inserted_at, updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.7",
+      "description": "GET /api/v1/cost-anomalies (role: user) lists unresolved anomalies for the tenant. Filterable by anomaly_type, project_id. Includes story title and agent name for context.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.8",
+      "description": "PATCH /api/v1/cost-anomalies/:id (role: user) marks an anomaly as resolved (acknowledged by tenant admin).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.9",
+      "description": "The rollup worker uses config-based DI. A Loopctl.TokenUsage.RollupBehaviour defines callbacks: @callback aggregate(tenant_id :: binary(), period_start :: Date.t(), period_end :: Date.t()) :: {:ok, [map()]} | {:error, term()}. The Oban worker resolves the implementation via @rollup_service Application.compile_env(:loopctl, :cost_rollup, Loopctl.TokenUsage.DefaultRollup). config/test.exs maps :cost_rollup to Loopctl.MockCostRollup. The mock is defined in test/support/mocks.ex.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.3.10",
+      "description": "Composite unique index on cost_summaries: (tenant_id, scope_type, scope_id, period_start) to support idempotent upserts.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.3.1",
+      "name": "Rollup worker computes correct per-agent and per-project summaries",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:epic, %{tenant_id: tenant.id, project_id: project.id}) as epic",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent_a",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent_b",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, project_id: project.id, agent_id: agent_a.id, input_tokens: 100000, cost_millicents: 1000})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, project_id: project.id, agent_id: agent_b.id, input_tokens: 200000, cost_millicents: 2500})"
+      ],
+      "steps": [
+        "Call CostRollupWorker.perform(%Oban.Job{args: %{\"tenant_id\" => tenant.id, \"period_date\" => Date.to_iso8601(Date.utc_today())}})"
+      ],
+      "expected_results": [
+        "cost_summary for agent_a: total_input_tokens=100000, total_cost_millicents=1000",
+        "cost_summary for agent_b: total_input_tokens=200000, total_cost_millicents=2500",
+        "cost_summary for project: total_input_tokens=300000, total_cost_millicents=3500, report_count=2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.3.2",
+      "name": "Rollup is idempotent -- double run produces same result",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, cost_millicents: 1000})"
+      ],
+      "steps": [
+        "Call CostRollupWorker.perform(%Oban.Job{args: %{\"tenant_id\" => tenant.id, \"period_date\" => Date.to_iso8601(Date.utc_today())}}) twice"
+      ],
+      "expected_results": [
+        "Only one cost_summary record per scope (upserted, not duplicated)",
+        "Values unchanged after second run"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.3.3",
+      "name": "Anomaly detection flags high-cost story",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:epic, %{tenant_id: tenant.id}) as epic",
+        "5 stories in epic with avg cost 10000 millicents each",
+        "1 story in epic with cost 50000 millicents (5x average)"
+      ],
+      "steps": [
+        "Call CostAnomalyWorker.perform(%Oban.Job{args: %{\"tenant_id\" => tenant.id}})"
+      ],
+      "expected_results": [
+        "cost_anomaly record created for the 50000-cost story",
+        "anomaly_type is 'high_cost'",
+        "deviation_factor is ~5.0",
+        "reference_avg_millicents is ~10000"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.3.4",
+      "name": "Anomaly detection flags suspiciously low-cost story",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "5 stories in epic with avg cost 50000 millicents each",
+        "1 story in epic with cost 2000 millicents (0.04x average)"
+      ],
+      "steps": [
+        "Call CostAnomalyWorker.perform(%Oban.Job{args: %{\"tenant_id\" => tenant.id}})"
+      ],
+      "expected_results": [
+        "cost_anomaly record created for the 2000-cost story",
+        "anomaly_type is 'suspiciously_low'",
+        "deviation_factor is ~0.04"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.3.5",
+      "name": "Resolve anomaly via PATCH",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:cost_anomaly, %{tenant_id: tenant.id, resolved: false})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "PATCH /api/v1/cost-anomalies/:id with body {resolved: true}"
+      ],
+      "expected_results": [
+        "Response status is 200",
+        "Anomaly record has resolved=true",
+        "Resolved anomalies no longer appear in default list"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.3.6",
+      "name": "Tenant isolation: rollup only processes own tenant's data",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:token_usage_report, %{tenant_id: tenant_a.id, cost_millicents: 1000})",
+        "fixture(:token_usage_report, %{tenant_id: tenant_b.id, cost_millicents: 9999})"
+      ],
+      "steps": [
+        "Call CostRollupWorker.perform/1 for tenant_a"
+      ],
+      "expected_results": [
+        "cost_summary for tenant_a includes only 1000 millicents",
+        "No cost_summary created for tenant_b",
+        "Tenant B's data not visible or aggregated"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Oban worker: Loopctl.Workers.CostRollupWorker with queue :analytics, max_attempts 3.",
+    "Oban worker: Loopctl.Workers.CostAnomalyWorker with queue :analytics, max_attempts 3. Scheduled to run after CostRollupWorker completes (use Oban.insert/1 chaining or separate cron schedule offset by 5 minutes).",
+    "Schema modules: Loopctl.TokenUsage.CostSummary, Loopctl.TokenUsage.CostAnomaly. Both use `use Loopctl.Schema`.",
+    "Rollup period: daily by default. period_start and period_end define the date range. Use Date.utc_today() for current period.",
+    "Idempotent upsert: Repo.insert(changeset, on_conflict: :replace_all, conflict_target: [:tenant_id, :scope_type, :scope_id, :period_start]).",
+    "model_breakdown is a jsonb column storing per-model, per-phase token/cost breakdown from day one (to avoid schema migration when US-21.5 adds phase tracking). Structure: {\"claude-opus-4-6\": {\"other\": {\"input_tokens\": 80000, \"output_tokens\": 20000, \"cost_millicents\": 1500}}, \"claude-sonnet-4-6\": {\"other\": {...}}}. Until US-21.5 adds the phase column, all reports use phase='other' as default. Analytics code that reads model_breakdown MUST handle both the nested structure and graceful absence of phase data.",
+    "Anomaly thresholds (3x high, 0.1x low) should be configurable via tenant settings for future flexibility, but hardcoded defaults are fine for v1.",
+    "Controller: LoopctlWeb.CostAnomalyController. Routes: GET /api/v1/cost-anomalies, PATCH /api/v1/cost-anomalies/:id.",
+    "Config-based DI for Oban workers: use @rollup_service Application.compile_env(:loopctl, :cost_rollup, Loopctl.TokenUsage.DefaultRollup) as a compile-time module attribute. Do NOT use Application.get_env at runtime in Oban workers. config/test.exs: config :loopctl, :cost_rollup, Loopctl.MockCostRollup.",
+    "New fixtures MUST be added to test/support/fixtures.ex: fixture(:cost_anomaly, attrs) with auto-dependency resolution for tenant, story. fixture(:cost_summary, attrs) for pre-computed rollup data in tests.",
+    "Testing: Oban workers tested by calling perform(%Oban.Job{args: %{...}}) directly with a real Oban.Job struct. Use Oban.Testing helpers for queue assertions. All tests async: true with Mox.set_mox_from_context."
+  ],
+  "dependencies": [
+    "US-21.1"
+  ],
+  "estimated_hours": 8
+}

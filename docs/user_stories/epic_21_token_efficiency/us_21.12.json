@@ -1,0 +1,146 @@
+{
+  "id": "US-21.12",
+  "title": "Landing Page & Documentation Updates for Token Efficiency",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "prospective loopctl user visiting the website",
+    "i_want_to": "understand that loopctl tracks not just what agents do but how efficiently they do it, including token cost tracking, budget alerts, and model mix analytics",
+    "so_that": "I can evaluate whether loopctl addresses my concern about AI agent cost management and make an informed decision about adopting it"
+  },
+  "rationale": "Token efficiency tracking is a significant differentiator for loopctl. Most agent coordination tools track correctness but ignore cost. Adding a landing page section that explains this capability directly addresses the growing concern (highlighted in industry discourse) that AI agent costs scale with model pricing and careless token habits. The PRD, README, and design system docs must also be updated to reflect this new capability so that contributors and users have accurate documentation.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.12.1",
+      "description": "The landing page at loopctl.com includes a new section titled 'Cost Intelligence' (or similar) positioned after the existing feature sections. The section explains: (1) agents report token usage alongside their work, (2) orchestrators see per-agent efficiency rankings and model mix analytics, (3) budgets and anomaly detection prevent runaway costs, (4) skill cost regression detection ensures prompt optimization doesn't sacrifice efficiency.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.2",
+      "description": "The landing page section includes a visual element (e.g., a table or chart mockup) showing example cost analytics: agent comparison table with efficiency ranks, model mix breakdown, or budget utilization bar. Follows the design system's terminal aesthetic (monospace, cool slate, no gradients).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.3",
+      "description": "The landing page section includes a concise value proposition connecting to the two-tier trust model: 'loopctl already ensures agents can't self-verify their work. Now it ensures they can't hide their cost either.'",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.4",
+      "description": "docs/prd.md is updated with a new section under Key Features describing token efficiency tracking, budget management, cost analytics, and anomaly detection. The section explains the millicent cost model, the rollup architecture, and the webhook integration.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.5",
+      "description": "README.md is updated: (1) Key Features list gains a 'Token efficiency tracking' bullet with brief description, (2) Concepts table gains entries for Token Budget, Cost Summary, Cost Anomaly, (3) Quick Start section mentions the token-usage and cost-summary CLI commands.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.6",
+      "description": "The design system doc (docs/design-system.md) is updated with guidance for cost data presentation: number formatting rules (millicents to dollars, K/M token suffixes), color coding for budget utilization (green < 60%, yellow 60-90%, red > 90%), and table layouts for analytics data.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.7",
+      "description": "CLAUDE.md is updated: Module Structure section lists the new Loopctl.TokenUsage context, and any new naming conventions or patterns introduced by this epic.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.12.8",
+      "description": "The OG image and social meta tags are NOT changed (US-18.2 already handles those). Landing page section uses existing CSS patterns and the site's established component library.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.12.1",
+      "name": "Landing page renders new Cost Intelligence section",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running",
+        "Landing page accessible at /"
+      ],
+      "steps": [
+        "Navigate to loopctl.com (or localhost:4000)",
+        "Scroll to the Cost Intelligence section"
+      ],
+      "expected_results": [
+        "Section is visible with heading, description, and visual element",
+        "Section follows design system: dark mode, cool slate, monospace for data",
+        "No gradients, glassmorphism, or rounded-xl (per anti-patterns)",
+        "Responsive on mobile"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.12.2",
+      "name": "PRD includes token efficiency section",
+      "type": "unit",
+      "preconditions": [
+        "docs/prd.md exists"
+      ],
+      "steps": [
+        "Read docs/prd.md"
+      ],
+      "expected_results": [
+        "Contains a section describing token efficiency tracking",
+        "Explains millicent cost model, rollup architecture, webhook integration",
+        "Consistent with the implemented feature set"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.12.3",
+      "name": "README includes updated feature list and concepts",
+      "type": "unit",
+      "preconditions": [
+        "README.md exists"
+      ],
+      "steps": [
+        "Read README.md"
+      ],
+      "expected_results": [
+        "Key Features includes 'Token efficiency tracking' bullet",
+        "Concepts table includes Token Budget, Cost Summary, Cost Anomaly",
+        "Quick Start mentions cost-summary and token-report CLI commands"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.12.4",
+      "name": "CLAUDE.md reflects new module structure",
+      "type": "unit",
+      "preconditions": [
+        "CLAUDE.md exists"
+      ],
+      "steps": [
+        "Read CLAUDE.md Module Structure section"
+      ],
+      "expected_results": [
+        "Lists Loopctl.TokenUsage context under lib/loopctl/",
+        "Naming conventions section includes TokenUsage patterns if applicable"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Landing page is a Phoenix LiveView (check lib/loopctl_web/ for the existing landing page module -- likely under a public live_session).",
+    "Follow the design system in docs/design-system.md strictly: dark mode only, cool slate grays, deep indigo-blue accent, Geist/Geist Mono fonts, rounded-md cards, terminal aesthetic.",
+    "The visual element (table/chart mockup) should use static data, not live API data. It's a marketing illustration, not a dashboard.",
+    "PRD update should be added as a new section, not modify existing sections. Place it after the existing Key Features list.",
+    "README update: add to existing bullet lists, don't restructure. Maintain the current README's tone and level of detail.",
+    "CLAUDE.md Module Structure: add a line for token_usage/ alongside the existing entries.",
+    "Design system update: add a subsection for 'Cost Data Formatting' with the color and number rules.",
+    "This story should be the last one implemented in the epic, after all API and tooling work is complete, so documentation reflects the actual shipped feature."
+  ],
+  "dependencies": [
+    "US-21.4",
+    "US-21.7",
+    "US-18.1"
+  ],
+  "estimated_hours": 5
+}

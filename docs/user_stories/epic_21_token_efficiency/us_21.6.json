@@ -1,0 +1,186 @@
+{
+  "id": "US-21.6",
+  "title": "Skill Performance Cost Extension",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "see the token cost associated with each skill version invocation alongside its verification outcome",
+    "so_that": "I can identify when a new skill version passes verification but costs significantly more than the previous version, which is a cost regression even if correctness improved"
+  },
+  "rationale": "loopctl already versions skills and tracks performance (Epic 15). But performance today only measures correctness (verification pass/fail rate). A skill version that passes verification 95% of the time but costs 5x more than the previous version is a regression that the current system cannot detect. By linking token usage reports to skill invocations, we add cost as a first-class dimension of skill performance. This enables data-driven prompt optimization where 'better' means both more correct AND more efficient.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.6.1",
+      "description": "The token_usage_reports table gains a skill_version_id column (uuid FK, nullable) referencing skill_versions. When an agent uses a specific skill version during implementation, the token report can be associated with that skill version.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.2",
+      "description": "POST /api/v1/token-usage and the report endpoint's token_usage object accept an optional skill_version_id field. Validates that the skill_version_id exists and belongs to the same tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.3",
+      "description": "GET /api/v1/skills/:id/cost-performance (role: user) returns cost metrics for each version of a skill: version_number, total_invocations, total_cost_millicents, avg_cost_per_invocation_millicents, stories_verified_count, stories_rejected_count, verification_rate_pct, cost_change_pct (relative to previous version).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.4",
+      "description": "A skill version is flagged as a 'cost regression' when its avg_cost_per_invocation is more than 2x the previous version's avg_cost_per_invocation AND it has at least 3 invocations (minimum sample size). The flag appears in the cost-performance response.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.5",
+      "description": "GET /api/v1/skills/:id/versions/:version (existing endpoint from US-15.1) is extended to include cost_summary: {total_invocations, avg_cost_millicents, total_cost_millicents} when token data is available.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.6.6",
+      "description": "The skill cost performance endpoint is tenant-scoped via RLS.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.6.1",
+      "name": "Token usage report linked to skill version",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "fixture(:skill_version, %{tenant_id: tenant.id, skill_id: skill.id, version: 1}) as sv",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id, assigned_agent_id: agent.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with body including skill_version_id: sv.id"
+      ],
+      "expected_results": [
+        "token_usage_report created with skill_version_id set",
+        "Response includes skill_version_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.2",
+      "name": "Cost performance shows version-over-version comparison",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:skill, %{tenant_id: tenant.id}) as skill",
+        "skill_version v1 with 5 token_usage_reports averaging 50000 millicents each",
+        "skill_version v2 with 5 token_usage_reports averaging 75000 millicents each",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/cost-performance"
+      ],
+      "expected_results": [
+        "v1: avg_cost_per_invocation_millicents=50000, cost_change_pct=null (no prior version)",
+        "v2: avg_cost_per_invocation_millicents=75000, cost_change_pct=50 (50% increase)",
+        "v2 is NOT flagged as cost_regression (1.5x, below 2x threshold)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.3",
+      "name": "Cost regression flag triggered at 2x threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "skill_version v1 with 5 reports avg 30000 millicents",
+        "skill_version v2 with 5 reports avg 80000 millicents (2.67x)",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/cost-performance"
+      ],
+      "expected_results": [
+        "v2 has cost_regression=true",
+        "v2 cost_change_pct=166 (166% increase)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.4",
+      "name": "Cost regression not flagged with insufficient sample size",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "skill_version v1 with 5 reports avg 30000 millicents",
+        "skill_version v2 with 2 reports avg 80000 millicents (2.67x but only 2 invocations)",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_id/cost-performance"
+      ],
+      "expected_results": [
+        "v2 has cost_regression=false (insufficient sample size, minimum 3 required)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.5",
+      "name": "Tenant isolation: cannot see other tenant's skill cost data",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:skill, %{tenant_id: tenant_a.id}) as skill_a with cost data",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})"
+      ],
+      "steps": [
+        "GET /api/v1/skills/:skill_a_id/cost-performance with tenant_b key"
+      ],
+      "expected_results": [
+        "Returns 404"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.6.6",
+      "name": "Validation rejects non-existent or cross-tenant skill_version_id",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:skill, %{tenant_id: tenant_b.id}) as skill_b",
+        "fixture(:skill_version, %{tenant_id: tenant_b.id, skill_id: skill_b.id}) as sv_b",
+        "fixture(:agent, %{tenant_id: tenant_a.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant_a.id, assigned_agent_id: agent.id})",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with tenant_a key and skill_version_id: sv_b.id (belongs to tenant_b)",
+        "POST /api/v1/token-usage with tenant_a key and skill_version_id: non-existent UUID"
+      ],
+      "expected_results": [
+        "Both return 422 with validation error on skill_version_id",
+        "No token_usage_report created"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "No migration needed for skill_version_id -- it is already included in the token_usage_reports table schema from US-21.1. Validation: query skill_versions WHERE id = ? JOIN skills WHERE skills.id = skill_versions.skill_id AND skills.tenant_id = ? to ensure tenant ownership.",
+    "cost_change_pct formula: ((avg_cost_this_version - avg_cost_previous_version) / avg_cost_previous_version) * 100, rounded to nearest integer. If previous version has 0 cost or is v1 (no prior), cost_change_pct is null and cost_regression is false.",
+    "Cost performance query: GROUP BY skill_version_id, compute avg/sum/count, then use LAG() window function for version-over-version cost_change_pct.",
+    "Cost regression detection: CASE WHEN avg_cost > 2 * LAG(avg_cost) AND count >= 3 THEN true ELSE false END.",
+    "Extend LoopctlWeb.SkillController or create LoopctlWeb.SkillCostController for the cost-performance endpoint.",
+    "Route: GET /api/v1/skills/:id/cost-performance nested under existing skills routes.",
+    "Extend the existing skill_version JSON view to include cost_summary when skill_version_id has associated token reports.",
+    "Context: add cost_performance/2 and version_cost_summary/2 functions to Loopctl.Skills or Loopctl.TokenUsage.",
+    "The skill_version_id is optional and nullable. Most token reports will not have it initially. The feature degrades gracefully when no skill associations exist."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-15.1"
+  ],
+  "estimated_hours": 5
+}
