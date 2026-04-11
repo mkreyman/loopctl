@@ -1,0 +1,169 @@
+{
+  "id": "US-21.10",
+  "title": "MCP Server Tool Updates for Token Efficiency",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "Claude Code agent using loopctl MCP tools",
+    "i_want_to": "report token usage and query cost analytics through MCP tools without needing to construct raw HTTP requests",
+    "so_that": "I can integrate token efficiency tracking into my development loop using the same MCP tool interface I already use for claiming stories and reporting progress"
+  },
+  "rationale": "The loopctl MCP server is the primary integration point for Claude Code agents. Adding token efficiency tools to the MCP server means agents can report token usage and query cost data with the same ergonomics as mcp__loopctl__claim_story or mcp__loopctl__verify_story. Without MCP tools, agents would need to fall back to curl or Req calls to the REST API, which is more error-prone and less discoverable. This is especially important because agents are both the producers (reporting tokens) and consumers (querying analytics for cost-aware decisions) of token data.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.10.1",
+      "description": "New MCP tool: mcp__loopctl__report_token_usage — accepts story_id, input_tokens, output_tokens, model_name, cost_millicents, phase (optional), skill_version_id (optional), session_id (optional). Calls POST /api/v1/token-usage.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.2",
+      "description": "New MCP tool: mcp__loopctl__get_cost_summary — accepts project_id, optional breakdown ('agent', 'epic', 'model'). Calls the appropriate analytics endpoint and returns formatted results.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.3",
+      "description": "New MCP tool: mcp__loopctl__get_story_token_usage — accepts story_id. Calls GET /api/v1/stories/:id/token-usage and returns reports with totals.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.4",
+      "description": "New MCP tool: mcp__loopctl__get_cost_anomalies — accepts optional project_id. Calls GET /api/v1/cost-anomalies and returns unresolved anomalies.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.5",
+      "description": "New MCP tool: mcp__loopctl__set_token_budget — accepts scope_type, scope_id, budget_millicents, optional alert_threshold_pct. Calls POST /api/v1/token-budgets. Requires orchestrator or user role API key.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.6",
+      "description": "The existing mcp__loopctl__report_story tool is extended to accept optional token_usage parameters (input_tokens, output_tokens, model_name, cost_millicents) which are passed through to the report endpoint's token_usage field.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.7",
+      "description": "The existing mcp__loopctl__get_progress tool response is extended to include cost data when available: total_cost_millicents, budget_millicents (if set), utilization_pct.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.8",
+      "description": "The existing mcp__loopctl__list_stories tool response includes per-story token totals (total_tokens, total_cost_millicents) when token data exists.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.9",
+      "description": "All new MCP tools include proper JSON Schema input validation with required/optional field annotations and descriptive parameter descriptions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.10.10",
+      "description": "The mcp-server/README.md is updated with documentation for all new tools, including parameter descriptions, example usage, and expected responses.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.10.1",
+      "name": "report_token_usage tool creates token report via API",
+      "type": "integration",
+      "preconditions": [
+        "loopctl server running with valid agent API key configured",
+        "Story exists in implementing state assigned to the configured agent"
+      ],
+      "steps": [
+        "Call mcp__loopctl__report_token_usage with story_id, input_tokens: 80000, output_tokens: 25000, model_name: 'claude-opus-4-6', cost_millicents: 1250"
+      ],
+      "expected_results": [
+        "Tool returns success with created report details",
+        "Token usage report exists in database via GET /api/v1/stories/:id/token-usage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.10.2",
+      "name": "get_cost_summary tool returns formatted analytics",
+      "type": "integration",
+      "preconditions": [
+        "Project with token usage data across multiple agents"
+      ],
+      "steps": [
+        "Call mcp__loopctl__get_cost_summary with project_id and breakdown: 'agent'"
+      ],
+      "expected_results": [
+        "Returns per-agent cost breakdown with totals",
+        "Data matches what GET /api/v1/analytics/agents returns"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.10.3",
+      "name": "Existing report_story tool passes through token_usage params",
+      "type": "integration",
+      "preconditions": [
+        "Story in implementing state with assigned agent"
+      ],
+      "steps": [
+        "Call mcp__loopctl__report_story with story_id and additional token_usage params: input_tokens: 60000, output_tokens: 15000, model_name: 'claude-sonnet-4-6', cost_millicents: 525"
+      ],
+      "expected_results": [
+        "Story transitions to reported_done",
+        "Token usage report created with the provided values"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.10.4",
+      "name": "get_progress includes cost data when available",
+      "type": "integration",
+      "preconditions": [
+        "Project with completed stories that have token usage data and a budget"
+      ],
+      "steps": [
+        "Call mcp__loopctl__get_progress with project_id"
+      ],
+      "expected_results": [
+        "Response includes existing progress fields",
+        "Response also includes total_cost_millicents, budget_millicents, utilization_pct"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.10.5",
+      "name": "New tools have proper input validation",
+      "type": "unit",
+      "preconditions": [
+        "MCP server loaded"
+      ],
+      "steps": [
+        "Call mcp__loopctl__report_token_usage with missing required field (no story_id)",
+        "Call mcp__loopctl__report_token_usage with invalid input_tokens: -100"
+      ],
+      "expected_results": [
+        "Both return clear validation error messages",
+        "No API calls made for invalid input"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "MCP server is in mcp-server/index.js. All tools are defined as JSON Schema tool definitions with handler functions.",
+    "New tools follow the existing pattern: define inputSchema, implement handler that calls the loopctl REST API using the configured LOOPCTL_SERVER and auth headers.",
+    "The report_story tool already exists. Extend its inputSchema to include optional token_usage fields. Modify the handler to include them in the POST body when present.",
+    "get_progress and list_stories already exist. Their handlers need to parse and include the new cost fields from the API response.",
+    "Auth: new tools use LOOPCTL_AGENT_KEY or LOOPCTL_ORCH_KEY depending on the required role. set_token_budget requires LOOPCTL_ORCH_KEY.",
+    "README update: add a 'Token Efficiency Tools' section listing all 5 new tools with parameter tables and example JSON.",
+    "Package version: bump MINOR version in mcp-server/package.json (backward-compatible schema extension). New cost fields (total_cost_millicents, budget_millicents, utilization_pct) in existing tool responses (get_progress, list_stories) are always present but null when no token data exists. This is backward-compatible -- existing agents that don't consume these fields are unaffected.",
+    "All MCP tool changes are in mcp-server/index.js (JavaScript, not Elixir). The handlers call the loopctl REST API using configured LOOPCTL_SERVER and auth headers.",
+    "Test approach: MCP tools are tested by running the MCP server and sending tool call messages. Alternatively, test the handler functions directly."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-21.2",
+    "US-21.4"
+  ],
+  "estimated_hours": 5
+}

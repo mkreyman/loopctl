@@ -1,0 +1,203 @@
+{
+  "id": "US-21.13",
+  "title": "Token Usage Report Correction & Deletion",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "delete or correct erroneous token usage reports that were submitted by agents with incorrect data",
+    "so_that": "budgets, analytics, and anomaly detection reflect accurate cost data rather than being permanently skewed by a single misreported value"
+  },
+  "rationale": "Agents can misreport token usage -- wrong model name, inflated token counts, duplicate submissions from retries. Without a correction mechanism, a single bad report permanently skews all downstream analytics: budget utilization, agent efficiency rankings, model mix correlations, and anomaly detection. The existing system has no way to undo a report once created. This story closes that gap by providing admin-level correction capabilities while preserving the audit trail (corrections are logged, not silent).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.13.1",
+      "description": "DELETE /api/v1/token-usage/:id (role: user) soft-deletes a token usage report by setting a deleted_at timestamp (not hard delete). The report no longer appears in GET /api/v1/stories/:id/token-usage results or in any analytics aggregation. The token_usage_reports table gains a deleted_at (utc_datetime_usec, nullable) column. All queries on token_usage_reports MUST filter WHERE deleted_at IS NULL by default.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.2",
+      "description": "POST /api/v1/token-usage/:id/correction (role: user) creates a correction report that adjusts the original. The correction report has the same schema as a regular token_usage_report but includes a corrects_report_id (uuid FK) pointing to the original. The original report is NOT deleted -- both original and correction exist in the database. Analytics aggregation sums all non-deleted reports including corrections, so a correction with negative cost_millicents effectively subtracts from the total.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.3",
+      "description": "Correction reports allow negative values for input_tokens, output_tokens, and cost_millicents (representing a reduction). The sum of original + correction must be >= 0 for each field. If the correction would make any total negative, return 422 with descriptive error.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.4",
+      "description": "When a token usage report is deleted or corrected, budget warning/exceeded flags (warning_fired, exceeded_fired) on any affected budgets are reset to false if the new total spend drops below the alert threshold. This allows budget warnings to re-fire correctly after corrections.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.5",
+      "description": "Deletion and correction are recorded in the audit log with entity_type='token_usage_report', action='deleted' or action='corrected'. The audit entry includes the original report data and the actor who performed the correction.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.6",
+      "description": "Deletion and correction generate change feed entries with entity_type='token_usage_report', action='deleted' or action='corrected'.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.7",
+      "description": "Cost summaries (from CostRollupWorker) are marked as stale when a report within their period is deleted or corrected. The next rollup run recomputes affected summaries. A stale flag (boolean) is added to cost_summaries for this purpose.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.8",
+      "description": "Agent role CANNOT delete or correct token usage reports. Only user role (tenant admin) can. This prevents agents from hiding their own cost data. Returns 403 for agent and orchestrator roles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.13.9",
+      "description": "All endpoints enforce tenant isolation via RLS. A tenant admin cannot delete or correct reports from another tenant. Returns 404 (not 403) for cross-tenant access.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.13.1",
+      "name": "Soft-delete token usage report removes it from queries",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, cost_millicents: 5000}) as report",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "DELETE /api/v1/token-usage/:report_id",
+        "GET /api/v1/stories/:story_id/token-usage"
+      ],
+      "expected_results": [
+        "DELETE returns 200",
+        "GET returns empty list (report excluded by deleted_at filter)",
+        "Report still exists in database with deleted_at set",
+        "Audit log entry created with action='deleted'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.13.2",
+      "name": "Correction report adjusts totals",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, input_tokens: 100000, output_tokens: 30000, cost_millicents: 5000}) as original",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage/:original_id/correction with body {input_tokens: -50000, output_tokens: -15000, cost_millicents: -2500, model_name: 'correction'}",
+        "GET /api/v1/stories/:story_id/token-usage"
+      ],
+      "expected_results": [
+        "POST returns 201 with correction report",
+        "GET returns both original and correction reports",
+        "Totals show: total_input_tokens=50000, total_output_tokens=15000, total_cost_millicents=2500"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.13.3",
+      "name": "Correction rejected if it would make totals negative",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, cost_millicents: 5000}) as original",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage/:original_id/correction with body {cost_millicents: -6000}"
+      ],
+      "expected_results": [
+        "Returns 422 with error: correction would make total cost negative",
+        "No correction report created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.13.4",
+      "name": "Deletion resets budget warning flags when spend drops below threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id, budget_millicents: 10000, alert_threshold_pct: 80, warning_fired: true})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, cost_millicents: 9000}) as report",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "DELETE /api/v1/token-usage/:report_id"
+      ],
+      "expected_results": [
+        "Report soft-deleted",
+        "Budget warning_fired reset to false (spend now 0, below 80% threshold)",
+        "Next token report that crosses threshold will fire warning again"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.13.5",
+      "name": "Agent role cannot delete or correct reports",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id}) as report",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "DELETE /api/v1/token-usage/:report_id with agent key",
+        "POST /api/v1/token-usage/:report_id/correction with agent key"
+      ],
+      "expected_results": [
+        "Both return 403 Forbidden",
+        "Report unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.13.6",
+      "name": "Tenant isolation: cannot delete other tenant's reports",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:token_usage_report, %{tenant_id: tenant_a.id}) as report_a",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})"
+      ],
+      "steps": [
+        "DELETE /api/v1/token-usage/:report_a_id with tenant_b key"
+      ],
+      "expected_results": [
+        "Returns 404",
+        "Report unchanged"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Migration: ALTER TABLE token_usage_reports ADD COLUMN deleted_at utc_datetime_usec, ADD COLUMN corrects_report_id uuid REFERENCES token_usage_reports(id). Add partial index on (tenant_id, story_id) WHERE deleted_at IS NULL for efficient filtered queries.",
+    "Migration: ALTER TABLE cost_summaries ADD COLUMN stale boolean DEFAULT false.",
+    "All existing queries on token_usage_reports MUST be updated to include WHERE deleted_at IS NULL. Use a query scope function: defp active(query), do: where(query, [r], is_nil(r.deleted_at)).",
+    "Correction validation: query SUM(input_tokens), SUM(output_tokens), SUM(cost_millicents) for the story, add the correction values, check all sums >= 0.",
+    "Budget flag reset: after deletion/correction, recalculate spend for affected budgets. If new spend < budget * alert_threshold_pct / 100, set warning_fired=false. If new spend < budget_millicents, set exceeded_fired=false.",
+    "Schema module: Loopctl.TokenUsage.Report (same schema, extended with deleted_at and corrects_report_id).",
+    "Context functions: Loopctl.TokenUsage.delete_report/2, Loopctl.TokenUsage.create_correction/3. Both take tenant_id as first arg.",
+    "Controller: extend LoopctlWeb.TokenUsageController with delete and correct actions.",
+    "All mutations via Ecto.Multi: deletion sets deleted_at + creates audit entry + creates change feed entry + resets budget flags if needed.",
+    "Schema module MUST use `use Loopctl.Schema`.",
+    "All context functions MUST return {:ok, result} or {:error, reason} tuples.",
+    "Controller MUST use `action_fallback LoopctlWeb.FallbackController`.",
+    "Testing infrastructure: async: true, Mox in test/support/mocks.ex, fixture/2 in test/support/fixtures.ex, verify_on_exit!, stub_all_defaults/0, NEVER Application.put_env."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-21.2",
+    "US-21.7"
+  ],
+  "estimated_hours": 6
+}

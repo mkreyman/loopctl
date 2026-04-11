@@ -1,0 +1,173 @@
+{
+  "id": "US-21.7",
+  "title": "Webhook Events for Cost Alerts",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "receive webhook notifications when token budgets are exceeded or cost anomalies are detected",
+    "so_that": "my external monitoring systems (dashboards, Slack alerts, PagerDuty) are notified in real-time and I can take corrective action before costs spiral"
+  },
+  "rationale": "Budgets and anomaly detection (US-21.2, US-21.3) generate the signals. But signals sitting in a database are useless unless someone is actively polling for them. Webhooks push these signals to external systems in real-time. This closes the feedback loop: tokens are spent -> budget check fires -> webhook delivers alert -> operator or orchestrator takes action. Without push delivery, cost overruns compound silently until someone manually checks analytics.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.7.1",
+      "description": "Three new webhook event types are registered: 'token.budget_warning' (fired when spend crosses alert_threshold_pct of budget), 'token.budget_exceeded' (fired when spend exceeds 100% of budget), 'token.anomaly_detected' (fired when CostAnomalyWorker creates a new anomaly). These are added to the known event types validated in webhook subscription creation (US-10.1).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.2",
+      "description": "The token.budget_warning payload includes: budget_id, scope_type, scope_id, budget_millicents, current_spend_millicents, utilization_pct, alert_threshold_pct, triggering_report_id (the token usage report that crossed the threshold).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.3",
+      "description": "The token.budget_exceeded payload includes the same fields as budget_warning plus overage_millicents (amount over budget).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.4",
+      "description": "The token.anomaly_detected payload includes: anomaly_id, story_id, story_title, agent_id, agent_name, anomaly_type, story_cost_millicents, reference_avg_millicents, deviation_factor.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.5",
+      "description": "Budget threshold checks occur synchronously when a new token_usage_report is created. After inserting the report, the system calculates current spend vs budget and fires the appropriate webhook event if a threshold is crossed. Uses the existing webhook delivery infrastructure (Oban WebhookDeliveryWorker).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.6",
+      "description": "Budget warning events are deduplicated using a boolean flag. A warning_fired (boolean, default false) column on token_budgets tracks whether the threshold warning has been sent. When a token_usage_report is created and current spend crosses alert_threshold_pct, the warning fires ONLY if warning_fired=false, then sets warning_fired=true. Similarly, an exceeded_fired (boolean, default false) column tracks the 100% exceeded alert. Both flags are reset to false when: (1) budget_millicents is increased via PATCH, OR (2) alert_threshold_pct is changed via PATCH. This avoids the complexity of tracking spend levels and prevents re-firing on every subsequent report.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.7",
+      "description": "Anomaly webhook events are fired by the CostAnomalyWorker after creating anomaly records. Each new anomaly triggers exactly one webhook event.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.7.8",
+      "description": "All webhook events are signed with HMAC-SHA256 using the webhook subscription's signing secret, consistent with existing webhook delivery.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.7.1",
+      "name": "Budget warning webhook fires when threshold crossed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:project, %{tenant_id: tenant.id}) as project",
+        "fixture(:token_budget, %{tenant_id: tenant.id, scope_type: :project, scope_id: project.id, budget_millicents: 100000, alert_threshold_pct: 80})",
+        "Existing token_usage_reports totaling 75000 millicents",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['token.budget_warning']})",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage with cost_millicents: 10000 (total now 85000, exceeds 80% threshold)"
+      ],
+      "expected_results": [
+        "Token usage report created successfully",
+        "A webhook_event is enqueued with event_type='token.budget_warning'",
+        "Payload includes utilization_pct=85, alert_threshold_pct=80"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.2",
+      "name": "Budget exceeded webhook fires when 100% crossed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id, budget_millicents: 100000})",
+        "Existing token_usage_reports totaling 95000 millicents",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['token.budget_exceeded']})"
+      ],
+      "steps": [
+        "Create token_usage_report with cost_millicents: 10000 (total now 105000)"
+      ],
+      "expected_results": [
+        "webhook_event enqueued with event_type='token.budget_exceeded'",
+        "Payload includes overage_millicents=5000"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.3",
+      "name": "Budget warning is deduplicated -- not fired twice for same threshold",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id, budget_millicents: 100000, alert_threshold_pct: 80, fired_at_millicents: 82000})",
+        "Existing spend at 82000 (warning already fired)",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['token.budget_warning']})"
+      ],
+      "steps": [
+        "Create token_usage_report with cost_millicents: 5000 (total now 87000, still above 80% but warning already fired)"
+      ],
+      "expected_results": [
+        "No new webhook_event enqueued for budget_warning",
+        "Token usage report still created successfully"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.4",
+      "name": "Anomaly detection fires webhook",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['token.anomaly_detected']})",
+        "Setup for anomaly detection (stories with outlier cost)"
+      ],
+      "steps": [
+        "Call CostAnomalyWorker.perform/1"
+      ],
+      "expected_results": [
+        "cost_anomaly record created",
+        "webhook_event enqueued with event_type='token.anomaly_detected'",
+        "Payload includes anomaly details and story/agent context"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.7.5",
+      "name": "No webhook fired when no subscriptions match event type",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id, budget_millicents: 100000, alert_threshold_pct: 80})",
+        "fixture(:webhook, %{tenant_id: tenant.id, events: ['story.verified']}) -- subscribed to different event"
+      ],
+      "steps": [
+        "Create token_usage_report that crosses budget threshold"
+      ],
+      "expected_results": [
+        "No webhook_event enqueued (no matching subscription)",
+        "Budget threshold still tracked internally"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add 'token.budget_warning', 'token.budget_exceeded', 'token.anomaly_detected' to the known event types list in Loopctl.Webhooks (the module attribute or constant used for validation in US-10.1).",
+    "Budget check logic lives in Loopctl.TokenUsage.create_report/2 (the context function), NOT in the controller. After inserting the token_usage_report within the Ecto.Multi, add a Multi step that queries effective budgets for the story/epic/project, compares current spend, and enqueues webhook events via Loopctl.Webhooks.fire_event/3 if thresholds are crossed. The budget flag update (warning_fired/exceeded_fired) is also within the same Multi for atomicity.",
+    "Deduplication: add warning_fired (boolean, default false) and exceeded_fired (boolean, default false) to token_budgets. When threshold is crossed and flag is false, fire webhook and set flag to true. Reset both flags to false when budget_millicents or alert_threshold_pct is updated via PATCH.",
+    "Migration: ALTER TABLE token_budgets ADD COLUMN warning_fired boolean DEFAULT false, ADD COLUMN exceeded_fired boolean DEFAULT false.",
+    "CostAnomalyWorker integration: after inserting each anomaly record, call Loopctl.Webhooks.fire_event(tenant_id, 'token.anomaly_detected', payload).",
+    "All webhook events use the existing delivery infrastructure: WebhookDeliveryWorker, HMAC signing, retry logic, consecutive_failures tracking.",
+    "Budget check should be efficient: single query with SUM() on token_usage_reports filtered by scope. Avoid N+1 by checking all applicable budgets in one query."
+  ],
+  "dependencies": [
+    "US-21.2",
+    "US-21.3",
+    "US-10.1"
+  ],
+  "estimated_hours": 5
+}

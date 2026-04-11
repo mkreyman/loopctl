@@ -1,0 +1,193 @@
+{
+  "id": "US-21.14",
+  "title": "Token Data Retention & Archival",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "low",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "configure a retention period for token usage data and have old reports automatically archived",
+    "so_that": "the database does not grow unbounded as my projects scale, query performance remains fast, and storage costs stay predictable"
+  },
+  "rationale": "Token usage reports grow linearly with agent activity. A tenant running 50 agents across 10 projects will generate thousands of reports per day. Without retention policies, the token_usage_reports table will bloat, degrading aggregation query performance and increasing storage costs. loopctl already has audit_log with 90-day retention and partitioning. Token data should follow the same pattern. Cost summaries (pre-computed rollups) provide the long-term analytics view, so raw reports can be archived after their utility window closes.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.14.1",
+      "description": "The tenants table gains a token_data_retention_days column (integer, nullable, default 365). When set, token_usage_reports older than this many days are eligible for archival. NULL means unlimited retention.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.2",
+      "description": "A Loopctl.Workers.TokenDataArchivalWorker Oban worker runs weekly via Oban.Cron (e.g., '0 3 * * 0' for 3 AM UTC Sunday). For each tenant with a retention policy, it soft-deletes token_usage_reports where inserted_at < NOW() - retention_days by setting deleted_at = NOW(). Uses batch processing (1000 records per batch) to avoid long-running transactions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.3",
+      "description": "A separate hard-delete pass runs 30 days after soft-delete: token_usage_reports where deleted_at < NOW() - 30 days are permanently removed. This gives administrators a 30-day recovery window.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.4",
+      "description": "Cost summaries (cost_summaries table) are NOT subject to retention — they are the long-term analytics record. Even after raw reports are archived, the pre-computed rollups remain queryable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.5",
+      "description": "Cost anomalies older than the retention period are marked as archived (archived boolean, default false) rather than deleted, preserving the audit trail. Archived anomalies are excluded from default list queries but available via ?include_archived=true filter.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.6",
+      "description": "GET /api/v1/tenants/:id (role: user) returns token_data_retention_days in the response. PATCH /api/v1/tenants/:id (role: user) allows updating token_data_retention_days. Minimum value is 30 days (to prevent accidental immediate deletion). NULL disables retention.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.7",
+      "description": "The archival worker logs the number of records archived per tenant per run to the audit log. Each archival run creates one audit entry per tenant with action='token_data_archived', including count of archived records.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.8",
+      "description": "The archival worker uses config-based DI. A Loopctl.TokenUsage.ArchivalBehaviour defines the callback. The Oban worker resolves the implementation via @archival_service Application.compile_env(:loopctl, :token_archival, Loopctl.TokenUsage.DefaultArchival). config/test.exs maps to Loopctl.MockTokenArchival.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.14.9",
+      "description": "The archival worker is tenant-scoped: it only archives records for tenants that have a retention policy set. It does NOT use AdminRepo (BYPASSRLS). It processes each tenant by setting the RLS context and running queries within that scope.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.14.1",
+      "name": "Archival worker soft-deletes reports older than retention period",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{token_data_retention_days: 90}) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, inserted_at: ~U[2025-12-01 00:00:00Z]}) as old_report",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, inserted_at: ~U[2026-03-15 00:00:00Z]}) as recent_report"
+      ],
+      "steps": [
+        "Call TokenDataArchivalWorker.perform(%Oban.Job{args: %{}}) with current date 2026-04-03"
+      ],
+      "expected_results": [
+        "old_report has deleted_at set (older than 90 days)",
+        "recent_report has deleted_at=nil (within retention)",
+        "Audit log entry created with count=1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.14.2",
+      "name": "Hard-delete removes records 30 days after soft-delete",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{token_data_retention_days: 90}) as tenant",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, deleted_at: ~U[2026-02-01 00:00:00Z]}) as archived_report"
+      ],
+      "steps": [
+        "Call TokenDataArchivalWorker hard_delete pass with current date 2026-04-03"
+      ],
+      "expected_results": [
+        "archived_report is permanently removed from database (30+ days since soft-delete)",
+        "No trace in token_usage_reports table"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.14.3",
+      "name": "Cost summaries are preserved after archival",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{token_data_retention_days: 90}) as tenant",
+        "fixture(:cost_summary, %{tenant_id: tenant.id, period_start: ~D[2025-12-01]})",
+        "fixture(:token_usage_report, %{tenant_id: tenant.id, inserted_at: ~U[2025-12-01 00:00:00Z]})"
+      ],
+      "steps": [
+        "Run archival worker",
+        "Query cost_summaries for the archived period"
+      ],
+      "expected_results": [
+        "Token usage report is soft-deleted",
+        "Cost summary for that period is still queryable",
+        "Analytics endpoints still return data for the archived period via cost_summaries"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.14.4",
+      "name": "Tenants without retention policy are skipped",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{token_data_retention_days: nil}) as tenant_no_policy",
+        "fixture(:tenant, %{token_data_retention_days: 30}) as tenant_with_policy",
+        "Old token_usage_reports for both tenants"
+      ],
+      "steps": [
+        "Run archival worker"
+      ],
+      "expected_results": [
+        "tenant_no_policy reports are untouched",
+        "tenant_with_policy old reports are soft-deleted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.14.5",
+      "name": "Minimum retention of 30 days enforced",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "{_raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})"
+      ],
+      "steps": [
+        "PATCH /api/v1/tenants/:id with body {token_data_retention_days: 7}"
+      ],
+      "expected_results": [
+        "Returns 422 with error: minimum retention is 30 days"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.14.6",
+      "name": "Tenant isolation: archival only processes own tenant's data",
+      "type": "unit",
+      "preconditions": [
+        "fixture(:tenant, %{token_data_retention_days: 30}) as tenant_a",
+        "fixture(:tenant, %{token_data_retention_days: nil}) as tenant_b",
+        "Old token_usage_reports for both tenants"
+      ],
+      "steps": [
+        "Run archival worker"
+      ],
+      "expected_results": [
+        "Only tenant_a's old reports are archived",
+        "tenant_b's reports are untouched (no retention policy)",
+        "No cross-tenant data access"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Migration: ALTER TABLE tenants ADD COLUMN token_data_retention_days integer. ALTER TABLE cost_anomalies ADD COLUMN archived boolean DEFAULT false.",
+    "Oban worker: Loopctl.Workers.TokenDataArchivalWorker with queue :maintenance, max_attempts 3. Cron: '0 3 * * 0' (weekly Sunday 3 AM UTC).",
+    "Batch processing: UPDATE token_usage_reports SET deleted_at = NOW() WHERE tenant_id = ? AND inserted_at < ? AND deleted_at IS NULL LIMIT 1000. Loop until 0 rows affected.",
+    "Hard-delete: DELETE FROM token_usage_reports WHERE deleted_at < NOW() - INTERVAL '30 days' LIMIT 1000. Separate pass after soft-delete.",
+    "Config-based DI: @archival_service Application.compile_env(:loopctl, :token_archival, Loopctl.TokenUsage.DefaultArchival). Mock in test/support/mocks.ex: Mox.defmock(Loopctl.MockTokenArchival, for: Loopctl.TokenUsage.ArchivalBehaviour).",
+    "Cost summaries are explicitly excluded from retention. They are the compressed long-term record.",
+    "The archival worker does NOT use AdminRepo. It sets RLS context per tenant and runs queries within that scope, same as all other tenant-scoped operations.",
+    "Schema module MUST use `use Loopctl.Schema`.",
+    "All context functions MUST return {:ok, result} or {:error, reason} tuples.",
+    "Testing: Oban workers tested by calling perform(%Oban.Job{args: %{}}) directly. All tests async: true with Mox.set_mox_from_context.",
+    "NEVER Application.put_env in tests. All service swapping via config/test.exs."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-21.3",
+    "US-21.13"
+  ],
+  "estimated_hours": 5
+}

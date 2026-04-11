@@ -20,6 +20,9 @@ deploy/certs/
 # MCP server
 mcp-server/node_modules/
 
+# MCP client config (contains live API keys — use .mcp.json.example as template)
+.mcp.json
+
 # Generated assets (built by esbuild/tailwind)
 /priv/static/assets/
 /priv/static/cache_manifest.json
