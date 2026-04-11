@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 41 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 42 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (41)
+## Tools (42)
 
 ### Project Tools
 
@@ -75,6 +75,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `get_tenant` | Get current tenant info. Use to verify connectivity. |
 | `list_projects` | List all projects in the current tenant. |
 | `create_project` | Create a new project in the current tenant. |
+| `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
 | `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). |
 
@@ -130,10 +131,10 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 | Tool | Description |
 |---|---|
-| `knowledge_index` | Load the knowledge wiki catalog at session start. Returns lightweight article metadata grouped by category. |
-| `knowledge_search` | Search the knowledge wiki by topic. Supports keyword, semantic, or combined search modes. Returns snippets. |
-| `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. |
-| `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. |
+| `knowledge_index` | Load the knowledge wiki catalog at session start. Returns lightweight article metadata grouped by category. Optional: `project_id`, `story_id`. |
+| `knowledge_search` | Search the knowledge wiki by topic. Supports keyword, semantic, or combined search modes. Returns snippets. Optional: `project_id`, `story_id` for attribution. |
+| `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |
+| `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. |
 
 ### Knowledge Management Tools (orchestrator key)
@@ -155,7 +156,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 |---|---|
 | `knowledge_analytics_top` | Top accessed knowledge articles for the tenant. Optional: `limit` (default 20, max 100), `since_days` (default 7), `access_type` (`search`, `get`, `context`, `index`). |
 | `knowledge_article_stats` | Per-article usage stats: total accesses, unique agents, by-type breakdown, recent events. Required: `article_id`. |
-| `knowledge_agent_usage` | Per-agent (api_key) knowledge usage: total reads, unique articles, top read articles. Required: `agent_id`. Optional: `limit`, `since_days`. |
+| `knowledge_agent_usage` | Per-agent knowledge usage: total reads, unique articles, top read articles. Required: exactly one of `api_key_id` (credential) or `agent_id` (logical identity). Optional: `limit`, `since_days`. See Wiki Attribution section. |
 | `knowledge_unused_articles` | Published articles with zero accesses in the window. Optional: `days_unused` (default 30), `limit` (default 50, max 200). |
 
 ### Discovery Tools
@@ -163,6 +164,102 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | Tool | Description |
 |---|---|
 | `list_routes` | List all available API routes on the loopctl server. |
+
+## Wiki Attribution
+
+### Passing context parameters on wiki reads
+
+Four wiki read tools (`knowledge_search`, `knowledge_get`, `knowledge_context`, `knowledge_index`) accept two optional attribution parameters:
+
+| Parameter | Description |
+|---|---|
+| `project_id` | UUID of the loopctl project the agent is working on |
+| `story_id` | UUID of the loopctl story the agent is currently implementing |
+
+Passing these parameters lets loopctl record which project and story triggered each wiki read. The analytics endpoints (`knowledge_analytics_top`, `knowledge_agent_usage`, etc.) can then slice usage by project, showing which knowledge articles are most valuable per project.
+
+The server silently drops attribution params that belong to a different tenant or are malformed UUIDs — you will not receive an error for invalid values.
+
+**Always pass `story_id` when you are working on a loopctl story.** This is the primary mechanism by which wiki reads are attributed to development work.
+
+#### Example: typical implementation agent workflow
+
+Step 1 — fetch the story to pick up its UUID and context:
+
+```json
+{
+  "tool": "get_story",
+  "arguments": { "story_id": "89aa0c48-5cf5-4925-b164-21684ef79c4d" }
+}
+```
+
+Step 2 — call `knowledge_search`, passing `story_id` so the read is attributed:
+
+```json
+{
+  "tool": "knowledge_search",
+  "arguments": {
+    "q": "csv import bulk validation",
+    "project_id": "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+    "story_id": "89aa0c48-5cf5-4925-b164-21684ef79c4d"
+  }
+}
+```
+
+Step 3 — call `knowledge_get`, reusing the same `story_id`:
+
+```json
+{
+  "tool": "knowledge_get",
+  "arguments": {
+    "article_id": "c3d2e1f0-1234-5678-abcd-ef0123456789",
+    "project_id": "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+    "story_id": "89aa0c48-5cf5-4925-b164-21684ef79c4d"
+  }
+}
+```
+
+### `knowledge_agent_usage`: api_key_id vs agent_id
+
+The `knowledge_agent_usage` tool accepts **exactly one** of two identifier parameters:
+
+| Parameter | Meaning | When to use |
+|---|---|---|
+| `api_key_id` | The `api_keys.id` credential UUID — the raw API key identity | You have the credential ID from `GET /api/v1/api_keys` or a loopctl admin page |
+| `agent_id` | The `agents.id` logical identity UUID — the agent registry entry | You have the agent registry ID from `GET /api/v1/agents` or a story's `assigned_agent_id` |
+
+The server's analytics endpoint performs dual-resolution: it tries both interpretations automatically. However, using the explicit parameter makes your intent clear and avoids ambiguity in the response's `resolved_as` field.
+
+Passing both parameters returns a validation error. Passing neither also returns a validation error.
+
+```json
+// Query by credential (api_key_id)
+{
+  "tool": "knowledge_agent_usage",
+  "arguments": {
+    "api_key_id": "b977c90c-061b-4e42-8afa-26a5efde51ad",
+    "since_days": 7
+  }
+}
+
+// Query by logical agent identity (agent_id)
+{
+  "tool": "knowledge_agent_usage",
+  "arguments": {
+    "agent_id": "09429bc4-328f-42f4-acec-db48b40849b2",
+    "since_days": 30
+  }
+}
+```
+
+#### Deprecated: old `agent_id` behavior
+
+In versions before 1.2.0, `knowledge_agent_usage` accepted a single `agent_id` parameter that actually meant the `api_keys.id` credential (not the logical agent). This was confusing and caused silent zero-result responses when callers passed a logical `agents.id` value.
+
+Starting with 1.2.0:
+- `agent_id` means the **logical** `agents.id` (the agent registry entry).
+- `api_key_id` means the **credential** `api_keys.id` (the raw API key).
+- The old behavior (passing `agent_id` meaning credential) is Deprecated and will be removed in a future release. When you call with `agent_id` alone, the response includes a `_meta.deprecation_hint` nudging you toward explicit parameters.
 
 ## Chain-of-Custody Enforcement
 
