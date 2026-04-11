@@ -2815,7 +2815,14 @@ defmodule Loopctl.Knowledge do
   @doc """
   Records a fire-and-forget article access event.
 
-  See `Loopctl.Knowledge.Analytics.record_access/5` for full semantics.
+  This 5-arity facade exists for backward compatibility; it delegates to
+  `Loopctl.Knowledge.Analytics.record_access/6` with an empty attribution
+  context. Callers that need to attribute the access to a project or story
+  should call the Knowledge APIs (e.g. `get_article/3`, `search_keyword/3`)
+  with `:project_id`/`:story_id` opts, or call
+  `Loopctl.Knowledge.Analytics.record_access/6` directly.
+
+  See `Loopctl.Knowledge.Analytics.record_access/6` for full semantics.
   """
   @spec record_access(
           Ecto.UUID.t(),

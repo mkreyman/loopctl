@@ -495,8 +495,13 @@ defmodule Loopctl.Knowledge.Analytics do
     end
   rescue
     error ->
-      Logger.debug(
-        "Knowledge.Analytics record failed (silently ignored): " <>
+      # Broad rescue so analytics failures never propagate to the read
+      # caller. Logged at :warning so operators can see dropped events in
+      # production; callers still see :ok. Malformed UUIDs in the
+      # attribution context are caught earlier in validate_project/2 and
+      # validate_story/2 and never reach this rescue.
+      Logger.warning(
+        "Knowledge.Analytics record failed (event dropped): " <>
           Exception.message(error)
       )
 
@@ -551,17 +556,33 @@ defmodule Loopctl.Knowledge.Analytics do
   #
   # - `{:ok, nil}` when no id was provided
   # - `{:ok, uuid}` when the id belongs to the tenant
-  # - `:drop` when the id is cross-tenant or malformed (logs a warning)
+  # - `:drop` when the id is malformed, cross-tenant, or non-binary (logs a warning)
+  #
+  # Malformed (non-UUID) binaries are rejected by `Ecto.UUID.cast/1` before
+  # the DB query so the underlying `get_project/2` never raises
+  # `Ecto.Query.CastError`. This is critical because the enclosing
+  # `do_record_sync/5` uses a broad rescue that would otherwise swallow the
+  # entire event row insertion.
   defp validate_project(_tenant_id, nil), do: {:ok, nil}
 
   defp validate_project(tenant_id, project_id) when is_binary(project_id) do
-    case Projects.get_project(tenant_id, project_id) do
-      {:ok, _project} ->
-        {:ok, project_id}
+    case Ecto.UUID.cast(project_id) do
+      {:ok, cast_id} ->
+        case Projects.get_project(tenant_id, cast_id) do
+          {:ok, _project} ->
+            {:ok, cast_id}
 
-      {:error, :not_found} ->
+          {:error, :not_found} ->
+            Logger.warning(
+              "cross-tenant project_id dropped tenant_id=#{tenant_id} project_id=#{cast_id}"
+            )
+
+            :drop
+        end
+
+      :error ->
         Logger.warning(
-          "cross-tenant project_id dropped tenant_id=#{tenant_id} project_id=#{project_id}"
+          "invalid project_id dropped tenant_id=#{tenant_id} project_id=#{inspect(project_id)}"
         )
 
         :drop
@@ -582,17 +603,30 @@ defmodule Loopctl.Knowledge.Analytics do
   #
   # - `{:ok, nil}` when no id was provided
   # - `{:ok, %{id: uuid, project_id: uuid | nil}}` on success
-  # - `:drop` when cross-tenant or malformed (logs a warning)
+  # - `:drop` when cross-tenant, malformed, or non-binary (logs a warning)
+  #
+  # Same malformed-UUID guarding as `validate_project/2` — `Ecto.UUID.cast/1`
+  # shields `Stories.get_story/2` from `Ecto.Query.CastError`.
   defp validate_story(_tenant_id, nil), do: {:ok, nil}
 
   defp validate_story(tenant_id, story_id) when is_binary(story_id) do
-    case Stories.get_story(tenant_id, story_id) do
-      {:ok, story} ->
-        {:ok, %{id: story.id, project_id: story.project_id}}
+    case Ecto.UUID.cast(story_id) do
+      {:ok, cast_id} ->
+        case Stories.get_story(tenant_id, cast_id) do
+          {:ok, story} ->
+            {:ok, %{id: story.id, project_id: story.project_id}}
 
-      {:error, :not_found} ->
+          {:error, :not_found} ->
+            Logger.warning(
+              "cross-tenant story_id dropped tenant_id=#{tenant_id} story_id=#{cast_id}"
+            )
+
+            :drop
+        end
+
+      :error ->
         Logger.warning(
-          "cross-tenant story_id dropped tenant_id=#{tenant_id} story_id=#{story_id}"
+          "invalid story_id dropped tenant_id=#{tenant_id} story_id=#{inspect(story_id)}"
         )
 
         :drop

@@ -155,6 +155,63 @@ defmodule Loopctl.Knowledge.AttributionTest do
       assert is_nil(event.story_id)
       assert event.metadata == %{"src" => "api"}
     end
+
+    # Regression: a malformed (non-UUID) project_id must not raise
+    # Ecto.Query.CastError inside the validation path. Before the review
+    # fix, passing a bogus string propagated CastError up to the outer
+    # rescue in do_record_sync and the entire event insertion was
+    # silently dropped. Now the UUID is validated with Ecto.UUID.cast/1
+    # before hitting the DB, the attribution is dropped, and the event
+    # row is still recorded with NULL attribution.
+    test "malformed project_id does not swallow the event row" do
+      {tenant, api_key} = setup_tenant_with_agent()
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      log =
+        capture_log(fn ->
+          :ok =
+            Analytics.record_access(
+              tenant.id,
+              article.id,
+              api_key.id,
+              "get",
+              %{},
+              %{project_id: "not-a-uuid"}
+            )
+        end)
+
+      assert log =~ "invalid project_id dropped"
+
+      [event] = AdminRepo.all(ArticleAccessEvent)
+      assert event.tenant_id == tenant.id
+      assert event.article_id == article.id
+      assert is_nil(event.project_id)
+      assert is_nil(event.story_id)
+    end
+
+    test "malformed story_id does not swallow the event row" do
+      {tenant, api_key} = setup_tenant_with_agent()
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      log =
+        capture_log(fn ->
+          :ok =
+            Analytics.record_access(
+              tenant.id,
+              article.id,
+              api_key.id,
+              "get",
+              %{},
+              %{story_id: "also-not-a-uuid"}
+            )
+        end)
+
+      assert log =~ "invalid story_id dropped"
+
+      [event] = AdminRepo.all(ArticleAccessEvent)
+      assert is_nil(event.project_id)
+      assert is_nil(event.story_id)
+    end
   end
 
   # -----------------------------------------------------------------------
