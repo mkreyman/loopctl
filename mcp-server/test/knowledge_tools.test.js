@@ -125,6 +125,8 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
   const normalizedApiKeyId =
     typeof api_key_id === "string" && api_key_id.trim() === "" ? null : api_key_id;
@@ -145,6 +147,15 @@ async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } =
   }
 
   const resolvedId = normalizedApiKeyId ?? normalizedAgentId;
+
+  if (typeof resolvedId !== "string" || !UUID_RE.test(resolvedId)) {
+    const which = normalizedApiKeyId != null ? "api_key_id" : "agent_id";
+    return {
+      content: [{ type: "text", text: `Error: ${which} must be a canonical UUID (8-4-4-4-12 hex).` }],
+      isError: true,
+    };
+  }
+
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (since_days != null) params.set("since_days", String(since_days));
@@ -425,6 +436,61 @@ describe("TC-25.3.7b: empty-string api_key_id/agent_id are rejected as missing",
 
     assert.equal(calls.length, 0, "no HTTP request when both are empty strings");
     assert.equal(result.isError, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-25.3.7c: knowledge_agent_usage rejects non-UUID resolvedId values
+// (defense-in-depth against URL path injection)
+// ---------------------------------------------------------------------------
+
+describe("TC-25.3.7c: non-UUID ids are rejected before a network call is made", () => {
+  test("path-traversal-style api_key_id is rejected client-side", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({
+      api_key_id: "../../../stories/123",
+    });
+
+    assert.equal(calls.length, 0, "no HTTP request should be made for non-UUID id");
+    assert.equal(result.isError, true);
+    assert.ok(
+      result.content[0].text.includes("canonical UUID"),
+      "error should mention the UUID constraint"
+    );
+  });
+
+  test("hex-but-wrong-shape agent_id is rejected", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({ agent_id: "deadbeef" });
+
+    assert.equal(calls.length, 0, "no HTTP request for malformed id");
+    assert.equal(result.isError, true);
+  });
+
+  test("numeric id is rejected", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({ api_key_id: 42 });
+
+    assert.equal(calls.length, 0);
+    assert.equal(result.isError, true);
+  });
+
+  test("valid canonical UUID passes the check", async () => {
+    setupEnv();
+    const calls = mockFetch({ reads: 1, articles: [] });
+
+    const result = await knowledgeAgentUsage({
+      api_key_id: "b977c90c-061b-4e42-8afa-26a5efde51ad",
+    });
+
+    assert.equal(calls.length, 1, "HTTP request should proceed for valid UUID");
+    assert.equal(result.isError, undefined);
   });
 });
 

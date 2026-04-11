@@ -184,14 +184,18 @@ The server silently drops attribution params that belong to a different tenant o
 
 #### Example: typical implementation agent workflow
 
+Step 1 — fetch the story to pick up its UUID and context:
+
 ```json
-// Step 1: get_story to retrieve current story context
 {
   "tool": "get_story",
   "arguments": { "story_id": "89aa0c48-5cf5-4925-b164-21684ef79c4d" }
 }
+```
 
-// Step 2: knowledge_search — pass story_id so the read is attributed
+Step 2 — call `knowledge_search`, passing `story_id` so the read is attributed:
+
+```json
 {
   "tool": "knowledge_search",
   "arguments": {
@@ -200,8 +204,11 @@ The server silently drops attribution params that belong to a different tenant o
     "story_id": "89aa0c48-5cf5-4925-b164-21684ef79c4d"
   }
 }
+```
 
-// Step 3: knowledge_get — pass story_id again for the full article read
+Step 3 — call `knowledge_get`, reusing the same `story_id`:
+
+```json
 {
   "tool": "knowledge_get",
   "arguments": {

@@ -575,6 +575,10 @@ async function knowledgeArticleStats({ article_id }) {
   return toContent(result);
 }
 
+// Canonical 8-4-4-4-12 UUID shape. Used to reject path-injection attempts
+// in tools that interpolate user-supplied IDs into URL path segments.
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
   // Normalize: treat empty strings / whitespace-only strings as missing so the
   // validation below catches them. Otherwise an empty string would slip past
@@ -599,6 +603,20 @@ async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } =
   }
 
   const resolvedId = normalizedApiKeyId ?? normalizedAgentId;
+
+  // Defense-in-depth: the MCP SDK declares `format: "uuid"` on these schemas
+  // but does not enforce it for tool arguments. Because `resolvedId` is
+  // interpolated directly into a URL path segment, a value containing `/`
+  // or `..` would let `fetch()` normalize the request to a different
+  // endpoint. Reject anything that isn't a canonical UUID before we touch
+  // the network.
+  if (typeof resolvedId !== "string" || !UUID_RE.test(resolvedId)) {
+    const which = normalizedApiKeyId != null ? "api_key_id" : "agent_id";
+    return {
+      content: [{ type: "text", text: `Error: ${which} must be a canonical UUID (8-4-4-4-12 hex).` }],
+      isError: true,
+    };
+  }
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (since_days != null) params.set("since_days", String(since_days));
