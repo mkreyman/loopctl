@@ -315,6 +315,31 @@ defmodule Loopctl.Knowledge.AttributionTest do
       assert is_nil(event.project_id)
       assert is_nil(event.story_id)
     end
+
+    # Regression: cross-tenant warnings must include the caller's
+    # api_key_id so operators can trace a misbehaving agent. Prior to
+    # the adversarial review fix, only tenant_id and project_id/story_id
+    # appeared in the log line, making it impossible to tell which
+    # caller was sending bad attribution.
+    test "cross-tenant warning log includes api_key_id of the caller" do
+      {tenant_a, api_key_a} = setup_tenant_with_agent()
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      article = fixture(:article, %{tenant_id: tenant_a.id, status: :published})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _article} =
+                   Knowledge.get_article(tenant_a.id, article.id,
+                     api_key_id: api_key_a.id,
+                     project_id: project_b.id
+                   )
+        end)
+
+      assert log =~ "cross-tenant project_id dropped"
+      assert log =~ "api_key_id="
+      assert log =~ api_key_a.id
+    end
   end
 
   # -----------------------------------------------------------------------

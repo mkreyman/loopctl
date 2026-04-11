@@ -469,9 +469,11 @@ defmodule Loopctl.Knowledge.Analytics do
   #
   # Attribution (`project_id` / `story_id`) is validated here, inside the
   # async task, so validation failures never reach the caller's code path.
-  # Cross-tenant values are silently dropped with a :warning log.
+  # Cross-tenant values are silently dropped with a :warning log that
+  # includes the caller's `api_key_id` so operators can trace which agent
+  # is sending bad attribution.
   def do_record_sync(items, tenant_id, api_key_id, access_type, context \\ %{}) do
-    {project_id, story_id} = resolve_attribution(tenant_id, context)
+    {project_id, story_id} = resolve_attribution(tenant_id, api_key_id, context)
     now = DateTime.utc_now()
 
     rows =
@@ -517,15 +519,19 @@ defmodule Loopctl.Knowledge.Analytics do
   # either may be `nil` when the caller did not supply it or when the
   # supplied id belonged to another tenant.
   #
+  # `api_key_id` is threaded through only so warning logs can identify
+  # the caller when attribution is dropped (it is never used for
+  # authorization here — that already happened upstream).
+  #
   # When only `story_id` is provided and it validates, `project_id` is
   # derived from the story's own `project_id`.
-  defp resolve_attribution(tenant_id, context) do
+  defp resolve_attribution(tenant_id, api_key_id, context) do
     context = ensure_map(context)
     raw_project_id = Map.get(context, :project_id) || Map.get(context, "project_id")
     raw_story_id = Map.get(context, :story_id) || Map.get(context, "story_id")
 
-    validated_story = validate_story(tenant_id, raw_story_id)
-    validated_project = resolve_project(tenant_id, raw_project_id, validated_story)
+    validated_story = validate_story(tenant_id, api_key_id, raw_story_id)
+    validated_project = resolve_project(tenant_id, api_key_id, raw_project_id, validated_story)
 
     {unwrap_project(validated_project), unwrap_story(validated_story)}
   end
@@ -533,16 +539,16 @@ defmodule Loopctl.Knowledge.Analytics do
   # Resolves the project attribution. When the caller supplied an explicit
   # `project_id`, validate it. Otherwise, derive it from the validated story
   # (the common orchestrator case — "I'm working on story X").
-  defp resolve_project(tenant_id, raw_project_id, _validated_story)
+  defp resolve_project(tenant_id, api_key_id, raw_project_id, _validated_story)
        when not is_nil(raw_project_id) do
-    validate_project(tenant_id, raw_project_id)
+    validate_project(tenant_id, api_key_id, raw_project_id)
   end
 
-  defp resolve_project(_tenant_id, _raw_project_id, {:ok, %{project_id: derived}}) do
+  defp resolve_project(_tenant_id, _api_key_id, _raw_project_id, {:ok, %{project_id: derived}}) do
     {:ok, derived}
   end
 
-  defp resolve_project(_tenant_id, _raw_project_id, _validated_story), do: {:ok, nil}
+  defp resolve_project(_tenant_id, _api_key_id, _raw_project_id, _validated_story), do: {:ok, nil}
 
   defp unwrap_project({:ok, id}), do: id
   defp unwrap_project(:drop), do: nil
@@ -563,9 +569,12 @@ defmodule Loopctl.Knowledge.Analytics do
   # `Ecto.Query.CastError`. This is critical because the enclosing
   # `do_record_sync/5` uses a broad rescue that would otherwise swallow the
   # entire event row insertion.
-  defp validate_project(_tenant_id, nil), do: {:ok, nil}
+  #
+  # `api_key_id` is included in the warning log so operators can trace
+  # which caller is sending bad attribution.
+  defp validate_project(_tenant_id, _api_key_id, nil), do: {:ok, nil}
 
-  defp validate_project(tenant_id, project_id) when is_binary(project_id) do
+  defp validate_project(tenant_id, api_key_id, project_id) when is_binary(project_id) do
     case Ecto.UUID.cast(project_id) do
       {:ok, cast_id} ->
         case Projects.get_project(tenant_id, cast_id) do
@@ -574,7 +583,10 @@ defmodule Loopctl.Knowledge.Analytics do
 
           {:error, :not_found} ->
             Logger.warning(
-              "cross-tenant project_id dropped tenant_id=#{tenant_id} project_id=#{cast_id}"
+              "cross-tenant project_id dropped" <>
+                " tenant_id=#{tenant_id}" <>
+                " api_key_id=#{inspect(api_key_id)}" <>
+                " project_id=#{cast_id}"
             )
 
             :drop
@@ -582,16 +594,22 @@ defmodule Loopctl.Knowledge.Analytics do
 
       :error ->
         Logger.warning(
-          "invalid project_id dropped tenant_id=#{tenant_id} project_id=#{inspect(project_id)}"
+          "invalid project_id dropped" <>
+            " tenant_id=#{tenant_id}" <>
+            " api_key_id=#{inspect(api_key_id)}" <>
+            " project_id=#{inspect(project_id)}"
         )
 
         :drop
     end
   end
 
-  defp validate_project(tenant_id, project_id) do
+  defp validate_project(tenant_id, api_key_id, project_id) do
     Logger.warning(
-      "invalid project_id dropped tenant_id=#{tenant_id} project_id=#{inspect(project_id)}"
+      "invalid project_id dropped" <>
+        " tenant_id=#{tenant_id}" <>
+        " api_key_id=#{inspect(api_key_id)}" <>
+        " project_id=#{inspect(project_id)}"
     )
 
     :drop
@@ -605,11 +623,14 @@ defmodule Loopctl.Knowledge.Analytics do
   # - `{:ok, %{id: uuid, project_id: uuid | nil}}` on success
   # - `:drop` when cross-tenant, malformed, or non-binary (logs a warning)
   #
-  # Same malformed-UUID guarding as `validate_project/2` — `Ecto.UUID.cast/1`
+  # Same malformed-UUID guarding as `validate_project/3` — `Ecto.UUID.cast/1`
   # shields `Stories.get_story/2` from `Ecto.Query.CastError`.
-  defp validate_story(_tenant_id, nil), do: {:ok, nil}
+  #
+  # `api_key_id` is included in the warning log so operators can trace
+  # which caller is sending bad attribution.
+  defp validate_story(_tenant_id, _api_key_id, nil), do: {:ok, nil}
 
-  defp validate_story(tenant_id, story_id) when is_binary(story_id) do
+  defp validate_story(tenant_id, api_key_id, story_id) when is_binary(story_id) do
     case Ecto.UUID.cast(story_id) do
       {:ok, cast_id} ->
         case Stories.get_story(tenant_id, cast_id) do
@@ -618,7 +639,10 @@ defmodule Loopctl.Knowledge.Analytics do
 
           {:error, :not_found} ->
             Logger.warning(
-              "cross-tenant story_id dropped tenant_id=#{tenant_id} story_id=#{cast_id}"
+              "cross-tenant story_id dropped" <>
+                " tenant_id=#{tenant_id}" <>
+                " api_key_id=#{inspect(api_key_id)}" <>
+                " story_id=#{cast_id}"
             )
 
             :drop
@@ -626,16 +650,22 @@ defmodule Loopctl.Knowledge.Analytics do
 
       :error ->
         Logger.warning(
-          "invalid story_id dropped tenant_id=#{tenant_id} story_id=#{inspect(story_id)}"
+          "invalid story_id dropped" <>
+            " tenant_id=#{tenant_id}" <>
+            " api_key_id=#{inspect(api_key_id)}" <>
+            " story_id=#{inspect(story_id)}"
         )
 
         :drop
     end
   end
 
-  defp validate_story(tenant_id, story_id) do
+  defp validate_story(tenant_id, api_key_id, story_id) do
     Logger.warning(
-      "invalid story_id dropped tenant_id=#{tenant_id} story_id=#{inspect(story_id)}"
+      "invalid story_id dropped" <>
+        " tenant_id=#{tenant_id}" <>
+        " api_key_id=#{inspect(api_key_id)}" <>
+        " story_id=#{inspect(story_id)}"
     )
 
     :drop
