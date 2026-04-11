@@ -1,0 +1,176 @@
+{
+  "id": "US-21.9",
+  "title": "CLI Token Commands",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "human developer or orchestrator script",
+    "i_want_to": "query token cost data from the command line using loopctl cost-summary and loopctl token-report commands",
+    "so_that": "I can check project cost health, agent efficiency, and budget utilization without opening a browser or writing API calls"
+  },
+  "rationale": "The CLI is loopctl's primary interface for human developers and shell scripts. Token analytics endpoints (US-21.4) provide the data, but accessing them requires crafting HTTP requests with auth headers. CLI commands make token data accessible in the same workflow where developers already use loopctl status, loopctl claim, etc. This is especially important for orchestrator scripts that need to make cost-aware decisions in automated pipelines.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.9.1",
+      "description": "loopctl cost-summary --project <name|id> displays a project cost overview: total cost (formatted as dollars), total tokens (formatted with K/M suffixes), budget utilization (if budget set), top 3 agents by cost, model mix breakdown. Output is a formatted table by default, --format json for machine-readable output.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.2",
+      "description": "loopctl cost-summary --project <name|id> --by-epic breaks down cost per epic: epic name, story count, total cost, avg cost per story, budget utilization. Sorted by total cost descending.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.3",
+      "description": "loopctl cost-summary --project <name|id> --by-agent breaks down cost per agent: agent name, stories completed, total cost, avg cost per story, efficiency rank, primary model.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.4",
+      "description": "loopctl token-report --story <id> displays detailed token usage for a specific story: list of all token reports with timestamp, model, input/output tokens, cost, phase. Includes totals at the bottom.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.5",
+      "description": "loopctl anomalies --project <name|id> lists unresolved cost anomalies: story title, anomaly type, deviation factor, cost vs average. --include-resolved shows all anomalies.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.6",
+      "description": "loopctl status --project <name|id> is extended with a cost summary line when token data exists: 'Cost: $X.XX / $Y.YY budget (Z% utilized)' or 'Cost: $X.XX (no budget set)'. This appears alongside existing progress stats.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.7",
+      "description": "All CLI cost commands respect the configured API key and tenant. Cost data is only visible for the authenticated tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.9.8",
+      "description": "Cost values are displayed in human-readable format: millicents are converted to dollars with 2 decimal places. Token counts use K/M suffixes (e.g., 150K, 1.2M).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.9.1",
+      "name": "cost-summary displays project overview",
+      "type": "integration",
+      "preconditions": [
+        "loopctl CLI configured with valid API key",
+        "Project exists with token usage data across multiple agents and models"
+      ],
+      "steps": [
+        "Run: loopctl cost-summary --project my-project"
+      ],
+      "expected_results": [
+        "Output includes total cost in dollars",
+        "Output includes token totals with K/M formatting",
+        "Output includes top 3 agents ranked by cost",
+        "Output includes model mix (percentage per model)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.9.2",
+      "name": "cost-summary --by-epic shows epic breakdown",
+      "type": "integration",
+      "preconditions": [
+        "Project with 3 epics, each with different cost profiles"
+      ],
+      "steps": [
+        "Run: loopctl cost-summary --project my-project --by-epic"
+      ],
+      "expected_results": [
+        "Table with 3 rows, one per epic",
+        "Sorted by total cost descending",
+        "Each row shows epic name, story count, total cost, avg cost"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.9.3",
+      "name": "token-report shows per-story detail",
+      "type": "integration",
+      "preconditions": [
+        "Story with 3 token usage reports from different models"
+      ],
+      "steps": [
+        "Run: loopctl token-report --story <story-id>"
+      ],
+      "expected_results": [
+        "Table with 3 rows showing timestamp, model, input/output tokens, cost",
+        "Totals row at bottom summing all values"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.9.4",
+      "name": "JSON output format for scripting",
+      "type": "integration",
+      "preconditions": [
+        "Project with token data"
+      ],
+      "steps": [
+        "Run: loopctl cost-summary --project my-project --format json"
+      ],
+      "expected_results": [
+        "Output is valid JSON",
+        "JSON structure matches API response format",
+        "Parseable by jq or similar tools"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.9.5",
+      "name": "status command includes cost line when data exists",
+      "type": "integration",
+      "preconditions": [
+        "Project with token data and a budget set"
+      ],
+      "steps": [
+        "Run: loopctl status --project my-project"
+      ],
+      "expected_results": [
+        "Output includes existing progress stats",
+        "Output includes new cost summary line: 'Cost: $X.XX / $Y.YY budget (Z% utilized)'"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.9.6",
+      "name": "status command omits cost line when no token data",
+      "type": "integration",
+      "preconditions": [
+        "Project with no token_usage_reports"
+      ],
+      "steps": [
+        "Run: loopctl status --project my-project"
+      ],
+      "expected_results": [
+        "Output shows normal progress stats",
+        "No cost line appears (graceful degradation)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "CLI module: Loopctl.CLI.CostCommands (or extend existing command modules).",
+    "CLI calls the analytics API endpoints (US-21.4) internally using the configured API key. No direct DB access from CLI.",
+    "Formatting helpers: millicents_to_dollars/1 (1875 -> '$0.02'), format_tokens/1 (150000 -> '150K', 1200000 -> '1.2M').",
+    "Table formatting: use the existing CLI table formatter if one exists, or use Erlang's :io.format for column alignment.",
+    "The --format json flag should output the raw API response JSON for piping to jq.",
+    "Extend the existing loopctl status command to call the project analytics endpoint and append cost data when available.",
+    "CLI escript must include the new modules in the escript configuration in mix.exs.",
+    "Error handling: if analytics endpoints return empty data, display 'No token data available' rather than an error."
+  ],
+  "dependencies": [
+    "US-21.4",
+    "US-14.1"
+  ],
+  "estimated_hours": 5
+}

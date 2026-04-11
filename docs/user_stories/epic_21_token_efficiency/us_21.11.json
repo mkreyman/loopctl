@@ -1,0 +1,143 @@
+{
+  "id": "US-21.11",
+  "title": "OpenAPI Spec & Swagger Documentation for Token Endpoints",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "API consumer or integration developer",
+    "i_want_to": "discover and understand all token efficiency endpoints through the OpenAPI specification and interactive Swagger UI",
+    "so_that": "I can integrate with loopctl's cost tracking features using auto-generated client code, accurate request/response schemas, and interactive testing without reading source code"
+  },
+  "rationale": "loopctl's API-first philosophy means the OpenAPI spec is the source of truth for integrations. Undocumented endpoints are invisible endpoints -- agents and external tools cannot use what they cannot discover. Token efficiency adds ~10 new endpoints plus extensions to existing ones. Without corresponding OpenAPI documentation, these become a hidden API that only works for those who read the source. Interactive Swagger UI documentation also serves as a testing tool during development.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.11.1",
+      "description": "The OpenAPI 3.0 spec includes schemas for: TokenUsageReport (with all fields), TokenBudget, CostSummary, CostAnomaly, TokenAnalyticsAgent, TokenAnalyticsEpic, TokenAnalyticsProject, TokenAnalyticsModel, TokenAnalyticsTrend, ModelMixEntry.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.2",
+      "description": "All new endpoints are documented with path, method, summary, description, parameters (query/path), request body schema, response schemas (200, 201, 400, 403, 404, 409, 422), and required authentication (role level).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.3",
+      "description": "New endpoints documented: POST /token-usage, GET /stories/:id/token-usage, POST /token-budgets, GET /token-budgets, GET /token-budgets/:id, PATCH /token-budgets/:id, DELETE /token-budgets/:id, GET /cost-anomalies, PATCH /cost-anomalies/:id, GET /analytics/agents, GET /analytics/epics, GET /analytics/projects/:id, GET /analytics/models, GET /analytics/model-mix, GET /analytics/agents/:id/model-profile, GET /analytics/trends, GET /skills/:id/cost-performance.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.4",
+      "description": "The existing POST /stories/:id/report endpoint documentation is updated to include the optional token_usage request body field with its sub-schema.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.5",
+      "description": "All schemas include example values that demonstrate realistic token data (e.g., input_tokens: 150000, model_name: 'claude-opus-4-6', cost_millicents: 1875).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.6",
+      "description": "The OpenAPI spec includes a new tag 'Token Efficiency' that groups all token-related endpoints for navigation in Swagger UI.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.7",
+      "description": "The Swagger UI at /api/docs correctly renders all new endpoints and allows interactive testing.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.11.8",
+      "description": "The three new webhook event types (token.budget_warning, token.budget_exceeded, token.anomaly_detected) are documented in the webhook events section with their payload schemas.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.11.1",
+      "name": "OpenAPI spec validates against OpenAPI 3.0 schema",
+      "type": "unit",
+      "preconditions": [
+        "OpenAPI spec file exists"
+      ],
+      "steps": [
+        "Run OpenAPI spec through a validator (e.g., openapi-spec-validator or mix task)"
+      ],
+      "expected_results": [
+        "Spec passes validation with no errors",
+        "All $ref references resolve correctly"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.11.2",
+      "name": "All new endpoints appear in Swagger UI",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running"
+      ],
+      "steps": [
+        "Navigate to /api/docs in browser",
+        "Search for 'Token Efficiency' tag"
+      ],
+      "expected_results": [
+        "All 17 new/updated endpoints visible under the tag",
+        "Each endpoint shows parameters, request body, and response schemas",
+        "Interactive 'Try it out' works for each endpoint"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.11.3",
+      "name": "Updated report endpoint shows token_usage field",
+      "type": "integration",
+      "preconditions": [
+        "Swagger UI loaded"
+      ],
+      "steps": [
+        "Navigate to POST /stories/:id/report in Swagger UI"
+      ],
+      "expected_results": [
+        "Request body schema shows optional token_usage object",
+        "token_usage sub-schema shows input_tokens, output_tokens, model_name, cost_millicents fields"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.11.4",
+      "name": "Webhook event payloads documented",
+      "type": "unit",
+      "preconditions": [
+        "OpenAPI spec file exists"
+      ],
+      "steps": [
+        "Search spec for token.budget_warning, token.budget_exceeded, token.anomaly_detected"
+      ],
+      "expected_results": [
+        "All three event types documented with payload schemas",
+        "Payload schemas include all fields specified in US-21.7"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "OpenAPI spec is maintained in lib/loopctl/api_spec/ (or wherever the existing spec lives -- check ApiSpec module).",
+    "Use the existing OpenApiSpex or similar library already in the project for spec generation from controller typespecs.",
+    "Group new endpoints under a 'Token Efficiency' tag for Swagger UI navigation.",
+    "Example values should use realistic data: model names from actual Claude/GPT models, token counts in realistic ranges (50K-500K), costs in millicents.",
+    "Ensure the cost_millicents field documentation explains the unit (1/1000 of a cent, so 1875 = $0.01875).",
+    "Document the phase enum values: 'planning', 'implementing', 'reviewing', 'other'.",
+    "Document the anomaly_type enum values: 'high_cost', 'suspiciously_low', 'budget_exceeded'.",
+    "Document the scope_type enum values: 'project', 'epic', 'story' for budgets.",
+    "Update the webhook events documentation section to include the three new event types with their full payload schemas."
+  ],
+  "dependencies": [
+    "US-21.4",
+    "US-21.7",
+    "US-16.1"
+  ],
+  "estimated_hours": 4
+}

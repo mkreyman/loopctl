@@ -1,0 +1,162 @@
+{
+  "id": "US-21.8",
+  "title": "Change Feed & Audit Integration for Token Events",
+  "epic": {
+    "id": "epic_21",
+    "name": "Token Efficiency & Cost Observability"
+  },
+  "priority": "medium",
+  "phase": "observability",
+  "story": {
+    "as_a": "external monitoring tool",
+    "i_want_to": "discover token usage events, budget threshold crossings, and cost anomalies through the existing change feed endpoint",
+    "so_that": "I can build real-time dashboards and alerting pipelines using the same polling mechanism I already use for story status changes, without needing a separate integration"
+  },
+  "rationale": "The change feed (US-3.2) is loopctl's primary mechanism for external tools to discover state changes. Token events are state changes just like story status transitions. By integrating token events into the existing change feed, external observers get a unified stream of all project activity. This avoids the antipattern of requiring separate polling endpoints for different event types, which the token efficiency research specifically warns against (unnecessary architectural complexity = wasted tokens on the observer side too).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-21.8.1",
+      "description": "Token usage report creation generates a change feed entry with entity_type='token_usage_report', action='created'. The entry includes story_id, agent_id, model_name, cost_millicents, total_tokens in the payload.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.8.2",
+      "description": "Budget threshold crossings (warning and exceeded) generate change feed entries with entity_type='token_budget', action='threshold_crossed'. The entry includes budget_id, scope_type, scope_id, utilization_pct, threshold_type ('warning' or 'exceeded').",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.8.3",
+      "description": "Cost anomaly detection generates a change feed entry with entity_type='cost_anomaly', action='detected'. The entry includes anomaly_id, story_id, anomaly_type, deviation_factor.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.8.4",
+      "description": "GET /api/v1/changes?since=... returns token events interleaved with other events in chronological order. The entity_type filter accepts 'token_usage_report', 'token_budget', and 'cost_anomaly' for filtering.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.8.5",
+      "description": "All token-related mutations are recorded in the immutable audit log: token_usage_report creation, budget creation/update/deletion, anomaly creation/resolution. Each audit entry includes the actor (agent or user) and the full before/after state.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-21.8.6",
+      "description": "GET /api/v1/stories/:id/history (existing audit endpoint) includes token usage events in the story's history timeline, showing when token reports were submitted and by which agent.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-21.8.1",
+      "name": "Token usage report appears in change feed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:agent, %{tenant_id: tenant.id}) as agent",
+        "fixture(:story, %{tenant_id: tenant.id})",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})",
+        "Record current timestamp as since_marker"
+      ],
+      "steps": [
+        "POST /api/v1/token-usage to create a report",
+        "GET /api/v1/changes?since=since_marker"
+      ],
+      "expected_results": [
+        "Change feed includes entry with entity_type='token_usage_report', action='created'",
+        "Entry payload contains cost_millicents and model_name"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.8.2",
+      "name": "Budget threshold crossing appears in change feed",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:token_budget, %{tenant_id: tenant.id, budget_millicents: 10000, alert_threshold_pct: 80})",
+        "Existing spend at 7500 millicents",
+        "Record current timestamp as since_marker"
+      ],
+      "steps": [
+        "Create token_usage_report with cost_millicents: 1500 (total 9000, crosses 80%)",
+        "GET /api/v1/changes?since=since_marker"
+      ],
+      "expected_results": [
+        "Change feed includes token_usage_report creation entry",
+        "Change feed includes token_budget threshold_crossed entry",
+        "Both entries in chronological order"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.8.3",
+      "name": "Change feed filterable by token entity types",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "Create a story status change and a token_usage_report",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/changes?since=...&entity_type=token_usage_report"
+      ],
+      "expected_results": [
+        "Only token_usage_report entries returned, story status changes filtered out"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.8.4",
+      "name": "Story history includes token usage events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant",
+        "fixture(:story, %{tenant_id: tenant.id}) with status transitions and token reports",
+        "fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/stories/:id/history"
+      ],
+      "expected_results": [
+        "History includes both status_changed and token_usage_reported events",
+        "Events ordered chronologically",
+        "Token events show agent, model, and cost"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-21.8.5",
+      "name": "Tenant isolation: change feed only shows own tenant's token events",
+      "type": "integration",
+      "preconditions": [
+        "fixture(:tenant) as tenant_a with token data",
+        "fixture(:tenant) as tenant_b",
+        "fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})"
+      ],
+      "steps": [
+        "GET /api/v1/changes?entity_type=token_usage_report with tenant_b key"
+      ],
+      "expected_results": [
+        "Returns empty list, no tenant_a events visible"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Change feed entries are created by inserting into the changes table (same mechanism as existing story/epic change events in US-3.2).",
+    "Add change feed insertion to the Ecto.Multi in token_usage_report creation, budget mutations, and anomaly creation.",
+    "The changes table already has entity_type and action columns. Add new entity_type values to whatever validation exists.",
+    "Audit log entries use the existing Loopctl.Audit.log/4 function within the same Ecto.Multi transaction as the entity mutation.",
+    "Story history endpoint (GET /stories/:id/history) already queries audit_log by entity. Token events are logged with entity_type='token_usage_report' and include the story_id in metadata for correlation.",
+    "Change feed uses cursor-based pagination (since= timestamp), not page-based pagination.",
+    "Consider batching change feed insertions if multiple token events happen in the same request (e.g., report with both artifact and token usage).",
+    "Story history endpoint (GET /stories/:id/history) must query BOTH direct story audit entries (entity_type='story', entity_id=story.id) AND related token audit entries (entity_type='token_usage_report' with metadata->>'story_id' = story.id). Add a GIN index on audit_log(metadata) or a btree index on ((metadata->>'story_id')) for efficient JSONB queries. Merge results and sort by timestamp.",
+    "Token events are recorded in BOTH the changes table (for unified change feed) AND the audit_log (for entity-specific history). These are two separate tables with different schemas but contain the same semantic events."
+  ],
+  "dependencies": [
+    "US-21.1",
+    "US-3.1",
+    "US-3.2"
+  ],
+  "estimated_hours": 4
+}
