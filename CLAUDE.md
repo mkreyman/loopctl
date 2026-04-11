@@ -120,6 +120,29 @@ Ask these questions:
 - `LOOPCTL_REVIEWER_KEY` — separate agent identity, used ONLY via curl by review agents (never in the same MCP server as the agent key)
 - `LOOPCTL_USER_KEY` — user role, used ONLY via curl for destructive/admin operations
 
+### One Agent = One Role
+
+An agent may hold at most one ACTIVE (non-revoked) api_key role at a time.
+`POST /api_keys` rejects (422) any attempt to bind a new key with a role
+that differs from the agent's existing active-key roles.
+
+**Why**: chain-of-custody checks compare `caller.agent_id != story.assigned_agent_id`.
+If a single agent could hold both an `agent`-role and an `orchestrator`-role
+key, a user-role caller could mint the higher-role key on an existing agent
+and use it to self-verify their own work while still technically satisfying
+the literal id comparison.
+
+**Allowed**:
+- Rotation within the same role (create a new `orchestrator` key for an agent
+  that already has an `orchestrator` key)
+- Binding to a fresh agent (one with zero active keys)
+- Binding to an agent whose only keys are revoked
+
+**Forbidden**:
+- Creating an `orchestrator` key for an agent that has an active `agent` key
+- Creating an `agent` key for an agent that has an active `reviewer` key
+- Any combination where the new role differs from an existing active role
+
 ## Dependency Injection — Config-Based (NOT Opts-Based)
 
 **All external dependencies use behaviours + config-based DI:**

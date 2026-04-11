@@ -98,6 +98,7 @@ defmodule LoopctlWeb.ApiKeyController do
 
     with :ok <- validate_not_superadmin(params["role"]),
          :ok <- validate_key_limit(tenant),
+         :ok <- validate_agent_role_consistency(tenant, params),
          {:ok, {raw_key, api_key}} <- do_create_key(tenant, params) do
       conn
       |> put_status(:created)
@@ -169,6 +170,45 @@ defmodule LoopctlWeb.ApiKeyController do
       :ok
     end
   end
+
+  # Enforces "one agent = one role": prevents a single agent from holding
+  # active api_keys with multiple different roles. Rotation within the same
+  # role is allowed. Agents with no active keys are also accepted.
+  #
+  # This closes the chain-of-custody bypass where a user-role caller could
+  # mint a new orch-role key on an agent that already held an agent-role
+  # key, then use the new key to satisfy the
+  # `caller.agent_id != assigned_agent_id` verify check while still acting
+  # as the same underlying actor.
+  defp validate_agent_role_consistency(_tenant, %{"agent_id" => nil}), do: :ok
+
+  defp validate_agent_role_consistency(_tenant, params) when not is_map_key(params, "agent_id"),
+    do: :ok
+
+  defp validate_agent_role_consistency(tenant, %{"agent_id" => agent_id, "role" => role_str})
+       when is_binary(agent_id) and is_binary(role_str) do
+    new_role = safe_to_role(role_str)
+    active_roles = Auth.list_active_roles_for_agent(tenant.id, agent_id)
+
+    cond do
+      active_roles == [] ->
+        :ok
+
+      active_roles == [new_role] ->
+        :ok
+
+      true ->
+        {:error, :unprocessable_entity,
+         "Agent #{agent_id} already has active keys with roles " <>
+           "#{inspect(active_roles)}. Cross-role binding is forbidden — " <>
+           "create a new agent first. See the Security & Trust Model section " <>
+           "of CLAUDE.md."}
+    end
+  end
+
+  # Any other shape (missing role, non-string role, etc.) falls through to
+  # the existing validation layers (do_create_key's cast_changeset).
+  defp validate_agent_role_consistency(_tenant, _params), do: :ok
 
   defp validate_not_revoked(%{revoked_at: nil}), do: :ok
 

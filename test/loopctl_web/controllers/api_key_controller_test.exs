@@ -61,6 +61,180 @@ defmodule LoopctlWeb.ApiKeyControllerTest do
     end
   end
 
+  describe "POST /api_keys — cross-role binding" do
+    test "rejects creating an orchestrator key for an agent that already has an agent-role key",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "existing-agent"})
+
+      _existing =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          agent_id: agent.id,
+          role: :agent,
+          name: "existing-agent-key"
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "sneaky-orch-key",
+          "role" => "orchestrator",
+          "agent_id" => agent.id
+        })
+
+      response = json_response(conn, 422)
+      assert response["error"]["message"] =~ "Cross-role binding is forbidden"
+      assert response["error"]["message"] =~ agent.id
+    end
+
+    test "rejects creating an agent-role key for an agent that already has an orchestrator-role key",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "orch-agent"})
+
+      _existing =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          agent_id: agent.id,
+          role: :orchestrator,
+          name: "existing-orch-key"
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "downgrade-attempt",
+          "role" => "agent",
+          "agent_id" => agent.id
+        })
+
+      assert json_response(conn, 422)
+    end
+
+    test "allows rotation within the same role (same agent, same role)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "rotation-agent"})
+
+      _existing =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          agent_id: agent.id,
+          role: :orchestrator,
+          name: "existing-orch-key"
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "rotated-orch-key",
+          "role" => "orchestrator",
+          "agent_id" => agent.id
+        })
+
+      assert %{"api_key" => %{"role" => "orchestrator"}} = json_response(conn, 201)
+    end
+
+    test "allows binding to a fresh agent with no existing keys", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fresh_agent = fixture(:agent, %{tenant_id: tenant.id, name: "fresh-agent"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "new-orch-key",
+          "role" => "orchestrator",
+          "agent_id" => fresh_agent.id
+        })
+
+      assert %{"api_key" => %{"role" => "orchestrator"}} = json_response(conn, 201)
+    end
+
+    test "revoked keys do not count against the cross-role check", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "revoked-agent"})
+
+      {_raw, revoked_key} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          agent_id: agent.id,
+          role: :agent,
+          name: "to-be-revoked"
+        })
+
+      {:ok, _} = Loopctl.Auth.revoke_api_key(revoked_key)
+
+      # Now a new orch-role key on the same agent should succeed because
+      # the agent-role key is revoked.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "post-revocation-orch",
+          "role" => "orchestrator",
+          "agent_id" => agent.id
+        })
+
+      assert %{"api_key" => %{"role" => "orchestrator"}} = json_response(conn, 201)
+    end
+
+    test "accepts keys with no agent_id (unbound keys still work)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "unbound-key",
+          "role" => "agent"
+        })
+
+      assert %{"api_key" => %{"role" => "agent"}} = json_response(conn, 201)
+    end
+
+    test "tenant isolation: another tenant's active keys do not affect this tenant's creation",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _admin} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      # Set up a conflicting key in ANOTHER tenant, bound to an agent there.
+      other_tenant = fixture(:tenant)
+      other_agent = fixture(:agent, %{tenant_id: other_tenant.id, name: "other-tenant-agent"})
+
+      _other_key =
+        fixture(:api_key, %{
+          tenant_id: other_tenant.id,
+          agent_id: other_agent.id,
+          role: :agent,
+          name: "other-agent-key"
+        })
+
+      # Create our OWN agent in OUR tenant with no keys yet.
+      our_agent = fixture(:agent, %{tenant_id: tenant.id, name: "our-agent"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/api_keys", %{
+          "name" => "our-orch-key",
+          "role" => "orchestrator",
+          "agent_id" => our_agent.id
+        })
+
+      assert %{"api_key" => %{"role" => "orchestrator"}} = json_response(conn, 201)
+    end
+  end
+
   describe "GET /api/v1/api_keys" do
     test "lists keys showing prefix only", %{conn: conn} do
       tenant = fixture(:tenant)

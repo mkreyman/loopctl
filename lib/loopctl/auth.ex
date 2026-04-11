@@ -303,6 +303,31 @@ defmodule Loopctl.Auth do
   end
 
   @doc """
+  Returns the distinct list of roles held by active (non-revoked) api_keys
+  for a given agent within a tenant.
+
+  Used by the api_key controller to enforce the "one agent = one role"
+  invariant at key creation time.
+
+  Returns an empty list if the agent has no active keys or if the agent_id
+  is nil.
+  """
+  @spec list_active_roles_for_agent(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: [atom()]
+  def list_active_roles_for_agent(_tenant_id, nil), do: []
+
+  def list_active_roles_for_agent(tenant_id, agent_id)
+      when is_binary(tenant_id) and is_binary(agent_id) do
+    from(k in ApiKey,
+      where: k.tenant_id == ^tenant_id,
+      where: k.agent_id == ^agent_id,
+      where: is_nil(k.revoked_at),
+      distinct: true,
+      select: k.role
+    )
+    |> AdminRepo.all()
+  end
+
+  @doc """
   Counts active (non-revoked) API keys for a tenant.
   """
   @spec count_api_keys(Ecto.UUID.t()) :: non_neg_integer()
