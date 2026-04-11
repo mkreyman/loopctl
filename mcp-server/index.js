@@ -576,21 +576,29 @@ async function knowledgeArticleStats({ article_id }) {
 }
 
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
+  // Normalize: treat empty strings / whitespace-only strings as missing so the
+  // validation below catches them. Otherwise an empty string would slip past
+  // the `!= null` checks and produce a malformed URL like /agents/.
+  const normalizedApiKeyId =
+    typeof api_key_id === "string" && api_key_id.trim() === "" ? null : api_key_id;
+  const normalizedAgentId =
+    typeof agent_id === "string" && agent_id.trim() === "" ? null : agent_id;
+
   // Validate: exactly one of api_key_id or agent_id must be provided.
-  if (api_key_id != null && agent_id != null) {
+  if (normalizedApiKeyId != null && normalizedAgentId != null) {
     return {
       content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id, not both. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
       isError: true,
     };
   }
-  if (api_key_id == null && agent_id == null) {
+  if (normalizedApiKeyId == null && normalizedAgentId == null) {
     return {
       content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
       isError: true,
     };
   }
 
-  const resolvedId = api_key_id ?? agent_id;
+  const resolvedId = normalizedApiKeyId ?? normalizedAgentId;
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (since_days != null) params.set("since_days", String(since_days));
@@ -602,7 +610,7 @@ async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } =
 
   // When agent_id alone is passed (new semantic: logical agents.id), emit a
   // one-release-cycle nudge so callers can be explicit about their intent.
-  if (agent_id != null && api_key_id == null) {
+  if (normalizedAgentId != null && normalizedApiKeyId == null) {
     const base = toContent(result);
     return {
       ...base,

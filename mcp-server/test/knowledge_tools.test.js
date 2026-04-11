@@ -126,20 +126,25 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
 }
 
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
-  if (api_key_id != null && agent_id != null) {
+  const normalizedApiKeyId =
+    typeof api_key_id === "string" && api_key_id.trim() === "" ? null : api_key_id;
+  const normalizedAgentId =
+    typeof agent_id === "string" && agent_id.trim() === "" ? null : agent_id;
+
+  if (normalizedApiKeyId != null && normalizedAgentId != null) {
     return {
       content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id, not both. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
       isError: true,
     };
   }
-  if (api_key_id == null && agent_id == null) {
+  if (normalizedApiKeyId == null && normalizedAgentId == null) {
     return {
       content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
       isError: true,
     };
   }
 
-  const resolvedId = api_key_id ?? agent_id;
+  const resolvedId = normalizedApiKeyId ?? normalizedAgentId;
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (since_days != null) params.set("since_days", String(since_days));
@@ -149,7 +154,7 @@ async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } =
     : `/api/v1/knowledge/analytics/agents/${resolvedId}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
 
-  if (agent_id != null && api_key_id == null) {
+  if (normalizedAgentId != null && normalizedApiKeyId == null) {
     const base = toContent(result);
     return {
       ...base,
@@ -380,6 +385,46 @@ describe("TC-25.3.7: deprecation hint for agent_id-only call", () => {
     // Hint should be in _meta, not polluting content
     const contentText = result.content[0].text;
     assert.ok(!contentText.includes("deprecation"), "deprecation hint should NOT be in content array");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-25.3.7b: knowledge_agent_usage treats empty strings as missing
+// ---------------------------------------------------------------------------
+
+describe("TC-25.3.7b: empty-string api_key_id/agent_id are rejected as missing", () => {
+  test("empty string api_key_id alone triggers neither-provided validation error", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({ api_key_id: "" });
+
+    assert.equal(calls.length, 0, "no HTTP request should be made for empty string id");
+    assert.equal(result.isError, true);
+    assert.ok(
+      result.content[0].text.includes("pass exactly one of api_key_id or agent_id"),
+      "empty string should surface the neither-provided error"
+    );
+  });
+
+  test("whitespace-only agent_id is treated as missing", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({ agent_id: "   " });
+
+    assert.equal(calls.length, 0, "no HTTP request should be made for whitespace-only id");
+    assert.equal(result.isError, true);
+  });
+
+  test("empty string on both sides still produces an error rather than a malformed URL", async () => {
+    setupEnv();
+    const calls = mockFetch();
+
+    const result = await knowledgeAgentUsage({ api_key_id: "", agent_id: "" });
+
+    assert.equal(calls.length, 0, "no HTTP request when both are empty strings");
+    assert.equal(result.isError, true);
   });
 });
 

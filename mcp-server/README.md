@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 41 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 42 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (41)
+## Tools (42)
 
 ### Project Tools
 
@@ -75,6 +75,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `get_tenant` | Get current tenant info. Use to verify connectivity. |
 | `list_projects` | List all projects in the current tenant. |
 | `create_project` | Create a new project in the current tenant. |
+| `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
 | `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). |
 
@@ -217,8 +218,8 @@ The `knowledge_agent_usage` tool accepts **exactly one** of two identifier param
 
 | Parameter | Meaning | When to use |
 |---|---|---|
-| `api_key_id` | The `api_keys.id` credential UUID — the raw API key identity | You have the credential ID from `list_api_keys` or a loopctl admin page |
-| `agent_id` | The `agents.id` logical identity UUID — the agent registry entry | You have the agent registry ID from `list_agents` or a story's `assigned_agent_id` |
+| `api_key_id` | The `api_keys.id` credential UUID — the raw API key identity | You have the credential ID from `GET /api/v1/api_keys` or a loopctl admin page |
+| `agent_id` | The `agents.id` logical identity UUID — the agent registry entry | You have the agent registry ID from `GET /api/v1/agents` or a story's `assigned_agent_id` |
 
 The server's analytics endpoint performs dual-resolution: it tries both interpretations automatically. However, using the explicit parameter makes your intent clear and avoids ambiguity in the response's `resolved_as` field.
 
