@@ -277,6 +277,10 @@ defmodule LoopctlWeb.Router do
         KnowledgeAnalyticsController,
         :agent_usage
 
+    get "/knowledge/analytics/projects/:id/usage",
+        KnowledgeAnalyticsController,
+        :project_usage
+
     get "/knowledge/articles/:id/stats",
         KnowledgeAnalyticsController,
         :article_stats

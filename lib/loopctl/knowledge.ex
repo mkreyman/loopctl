@@ -2868,11 +2868,25 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Returns usage statistics for a single api_key (agent identity).
+  Returns usage statistics for a single api_key or logical agent.
+
+  Accepts either an `api_keys.id` or an `agents.id` — see
+  `Loopctl.Knowledge.Analytics.get_agent_usage/3` for the resolution
+  rules and response shape.
   """
-  @spec get_agent_usage(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: map()
-  def get_agent_usage(tenant_id, api_key_id, opts \\ []) do
-    Analytics.get_agent_usage(tenant_id, api_key_id, opts)
+  @spec get_agent_usage(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, map()} | {:error, :not_found}
+  def get_agent_usage(tenant_id, id, opts \\ []) do
+    Analytics.get_agent_usage(tenant_id, id, opts)
+  end
+
+  @doc """
+  Returns a per-project wiki usage rollup.
+  """
+  @spec get_project_usage(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, map()} | {:error, :not_found}
+  def get_project_usage(tenant_id, project_id, opts \\ []) do
+    Analytics.get_project_usage(tenant_id, project_id, opts)
   end
 
   @doc """
