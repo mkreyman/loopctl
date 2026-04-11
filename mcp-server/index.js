@@ -416,17 +416,22 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id }) {
-  const path = project_id
+async function knowledgeIndex({ project_id, story_id }) {
+  const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
+  const params = new URLSearchParams();
+  if (story_id) params.set("story_id", story_id);
+  const qs = params.toString();
+  const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
 
-async function knowledgeSearch({ q, project_id, category, tags, mode, limit }) {
+async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit }) {
   const params = new URLSearchParams({ q });
   if (project_id) params.set("project_id", project_id);
+  if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
   if (tags) params.set("tags", tags);
   if (mode) params.set("mode", mode);
@@ -436,14 +441,20 @@ async function knowledgeSearch({ q, project_id, category, tags, mode, limit }) {
   return toContent(result);
 }
 
-async function knowledgeGet({ article_id }) {
-  const result = await apiCall("GET", `/api/v1/articles/${article_id}`, null, process.env.LOOPCTL_AGENT_KEY);
+async function knowledgeGet({ article_id, project_id, story_id }) {
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (story_id) params.set("story_id", story_id);
+  const qs = params.toString();
+  const path = qs ? `/api/v1/articles/${article_id}?${qs}` : `/api/v1/articles/${article_id}`;
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
 
-async function knowledgeContext({ query, project_id, limit, recency_weight }) {
+async function knowledgeContext({ query, project_id, story_id, limit, recency_weight }) {
   const params = new URLSearchParams({ query });
   if (project_id) params.set("project_id", project_id);
+  if (story_id) params.set("story_id", story_id);
   if (limit != null) params.set("limit", String(limit));
   if (recency_weight != null) params.set("recency_weight", String(recency_weight));
 
@@ -564,15 +575,44 @@ async function knowledgeArticleStats({ article_id }) {
   return toContent(result);
 }
 
-async function knowledgeAgentUsage({ agent_id, limit, since_days } = {}) {
+async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
+  // Validate: exactly one of api_key_id or agent_id must be provided.
+  if (api_key_id != null && agent_id != null) {
+    return {
+      content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id, not both. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
+      isError: true,
+    };
+  }
+  if (api_key_id == null && agent_id == null) {
+    return {
+      content: [{ type: "text", text: "Error: pass exactly one of api_key_id or agent_id. Use api_key_id for the api_keys.id credential; use agent_id for the agents.id logical identity." }],
+      isError: true,
+    };
+  }
+
+  const resolvedId = api_key_id ?? agent_id;
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (since_days != null) params.set("since_days", String(since_days));
   const qs = params.toString();
   const path = qs
-    ? `/api/v1/knowledge/analytics/agents/${agent_id}?${qs}`
-    : `/api/v1/knowledge/analytics/agents/${agent_id}`;
+    ? `/api/v1/knowledge/analytics/agents/${resolvedId}?${qs}`
+    : `/api/v1/knowledge/analytics/agents/${resolvedId}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+
+  // When agent_id alone is passed (new semantic: logical agents.id), emit a
+  // one-release-cycle nudge so callers can be explicit about their intent.
+  if (agent_id != null && api_key_id == null) {
+    const base = toContent(result);
+    return {
+      ...base,
+      _meta: {
+        deprecation_hint:
+          "knowledge_agent_usage: if you meant the api_keys.id credential, pass it as api_key_id explicitly. The agent_id parameter now refers to the logical agents.id only.",
+      },
+    };
+  }
+
   return toContent(result);
 }
 
@@ -1177,14 +1217,20 @@ const TOOLS = [
   {
     name: "knowledge_index",
     description:
-      "Load the knowledge wiki catalog at session start. Returns lightweight article metadata " +
-      "(titles, categories, tags) grouped by category. Use this to discover available knowledge before searching.",
+      "Load the knowledge wiki catalog at session start. Returns article metadata grouped by category. " +
+      "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: {
           type: "string",
+          format: "uuid",
           description: "Optional: scope the index to a specific project UUID.",
+        },
+        story_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: loopctl story UUID for attribution tracking.",
         },
       },
       required: [],
@@ -1193,8 +1239,8 @@ const TOOLS = [
   {
     name: "knowledge_search",
     description:
-      "Search the knowledge wiki by topic. Supports keyword, semantic, or combined search modes. " +
-      "Returns snippets, not full bodies. Use after index to find specific articles.",
+      "Search the knowledge wiki by topic. Returns snippets. " +
+      "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1204,7 +1250,13 @@ const TOOLS = [
         },
         project_id: {
           type: "string",
+          format: "uuid",
           description: "Optional: scope search to a specific project UUID.",
+        },
+        story_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: loopctl story UUID for attribution tracking.",
         },
         category: {
           type: "string",
@@ -1230,13 +1282,25 @@ const TOOLS = [
   {
     name: "knowledge_get",
     description:
-      "Get full article content by ID. Use after search to read an article in detail.",
+      "Get full article content by ID. Use after search to read an article in detail. " +
+      "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
         article_id: {
           type: "string",
+          format: "uuid",
           description: "The UUID of the article.",
+        },
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: project UUID for attribution tracking.",
+        },
+        story_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: loopctl story UUID for attribution tracking.",
         },
       },
       required: ["article_id"],
@@ -1245,8 +1309,8 @@ const TOOLS = [
   {
     name: "knowledge_context",
     description:
-      "Get relevance-and-recency-ranked full articles for a task query. Returns the best knowledge " +
-      "for your current context with linked references. Use when starting a task that needs domain knowledge.",
+      "Get ranked full articles for a task query. Returns best knowledge with linked references. " +
+      "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1256,7 +1320,13 @@ const TOOLS = [
         },
         project_id: {
           type: "string",
+          format: "uuid",
           description: "Optional: scope context to a specific project UUID.",
+        },
+        story_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: loopctl story UUID for attribution tracking.",
         },
         limit: {
           type: "integer",
@@ -1566,15 +1636,21 @@ const TOOLS = [
   {
     name: "knowledge_agent_usage",
     description:
-      "Return knowledge usage for a specific agent (api_key): total reads, " +
-      "unique articles, access type breakdown, and top read articles. " +
+      "Return knowledge usage for an agent: total reads, unique articles, top read articles. " +
+      "Pass api_key_id (api_keys.id credential) OR agent_id (agents.id logical identity) — not both. " +
       "Requires orchestrator role.",
     inputSchema: {
       type: "object",
       properties: {
+        api_key_id: {
+          type: "string",
+          format: "uuid",
+          description: "The api_keys.id credential UUID. Use this when you have the raw API key ID.",
+        },
         agent_id: {
           type: "string",
-          description: "API key UUID identifying the agent identity.",
+          format: "uuid",
+          description: "The agents.id logical identity UUID. Use this when you have the agent registry ID.",
         },
         limit: {
           type: "integer",
@@ -1589,7 +1665,7 @@ const TOOLS = [
           maximum: 365,
         },
       },
-      required: ["agent_id"],
+      required: [],
     },
   },
   {
@@ -1636,7 +1712,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.1.2",
+    version: "1.2.0",
   },
   {
     capabilities: { tools: {} },

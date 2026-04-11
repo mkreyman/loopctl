@@ -1,6 +1,6 @@
 {
   "name": "loopctl-mcp-server",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "MCP server for loopctl — structural trust for AI development loops",
   "type": "module",
   "main": "index.js",
@@ -8,7 +8,8 @@
     "loopctl-mcp-server": "index.js"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test test/**/*.test.js"
   },
   "keywords": [
     "mcp",
