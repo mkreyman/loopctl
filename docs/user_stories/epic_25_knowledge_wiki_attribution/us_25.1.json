@@ -1,0 +1,249 @@
+{
+  "id": "US-25.1",
+  "title": "Wiki Access Event Attribution — Schema & Ingestion",
+  "epic": {
+    "id": "epic_25",
+    "name": "Knowledge Wiki Attribution & Analytics"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant administrator",
+    "i_want_to": "have every knowledge wiki access event tagged with the project and story the caller was working on at the time of the read",
+    "so_that": "I can answer 'which projects rely on the wiki?' and 'which stories triggered the most research?' after the fact, without needing to correlate through audit logs or guess from timestamps"
+  },
+  "rationale": "Today knowledge_access_events stores only tenant_id, article_id, api_key_id, access_type, and a jsonb metadata blob. That is enough to know *when* something was read, but not *what work it was in service of*. Stories and projects are the natural attribution dimensions — they are what a human operator actually wants to slice by when deciding whether the wiki is earning its keep. Recording these at ingest time is the only way to answer those questions honestly; reconstructing after the fact requires fragile heuristics. This story plumbs the context through from the API surface to the event row, keeping tenant isolation exactly as it is (tenant_id remains the hard boundary).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-25.1.1",
+      "description": "A migration adds two nullable columns to knowledge_access_events: project_id (uuid, FK to projects.id, ON DELETE SET NULL) and story_id (uuid, FK to stories.id, ON DELETE SET NULL). Both are nullable so rows written before this story remain valid and so callers without context can still record reads.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.2",
+      "description": "Two btree indexes are created: knowledge_access_events_project_id_inserted_at_idx on (tenant_id, project_id, inserted_at DESC) and knowledge_access_events_story_id_inserted_at_idx on (tenant_id, story_id, inserted_at DESC). Indexes include tenant_id as the first column to match RLS query shapes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.3",
+      "description": "RLS policy on knowledge_access_events is unchanged — tenant_id remains the sole isolation boundary. The new project_id and story_id columns are not referenced in any RLS predicate. A cross-tenant project_id or story_id passed by a caller will fail validation before the insert (see AC-25.1.7), not fall through RLS.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.4",
+      "description": "Loopctl.Knowledge.Analytics.record_access/5 is extended with a new 6th positional argument `context` defaulting to %{} that accepts %{project_id: uuid | nil, story_id: uuid | nil}. When present, those values are written to the new columns. Existing 5-arity callers continue to work (bitwise default). The function preserves its fire-and-forget async semantics.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.5",
+      "description": "Loopctl.Knowledge.Analytics.record_search_access/5 and record_context_access/4 are similarly extended to accept and persist the context map. The event row stores the same project_id/story_id for every article in a batch search/context access.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.6",
+      "description": "Loopctl.Knowledge.get_article/3, search_articles/3, get_context/3, and list_index/2 accept opts[:project_id] and opts[:story_id]. When present, they are forwarded to the Analytics.record_* call. When absent, the event is recorded with NULL columns (no behavior change).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.7",
+      "description": "Validation: if opts[:project_id] is provided, the Knowledge context verifies the project belongs to the caller's tenant by querying Loopctl.Projects.get_project/2 before recording. On mismatch the read still succeeds but the attribution is silently dropped (logged at :warning level via Logger) — the wiki read must never 500 because a caller mis-tagged context. Same for story_id against Loopctl.WorkBreakdown.get_story/2.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.8",
+      "description": "When story_id is provided and project_id is not, the server derives project_id from story.project_id and records both. This keeps the common orchestrator case ('I am working on story X') ergonomic and never under-attributes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.9",
+      "description": "Tenant isolation test: tenant A passes tenant B's project_id to a knowledge read. The read succeeds, but the inserted knowledge_access_events row has project_id = NULL (validation rejected it). Tenant B's analytics queries never see the read.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.1.10",
+      "description": "No query path in this story reads the new columns. All analytics changes (filtering, grouping, aggregation) are deferred to US-25.2. This story ships the ingestion layer only.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-25.1.1",
+      "name": "Migration adds columns and indexes with correct tenant-first index shape",
+      "type": "integration",
+      "preconditions": [
+        "Fresh test database",
+        "Migration priv/repo/migrations/<ts>_add_attribution_to_knowledge_access_events.exs"
+      ],
+      "steps": [
+        "Run mix ecto.migrate",
+        "Query pg_indexes for tables knowledge_access_events",
+        "Query information_schema.columns for knowledge_access_events"
+      ],
+      "expected_results": [
+        "columns project_id (uuid, nullable, FK on projects) and story_id (uuid, nullable, FK on stories) exist",
+        "Index knowledge_access_events_project_id_inserted_at_idx exists with columns (tenant_id, project_id, inserted_at DESC)",
+        "Index knowledge_access_events_story_id_inserted_at_idx exists with columns (tenant_id, story_id, inserted_at DESC)",
+        "RLS policy unchanged from before the migration"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.2",
+      "name": "record_access writes project_id and story_id when context is provided",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant)",
+        "story = fixture(:story, tenant: tenant, project: project)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "article = fixture(:article, tenant: tenant, status: :published)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.Analytics.record_access(tenant.id, article.id, api_key.id, \"get\", %{}, %{project_id: project.id, story_id: story.id})",
+        "Wait for the async task to finish (use Task.Supervisor.async sync in test mode or sync_stream)",
+        "Query knowledge_access_events where tenant_id = tenant.id and article_id = article.id"
+      ],
+      "expected_results": [
+        "A row exists",
+        "row.project_id == project.id",
+        "row.story_id == story.id",
+        "row.api_key_id == api_key.id",
+        "row.access_type == \"get\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.3",
+      "name": "get_article forwards project_id/story_id from opts to record_access",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant)",
+        "story = fixture(:story, tenant: tenant, project: project)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "article = fixture(:article, tenant: tenant, status: :published)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.get_article(tenant.id, article.id, api_key_id: api_key.id, project_id: project.id, story_id: story.id)",
+        "Flush async tasks",
+        "Query knowledge_access_events"
+      ],
+      "expected_results": [
+        "{:ok, article} returned",
+        "Event row has project_id = project.id and story_id = story.id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.4",
+      "name": "Deriving project_id from story_id when project_id omitted",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant)",
+        "story = fixture(:story, tenant: tenant, project: project)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "article = fixture(:article, tenant: tenant, status: :published)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.get_article(tenant.id, article.id, api_key_id: api_key.id, story_id: story.id)",
+        "Flush async tasks",
+        "Query knowledge_access_events"
+      ],
+      "expected_results": [
+        "Event row has project_id == project.id (derived from story)",
+        "Event row has story_id == story.id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.5",
+      "name": "Cross-tenant project_id is rejected and attribution is dropped (not 500)",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "project_b = fixture(:project, tenant: tenant_b)",
+        "api_key_a = fixture(:api_key, tenant: tenant_a, role: :agent)",
+        "article = fixture(:article, tenant: tenant_a, status: :published)",
+        "capture_log(fn -> ... end)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.get_article(tenant_a.id, article.id, api_key_id: api_key_a.id, project_id: project_b.id)",
+        "Flush async tasks",
+        "Query knowledge_access_events where tenant_id = tenant_a.id"
+      ],
+      "expected_results": [
+        "{:ok, article} returned (read succeeds)",
+        "Event row exists with project_id = NULL",
+        "A warning log line mentioning \"cross-tenant project_id dropped\" or similar",
+        "No rows visible in tenant_b's analytics (RLS unchanged)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.6",
+      "name": "Omitting context still records the event with NULL columns (backward compat)",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "article = fixture(:article, tenant: tenant, status: :published)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.Analytics.record_access(tenant.id, article.id, api_key.id, \"search\", %{})",
+        "Flush async tasks",
+        "Query knowledge_access_events"
+      ],
+      "expected_results": [
+        "Row exists with project_id = nil and story_id = nil",
+        "No errors raised"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.1.7",
+      "name": "Batch search_access records the same project_id/story_id for every article in the batch",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant)",
+        "story = fixture(:story, tenant: tenant, project: project)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "article_1 = fixture(:article, tenant: tenant, status: :published)",
+        "article_2 = fixture(:article, tenant: tenant, status: :published)",
+        "article_3 = fixture(:article, tenant: tenant, status: :published)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.Analytics.record_search_access(tenant.id, [article_1.id, article_2.id, article_3.id], api_key.id, \"csv import\", %{}, %{project_id: project.id, story_id: story.id})",
+        "Flush async tasks",
+        "Query knowledge_access_events"
+      ],
+      "expected_results": [
+        "3 rows exist (one per article)",
+        "All 3 rows have project_id = project.id and story_id = story.id",
+        "All 3 rows have access_type = \"search\""
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Schema module: Loopctl.Knowledge.AccessEvent (or wherever the existing schema lives — verify in lib/loopctl/knowledge/analytics.ex)",
+    "Context module: Loopctl.Knowledge (lib/loopctl/knowledge.ex)",
+    "Analytics module: Loopctl.Knowledge.Analytics (lib/loopctl/knowledge/analytics.ex) — record_access/5, record_search_access/5, record_context_access/4",
+    "Migration file: priv/repo/migrations/<ts>_add_attribution_to_knowledge_access_events.exs",
+    "Use ENABLE ROW LEVEL SECURITY (not FORCE) — the production role schema_admin owns the table",
+    "Fire-and-forget semantics: the existing do_record_async/4 in Analytics uses Task.Supervisor. Do not change that — keep the validation + insert inside the async task. Validation failures log but never raise.",
+    "Cross-tenant validation: use Loopctl.Projects.get_project(tenant_id, project_id) which already scopes by tenant. A {:error, :not_found} means either the project does not exist or belongs to another tenant — either way, drop the attribution silently.",
+    "Story-to-project derivation: Loopctl.WorkBreakdown.get_story(tenant_id, story_id) returns a %Story{} with project_id preloaded in the base query. If not preloaded, add a select-only query that returns %{id, project_id} to avoid loading ACs/metadata.",
+    "Test async safety: this file uses async: true via DataCase. Use Mox.set_mox_from_context(tags) and ensure the Task.Supervisor flush pattern used elsewhere in loopctl tests (see existing knowledge tests for the pattern).",
+    "No changes to the API surface (controllers) in this story — the opts plumbing stops at the context module. Controller wiring is part of US-25.3 via the MCP tool surface.",
+    "Do NOT expand RLS policy to include project_id. Tenant_id is the boundary; project_id is a reporting dimension.",
+    "Index naming follows the existing convention: <table>_<cols>_idx with DESC on inserted_at for timeline queries."
+  ],
+  "dependencies": [
+    "US-22.1",
+    "US-22.3"
+  ],
+  "estimated_hours": 5
+}

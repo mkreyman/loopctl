@@ -1,0 +1,232 @@
+{
+  "id": "US-25.3",
+  "title": "MCP Tool Context Parameters & agent_id Disambiguation",
+  "epic": {
+    "id": "epic_25",
+    "name": "Knowledge Wiki Attribution & Analytics"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "AI implementation agent working on a loopctl-tracked story",
+    "i_want_to": "pass the project_id and story_id I am working on when calling the knowledge wiki MCP tools, and receive a non-ambiguous parameter name when querying agent usage analytics",
+    "so_that": "my wiki reads are attributed to the correct project and story without the orchestrator having to correlate timestamps, and I do not hit a silent 'zero results' bug because I passed an agents.id when the tool wanted an api_keys.id"
+  },
+  "rationale": "The HTTP API gains attribution in US-25.1 and analytics slices in US-25.2, but the MCP server surface is still what implementation agents actually call. Today mcp__loopctl__knowledge_search, knowledge_get, knowledge_context, and knowledge_index have no way to pass project_id or story_id — they just forward q and filters. And mcp__loopctl__knowledge_agent_usage advertises a parameter named agent_id but actually expects api_keys.id, which caused real confusion while debugging HomeCareBilling wiki usage in April 2026 (we silently got zero results and blamed the agent, when the agent had 31 reads). This story fixes both: it plumbs project_id/story_id through the MCP tool call to the HTTP body, and it reshapes the agent_usage tool to accept either flavor of id with a clear parameter name.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-25.3.1",
+      "description": "mcp__loopctl__knowledge_search gains two optional string parameters: project_id and story_id. When present, they are forwarded as query params on the underlying GET /api/v1/knowledge/search request. The tool description is updated to recommend always passing story_id when the agent is working on a loopctl story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.2",
+      "description": "mcp__loopctl__knowledge_get gains the same project_id and story_id optional parameters, forwarded to GET /api/v1/articles/:id as query params.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.3",
+      "description": "mcp__loopctl__knowledge_context gains the same two optional parameters, forwarded to the underlying context endpoint. When the MCP caller has already specified a story_id at the top level of the call (some context tools accept it for other reasons), the top-level value takes precedence and no error is raised.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.4",
+      "description": "mcp__loopctl__knowledge_index gains the same two optional parameters, forwarded as query params.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.5",
+      "description": "mcp__loopctl__knowledge_agent_usage replaces its single agent_id parameter with a disambiguated signature. The new tool accepts exactly one of: api_key_id (string, uuid, the api_keys.id credential) OR agent_id (string, uuid, the agents.id logical identity). Passing both returns a validation error before hitting the HTTP API. Passing neither returns a validation error. The tool description explicitly explains the difference and links to the chain-of-custody doc.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.6",
+      "description": "Backward compatibility shim: for one release cycle, the old signature {agent_id: <uuid>} continues to work by routing to the server's dual-resolution endpoint (US-25.2 AC-25.2.3). The tool emits a deprecation warning in the tool response's metadata field when only the ambiguous old-shape argument is used, pointing users at api_key_id / agent_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.7",
+      "description": "The MCP server's README (mcp-server/README.md) gains a 'Wiki Attribution' section explaining: (a) pass project_id and story_id on every wiki read so analytics can attribute your work; (b) the difference between api_key_id and agent_id in knowledge_agent_usage; (c) the old agent_id behavior is deprecated.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.8",
+      "description": "Example usage snippets in mcp-server/README.md show a typical implementation agent workflow: get_story -> knowledge_search with story_id passed -> knowledge_get with story_id passed. The snippets use realistic UUIDs and make clear that story_id is optional but strongly recommended.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.9",
+      "description": "The tool description text for all four read tools (search, get, context, index) includes the same one-line nudge: 'Pass story_id when working on a loopctl story so reads attribute correctly.' This text is the primary mechanism by which agents learn to pass the parameter, so it must be concise and appear in the default tool listing Claude Code shows.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.3.10",
+      "description": "No schema or HTTP API changes in this story — all server-side work is done in US-25.1 and US-25.2. This is a pure mcp-server package update, shippable as a patch release of loopctl-mcp-server on npm.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-25.3.1",
+      "name": "knowledge_search forwards project_id and story_id to the HTTP call",
+      "type": "unit",
+      "preconditions": [
+        "Nock or a mock HTTP transport intercepting loopctl API calls",
+        "LOOPCTL_SERVER = http://localhost:4000",
+        "LOOPCTL_AGENT_KEY = lc_test_key"
+      ],
+      "steps": [
+        "Invoke the MCP tool handler for knowledge_search with args: {q: 'csv import', project_id: 'b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0', story_id: '89aa0c48-5cf5-4925-b164-21684ef79c4d'}",
+        "Capture the outbound HTTP request"
+      ],
+      "expected_results": [
+        "Request URL contains project_id=b50c9e38-... and story_id=89aa0c48-... as query params",
+        "Authorization header set from LOOPCTL_AGENT_KEY",
+        "Request method is GET"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.2",
+      "name": "knowledge_search omits project_id/story_id when not passed",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport"
+      ],
+      "steps": [
+        "Invoke knowledge_search with args: {q: 'csv import'}",
+        "Capture outbound request"
+      ],
+      "expected_results": [
+        "Request URL has no project_id or story_id query params",
+        "Request succeeds (backward compatible)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.3",
+      "name": "knowledge_agent_usage with api_key_id routes to credential query",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport"
+      ],
+      "steps": [
+        "Invoke knowledge_agent_usage with args: {api_key_id: 'b977c90c-061b-4e42-8afa-26a5efde51ad', since_days: 7}",
+        "Capture outbound request"
+      ],
+      "expected_results": [
+        "Request URL is /api/v1/knowledge/analytics/agents/b977c90c-061b-4e42-8afa-26a5efde51ad",
+        "Query contains since_days=7",
+        "No deprecation warning in the tool response metadata"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.4",
+      "name": "knowledge_agent_usage with agent_id routes to logical-agent query",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport"
+      ],
+      "steps": [
+        "Invoke knowledge_agent_usage with args: {agent_id: '09429bc4-328f-42f4-acec-db48b40849b2', since_days: 7}",
+        "Capture outbound request"
+      ],
+      "expected_results": [
+        "Request URL is /api/v1/knowledge/analytics/agents/09429bc4-328f-42f4-acec-db48b40849b2",
+        "Server-side dual-resolution (US-25.2) will figure out this is an agents.id",
+        "No deprecation warning in the tool response metadata"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.5",
+      "name": "knowledge_agent_usage errors when both api_key_id and agent_id are passed",
+      "type": "unit",
+      "preconditions": [
+        "None"
+      ],
+      "steps": [
+        "Invoke knowledge_agent_usage with args: {api_key_id: '<uuid>', agent_id: '<uuid>'}"
+      ],
+      "expected_results": [
+        "Tool returns a validation error before any HTTP request",
+        "Error message mentions 'pass exactly one of api_key_id or agent_id'",
+        "No outbound HTTP traffic"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.6",
+      "name": "knowledge_agent_usage errors when neither api_key_id nor agent_id is passed",
+      "type": "unit",
+      "preconditions": [
+        "None"
+      ],
+      "steps": [
+        "Invoke knowledge_agent_usage with args: {since_days: 7}"
+      ],
+      "expected_results": [
+        "Tool returns a validation error",
+        "Error message mentions the required parameters",
+        "No outbound HTTP traffic"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.7",
+      "name": "Deprecation warning for legacy single-parameter shape",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport",
+        "Mock response body with valid agent_usage payload"
+      ],
+      "steps": [
+        "Invoke knowledge_agent_usage using the LEGACY shape accepted by the old tool: the server-side tool accepts {agent_id: <uuid>} but the new validator treats this as ambiguous. For one release, this still routes to the dual-resolution endpoint but surfaces a deprecation warning.",
+        "Inspect the tool response metadata"
+      ],
+      "expected_results": [
+        "The HTTP call still succeeds",
+        "The tool response metadata contains a deprecation_warning field",
+        "Warning text points at api_key_id vs agent_id split"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.3.8",
+      "name": "README includes Wiki Attribution section with usage snippets",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server/README.md exists"
+      ],
+      "steps": [
+        "Read mcp-server/README.md"
+      ],
+      "expected_results": [
+        "File contains a heading 'Wiki Attribution'",
+        "Section explains project_id / story_id context params",
+        "Section explains api_key_id vs agent_id disambiguation",
+        "File contains a JSON example for knowledge_search with story_id"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "MCP server source: mcp-server/index.js (published as loopctl-mcp-server on npm)",
+    "Tool definitions live in the ListToolsResponse of mcp-server/index.js. Search for 'knowledge_search', 'knowledge_get', 'knowledge_context', 'knowledge_index', 'knowledge_agent_usage' to find their current shapes.",
+    "HTTP client layer in mcp-server uses fetch — project_id and story_id become URLSearchParams entries when present. Use a helper like appendIfDefined(params, 'project_id', args.project_id) to keep the code clean.",
+    "The MCP protocol returns validation errors by throwing an InputValidationError-shaped object or returning { isError: true, content: [...] }. Follow the existing pattern in mcp-server for how other tools signal validation failures.",
+    "Deprecation warning delivery: MCP tool responses have a content array and a metadata object. Put the deprecation note in metadata so it does not pollute the tool output Claude Code renders to the user. Example: { metadata: { deprecation_warning: 'knowledge_agent_usage: agent_id is deprecated, use api_key_id or the new logical agent_id semantics' } }.",
+    "Bump loopctl-mcp-server to a new minor version in mcp-server/package.json. Add a changelog entry under mcp-server/CHANGELOG.md (or the equivalent file) documenting the new params and the deprecation.",
+    "The tool description text is what Claude Code surfaces when the tool is first introduced via ToolSearch. Keep it under 300 characters so it does not get truncated in the listing.",
+    "Cross-reference US-25.1 AC-25.1.7 (cross-tenant attribution dropped silently) — the MCP tool should NOT validate tenant ownership of project_id/story_id client-side. The server handles that. The tool just forwards whatever the agent passes.",
+    "No code changes to lib/loopctl_web or lib/loopctl are required by this story — all server-side plumbing is already in US-25.1 and US-25.2. This is a pure mcp-server update.",
+    "Testing convention for mcp-server: the test file lives at mcp-server/test/knowledge_tools.test.js (or .ts depending on repo convention). Use vitest or node:test per the existing mcp-server test setup. Mock the fetch transport; do not hit a live loopctl instance in unit tests.",
+    "The .mcp.json example file (added in PR #84) does not need to change — this story is about what agents pass as tool arguments, not about what env vars they set."
+  ],
+  "dependencies": [
+    "US-25.1",
+    "US-25.2"
+  ],
+  "estimated_hours": 4
+}
