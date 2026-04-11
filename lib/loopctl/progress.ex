@@ -1439,8 +1439,10 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # nil reviewer_agent_id: no agent identity to compare — cannot self-review
-  defp validate_not_self_review(_story, nil), do: :ok
+  # nil reviewer_agent_id: no attributable reviewer — default to rejecting.
+  # The controller must enforce non-nil upstream; this is defense-in-depth
+  # for any future code path that calls record_review/4 directly.
+  defp validate_not_self_review(_story, nil), do: {:error, :self_review_blocked}
 
   defp validate_not_self_review(story, reviewer_agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do

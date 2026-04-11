@@ -13,6 +13,7 @@ defmodule LoopctlWeb.ReviewRecordController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.Agents
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Progress
   alias LoopctlWeb.AuditContext
@@ -69,6 +70,18 @@ defmodule LoopctlWeb.ReviewRecordController do
              description:
                "When the review completed (defaults to now). Must be after reported_done_at.",
              example: "2026-03-30T01:44:41Z"
+           },
+           reviewer_agent_id: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             description:
+               "Optional explicit reviewer agent id. Required when the calling API key " <>
+                 "does not have an agent_id set (e.g., user-role keys recording a manual " <>
+                 "review on behalf of a human reviewer). Must belong to the caller's tenant " <>
+                 "and must differ from the story's assigned implementer. When the caller's " <>
+                 "API key already has an agent_id, this field defaults to that value and " <>
+                 "must not be set to the same value explicitly.",
+             example: "09429bc4-1234-5678-90ab-cdef12345678"
            }
          }
        }},
@@ -89,16 +102,62 @@ defmodule LoopctlWeb.ReviewRecordController do
   def create(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    reviewer_agent_id = api_key.agent_id
 
-    # Agent and orchestrator keys must have an agent_id set for chain-of-custody enforcement.
-    # User-role keys may legitimately record reviews without an agent identity.
-    if api_key.role in [:agent, :orchestrator] and is_nil(reviewer_agent_id) do
-      {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
-    else
+    # Determine the reviewer agent id:
+    #   - Prefer the explicit body param if provided. This is the path for
+    #     user-role keys that don't have an agent_id of their own (e.g.,
+    #     a human admin recording a manual review by a specific agent).
+    #   - Fall back to the caller's own agent_id.
+    #   - Reject if neither is available — reviews must always be attributable.
+    body_reviewer_id = params["reviewer_agent_id"]
+    reviewer_agent_id = body_reviewer_id || api_key.agent_id
+
+    with :ok <- validate_reviewer_identity_present(reviewer_agent_id),
+         :ok <- validate_reviewer_tenant(tenant_id, reviewer_agent_id),
+         :ok <- validate_reviewer_not_self_via_body(api_key, body_reviewer_id) do
       do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params)
     end
   end
+
+  # Every review_complete call must have an attributable reviewer agent id.
+  # This eliminates the nil-bypass where a user-role key with no agent_id
+  # could record a review without ever triggering the self-review check.
+  defp validate_reviewer_identity_present(nil) do
+    {:error, :unprocessable_entity,
+     "reviewer_agent_id is required. Provide it in the request body or " <>
+       "authenticate with a key that has an agent_id set."}
+  end
+
+  defp validate_reviewer_identity_present(_), do: :ok
+
+  # The declared reviewer agent id must belong to the caller's tenant.
+  # This prevents a caller from claiming a review by an agent from another
+  # tenant (which would both 404 at read time AND pollute the review record).
+  defp validate_reviewer_tenant(tenant_id, reviewer_agent_id) do
+    case Agents.get_agent(tenant_id, reviewer_agent_id) do
+      {:ok, _agent} ->
+        :ok
+
+      {:error, :not_found} ->
+        {:error, :unprocessable_entity,
+         "reviewer_agent_id not found in tenant. The declared reviewer must " <>
+           "be an existing agent in the current tenant."}
+    end
+  end
+
+  # When a caller passes reviewer_agent_id in the body AND has their own
+  # agent_id on the key, the body value must not equal the caller's own
+  # agent — that's bypass theater ("I'm reviewing this, but I'm also the
+  # same agent that implemented it").
+  defp validate_reviewer_not_self_via_body(%{agent_id: caller_agent_id}, body_reviewer_id)
+       when not is_nil(caller_agent_id) and not is_nil(body_reviewer_id) and
+              caller_agent_id == body_reviewer_id do
+    {:error, :unprocessable_entity,
+     "reviewer_agent_id in request body must not match the caller's own agent_id. " <>
+       "Use a different agent or authenticate as that agent directly."}
+  end
+
+  defp validate_reviewer_not_self_via_body(_api_key, _body_reviewer_id), do: :ok
 
   defp do_create_review(conn, tenant_id, reviewer_agent_id, story_id, params) do
     opts =

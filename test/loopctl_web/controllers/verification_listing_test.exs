@@ -63,9 +63,16 @@ defmodule LoopctlWeb.VerificationListingTest do
   end
 
   # Creates a fresh review_record so the next POST /verify succeeds.
-  defp create_review_record(tenant_id, story_id) do
+  # Reviewer must be attributable and differ from the implementer per the
+  # "Reviews Require Attributable Reviewer Identity" invariant.
+  defp create_review_record(tenant_id, story_id, reviewer_agent_id) do
     {:ok, _} =
-      Progress.record_review(tenant_id, story_id, %{"review_type" => "enhanced"})
+      Progress.record_review(
+        tenant_id,
+        story_id,
+        %{"review_type" => "enhanced"},
+        reviewer_agent_id: reviewer_agent_id
+      )
   end
 
   # --- Paginated verification listing ---
@@ -167,10 +174,11 @@ defmodule LoopctlWeb.VerificationListingTest do
 
   describe "iteration field auto-computation" do
     test "verify creates verification result with correct iteration number", %{conn: conn} do
-      %{tenant: tenant, story: story, orch_key: orch_key} = setup_verified_story()
+      %{tenant: tenant, story: story, orch_key: orch_key, orch_agent: orch_agent} =
+        setup_verified_story()
 
       # Create review record so first verify succeeds
-      create_review_record(tenant.id, story.id)
+      create_review_record(tenant.id, story.id, orch_agent.id)
 
       # First verification
       build_conn()
@@ -200,7 +208,7 @@ defmodule LoopctlWeb.VerificationListingTest do
       |> Loopctl.AdminRepo.update!()
 
       # Create a fresh review record so second verify succeeds
-      create_review_record(tenant.id, story.id)
+      create_review_record(tenant.id, story.id, orch_agent.id)
 
       # Second verification
       build_conn()
@@ -227,10 +235,11 @@ defmodule LoopctlWeb.VerificationListingTest do
 
   describe "verification result fields" do
     test "result enum includes pass, fail values", %{conn: conn} do
-      %{tenant: tenant, story: story, orch_key: orch_key} = setup_verified_story()
+      %{tenant: tenant, story: story, orch_key: orch_key, orch_agent: orch_agent} =
+        setup_verified_story()
 
       # Create review record so verify succeeds
-      create_review_record(tenant.id, story.id)
+      create_review_record(tenant.id, story.id, orch_agent.id)
 
       # Verify (pass)
       build_conn()

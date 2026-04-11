@@ -120,6 +120,31 @@ Ask these questions:
 - `LOOPCTL_REVIEWER_KEY` — separate agent identity, used ONLY via curl by review agents (never in the same MCP server as the agent key)
 - `LOOPCTL_USER_KEY` — user role, used ONLY via curl for destructive/admin operations
 
+### Reviews Require Attributable Reviewer Identity
+
+Every `POST /api/v1/stories/:id/review-complete` call must carry a non-nil
+reviewer agent id that (a) belongs to the caller's tenant and (b) is
+different from the story's `assigned_agent_id`. There is NO nil
+short-circuit: if the caller can't declare who reviewed the work, the
+review is rejected.
+
+**How the reviewer id is determined**:
+1. If the request body contains `reviewer_agent_id`, that value is used.
+2. Otherwise, the calling api_key's `agent_id` is used.
+3. If neither is available, the request is rejected with 422.
+
+**User-role keys** must explicitly declare `reviewer_agent_id` in the
+request body unless they happen to also have an `agent_id` bound to
+their api_key. This preserves the legitimate "human admin records a
+manual review" use case while eliminating the nil bypass.
+
+**Why**: a previous implementation returned `:ok` when the reviewer id
+was nil, on the theory that "no agent identity → cannot self-review".
+That default was wrong — it accepted reviews with no attribution, which
+let a user-role caller bypass the self-review check by never having an
+agent_id at all. The correct default is to reject when identity is
+unknown.
+
 ## Dependency Injection — Config-Based (NOT Opts-Based)
 
 **All external dependencies use behaviours + config-based DI:**

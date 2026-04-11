@@ -615,8 +615,13 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     test "verifies all reported_done unverified stories in an epic when review_records exist", %{
       conn: conn
     } do
-      %{tenant: tenant, epic: epic, impl_agent: impl_agent, orch_key: orch_key} =
-        setup_reported_story()
+      %{
+        tenant: tenant,
+        epic: epic,
+        impl_agent: impl_agent,
+        orch_agent: orch_agent,
+        orch_key: orch_key
+      } = setup_reported_story()
 
       # Create 2 more reported_done stories in the same epic, each with a review_record
       for _ <- 1..2 do
@@ -632,10 +637,15 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           |> Loopctl.AdminRepo.update!()
 
         {:ok, _} =
-          Progress.record_review(tenant.id, story.id, %{
-            "review_type" => "enhanced",
-            "summary" => "Passed"
-          })
+          Progress.record_review(
+            tenant.id,
+            story.id,
+            %{
+              "review_type" => "enhanced",
+              "summary" => "Passed"
+            },
+            reviewer_agent_id: orch_agent.id
+          )
       end
 
       conn =
@@ -753,11 +763,21 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       %{tenant: tenant, story: story} = setup_reported_story(%{with_review_record: false})
       {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
+      # User-role keys with nil agent_id must declare an explicit reviewer
+      # in the request body (per the Reviews Require Attributable Reviewer
+      # Identity invariant in CLAUDE.md).
+      reviewer_agent =
+        fixture(:agent, %{
+          tenant_id: tenant.id,
+          name: "human-reviewer-#{:erlang.unique_integer([:positive])}"
+        })
+
       conn =
         conn
         |> auth_conn(user_key)
         |> post(~p"/api/v1/stories/#{story.id}/review-complete", %{
-          "review_type" => "team"
+          "review_type" => "team",
+          "reviewer_agent_id" => reviewer_agent.id
         })
 
       assert json_response(conn, 201)
