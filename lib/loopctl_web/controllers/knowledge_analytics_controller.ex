@@ -8,6 +8,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   - `GET /api/v1/knowledge/analytics/top-articles` -- top accessed articles
   - `GET /api/v1/knowledge/articles/:id/stats` -- per-article usage stats
   - `GET /api/v1/knowledge/analytics/agents/:agent_id` -- per-agent usage
+  - `GET /api/v1/knowledge/analytics/projects/:id/usage` -- per-project rollup
   - `GET /api/v1/knowledge/analytics/unused-articles` -- unused published articles
   """
 
@@ -26,11 +27,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   @max_limit 100
   @max_unused_limit 200
   @valid_access_types ~w(search get context index)
+  @valid_group_by ~w(article project agent)
 
   operation(:top_articles,
     summary: "Top accessed knowledge articles",
     description:
       "Returns the top accessed articles for the tenant in a time window. " <>
+        "Supports `project_id` filtering and `group_by` (article|project|agent). " <>
         "Role: orchestrator+.",
     parameters: [
       limit: [
@@ -42,13 +45,26 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       since_days: [
         in: :query,
         type: :integer,
-        description: "Look back this many days (default 7)",
+        description: "Look back this many days (default 7, min 1, max 365)",
         required: false
       ],
       access_type: [
         in: :query,
         type: :string,
         description: "Restrict to a single access type (search, get, context, index)",
+        required: false
+      ],
+      project_id: [
+        in: :query,
+        type: :string,
+        description:
+          "Filter events to a single project_id (events without attribution are excluded)",
+        required: false
+      ],
+      group_by: [
+        in: :query,
+        type: :string,
+        description: "Grouping dimension: article (default), project, or agent",
         required: false
       ]
     ],
@@ -64,12 +80,15 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   @doc "GET /api/v1/knowledge/analytics/top-articles"
   def top_articles(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    group_by = parse_group_by(params["group_by"])
 
     opts =
       []
       |> put_limit(params["limit"], 20, @max_limit)
       |> put_since(params["since_days"], 7)
       |> put_access_type(params["access_type"])
+      |> put_project_id(params["project_id"])
+      |> Keyword.put(:group_by, group_by)
 
     rows = Knowledge.list_top_articles(tenant_id, opts)
     json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.top_articles(rows, opts))
@@ -107,13 +126,16 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   operation(:agent_usage,
     summary: "Per-agent knowledge usage",
     description:
-      "Returns the reads, top articles, and access type breakdown for a specific " <>
-        "api_key (agent identity). Role: orchestrator+.",
+      ~s(Returns the reads, top articles, and access type breakdown for a single ) <>
+        ~s(api_key OR logical agent. The path parameter is resolved against ) <>
+        ~s(`api_keys.id` first, then `agents.id`. The response envelope includes ) <>
+        ~s(`resolved_as: "api_key" | "agent"` so callers can tell which branch ) <>
+        ~s(ran. Cross-tenant or missing ids return 404. Role: orchestrator+.),
     parameters: [
       agent_id: [
         in: :path,
         type: :string,
-        description: "API key UUID identifying the agent",
+        description: "API key UUID or agent UUID",
         required: true
       ],
       limit: [
@@ -125,7 +147,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       since_days: [
         in: :query,
         type: :integer,
-        description: "Look back this many days (default 7)",
+        description: "Look back this many days (default 7, min 1, max 365)",
         required: false
       ]
     ],
@@ -133,12 +155,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       200 =>
         {"Agent usage", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/analytics/agents/:agent_id"
-  def agent_usage(conn, %{"agent_id" => api_key_id} = params) do
+  def agent_usage(conn, %{"agent_id" => id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
     opts =
@@ -146,8 +169,61 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       |> put_limit(params["limit"], 20, @max_limit)
       |> put_since(params["since_days"], 7)
 
-    usage = Knowledge.get_agent_usage(tenant_id, api_key_id, opts)
-    json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.agent_usage(usage, opts))
+    with {:ok, usage} <- Knowledge.get_agent_usage(tenant_id, id, opts) do
+      json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.agent_usage(usage, opts))
+    end
+  end
+
+  operation(:project_usage,
+    summary: "Per-project wiki usage rollup",
+    description:
+      "Returns total reads, unique articles, unique callers, access type " <>
+        "breakdown, top articles, and a zero-filled daily read-count series " <>
+        "for a single project. Cross-tenant or missing projects return 404. " <>
+        "Role: orchestrator+.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        description: "Project UUID",
+        required: true
+      ],
+      since_days: [
+        in: :query,
+        type: :integer,
+        description: "Look back this many days (default 7, min 1, max 365)",
+        required: false
+      ],
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Max top articles to return (default 20, max 100)",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Project usage", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/analytics/projects/:id/usage"
+  def project_usage(conn, %{"id" => project_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    since_days = parse_int(params["since_days"], 7) |> max(1) |> min(365)
+
+    opts =
+      []
+      |> put_limit(params["limit"], 20, @max_limit)
+      |> Keyword.put(:since_days, since_days)
+
+    with {:ok, usage} <- Knowledge.get_project_usage(tenant_id, project_id, opts) do
+      json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.project_usage(usage, since_days))
+    end
   end
 
   operation(:unused_articles,
@@ -212,6 +288,27 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   end
 
   defp put_access_type(opts, _), do: opts
+
+  defp put_project_id(opts, nil), do: opts
+  defp put_project_id(opts, ""), do: opts
+
+  defp put_project_id(opts, value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, cast_id} -> Keyword.put(opts, :project_id, cast_id)
+      :error -> opts
+    end
+  end
+
+  defp put_project_id(opts, _), do: opts
+
+  defp parse_group_by(nil), do: :article
+  defp parse_group_by(""), do: :article
+
+  defp parse_group_by(value) when value in @valid_group_by do
+    String.to_existing_atom(value)
+  end
+
+  defp parse_group_by(_), do: :article
 
   defp put_int(opts, key, value, default, min_value, max_value) do
     Keyword.put(opts, key, parse_int(value, default) |> max(min_value) |> min(max_value))

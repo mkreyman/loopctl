@@ -530,6 +530,8 @@ defmodule Loopctl.Fixtures do
           {id, attrs}
       end
 
+    project_id = Map.get(attrs, :project_id)
+    story_id = Map.get(attrs, :story_id)
     data = build(:article_access_event, attrs)
 
     changeset =
@@ -537,6 +539,8 @@ defmodule Loopctl.Fixtures do
       |> ArticleAccessEvent.create_changeset(%{
         article_id: article_id,
         api_key_id: api_key_id,
+        project_id: project_id,
+        story_id: story_id,
         access_type: data.access_type,
         metadata: data.metadata,
         accessed_at: data.accessed_at
