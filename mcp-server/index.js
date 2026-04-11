@@ -169,6 +169,16 @@ async function createProject({ name, slug, repo_url, description, tech_stack, mi
   return toContent(result);
 }
 
+async function deleteProject({ project_id }) {
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/projects/${project_id}`,
+    null,
+    process.env.LOOPCTL_USER_KEY
+  );
+  return toContent(result);
+}
+
 async function getProgress({ project_id, include_cost }) {
   const params = new URLSearchParams();
   if (include_cost) params.set("include_cost", "true");
@@ -645,6 +655,21 @@ const TOOLS = [
         },
       },
       required: ["name", "slug"],
+    },
+  },
+  {
+    name: "delete_project",
+    description:
+      "Delete a project and all of its dependent resources (epics, stories, audit entries scoped to it). REQUIRES LOOPCTL_USER_KEY to be set in the MCP server env (user role — orchestrator role is NOT sufficient for this destructive operation). The deletion is irreversible.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "The UUID of the project to delete.",
+        },
+      },
+      required: ["project_id"],
     },
   },
   {
@@ -1635,6 +1660,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "create_project":
       return await createProject(args);
+
+    case "delete_project":
+      return await deleteProject(args);
 
     case "get_progress":
       return await getProgress(args);
