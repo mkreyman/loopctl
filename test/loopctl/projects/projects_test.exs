@@ -271,6 +271,105 @@ defmodule Loopctl.ProjectsTest do
     end
   end
 
+  describe "mission field" do
+    test "creates project with mission" do
+      tenant = fixture(:tenant)
+
+      mission = "Build the #1 AI note-taking app to $1M MRR."
+
+      attrs = %{
+        name: "notes",
+        slug: "notes",
+        mission: mission
+      }
+
+      assert {:ok, project} =
+               Projects.create_project(tenant.id, attrs,
+                 actor_id: uuid(),
+                 actor_label: "user:admin"
+               )
+
+      assert project.mission == mission
+    end
+
+    test "creates project without mission (defaults to nil)" do
+      tenant = fixture(:tenant)
+
+      attrs = %{name: "plain", slug: "plain"}
+
+      assert {:ok, project} =
+               Projects.create_project(tenant.id, attrs,
+                 actor_id: uuid(),
+                 actor_label: "user:admin"
+               )
+
+      assert project.mission == nil
+    end
+
+    test "trims whitespace from mission" do
+      tenant = fixture(:tenant)
+
+      attrs = %{name: "trim", slug: "trim", mission: "   Be awesome.   "}
+
+      assert {:ok, project} =
+               Projects.create_project(tenant.id, attrs,
+                 actor_id: uuid(),
+                 actor_label: "user:admin"
+               )
+
+      assert project.mission == "Be awesome."
+    end
+
+    test "normalizes empty-string mission to nil" do
+      tenant = fixture(:tenant)
+
+      attrs = %{name: "empty", slug: "empty", mission: "   "}
+
+      assert {:ok, project} =
+               Projects.create_project(tenant.id, attrs,
+                 actor_id: uuid(),
+                 actor_label: "user:admin"
+               )
+
+      assert project.mission == nil
+    end
+
+    test "rejects mission longer than 2000 characters" do
+      tenant = fixture(:tenant)
+
+      long_mission = String.duplicate("a", 2001)
+      attrs = %{name: "toolong", slug: "toolong", mission: long_mission}
+
+      assert {:error, changeset} =
+               Projects.create_project(tenant.id, attrs,
+                 actor_id: uuid(),
+                 actor_label: "user:admin"
+               )
+
+      assert errors_on(changeset).mission != []
+    end
+
+    test "updates mission via update_project" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, mission: "old goal"})
+
+      assert {:ok, updated} =
+               Projects.update_project(tenant.id, project, %{mission: "new goal"})
+
+      assert updated.mission == "new goal"
+    end
+
+    test "clears mission via empty string" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, mission: "old goal"})
+
+      assert {:ok, updated} =
+               Projects.update_project(tenant.id, project, %{mission: ""})
+
+      assert updated.mission == nil
+    end
+  end
+
   describe "archive_project/3" do
     test "archives project by setting status to archived" do
       tenant = fixture(:tenant)

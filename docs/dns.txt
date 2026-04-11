@@ -1,0 +1,13 @@
+loopctl.com records
+
+Name Servers
+doma269397.earth.orderbox-dns.com
+doma269397.mars.orderbox-dns.com
+doma269397.mercury.orderbox-dns.com
+doma269397.venus.orderbox-dns.com
+
+  ├──────┼──────┼────────────────────────┤
+  │ A    │ @    │ 66.241.127.218         │
+  ├──────┼──────┼────────────────────────┤
+  │ AAAA │ @    │ 2a09:8280:1::ef:572c:1 │
+  └──────┴──────┴────────────────────────┘

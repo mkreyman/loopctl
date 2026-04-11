@@ -36,6 +36,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ContentChunker
 
   @content_extractor Application.compile_env(
                        :loopctl,
@@ -81,24 +82,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   # --- Private ---
 
-  # Content chunking threshold: ~8KB. Content larger than this is split
-  # into chunks and each chunk is extracted separately to avoid LLM
-  # response truncation from max_tokens limits.
-  @chunk_threshold 8_000
-
-  defp extract_with_chunking(content, source_type) when byte_size(content) <= @chunk_threshold do
-    case @content_extractor.extract_from_content(content, source_type: source_type) do
-      {:ok, articles} -> {:ok, articles}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   defp extract_with_chunking(content, source_type) do
-    chunks = chunk_content(content)
+    chunks = ContentChunker.chunk(content)
 
-    Logger.info(
-      "ContentIngestionWorker: splitting #{byte_size(content)} bytes into #{length(chunks)} chunks"
-    )
+    if length(chunks) > 1 do
+      Logger.info(
+        "ContentIngestionWorker: splitting #{byte_size(content)} bytes into #{length(chunks)} chunks"
+      )
+    end
 
     {articles, errors} =
       Enum.reduce(chunks, {[], []}, fn chunk, {arts, errs} ->
@@ -117,48 +108,56 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
           )
         end
 
-        {:ok, Enum.take(articles, @max_articles)}
+        {:ok, articles |> dedup_articles() |> Enum.take(@max_articles)}
 
       errors != [] ->
         # All chunks failed — propagate the first error so Oban retries
         {:error, List.first(errors)}
 
       true ->
-        # No chunks produced anything but no errors either (empty content)
+        # All chunks succeeded but extracted no articles — legitimately
+        # nothing reusable in the content.
         {:ok, []}
     end
   end
 
-  # Split content into chunks at logical boundaries (headings, blank lines).
-  # Each chunk stays under @chunk_threshold bytes.
-  defp chunk_content(content) do
-    # Split on markdown headings (## or #) as primary boundaries
-    sections =
-      content
-      |> String.split(~r/(?=^\#{1,3}\s)/m)
-      |> Enum.reject(&(String.trim(&1) == ""))
-
-    # Merge small sections together until we approach the threshold
-    merge_sections(sections, [], "")
+  # When content is split into chunks, the same article may be extracted
+  # from two overlapping chunks. Dedup by normalized title before capping.
+  #
+  # Two rules:
+  #   1. Articles with blank/missing titles are NEVER merged together (each
+  #      gets a unique sentinel key). They'll be rejected later by schema
+  #      validation anyway, but collapsing them here would silently drop
+  #      distinct articles.
+  #   2. When duplicates exist, keep the one with the LONGEST body (the
+  #      more complete extraction, vs a truncated partial from a chunk
+  #      boundary). Enum.uniq_by keeps first-occurrence, so we sort by
+  #      body length descending first.
+  defp dedup_articles(articles) do
+    articles
+    |> Enum.sort_by(&article_body_length/1, :desc)
+    |> Enum.uniq_by(&article_dedup_key/1)
   end
 
-  defp merge_sections([], acc, current) do
-    if String.trim(current) != "" do
-      Enum.reverse([current | acc])
+  defp article_dedup_key(article) do
+    title =
+      (Map.get(article, :title) || Map.get(article, "title") || "")
+      |> String.trim()
+      |> String.downcase()
+
+    if title == "" do
+      # Unique sentinel so blank-title articles are never merged together.
+      # They'll be filtered by downstream validation, but don't collapse
+      # them here.
+      {:no_title, System.unique_integer([:positive])}
     else
-      Enum.reverse(acc)
+      title
     end
   end
 
-  defp merge_sections([section | rest], acc, current) do
-    candidate = current <> "\n" <> section
-
-    if byte_size(candidate) > @chunk_threshold and String.trim(current) != "" do
-      # Current chunk is full, start a new one
-      merge_sections(rest, [current | acc], section)
-    else
-      merge_sections(rest, acc, candidate)
-    end
+  defp article_body_length(article) do
+    body = Map.get(article, :body) || Map.get(article, "body") || ""
+    byte_size(body)
   end
 
   defp resolve_content(nil, content) when is_binary(content) and content != "" do

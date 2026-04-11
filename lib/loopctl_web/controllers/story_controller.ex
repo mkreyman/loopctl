@@ -14,6 +14,7 @@ defmodule LoopctlWeb.StoryController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
+  alias Loopctl.Projects
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epics
   alias Loopctl.WorkBreakdown.Stories
@@ -309,6 +310,10 @@ defmodule LoopctlWeb.StoryController do
         {:ok, artifacts_result} = Artifacts.list_artifact_reports(tenant_id, story.id)
         iteration_count = Artifacts.count_verifications(tenant_id, story.id)
 
+        # Fetch project mission so agents see the goal cascade without
+        # having to make a second request. Omits the key when unset.
+        project_mission = fetch_project_mission(tenant_id, story.project_id)
+
         json(conn, %{
           story:
             story_json(story)
@@ -318,6 +323,7 @@ defmodule LoopctlWeb.StoryController do
               latest_verification: nil,
               iteration_count: iteration_count
             })
+            |> maybe_put(:project_mission, project_mission)
         })
 
       {:error, :not_found} ->
@@ -382,6 +388,18 @@ defmodule LoopctlWeb.StoryController do
   end
 
   # --- Private helpers ---
+
+  defp fetch_project_mission(_tenant_id, nil), do: nil
+
+  defp fetch_project_mission(tenant_id, project_id) do
+    case Projects.get_project(tenant_id, project_id) do
+      {:ok, %{mission: mission}} when is_binary(mission) and mission != "" -> mission
+      _ -> nil
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp story_json(story) do
     %{

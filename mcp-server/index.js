@@ -159,11 +159,12 @@ async function listProjects() {
   return toContent(result);
 }
 
-async function createProject({ name, slug, repo_url, description, tech_stack }) {
+async function createProject({ name, slug, repo_url, description, tech_stack, mission }) {
   const body = { name, slug };
   if (repo_url) body.repo_url = repo_url;
   if (description) body.description = description;
   if (tech_stack) body.tech_stack = tech_stack;
+  if (mission) body.mission = mission;
   const result = await apiCall("POST", "/api/v1/projects", body, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
@@ -637,6 +638,11 @@ const TOOLS = [
         repo_url: { type: "string", description: "GitHub repo URL." },
         description: { type: "string", description: "Project description." },
         tech_stack: { type: "string", description: "Tech stack summary." },
+        mission: {
+          type: "string",
+          description:
+            "Optional project mission/goal statement that cascades into story context. Surfaces in get_story responses as project_mission so agents see the why without a second fetch. Max 2000 chars.",
+        },
       },
       required: ["name", "slug"],
     },

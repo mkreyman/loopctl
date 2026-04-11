@@ -112,6 +112,37 @@ defmodule LoopctlWeb.ProjectControllerTest do
 
       assert length(result.data) == 1
     end
+
+    test "creates project with mission and round-trips it in the response", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{
+          "name" => "mission-test",
+          "slug" => "mission-test",
+          "mission" => "Build the #1 AI dev loop tool by 2027."
+        })
+
+      project = json_response(conn, 201)["project"]
+      assert project["mission"] == "Build the #1 AI dev loop tool by 2027."
+    end
+
+    test "returns mission as nil when not provided", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects", %{"name" => "plain", "slug" => "plain"})
+
+      project = json_response(conn, 201)["project"]
+      assert Map.has_key?(project, "mission")
+      assert project["mission"] == nil
+    end
   end
 
   describe "GET /api/v1/projects" do
@@ -278,6 +309,32 @@ defmodule LoopctlWeb.ProjectControllerTest do
       body = json_response(conn, 200)
       assert body["project"]["name"] == "Updated Name"
       assert body["project"]["description"] == "New description"
+    end
+
+    test "updates project mission via PATCH", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id, mission: "old goal"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"mission" => "new goal"})
+
+      assert json_response(conn, 200)["project"]["mission"] == "new goal"
+    end
+
+    test "clears mission when sent as empty string", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id, mission: "old goal"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"mission" => ""})
+
+      assert json_response(conn, 200)["project"]["mission"] == nil
     end
 
     test "does not change slug (slug not in update cast)", %{conn: conn} do
