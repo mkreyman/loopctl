@@ -494,11 +494,16 @@ defmodule Loopctl.Knowledge.Analytics do
   - `:api_key_id` -- the caller-supplied id (when `resolved_as == :api_key`)
   - `:agent_id` -- the logical agent id (when `resolved_as == :agent`)
   - `:agent_name` -- the agent's name (when `resolved_as == :agent`)
-  - `:api_key_count` -- number of live keys rolled up (when `resolved_as == :agent`)
-  - `:total_reads`
-  - `:unique_articles`
-  - `:access_by_type`
-  - `:top_articles`
+  - `:api_key_count` -- number of *live* (non-revoked) keys currently
+    belonging to the agent (when `resolved_as == :agent`)
+  - `:total_reads` -- total events across ALL keys (live + revoked) for
+    the agent. Revoked-key events still count toward historical totals.
+  - `:unique_articles` -- distinct articles across ALL keys (live + revoked)
+  - `:access_by_type` -- per-type counts across ALL keys (live + revoked)
+  - `:top_articles` -- top articles read via *live* keys only. Revoked-key
+    reads are excluded here so the list reflects the agent's current
+    operational surface. This is the only field that uses the live-keys
+    subset; every other aggregate includes revoked-key history.
 
   …or `{:error, :not_found}` if neither an api_key nor an agent with the
   given id exists in the tenant.
@@ -592,8 +597,16 @@ defmodule Loopctl.Knowledge.Analytics do
   end
 
   # Logical-agent rollup — aggregates every live api_key belonging to
-  # the agent. Revoked keys are excluded from the live count but still
-  # contribute to `total_reads`.
+  # the agent.
+  #
+  # Revoked-key handling follows AC-25.2.7: revoked-key events are
+  # included in the "historical" aggregates (`total_reads`,
+  # `unique_articles`, `access_by_type`) because the work happened and
+  # still counts — but excluded from the "live breakdown" fields
+  # (`api_key_count`, `top_articles`) which represent the agent's
+  # current operational surface. This intentional split means
+  # `sum(top_articles[:access_count])` can be less than `total_reads`
+  # when the agent has revoked keys with historical reads.
   defp build_agent_usage(tenant_id, agent_id, since, limit) do
     agent = AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id)
 
@@ -684,9 +697,9 @@ defmodule Loopctl.Knowledge.Analytics do
   ## Options
 
   - `:limit` -- max top articles to return (default 20, max 100)
-  - `:since` -- DateTime lower bound (default 7 days ago)
-  - `:since_days` -- window length in days; overrides `:since` if given.
-    Used to size the `daily_series`.
+  - `:since_days` -- window length in days (default 7, clamped to [1, 365]).
+    Drives both the count window AND the `daily_series` length, so the
+    two are always consistent.
 
   ## Returns
 
@@ -704,8 +717,10 @@ defmodule Loopctl.Knowledge.Analytics do
     limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
     since_days = opts |> Keyword.get(:since_days, 7) |> max(1) |> min(365)
 
-    since =
-      Keyword.get(opts, :since) || DateTime.add(DateTime.utc_now(), -since_days * 86_400, :second)
+    # `:since` is always derived from `:since_days` so the count window
+    # and the `daily_series` length never desync. Callers cannot override
+    # it directly.
+    since = DateTime.add(DateTime.utc_now(), -since_days * 86_400, :second)
 
     with {:ok, cast_id} <- cast_uuid(project_id),
          {:ok, project} <- Projects.get_project(tenant_id, cast_id) do
@@ -786,21 +801,25 @@ defmodule Loopctl.Knowledge.Analytics do
   end
 
   # Build a zero-filled daily read-count series for the last
-  # `since_days` days. The day buckets are UTC days and the result is
-  # ordered ascending (oldest first).
+  # `since_days` days. The day buckets are explicitly UTC calendar days
+  # (not the Postgres session timezone) so the result matches
+  # `Date.utc_today()` regardless of the DB server's `TimeZone` setting.
+  # Ordered ascending (oldest first).
   defp build_daily_series(tenant_id, project_id, since_days) do
     today = Date.utc_today()
     start = Date.add(today, -(since_days - 1))
 
-    # Group events by UTC calendar day.
+    # Group events by UTC calendar day. We cast `accessed_at AT TIME ZONE
+    # 'UTC'` before `::date` so the bucket edges are always aligned with
+    # `Date.utc_today()` even if the Postgres session TZ is not UTC.
     event_counts =
       from(e in ArticleAccessEvent,
         where: e.tenant_id == ^tenant_id,
         where: e.project_id == ^project_id,
-        where: fragment("(?)::date", e.accessed_at) >= ^start,
-        where: fragment("(?)::date", e.accessed_at) <= ^today,
-        group_by: fragment("(?)::date", e.accessed_at),
-        select: {fragment("(?)::date", e.accessed_at), count(e.id)}
+        where: fragment("((? AT TIME ZONE 'UTC'))::date", e.accessed_at) >= ^start,
+        where: fragment("((? AT TIME ZONE 'UTC'))::date", e.accessed_at) <= ^today,
+        group_by: fragment("((? AT TIME ZONE 'UTC'))::date", e.accessed_at),
+        select: {fragment("((? AT TIME ZONE 'UTC'))::date", e.accessed_at), count(e.id)}
       )
       |> AdminRepo.all()
       |> Map.new()
