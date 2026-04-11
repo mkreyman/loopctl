@@ -1,0 +1,282 @@
+{
+  "id": "US-25.2",
+  "title": "Wiki Access Analytics — Project & Logical-Agent Slicing",
+  "epic": {
+    "id": "epic_25",
+    "name": "Knowledge Wiki Attribution & Analytics"
+  },
+  "priority": "high",
+  "phase": "observability",
+  "story": {
+    "as_a": "tenant orchestrator or administrator",
+    "i_want_to": "query wiki access analytics rolled up by project or by logical agent (not just by api_key credential), and filter top-articles by project",
+    "so_that": "I can answer 'which projects are getting value from the wiki?', 'which agents are actually reading the docs before coding?', and 'what are the hot articles for HomeCareBilling specifically?' from a single endpoint call"
+  },
+  "rationale": "US-25.1 gives us attribution data in the events table; this story turns that data into answers. Today knowledge_analytics_top only groups by article, and knowledge_agent_usage only accepts an api_keys.id — it cannot aggregate across all keys belonging to a logical agent and cannot filter by project at all. The orchestrator running loopctl across multiple SaaS projects needs to see per-project rollups to decide where to invest in more articles, and needs logical-agent rollups because api_keys rotate while agent identities do not. Without these slices, the wiki analytics surface is effectively single-dimensional and cannot drive investment decisions.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-25.2.1",
+      "description": "GET /api/v1/knowledge/analytics/top-articles accepts an optional project_id query parameter. When present, events are filtered to WHERE project_id = ? before aggregation. When absent, behavior is unchanged (aggregate across all events in the tenant).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.2",
+      "description": "GET /api/v1/knowledge/analytics/top-articles accepts an optional group_by query parameter with values 'article' (default, current behavior), 'project', or 'agent'. When group_by=project, each row is %{project_id, project_name, access_count, unique_articles, unique_api_keys}. When group_by=agent, each row is %{agent_id, agent_name, agent_type, access_count, unique_articles, api_key_count} where agent_id is the logical agents.id joined via api_keys.agent_id.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.3",
+      "description": "GET /api/v1/knowledge/analytics/agents/:id accepts the URL path parameter as EITHER an api_keys.id (current behavior) OR an agents.id. The controller first attempts to match api_keys.id; if no rows, it falls back to treating the id as agents.id and JOINs api_keys WHERE agent_id = :id to sum reads across every key belonging to that logical agent. The response envelope includes a new field resolved_as: 'api_key' | 'agent' so callers can tell which branch ran.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.4",
+      "description": "A new endpoint GET /api/v1/knowledge/analytics/projects/:id/usage (role: orchestrator+) returns a per-project rollup: %{project_id, project_name, total_reads, unique_articles, unique_api_keys, unique_agents, access_by_type, top_articles (limit 20), daily_series (array of %{date, read_count} for the last since_days)}. The since_days query parameter defaults to 7 and caps at 365.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.5",
+      "description": "All new and extended queries enforce tenant isolation at the SQL level via tenant_id = ? predicates layered on top of existing RLS. No new RLS policies required. Cross-tenant project_id or agent_id in the URL path returns 404 not_found (not 403), consistent with existing loopctl conventions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.6",
+      "description": "All new and extended query paths use the existing since_days parameter (minimum 1, maximum 365, default 7 for agent_usage / top_articles, default 30 for any future windowed endpoints). Queries are bounded by inserted_at >= now() - since_days.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.7",
+      "description": "Queries that group by agent MUST join api_keys with a LEFT JOIN so events whose api_key has since been revoked still contribute to the rollup (group under a sentinel 'revoked' agent_name). Revoked-key events never appear in the 'live' breakdown but are still counted in total_reads.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-25.2.8",
+      "description": "Query performance: the new group-by and filter paths must use the indexes added in US-25.1. A query plan check (EXPLAIN) for the most common call (top-articles with project_id filter) must show Index Scan on knowledge_access_events_project_id_inserted_at_idx, not Seq Scan.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-25.2.1",
+      "name": "top-articles with project_id filter returns only that project's reads",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project_a = fixture(:project, tenant: tenant)",
+        "project_b = fixture(:project, tenant: tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :orchestrator)",
+        "article_1 = fixture(:article, tenant: tenant, status: :published)",
+        "article_2 = fixture(:article, tenant: tenant, status: :published)",
+        "3 events for article_1 tagged with project_a",
+        "2 events for article_2 tagged with project_b",
+        "1 event for article_1 with project_id = NULL"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/top-articles?project_id=<project_a.id>",
+        "Authorization: Bearer <orchestrator key>"
+      ],
+      "expected_results": [
+        "200 response",
+        "data contains only article_1 with access_count = 3",
+        "article_2 is not present",
+        "The NULL-tagged event for article_1 is NOT counted (project filter excludes NULLs)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.2",
+      "name": "top-articles group_by=project rolls up per project",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project_a = fixture(:project, tenant: tenant, name: \"HomeCareBilling\")",
+        "project_b = fixture(:project, tenant: tenant, name: \"Balic Tracker\")",
+        "api_key = fixture(:api_key, tenant: tenant, role: :orchestrator)",
+        "10 events across 4 articles tagged project_a",
+        "3 events across 2 articles tagged project_b"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/top-articles?group_by=project"
+      ],
+      "expected_results": [
+        "200 response",
+        "data contains 2 rows, sorted by access_count DESC",
+        "First row: %{project_id: project_a.id, project_name: \"HomeCareBilling\", access_count: 10, unique_articles: 4, unique_api_keys: 1}",
+        "Second row: %{project_id: project_b.id, project_name: \"Balic Tracker\", access_count: 3, unique_articles: 2, unique_api_keys: 1}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.3",
+      "name": "top-articles group_by=agent aggregates across all keys belonging to one logical agent",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "agent_record = fixture(:agent, tenant: tenant, name: \"orchestrator\", agent_type: \"orchestrator\")",
+        "api_key_1 = fixture(:api_key, tenant: tenant, agent_id: agent_record.id, role: :orchestrator)",
+        "api_key_2 = fixture(:api_key, tenant: tenant, agent_id: agent_record.id, role: :orchestrator)",
+        "api_key_solo = fixture(:api_key, tenant: tenant, role: :agent)",
+        "5 events recorded under api_key_1",
+        "7 events recorded under api_key_2",
+        "2 events recorded under api_key_solo"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/top-articles?group_by=agent"
+      ],
+      "expected_results": [
+        "data contains 2 rows (one per logical agent)",
+        "Row for agent_record: %{agent_id: agent_record.id, agent_name: \"orchestrator\", access_count: 12, api_key_count: 2}",
+        "Row for the solo key's agent: access_count: 2, api_key_count: 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.4",
+      "name": "agent_usage resolves api_keys.id when id matches a key",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :orchestrator)",
+        "3 events recorded under api_key",
+        "orchestrator_api_key = fixture(:api_key, tenant: tenant, role: :orchestrator)"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/agents/<api_key.id>",
+        "Authorization: Bearer <orchestrator_api_key>"
+      ],
+      "expected_results": [
+        "200 response",
+        "body.resolved_as == \"api_key\"",
+        "body.total_reads == 3"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.5",
+      "name": "agent_usage resolves agents.id by joining api_keys when id matches no api_key",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "agent_record = fixture(:agent, tenant: tenant, name: \"orchestrator\")",
+        "api_key_1 = fixture(:api_key, tenant: tenant, agent_id: agent_record.id, role: :orchestrator)",
+        "api_key_2 = fixture(:api_key, tenant: tenant, agent_id: agent_record.id, role: :orchestrator)",
+        "4 events recorded under api_key_1",
+        "6 events recorded under api_key_2",
+        "caller_key = fixture(:api_key, tenant: tenant, role: :orchestrator)"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/agents/<agent_record.id>",
+        "Authorization: Bearer <caller_key>"
+      ],
+      "expected_results": [
+        "200 response",
+        "body.resolved_as == \"agent\"",
+        "body.total_reads == 10",
+        "body.api_key_count == 2"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.6",
+      "name": "projects/:id/usage returns per-project rollup with daily series",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant, name: \"HomeCareBilling\")",
+        "api_key = fixture(:api_key, tenant: tenant, role: :orchestrator)",
+        "15 events tagged with project.id across 10 articles, spread over 3 consecutive days"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/projects/<project.id>/usage?since_days=7"
+      ],
+      "expected_results": [
+        "200 response",
+        "body.project_id == project.id",
+        "body.project_name == \"HomeCareBilling\"",
+        "body.total_reads == 15",
+        "body.unique_articles == 10",
+        "body.top_articles is an array (limit 20)",
+        "body.daily_series is an array of 7 entries (one per day in window), zero-filled on quiet days",
+        "The 3 days with events have the correct counts"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.7",
+      "name": "Tenant isolation: cross-tenant project_id returns 404",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant)",
+        "tenant_b = fixture(:tenant)",
+        "project_b = fixture(:project, tenant: tenant_b)",
+        "api_key_a = fixture(:api_key, tenant: tenant_a, role: :orchestrator)"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/analytics/projects/<project_b.id>/usage",
+        "Authorization: Bearer <api_key_a>"
+      ],
+      "expected_results": [
+        "404 not_found",
+        "No data leaked from tenant_b"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.8",
+      "name": "Revoked api_keys are aggregated under a sentinel 'revoked' name but still counted",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "api_key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "5 events recorded under api_key",
+        "Loopctl.Auth.revoke_api_key(api_key)"
+      ],
+      "steps": [
+        "Call Loopctl.Knowledge.Analytics.top_articles(tenant.id, since_days: 30, group_by: :agent)"
+      ],
+      "expected_results": [
+        "Returns a row with agent_name like \"revoked\" or api_key_id suffix",
+        "access_count for that row == 5"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-25.2.9",
+      "name": "EXPLAIN plan uses the project_id index (not a seq scan)",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "project = fixture(:project, tenant: tenant)",
+        "10,000 events inserted across 5 projects (2000 per project)",
+        "Analyze run on knowledge_access_events"
+      ],
+      "steps": [
+        "Run EXPLAIN (FORMAT JSON) for: SELECT count(*) FROM knowledge_access_events WHERE tenant_id = ? AND project_id = ? AND inserted_at >= now() - interval '7 days'"
+      ],
+      "expected_results": [
+        "Plan uses Index Scan on knowledge_access_events_project_id_inserted_at_idx",
+        "No Seq Scan node in the plan tree"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Context module: Loopctl.Knowledge.Analytics (lib/loopctl/knowledge/analytics.ex) — extend top_articles/2 and get_agent_usage/3, add get_project_usage/3",
+    "Controller: LoopctlWeb.KnowledgeAnalyticsController (lib/loopctl_web/controllers/knowledge_analytics_controller.ex) — existing actions top_articles/2, agent_usage/2; new action project_usage/2",
+    "Router: lib/loopctl_web/router.ex — existing scope mounts at /api/v1/knowledge/analytics. Add get \"/projects/:id/usage\", KnowledgeAnalyticsController, :project_usage under the same role plug.",
+    "Role gate: all new and existing analytics endpoints use LoopctlWeb.Plugs.RequireRole with role: :orchestrator. Do not relax.",
+    "JSON view: LoopctlWeb.KnowledgeAnalyticsJSON — add project_usage/2, extend top_articles/2 to handle the three group_by variants.",
+    "Agent-id-or-api-key-id resolution in agent_usage: first SELECT 1 FROM api_keys WHERE id = ? AND tenant_id = ?. If matched, run the existing query. If not, SELECT 1 FROM agents WHERE id = ? AND tenant_id = ?. If matched, JOIN api_keys WHERE agent_id = ? and aggregate. If neither, 404.",
+    "Left join for revoked keys: in the group_by=agent aggregation, LEFT JOIN api_keys ON events.api_key_id = api_keys.id. Rows where api_keys.id IS NULL (deleted key) or api_keys.revoked_at IS NOT NULL collapse into a synthetic {agent_id: nil, agent_name: \"revoked\", ...} row.",
+    "Daily series: use generate_series(now() - since_days::interval, now(), '1 day'::interval) LEFT JOIN the aggregated events subquery to get zero-filled days. This is Postgres-specific.",
+    "Tenant-first index use: the queries must have tenant_id = ? as the first predicate to hit the composite index. Do not rely on RLS to add it — the query planner needs the literal.",
+    "Guard against unbounded windows: clamp since_days to the range [1, 365] at the controller level before forwarding to Analytics.",
+    "OpenAPI spec: add the new query params and the new endpoint to lib/loopctl/api_spec/schemas.ex and the KnowledgeAnalyticsController operation specs (existing uses OpenApiSpex.ControllerSpecs).",
+    "Test convention: this epic's tests live in test/loopctl/knowledge/analytics_test.exs (unit) and test/loopctl_web/controllers/knowledge_analytics_controller_test.exs (integration). Both use DataCase/ConnCase with async: true, Mox.set_mox_from_context, and fixture/2.",
+    "The analytics MCP surface (mcp__loopctl__knowledge_analytics_top, knowledge_agent_usage, etc.) is updated in US-25.3 — this story ships the HTTP API only. Curl-based verification is acceptable for the ConnCase tests."
+  ],
+  "dependencies": [
+    "US-25.1"
+  ],
+  "estimated_hours": 6
+}
