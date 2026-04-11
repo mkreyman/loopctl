@@ -19,12 +19,25 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   - `tenant_id` -- the tenant that owns the article and the api_key
   - `article_id` -- the article that was accessed
   - `api_key_id` -- the api_key (and therefore the agent identity) that accessed it
+  - `project_id` -- optional project attribution for the read (nullable)
+  - `story_id` -- optional story attribution for the read (nullable)
   - `access_type` -- one of the access types above
   - `metadata` -- free-form context (e.g., search query, rank, score)
   - `accessed_at` -- when the access happened (microsecond precision)
 
   Access events are immutable: there are no updates and no `updated_at`
   column. Only `accessed_at` is stored.
+
+  ## Attribution
+
+  `project_id` and `story_id` are reporting dimensions added by US-25.1.
+  They record the work context the caller was in at the time of the read.
+  Both are optional so rows written before attribution existed remain valid
+  and callers without context can still record reads.
+
+  Neither column is referenced in any RLS predicate — `tenant_id` remains
+  the sole isolation boundary. Cross-tenant attribution attempts are
+  rejected by the context layer before the insert.
   """
 
   use Loopctl.Schema
@@ -37,6 +50,8 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
     tenant_field()
     belongs_to :article, Loopctl.Knowledge.Article
     belongs_to :api_key, Loopctl.Auth.ApiKey
+    belongs_to :project, Loopctl.Projects.Project
+    belongs_to :story, Loopctl.WorkBreakdown.Story
 
     field :access_type, :string
     field :metadata, :map, default: %{}
@@ -55,15 +70,26 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   Changeset for creating a new article access event.
 
   `tenant_id` is set programmatically and must not appear in attrs.
-  All four positional fields are required; metadata is optional.
+  The four positional fields (article_id, api_key_id, access_type, accessed_at)
+  are required; metadata, project_id, and story_id are optional.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(struct \\ %__MODULE__{}, attrs) do
     struct
-    |> cast(attrs, [:article_id, :api_key_id, :access_type, :metadata, :accessed_at])
+    |> cast(attrs, [
+      :article_id,
+      :api_key_id,
+      :project_id,
+      :story_id,
+      :access_type,
+      :metadata,
+      :accessed_at
+    ])
     |> validate_required([:article_id, :api_key_id, :access_type, :accessed_at])
     |> validate_inclusion(:access_type, @access_types)
     |> foreign_key_constraint(:article_id)
     |> foreign_key_constraint(:api_key_id)
+    |> foreign_key_constraint(:project_id)
+    |> foreign_key_constraint(:story_id)
   end
 end

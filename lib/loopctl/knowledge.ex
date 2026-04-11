@@ -132,8 +132,11 @@ defmodule Loopctl.Knowledge do
 
   - `tenant_id` -- the tenant UUID
   - `article_id` -- the article UUID
-  - `opts` -- keyword list with optional `:api_key_id` for access tracking
-    and `:access_metadata` for extra context attached to the event
+  - `opts` -- keyword list with optional:
+    - `:api_key_id` -- for access tracking
+    - `:access_metadata` -- extra context attached to the event
+    - `:project_id` -- attribute the read to a project (US-25.1)
+    - `:story_id` -- attribute the read to a story (US-25.1)
 
   ## Returns
 
@@ -159,11 +162,21 @@ defmodule Loopctl.Knowledge do
           article.id,
           Keyword.get(opts, :api_key_id),
           "get",
-          Keyword.get(opts, :access_metadata, %{})
+          Keyword.get(opts, :access_metadata, %{}),
+          attribution_context(opts)
         )
 
         {:ok, article}
     end
+  end
+
+  # Extracts the attribution context map from the caller's opts. Returns
+  # an empty map when neither `:project_id` nor `:story_id` was provided.
+  defp attribution_context(opts) do
+    %{
+      project_id: Keyword.get(opts, :project_id),
+      story_id: Keyword.get(opts, :story_id)
+    }
   end
 
   @doc """
@@ -260,6 +273,9 @@ defmodule Loopctl.Knowledge do
   - `opts` -- keyword list with:
     - `:project_id` -- when provided, includes both tenant-wide (nil project_id)
       and project-specific articles
+    - `:story_id` -- accepted for caller ergonomics (US-25.1); index listings
+      are intentionally not recorded as access events so the value is not
+      persisted anywhere
 
   ## Returns
 
@@ -409,7 +425,8 @@ defmodule Loopctl.Knowledge do
           tenant_id,
           context_ids,
           api_key_id,
-          %{"query" => query_string}
+          %{"query" => query_string},
+          attribution_context(opts)
         )
 
         {:ok, context}
@@ -691,7 +708,8 @@ defmodule Loopctl.Knowledge do
           article_ids,
           api_key_id,
           query_string,
-          %{"mode" => mode}
+          %{"mode" => mode},
+          attribution_context(opts)
         )
     end
   end
