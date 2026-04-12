@@ -382,6 +382,7 @@ defmodule Loopctl.Fixtures do
   def fixture(:tenant, attrs) do
     data = build(:tenant, attrs)
     status = Map.get(data, :status, :active)
+    audit_pub_key = Map.get(data, :audit_signing_public_key)
 
     tenant =
       %Tenant{}
@@ -389,9 +390,19 @@ defmodule Loopctl.Fixtures do
       |> AdminRepo.insert!()
 
     # Apply non-active status after creation (create always defaults to :active)
-    if status != :active do
+    tenant =
+      if status != :active do
+        tenant
+        |> Tenant.status_changeset(status)
+        |> AdminRepo.update!()
+      else
+        tenant
+      end
+
+    # Set audit_signing_public_key if provided (not in create_changeset cast)
+    if audit_pub_key do
       tenant
-      |> Tenant.status_changeset(status)
+      |> Ecto.Changeset.change(audit_signing_public_key: audit_pub_key)
       |> AdminRepo.update!()
     else
       tenant

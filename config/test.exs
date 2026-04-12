@@ -93,6 +93,9 @@ config :loopctl, :webauthn,
   origin: "http://localhost:4002",
   user_verification: "preferred"
 
+# DI: Use mock secrets adapter in tests
+config :loopctl, :secrets_adapter, Loopctl.MockSecrets
+
 # DI: Use Req.Test plug for content ingestion URL fetching in tests
 config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
 

@@ -150,6 +150,11 @@ defmodule Loopctl.DataCase do
     Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _payload, _challenge, _opts ->
       {:ok, %{sign_count: 1}}
     end)
+
+    # Default stub for Secrets adapter — accepts all writes, returns :not_found on reads.
+    Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :not_found} end)
+    Mox.stub(Loopctl.MockSecrets, :set, fn _name, _value -> :ok end)
+    Mox.stub(Loopctl.MockSecrets, :delete, fn _name -> :ok end)
   end
 
   @doc """

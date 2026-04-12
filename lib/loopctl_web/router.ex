@@ -68,6 +68,13 @@ defmodule LoopctlWeb.Router do
     get "/", LoopctlWeb.WelcomeController, :index
   end
 
+  # US-26.0.2 — Public endpoint for tenant audit key (no auth required)
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api]
+
+    get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
+  end
+
   scope "/swaggerui" do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
@@ -84,6 +91,7 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+    post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
 
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]

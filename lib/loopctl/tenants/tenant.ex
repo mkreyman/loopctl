@@ -33,8 +33,12 @@ defmodule Loopctl.Tenants.Tenant do
     field :default_story_budget_millicents, :integer
     # AC-21.14.1: NULL means unlimited (no archival)
     field :token_data_retention_days, :integer
+    # US-26.0.2: ed25519 public key for signing audit chain entries
+    field :audit_signing_public_key, :binary
+    field :audit_key_rotated_at, :utc_datetime_usec
 
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
+    has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id
 
     timestamps()
   end
