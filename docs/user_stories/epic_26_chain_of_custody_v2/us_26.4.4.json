@@ -1,0 +1,99 @@
+{
+  "id": "US-26.4.4",
+  "title": "verify_story Refactor and Operator Dashboard for manual: Criteria",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "re_execution",
+  "story": {
+    "as_a": "tenant operator",
+    "i_want_to": "have the verify_story endpoint enqueue a verification run instead of transitioning state directly, and have a dashboard where I can batch-review manual: acceptance criteria without context switching per story",
+    "so_that": "verification is always backed by independent re-execution, and manual review criteria (legacy or intentional) don't block throughput"
+  },
+  "rationale": "Without a refactor, `verify_story` still takes the caller's word. With US-26.4.2 and US-26.4.3 in place, the endpoint should enqueue a run and wait for results. For manual: criteria (legacy stories or intentionally human-reviewed ones), an operator dashboard gives efficient batching.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.4.1",
+      "description": "`POST /api/v1/stories/:id/verify` no longer transitions state directly. It validates the verify_cap (from US-26.3.1), enqueues a verification_run, and returns 202 Accepted with `{status: \"verification_pending\", run_id: \"...\"}` and a `next_action` describing how to poll the run."
+    },
+    {
+      "id": "AC-26.4.4.2",
+      "description": "The verification_run's completion callback (the Oban worker after the run finishes) transitions the story to `:verified` IF all non-manual ACs pass AND no manual ACs are pending (i.e., they're all already approved). Otherwise transitions to `:manual_review_pending` or `:rejected`."
+    },
+    {
+      "id": "AC-26.4.4.3",
+      "description": "If any AC has type `manual`, the story status flag `manual_review_pending` is set and the story waits for operator decisions before final verification."
+    },
+    {
+      "id": "AC-26.4.4.4",
+      "description": "LiveView at `/admin/manual-reviews` lists all pending manual ACs across the operator's tenants (or a single tenant if the operator is tenant-scoped). Each row shows the story, the AC, the description, the commit SHA, and action buttons: Approve, Reject, Request More Info."
+    },
+    {
+      "id": "AC-26.4.4.5",
+      "description": "Bulk approval: checkbox per row, 'approve selected' button. Rate-limited to prevent rubber-stamping — max 20 approvals per minute per operator."
+    },
+    {
+      "id": "AC-26.4.4.6",
+      "description": "Approval and rejection both write audit_chain entries. Approval includes the operator's dispatch lineage and an optional note. Rejection includes a required reason."
+    },
+    {
+      "id": "AC-26.4.4.7",
+      "description": "A story with all non-manual ACs passing but some manual ACs pending transitions to `manual_review_pending`, not `verified`. Once the operator approves all pending manual ACs, the story auto-transitions to `verified`."
+    },
+    {
+      "id": "AC-26.4.4.8",
+      "description": "Existing tests for `verify_story` are updated: they await the verification_run before asserting state change. Tests use Oban.drain_queue to process the runs synchronously."
+    },
+    {
+      "id": "AC-26.4.4.9",
+      "description": "Tenant isolation: operators see only their tenant's manual reviews. Superadmin sees all."
+    },
+    {
+      "id": "AC-26.4.4.10",
+      "description": "OpenAPI updates for the new verify response shape and the new dashboard routes. CHANGELOG entry."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.4.1",
+      "name": "verify_story returns 202 and enqueues a run",
+      "type": "integration",
+      "steps": ["POST /stories/:id/verify with a valid verify_cap"],
+      "expected_results": ["Response 202", "Body has status: verification_pending and run_id", "verification_runs has a pending row"]
+    },
+    {
+      "id": "TC-26.4.4.2",
+      "name": "Run completion with all passes transitions story to verified",
+      "type": "integration",
+      "steps": ["Enqueue verify", "Run drains queue with stub runner that returns all-pass"],
+      "expected_results": ["story.agent_status = reported_done (unchanged)", "story.verified_status = verified"]
+    },
+    {
+      "id": "TC-26.4.4.3",
+      "name": "Manual AC pending blocks verified transition",
+      "type": "integration",
+      "preconditions": ["Story with one test AC and one manual AC"],
+      "steps": ["Enqueue verify", "Run drains (test AC passes, manual AC is pending)"],
+      "expected_results": ["story.verified_status = unverified", "story.manual_review_pending = true"]
+    },
+    {
+      "id": "TC-26.4.4.4",
+      "name": "Operator approves pending manual AC, story auto-verifies",
+      "type": "integration",
+      "preconditions": ["Story in manual_review_pending state with one pending manual AC"],
+      "steps": ["Operator calls POST /admin/manual-reviews/:ac_id/approve"],
+      "expected_results": ["AC status = verified", "Story auto-transitions to verified", "Audit chain has approval entry"]
+    }
+  ],
+  "technical_notes": [
+    "LiveView: lib/loopctl_web/live/admin/manual_reviews_live.ex in the admin live_session.",
+    "Bulk approval rate limit: reuse Hammer.",
+    "The verification_run completion callback is an Oban worker chained after VerificationRunner: VerificationCompletionWorker reads the run and transitions the story.",
+    "verify_story response shape changes from 200 to 202; existing clients need migration. Include deprecation period and deprecation header during cutover.",
+    "Reference: docs/chain-of-custody-v2.md section 7.3."
+  ],
+  "dependencies": ["US-26.4.1", "US-26.4.2"],
+  "estimated_hours": 8
+}
