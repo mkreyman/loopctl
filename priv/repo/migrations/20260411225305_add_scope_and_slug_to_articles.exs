@@ -38,12 +38,27 @@ defmodule Loopctl.Repo.Migrations.AddScopeAndSlugToArticles do
              name: :articles_tenant_slug_idx
            )
 
-    # Backfill: generate slugs for existing articles from their titles
+    # Backfill: generate slugs from titles, appending row number for duplicates
     execute(
       """
-      UPDATE articles
-      SET slug = LOWER(REGEXP_REPLACE(REGEXP_REPLACE(title, '[^a-zA-Z0-9 -]', '', 'g'), '\\s+', '-', 'g'))
-      WHERE slug IS NULL
+      WITH slugged AS (
+        SELECT id, tenant_id,
+          LOWER(REGEXP_REPLACE(REGEXP_REPLACE(title, '[^a-zA-Z0-9 -]', '', 'g'), '\\s+', '-', 'g')) AS base_slug,
+          ROW_NUMBER() OVER (
+            PARTITION BY tenant_id,
+              LOWER(REGEXP_REPLACE(REGEXP_REPLACE(title, '[^a-zA-Z0-9 -]', '', 'g'), '\\s+', '-', 'g'))
+            ORDER BY inserted_at
+          ) AS rn
+        FROM articles
+        WHERE slug IS NULL
+      )
+      UPDATE articles a
+      SET slug = CASE
+        WHEN s.rn = 1 THEN LEFT(s.base_slug, 64)
+        ELSE LEFT(s.base_slug, 58) || '-' || s.rn::text
+      END
+      FROM slugged s
+      WHERE a.id = s.id
       """,
       "SELECT 1"
     )
