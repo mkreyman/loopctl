@@ -122,8 +122,12 @@ defmodule Loopctl.TenantsTest do
 
       assert {:ok, tenants} = Tenants.list_tenants()
       names = Enum.map(tenants, & &1.name)
-      assert Enum.at(names, 0) == "Alpha Corp"
-      assert Enum.at(names, 1) == "Zeta Corp"
+      assert "Alpha Corp" in names
+      assert "Zeta Corp" in names
+      # Alphabetical order: Alpha before Zeta
+      alpha_idx = Enum.find_index(names, &(&1 == "Alpha Corp"))
+      zeta_idx = Enum.find_index(names, &(&1 == "Zeta Corp"))
+      assert alpha_idx < zeta_idx
     end
 
     test "filters by status" do

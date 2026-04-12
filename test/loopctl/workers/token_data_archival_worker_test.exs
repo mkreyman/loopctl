@@ -8,6 +8,7 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
   describe "perform/1" do
     test "processes tenants with retention policy: runs all three passes" do
       tenant = fixture(:tenant)
+      tenant_ids = [tenant.id]
       # Set retention policy
       tenant
       |> Ecto.Changeset.change(token_data_retention_days: 90)
@@ -32,11 +33,12 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
         {:ok, 3}
       end)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
     end
 
     test "processes tenants without retention policy: only runs hard-delete" do
       tenant = fixture(:tenant)
+      tenant_ids = [tenant.id]
       # No retention policy (nil)
       assert tenant.token_data_retention_days == nil
 
@@ -51,24 +53,26 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
       # Soft-delete and anomaly archive should NOT be called for tenants without policy
       # (default stubs return {:ok, 0} but verify_on_exit! would catch unexpected calls)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
     end
 
     test "skips suspended tenants entirely" do
-      _suspended = fixture(:tenant, %{status: :suspended})
-      _active = fixture(:tenant)
+      suspended = fixture(:tenant, %{status: :suspended})
+      active = fixture(:tenant)
+      tenant_ids = [suspended.id, active.id]
 
       # Hard-delete only called for the active tenant
       expect(Loopctl.MockTokenArchival, :hard_delete_expired_reports, fn _tid ->
         {:ok, 0}
       end)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
     end
 
     test "handles multiple tenants" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
+      tenant_ids = [tenant_a.id, tenant_b.id]
 
       # Set retention on both
       tenant_a
@@ -88,11 +92,12 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
 
       expect(Loopctl.MockTokenArchival, :archive_old_anomalies, 2, fn _tid, _days -> {:ok, 0} end)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
     end
 
     test "handles archival service errors gracefully" do
       tenant = fixture(:tenant)
+      tenant_ids = [tenant.id]
 
       tenant
       |> Ecto.Changeset.change(token_data_retention_days: 90)
@@ -111,11 +116,12 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
       end)
 
       # Should not raise — errors are logged and swallowed
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
     end
 
     test "writes audit log entries for tenants with archival activity" do
       tenant = fixture(:tenant)
+      tenant_ids = [tenant.id]
 
       tenant
       |> Ecto.Changeset.change(token_data_retention_days: 90)
@@ -125,7 +131,7 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
       expect(Loopctl.MockTokenArchival, :soft_delete_old_reports, fn _tid, _days -> {:ok, 10} end)
       expect(Loopctl.MockTokenArchival, :archive_old_anomalies, fn _tid, _days -> {:ok, 3} end)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
 
       # Verify audit log entry was created
       import Ecto.Query
@@ -147,6 +153,7 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
     test "tenant isolation: each tenant processed independently" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
+      tenant_ids = [tenant_a.id, tenant_b.id]
 
       tenant_a
       |> Ecto.Changeset.change(token_data_retention_days: 30)
@@ -173,7 +180,7 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
         {:ok, 0}
       end)
 
-      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{}})
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
 
       # tenant_a (with policy) should get all three passes
       assert :ets.member(received_ids, {tenant_a.id, :hard_delete})

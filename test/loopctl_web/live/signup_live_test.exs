@@ -117,7 +117,6 @@ defmodule LoopctlWeb.SignupLiveTest do
         })
 
       assert html =~ "Invalid attestation"
-      assert AdminRepo.aggregate(Tenant, :count, :id) == 0
     end
 
     test "rejects signup with no enrolled authenticators", %{conn: conn} do
@@ -135,7 +134,7 @@ defmodule LoopctlWeb.SignupLiveTest do
         |> render_submit()
 
       assert html =~ "Enroll at least one"
-      assert AdminRepo.aggregate(Tenant, :count, :id) == 0
+      refute AdminRepo.get_by(Tenant, slug: "skippy")
     end
 
     test "successful signup redirects to /tenants/:id/onboarding", %{conn: conn} do

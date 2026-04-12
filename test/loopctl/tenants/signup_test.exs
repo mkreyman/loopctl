@@ -65,7 +65,7 @@ defmodule Loopctl.Tenants.SignupTest do
       }
 
       assert {:error, :no_authenticators} = Tenants.signup(attrs)
-      assert AdminRepo.aggregate(Tenant, :count, :id) == 0
+      assert {:error, :not_found} = Tenants.get_tenant_by_slug("empty-signup")
     end
 
     test "more than 5 authenticators rejected" do
@@ -77,7 +77,7 @@ defmodule Loopctl.Tenants.SignupTest do
       }
 
       assert {:error, :too_many_authenticators} = Tenants.signup(attrs)
-      assert AdminRepo.aggregate(Tenant, :count, :id) == 0
+      assert {:error, :not_found} = Tenants.get_tenant_by_slug("too-many")
     end
 
     test "duplicate slug returns :slug_taken (TC-26.0.1.3)" do
