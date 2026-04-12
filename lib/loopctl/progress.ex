@@ -19,6 +19,8 @@ defmodule Loopctl.Progress do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Capabilities
+  alias Loopctl.Dispatches
   alias Loopctl.Tenants
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
@@ -213,11 +215,34 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :check_deps, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated}} ->
+        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage
+        lineage = Keyword.get(opts, :lineage, [])
+        mint_cap_best_effort(tenant_id, "start_cap", updated.id, lineage)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :check_deps, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
+    end
+  end
+
+  # Mints a capability token as a side-effect. Returns nil if key is
+  # unavailable (tenant has no audit key yet). The cap is retrievable
+  # via the Capabilities module; it's not returned in the function value
+  # to keep the return type backward-compatible.
+  defp mint_cap_best_effort(tenant_id, typ, story_id, lineage) do
+    case Capabilities.mint(tenant_id, typ, story_id, lineage) do
+      {:ok, cap} -> cap
+      {:error, _} -> nil
     end
   end
 
@@ -300,10 +325,20 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated}} ->
+        # US-26.3.1 AC-6: mint a report_cap for the implementing lineage
+        lineage = Keyword.get(opts, :lineage, [])
+        mint_cap_best_effort(tenant_id, "report_cap", updated.id, lineage)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
     end
   end
 
@@ -1016,10 +1051,32 @@ defmodule Loopctl.Progress do
   defp validate_not_self_verify(_story, nil), do: {:error, :self_verify_blocked}
 
   defp validate_not_self_verify(story, orchestrator_agent_id) do
-    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id do
-      {:error, :self_verify_blocked}
-    else
-      {:ok, story}
+    # US-26.2.2 AC-2: use lineage comparison when dispatch IDs are available
+    cond do
+      # Lineage-based check (preferred): compare dispatch lineage paths
+      not is_nil(story.implementer_dispatch_id) and not is_nil(story.verifier_dispatch_id) ->
+        impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
+        verifier = get_dispatch_lineage(story.tenant_id, story.verifier_dispatch_id)
+
+        if Dispatches.lineage_shares_prefix?(impl, verifier) do
+          {:error, :self_verify_blocked}
+        else
+          {:ok, story}
+        end
+
+      # Fallback: agent_id comparison for pre-dispatch stories
+      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id ->
+        {:error, :self_verify_blocked}
+
+      true ->
+        {:ok, story}
+    end
+  end
+
+  defp get_dispatch_lineage(tenant_id, dispatch_id) do
+    case Dispatches.get_dispatch(tenant_id, dispatch_id) do
+      {:ok, dispatch} -> dispatch.lineage_path
+      {:error, _} -> []
     end
   end
 
