@@ -139,6 +139,9 @@ defmodule LoopctlWeb.Router do
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
 
+    # US-26.4.1 — First-class acceptance criteria
+    get "/stories/:story_id/acceptance_criteria", AcceptanceCriteriaController, :index
+
     # Story status transitions (agent side of two-tier trust model)
     post "/stories/:id/contract", StoryStatusController, :contract
     post "/stories/:id/claim", StoryStatusController, :claim
