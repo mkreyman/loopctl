@@ -7,6 +7,8 @@ defmodule Loopctl.Application do
 
   @impl true
   def start(_type, _args) do
+    Loopctl.TenantKeys.init_cache()
+
     children = [
       LoopctlWeb.Telemetry,
       Loopctl.Vault,

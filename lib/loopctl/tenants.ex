@@ -13,6 +13,9 @@ defmodule Loopctl.Tenants do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Secrets
+  alias Loopctl.TenantKeys
+  alias Loopctl.Tenants.AuditKeyHistory
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
 
@@ -97,15 +100,34 @@ defmodule Loopctl.Tenants do
       Multi.new()
       |> Multi.insert(:tenant, Tenant.signup_changeset(tenant_attrs))
       |> insert_authenticators(authenticators)
-      |> Multi.update(:activate, fn %{tenant: tenant} ->
+      |> Multi.run(:generate_audit_keypair, fn _repo, %{tenant: tenant} ->
+        {pub, priv} = generate_ed25519_keypair()
+        secret_name = Secrets.audit_key_secret_name(tenant.slug)
+
+        case Secrets.set(secret_name, priv) do
+          :ok ->
+            {:ok, %{public_key: pub, private_key: priv, secret_name: secret_name}}
+
+          {:error, reason} ->
+            {:error, {:audit_key_storage_failed, reason}}
+        end
+      end)
+      |> Multi.update(:set_public_key, fn %{tenant: tenant, generate_audit_keypair: keypair} ->
+        Ecto.Changeset.change(tenant, audit_signing_public_key: keypair.public_key)
+      end)
+      |> Multi.update(:activate, fn %{set_public_key: tenant} ->
         Tenant.activate_after_enrollment_changeset(tenant)
       end)
-      |> Audit.log_in_multi(:audit_genesis, fn %{activate: tenant, authenticators: auths} ->
+      |> Audit.log_in_multi(:audit_genesis, fn %{
+                                                 activate: tenant,
+                                                 authenticators: auths,
+                                                 generate_audit_keypair: keypair
+                                               } ->
         %{
           tenant_id: tenant.id,
           entity_type: "tenant",
           entity_id: tenant.id,
-          action: "signed_up",
+          action: "tenant_created",
           actor_type: "human",
           actor_id: nil,
           actor_label: "human:webauthn",
@@ -114,7 +136,8 @@ defmodule Loopctl.Tenants do
             "slug" => tenant.slug,
             "email" => tenant.email,
             "authenticator_count" => length(auths),
-            "authenticator_fingerprints" => Enum.map(auths, &fingerprint(&1.credential_id))
+            "authenticator_fingerprints" => Enum.map(auths, &fingerprint(&1.credential_id)),
+            "audit_signing_public_key" => Base.encode64(keypair.public_key)
           }
         }
       end)
@@ -198,6 +221,91 @@ defmodule Loopctl.Tenants do
     :crypto.hash(:sha256, credential_id)
     |> Base.encode16(case: :lower)
     |> String.slice(0, 16)
+  end
+
+  # Generates a fresh ed25519 keypair. Returns {public_key_bytes, private_key_bytes}.
+  defp generate_ed25519_keypair do
+    {pub, priv} = :crypto.generate_key(:eddsa, :ed25519)
+    {pub, priv}
+  end
+
+  @doc """
+  Rotate the tenant's audit signing key. Requires a WebAuthn assertion
+  to authorize. Stores the old public key in `tenant_audit_key_history`,
+  generates a new keypair, updates the Fly secret, and writes an audit
+  chain entry.
+
+  Returns `{:ok, updated_tenant}` or `{:error, reason}`.
+  """
+  @spec rotate_audit_key(Ecto.UUID.t(), binary()) :: {:ok, Tenant.t()} | {:error, term()}
+  def rotate_audit_key(tenant_id, webauthn_assertion_signature) do
+    case get_tenant(tenant_id) do
+      {:error, _} = err ->
+        err
+
+      {:ok, tenant} ->
+        old_public_key = tenant.audit_signing_public_key
+
+        if is_nil(old_public_key) do
+          {:error, :no_existing_key}
+        else
+          do_rotate_audit_key(tenant, old_public_key, webauthn_assertion_signature)
+        end
+    end
+  end
+
+  defp do_rotate_audit_key(tenant, old_public_key, webauthn_assertion_signature) do
+    now = DateTime.utc_now()
+    {new_pub, new_priv} = generate_ed25519_keypair()
+    secret_name = Secrets.audit_key_secret_name(tenant.slug)
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:archive_old_key, fn _ ->
+        %AuditKeyHistory{tenant_id: tenant.id}
+        |> AuditKeyHistory.changeset(%{
+          public_key: old_public_key,
+          rotated_in: tenant.audit_key_rotated_at || tenant.inserted_at,
+          rotated_out: now,
+          rotation_signature: webauthn_assertion_signature
+        })
+      end)
+      |> Multi.run(:store_new_secret, fn _repo, _changes ->
+        case Secrets.set(secret_name, new_priv) do
+          :ok -> {:ok, :stored}
+          {:error, reason} -> {:error, {:audit_key_storage_failed, reason}}
+        end
+      end)
+      |> Multi.update(:update_tenant, fn _ ->
+        Ecto.Changeset.change(tenant,
+          audit_signing_public_key: new_pub,
+          audit_key_rotated_at: now
+        )
+      end)
+      |> Audit.log_in_multi(:audit_rotation, fn %{update_tenant: updated_tenant} ->
+        %{
+          tenant_id: updated_tenant.id,
+          entity_type: "tenant",
+          entity_id: updated_tenant.id,
+          action: "key_rotated",
+          actor_type: "human",
+          actor_id: nil,
+          actor_label: "human:webauthn",
+          new_state: %{
+            "old_public_key" => Base.encode64(old_public_key),
+            "new_public_key" => Base.encode64(new_pub)
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{update_tenant: updated_tenant}} ->
+        TenantKeys.invalidate(tenant.id)
+        {:ok, updated_tenant}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
   end
 
   @doc """
