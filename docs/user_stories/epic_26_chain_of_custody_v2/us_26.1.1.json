@@ -1,0 +1,230 @@
+{
+  "id": "US-26.1.1",
+  "title": "Hash-Chained audit_chain Table with Append-Only Triggers",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "audit_foundation",
+  "story": {
+    "as_a": "tenant operator needing tamper-evident audit of every custody-critical event in my tenant",
+    "i_want_to": "have a hash-chained, append-only database table where every entry references the previous entry's hash, every insert is validated by a trigger, and the production database role cannot disable the triggers or delete rows",
+    "so_that": "retroactive tampering of the audit log requires compromising the database at a level that leaves separate evidence, and routine application bugs cannot silently rewrite history"
+  },
+  "rationale": "The per-tenant audit chain is the foundation of Layer 2 tamper evidence in the chain-of-custody v2 stack. Without a hash-chained append-only store enforced by database triggers, every other layer collapses to advisory checks. This story ships the schema and the enforcement — STH computation (US-26.1.2) and agent-witnessed verification (Phase 5) build on top. The design pattern (hash chain + triggers + position monotonicity) is well-understood from blockchain and Certificate Transparency literature and maps cleanly to PostgreSQL's trigger system.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.1.1.1",
+      "description": "Migration creates `audit_chain` table with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), chain_position (bigint NOT NULL), prev_entry_hash (bytea NOT NULL, 32 bytes), action (text NOT NULL), actor_lineage (jsonb NOT NULL, list of dispatch IDs), entity_type (text NOT NULL), entity_id (uuid), payload (jsonb NOT NULL), inserted_at (timestamptz NOT NULL DEFAULT now()), entry_hash (bytea NOT NULL, 32 bytes).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.2",
+      "description": "Unique constraint on `(tenant_id, chain_position)` ensures no gaps or duplicates in any tenant's chain. Index on `(tenant_id, inserted_at DESC)` for timeline queries. Index on `(tenant_id, action)` for filtering by action type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.3",
+      "description": "BEFORE UPDATE trigger `audit_chain_prevent_update` raises a `cannot_modify_audit_chain` exception on any attempt to update any column of any row. The trigger fires for ALL updates, no exceptions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.4",
+      "description": "BEFORE DELETE trigger `audit_chain_prevent_delete` raises a `cannot_delete_audit_chain` exception on any attempt to delete any row. The trigger fires for ALL deletes, no exceptions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.5",
+      "description": "BEFORE INSERT trigger `audit_chain_verify_invariants` validates three conditions: (a) `chain_position` equals `(SELECT MAX(chain_position) FROM audit_chain WHERE tenant_id = NEW.tenant_id) + 1`, OR 0 if no prior entries; (b) `prev_entry_hash` equals the previous entry's `entry_hash` for this tenant, or 32 zero bytes if this is the genesis entry; (c) `entry_hash` equals the SHA-256 of `tenant_id || chain_position || prev_entry_hash || canonical_json_of(action, actor_lineage, entity_type, entity_id, payload) || inserted_at`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.6",
+      "description": "The production database role (e.g., `loopctl_prod`) lacks DDL privileges (`NOCREATE`, `NOSUPERUSER`, cannot ALTER TABLE). Triggers cannot be dropped or disabled from within the application. Documented in deployment notes with a sample `GRANT` / `REVOKE` script.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.7",
+      "description": "`Loopctl.AuditChain.append/2` context function is the only public API for writing entries. Signature: `append(tenant_id, %{action, actor_lineage, entity_type, entity_id, payload})`. The function computes chain_position, prev_entry_hash, and entry_hash inside an Ecto.Multi with SELECT...FOR UPDATE on the previous entry to prevent concurrent insert races.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.8",
+      "description": "`Loopctl.AuditChain.list_entries/2` reads entries for a tenant with standard pagination. It is tenant-scoped via RLS policy: `USING (tenant_id = current_tenant_id())`. AdminRepo bypasses RLS for superadmin queries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.9",
+      "description": "Genesis entry for a tenant (the first `tenant_created` event) has chain_position = 0, prev_entry_hash = 32 zero bytes. This is written as part of the signup transaction (dependency on US-26.0.1, US-26.0.2).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.10",
+      "description": "Tenant isolation test: tenant A cannot read, write to, or see tenant B's audit_chain entries. Confirmed via RLS policy tests with both Repo (RLS-enforced) and AdminRepo (BYPASSRLS) paths.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.11",
+      "description": "Concurrent append test: two processes attempt to append to the same tenant's chain simultaneously. Both operations either succeed with sequential positions (one gets N, one gets N+1) or one fails gracefully — no case where both succeed with the same position, no case where the chain has a gap.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.1.12",
+      "description": "OpenAPI spec updates: new `AuditChainEntry` schema. Operation specs for any new read endpoints (if added in this story or deferred to a later docs story). CHANGELOG entry describing the new table.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.1.1.1",
+      "name": "Append genesis entry succeeds with zero prev_entry_hash",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Call Loopctl.AuditChain.append(tenant.id, %{action: \"tenant_created\", ...})"
+      ],
+      "expected_results": [
+        "Entry is inserted with chain_position = 0",
+        "prev_entry_hash is 32 zero bytes",
+        "entry_hash is correctly computed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.2",
+      "name": "Second entry references first entry's hash",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "First entry appended"
+      ],
+      "steps": [
+        "Append second entry"
+      ],
+      "expected_results": [
+        "chain_position = 1",
+        "prev_entry_hash = first entry's entry_hash"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.3",
+      "name": "UPDATE trigger blocks any modification",
+      "type": "unit",
+      "preconditions": [
+        "Appended entry"
+      ],
+      "steps": [
+        "Attempt raw Repo.update_all to change a column"
+      ],
+      "expected_results": [
+        "Database raises exception with message mentioning cannot_modify_audit_chain",
+        "No row is modified"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.4",
+      "name": "DELETE trigger blocks any row removal",
+      "type": "unit",
+      "preconditions": [
+        "Appended entry"
+      ],
+      "steps": [
+        "Attempt Repo.delete_all"
+      ],
+      "expected_results": [
+        "Database raises cannot_delete_audit_chain",
+        "No rows deleted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.5",
+      "name": "INSERT with wrong prev_entry_hash is rejected",
+      "type": "unit",
+      "preconditions": [
+        "First entry appended"
+      ],
+      "steps": [
+        "Attempt a raw insert with prev_entry_hash = 0x42 × 32"
+      ],
+      "expected_results": [
+        "Trigger raises invariant violation",
+        "No insert"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.6",
+      "name": "INSERT with wrong chain_position is rejected",
+      "type": "unit",
+      "preconditions": [
+        "First entry appended (position 0)"
+      ],
+      "steps": [
+        "Attempt insert with chain_position = 5 (skip)"
+      ],
+      "expected_results": [
+        "Trigger raises",
+        "No insert"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.7",
+      "name": "Tenant isolation: cross-tenant reads return nothing",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant) with 3 audit entries",
+        "tenant_b = fixture(:tenant) with 0 entries",
+        "Execute as tenant_b via RLS"
+      ],
+      "steps": [
+        "List entries via Loopctl.AuditChain.list_entries(tenant_b.id, [])"
+      ],
+      "expected_results": [
+        "Returns empty list",
+        "tenant_a entries are not leaked"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.1.8",
+      "name": "Concurrent appends produce sequential positions, no gaps",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Spawn 10 concurrent tasks each calling append/2 with distinct payloads",
+        "Wait for all to complete",
+        "Query the chain"
+      ],
+      "expected_results": [
+        "All 10 entries are present",
+        "chain_position values are 0..9 with no gaps or duplicates",
+        "Each prev_entry_hash matches the previous entry_hash"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Migration file: priv/repo/migrations/<ts>_create_audit_chain.exs",
+    "Trigger functions are PL/pgSQL. Use `EXECUTE execute_error(...)` to raise with a stable error code.",
+    "The entry_hash computation must be canonical — use Jason.encode! with sorted keys, OR compute the hash in application code and store it (the trigger verifies it matches). Application-computed is simpler; the trigger just verifies.",
+    "SELECT...FOR UPDATE in append/2 locks the previous entry row to serialize concurrent appends. Without this lock, two callers can both read position N and both try to insert at N+1.",
+    "RLS policy: ENABLE ROW LEVEL SECURITY (not FORCE — the production schema_admin is owner) with `USING (tenant_id = current_tenant_id())`.",
+    "Migration file for the trigger functions should use `execute/2` with multi-line strings for the PL/pgSQL bodies.",
+    "AdminRepo is used by the STH computation (US-26.1.2) which needs to scan all tenants. Regular Repo is used for append.",
+    "Reference: docs/chain-of-custody-v2.md sections 4.1 and 4.2."
+  ],
+  "dependencies": [
+    "US-26.0.1",
+    "US-26.0.2"
+  ],
+  "estimated_hours": 12
+}

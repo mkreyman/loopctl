@@ -1,0 +1,179 @@
+{
+  "id": "US-26.1.4",
+  "title": "Pre-Existing Violator Discovery and Operator Triage Dashboard",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "audit_foundation",
+  "story": {
+    "as_a": "tenant operator rolling out the Chain of Custody v2 invariants to an existing deployment",
+    "i_want_to": "see a dashboard of pre-existing data that violates the new rules (cross-role agent bindings, nil-agent non-user keys, review records with nil reviewer, orphaned audit entries) with actionable remediation per row",
+    "so_that": "I can triage and resolve violations manually before the hard cutover without the system auto-deleting anything I might still need"
+  },
+  "rationale": "Phase 1 ships new invariants that block future violations, but existing data that predates the rules is grandfathered in. Silently ignoring pre-existing violations creates false confidence — the operator will believe the system is protected when some tenants still hold exploit vectors. This story ships a read-only discovery pass + an operator-facing dashboard to surface every violation with context and remediation options. Resolution is always operator-driven, never automated.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.1.4.1",
+      "description": "Mix task `mix loopctl.audit.discover_violators` runs a series of read-only queries and prints a report to stdout with counts per violation type. Exit code is 0 if no violations, 1 if any exist.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.2",
+      "description": "Violation types detected: (a) cross-role agent binding — same (tenant_id, agent_id) has multiple active keys with different roles; (b) nil-agent non-user key — api_key with role != user AND agent_id IS NULL; (c) api_key referencing a non-existent agent — FK would fail; (d) review_records with reviewer_agent_id IS NULL; (e) audit entries (if any exist pre-migration) without a chain hash; (f) stories in reported_done that never had a corresponding review record.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.3",
+      "description": "Each detected violation writes a row to a new `audit_pending_violations` table: id (uuid), tenant_id, violation_type (enum), entity_type, entity_id, discovered_at, detail (jsonb), status (enum: pending/resolved/ignored), resolved_at, resolved_by_api_key_id, resolution_note.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.4",
+      "description": "`GET /api/v1/admin/violators` returns all pending violations as JSON. Requires role `:superadmin`. Paginated with filters by tenant_id and violation_type.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.5",
+      "description": "LiveView at `/admin/violators` (requires superadmin key via the existing admin live_session) displays the violation list grouped by violation_type. Each row has metadata (entity, discovered_at, detail) and action buttons: \"Revoke key\" (for key-based violations), \"Reject story\" (for story-based), \"Ignore\" (for manual review), \"Mark resolved\" (for manually-fixed).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.6",
+      "description": "Every action from the dashboard is logged in the audit chain with action `violation_resolved` or `violation_ignored`, actor_lineage of the operator, and detail including the original violation and the resolution note.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.7",
+      "description": "The dashboard shows a prominent summary: total violations, count per type, and a \"cutover countdown\" (days remaining until the hard cutover enforces the new rules strictly). The cutover date is configured in `config/config.exs` as a fixed timestamp.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.8",
+      "description": "The dashboard follows `docs/design-system.md` — dark mode, slate palette, rounded-md cards, terminal aesthetic. Action buttons use the existing `.button` component with destructive/primary variants.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.9",
+      "description": "Tenant isolation: operators with a tenant-scoped admin key see only their tenant's violations. Loopctl-root superadmin key sees all tenants.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.10",
+      "description": "System article at slug `pre-existing-violators` documents the triage process: what each violation type means, the recommended remediation, and what happens if a violation goes unresolved past the cutover date. Article is authored inline in this story (short — ~500-800 words).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.4.11",
+      "description": "CHANGELOG entry describes the discovery mechanism and the dashboard. Deployment notes explain how to configure the cutover date and how to interpret the violation counts.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.1.4.1",
+      "name": "Mix task discovers cross-role bindings and writes pending violation rows",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "agent = fixture(:agent, tenant: tenant)",
+        "Bypass the new unique index to insert two active keys for the same agent with different roles (use raw SQL or AdminRepo)"
+      ],
+      "steps": [
+        "Run mix loopctl.audit.discover_violators"
+      ],
+      "expected_results": [
+        "Exit code is 1",
+        "Output lists 1 cross_role_binding violation",
+        "audit_pending_violations has 1 row of type cross_role_binding"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.4.2",
+      "name": "Dashboard lists violations with actions",
+      "type": "integration",
+      "preconditions": [
+        "audit_pending_violations has 3 rows of different types",
+        "superadmin_key = fixture(:api_key, role: :superadmin)"
+      ],
+      "steps": [
+        "Authenticate as superadmin_key",
+        "GET /admin/violators"
+      ],
+      "expected_results": [
+        "Response is 200",
+        "Page shows 3 violations grouped by type",
+        "Each has visible action buttons"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.4.3",
+      "name": "Resolving a violation writes an audit chain entry",
+      "type": "integration",
+      "preconditions": [
+        "Pending violation and superadmin_key"
+      ],
+      "steps": [
+        "POST /admin/violators/:id/resolve with a note",
+        "Query audit_chain"
+      ],
+      "expected_results": [
+        "Violation status changes to resolved",
+        "Audit chain has a new entry with action = violation_resolved",
+        "Payload includes the violation detail and the note"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.4.4",
+      "name": "Tenant-scoped admin sees only their tenant's violations",
+      "type": "integration",
+      "preconditions": [
+        "violations for tenant_a and tenant_b",
+        "tenant-admin key for tenant_a (user role, scoped)"
+      ],
+      "steps": [
+        "GET /admin/violators as tenant_a admin"
+      ],
+      "expected_results": [
+        "Response shows only tenant_a's violations",
+        "tenant_b violations are not visible"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.4.5",
+      "name": "Non-admin cannot access the dashboard",
+      "type": "integration",
+      "preconditions": [
+        "agent_key = fixture(:api_key, role: :agent)"
+      ],
+      "steps": [
+        "GET /admin/violators as agent_key"
+      ],
+      "expected_results": [
+        "Response is 403"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Mix task: lib/mix/tasks/loopctl.audit.discover_violators.ex.",
+    "The task uses AdminRepo (BYPASSRLS) to read across all tenants for a superadmin-run scan.",
+    "Each violation type corresponds to a specific SQL query. Example for cross-role: `SELECT tenant_id, agent_id, array_agg(DISTINCT role) FROM api_keys WHERE revoked_at IS NULL AND agent_id IS NOT NULL GROUP BY tenant_id, agent_id HAVING count(DISTINCT role) > 1`",
+    "Migration for audit_pending_violations: standard fields + jsonb detail + enum status.",
+    "LiveView: lib/loopctl_web/live/admin/violators_live.ex in the existing admin live_session.",
+    "Cutover date config: `config :loopctl, :chain_of_custody_v2_cutover, ~U[2026-05-15 00:00:00Z]`.",
+    "Action buttons: \"Revoke key\" calls Loopctl.Auth.revoke_api_key via the existing function. \"Reject story\" calls Progress.reject_story. Both write to audit_chain automatically.",
+    "The wiki article is authored as a heredoc in the seed migration, matching the pattern from US-26.0.5.",
+    "Reference: docs/chain-of-custody-v2.md section 11 (migration notes)."
+  ],
+  "dependencies": [
+    "US-26.1.1",
+    "US-26.1.3"
+  ],
+  "estimated_hours": 6
+}
