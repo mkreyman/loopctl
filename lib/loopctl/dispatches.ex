@@ -260,9 +260,9 @@ defmodule Loopctl.Dispatches do
     end
   end
 
-  defp normalize_role(role) when is_atom(role), do: role
+  defp normalize_role(role) when role in [:agent, :orchestrator, :user], do: role
   defp normalize_role("agent"), do: :agent
   defp normalize_role("orchestrator"), do: :orchestrator
   defp normalize_role("user"), do: :user
-  defp normalize_role(other), do: other
+  defp normalize_role(invalid), do: {:error, {:invalid_role, invalid}}
 end

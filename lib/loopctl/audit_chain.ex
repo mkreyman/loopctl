@@ -23,6 +23,7 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.PubSub, as: ChainPubSub
   alias Loopctl.AuditChain.SignedTreeHead
   alias Loopctl.TenantKeys
 
@@ -68,8 +69,13 @@ defmodule Loopctl.AuditChain do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{insert_entry: entry}} -> {:ok, entry}
-      {:error, _step, reason, _changes} -> {:error, reason}
+      {:ok, %{insert_entry: entry}} ->
+        # US-26.5.1: broadcast new entry to PubSub subscribers
+        ChainPubSub.broadcast_entry(tenant_id, entry)
+        {:ok, entry}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   end
 
@@ -181,7 +187,15 @@ defmodule Loopctl.AuditChain do
           conflict_target: [:tenant_id, :chain_position]
         )
 
-      sth
+      # US-26.5.1: broadcast STH to PubSub subscribers
+      case sth do
+        {:ok, stored_sth} ->
+          ChainPubSub.broadcast_sth(tenant_id, stored_sth)
+          {:ok, stored_sth}
+
+        error ->
+          error
+      end
     else
       {:ok, nil} -> {:error, :empty_chain}
       nil -> {:error, :empty_chain}

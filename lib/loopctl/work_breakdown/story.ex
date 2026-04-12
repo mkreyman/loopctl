@@ -49,6 +49,9 @@ defmodule Loopctl.WorkBreakdown.Story do
              :rejection_reason,
              :sort_key,
              :metadata,
+             :implementer_dispatch_id,
+             :verifier_dispatch_id,
+             :verifier_needed,
              :inserted_at,
              :updated_at
            ]}

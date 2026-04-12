@@ -67,6 +67,11 @@ defmodule Loopctl.TokenUsage.Report do
     field :metadata, :map, default: %{}
     field :deleted_at, :utc_datetime_usec
 
+    # US-26.6.1: Extended telemetry for lazy-bastard scoring
+    field :tool_call_count, :integer
+    field :cot_length_tokens, :integer
+    field :tests_run_count, :integer
+
     timestamps()
   end
 
@@ -87,7 +92,10 @@ defmodule Loopctl.TokenUsage.Report do
       :phase,
       :session_id,
       :skill_version_id,
-      :metadata
+      :metadata,
+      :tool_call_count,
+      :cot_length_tokens,
+      :tests_run_count
     ])
     |> validate_required([:input_tokens, :output_tokens, :model_name, :cost_millicents])
     |> validate_number(:input_tokens, greater_than_or_equal_to: 0)
@@ -121,7 +129,10 @@ defmodule Loopctl.TokenUsage.Report do
       :phase,
       :session_id,
       :skill_version_id,
-      :metadata
+      :metadata,
+      :tool_call_count,
+      :cot_length_tokens,
+      :tests_run_count
     ])
     |> validate_required([:input_tokens, :output_tokens, :model_name, :cost_millicents])
     |> validate_inclusion(:phase, @phases)

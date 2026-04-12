@@ -19,8 +19,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   def perform(%Oban.Job{args: %{"run_id" => run_id, "tenant_id" => tenant_id}}) do
     case Verification.get_run(tenant_id, run_id) do
       {:ok, run} ->
-        {:ok, run} = Verification.start_run(run)
-        execute_verification(run)
+        case Verification.start_run(run) do
+          {:ok, started} -> execute_verification(started)
+          {:error, reason} -> {:error, reason}
+        end
 
       {:error, :not_found} ->
         Logger.warning("VerificationRunner: run #{run_id} not found")
