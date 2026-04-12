@@ -343,5 +343,10 @@ defmodule LoopctlWeb.Router do
 
     # Cross-tenant audit log
     get "/audit", AdminAuditController, :index
+
+    # US-26.1.4 — Pre-existing violation management
+    get "/violators", AdminViolatorController, :index
+    post "/violators/:id/resolve", AdminViolatorController, :resolve
+    post "/violators/:id/ignore", AdminViolatorController, :ignore
   end
 end
