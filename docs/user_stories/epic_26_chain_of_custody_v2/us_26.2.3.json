@@ -46,12 +46,12 @@
     },
     {
       "id": "AC-26.2.3.7",
-      "description": "During the deprecation window (30 days from Phase 2 ship), calls using a legacy long-lived LOOPCTL_AGENT_KEY receive a `X-Loopctl-Deprecation-Warning` response header and a `_meta.deprecation_warning` field in the body. The warning text includes the cutover date and a link to `/wiki/dispatch-lineage`.",
+      "description": "While the `lineage_prefix_overlap` enforcement flag is `:shadow`, calls using a legacy long-lived LOOPCTL_AGENT_KEY are resolved via an implicit-root-dispatch shim: the auth plug looks up the key and synthesizes a dispatch row for it on the fly, binding it to the operator's root dispatch from tenant signup. The synthesis is invisible to callers — existing orchestrator sessions continue working unchanged. Every synthesis is logged as a shadow event so the operator can see how many calls still rely on the legacy path before flipping the flag.",
       "status": "pending"
     },
     {
       "id": "AC-26.2.3.8",
-      "description": "After the cutover date (configured via `config :loopctl, :lineage_cutover_date`), legacy calls receive `410 Gone` with the same remediation information.",
+      "description": "When the operator flips the enforcement flag to `:strict`, the implicit-root-dispatch shim is removed in the same deploy. From that moment, calls without a real dispatch fail with 403 `missing_dispatch` and remediation pointing at `/wiki/dispatch-lineage`. The orchestrator skill update (sibling PR in claude-config) is coordinated to land at the same cutover moment so running sessions get the new pattern on restart.",
       "status": "pending"
     },
     {
@@ -174,6 +174,7 @@
     "Reference: docs/chain-of-custody-v2.md sections 6 and 10.2."
   ],
   "dependencies": [
+    "US-26.0.0",
     "US-26.2.1",
     "US-26.2.2"
   ],

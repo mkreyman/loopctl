@@ -48,7 +48,7 @@
     },
     {
       "id": "AC-26.5.2.9",
-      "description": "60-day soft launch: the header is optional during the window. A new config value `:witness_header_required` flips to true at the cutover, making the header mandatory. Pre-cutover, missing header is allowed but emits a `X-Loopctl-Deprecation-Warning` response header."
+      "description": "The witness-header requirement is routed through enforcement flag `:witness_header_missing`. In shadow mode the plug logs every request missing the header (or carrying a stale one) but allows it through. When the operator flips the flag to `:strict`, the plug rejects the request with 412 Precondition Required and a remediation pointing at `/wiki/witness-protocol`. The shadow mode branch and the strict branch use the same plug — only the flag determines whether a violation results in reject."
     },
     {
       "id": "AC-26.5.2.10",
@@ -92,9 +92,9 @@
     "Signature prefix comparison: compare the first 16 bytes of the STH signature (64 bytes total). Prefix is enough for divergence detection and keeps the header short.",
     "Halt state is stored on the tenants table. All custody endpoints check this at the plug level.",
     "Clear-halt endpoint is separate from the normal admin API to require WebAuthn.",
-    "60-day soft launch: config `:witness_header_required, false` for now. Flip at cutover.",
+    "Enforcement flag: :witness_header_missing starts in :shadow when Phase 5 ships. Operator observes the dashboard for 7 days, confirms all active agents have been updated, then flips to :strict via the admin endpoint.",
     "Reference: docs/chain-of-custody-v2.md section 4.4 and section 2.7 (halt on byzantine)."
   ],
-  "dependencies": ["US-26.5.1"],
+  "dependencies": ["US-26.0.0", "US-26.5.1"],
   "estimated_hours": 10
 }

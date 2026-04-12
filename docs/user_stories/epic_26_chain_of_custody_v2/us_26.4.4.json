@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-26.4.4.1",
-      "description": "`POST /api/v1/stories/:id/verify` no longer transitions state directly. It validates the verify_cap (from US-26.3.1), enqueues a verification_run, and returns 202 Accepted with `{status: \"verification_pending\", run_id: \"...\"}` and a `next_action` describing how to poll the run."
+      "description": "`POST /api/v1/stories/:id/verify` no longer transitions state directly. It validates the verify_cap (from US-26.3.1), enqueues a verification_run, and returns 202 Accepted with `{status: \"verification_pending\", run_id: \"...\"}` and a `next_action` describing how to poll the run. The response-shape change is routed through enforcement flag `:verify_sync_response` — during shadow mode the endpoint still returns 200 with the legacy synchronous shape but ALSO enqueues a verification run in the background; the shadow dashboard shows how many callers would see the new 202 shape. When the flag flips to :strict, the endpoint returns 202 and the legacy synchronous branch is removed from the code."
     },
     {
       "id": "AC-26.4.4.2",
@@ -44,7 +44,7 @@
     },
     {
       "id": "AC-26.4.4.8",
-      "description": "Existing tests for `verify_story` are updated: they await the verification_run before asserting state change. Tests use Oban.drain_queue to process the runs synchronously."
+      "description": "Existing tests for `verify_story` are updated: they await the verification_run before asserting state change. Tests use Oban.drain_queue to process the runs synchronously. After the flag flip to strict, the synchronous fallback path is deleted — tests cannot exercise it because it no longer exists."
     },
     {
       "id": "AC-26.4.4.9",
@@ -91,9 +91,9 @@
     "LiveView: lib/loopctl_web/live/admin/manual_reviews_live.ex in the admin live_session.",
     "Bulk approval rate limit: reuse Hammer.",
     "The verification_run completion callback is an Oban worker chained after VerificationRunner: VerificationCompletionWorker reads the run and transitions the story.",
-    "verify_story response shape changes from 200 to 202; existing clients need migration. Include deprecation period and deprecation header during cutover.",
+    "verify_story response shape changes from 200 to 202 at the enforcement flag flip moment. The shadow-mode branch and the strict branch share a single function with the flag controlling the return shape. After the cutover, the legacy branch is deleted in the same commit that removes the :verify_sync_response flag.",
     "Reference: docs/chain-of-custody-v2.md section 7.3."
   ],
-  "dependencies": ["US-26.4.1", "US-26.4.2"],
+  "dependencies": ["US-26.0.0", "US-26.4.1", "US-26.4.2"],
   "estimated_hours": 8
 }

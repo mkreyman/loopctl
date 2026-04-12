@@ -61,7 +61,7 @@
     },
     {
       "id": "AC-26.2.2.10",
-      "description": "Migration adds `stories.implementer_dispatch_id`, `stories.verifier_dispatch_id`, `stories.verifier_needed` columns. Backfill for existing stories sets them to null; the new validators treat null as \"pre-dispatch-era, fall back to old agent_id check\" during a 30-day deprecation window, then hard-require non-null after cutover.",
+      "description": "Migration adds `stories.implementer_dispatch_id`, `stories.verifier_dispatch_id`, `stories.verifier_needed` columns. The Phase 2 cutover is an atomic operation: Phase 1 ships the enforcement flag for `lineage_prefix_overlap` in :shadow mode; the operator runs a one-shot backfill script that creates dispatches for any in-flight stories (associating them with the legacy long-lived key as an implicit root dispatch); then the flag flips to :strict. After the flip, all stories have non-null dispatch references and the legacy agent_id comparison is removed from the call site entirely. No dual path remains.",
       "status": "pending"
     },
     {
@@ -177,6 +177,7 @@
     "Reference: docs/chain-of-custody-v2.md sections 6.2 and 6.3."
   ],
   "dependencies": [
+    "US-26.0.0",
     "US-26.2.1"
   ],
   "estimated_hours": 10

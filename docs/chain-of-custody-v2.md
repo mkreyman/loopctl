@@ -688,7 +688,7 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - Orchestrator skill updated to use dispatches instead of the env var
 - Loopctl MCP server updated to present dispatch flow in tool descriptions
 
-**Shippable**: yes. Old orchestrator sessions continue working on the deprecated path for 30 days with loud warnings; hard cutover after the deprecation window.
+**Shippable**: yes. The dispatch endpoint ships in shadow mode (legacy long-lived keys still resolve to an implicit root dispatch, shadow events log every resolution), then the flag flips to strict — from that moment the long-lived key path is removed entirely and only ephemeral dispatches are accepted.
 
 ### Phase 3 — Capability tokens
 
@@ -702,7 +702,7 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - Error responses for cap failures include the remediation path
 - System articles updated with the cap scheme
 
-**Shippable**: yes. Cap verification defaults to permissive during a 7-day migration window (with loud warnings on every request), then strict.
+**Shippable**: yes. Cap verification ships in shadow mode for a 7-day observation window, then flips to strict via the enforcement flag. After the flip, the missing-capability path is the only behavior — no permissive fallback remains.
 
 ### Phase 4 — Independent re-execution
 
@@ -717,7 +717,7 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - `verify_story` endpoint refactored to enqueue a verification run instead of transitioning directly
 - Operator dashboard for `manual:` criteria requiring human review
 
-**Shippable**: yes. Existing stories with no `verification_criterion` default to `manual:legacy` and require human sign-off; new stories must declare bindings at contract time.
+**Shippable**: yes. The one-time backfill converts existing stories' jsonb-blob ACs into `story_acceptance_criteria` rows with `{type: "manual", description: "legacy"}` bindings. Stories contracted after the phase ship must declare real bindings at contract time — the check ships in shadow mode first, then strict after a 7-day observation window.
 
 ### Phase 5 — Witness protocol
 
@@ -729,7 +729,7 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - Divergence detection and halt
 - System article explaining how agents contribute to tamper evidence
 
-**Shippable**: yes. Agents without witness support continue working; the header is optional but encouraged. After a 60-day adoption window, the header becomes mandatory.
+**Shippable**: yes. Header validation ships in shadow mode for 7 days (missing header is logged but allowed), then the enforcement flag flips to strict — from that moment the header is required on every custody request.
 
 ### Phase 6 — Behavioral telemetry
 
@@ -741,18 +741,37 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - CoT sanity monitor (non-blocking, non-trained) running on review records
 - Alert dashboard for anomalies
 
-**Shippable**: yes. Telemetry is non-blocking; thresholds are tunable per tenant.
+**Shippable**: yes. Telemetry is non-blocking by design — scores route stories for stricter re-review, they never reject custody operations directly.
 
-## 11. Migration notes
+## 11. Migration notes — hard cutover strategy
 
-Every phase includes a deprecation window with loud warnings. No phase breaks the existing API contract on day one — old-shape calls continue working with deprecation headers in the response, and a hard cutover date is announced at phase ship time (typically 30-60 days later).
+Loopctl.com is a single-tenant production deployment. The cutover from v1 to v2 is global and one-shot per invariant: every new check ships first in shadow mode (logs would-have-rejected events without blocking), then flips to strict via a single config change after the operator reviews the shadow-mode dashboard and confirms no false positives.
 
-Pre-existing data that violates new invariants is flagged for operator review, not auto-corrected:
+No deprecation windows. No legacy compatibility shims. No `tenants.protocol_version` column. No per-story version gating. The `Loopctl.Enforcement.check/3` call site is the uniform enforcement path — the config flag controls whether it rejects or allows, but the call site is the same in both modes. At no point does the codebase contain a parallel "v1 path" and "v2 path" — there is one path, with one flag.
 
-- Cross-role bindings on the same agent: flagged at Phase 1 ship, operator must resolve before the cutover date
-- Nil-agent long-lived keys: flagged at Phase 1 ship, operator must issue new lineage-scoped dispatches before the cutover date
-- Stories without `verification_criterion`: flagged at Phase 4 ship, default to `manual:legacy` with operator approval required
-- Audit chain gaps from before Phase 1: the genesis entry is computed from the first post-Phase-1 event, and historical audit events are archived read-only in a separate table
+### Cutover sequence per phase
+
+1. **Ship phase code with enforcement flags set to `:shadow`**. New checks log to `enforcement_shadow_events` but do not reject.
+2. **Observe for 7 days** via the `/admin/shadow-events` dashboard. Review every would-reject event. If any are false positives (a check rejecting a legitimate request the operator did not intend to block), fix the check and restart the observation window.
+3. **Flip the flag to `:strict`** via `PATCH /api/v1/admin/enforcement/:invariant`. The flip is immediate and global. From that moment, the check rejects matching requests. The flip is audit-logged.
+4. **No rollback to shadow** is expected in normal operation, but the flag can be flipped back via the same endpoint if a production issue surfaces. Flipping back does not require a deploy.
+
+### Pre-existing data handling
+
+Every invariant that could be violated by pre-existing data gets a discovery pass before its strict cutover:
+
+- **Cross-role api_key bindings**: discovered at Phase 1 ship, surfaced in `/admin/violators`. Operator must revoke conflicting keys before flipping the `cross_role_binding` flag to strict. Migration checks the violator count and refuses to set strict if any unresolved.
+- **Nil-agent non-user keys**: same pattern — discovered, surfaced, operator resolves, then flag flips.
+- **Stories without `verification_criterion`**: backfilled with `manual:legacy` bindings. Operator can re-annotate them with real bindings via the admin dashboard before the `missing_verification_criterion_on_contract` flag flips.
+- **Audit chain gap before Phase 1**: the genesis entry is written at the moment Phase 1 ships. Historical data from the pre-v2 `audit_log` table remains readable but is NOT part of the hash-chained history. A followup migration after Phase 1 stabilizes can optionally copy historical entries into an immutable archive table if needed for compliance.
+
+### Observation-to-strict windows
+
+The 7-day shadow window per phase is the default; the operator can extend it for phases where the observation reveals more edge cases than expected. There is no fixed calendar deadline for each cutover — the flip happens when the shadow data looks clean, not on a clock.
+
+### After all flags are strict
+
+Once every enforcement flag has been in `:strict` mode stably for 30 days post-Phase-6, a final cleanup story can remove the config flag machinery entirely and inline the strict behavior directly into the call sites. That cleanup is tracked as a future story after Epic 26 wraps — it is NOT part of any Phase 0-6 story to avoid coupling the feature work to the cleanup.
 
 ## 12. Open questions
 

@@ -1,0 +1,160 @@
+{
+  "id": "US-26.0.0",
+  "title": "Shadow-Mode Machinery and Cutover Infrastructure",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "tenant_signup",
+  "story": {
+    "as_a": "loopctl maintainer rolling out Chain of Custody v2 enforcement without breaking running orchestrator sessions",
+    "i_want_to": "ship each new invariant in a shadow-mode phase where the check runs, logs what it would have rejected, but allows the request to proceed — and then flip to strict enforcement via a single config change after validating the shadow-mode logs",
+    "so_that": "we can catch false positives and code bugs before they cause real rejections, and the cutover from v1 to v2 behavior is a deliberate, reversible moment rather than a day-one breaking change"
+  },
+  "rationale": "Every later story in Epic 26 that introduces a new invariant (nil-rejection in Progress.validate_not_self_*, capability token requirement, lineage-based self-check, witness STH header, verify_story async mode) ships a check that will reject some subset of traffic. Running that check in 'strict from day one' mode risks breaking legitimate requests that happen to look like the class we want to block. Shadow mode lets us observe what the check would do, tune if needed, then enforce. Loopctl.com is a single-tenant production deployment at cutover time, so there is no need for per-tenant or per-story version gating — the cutover is global, one moment in time, and no dual-mode compatibility is preserved in the final code.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.0.1",
+      "description": "New table `enforcement_shadow_events` with columns: id (uuid PK), tenant_id (uuid, FK nullable for pre-tenant events), invariant (string enum naming the check — e.g. 'self_verify_nil_bypass', 'missing_capability_token', 'witness_header_missing', 'lineage_prefix_overlap', 'verify_sync_mode'), outcome (enum: :would_reject, :allowed_legacy), caller_summary (jsonb: api_key_id, api_key_role, dispatch_id if applicable), request_summary (jsonb: path, method, relevant_params), inserted_at. Append-only via BEFORE UPDATE/DELETE trigger raising."
+    },
+    {
+      "id": "AC-26.0.0.2",
+      "description": "Config-driven feature flags in `config :loopctl, :enforcement` keyword list. Each new Chain of Custody v2 invariant has a named flag with values `:shadow` (log would-reject, allow through) or `:strict` (log AND reject). Flags default to `:shadow` when the phase ships and are flipped to `:strict` in a subsequent release commit. Flag names match the invariant names in AC-26.0.0.1."
+    },
+    {
+      "id": "AC-26.0.0.3",
+      "description": "`Loopctl.Enforcement` module exposes `check/3` taking an invariant name, a `would_reject?` boolean, and an event context map. If the flag is `:shadow` and `would_reject?` is true, it writes a shadow_events row and returns `:ok` (the caller proceeds). If `:strict` and `would_reject?` is true, it writes the shadow_events row AND returns `{:error, invariant_name}`. If `would_reject?` is false, no row is written and returns `:ok`. Every later story in Epic 26 that introduces a new check routes its enforcement through this function."
+    },
+    {
+      "id": "AC-26.0.0.4",
+      "description": "Operator dashboard at `/admin/shadow-events` lists recent shadow-mode events grouped by invariant with counts, distinct callers, and sample requests. Used for a 7-day observation period after each phase ships to decide whether the check is ready to flip to `:strict`. Requires superadmin role."
+    },
+    {
+      "id": "AC-26.0.0.5",
+      "description": "`GET /api/v1/admin/enforcement` returns the current flag state for every invariant. `PATCH /api/v1/admin/enforcement/:invariant` flips a single invariant from shadow to strict (or back). Requires superadmin role. The patch writes an audit_chain entry."
+    },
+    {
+      "id": "AC-26.0.0.6",
+      "description": "No `tenants.protocol_version` column. No `stories.protocol_version` column. The cutover is global and one-shot per invariant via the enforcement flags. After the final flip to strict for an invariant, the shadow-mode code path is NOT removed — it continues to function because strict mode uses the same `check/3` call site, the flag just changes behavior. Dead-code-free: there is never a legacy path alongside a modern path."
+    },
+    {
+      "id": "AC-26.0.0.7",
+      "description": "CLI / Mix task `mix loopctl.enforcement.status` prints the current state of every flag and the count of shadow events per invariant over the last 24 hours. Used by the operator to decide when each phase is ready to cut over."
+    },
+    {
+      "id": "AC-26.0.0.8",
+      "description": "After all Epic 26 invariants are in `:strict` and have been stable for at least 30 days, a final cleanup migration can drop the feature flag config entirely and inline the strict behavior. That cleanup is NOT part of this story — it is tracked as a future story after Phase 6 ships. Meanwhile, the `Loopctl.Enforcement.check/3` call sites stay in place indefinitely since they're the uniform enforcement path."
+    },
+    {
+      "id": "AC-26.0.0.9",
+      "description": "System article stub at slug `enforcement-shadow-mode` documents the shadow-mode pattern for operator context. Content authored inline in this story (~400 words explaining shadow mode, when to flip, how to interpret the dashboard)."
+    },
+    {
+      "id": "AC-26.0.0.10",
+      "description": "OpenAPI spec updates: new admin endpoints for enforcement flag state, new ShadowEventResponse schema. CHANGELOG entry describing the shadow-mode rollout pattern."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.0.1",
+      "name": "Shadow flag allows request and writes event",
+      "type": "unit",
+      "preconditions": [
+        "Config flag :example_invariant set to :shadow"
+      ],
+      "steps": [
+        "Call Enforcement.check(:example_invariant, true, %{caller: ...})"
+      ],
+      "expected_results": [
+        "Returns :ok",
+        "enforcement_shadow_events has a new row with outcome = :would_reject"
+      ]
+    },
+    {
+      "id": "TC-26.0.0.2",
+      "name": "Strict flag rejects request and writes event",
+      "type": "unit",
+      "preconditions": [
+        "Config flag :example_invariant set to :strict"
+      ],
+      "steps": [
+        "Call Enforcement.check(:example_invariant, true, %{caller: ...})"
+      ],
+      "expected_results": [
+        "Returns {:error, :example_invariant}",
+        "enforcement_shadow_events has a new row with outcome = :would_reject (we still log it so the dashboard shows strict-mode rejections too)"
+      ]
+    },
+    {
+      "id": "TC-26.0.0.3",
+      "name": "Non-triggering request writes no row",
+      "type": "unit",
+      "steps": [
+        "Call Enforcement.check(:example_invariant, false, %{})"
+      ],
+      "expected_results": [
+        "Returns :ok",
+        "No shadow event row is inserted"
+      ]
+    },
+    {
+      "id": "TC-26.0.0.4",
+      "name": "Operator flips flag via PATCH endpoint",
+      "type": "integration",
+      "preconditions": [
+        "Flag :example_invariant is :shadow",
+        "superadmin_key authenticated"
+      ],
+      "steps": [
+        "PATCH /api/v1/admin/enforcement/example_invariant with body {state: \"strict\"}"
+      ],
+      "expected_results": [
+        "Response is 200",
+        "Current flag state is :strict",
+        "audit_chain has a new entry with action = enforcement_flag_flipped"
+      ]
+    },
+    {
+      "id": "TC-26.0.0.5",
+      "name": "Dashboard groups events by invariant with counts",
+      "type": "integration",
+      "preconditions": [
+        "5 shadow events for invariant_a, 2 for invariant_b"
+      ],
+      "steps": [
+        "GET /admin/shadow-events as superadmin"
+      ],
+      "expected_results": [
+        "Page lists both invariants with counts 5 and 2",
+        "Sample request details are displayed"
+      ]
+    },
+    {
+      "id": "TC-26.0.0.6",
+      "name": "Shadow events are append-only",
+      "type": "unit",
+      "steps": [
+        "Attempt Repo.update_all on an event",
+        "Attempt Repo.delete"
+      ],
+      "expected_results": [
+        "Both attempts raise an exception from the BEFORE UPDATE/DELETE triggers"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Module: lib/loopctl/enforcement.ex exposes check/3 + get_flag/1 + flip_flag/2.",
+    "Config file: config/config.exs has `config :loopctl, :enforcement, [...]` with all invariants initially set to :shadow. Individual environments (dev, test, prod) override per need.",
+    "Migration file: priv/repo/migrations/<ts>_create_enforcement_shadow_events.exs",
+    "Triggers: BEFORE UPDATE and BEFORE DELETE on enforcement_shadow_events raise 'append_only' error.",
+    "Dashboard LiveView: lib/loopctl_web/live/admin/shadow_events_live.ex.",
+    "Flag flip endpoint: PATCH writes the new value to a GenServer-backed state (not a file write, since Fly machines are ephemeral). Flag state is persisted in a `enforcement_flags` table for durability across restarts.",
+    "Wait — revise: flag state is stored in the DB via a simple `enforcement_flags (invariant text PK, state text, updated_at)` table. Application reads the current state on each check, cached in ETS with a 5-second TTL for low-latency.",
+    "Cutover process: operator observes shadow events for 7 days after each phase ships, reviews the dashboard, flips the flag via PATCH. The flip is immediate and global (single-tenant deployment). No per-tenant, no per-story gating.",
+    "The invariants to be introduced in later phases are known and enumerated here as config defaults: self_verify_nil_bypass, self_report_nil_bypass, self_review_nil_bypass, missing_capability_token, lineage_prefix_overlap, witness_header_missing, verify_sync_response. Each is added as shadow in its phase and flipped to strict after observation.",
+    "Reference: docs/chain-of-custody-v2.md section 11 (hard cutover migration notes)."
+  ],
+  "dependencies": [],
+  "estimated_hours": 8
+}
