@@ -1,0 +1,86 @@
+{
+  "id": "US-26.6.2",
+  "title": "Lazy-Bastard Score Computation and Re-Review Flag",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "behavioral_detection",
+  "story": {
+    "as_a": "tenant operator relying on soft signals to catch agents declaring work done without actually doing it",
+    "i_want_to": "have loopctl compute a lazy-bastard score for every completed story based on telemetry anomalies relative to the story's complexity, and auto-flag high-scoring stories for a more scrupulous re-review",
+    "so_that": "prematurely-declared stories get caught by additional scrutiny even when the code technically compiles and tests pass"
+  },
+  "rationale": "With telemetry from US-26.6.1 flowing, scoring it mechanically catches the most common lazy patterns: too-few tool calls, too-short CoT, mismatch between tests_run and test ACs. The score is never a hard block — it triggers re-review, which the chain-of-custody system handles normally.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.6.2.1",
+      "description": "`Loopctl.Stories.compute_lazy_score/1` takes a story and returns a score 0-100 based on these weighted signals: (a) tool_call_count vs baseline for stories of similar estimated_hours (weight 25), (b) cot_length_tokens vs baseline (weight 15), (c) tests_run_count vs count of ACs with type:test criterion (weight 30), (d) time_to_completion vs estimated_hours (weight 15), (e) ratio of commits to files_modified (weight 15). Each subscore 0-100."
+    },
+    {
+      "id": "AC-26.6.2.2",
+      "description": "Baseline is computed per tenant from the last 30 days of successfully verified stories. Fallback to a loopctl-global baseline if the tenant has fewer than 10 verified stories."
+    },
+    {
+      "id": "AC-26.6.2.3",
+      "description": "Score is computed at `request_review` time and stored on the story as `lazy_score` (integer) and `lazy_score_breakdown` (jsonb with per-signal subscores)."
+    },
+    {
+      "id": "AC-26.6.2.4",
+      "description": "Stories with `lazy_score >= 75` are flagged `re_review_required: true`. The rotating verifier selection for re-review stories uses a more-scrupulous verifier prompt (system article `re-review-prompt` describes the extra checks)."
+    },
+    {
+      "id": "AC-26.6.2.5",
+      "description": "Lazy scores and flags are visible in the admin story dashboard. Operator can manually flag or unflag a story with a note; both actions write audit_chain entries."
+    },
+    {
+      "id": "AC-26.6.2.6",
+      "description": "The thresholds (75 for flag, weights per signal) are tunable per tenant via tenant settings. Default values ship in config."
+    },
+    {
+      "id": "AC-26.6.2.7",
+      "description": "Documented: the scoring is a soft signal — the story still progresses through normal verification even at score 100. Flags change WHO reviews, not WHETHER the story can pass."
+    },
+    {
+      "id": "AC-26.6.2.8",
+      "description": "System article `lazy-bastard-detection` (from US-26.4.5) updated with the scoring formula and thresholds (in a way that doesn't give agents a gaming recipe — documents what's measured but not the exact weights)."
+    },
+    {
+      "id": "AC-26.6.2.9",
+      "description": "Migration adds `stories.lazy_score` and `stories.lazy_score_breakdown` columns. CHANGELOG entry."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.6.2.1",
+      "name": "Low tool_call_count drives up the score",
+      "type": "unit",
+      "preconditions": ["Baseline of 50 tool calls for 4-hour stories"],
+      "steps": ["Create story with 4h estimate and 5 tool calls", "Compute score"],
+      "expected_results": ["Score is high (> 50) due to the tool call subscore"]
+    },
+    {
+      "id": "TC-26.6.2.2",
+      "name": "Normal telemetry yields a low score",
+      "type": "unit",
+      "steps": ["Story matching baseline on all signals"],
+      "expected_results": ["Score < 30"]
+    },
+    {
+      "id": "TC-26.6.2.3",
+      "name": "High score sets re_review_required flag",
+      "type": "integration",
+      "steps": ["Submit a story with deliberately low telemetry", "Call request_review"],
+      "expected_results": ["story.lazy_score >= 75", "story.re_review_required = true"]
+    }
+  ],
+  "technical_notes": [
+    "Baseline queries use AdminRepo to read cross-tenant or loopctl-global data.",
+    "Subscore formulas are documented in an internal module module-docstring for future tuning.",
+    "The loopctl-global baseline serves new tenants; fallback triggers when tenant has < 10 verified stories.",
+    "Reference: docs/chain-of-custody-v2.md section 10 Phase 6."
+  ],
+  "dependencies": ["US-26.6.1", "US-26.2.2"],
+  "estimated_hours": 8
+}

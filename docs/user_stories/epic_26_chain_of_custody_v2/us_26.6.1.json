@@ -1,0 +1,82 @@
+{
+  "id": "US-26.6.1",
+  "title": "Extended Token Usage Telemetry: Tool Calls, CoT Length, Tests Run",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "behavioral_detection",
+  "story": {
+    "as_a": "operator evaluating agent behavior across stories",
+    "i_want_to": "have token_usage_reports carry additional behavioral signals (tool_call_count, cot_length_tokens, tests_run_count) per story per role",
+    "so_that": "loopctl can compute lazy-bastard scores (US-26.6.2) and flag suspicious stories for re-review"
+  },
+  "rationale": "Lazy-bastard detection (L5 in the chain-of-custody v2 stack) relies on mechanical signals from agent telemetry. The existing token_usage infrastructure from Epic 21 is close but missing three fields that the research literature identified as the strongest indicators of premature task declaration.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.6.1.1",
+      "description": "Migration adds columns to `token_usage_reports`: `tool_call_count` (integer nullable), `cot_length_tokens` (integer nullable), `tests_run_count` (integer nullable). All nullable for backward compat with existing reports."
+    },
+    {
+      "id": "AC-26.6.1.2",
+      "description": "`POST /api/v1/token-usage` accepts the three new fields in the request body. Schema updated in OpenAPI spec."
+    },
+    {
+      "id": "AC-26.6.1.3",
+      "description": "mcp-server's token_usage reporting helper updates to include the new fields. Agents can now report telemetry along with each token usage submission."
+    },
+    {
+      "id": "AC-26.6.1.4",
+      "description": "`Loopctl.TokenUsage.Analytics` queries gain aggregation dimensions: average, p50, p95, p99 of each new field per story, per role, per agent_id."
+    },
+    {
+      "id": "AC-26.6.1.5",
+      "description": "New MCP tool `mcp__loopctl__knowledge_agent_usage` response includes the new aggregates."
+    },
+    {
+      "id": "AC-26.6.1.6",
+      "description": "Backward compat: existing callers reporting without the new fields continue to work; the fields are stored as null."
+    },
+    {
+      "id": "AC-26.6.1.7",
+      "description": "System article `agent-telemetry` documents the reporting contract and what the new fields mean. Full content authored inline in this story (~500 words)."
+    },
+    {
+      "id": "AC-26.6.1.8",
+      "description": "CHANGELOG entry describing the new fields. OpenAPI schema updated. Integration test asserts the new fields are stored and queryable."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.6.1.1",
+      "name": "POST /token-usage with new fields stores them correctly",
+      "type": "integration",
+      "steps": ["POST with tool_call_count, cot_length_tokens, tests_run_count"],
+      "expected_results": ["Record is stored with all three values"]
+    },
+    {
+      "id": "TC-26.6.1.2",
+      "name": "Backward compat: POST without new fields stores nulls",
+      "type": "integration",
+      "steps": ["POST only the original fields"],
+      "expected_results": ["Record stored with new fields = null"]
+    },
+    {
+      "id": "TC-26.6.1.3",
+      "name": "Analytics aggregates the new fields",
+      "type": "unit",
+      "preconditions": ["10 reports with varying tool_call_count"],
+      "steps": ["Call Analytics.aggregate_by_agent/1"],
+      "expected_results": ["Result includes mean, p50, p95, p99 of tool_call_count"]
+    }
+  ],
+  "technical_notes": [
+    "Migration file: priv/repo/migrations/<ts>_add_behavioral_signals_to_token_usage.exs",
+    "OpenAPI schema: add fields to TokenUsageReport schema in api_spec/schemas.ex.",
+    "mcp-server helper: update mcp-server/index.js report_token_usage wrapper.",
+    "Reference: docs/chain-of-custody-v2.md section 3 L5 and section 10 Phase 6."
+  ],
+  "dependencies": ["US-26.1.1"],
+  "estimated_hours": 4
+}

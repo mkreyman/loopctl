@@ -1,0 +1,100 @@
+{
+  "id": "US-26.5.2",
+  "title": "X-Loopctl-Last-Known-STH Header Validation and Halt on Divergence",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "witness",
+  "story": {
+    "as_a": "tenant operator needing cryptographic tamper evidence on the audit chain",
+    "i_want_to": "have every API call cross-check the caller's local STH cache against the server's current STH, and halt the tenant's custody operations if a divergence is detected",
+    "so_that": "an attacker rewriting the chain on the server side must simultaneously rewrite every connected agent's memory — an infeasible requirement"
+  },
+  "rationale": "US-26.5.1 ships the subscription and cache. This story adds the enforcement: request-time divergence detection plus halt on mismatch. Without this story, the cache is informational but unused.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.5.2.1",
+      "description": "mcp-server attaches `X-Loopctl-Last-Known-STH: <position>:<base64url_sig_prefix_16_bytes>` header to every outbound request if the session cache has a valid STH."
+    },
+    {
+      "id": "AC-26.5.2.2",
+      "description": "Loopctl plug `Loopctl.Web.Plugs.ValidateWitnessHeader` runs on every authenticated request and checks: (a) header is present (optional during 60-day soft launch, required after), (b) position ≤ server's current STH position for the tenant, (c) signature prefix matches the loopctl-side record for that position."
+    },
+    {
+      "id": "AC-26.5.2.3",
+      "description": "If the signature prefix doesn't match the known STH at that position → divergence detected. The response returns 409 with error code `witness_divergence` and remediation pointing at `/wiki/witness-protocol`."
+    },
+    {
+      "id": "AC-26.5.2.4",
+      "description": "On divergence, the tenant's custody operations are halted: `tenants.custody_halted_at` is set, all subsequent custody-critical endpoints return 503 with error code `tenant_halted` until an operator clears the halt via break-glass."
+    },
+    {
+      "id": "AC-26.5.2.5",
+      "description": "Halt event is logged in the audit chain with action `witness_divergence_detected` and payload including the agent's claimed STH, the server's STH, and the position where they diverge."
+    },
+    {
+      "id": "AC-26.5.2.6",
+      "description": "Operator alert webhook fires on halt (event type `tenant.custody_halted`). The webhook payload includes the divergence details."
+    },
+    {
+      "id": "AC-26.5.2.7",
+      "description": "`POST /api/v1/admin/tenants/:id/clear-halt` requires a fresh WebAuthn assertion from a root authenticator. Clears the halt and writes a `halt_cleared` audit entry with the operator's signature."
+    },
+    {
+      "id": "AC-26.5.2.8",
+      "description": "Dashboard at `/admin/halts` shows active halts across tenants (operator-scoped) with diagnostic details and a clear-halt button."
+    },
+    {
+      "id": "AC-26.5.2.9",
+      "description": "60-day soft launch: the header is optional during the window. A new config value `:witness_header_required` flips to true at the cutover, making the header mandatory. Pre-cutover, missing header is allowed but emits a `X-Loopctl-Deprecation-Warning` response header."
+    },
+    {
+      "id": "AC-26.5.2.10",
+      "description": "OpenAPI spec updates for the new error codes and the halt/clear-halt endpoints. CHANGELOG entry."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.5.2.1",
+      "name": "Valid STH header passes",
+      "type": "integration",
+      "preconditions": ["tenant with a current STH", "mcp-server session with matching cache"],
+      "steps": ["Make an authenticated request with the correct header"],
+      "expected_results": ["Request proceeds normally"]
+    },
+    {
+      "id": "TC-26.5.2.2",
+      "name": "Invalid signature prefix triggers divergence halt",
+      "type": "integration",
+      "steps": ["Send request with a forged/wrong signature prefix at a real position"],
+      "expected_results": ["Response 409 witness_divergence", "tenant.custody_halted_at is set", "audit_chain has the divergence entry", "Operator webhook fired"]
+    },
+    {
+      "id": "TC-26.5.2.3",
+      "name": "Subsequent requests after halt return 503 tenant_halted",
+      "type": "integration",
+      "preconditions": ["Tenant halted"],
+      "steps": ["Attempt any custody operation"],
+      "expected_results": ["Response 503 with error code tenant_halted"]
+    },
+    {
+      "id": "TC-26.5.2.4",
+      "name": "Clear halt with WebAuthn restores operations",
+      "type": "integration",
+      "steps": ["POST /admin/tenants/:id/clear-halt with a valid WebAuthn assertion"],
+      "expected_results": ["Response 200", "tenant.custody_halted_at is null", "audit_chain has halt_cleared entry", "Subsequent custody operations work"]
+    }
+  ],
+  "technical_notes": [
+    "Plug location: lib/loopctl_web/plugs/validate_witness_header.ex, mounted in the :api pipeline.",
+    "Signature prefix comparison: compare the first 16 bytes of the STH signature (64 bytes total). Prefix is enough for divergence detection and keeps the header short.",
+    "Halt state is stored on the tenants table. All custody endpoints check this at the plug level.",
+    "Clear-halt endpoint is separate from the normal admin API to require WebAuthn.",
+    "60-day soft launch: config `:witness_header_required, false` for now. Flip at cutover.",
+    "Reference: docs/chain-of-custody-v2.md section 4.4 and section 2.7 (halt on byzantine)."
+  ],
+  "dependencies": ["US-26.5.1"],
+  "estimated_hours": 10
+}
