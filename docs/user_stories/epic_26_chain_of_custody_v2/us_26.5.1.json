@@ -1,0 +1,92 @@
+{
+  "id": "US-26.5.1",
+  "title": "PubSub Audit Chain Broadcast and Agent STH Cache",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "witness",
+  "story": {
+    "as_a": "agent participating in a tenant's chain of custody",
+    "i_want_to": "subscribe to real-time audit chain events for my tenant and maintain my own local cache of the latest STH, so I can detect if the server-reported chain diverges from what I saw",
+    "so_that": "I provide independent tamper evidence — a single operator trying to rewrite the chain would have to simultaneously rewrite every connected agent's cached view"
+  },
+  "rationale": "The witness protocol (section 4.4) makes audit tampering detectable by cross-referencing every agent's local cached STH. This story ships the broadcast mechanism and the client-side cache. US-26.5.2 adds the header validation that ties the cache into request handling.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.5.1.1",
+      "description": "`Loopctl.AuditChain.append/2` (from US-26.1.1) publishes every new entry to Phoenix.PubSub topic `audit_chain:<tenant_id>` after the successful database commit. Publishing happens outside the transaction to avoid blocking the append on subscriber fanout."
+    },
+    {
+      "id": "AC-26.5.1.2",
+      "description": "The published message includes: chain_position, entry_hash, action, entity_type, entity_id, actor_lineage (for consumers to correlate with their own operations). Payload bytes are not included — clients can fetch them if needed."
+    },
+    {
+      "id": "AC-26.5.1.3",
+      "description": "New Oban worker `Loopctl.Workers.BroadcastSthWorker` runs when a new STH is computed (US-26.1.2) and publishes the STH to the same PubSub topic as a separate event type `{type: :sth_updated, ...}`."
+    },
+    {
+      "id": "AC-26.5.1.4",
+      "description": "mcp-server (loopctl-mcp-server package) gains a WebSocket or HTTP long-poll subscriber for the audit_chain topic. Subscriber connects on MCP session start using the authenticated api_key."
+    },
+    {
+      "id": "AC-26.5.1.5",
+      "description": "mcp-server maintains an in-memory cache per session: `{latest_sth, recent_entry_hashes (last 1000)}`. Cache is updated as events arrive."
+    },
+    {
+      "id": "AC-26.5.1.6",
+      "description": "On reconnect after a disconnect, mcp-server requests a reconciliation batch: `GET /api/v1/audit/chain/since/:last_position?tenant_id=...` returns entries since the last known position. Cache is updated."
+    },
+    {
+      "id": "AC-26.5.1.7",
+      "description": "A helper function in mcp-server exposes the current cached STH so other tools can read it and attach it to outbound requests (for US-26.5.2)."
+    },
+    {
+      "id": "AC-26.5.1.8",
+      "description": "Fanout scales to at least 50 concurrent agents per tenant without significant latency. Load-test documents the ceiling and the failure mode (slow subscribers get a circuit breaker that drops their subscription — they reconcile on reconnect)."
+    },
+    {
+      "id": "AC-26.5.1.9",
+      "description": "The topic is per-tenant, so cross-tenant subscribers are impossible. Enforced by Phoenix.PubSub topic scoping + the subscribing channel's authentication check."
+    },
+    {
+      "id": "AC-26.5.1.10",
+      "description": "System article stub `witness-protocol` updated (full content in US-26.4.5) to reference this mechanism. CHANGELOG entry."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.5.1.1",
+      "name": "Append triggers PubSub broadcast",
+      "type": "integration",
+      "steps": ["Subscribe to audit_chain:<tenant_id>", "Call AuditChain.append/2"],
+      "expected_results": ["Subscriber receives a message with the new chain_position and entry_hash"]
+    },
+    {
+      "id": "TC-26.5.1.2",
+      "name": "mcp-server cache updates on event receipt",
+      "type": "unit",
+      "steps": ["Start an mcp-server session", "Inject a fake audit event into the cache's event loop"],
+      "expected_results": ["Cache.latest_sth reflects the new event", "Cache.recent_entry_hashes includes the new hash"]
+    },
+    {
+      "id": "TC-26.5.1.3",
+      "name": "Reconnection fetches missed entries",
+      "type": "integration",
+      "preconditions": ["mcp-server session disconnects at position 5, chain now at position 10"],
+      "steps": ["Reconnect"],
+      "expected_results": ["GET /audit/chain/since/5 is called", "Cache is updated with entries 6-10"]
+    }
+  ],
+  "technical_notes": [
+    "Phoenix.PubSub: use the existing Phoenix.PubSub setup from Epic 17 (orchestrator observability).",
+    "Topic naming: `\"audit_chain:#{tenant_id}\"` — matches existing conventions.",
+    "mcp-server cache: simple JavaScript object with TTL on entries. No external dep needed.",
+    "Subscription protocol: loopctl's existing MCP channel or a new WebSocket endpoint. Prefer extending existing channel.",
+    "Reconciliation endpoint: new `GET /audit/chain/since/:position` in the audit controller.",
+    "Reference: docs/chain-of-custody-v2.md section 4.4."
+  ],
+  "dependencies": ["US-26.1.1", "US-26.1.2"],
+  "estimated_hours": 10
+}

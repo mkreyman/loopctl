@@ -1,0 +1,65 @@
+{
+  "id": "US-26.4.5",
+  "title": "System Wiki Articles — Verification and Witness Set",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "re_execution",
+  "story": {
+    "as_a": "agent learning how loopctl verifies its work and how witness-based tamper detection operates",
+    "i_want_to": "read canonical articles on verification criteria, the re-execution model, the witness protocol (agent-held STHs), the lazy-bastard detection signals, and the pre-existing violators dashboard",
+    "so_that": "every error response pointing at these topics has real content to land on"
+  },
+  "rationale": "Phase 4 and Phase 5 error responses and dashboards link to articles that must exist. This story authors them. Each is long-lived, authoritative content.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.5.1",
+      "description": "System article at slug `verification-criteria` exists (~1500 words). Content: documents all 5 verification_criterion types with examples, explains why each AC needs one, lists common mistakes when authoring them (criteria that don't map to any real code artifact, criteria that are too strict, criteria that drift from the implementation)."
+    },
+    {
+      "id": "AC-26.4.5.2",
+      "description": "System article at slug `re-execution` exists (~2000 words). Content: explains why loopctl doesn't trust self-reported test results, describes the verification runner architecture at a high level, walks through what happens from verify_story to verified, covers fallback logic (CI → Fly runner), and explains how commit content hashing prevents SHA manipulation."
+    },
+    {
+      "id": "AC-26.4.5.3",
+      "description": "System article at slug `witness-protocol` exists (~1500 words). Content: describes agent-held STHs, how to subscribe to audit chain events, how the `X-Loopctl-Last-Known-STH` header works, what divergence detection means, and how to recover from a halt. Written for agent consumption."
+    },
+    {
+      "id": "AC-26.4.5.4",
+      "description": "System article at slug `lazy-bastard-detection` exists (~1000 words). Content: describes the behavioral signals loopctl uses (tool-call count, CoT length, test-run count vs AC count), explains that these are soft signals and not trust boundaries, and gives honest-work tips for agents (how to naturally satisfy the signals by actually doing the work)."
+    },
+    {
+      "id": "AC-26.4.5.5",
+      "description": "System article at slug `pre-existing-violators` exists (already stubbed in US-26.1.4 — this story replaces the stub with full content, ~800 words)."
+    },
+    {
+      "id": "AC-26.4.5.6",
+      "description": "System article at slug `verification-ci-integration` exists (~800 words). Content: setup instructions for GitHub Actions, GitLab CI, CircleCI configuration, PAT storage, required check-runs, troubleshooting common failures."
+    },
+    {
+      "id": "AC-26.4.5.7",
+      "description": "All articles cross-link. Link-checker validates no broken links."
+    },
+    {
+      "id": "AC-26.4.5.8",
+      "description": "Seed migration idempotently installs the articles."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.5.1",
+      "name": "All 6 articles exist with full content",
+      "type": "integration",
+      "steps": ["Query articles for expected slugs"],
+      "expected_results": ["6 system articles exist", "Each body > 800 characters"]
+    }
+  ],
+  "technical_notes": [
+    "Writing estimate: ~10 hours for the 6 articles combined.",
+    "Follow the established authoring pattern from US-26.0.5 and US-26.3.3."
+  ],
+  "dependencies": ["US-26.0.3", "US-26.4.1", "US-26.4.2", "US-26.4.3", "US-26.4.4"],
+  "estimated_hours": 10
+}

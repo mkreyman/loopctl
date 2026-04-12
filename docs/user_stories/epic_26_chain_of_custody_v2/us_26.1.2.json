@@ -1,0 +1,209 @@
+{
+  "id": "US-26.1.2",
+  "title": "Signed Tree Heads: Oban Worker and Public Verification Endpoint",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "audit_foundation",
+  "story": {
+    "as_a": "tenant agent or external auditor",
+    "i_want_to": "fetch a current Signed Tree Head for a tenant's audit chain and verify it against the tenant's public audit key",
+    "so_that": "I can cryptographically prove the chain's state at a specific position without trusting loopctl's running application, and I can detect divergence between my cached view and the server's current view"
+  },
+  "rationale": "Hash-chained entries (US-26.1.1) are tamper-evident only if someone periodically commits the chain's state into a signed artifact that downstream verifiers can cache. Signed Tree Heads (STHs) — a pattern from Certificate Transparency and similar transparency log systems — give us that artifact: a signed tuple of (tenant_id, chain_position, merkle_root, timestamp). STHs are computed periodically by a background job and served via a public endpoint. The agent-witnessed verification in Phase 5 depends on STHs being available; this story ships the computation and serving infrastructure.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.1.2.1",
+      "description": "Migration creates `audit_signed_tree_heads` table with columns: id (uuid PK), tenant_id (uuid FK), chain_position (bigint), merkle_root (bytea), signed_at (timestamptz), signature (bytea). Unique index on (tenant_id, chain_position). Index on (tenant_id, signed_at DESC).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.2",
+      "description": "`Loopctl.AuditChain.compute_merkle_root/1` takes a tenant_id and returns the SHA-256 merkle root of all audit_chain entry_hashes for that tenant, in chain_position order. Uses a straightforward pairwise merkle tree (hash(a || b) for pairs, handling odd count by doubling the last element).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.3",
+      "description": "`Loopctl.AuditChain.sign_tree_head/2` takes a tenant_id and a merkle_root, retrieves the tenant's private audit-signing key via `Loopctl.TenantKeys.get_private_key/1`, and produces an ed25519 signature over `tenant_id || chain_position || merkle_root || signed_at_unix`. Returns `{:ok, %{chain_position, merkle_root, signed_at, signature}}` or `{:error, reason}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.4",
+      "description": "Oban worker `Loopctl.Workers.ComputeSthWorker` is configured to run per tenant via two mechanisms: (a) scheduled every 60 seconds per tenant via Oban.Pro's cron or manual re-enqueue, (b) triggered inline when a tenant's chain gains 100+ new entries since the last STH. The worker is idempotent — running it twice in a row with no new entries is a no-op.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.5",
+      "description": "`GET /api/v1/audit/sth/:tenant_id` returns the latest STH for the tenant as JSON: `{tenant_id, chain_position, merkle_root (base64url), signed_at, signature (base64url)}`. No authentication required — the STH is designed for public verification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.6",
+      "description": "`GET /api/v1/audit/sth/:tenant_id?at=<position>` returns the STH that covers the given chain position (the smallest STH with `chain_position >= at`). Returns 404 if no STH covers that position yet.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.7",
+      "description": "`mcp__loopctl__get_sth` MCP tool exposes the STH retrieval for agent consumption. Response includes the STH fields plus a helper note: `verification_hint: \"Verify the signature against the tenant's audit_public_key from /api/v1/tenants/:id/audit_public_key\"`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.8",
+      "description": "A helper module `Loopctl.AuditChain.Verifier` provides `verify_sth/2` taking an STH and a public key and returning `{:ok, true} | {:error, :invalid_signature}`. This module is stateless and can be reused by the mcp-server (via Elixir→JS port or by reimplementation) for client-side verification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.9",
+      "description": "Tenant isolation: cross-tenant STH requests return 404 (not 403). Tenant A's key cannot sign tenant B's STH. Confirmed via tests with two tenants and distinct keys.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.10",
+      "description": "Performance: computing a fresh merkle root for a chain of 10,000 entries takes under 100ms in benchmark tests. Beyond 100,000 entries, the worker uses an incremental merkle tree update instead of recomputing from scratch (deferred to a follow-up if under the threshold).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.2.11",
+      "description": "OpenAPI spec updates: new `SignedTreeHead` schema. Operation specs for the new endpoints. CHANGELOG entry.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.1.2.1",
+      "name": "Merkle root computation is deterministic and reproducible",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant) with 5 audit_chain entries"
+      ],
+      "steps": [
+        "Call compute_merkle_root/1 twice"
+      ],
+      "expected_results": [
+        "Both calls return the same 32-byte value",
+        "The value matches an independently computed merkle root"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.2",
+      "name": "Worker computes and stores a new STH",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant) with audit key",
+        "3 audit entries on the chain"
+      ],
+      "steps": [
+        "Enqueue ComputeSthWorker for tenant.id",
+        "Run Oban.drain_queue"
+      ],
+      "expected_results": [
+        "audit_signed_tree_heads has a new row",
+        "chain_position = 2 (zero-indexed, 3 entries → latest position 2)",
+        "signature verifies against the tenant's audit_public_key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.3",
+      "name": "Worker is idempotent — no new STH when no new entries",
+      "type": "integration",
+      "preconditions": [
+        "tenant with 1 STH already at the current position"
+      ],
+      "steps": [
+        "Enqueue and run the worker again"
+      ],
+      "expected_results": [
+        "audit_signed_tree_heads row count is unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.4",
+      "name": "GET /audit/sth/:tenant_id returns the latest STH",
+      "type": "integration",
+      "preconditions": [
+        "tenant with a computed STH"
+      ],
+      "steps": [
+        "GET /api/v1/audit/sth/<tenant_id> (no auth)"
+      ],
+      "expected_results": [
+        "Response is 200",
+        "Body contains tenant_id, chain_position, merkle_root, signed_at, signature",
+        "merkle_root and signature are base64url encoded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.5",
+      "name": "Verifier.verify_sth accepts a valid STH and rejects a tampered one",
+      "type": "unit",
+      "preconditions": [
+        "tenant with STH and known public key"
+      ],
+      "steps": [
+        "Call verify_sth with the STH and public key",
+        "Modify one byte of merkle_root and call again"
+      ],
+      "expected_results": [
+        "First call returns {:ok, true}",
+        "Second call returns {:error, :invalid_signature}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.6",
+      "name": "STH at position query returns the correct STH",
+      "type": "integration",
+      "preconditions": [
+        "tenant with 3 STHs at positions 5, 10, 15"
+      ],
+      "steps": [
+        "GET /api/v1/audit/sth/:id?at=7",
+        "GET /api/v1/audit/sth/:id?at=20"
+      ],
+      "expected_results": [
+        "First request returns the STH at position 10 (smallest >= 7)",
+        "Second request returns 404 (no STH covers position 20)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.2.7",
+      "name": "Cross-tenant STH requests return 404",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a and tenant_b with STHs",
+        "conn authenticated as tenant_b"
+      ],
+      "steps": [
+        "GET /api/v1/audit/sth/<tenant_a_id>"
+      ],
+      "expected_results": [
+        "Response is 200 (STHs are public)",
+        "Response contains tenant_a's STH data"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Worker: lib/loopctl/workers/compute_sth_worker.ex using Oban.Worker with `unique: [fields: [:worker, :args], period: 30]` to prevent duplicate enqueues.",
+    "Scheduling: add to config/config.exs Oban cron entries: `{\"* * * * *\", ComputeSthWorker, args: %{mode: :all_tenants}}` runs every minute and enqueues per-tenant jobs.",
+    "Incremental merkle: defer until benchmark shows it's needed. 10K entries × 32 bytes × SHA-256 is ~50ms on modern hardware.",
+    "Signing: use `:public_key.sign(message, :eddsa, private_key, [:ed25519])`. The private key must be in the raw 32-byte form.",
+    "STH endpoint route: `get \"/audit/sth/:tenant_id\", AuditSthController, :show` in the public scope.",
+    "base64url encoding for binary fields: use `Base.url_encode64(data, padding: false)`.",
+    "Verifier module is stateless and PURE (no IO), so it can be called from anywhere and tested easily.",
+    "mcp-server tool: add `knowledge_get_sth` (or similar name) in a follow-up mcp-server update story. This story ships only the Elixir side.",
+    "Reference: docs/chain-of-custody-v2.md section 4.3."
+  ],
+  "dependencies": [
+    "US-26.0.2",
+    "US-26.1.1"
+  ],
+  "estimated_hours": 6
+}

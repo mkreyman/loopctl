@@ -1,0 +1,183 @@
+{
+  "id": "US-26.2.2",
+  "title": "Lineage-Based Self-Check and Rotating Verifier Selection",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "lineage",
+  "story": {
+    "as_a": "tenant operator trusting loopctl's chain of custody to enforce that implementers and verifiers are genuinely independent",
+    "i_want_to": "have the self-check compare dispatch lineage paths (not bare agent_ids) and have loopctl choose which verifier lineage handles each story, not the orchestrator",
+    "so_that": "a creative orchestrator cannot dispatch a sock-puppet sub-agent and pre-select it as its own verifier, and the lineage model actually prevents self-approval instead of just theater"
+  },
+  "rationale": "Dispatch lineage (US-26.2.1) exists but the self-check still compares agent_ids. Two dispatches from the same orchestrator have different agent_ids but share a common ancestor — they're effectively the same actor. This story teaches `validate_not_self_*` to compare lineage paths and picks the verifier from an eligible pool, removing the orchestrator's ability to pre-choose. Without this change, the ephemeral-key work from US-26.2.1 is pointless — the old agent_id comparison would still pass for sock-puppet sub-agents.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.2.2.1",
+      "description": "Helper `Loopctl.Dispatches.lineage_shares_prefix?/2` takes two lineage paths (arrays of uuids) and returns true if they share any common prefix of length ≥ 1. Example: `[\"root\", \"orch\", \"impl\"]` and `[\"root\", \"orch\", \"rev\"]` share prefix → true. `[\"root_a\", \"impl\"]` and `[\"root_b\", \"rev\"]` share nothing → false.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.2",
+      "description": "`Loopctl.Progress.validate_not_self_report/2`, `validate_not_self_review/2`, and `validate_not_self_verify/2` accept a caller dispatch lineage and the story's implementer dispatch lineage, comparing via `lineage_shares_prefix?`. Shared prefix → `{:error, :self_*_blocked}`. No prefix match → `:ok`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.3",
+      "description": "The implementer's lineage is recorded on the story at claim time: `stories.implementer_dispatch_id` (FK to dispatches). This is set in `claim_story` and is immutable afterwards (trigger enforces).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.4",
+      "description": "`Loopctl.Progress.request_review/2` selects a verifier lineage by querying active non-expired, non-revoked dispatches in the tenant that: (a) have `role = :orchestrator` OR `role = :agent` with a verifier-capable tag, and (b) do NOT share a prefix with the implementer's lineage. If multiple candidates exist, select one using a cryptographically-seeded RNG with the tenant's audit-signing key + story_id as seed (deterministic but unpredictable to the orchestrator).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.5",
+      "description": "If no eligible verifier exists at `request_review` time, the story remains in `reported_done` with a new status flag `verifier_needed: true`. An operator alert is triggered (webhook from existing Epic 10/17 infrastructure) pointing at a system article `verifier-needed`. The orchestrator can request additional dispatches to unblock this.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.6",
+      "description": "The selected verifier is recorded on the story as `stories.verifier_dispatch_id`, immutable after set. Chain-of-custody checks compare against this stored id rather than recomputing.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.7",
+      "description": "Verifier selection is logged in the audit chain with action `verifier_selected`, payload including the pool size, the selected dispatch id, and a commitment hash of the RNG seed (so the operator can later audit that the selection was deterministic and unbiased).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.8",
+      "description": "Integration test: a verifier with a lineage descending from the same orchestrator as the implementer gets `{:error, :self_verify_blocked}` on verify attempt. A verifier with a completely separate root ancestor succeeds.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.9",
+      "description": "Edge case: when the first dispatch after tenant signup tries to claim and report a story before any other lineage exists, the story stays in `reported_done` with `verifier_needed: true` until another lineage is registered. System article explains the expected workflow: the operator dispatches a second independent lineage (typically via a second CLI session or a second machine) and the system auto-picks it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.10",
+      "description": "Migration adds `stories.implementer_dispatch_id`, `stories.verifier_dispatch_id`, `stories.verifier_needed` columns. The migration runs a one-shot backfill in the same transaction: for every in-flight story with a non-null `assigned_agent_id`, it synthesizes a dispatch row (from the agent's long-lived api_key, treated as an implicit root dispatch) and sets `implementer_dispatch_id`. After the backfill, all stories have non-null implementer_dispatch_id. The legacy agent_id comparison is deleted from the call site in the same commit. No dual path, no flag, no shadow mode — the migration either succeeds in full or the deploy rolls back.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.2.11",
+      "description": "OpenAPI spec updates: extended Story schema with dispatch fields. New error codes `self_verify_blocked` (via lineage), `verifier_needed`. CHANGELOG entry. System article stub `verifier-needed` reserved for US-26.3.3.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.2.2.1",
+      "name": "lineage_shares_prefix? correctly detects overlap",
+      "type": "unit",
+      "preconditions": [
+        "None"
+      ],
+      "steps": [
+        "Call lineage_shares_prefix?([\"a\", \"b\", \"c\"], [\"a\", \"b\", \"d\"])",
+        "Call lineage_shares_prefix?([\"a\"], [\"b\"])",
+        "Call lineage_shares_prefix?([], [\"a\"])"
+      ],
+      "expected_results": [
+        "First call returns true",
+        "Second call returns false",
+        "Third call returns false"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.2.2",
+      "name": "Verifier from sibling dispatch of implementer is blocked",
+      "type": "integration",
+      "preconditions": [
+        "root dispatch",
+        "orchestrator dispatch from root",
+        "implementer dispatch from orchestrator",
+        "sibling (pseudo-reviewer) dispatch from the same orchestrator",
+        "story claimed by implementer"
+      ],
+      "steps": [
+        "Attempt verify_story with the sibling dispatch"
+      ],
+      "expected_results": [
+        "Returns {:error, :self_verify_blocked}",
+        "Audit chain has no verify entry"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.2.3",
+      "name": "Verifier from a separate root ancestor is allowed",
+      "type": "integration",
+      "preconditions": [
+        "Two separate root dispatches (operator opened two independent CLI sessions)",
+        "implementer under root A",
+        "verifier under root B",
+        "story claimed by implementer"
+      ],
+      "steps": [
+        "Call verify_story with the verifier"
+      ],
+      "expected_results": [
+        "Returns {:ok, story}",
+        "Story is verified"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.2.4",
+      "name": "Rotating selection: verifier_dispatch_id is set by loopctl, not the caller",
+      "type": "integration",
+      "preconditions": [
+        "Multiple eligible verifier dispatches exist",
+        "Story reported_done"
+      ],
+      "steps": [
+        "Call request_review on the story"
+      ],
+      "expected_results": [
+        "stories.verifier_dispatch_id is set to one of the eligible dispatches",
+        "The selection is deterministic given the RNG seed",
+        "A different caller cannot override the selection"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.2.5",
+      "name": "verifier_needed flag is set when no eligible lineage exists",
+      "type": "integration",
+      "preconditions": [
+        "Only the implementer's lineage exists in the tenant",
+        "Story in reported_done"
+      ],
+      "steps": [
+        "Call request_review"
+      ],
+      "expected_results": [
+        "Story remains in reported_done",
+        "stories.verifier_needed = true",
+        "Alert webhook is fired (check webhook queue)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Module: lib/loopctl/dispatches.ex for lineage_shares_prefix/2 helper. Keep it pure (no DB access).",
+    "Update validate_not_self_* signatures: they now take (story, caller_lineage) where caller_lineage is resolved from the authenticated dispatch in the controller.",
+    "The caller's lineage is resolved at controller time: look up the dispatch associated with the authenticated api_key, extract lineage_path. Pass to Progress functions.",
+    "Rotating verifier selection: use `:crypto.hash/2` seeded with `tenant_audit_private_key || story_id || current_day` to derive a deterministic but unpredictable index into the eligible pool. Document that this reseeds daily to prevent long-term prediction.",
+    "Deterministic but unpredictable: the selection is reproducible given the seed, but the orchestrator cannot predict it without the private audit key.",
+    "Webhook alert for verifier_needed: use the existing Loopctl.Webhooks infrastructure with event_type `story.verifier_needed`.",
+    "After the backfill migration, implementer_dispatch_id is NOT NULL for all rows. A NOT NULL constraint is added in the same migration after the backfill step runs. Any code path referencing the legacy agent_id comparison is deleted in the same commit.",
+    "Reference: docs/chain-of-custody-v2.md sections 6.2 and 6.3."
+  ],
+  "dependencies": [
+    "US-26.2.1"
+  ],
+  "estimated_hours": 10
+}

@@ -1,0 +1,99 @@
+{
+  "id": "US-26.R.1",
+  "title": "loopctl-mcp-server v2.0.0 Major Release and npm Publish",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "release",
+  "story": {
+    "as_a": "tenant operator upgrading their agent tooling to the Chain of Custody v2 API",
+    "i_want_to": "have a new major version of loopctl-mcp-server published to npm with all the new tools, clear migration instructions, and a documented cutover schedule",
+    "so_that": "my agents can upgrade in a single `npm install` and start using the new dispatch + capability + witness flow without me having to hand-assemble the tool surface"
+  },
+  "rationale": "Phases 2 through 5 each add new MCP tools and change existing tool shapes. Shipping these incrementally to npm would create intermediate versions that only half-work. A single v2.0.0 release ceremony captures all breaking changes in one cutover, gives the operator one upgrade step, and marks a clear before/after for downstream consumers.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.R.1.1",
+      "description": "mcp-server/package.json version is bumped from 1.x to 2.0.0. `engines.node` is set to `>=18`."
+    },
+    {
+      "id": "AC-26.R.1.2",
+      "description": "mcp-server/CHANGELOG.md gains a `## 2.0.0` entry listing: (a) BREAKING: shared LOOPCTL_AGENT_KEY pattern retired, replaced by per-dispatch ephemeral keys; (b) NEW: `mcp__loopctl__dispatch` tool; (c) NEW: capability token handling (caps are now included in request bodies); (d) NEW: witness STH subscription and X-Loopctl-Last-Known-STH header; (e) NEW: telemetry fields in token_usage reports; (f) NEW: AC verification_criterion field on story responses; (g) deprecated/removed tools list."
+    },
+    {
+      "id": "AC-26.R.1.3",
+      "description": "mcp-server/README.md is rewritten to cover the v2 workflow end-to-end. Includes a migration guide from v1 (step-by-step), a quickstart for new users, and a tool reference. Replaces the old trust-model description with a summary of Chain of Custody v2."
+    },
+    {
+      "id": "AC-26.R.1.4",
+      "description": "The tool reference section lists every MCP tool the package exposes with its final signature, example input, example output. Tools added in Phases 2-6 are clearly marked 'new in 2.0'."
+    },
+    {
+      "id": "AC-26.R.1.5",
+      "description": "A migration section in the README walks a v1 user through: (1) update npm install, (2) update orchestrator prompt to use dispatch tool, (3) update calls that receive capability tokens in responses, (4) ensure the STH subscription is enabled, (5) verify existing legacy keys are replaced."
+    },
+    {
+      "id": "AC-26.R.1.6",
+      "description": "npm publish is executed in a controlled way: a dry-run first (`npm publish --dry-run`) to verify the package contents, then the real publish after operator approval. The `gh release create` command tags the Git commit and attaches the package tarball."
+    },
+    {
+      "id": "AC-26.R.1.7",
+      "description": "The published package on npmjs.com shows version 2.0.0 with the README rendered correctly, including the migration guide visible at the top."
+    },
+    {
+      "id": "AC-26.R.1.8",
+      "description": "A post-release sanity test: install the published package fresh in a test project and run the MCP server to verify it starts, lists all expected tools, and can make a basic API call to a test loopctl instance."
+    },
+    {
+      "id": "AC-26.R.1.9",
+      "description": "An announcement is posted to the loopctl.com landing page (a new blog-style entry or a banner) summarizing the release and linking to the migration guide."
+    },
+    {
+      "id": "AC-26.R.1.10",
+      "description": "Loopctl root CHANGELOG.md gains a matching entry pointing at the mcp-server release and the new spec version."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.R.1.1",
+      "name": "Package manifest reflects v2.0.0",
+      "type": "unit",
+      "steps": ["Read mcp-server/package.json"],
+      "expected_results": ["version is 2.0.0", "engines.node is >=18"]
+    },
+    {
+      "id": "TC-26.R.1.2",
+      "name": "Dry-run publish succeeds",
+      "type": "integration",
+      "steps": ["cd mcp-server && npm publish --dry-run"],
+      "expected_results": ["Exit code 0", "Package contents list includes README.md, index.js, package.json"]
+    },
+    {
+      "id": "TC-26.R.1.3",
+      "name": "Post-publish smoke test: install and run",
+      "type": "integration",
+      "preconditions": ["Published 2.0.0 on npm"],
+      "steps": ["In a fresh directory: npm install loopctl-mcp-server@2.0.0", "node node_modules/loopctl-mcp-server/index.js"],
+      "expected_results": ["Server starts without errors", "Lists expected tools in the ListToolsResponse"]
+    },
+    {
+      "id": "TC-26.R.1.4",
+      "name": "README migration section exists",
+      "type": "unit",
+      "steps": ["Read mcp-server/README.md"],
+      "expected_results": ["File contains 'Migration from v1.x' heading", "Section has 5+ numbered steps", "Links to https://loopctl.com/wiki/dispatch-lineage and /wiki/capability-tokens"]
+    }
+  ],
+  "technical_notes": [
+    "Publish sequence: (1) ensure Phases 2, 3, and 5 are merged to master, (2) CI is green, (3) run mix precommit on loopctl to catch any integration issues, (4) review package contents via `npm pack --dry-run`, (5) `npm publish` with 2FA, (6) `gh release create v2.0.0` with the tarball attached.",
+    "README structure: Quickstart → Tool Reference → Migration Guide → Trust Model → FAQ. ~1500-2000 words total.",
+    "Migration guide is the most important section for existing users. Make it step-by-step with command examples.",
+    "Announcement on loopctl.com: a new LiveView section or a blog-style markdown post. Short — 200 words with a link to the migration guide.",
+    "This story executes AFTER US-26.2.3, US-26.3.1, US-26.3.2, US-26.4.1, US-26.5.1, US-26.5.2, US-26.6.1 are merged. It's the final capstone.",
+    "Reference: docs/chain-of-custody-v2.md section 11 (migration notes)."
+  ],
+  "dependencies": ["US-26.2.3", "US-26.3.1", "US-26.3.2", "US-26.4.1", "US-26.5.1", "US-26.5.2", "US-26.6.1"],
+  "estimated_hours": 6
+}

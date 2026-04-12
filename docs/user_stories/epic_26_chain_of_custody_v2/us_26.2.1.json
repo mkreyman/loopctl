@@ -1,0 +1,225 @@
+{
+  "id": "US-26.2.1",
+  "title": "Dispatches Table and POST /dispatches Endpoint with Ephemeral API Keys",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "lineage",
+  "story": {
+    "as_a": "orchestrator agent dispatching a sub-agent to work on a specific story in a specific role",
+    "i_want_to": "request a dispatch-scoped ephemeral API key that carries a recorded lineage path back to my own dispatch, binds to a single story and role, and expires automatically at task completion",
+    "so_that": "sub-agents never inherit a shared long-lived credential, loopctl can reason about the full dispatch tree, and leaked keys have bounded blast radius"
+  },
+  "rationale": "Loopctl's chain-of-custody currently treats every caller identically by api_key, which means sub-agents dispatched with a shared environment variable all look identical to the chain-of-custody checks. The redesigned model (chain-of-custody-v2.md section 6) replaces this with per-dispatch ephemeral keys that record their parent lineage. This story ships the table, the endpoint, and the key minting — the lineage-based self-check (US-26.2.2) and the skill update (US-26.2.3) depend on this foundation.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.2.1.1",
+      "description": "Migration creates `dispatches` table with columns: id (uuid PK), tenant_id (uuid FK NOT NULL), parent_dispatch_id (uuid FK self-reference, nullable for root dispatches), api_key_id (uuid FK to api_keys, the ephemeral key minted for this dispatch), agent_id (uuid FK to agents), story_id (uuid FK to stories, nullable for non-story dispatches like admin ops), role (enum: :agent, :orchestrator), lineage_path (uuid[] NOT NULL — array of dispatch ids from root to self, inclusive), created_at (timestamptz NOT NULL), expires_at (timestamptz NOT NULL), revoked_at (timestamptz, nullable).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.2",
+      "description": "GIN index on `lineage_path` for efficient prefix-match and containment queries. Standard index on `(tenant_id, expires_at DESC)` for active-dispatch queries.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.3",
+      "description": "`POST /api/v1/dispatches` endpoint requires authentication. Request body: `{parent_dispatch_id (uuid, optional for root), role (string), story_id (uuid, optional), agent_id (uuid), expires_in_seconds (integer, default 3600, max 14400)}`. Returns 201 with `{dispatch: {id, lineage_path, ...}, api_key: {raw_key, role, agent_id, expires_at}, next_action: {description, learn_more, example}}`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.4",
+      "description": "The root dispatch (one per tenant lifetime) is created at tenant signup (US-26.0.1) from the operator's WebAuthn ceremony. Its `parent_dispatch_id` is NULL, its `lineage_path` is `[its own id]`, and its `role` is `:user`. Subsequent dispatches descend from this root.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.5",
+      "description": "Lineage path computation: `NEW.lineage_path = parent.lineage_path ++ [NEW.id]`. If `parent_dispatch_id` is NULL, `lineage_path = [NEW.id]`. Enforced in the context function, backstopped by a trigger that rejects inserts with inconsistent lineage_path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.6",
+      "description": "Ephemeral api_key minting: `Loopctl.Auth.generate_api_key/1` accepts an `expires_at` parameter and creates a key that the existing auth pipeline treats as revoked after `expires_at`. The api_key is created atomically with the dispatch row in a single Ecto.Multi.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.7",
+      "description": "Oban worker `Loopctl.Workers.RevokeExpiredDispatchesWorker` runs every minute and revokes dispatches (and their associated api_keys) past their `expires_at`. Setting `revoked_at` on the dispatch cascades to revoking the api_key atomically.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.8",
+      "description": "Revoking a parent dispatch cascades to all descendants: `Loopctl.Dispatches.revoke/2` sets `revoked_at` on the target AND all dispatches whose `lineage_path @> ARRAY[target.id]` (GIN-indexed containment query). Happens in a single Ecto.Multi.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.9",
+      "description": "`GET /api/v1/dispatches/:id` returns a dispatch record (without the raw api_key — only the id and prefix). Requires authentication; tenant-scoped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.10",
+      "description": "`GET /api/v1/dispatches?tenant_id=...&role=...&active_only=true` lists dispatches filtered by role and active status. Paginated. Useful for the operator dashboard and the rotating verifier selection in US-26.2.2.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.11",
+      "description": "The dispatch creation request is audit-logged via the audit chain from US-26.1.1: action `dispatch_created`, actor_lineage set to the caller's dispatch lineage, payload includes the new lineage_path, role, and expires_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.12",
+      "description": "Tenant isolation: cannot create a dispatch with a parent_dispatch_id or agent_id belonging to another tenant. Cross-tenant attempts return 404 (not 403) consistent with loopctl's existing isolation convention.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.1.13",
+      "description": "OpenAPI spec updates: new `DispatchRequest`, `DispatchResponse`, `DispatchListResponse` schemas. Operation specs for the three new endpoints. CHANGELOG entry. A system article stub at slug `dispatch-lineage` is reserved (content authored in US-26.3.3).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.2.1.1",
+      "name": "Root dispatch is created at tenant signup with NULL parent and lineage_path = [self]",
+      "type": "integration",
+      "preconditions": [
+        "Signup ceremony completes (US-26.0.1)"
+      ],
+      "steps": [
+        "Query dispatches for the new tenant"
+      ],
+      "expected_results": [
+        "Exactly one dispatch exists",
+        "parent_dispatch_id is NULL",
+        "lineage_path has length 1 and contains the dispatch's own id",
+        "role is :user"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.2",
+      "name": "Child dispatch inherits and extends the parent's lineage_path",
+      "type": "integration",
+      "preconditions": [
+        "Root dispatch exists",
+        "Authenticated caller holds the root dispatch's api_key"
+      ],
+      "steps": [
+        "POST /dispatches with parent_dispatch_id = root.id, role: agent, story_id: some story"
+      ],
+      "expected_results": [
+        "Response 201 with lineage_path = [root.id, new_dispatch.id]",
+        "api_key.raw_key is returned once",
+        "dispatch.expires_at is default 1 hour in the future"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.3",
+      "name": "Revoking parent dispatch cascades to all descendants",
+      "type": "integration",
+      "preconditions": [
+        "Dispatch tree: root → A → A1, A → A2"
+      ],
+      "steps": [
+        "Call Loopctl.Dispatches.revoke(A, opts)"
+      ],
+      "expected_results": [
+        "A, A1, A2 all have revoked_at set",
+        "Root dispatch is unchanged",
+        "Associated api_keys for A, A1, A2 are revoked"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.4",
+      "name": "Expired dispatches are revoked by the worker",
+      "type": "integration",
+      "preconditions": [
+        "Dispatch with expires_at = 1 minute ago",
+        "Oban worker available"
+      ],
+      "steps": [
+        "Run Loopctl.Workers.RevokeExpiredDispatchesWorker"
+      ],
+      "expected_results": [
+        "Dispatch has revoked_at set",
+        "api_key is revoked"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.5",
+      "name": "Ephemeral api_key is not accepted after expiry",
+      "type": "integration",
+      "preconditions": [
+        "Dispatch with expired api_key"
+      ],
+      "steps": [
+        "Attempt GET /api/v1/projects using the expired raw_key"
+      ],
+      "expected_results": [
+        "Response 401 with error code expired_api_key",
+        "Remediation points at /wiki/dispatch-lineage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.6",
+      "name": "Tenant isolation: cross-tenant parent_dispatch_id returns 404",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a root dispatch",
+        "tenant_b authenticated caller"
+      ],
+      "steps": [
+        "POST /dispatches with parent_dispatch_id = tenant_a.root.id as tenant_b"
+      ],
+      "expected_results": [
+        "Response 404",
+        "No dispatch is created in either tenant"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.1.7",
+      "name": "Dispatch creation writes an audit chain entry",
+      "type": "integration",
+      "preconditions": [
+        "Root dispatch exists"
+      ],
+      "steps": [
+        "POST /dispatches",
+        "Query audit_chain"
+      ],
+      "expected_results": [
+        "audit_chain has a new entry with action = \"dispatch_created\"",
+        "actor_lineage matches the caller's dispatch lineage",
+        "Payload includes the new dispatch_id, role, and expires_at"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Migration file: priv/repo/migrations/<ts>_create_dispatches.exs",
+    "uuid[] type: declare as `add :lineage_path, {:array, :binary_id}`",
+    "GIN index: `create index(:dispatches, [:lineage_path], using: :gin)`",
+    "Oban cron entry: `{\"* * * * *\", RevokeExpiredDispatchesWorker}` to run every minute.",
+    "The parent_dispatch_id self-reference FK uses ON DELETE RESTRICT (revoking, not deleting).",
+    "Loopctl.Dispatches.revoke/2 uses a CTE-based UPDATE to revoke all descendants in one query: `UPDATE dispatches SET revoked_at = now() WHERE id = ANY(SELECT id FROM dispatches WHERE lineage_path @> ARRAY[$1]::uuid[])`.",
+    "Authentication of ephemeral keys: the existing ResolveApiKey plug already checks expires_at — verify and extend if needed. The key becomes invalid automatically.",
+    "The raw_key is returned ONLY at creation time. Subsequent GETs return only the id and prefix.",
+    "The tenant signup ceremony from US-26.0.1/US-26.0.2 is extended to create the root dispatch as part of the same Ecto.Multi.",
+    "Reference: docs/chain-of-custody-v2.md section 6.1 and 6.4."
+  ],
+  "dependencies": [
+    "US-26.0.1",
+    "US-26.0.2",
+    "US-26.1.1",
+    "US-26.1.3"
+  ],
+  "estimated_hours": 12
+}

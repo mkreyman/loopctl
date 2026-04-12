@@ -1,0 +1,97 @@
+{
+  "id": "US-26.4.2",
+  "title": "verification_runs Table and Ephemeral Fly Verification Runner",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "re_execution",
+  "story": {
+    "as_a": "tenant operator needing independent proof that a story's tests actually pass on the post-commit tree",
+    "i_want_to": "have loopctl spawn an ephemeral Fly.io machine at verification time, fetch the commit SHA from the project's git remote, run the test suite and the per-AC verification checks in a clean container, and report results back",
+    "so_that": "the implementer cannot lie about test results because the verification environment is one it never touched"
+  },
+  "rationale": "The independent re-execution layer (section 3 L3) requires a process the implementer cannot reach. Fly.io ephemeral machines are the cheapest way to get that isolation without standing up separate infrastructure. This story ships the runner — Phase 4's GitHub Actions integration (US-26.4.3) is the faster path when CI already exists; the Fly runner is the fallback.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.2.1",
+      "description": "Migration creates `verification_runs` table: id (uuid PK), tenant_id (FK), story_id (FK), commit_sha (text), commit_content_hash (bytea, SHA-256 of the tree), status (enum: pending/running/pass/fail/error), started_at, completed_at, runner_type (enum: ci_github/ci_gitlab/fly_machine), ac_results (jsonb: map of ac_id → {status, evidence}), logs_url (text), machine_id (text, Fly machine id when applicable)."
+    },
+    {
+      "id": "AC-26.4.2.2",
+      "description": "`Loopctl.Workers.VerificationRunner` Oban worker processes jobs from a dedicated `:verification` queue. On dequeue it: (a) fetches the commit SHA from the project's git remote using libgit2 or a `git fetch` + `git show` subprocess; (b) computes the tree content hash; (c) dispatches to the appropriate runner based on project.ci_provider."
+    },
+    {
+      "id": "AC-26.4.2.3",
+      "description": "For `ci_provider = :none` or as the fallback when CI results are unavailable, the worker creates an ephemeral Fly machine via the Fly GraphQL API. The machine boots a project-appropriate image (Elixir, Node.js, Python) with the commit SHA checked out, runs `mix test` (or equivalent), captures stdout/stderr, and reports results back to loopctl before self-destructing."
+    },
+    {
+      "id": "AC-26.4.2.4",
+      "description": "The Fly machine runs with a short-lived auth token that can ONLY call the verification-result reporting endpoint on loopctl. It cannot read tenant data, cannot query other stories, cannot write to the audit chain directly. The token expires on machine destruction."
+    },
+    {
+      "id": "AC-26.4.2.5",
+      "description": "Per-AC verification: for each AC with `type: test`, the runner greps the test output for the named test and records pass/fail. For `type: code`, it greps the specified file region against the pattern. For `type: route`, it compile-checks the router. For `type: migration`, it parses migration files. For `type: manual`, it marks the AC as `manual_review_pending`."
+    },
+    {
+      "id": "AC-26.4.2.6",
+      "description": "Commit verification: loopctl computes the sha256 of the fetched tree contents and stores it. Subsequent lookups of the same commit return the stored hash without re-fetching."
+    },
+    {
+      "id": "AC-26.4.2.7",
+      "description": "Rate limiting: per-tenant cap of 50 verification runs per day by default, configurable. Exceeding the cap queues runs with a delay instead of failing them."
+    },
+    {
+      "id": "AC-26.4.2.8",
+      "description": "Failed runs retry up to 3 times with exponential backoff. Persistent failures mark the run as `error` and alert the operator via webhook."
+    },
+    {
+      "id": "AC-26.4.2.9",
+      "description": "Logs: the Fly machine streams output to an S3-compatible object store (Fly's own storage, not a new vendor), and loopctl stores the URL. The operator dashboard from US-26.4.4 links to the logs."
+    },
+    {
+      "id": "AC-26.4.2.10",
+      "description": "Tenant isolation: each run is scoped to one tenant; the Fly machine's short-lived token is bound to the tenant_id and cannot call loopctl endpoints for other tenants."
+    },
+    {
+      "id": "AC-26.4.2.11",
+      "description": "OpenAPI updates, CHANGELOG entry, deployment notes for Fly machine templates and API token setup."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.2.1",
+      "name": "Worker enqueued, fetches commit, runs tests on a stub Fly runner",
+      "type": "integration",
+      "preconditions": ["Mock Fly adapter captures machine lifecycle calls", "Story with a test-type AC and a fetchable commit SHA"],
+      "steps": ["Enqueue VerificationRunner for the story", "Drain queue"],
+      "expected_results": ["verification_runs row is created", "status transitions pending → running → pass", "ac_results has the test result", "Mock adapter confirms machine creation and destruction"]
+    },
+    {
+      "id": "TC-26.4.2.2",
+      "name": "Non-existent commit SHA marks run as error with retry",
+      "type": "integration",
+      "steps": ["Enqueue run with a bogus SHA"],
+      "expected_results": ["After 3 retries, run.status = error", "Operator webhook fired"]
+    },
+    {
+      "id": "TC-26.4.2.3",
+      "name": "Tenant isolation: ephemeral machine's token cannot access other tenants",
+      "type": "integration",
+      "preconditions": ["Mock the machine's outbound API call"],
+      "steps": ["Machine attempts to call an endpoint for a different tenant_id"],
+      "expected_results": ["Response is 403", "The attempt is logged"]
+    }
+  ],
+  "technical_notes": [
+    "Fly GraphQL API: use a Req-based client with a FLY_API_TOKEN from Fly secrets.",
+    "Machine images: pre-built per language, published under loopctl's Fly registry. Build once, reuse.",
+    "Short-lived token: a scoped capability token (reuse Capabilities.mint from US-26.3.1) valid for the machine's lifetime, type `verification_report_cap`.",
+    "Rate limiting: use the existing Hammer or ETS-based rate limiter from earlier epics.",
+    "libgit2 binding: use the `:git` hex package or shell out to git via System.cmd/2 in a sandboxed tmpdir.",
+    "Reference: docs/chain-of-custody-v2.md section 7.2."
+  ],
+  "dependencies": ["US-26.3.1", "US-26.4.1"],
+  "estimated_hours": 16
+}

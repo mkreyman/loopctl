@@ -1,0 +1,181 @@
+{
+  "id": "US-26.2.3",
+  "title": "Orchestrator Skill and MCP Server Migration to Dispatch Pattern",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "lineage",
+  "story": {
+    "as_a": "orchestrator agent operating a loopctl-managed project",
+    "i_want_to": "mint ephemeral dispatch-scoped api_keys at the moment I spawn each sub-agent, via the new `POST /api/v1/dispatches` endpoint and a corresponding `mcp__loopctl__dispatch` tool, with the orchestrator skill and mcp-server README updated to reflect the new workflow",
+    "so_that": "I no longer share a long-lived LOOPCTL_AGENT_KEY across sub-agents, and my orchestration flow matches the chain-of-custody invariants the server now enforces"
+  },
+  "rationale": "The database invariants (US-26.1.3) and lineage-based self-check (US-26.2.2) will reject orchestration flows that rely on a shared LOOPCTL_AGENT_KEY. Without this story updating the orchestrator skill and the mcp-server, every existing orchestrator session would hit trust-model errors it doesn't know how to recover from. This story ships the agent-facing migration so running sessions pick up the new dispatch-minting pattern on next restart after the epic merge.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.2.3.1",
+      "description": "`mcp-server/index.js` gains a new tool `mcp__loopctl__dispatch` that wraps `POST /api/v1/dispatches`. Input schema: `{parent_dispatch_id (optional uuid), role (enum), story_id (optional uuid), agent_id (uuid), expires_in_seconds (optional integer, default 3600)}`. Returns the dispatch record and the ephemeral raw_key in the response.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.2",
+      "description": "The new mcp-server tool includes tool-level instructions in its description telling agents: \"This tool mints an ephemeral api_key for a sub-agent. The raw_key is returned ONCE — pass it to the sub-agent via its launch arguments, never store it in env vars. The key expires after expires_in_seconds.\"",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.3",
+      "description": "mcp-server version bumps to 2.0.0 (breaking change). Changelog entry describes the new dispatch requirement. The v1.x client is incompatible after the epic merge — users must update before their next session or calls will fail with `missing_dispatch`. The v2 release coordinates with the epic merge (US-26.R.1 handles the npm publish ceremony).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.4",
+      "description": "`mcp-server/README.md` gains a new top section \"Chain of Custody v2 migration\" that describes: (a) the shift from shared LOOPCTL_AGENT_KEY to per-dispatch ephemeral keys, (b) how to update existing orchestrator prompts, (c) a worked example of the new dispatch flow from root ceremony to sub-agent launch, (d) a link to `https://loopctl.com/wiki/dispatch-lineage`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.5",
+      "description": "The existing `/loopctl:orchestrate` skill body (in the claude-config repo) is updated to replace the \"agents share LOOPCTL_AGENT_KEY\" pattern with \"call `mcp__loopctl__dispatch` to mint a scoped key for each sub-agent dispatch\". The update is committed in a separate PR in the claude-config repo (linked from this story).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.6",
+      "description": "The `/loopctl:implement` skill is similarly updated: the bootstrap flow calls `mcp__loopctl__dispatch` to obtain its own ephemeral key at session start, and the skill explains that the key is valid only for the current story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.7",
+      "description": "One-shot backfill migration runs at epic-merge time: every existing long-lived api_key (agent or orchestrator role) gets a synthesized root dispatch row inserted and its id written to `api_keys.dispatch_id`. After the backfill, every non-user api_key references a dispatches row. The backfill is part of the epic merge PR's migration — it either completes in full or the deploy rolls back.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.8",
+      "description": "After the backfill, the auth plug requires every non-user api_key to have a non-null dispatch_id. Requests authenticated with a key that has no dispatch reference fail with 403 `missing_dispatch` and remediation pointing at `/wiki/dispatch-lineage`. The claude-config repo's `/loopctl:orchestrate` skill update lands as a sibling PR merged immediately before the epic merge, so running sessions pick up the new dispatch-minting pattern on restart. No shim, no shadow mode, no dual-path detection — the backfill makes the invariant trivially true for all existing keys.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.9",
+      "description": "The Epic 25 review pipeline (loopctl-enhanced-review skill) continues to function by wrapping each review sub-agent in a fresh dispatch under a different lineage root, ensuring the rotating verifier selection can pick the review lineage as non-overlapping with the implementer.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.10",
+      "description": "System article stub `dispatch-lineage` is reserved and linked from the tool description. Full article content is authored in US-26.3.3. A minimal placeholder article is seeded in this story so the links resolve to non-empty content while Phase 3 is still being built on the epic branch.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.11",
+      "description": "mcp-server CHANGELOG.md entry for 2.0.0: lists the new tool, the removal of the shared-key pattern, the migration URL, and the epic merge commit SHA as the cutover anchor (filled in by US-26.R.1 at release time).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.12",
+      "description": "Release process: `npm publish` is NOT executed in this story. The release ceremony is handled by US-26.R.1 (the dedicated release story). This story ships the code to the research branch; publishing waits for approval.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.2.3.1",
+      "name": "New dispatch tool returns ephemeral raw_key and dispatch record",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport in mcp-server test",
+        "Mock response with a dispatch object and raw_key"
+      ],
+      "steps": [
+        "Invoke mcp__loopctl__dispatch handler with parent_dispatch_id, role, agent_id, expires_in_seconds"
+      ],
+      "expected_results": [
+        "Outbound HTTP POST is to /api/v1/dispatches",
+        "Request body matches input",
+        "Handler returns {dispatch, api_key}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.2",
+      "name": "Backfilled long-lived key has dispatch association",
+      "type": "integration",
+      "preconditions": [
+        "tenant with a pre-epic-26 agent api_key",
+        "Backfill migration has run"
+      ],
+      "steps": [
+        "Query api_keys for the key's dispatch_id",
+        "Query dispatches for the synthesized row"
+      ],
+      "expected_results": [
+        "api_keys.dispatch_id is non-null",
+        "dispatches row has role matching the key, parent_dispatch_id is nil (root), lineage_path is [self_id]",
+        "GET /api/v1/projects using the key returns 200"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.3",
+      "name": "Api_key without dispatch association returns 403 missing_dispatch",
+      "type": "integration",
+      "preconditions": [
+        "A raw api_key row inserted bypassing the backfill (simulating a test-only corruption or post-merge code path regression)"
+      ],
+      "steps": [
+        "GET /api/v1/projects with that key"
+      ],
+      "expected_results": [
+        "Response 403",
+        "Body error code is missing_dispatch",
+        "Body includes remediation pointing at /wiki/dispatch-lineage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.4",
+      "name": "mcp-server README contains the migration section",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server/README.md exists"
+      ],
+      "steps": [
+        "Read README.md"
+      ],
+      "expected_results": [
+        "File contains a section titled 'Chain of Custody v2 migration'",
+        "Section includes a code example using mcp__loopctl__dispatch",
+        "Section links to https://loopctl.com/wiki/dispatch-lineage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.5",
+      "name": "dispatch-lineage stub article exists",
+      "type": "integration",
+      "preconditions": [
+        "Seed migration has run"
+      ],
+      "steps": [
+        "GET /wiki/dispatch-lineage"
+      ],
+      "expected_results": [
+        "Response 200",
+        "Body contains placeholder content (at minimum: title, brief intro, and a pointer to full content in US-26.3.3)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "mcp-server tool addition: edit mcp-server/index.js — add to the ListToolsResponse and the CallToolRequestSchema handler switch.",
+    "Version bump: mcp-server/package.json version 1.x → 2.0.0. Node engines stays >=18.",
+    "The claude-config update is a sibling PR, linked from this story's description. It lives in ~/workspace/claude-config/commands/loopctl/orchestrate.md. The story's AC tracks whether the sibling PR was opened, not its merge status.",
+    "Backfill migration: one-shot script in the Phase 2 merge PR that inserts a root dispatch for every existing non-user api_key and writes `api_keys.dispatch_id`. Runs inside the same transaction as the schema change — migration either succeeds in full or rolls back.",
+    "After the backfill, `api_keys.dispatch_id` is NOT NULL for all rows with `role IN ('agent', 'orchestrator')`. A CHECK constraint enforces this post-migration. The auth plug requires `dispatch_id` to resolve for every non-user key — any nil is a 403 `missing_dispatch` (only reachable via code regression since the invariant is enforced at the DB level).",
+    "Stub article body is ~200 words with a 'full content coming in US-26.3.3' note. Prevents broken links while Phase 3 is still building on the epic branch.",
+    "Reference: docs/chain-of-custody-v2.md sections 6 and 10.2."
+  ],
+  "dependencies": [
+    "US-26.2.1",
+    "US-26.2.2"
+  ],
+  "estimated_hours": 8
+}

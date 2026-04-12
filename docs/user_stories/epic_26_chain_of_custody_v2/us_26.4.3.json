@@ -1,0 +1,85 @@
+{
+  "id": "US-26.4.3",
+  "title": "GitHub Actions CI Integration for Verification Results",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "re_execution",
+  "story": {
+    "as_a": "tenant operator whose project already has GitHub Actions CI set up",
+    "i_want_to": "have loopctl consume the CI's check-run results as the primary verification evidence, falling back to the Fly runner only when CI is unavailable",
+    "so_that": "projects with working CI don't pay the cost of a second verification environment, and verification happens in GitHub's infrastructure (outside the implementer's trust zone) for free"
+  },
+  "rationale": "Projects with CI already have a trusted re-execution environment — GitHub Actions runs CI on the implementer's branch in GitHub's infrastructure, which the implementer cannot touch. Consuming CI results is free, fast, and leverages existing operator investment. This story adds the integration; the Fly runner remains the fallback for projects without CI.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.3.1",
+      "description": "Migration adds `projects.ci_provider` enum column (values: :none, :github_actions, :gitlab_ci, :circle_ci) with default :none. Migration adds `projects.ci_config` jsonb for provider-specific config (e.g., workflow name, required check names)."
+    },
+    {
+      "id": "AC-26.4.3.2",
+      "description": "For github_actions: loopctl queries `GET /repos/:owner/:repo/commits/:sha/check-runs` via the `gh` CLI or the GitHub REST API with a project-scoped PAT. Token is stored as a Fly secret per project."
+    },
+    {
+      "id": "AC-26.4.3.3",
+      "description": "Mapping: all check-runs with `conclusion: success` → run.status = pass; any `conclusion: failure` or `conclusion: cancelled` → run.status = fail; any `status: in_progress` or `status: queued` → run re-enqueues with a 60-second delay; total wait time capped at 30 minutes before falling back to Fly runner."
+    },
+    {
+      "id": "AC-26.4.3.4",
+      "description": "Per-AC verification via CI: CI results cover the aggregate test-pass status. Per-AC bindings (test-name, code-pattern, etc.) still run locally in the verification_runner process after CI results are consumed — they don't require re-running tests, just reading the fetched tree."
+    },
+    {
+      "id": "AC-26.4.3.5",
+      "description": "If CI is configured but no check-runs exist for the SHA (perhaps the CI workflow didn't run), the runner falls back to the Fly ephemeral machine path from US-26.4.2. The run record notes the fallback reason."
+    },
+    {
+      "id": "AC-26.4.3.6",
+      "description": "CI PAT setup is documented in a system article `verification-ci-integration` and in deployment notes. Tokens are scoped to read-only check-runs access (no write access)."
+    },
+    {
+      "id": "AC-26.4.3.7",
+      "description": "An integration test uses a stub GitHub API adapter that returns fake check-runs. The test verifies that the runner consumes the results correctly and transitions the verification_run."
+    },
+    {
+      "id": "AC-26.4.3.8",
+      "description": "OpenAPI spec updates for the new `projects.ci_provider` / `ci_config` fields. CHANGELOG entry."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.3.1",
+      "name": "GitHub Actions success maps to run pass",
+      "type": "integration",
+      "preconditions": ["Project configured with ci_provider: github_actions", "Stub returns all check-runs success"],
+      "steps": ["Enqueue VerificationRunner"],
+      "expected_results": ["run.status = pass", "run.runner_type = ci_github"]
+    },
+    {
+      "id": "TC-26.4.3.2",
+      "name": "GitHub Actions failure maps to run fail",
+      "type": "integration",
+      "preconditions": ["Stub returns one check-run with conclusion: failure"],
+      "steps": ["Enqueue VerificationRunner"],
+      "expected_results": ["run.status = fail", "ac_results reflects the failure"]
+    },
+    {
+      "id": "TC-26.4.3.3",
+      "name": "No check-runs falls back to Fly runner",
+      "type": "integration",
+      "preconditions": ["Stub returns empty check-runs list"],
+      "steps": ["Enqueue VerificationRunner with a 60 second timeout to skip the retry delay"],
+      "expected_results": ["Run falls back to Fly path", "runner_type = fly_machine"]
+    }
+  ],
+  "technical_notes": [
+    "GitHub API client: use Req with Authorization: Bearer <PAT>. Or shell out to `gh api` if gh is available in the runner.",
+    "Behaviour-based DI for the CI adapter: Loopctl.Verification.CIAdapter.Behaviour with GitHubAdapter, GitLabAdapter (later), MockAdapter.",
+    "PAT storage: projects.metadata.github_pat_secret_name referencing a Fly secret.",
+    "Retry with delay: Oban's snooze/1 function delays a job without consuming retry attempts.",
+    "Reference: docs/chain-of-custody-v2.md section 7.2 (prefer CI)."
+  ],
+  "dependencies": ["US-26.4.2"],
+  "estimated_hours": 8
+}

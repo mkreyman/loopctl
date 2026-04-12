@@ -1,0 +1,70 @@
+{
+  "id": "US-26.3.4",
+  "title": "loopctl.com Landing Page and CLAUDE.md Trust Model Rewrite",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "capabilities",
+  "story": {
+    "as_a": "prospective loopctl adopter visiting the public website or a developer reading the repo for the first time",
+    "i_want_to": "see a clear, accurate explanation of the Chain of Custody v2 trust model on the loopctl.com landing page and in the root CLAUDE.md, reflecting what the platform actually does after Phase 3 ships",
+    "so_that": "I can evaluate whether loopctl's trust model fits my needs without having to read the design doc, and so that AI contributors working in the repo have an accurate summary of the current model"
+  },
+  "rationale": "After Phase 3 ships, the public loopctl.com landing page and the repo's CLAUDE.md will contain outdated descriptions of the trust model. Both are primary contact surfaces for potential users and AI contributors and must reflect the current state accurately. This story updates both.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.3.4.1",
+      "description": "The loopctl.com landing page (a Phoenix LiveView at `/`) gains a new section titled 'How It Keeps Agents Honest' that explains the two threat profiles (sneaky, lazy), the six-layer enforcement stack summary, and links to the system articles for deeper reading. Content is written for humans evaluating the platform, not agents."
+    },
+    {
+      "id": "AC-26.3.4.2",
+      "description": "The landing page section follows `docs/design-system.md`: dark mode, slate palette, rounded-md, terminal aesthetic. Includes a simple ASCII or SVG diagram of the custody flow."
+    },
+    {
+      "id": "AC-26.3.4.3",
+      "description": "Root `CLAUDE.md` file's 'Security & Trust Model' section is rewritten to reflect Chain of Custody v2. The new section summarizes the six layers, points at `docs/chain-of-custody-v2.md` as the authoritative spec, and removes the deprecated pre-v2 rules. Old rules that still apply (RLS, tenant isolation) are retained."
+    },
+    {
+      "id": "AC-26.3.4.4",
+      "description": "The landing page's existing sections (Features, Get Started, etc.) are updated where they reference the pre-v2 trust model. No broken references remain."
+    },
+    {
+      "id": "AC-26.3.4.5",
+      "description": "Root `README.md` is updated: the 'Security & Trust Model' bullet is rewritten, the 'Quick Start' section mentions the signup ceremony requirement, and the 'Key Distribution Rules' are removed (they're replaced by the dispatch pattern from Phase 2)."
+    },
+    {
+      "id": "AC-26.3.4.6",
+      "description": "A new section in README.md (brief — 5-10 lines) titled 'Trust Model' summarizes Chain of Custody v2 in a couple sentences and links to `docs/chain-of-custody-v2.md` and `https://loopctl.com/wiki/chain-of-custody`."
+    },
+    {
+      "id": "AC-26.3.4.7",
+      "description": "CHANGELOG entry describes the documentation updates."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.3.4.1",
+      "name": "Landing page renders new section with expected content",
+      "type": "integration",
+      "steps": ["GET /"],
+      "expected_results": ["Response contains 'How It Keeps Agents Honest' heading", "Content mentions the six layers", "CSS classes are slate-*, rounded-md, no daisyUI"]
+    },
+    {
+      "id": "TC-26.3.4.2",
+      "name": "CLAUDE.md Security section references the v2 spec",
+      "type": "unit",
+      "steps": ["Read CLAUDE.md"],
+      "expected_results": ["Section title is 'Security & Trust Model'", "Content references docs/chain-of-custody-v2.md", "No references to the deprecated Key Distribution Rules"]
+    }
+  ],
+  "technical_notes": [
+    "Landing page: lib/loopctl_web/live/landing_live.ex or wherever the current /  LiveView lives.",
+    "Use existing component patterns from Epic 18/19.",
+    "CLAUDE.md update: preserve the overall structure (module list, test conventions, etc), rewrite only the Security & Trust Model section.",
+    "No training data: don't include the chain-of-custody design document content inline in CLAUDE.md — reference it."
+  ],
+  "dependencies": ["US-26.3.3"],
+  "estimated_hours": 8
+}

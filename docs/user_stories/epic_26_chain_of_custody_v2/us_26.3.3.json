@@ -1,0 +1,74 @@
+{
+  "id": "US-26.3.3",
+  "title": "System Wiki Articles — Custody Protocol Set",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "capabilities",
+  "story": {
+    "as_a": "agent encountering a chain-of-custody error or learning the protocol for the first time",
+    "i_want_to": "read canonical, authoritative articles on capability tokens, dispatch lineage, the verify-story workflow, the self-verify-blocked error, the break-glass escape hatch, and the acceptance-criteria binding format",
+    "so_that": "every error response that points me at these articles actually leads to real content that explains the concept and gives me a worked example"
+  },
+  "rationale": "Phase 3 error responses link to articles that must exist with real content. This story authors the canonical custody protocol articles. Each article is long-lived and stable — they describe the protocol, not a specific release. Subsequent changes to the protocol update the articles via normal migrations.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.3.3.1",
+      "description": "System article at slug `capability-tokens` exists. Content: 1500-2500 words explaining what a capability token is, how loopctl mints them, the four types (start, report, verify, review_complete), how to present them in requests, how they're verified server-side, what the lineage binding means. Includes at least one worked example with realistic placeholder UUIDs."
+    },
+    {
+      "id": "AC-26.3.3.2",
+      "description": "System article at slug `dispatch-lineage` exists (full content, not stub). Content: explains the dispatch tree, the lineage path format, why `POST /dispatches` exists, how sub-agents are spawned with ephemeral keys, how the self-check compares lineages, how the rotating verifier is selected, and what the orchestrator's role is."
+    },
+    {
+      "id": "AC-26.3.3.3",
+      "description": "System article at slug `verify-story` exists. Content: end-to-end walkthrough for a verifier — from receiving a verify_cap via list_ready_stories, through re-executing the tests, through calling POST /verify with the cap, to the verified state. Includes the exact JSON payloads."
+    },
+    {
+      "id": "AC-26.3.3.4",
+      "description": "System article at slug `self-verify-blocked` exists. Content: explains the error, why it happens (lineage overlap), how to recover (request a new dispatch from a different root OR ask the operator to dispatch an independent lineage), and the rationale for the structural enforcement."
+    },
+    {
+      "id": "AC-26.3.3.5",
+      "description": "System article at slug `break-glass` exists. Content: explains that destructive operations require a human operator with WebAuthn, what break-glass means, how to request one (the agent cannot — it must emit a halt and wait for operator), the rate limit, and the audit trail break-glass leaves."
+    },
+    {
+      "id": "AC-26.3.3.6",
+      "description": "System article at slug `acceptance-criteria-bindings` exists. Content: documents the five verification_criterion types (test, code, route, migration, manual), with examples of each, and explains why these bindings are required in Phase 4."
+    },
+    {
+      "id": "AC-26.3.3.7",
+      "description": "All articles cross-link via /wiki/:slug relative URLs. Link-checker (from US-26.0.5) validates no broken links."
+    },
+    {
+      "id": "AC-26.3.3.8",
+      "description": "Seed migration idempotently installs the 6 articles. Re-running the migration updates existing articles with the latest content (UPSERT on slug)."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.3.3.1",
+      "name": "All 6 articles exist with non-placeholder content",
+      "type": "integration",
+      "steps": ["Query articles with scope=system and slugs in the 6 expected list"],
+      "expected_results": ["6 rows exist", "Each body length > 1500 characters", "No placeholder text remaining"]
+    },
+    {
+      "id": "TC-26.3.3.2",
+      "name": "Every article renders without broken links",
+      "type": "integration",
+      "steps": ["GET /wiki/<slug> for each of the 6", "Run link-check"],
+      "expected_results": ["All 6 render 200", "Zero broken internal links"]
+    }
+  ],
+  "technical_notes": [
+    "Writing 6 articles at ~1500-2500 words each is ~8-12 hours of focused work.",
+    "Follow the pattern from US-26.0.5: heredoc bodies in a seed migration.",
+    "Keep tone consistent with the agent-bootstrap set — direct, example-driven, minimal prose padding.",
+    "All examples use the placeholder UUIDs from US-26.0.5."
+  ],
+  "dependencies": ["US-26.0.3", "US-26.0.5", "US-26.3.1", "US-26.3.2"],
+  "estimated_hours": 12
+}

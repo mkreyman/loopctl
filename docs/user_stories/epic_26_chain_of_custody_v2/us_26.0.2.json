@@ -1,0 +1,239 @@
+{
+  "id": "US-26.0.2",
+  "title": "Tenant Audit-Signing Keypair Generation and Fly Secret Storage",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "tenant_signup",
+  "story": {
+    "as_a": "tenant operator who has just completed signup",
+    "i_want_to": "have loopctl automatically generate a dedicated ed25519 audit-signing keypair for my tenant, store the private half in Fly secrets, and write the genesis audit event signed by both my WebAuthn enrollment and the new audit key",
+    "so_that": "every subsequent Signed Tree Head and capability token in my tenant's audit chain has a cryptographic provenance back to my hardware authenticator, and the private key is never accessible to any LLM agent"
+  },
+  "rationale": "Loopctl needs a machine-held software key for high-volume signing (STHs every 60 seconds, capability tokens on every custody transition). WebAuthn keys are human-held and cannot be used programmatically. A software ed25519 key, generated at signup, bound to the tenant via the genesis audit event, and stored as a Fly.io secret, gives us the operational signing capacity while maintaining a cryptographic chain from the operator's hardware ceremony to every signed artifact. Using Fly secrets rather than a process environment variable means the key is rotatable by the operator without redeploying code and is not readable by agents running in the same application process.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.2.1",
+      "description": "At signup completion (inside the signup Ecto.Multi), loopctl generates an ed25519 keypair using `:public_key.generate_key({:eddsa, :ed25519})` or an equivalent library. The keypair is generated fresh per tenant; no shared or master keys.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.2",
+      "description": "Migration adds `tenants.audit_signing_public_key` (bytea, non-null after signup) and `tenants.audit_key_rotated_at` (timestamptz, nullable). The public key is stored in the database; the private key is NEVER stored in the database.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.3",
+      "description": "The private key is written as a Fly.io secret named `TENANT_AUDIT_KEY_<tenant_slug_uppercase_underscored>` via the Fly.io GraphQL API (`https://api.fly.io/graphql`). The write is behavior-based DI: `Loopctl.Secrets.Behaviour` with `Loopctl.Secrets.FlyAdapter` for production and `Loopctl.Secrets.MockAdapter` for tests (using an in-memory map). Config via `Application.get_env(:loopctl, :secrets_adapter)`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.4",
+      "description": "If the Fly secret write fails, the entire signup transaction rolls back. The tenant is not created. A specific error code (`audit_key_storage_failed`) is returned with a retry hint. The operator is not charged a pending-enrollment slot for a failure caused by the secret store.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.5",
+      "description": "Loopctl provides a `Loopctl.TenantKeys.get_private_key(tenant_id)` function that reads the Fly secret into application memory on demand and caches it in an ETS table with a 5-minute TTL. Cache entries are keyed by tenant_id and are tenant-scoped (no cross-tenant access).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.6",
+      "description": "The genesis audit_chain entry is written in the same Ecto.Multi as tenant creation. Its `action` is `tenant_created`, `actor_lineage` contains the operator's WebAuthn credential ID, and `payload` includes the authenticator_public_key, the new audit_signing_public_key, and the WebAuthn assertion signature from the signup ceremony. The genesis entry has `chain_position = 0` and `prev_entry_hash = 0x00` × 32.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.7",
+      "description": "`GET /api/v1/tenants/:id/audit_public_key` returns the public key as PEM-encoded bytes with content-type `application/x-pem-file`, and also supports `Accept: application/jwk+json` for JWK format. This endpoint is public (no authentication required) because the public key is intended for external verification.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.8",
+      "description": "`POST /api/v1/tenants/:id/rotate-audit-key` requires a fresh WebAuthn assertion from an enrolled root authenticator. On success, a new keypair is generated, the private half replaces the Fly secret, the public half updates `tenants.audit_signing_public_key`, `tenants.audit_key_rotated_at` is set to now, and a `key_rotated` entry is written to the audit chain. Historical STHs signed under the old key remain verifiable because loopctl stores the old public key in a `tenant_audit_key_history` table.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.9",
+      "description": "Migration adds `tenant_audit_key_history` table with columns: id, tenant_id, public_key, rotated_in, rotated_out (nullable), rotation_signature (the WebAuthn assertion that authorized the rotation). Supports multiple rotations over a tenant's lifetime.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.10",
+      "description": "The operator can never directly read the private key via the API. There is no `GET /api/v1/tenants/:id/audit_private_key` endpoint. There is no way to export the key. Key recovery after tenant lockout (all authenticators lost, Fly secret accidentally deleted) requires out-of-band contact with the loopctl maintainer and is explicitly documented as a rare, manual, loud event.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.2.11",
+      "description": "OpenAPI spec updates for the new endpoints (`GET .../audit_public_key`, `POST .../rotate-audit-key`). CHANGELOG entry describing the audit key lifecycle. CLAUDE.md references the new key management pattern under Security & Trust Model.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.2.1",
+      "name": "Signup generates a keypair, stores the private key in the secret adapter, and records the public key",
+      "type": "integration",
+      "preconditions": [
+        "Signup completes successfully with stub WebAuthn attestation",
+        "Stub secrets adapter captures writes"
+      ],
+      "steps": [
+        "POST /signup with valid attestation",
+        "Query tenants table",
+        "Query the mock secrets adapter"
+      ],
+      "expected_results": [
+        "tenants.audit_signing_public_key is non-null and is a valid ed25519 public key",
+        "Mock secrets adapter has an entry for TENANT_AUDIT_KEY_<slug> containing a valid ed25519 private key",
+        "audit_chain has a genesis entry with action = tenant_created, chain_position = 0"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.2",
+      "name": "Failed secret write rolls back tenant creation",
+      "type": "integration",
+      "preconditions": [
+        "Mock secrets adapter configured to return {:error, :network_failure}"
+      ],
+      "steps": [
+        "POST /signup with valid attestation"
+      ],
+      "expected_results": [
+        "Response is 500 with error.code = audit_key_storage_failed",
+        "No tenant row created",
+        "No root_authenticators row created",
+        "No audit_chain entry created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.3",
+      "name": "TenantKeys.get_private_key returns the key and caches it in ETS",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant) with audit key",
+        "Mock adapter returns the test private key"
+      ],
+      "steps": [
+        "Call TenantKeys.get_private_key(tenant.id)",
+        "Call it again"
+      ],
+      "expected_results": [
+        "First call returns the private key",
+        "Second call returns the same value",
+        "Mock adapter was invoked exactly once (second call hit the cache)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.4",
+      "name": "Cross-tenant private key access is isolated",
+      "type": "unit",
+      "preconditions": [
+        "tenant_a and tenant_b each have distinct audit keys in the mock adapter"
+      ],
+      "steps": [
+        "Call TenantKeys.get_private_key(tenant_a.id)",
+        "Call TenantKeys.get_private_key(tenant_b.id)"
+      ],
+      "expected_results": [
+        "Two distinct keys returned",
+        "Tenant A's key is never returned for tenant B's query"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.5",
+      "name": "Public key endpoint returns PEM by default, JWK on Accept header",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant) with audit key"
+      ],
+      "steps": [
+        "GET /api/v1/tenants/:id/audit_public_key",
+        "GET /api/v1/tenants/:id/audit_public_key with Accept: application/jwk+json"
+      ],
+      "expected_results": [
+        "First response is 200 with Content-Type application/x-pem-file and valid PEM body",
+        "Second response is 200 with Content-Type application/jwk+json and a valid JWK object (kty = OKP, crv = Ed25519)",
+        "Both are accessible without authentication"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.6",
+      "name": "Rotate audit key requires fresh WebAuthn assertion and preserves historical public key",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant) with audit key",
+        "Stub WebAuthn verification returns success for the tenant's root authenticator"
+      ],
+      "steps": [
+        "POST /api/v1/tenants/:id/rotate-audit-key with a valid WebAuthn assertion"
+      ],
+      "expected_results": [
+        "Response is 200 with the new public key",
+        "tenants.audit_signing_public_key is updated",
+        "tenants.audit_key_rotated_at is set",
+        "Mock adapter has the new private key",
+        "tenant_audit_key_history has the old public key with rotated_out = now",
+        "audit_chain has a new entry with action = key_rotated"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.7",
+      "name": "Rotate audit key without WebAuthn assertion returns 401",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant) with audit key"
+      ],
+      "steps": [
+        "POST /api/v1/tenants/:id/rotate-audit-key without an assertion"
+      ],
+      "expected_results": [
+        "Response is 401 with error.code = webauthn_required",
+        "Private key is unchanged",
+        "No audit chain entry is added"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.2.8",
+      "name": "No API endpoint exposes the private key",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Attempt GET /api/v1/tenants/:id/audit_private_key",
+        "Attempt GET /api/v1/admin/tenants/:id/secrets"
+      ],
+      "expected_results": [
+        "Both return 404",
+        "No endpoint in the router returns the private key"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Ed25519 generation: use the built-in :public_key Erlang module. Pattern: `{pub, priv} = :public_key.generate_key({:eddsa, :ed25519})`.",
+    "Fly.io secrets API: use a GraphQL mutation against https://api.fly.io/graphql with `setSecrets` mutation. Auth via a FLY_API_TOKEN env variable scoped to the loopctl app.",
+    "Secret naming convention: `TENANT_AUDIT_KEY_<UPPER_SLUG>` where UPPER_SLUG is `String.upcase(tenant.slug) |> String.replace(\"-\", \"_\")`. Fly secret name limit is 64 chars.",
+    "Behaviour: `Loopctl.Secrets.Behaviour` with callbacks `get/1`, `set/2`, `delete/1`, all returning `{:ok, binary} | {:error, term}`.",
+    "ETS cache: named table `:tenant_key_cache`, created at application start. Entries are `{tenant_id, private_key, expires_at}`. Lookup is a single ETS read, TTL checked inline. Refresh on miss.",
+    "The private key is stored as raw bytes (32 bytes for ed25519 private). Never base64 in the DB or logs.",
+    "Log hygiene: any log line that includes tenant_id MUST NOT include the private key or any derivative. Use `Logger.metadata(tenant_id: ..., key: :redacted)`.",
+    "Key rotation MUST preserve the old public key in `tenant_audit_key_history` so that historical STHs and capability tokens remain verifiable. Verification functions check the key history.",
+    "The genesis audit_chain entry writes two signatures into the payload: the WebAuthn assertion signature (proof of human ceremony) and nothing else from the audit key (the audit key itself is SIGNED INTO the genesis entry, not signing it). Subsequent entries are signed by the audit key.",
+    "Audit key rotation is itself an audit event, so rotation creates a new chain entry that references the old key in its payload and is signed with the NEW key.",
+    "Reference: docs/chain-of-custody-v2.md section 4.3 and section 9 for the full key lifecycle."
+  ],
+  "dependencies": [
+    "US-26.0.1"
+  ],
+  "estimated_hours": 8
+}

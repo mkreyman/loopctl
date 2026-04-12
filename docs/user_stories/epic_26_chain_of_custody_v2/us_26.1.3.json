@@ -1,0 +1,209 @@
+{
+  "id": "US-26.1.3",
+  "title": "Nil-Permissive Fall-Through Fixes and api_keys Database Invariants",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "audit_foundation",
+  "story": {
+    "as_a": "tenant operator relying on loopctl's chain-of-custody guarantees",
+    "i_want_to": "have every self-report/self-review/self-verify check reject nil identity as unsafe (rather than silently permitting), and have the api_keys table enforce at the database layer that no agent can hold multiple active roles or have its role changed after creation",
+    "so_that": "a creative adversary cannot bypass chain-of-custody by passing nil identity fields or by minting a second-role key on an existing agent"
+  },
+  "rationale": "Two structural problems exist in the current loopctl code: (1) `Progress.validate_not_self_*` functions return `:ok` when the actor identity is nil, documented as 'no identity to compare — cannot self-review', which is the wrong default for a trust check; (2) `api_keys.agent_id` has no FK to `agents`, the same agent can hold keys with different roles simultaneously, and api_key role is mutable after creation. Each of these is an exploit vector independently. This story fixes all three at the layer where they matter (application code for the nil check, database constraints for the FK and invariants).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.1.3.1",
+      "description": "`Loopctl.Progress.validate_not_self_report/2`, `validate_not_self_review/2`, and `validate_not_self_verify/2` treat nil actor identity as unsafe. The nil clauses return `{:error, :self_report_blocked}`, `{:error, :self_review_blocked}`, `{:error, :self_verify_blocked}` respectively. The legacy `:ok` fall-through is deleted from the source — there is no flag, no shadow mode, no conditional. A single commit flips the clauses and updates all callers to handle the new error tuple.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.2",
+      "description": "Migration adds a FK constraint on `api_keys.agent_id` referencing `agents(id)` ON DELETE RESTRICT. The FK is nullable ONLY when `role = 'user'` (the human operator root key doesn't need an agent record). Check constraint: `(role = 'user' AND agent_id IS NULL) OR (role IN ('agent', 'orchestrator') AND agent_id IS NOT NULL)`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.3",
+      "description": "Migration adds a partial unique index `api_keys_one_role_per_agent_idx` on `(tenant_id, agent_id)` WHERE `revoked_at IS NULL AND role != 'user'`. This ensures: one active non-user key per agent, ever. Rotation within the same role is handled by revoking the old key before or concurrently with creating the new one.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.4",
+      "description": "Migration adds an IMMUTABLE trigger on `api_keys`: BEFORE UPDATE raises `api_key_role_immutable` if `OLD.role != NEW.role`. Role changes require explicit revoke + recreate, not in-place update.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.5",
+      "description": "Error responses for the new rejection paths include `error.remediation.next_action` (string), `error.remediation.learn_more` (URL pointing at the relevant wiki article: `self-verify-blocked`, `one-agent-one-role`, `api-key-role-immutable`), `error.remediation.example` (sample request body showing the correct pattern).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.6",
+      "description": "Existing tests that relied on the nil short-circuit are updated to pass an explicit reviewer/verifier identity. No test is disabled or deleted to avoid fixing it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.7",
+      "description": "Pre-existing data violations are NOT auto-revoked. The migration flags them for operator review (see US-26.1.4). A warning log entry is written for every violation detected during the migration.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.8",
+      "description": "`Loopctl.Auth.create_api_key/1` wraps the creation in a transaction that also writes an audit_chain entry for the creation. The audit entry records the creator's lineage, the new key's role and agent_id, and a redacted key prefix (never the full key).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.9",
+      "description": "Tenant isolation test: a cross-tenant agent_id in an api_key creation request returns 422 because the agent doesn't exist in the caller's tenant (the FK is enforced within-tenant via a composite index on (tenant_id, id) on the agents table if not already present).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.10",
+      "description": "Rotation flow is explicitly supported: `Loopctl.Auth.rotate_api_key/2` revokes the old key and creates the new key in a single Ecto.Multi. The partial unique index does not block rotation because the old key has `revoked_at` set before the new key is inserted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.1.3.11",
+      "description": "CHANGELOG entry describes the new invariants and migration impact. CLAUDE.md's Security & Trust Model section is updated to reference `docs/chain-of-custody-v2.md` and summarize the new rules.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.1.3.1",
+      "name": "validate_not_self_verify with nil verifier_agent_id returns :self_verify_blocked",
+      "type": "unit",
+      "preconditions": [
+        "story = fixture(:story, assigned_agent_id: \"some-id\")"
+      ],
+      "steps": [
+        "Call Loopctl.Progress.validate_not_self_verify(story, nil)"
+      ],
+      "expected_results": [
+        "Returns {:error, :self_verify_blocked}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.2",
+      "name": "Inserting an api_key with non-existent agent_id raises FK violation",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Attempt Loopctl.Auth.create_api_key(%{tenant_id: tenant.id, role: :agent, agent_id: \"non-existent-uuid\"})"
+      ],
+      "expected_results": [
+        "Returns {:error, changeset} with a foreign_key_constraint error on :agent_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.3",
+      "name": "Creating a second active key for the same agent in a different role raises unique constraint",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "agent = fixture(:agent, tenant: tenant)",
+        "_first = fixture(:api_key, tenant: tenant, agent_id: agent.id, role: :agent)"
+      ],
+      "steps": [
+        "Attempt create_api_key with same agent.id and role: :orchestrator"
+      ],
+      "expected_results": [
+        "Returns {:error, changeset} with a unique_constraint error",
+        "Error.remediation.next_action mentions revoking the existing key first",
+        "Error.remediation.learn_more points at /wiki/one-agent-one-role"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.4",
+      "name": "Updating an api_key's role is blocked by trigger",
+      "type": "integration",
+      "preconditions": [
+        "api_key = fixture(:api_key, role: :agent)"
+      ],
+      "steps": [
+        "Attempt Repo.update(changeset_changing_role_to_orchestrator)"
+      ],
+      "expected_results": [
+        "Database raises api_key_role_immutable",
+        "Row is unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.5",
+      "name": "User-role key can be created without an agent_id",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "create_api_key with role: :user, agent_id: nil"
+      ],
+      "expected_results": [
+        "Returns {:ok, key} with agent_id = nil",
+        "No constraint violation"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.6",
+      "name": "Rotation succeeds — revoke old, create new atomically",
+      "type": "integration",
+      "preconditions": [
+        "api_key = fixture(:api_key, tenant: tenant, agent_id: agent.id, role: :agent)"
+      ],
+      "steps": [
+        "Call Loopctl.Auth.rotate_api_key(api_key, %{})"
+      ],
+      "expected_results": [
+        "Returns {:ok, %{old_key: ..., new_key: ...}}",
+        "Old key has revoked_at set",
+        "New key is active with the same role and agent_id",
+        "Audit chain has entries for revocation and creation"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.1.3.7",
+      "name": "api_key creation writes an audit chain entry",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "agent = fixture(:agent, tenant: tenant)"
+      ],
+      "steps": [
+        "Call Loopctl.Auth.create_api_key/1",
+        "Query audit_chain for the tenant"
+      ],
+      "expected_results": [
+        "A new entry exists with action = \"api_key_created\"",
+        "Payload includes agent_id, role, and redacted key_prefix",
+        "Full key material is NOT in the payload"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Module: lib/loopctl/progress.ex, search for defp validate_not_self_ and flip the nil clauses.",
+    "Migration file: priv/repo/migrations/<ts>_enforce_api_key_invariants.exs",
+    "FK on agent_id requires the agents table exists with a composite UNIQUE on (tenant_id, id) if not already present (likely already there via the PK).",
+    "Check constraint SQL: `ALTER TABLE api_keys ADD CONSTRAINT api_keys_agent_role_consistency CHECK ((role = 'user' AND agent_id IS NULL) OR (role IN ('agent', 'orchestrator') AND agent_id IS NOT NULL))`",
+    "Partial unique index: `CREATE UNIQUE INDEX api_keys_one_role_per_agent_idx ON api_keys (tenant_id, agent_id) WHERE revoked_at IS NULL AND role != 'user'`",
+    "Role immutability trigger: PL/pgSQL function that raises if OLD.role != NEW.role. Trigger BEFORE UPDATE.",
+    "Pre-existing data survey: the migration runs a SELECT aggregating violations and writes them to a new `audit_chain_pending_violations` table (or uses Logger.warning for operator visibility). The actual resolution UI is in US-26.1.4.",
+    "Error response shape for 422 on invariant violation: standard {error: {code, message, remediation: {next_action, learn_more, example}}}.",
+    "The audit_chain entry for api_key creation is written in the same Ecto.Multi as the insert, via the new AuditChain.append helper from US-26.1.1.",
+    "Reference: docs/chain-of-custody-v2.md sections 2.2 (nil is never permissive) and L2 (database invariants)."
+  ],
+  "dependencies": [
+    "US-26.1.1"
+  ],
+  "estimated_hours": 10
+}

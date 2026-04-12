@@ -1,0 +1,91 @@
+{
+  "id": "US-26.4.1",
+  "title": "Story Acceptance Criteria as First-Class Table with verification_criterion Field",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "re_execution",
+  "story": {
+    "as_a": "tenant operator trusting that story verification re-executes the implementer's work rather than accepting their self-report",
+    "i_want_to": "have each acceptance criterion on a story promoted from jsonb-on-story to a first-class table row, with a machine-checkable verification_criterion describing what code artifact proves it's implemented",
+    "so_that": "loopctl's verification engine can independently re-check each AC against the actual committed code instead of trusting the implementer"
+  },
+  "rationale": "Lazy-bastard defense (section 3 L3 of chain-of-custody-v2.md) requires independent re-execution. That requires knowing what to check. The existing ACs are jsonb blobs with human-readable descriptions — unverifiable programmatically. Promoting to a first-class table with structured bindings lets the verification runner (US-26.4.2) actually check each one.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.1.1",
+      "description": "Migration creates `story_acceptance_criteria` table: id (uuid PK), tenant_id (FK), story_id (FK), ac_id (string, like 'AC-26.1.1'), description (text), verification_criterion (jsonb), status (enum: pending, verified, failed, unverifiable), verified_at (timestamptz nullable), verified_by_dispatch_id (FK nullable), evidence_path (text nullable), inserted_at, updated_at."
+    },
+    {
+      "id": "AC-26.4.1.2",
+      "description": "Unique index on (story_id, ac_id)."
+    },
+    {
+      "id": "AC-26.4.1.3",
+      "description": "`verification_criterion` jsonb accepts one of 5 type tags: `{type: \"test\", path, test_name}`, `{type: \"code\", path, line_range, pattern}`, `{type: \"route\", method, path}`, `{type: \"migration\", table, column, column_type}`, `{type: \"manual\", description}`. A check constraint or application-level validator ensures the jsonb conforms to one of the shapes."
+    },
+    {
+      "id": "AC-26.4.1.4",
+      "description": "Backfill migration: for every existing story with jsonb-blob ACs, extract each AC into a row in the new table. Default `verification_criterion` to `{type: \"manual\", description: \"legacy\"}` for backfilled rows. Legacy rows are flagged and require operator approval to verify per US-26.4.4."
+    },
+    {
+      "id": "AC-26.4.1.5",
+      "description": "`Loopctl.WorkBreakdown.contract_story/3` validates that every AC in the contract has a `verification_criterion` OR explicitly uses `{type: \"manual\", description: ...}`. Stories with legacy 'manual: legacy' criteria get a warning but are not rejected."
+    },
+    {
+      "id": "AC-26.4.1.6",
+      "description": "`GET /api/v1/stories/:id/acceptance_criteria` returns the full AC list with verification status. Tenant-scoped."
+    },
+    {
+      "id": "AC-26.4.1.7",
+      "description": "`list_stories` and `get_story` responses include the new AC list (replacing the jsonb blob in story.metadata)."
+    },
+    {
+      "id": "AC-26.4.1.8",
+      "description": "The story-writer skill in claude-config is updated to emit the new verification_criterion shape in every AC it generates (documented in mcp-server README)."
+    },
+    {
+      "id": "AC-26.4.1.9",
+      "description": "Tenant isolation: AC queries enforce tenant_id. Cross-tenant access returns 404."
+    },
+    {
+      "id": "AC-26.4.1.10",
+      "description": "OpenAPI spec updates: new `AcceptanceCriterion` schema, new operation specs. CHANGELOG entry. System article stub `acceptance-criteria-bindings` reserved for US-26.4.5."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.1.1",
+      "name": "Contract story with test-type criterion",
+      "type": "integration",
+      "steps": ["POST /stories with ACs containing verification_criterion of type test"],
+      "expected_results": ["201 with story", "story_acceptance_criteria has a row per AC with the criterion stored"]
+    },
+    {
+      "id": "TC-26.4.1.2",
+      "name": "Invalid criterion type rejected at contract time",
+      "type": "integration",
+      "steps": ["POST /stories with verification_criterion.type = 'bogus'"],
+      "expected_results": ["422 with remediation"]
+    },
+    {
+      "id": "TC-26.4.1.3",
+      "name": "Backfill creates manual:legacy rows for existing stories",
+      "type": "integration",
+      "preconditions": ["Existing story with jsonb AC blob"],
+      "steps": ["Run backfill migration"],
+      "expected_results": ["story_acceptance_criteria has one row per AC", "Each row has verification_criterion = manual:legacy"]
+    }
+  ],
+  "technical_notes": [
+    "Migration file: priv/repo/migrations/<ts>_create_story_acceptance_criteria.exs",
+    "Ecto schema: lib/loopctl/work_breakdown/acceptance_criterion.ex",
+    "Check constraint on verification_criterion shape is verbose in SQL — prefer application-level validation via Ecto.Changeset.",
+    "The story-writer skill update is a sibling PR in claude-config, linked from this story.",
+    "Reference: docs/chain-of-custody-v2.md section 7.1."
+  ],
+  "dependencies": ["US-26.1.1"],
+  "estimated_hours": 10
+}

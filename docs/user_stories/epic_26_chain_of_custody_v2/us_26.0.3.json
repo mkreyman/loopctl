@@ -1,0 +1,235 @@
+{
+  "id": "US-26.0.3",
+  "title": "System-Scoped Knowledge Articles and Public Wiki Rendering",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "self_discovery",
+  "story": {
+    "as_a": "new agent or human operator encountering loopctl for the first time",
+    "i_want_to": "read authoritative canonical documentation about how loopctl's trust model, custody protocol, and agent lifecycle work — discoverable via stable URLs without needing to authenticate or be bound to any specific tenant",
+    "so_that": "I can learn the protocol and recover from errors without reading source code, and error responses can link to articles that actually exist and render cleanly"
+  },
+  "rationale": "Loopctl's self-discovery design (section 8 of chain-of-custody-v2.md) depends on a public set of canonical articles that agents can retrieve via stable URLs. Every error response in the redesigned API includes a `learn_more` URL that must resolve to a real, rendered article. Without this foundation, the HATEOAS layer collapses. System-scoped articles also eliminate the need to seed tutorial content per-tenant: one global set, updated via migrations, serves every tenant in every deployment. This story ships the database changes, the rendering LiveView, and the infrastructure to serve system articles — the actual article CONTENT is authored in US-26.0.5 and later docs-content stories.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.3.1",
+      "description": "Migration adds an enum column `articles.scope` with values `:tenant` (default) and `:system`. Backfills existing articles to `:tenant`. Makes `articles.tenant_id` nullable only when `scope = :system` (enforced via a check constraint: `(scope = 'tenant' AND tenant_id IS NOT NULL) OR (scope = 'system' AND tenant_id IS NULL)`).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.2",
+      "description": "Migration adds `articles.slug` column (unique per scope — system slugs are globally unique, tenant slugs are unique per tenant). Slug format: lowercase kebab-case, max 64 chars, regex `^[a-z0-9][a-z0-9-]*[a-z0-9]$`. Existing articles get auto-generated slugs from their titles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.3",
+      "description": "System articles are writable ONLY by api_keys with role `:superadmin`. Attempts to write a system article from any other role return 403 with error code `system_scope_forbidden`. The existing article creation/update/delete endpoints handle the scope-aware permission check.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.4",
+      "description": "`Loopctl.Knowledge.search_articles/3` and `Loopctl.Knowledge.get_article/3` are updated to include system articles in results alongside tenant articles. For a search query, results merge system and tenant articles, ranked by relevance; system articles are tagged with `scope: \"system\"` in the response so callers can distinguish them. Tenant articles from other tenants remain invisible (RLS unchanged).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.5",
+      "description": "A new public LiveView at `/wiki/:slug` renders a system article as HTML. The slug path parameter is the article's slug. The LiveView resolves the slug, fetches the system article (no authentication required), and renders its body as Markdown via Earmark (already in deps). Unknown slugs return a 404 page with a search box pointing at `/wiki`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.6",
+      "description": "The rendered page follows `docs/design-system.md`: dark mode, Geist/Geist Mono fonts, slate palette, rounded-md cards, terminal aesthetic for code blocks, no rounded-xl, no gradients. Code blocks use `phx-no-curly-interpolation` for Elixir snippets that contain literal `{` or `}`. The page includes a sticky navigation sidebar listing all system articles, with the current one highlighted.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.7",
+      "description": "A new public index LiveView at `/wiki` lists all system articles grouped by category (pattern, convention, decision, finding, reference), searchable by keyword. Also no authentication required.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.8",
+      "description": "`GET /api/v1/articles/system?slug=<slug>` returns the article as JSON for programmatic consumers. `GET /api/v1/articles?scope=system` lists all system articles. Both endpoints are public (no authentication).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.9",
+      "description": "Article body is stored as Markdown in the existing `articles.body` field. System articles can include inline links to other system articles using `[text](/wiki/<slug>)` or `https://loopctl.com/wiki/<slug>`. A simple link-check in the rendering path flags broken internal links (article doesn't exist) and renders them with a warning indicator.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.10",
+      "description": "Tenant isolation test: a tenant-scoped agent searches the wiki. The search returns both system articles and the agent's own tenant's articles, but NEVER articles from a different tenant. Confirmed via a test with two tenants and overlapping search terms.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.11",
+      "description": "Auto-link worker from Epic 24 (article auto-linking) is updated to respect the scope boundary: system articles link to system articles, tenant articles link to tenant articles AND system articles, but never to other tenants' articles.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.3.12",
+      "description": "OpenAPI spec updates: `ArticleResponse` schema gains a `scope` field. New `SystemArticleListResponse` schema. Operation specs for the new public endpoints. Swagger UI reflects the changes.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.3.1",
+      "name": "System article creation by superadmin succeeds, by agent role fails",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "superadmin_key = fixture(:api_key, tenant: tenant, role: :superadmin)",
+        "agent_key = fixture(:api_key, tenant: tenant, role: :agent)"
+      ],
+      "steps": [
+        "POST /api/v1/articles with scope: system using superadmin_key",
+        "POST /api/v1/articles with scope: system using agent_key"
+      ],
+      "expected_results": [
+        "First request returns 201 with the new system article (tenant_id is null)",
+        "Second request returns 403 with error.code = system_scope_forbidden"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.2",
+      "name": "Search returns system and own-tenant articles, excludes other tenants",
+      "type": "integration",
+      "preconditions": [
+        "system article with title including 'chain of custody'",
+        "tenant_a article with title including 'chain of custody'",
+        "tenant_b article with title including 'chain of custody'",
+        "agent_a_key = fixture(:api_key, tenant: tenant_a, role: :agent)"
+      ],
+      "steps": [
+        "Search as agent_a_key for 'chain of custody'"
+      ],
+      "expected_results": [
+        "Returns the system article (marked scope: system)",
+        "Returns the tenant_a article (marked scope: tenant)",
+        "Does NOT return the tenant_b article"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.3",
+      "name": "Public /wiki/:slug renders a system article",
+      "type": "integration",
+      "preconditions": [
+        "system article with slug 'chain-of-custody' and body containing markdown"
+      ],
+      "steps": [
+        "GET /wiki/chain-of-custody (no auth)"
+      ],
+      "expected_results": [
+        "Response is 200",
+        "HTML body contains the rendered markdown",
+        "Page includes the sticky sidebar",
+        "CSS classes include slate-* and font-geist",
+        "No daisyUI or rounded-xl classes"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.4",
+      "name": "Unknown wiki slug returns 404 page with search",
+      "type": "integration",
+      "preconditions": [
+        "No article with slug 'does-not-exist'"
+      ],
+      "steps": [
+        "GET /wiki/does-not-exist"
+      ],
+      "expected_results": [
+        "Response is 404",
+        "Body includes 'not found' copy and a search box pointing at /wiki"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.5",
+      "name": "Public article index lists all system articles grouped by category",
+      "type": "integration",
+      "preconditions": [
+        "3 system articles across 2 categories"
+      ],
+      "steps": [
+        "GET /wiki"
+      ],
+      "expected_results": [
+        "Response is 200",
+        "Body lists all 3 articles",
+        "Articles are grouped by category header"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.6",
+      "name": "JSON API returns system article by slug",
+      "type": "integration",
+      "preconditions": [
+        "system article with slug 'test-slug'"
+      ],
+      "steps": [
+        "GET /api/v1/articles/system?slug=test-slug"
+      ],
+      "expected_results": [
+        "Response is 200 with application/json",
+        "Body includes article fields and scope: system"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.7",
+      "name": "Broken internal link is rendered with a warning indicator",
+      "type": "integration",
+      "preconditions": [
+        "system article body contains [broken](/wiki/nonexistent)"
+      ],
+      "steps": [
+        "GET /wiki/<slug of article with broken link>"
+      ],
+      "expected_results": [
+        "Page renders successfully",
+        "The broken link is styled differently (warning indicator)",
+        "A server-side log entry notes the broken link"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.3.8",
+      "name": "Scope constraint prevents inconsistent rows",
+      "type": "unit",
+      "preconditions": [
+        "Raw Repo access"
+      ],
+      "steps": [
+        "Attempt to insert an article with scope: :system AND tenant_id not null",
+        "Attempt to insert an article with scope: :tenant AND tenant_id null"
+      ],
+      "expected_results": [
+        "Both attempts raise a constraint violation",
+        "No rows are inserted"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Scope enum: use Ecto.Enum with values :tenant and :system. Store as string in the database for readability.",
+    "Check constraint SQL: ALTER TABLE articles ADD CONSTRAINT articles_scope_tenant_consistency CHECK ((scope = 'tenant' AND tenant_id IS NOT NULL) OR (scope = 'system' AND tenant_id IS NULL))",
+    "Slug uniqueness: partial unique index `CREATE UNIQUE INDEX articles_system_slug_idx ON articles (slug) WHERE scope = 'system'` and `CREATE UNIQUE INDEX articles_tenant_slug_idx ON articles (tenant_id, slug) WHERE scope = 'tenant'`.",
+    "LiveView route: `live \"/wiki\", WikiIndexLive` and `live \"/wiki/:slug\", WikiShowLive` in the public live_session.",
+    "Markdown rendering: Earmark is already a dep. Wrap with a sanitizer (HtmlSanitizeEx or equivalent) to prevent XSS from user-authored article bodies — even though only superadmin can author system articles, defense in depth.",
+    "The sidebar is built from a single query listing all system articles. Cache with a short TTL (30 seconds) via a GenServer or ETS to avoid hitting the DB on every wiki page load.",
+    "Public endpoints bypass the RequireAuth plug but still go through the SetTenantContext plug (which sets tenant_id to nil for public requests).",
+    "The link checker uses a regex to find `/wiki/:slug` references and checks each slug against the system articles list. Flag broken ones at render time.",
+    "System articles are ordered in the sidebar by a manual `sort_order` field (optional integer) OR alphabetical by title when sort_order is null.",
+    "Reference: docs/chain-of-custody-v2.md section 8.3 for the system article design."
+  ],
+  "dependencies": [],
+  "estimated_hours": 8
+}
