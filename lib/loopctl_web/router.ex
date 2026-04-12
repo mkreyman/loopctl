@@ -51,6 +51,12 @@ defmodule LoopctlWeb.Router do
       live "/signup", SignupLive, :index
       live "/tenants/:id/onboarding", TenantOnboardingLive, :index
     end
+
+    # US-26.0.3 — public wiki rendering for system-scoped articles
+    live_session :public_wiki do
+      live "/wiki", WikiIndexLive, :index
+      live "/wiki/:slug", WikiShowLive, :show
+    end
   end
 
   # Health check — unauthenticated JSON, outside /api/v1
@@ -69,10 +75,12 @@ defmodule LoopctlWeb.Router do
   end
 
   # US-26.0.2 — Public endpoint for tenant audit key (no auth required)
+  # US-26.0.3 — Public system article endpoints (no auth required)
   scope "/api/v1", LoopctlWeb do
     pipe_through [:api]
 
     get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
+    get "/articles/system", SystemArticleController, :index
   end
 
   scope "/swaggerui" do

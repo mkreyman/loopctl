@@ -101,6 +101,9 @@ defmodule Loopctl.MixProject do
       # WebAuthn / FIDO2 attestation verification (US-26.0.1)
       {:wax_, "~> 0.6"},
 
+      # Markdown rendering for wiki articles (US-26.0.3)
+      {:earmark, "~> 1.4"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},

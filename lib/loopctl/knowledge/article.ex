@@ -30,8 +30,10 @@ defmodule Loopctl.Knowledge.Article do
 
   @category_values [:pattern, :convention, :decision, :finding, :reference]
   @status_values [:draft, :published, :archived, :superseded]
+  @scope_values [:tenant, :system]
   @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   @max_tags 20
   @max_tag_length 100
 
@@ -43,6 +45,8 @@ defmodule Loopctl.Knowledge.Article do
     field :body, :string
     field :category, Ecto.Enum, values: @category_values
     field :status, Ecto.Enum, values: @status_values, default: :draft
+    field :scope, Ecto.Enum, values: @scope_values, default: :tenant
+    field :slug, :string
     field :tags, {:array, :string}, default: []
     field :source_type, :string
     field :source_id, :binary_id
@@ -61,6 +65,8 @@ defmodule Loopctl.Knowledge.Article do
     :body,
     :category,
     :status,
+    :scope,
+    :slug,
     :tags,
     :source_type,
     :source_id,
@@ -81,12 +87,22 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_required([:title, :body, :category])
     |> validate_length(:title, max: 500)
     |> validate_length(:body, max: 100_000)
+    |> validate_slug()
     |> validate_tags()
     |> validate_source_type()
     |> validate_metadata()
+    |> maybe_generate_slug()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
+      message: "has already been taken for this tenant"
+    )
+    |> unique_constraint(:slug,
+      name: :articles_system_slug_idx,
+      message: "has already been taken"
+    )
+    |> unique_constraint([:tenant_id, :slug],
+      name: :articles_tenant_slug_idx,
       message: "has already been taken for this tenant"
     )
   end
@@ -100,14 +116,23 @@ defmodule Loopctl.Knowledge.Article do
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(article, attrs) do
     article
-    |> cast(attrs, [:title, :body, :category, :status, :tags, :metadata, :project_id])
+    |> cast(attrs, [:title, :body, :category, :status, :tags, :slug, :metadata, :project_id])
     |> validate_length(:title, max: 500)
     |> validate_length(:body, max: 100_000)
+    |> validate_slug()
     |> validate_tags()
     |> validate_metadata()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint([:tenant_id, :title],
       name: :articles_tenant_title_active_idx,
+      message: "has already been taken for this tenant"
+    )
+    |> unique_constraint(:slug,
+      name: :articles_system_slug_idx,
+      message: "has already been taken"
+    )
+    |> unique_constraint([:tenant_id, :slug],
+      name: :articles_tenant_slug_idx,
       message: "has already been taken for this tenant"
     )
   end
@@ -279,6 +304,52 @@ defmodule Loopctl.Knowledge.Article do
 
       _ ->
         changeset
+    end
+  end
+
+  defp validate_slug(changeset) do
+    case get_change(changeset, :slug) do
+      nil ->
+        changeset
+
+      slug when is_binary(slug) ->
+        changeset
+        |> validate_format(:slug, @slug_format,
+          message: "must be lowercase alphanumeric with hyphens"
+        )
+        |> validate_length(:slug, min: 2, max: 64)
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp maybe_generate_slug(changeset) do
+    case {get_field(changeset, :slug), get_field(changeset, :title)} do
+      {nil, title} when is_binary(title) and title != "" ->
+        maybe_put_generated_slug(changeset, title)
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp maybe_put_generated_slug(changeset, title) do
+    base =
+      title
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9\s-]/, "")
+      |> String.replace(~r/\s+/, "-")
+      |> String.trim("-")
+      |> String.slice(0, 56)
+
+    suffix = :crypto.strong_rand_bytes(3) |> Base.encode16(case: :lower)
+    slug = if base != "", do: "#{base}-#{suffix}", else: suffix
+
+    if Regex.match?(@slug_format, slug) do
+      put_change(changeset, :slug, slug)
+    else
+      changeset
     end
   end
 end

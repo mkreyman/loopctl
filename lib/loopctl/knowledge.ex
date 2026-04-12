@@ -66,7 +66,11 @@ defmodule Loopctl.Knowledge do
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Article.t()} | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
+    scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
+
+    # System articles have no tenant — set tenant_id to nil
+    effective_tenant_id = if scope in [:system, "system"], do: nil, else: tenant_id
 
     with :ok <- validate_project_ownership(tenant_id, project_id) do
       actor_id = Keyword.get(opts, :actor_id)
@@ -74,7 +78,7 @@ defmodule Loopctl.Knowledge do
       actor_type = Keyword.get(opts, :actor_type, "api_key")
 
       changeset =
-        %Article{tenant_id: tenant_id}
+        %Article{tenant_id: effective_tenant_id}
         |> Article.create_changeset(attrs)
 
       # Content is always "changed" on create (title + body are required).
@@ -254,6 +258,54 @@ defmodule Loopctl.Knowledge do
       data: articles,
       meta: %{total_count: total_count, limit: limit, offset: offset}
     }
+  end
+
+  @doc """
+  Retrieves a system article by slug. No tenant scoping — system articles
+  are globally visible.
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if no published system article with that slug exists
+  """
+  @spec get_system_article_by_slug(String.t()) :: {:ok, Article.t()} | {:error, :not_found}
+  def get_system_article_by_slug(slug) when is_binary(slug) do
+    case AdminRepo.get_by(Article, slug: slug, scope: :system, status: :published) do
+      nil -> {:error, :not_found}
+      article -> {:ok, article}
+    end
+  end
+
+  @doc """
+  Lists all published system articles, optionally filtered by category.
+  Returns results ordered by title.
+  """
+  @spec list_system_articles(keyword()) :: [Article.t()]
+  def list_system_articles(opts \\ []) do
+    base =
+      from(a in Article,
+        where: a.scope == :system and a.status == :published,
+        order_by: [asc: a.title]
+      )
+
+    base =
+      case Keyword.get(opts, :category) do
+        nil -> base
+        cat -> from(a in base, where: a.category == ^cat)
+      end
+
+    AdminRepo.all(base)
+  end
+
+  @doc """
+  Lists all published system articles grouped by category.
+  Returns a map of `%{category => [articles]}`.
+  """
+  @spec list_system_articles_grouped() :: %{atom() => [Article.t()]}
+  def list_system_articles_grouped do
+    list_system_articles()
+    |> Enum.group_by(& &1.category)
   end
 
   @doc """
