@@ -66,6 +66,14 @@ defmodule LoopctlWeb.Router do
     get "/health", HealthController, :check
   end
 
+  # US-26.0.4 — RFC 8615 discovery endpoint (unauthenticated)
+  scope "/", LoopctlWeb do
+    pipe_through :api
+
+    get "/.well-known/loopctl", WellKnownController, :discovery
+    get "/.well-known/loopctl/schema.json", WellKnownController, :schema
+  end
+
   # OpenAPI spec, Swagger UI, and API discovery — available in all environments
   scope "/api/v1" do
     pipe_through [:api]
