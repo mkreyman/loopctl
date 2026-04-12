@@ -110,6 +110,9 @@ defmodule LoopctlWeb.Router do
     patch "/tenants/me", TenantController, :update
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
 
+    # US-26.2.1 — Dispatch lineage
+    resources "/dispatches", DispatchController, only: [:create, :show, :index]
+
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
     post "/api_keys/:id/rotate", ApiKeyController, :rotate

@@ -103,7 +103,8 @@ config :loopctl, Oban,
        {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
        {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
-       {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}}
+       {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
+       {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker}
      ]}
   ]
 
