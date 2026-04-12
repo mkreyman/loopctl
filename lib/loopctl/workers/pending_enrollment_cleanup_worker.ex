@@ -28,16 +28,27 @@ defmodule Loopctl.Workers.PendingEnrollmentCleanupWorker do
       DateTime.utc_now()
       |> DateTime.add(-Tenants.pending_enrollment_ttl_seconds(), :second)
 
-    {deleted_count, _} =
+    # Fetch the abandoned tenants first so we can log their IDs,
+    # then delete. SELECT + DELETE is safe here because no other
+    # process transitions tenants OUT of :pending_enrollment except
+    # the signup Multi (which sets :active atomically).
+    abandoned =
       from(t in Tenant,
         where: t.status == :pending_enrollment,
-        where: t.inserted_at < ^cutoff
+        where: t.inserted_at < ^cutoff,
+        select: %{id: t.id, slug: t.slug, inserted_at: t.inserted_at}
       )
-      |> AdminRepo.delete_all()
+      |> AdminRepo.all()
 
-    if deleted_count > 0 do
-      Logger.info(
-        "PendingEnrollmentCleanupWorker deleted #{deleted_count} abandoned signup tenants"
+    if abandoned != [] do
+      ids = Enum.map(abandoned, & &1.id)
+
+      {deleted_count, _} =
+        from(t in Tenant, where: t.id in ^ids)
+        |> AdminRepo.delete_all()
+
+      Logger.warning(
+        "PendingEnrollmentCleanupWorker deleted #{deleted_count} abandoned signup tenants: #{inspect(ids)}"
       )
     end
 

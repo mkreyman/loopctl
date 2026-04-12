@@ -63,9 +63,9 @@ defmodule LoopctlWeb.PageHTML do
   """
 
   @step1_code ~S"""
-  <pre>curl -X POST https://loopctl.com/api/v1/tenants/register \
-  -H "Content-Type: application/json" \
-  -d '{"name": "My Company", "slug": "my-company", "email": "dev@example.com"}'</pre>
+  <pre># Visit https://loopctl.com/signup to create your tenant.
+  # Signup requires a hardware authenticator (YubiKey, Touch ID,
+  # or Windows Hello) — no API-based registration.</pre>
   """
 
   @step2_code ~S"""

@@ -8,14 +8,6 @@ defmodule Loopctl.CLI.Commands.TenantsTest do
   setup do
     Req.Test.stub(Loopctl.CLI.Client, fn conn ->
       case {conn.method, conn.request_path} do
-        {"POST", "/api/v1/tenants/register"} ->
-          conn = Plug.Conn.put_status(conn, 201)
-
-          Req.Test.json(conn, %{
-            "tenant" => %{"id" => "t-1", "name" => "New Tenant", "slug" => "new-tenant"},
-            "api_key" => "lc_newkey123"
-          })
-
         {"GET", "/api/v1/tenants/me"} ->
           Req.Test.json(conn, %{
             "tenant" => %{
@@ -45,9 +37,9 @@ defmodule Loopctl.CLI.Commands.TenantsTest do
   end
 
   describe "tenant register" do
-    test "registers a tenant with name and email" do
+    test "outputs web signup message instead of calling API" do
       output =
-        capture_io(fn ->
+        capture_io(:stderr, fn ->
           Tenants.run(
             "tenant",
             ["register", "--name", "New Tenant", "--email", "new@example.com"],
@@ -55,16 +47,8 @@ defmodule Loopctl.CLI.Commands.TenantsTest do
           )
         end)
 
-      assert output =~ "New Tenant"
-    end
-
-    test "requires --name and --email" do
-      output =
-        capture_io(:stderr, fn ->
-          Tenants.run("tenant", ["register", "--name", "Only Name"], [])
-        end)
-
-      assert output =~ "Usage:"
+      assert output =~ "WebAuthn enrollment"
+      assert output =~ "/signup"
     end
   end
 

@@ -44,25 +44,34 @@ defmodule LoopctlWeb.TenantOnboardingLive do
   ]
 
   @impl true
-  def mount(%{"id" => tenant_id}, _session, socket) do
-    case Tenants.get_tenant(tenant_id) do
-      {:ok, tenant} ->
-        completed = completed_steps(tenant)
+  def mount(%{"id" => tenant_id} = params, _session, socket) do
+    token = Map.get(params, "token", "")
 
-        {:ok,
-         socket
-         |> assign(:page_title, "Welcome to loopctl")
-         |> assign(:tenant, tenant)
-         |> assign(:steps, @steps)
-         |> assign(:completed, completed)}
+    # Verify the signed token from the signup redirect (valid for 15 min).
+    case Phoenix.Token.verify(LoopctlWeb.Endpoint, "onboarding", token, max_age: 900) do
+      {:ok, ^tenant_id} ->
+        case Tenants.get_tenant(tenant_id) do
+          {:ok, tenant} ->
+            completed = completed_steps(tenant)
 
-      {:error, :not_found} ->
+            {:ok,
+             socket
+             |> assign(:page_title, "Welcome to loopctl")
+             |> assign(:tenant, tenant)
+             |> assign(:steps, @steps)
+             |> assign(:completed, completed)}
+
+          {:error, :not_found} ->
+            {:ok, push_navigate(socket, to: ~p"/")}
+        end
+
+      _ ->
         {:ok, push_navigate(socket, to: ~p"/")}
     end
   end
 
   defp completed_steps(tenant) do
-    tenant.settings
+    (tenant.settings || %{})
     |> Map.get("onboarding", %{})
     |> Map.get("completed", [])
     |> MapSet.new()

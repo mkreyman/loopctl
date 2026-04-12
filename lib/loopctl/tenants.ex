@@ -410,6 +410,8 @@ defmodule Loopctl.Tenants do
         select: %{
           total: count(t.id),
           active: count(fragment("CASE WHEN ? = 'active' THEN 1 END", t.status)),
+          pending_enrollment:
+            count(fragment("CASE WHEN ? = 'pending_enrollment' THEN 1 END", t.status)),
           suspended: count(fragment("CASE WHEN ? = 'suspended' THEN 1 END", t.status)),
           deactivated: count(fragment("CASE WHEN ? = 'deactivated' THEN 1 END", t.status))
         }

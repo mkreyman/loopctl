@@ -239,9 +239,10 @@ defmodule LoopctlWeb.SignupLiveTest do
   end
 
   describe "/tenants/:id/onboarding" do
-    test "renders onboarding checklist for a valid tenant", %{conn: conn} do
+    test "renders onboarding checklist with a valid signed token", %{conn: conn} do
       tenant = fixture(:tenant, %{name: "Onboarding Target"})
-      {:ok, _view, html} = live(conn, ~p"/tenants/#{tenant.id}/onboarding")
+      token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
+      {:ok, _view, html} = live(conn, ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")
 
       assert html =~ "Onboarding Target"
       assert html =~ "Generate audit signing key"
@@ -249,11 +250,35 @@ defmodule LoopctlWeb.SignupLiveTest do
       assert html =~ "Register your first agent"
     end
 
-    test "redirects when tenant not found", %{conn: conn} do
-      missing_id = Ecto.UUID.generate()
+    test "redirects when token is missing", %{conn: conn} do
+      tenant = fixture(:tenant, %{name: "Token Test"})
 
       assert {:error, {:live_redirect, %{to: "/"}}} =
-               live(conn, ~p"/tenants/#{missing_id}/onboarding")
+               live(conn, ~p"/tenants/#{tenant.id}/onboarding")
+    end
+
+    test "redirects when token is invalid", %{conn: conn} do
+      tenant = fixture(:tenant, %{name: "Bad Token"})
+
+      assert {:error, {:live_redirect, %{to: "/"}}} =
+               live(conn, ~p"/tenants/#{tenant.id}/onboarding?token=bogus")
+    end
+
+    test "redirects when token belongs to a different tenant", %{conn: conn} do
+      tenant = fixture(:tenant, %{name: "Real Tenant"})
+      other = fixture(:tenant, %{name: "Other Tenant"})
+      token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", other.id)
+
+      assert {:error, {:live_redirect, %{to: "/"}}} =
+               live(conn, ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")
+    end
+
+    test "redirects when tenant not found", %{conn: conn} do
+      missing_id = Ecto.UUID.generate()
+      token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", missing_id)
+
+      assert {:error, {:live_redirect, %{to: "/"}}} =
+               live(conn, ~p"/tenants/#{missing_id}/onboarding?token=#{token}")
     end
   end
 end

@@ -66,7 +66,7 @@ defmodule Loopctl.WebAuthn.Wax do
   end
 
   defp normalize_opts(opts) do
-    defaults = Application.get_env(:loopctl, :webauthn_defaults, [])
+    defaults = Application.get_env(:loopctl, :webauthn, [])
     Keyword.merge(defaults, opts)
   end
 

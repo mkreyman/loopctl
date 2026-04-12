@@ -31,21 +31,46 @@ defmodule LoopctlWeb.SignupLive do
 
   @learn_more_url "https://loopctl.com/wiki/tenant-signup"
 
+  @max_signups_per_ip 5
+  @rate_window_ms 60_000 * 60
+
   @impl true
   def mount(_params, _session, socket) do
-    challenge = new_challenge()
+    ip = peer_ip(socket)
 
-    {:ok,
-     socket
-     |> assign(:page_title, "Sign up a new tenant")
-     |> assign(:form, to_form(%{"name" => "", "slug" => "", "email" => ""}, as: :tenant))
-     |> assign(:authenticators, [])
-     |> assign(:max_authenticators, Tenants.max_authenticators_per_signup())
-     |> assign(:challenge, challenge)
-     |> assign(:challenge_payload, encode_challenge(challenge))
-     |> assign(:learn_more_url, @learn_more_url)
-     |> assign(:friendly_name_draft, "")
-     |> assign(:error, nil)}
+    case rate_limiter().check_rate("signup:#{ip}", @rate_window_ms, @max_signups_per_ip) do
+      {:deny, _limit} ->
+        {:ok,
+         socket
+         |> put_flash(:error, "Too many signup attempts. Please try again later.")
+         |> push_navigate(to: ~p"/")}
+
+      {:allow, _count} ->
+        challenge = new_challenge()
+
+        {:ok,
+         socket
+         |> assign(:page_title, "Sign up a new tenant")
+         |> assign(:form, to_form(%{"name" => "", "slug" => "", "email" => ""}, as: :tenant))
+         |> assign(:authenticators, [])
+         |> assign(:max_authenticators, Tenants.max_authenticators_per_signup())
+         |> assign(:challenge, challenge)
+         |> assign(:challenge_payload, encode_challenge(challenge))
+         |> assign(:learn_more_url, @learn_more_url)
+         |> assign(:friendly_name_draft, "")
+         |> assign(:error, nil)}
+    end
+  end
+
+  defp peer_ip(socket) do
+    case Phoenix.LiveView.get_connect_info(socket, :peer_data) do
+      %{address: addr} -> addr |> :inet.ntoa() |> to_string()
+      _ -> "unknown"
+    end
+  end
+
+  defp rate_limiter do
+    Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
   @impl true
@@ -152,7 +177,8 @@ defmodule LoopctlWeb.SignupLive do
           "The browser returned no credential — please try again"
 
         _ ->
-          "Authenticator ceremony failed (#{reason}). Please retry."
+          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason)}")
+          "Authenticator ceremony failed. Please retry."
       end
 
     {:noreply, assign(socket, :error, message)}
@@ -178,10 +204,12 @@ defmodule LoopctlWeb.SignupLive do
 
         case Tenants.signup(attrs) do
           {:ok, %{tenant: tenant}} ->
+            token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
+
             {:noreply,
              socket
              |> put_flash(:info, "Tenant signup complete — welcome to loopctl")
-             |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding")}
+             |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")}
 
           {:error, :slug_taken} ->
             {:noreply,
