@@ -1,0 +1,218 @@
+{
+  "id": "US-26.0.1",
+  "title": "Tenant Signup Ceremony with WebAuthn Enrollment",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "tenant_signup",
+  "story": {
+    "as_a": "human operator establishing a new loopctl tenant",
+    "i_want_to": "enroll a hardware authenticator (YubiKey, Touch ID, Windows Hello, or any FIDO2 device) as the root of trust for my tenant during signup",
+    "so_that": "the tenant's entire chain of custody traces back to a physical touch only I can perform, and no agent in the system can ever impersonate my root authority"
+  },
+  "rationale": "Every tenant in loopctl needs a human root of trust that agents cannot forge. WebAuthn is the only widely-deployed standard that binds a signing operation to a physical device hold, and FIDO2 hardware authenticators (or platform authenticators like Touch ID / Windows Hello) are unforgeable by software. By requiring enrollment at tenant creation time and making it the gate for all subsequent destructive operations, we establish a Layer 0 anchor (per the chain-of-custody v2 spec) that the rest of the trust model hangs from. Without this ceremony, every other invariant in Chain of Custody v2 degrades to policy-level enforcement that a creative adversary can reach around.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.1.1",
+      "description": "A new LiveView at `/signup` collects tenant metadata (name, slug, contact_email) and initiates a WebAuthn registration ceremony via the browser's `navigator.credentials.create()` API. The ceremony uses platform-agnostic relying party ID `loopctl.com` and accepts both cross-platform (YubiKey, etc) and platform (Touch ID, Windows Hello) authenticators.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.2",
+      "description": "Migration adds a `tenants.root_authenticators` table with columns: id (uuid PK), tenant_id (uuid FK), credential_id (bytea, the FIDO2 credential ID), public_key (bytea, COSE-encoded), attestation_format (string), sign_count (integer), friendly_name (string), inserted_at, last_used_at. Unique index on (tenant_id, credential_id). One-to-many relationship supports multiple backup authenticators per tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.3",
+      "description": "Server-side WebAuthn verification uses a dedicated Elixir library (Wax or equivalent) to verify the FIDO2 attestation statement. The public key, attestation format, and sign counter are extracted and stored in `root_authenticators`. Invalid attestations return 422 with `error.reason: invalid_attestation` and a link to `https://loopctl.com/wiki/tenant-signup`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.4",
+      "description": "A tenant record is created in the database ONLY after the WebAuthn enrollment succeeds. The `tenants.status` field is `:pending_enrollment` until enrollment completes, then `:active`. A tenant stuck in `:pending_enrollment` for more than 15 minutes is cleaned up by an Oban job.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.5",
+      "description": "Duplicate slug or email returns 422 with a stable error code (`slug_taken` or `email_taken`) and a remediation URL. Slugs are normalized to lowercase kebab-case with a length limit of 64 characters and a regex of `^[a-z0-9][a-z0-9-]*[a-z0-9]$`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.6",
+      "description": "The signup flow supports multiple authenticator types in a single ceremony: the operator can enroll a primary YubiKey AND a backup platform authenticator in the same session, both recorded in `root_authenticators`. Minimum one authenticator is required to complete signup; up to 5 can be enrolled in the initial ceremony.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.7",
+      "description": "Tenant signup is the ONLY path to create a tenant. There is no admin endpoint to create tenants without WebAuthn, no password fallback, no email magic link, no OAuth, no invitation token. Attempting to create a tenant via any other path returns 403 or 404 as appropriate.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.8",
+      "description": "The signup LiveView follows `docs/design-system.md`: dark mode, Geist typography, slate palette, cool blue-gray accent, rounded-md cards, no rounded-xl, no gradients, no warm grays. Error states use hand-written Tailwind (no daisyUI). The hardware-key prompt uses Phoenix.Component `<.icon name=\"hero-key\" />` styling.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.9",
+      "description": "After successful enrollment, the operator is redirected to `/tenants/:id/onboarding` (a subsequent LiveView) that guides them through the next steps: audit key generation (US-26.0.2), system article tour, first project creation, first agent registration. Each step is marked complete as the operator performs it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.10",
+      "description": "OpenAPI spec updates: new schemas for `TenantSignupRequest`, `WebAuthnChallenge`, `WebAuthnAttestation`, `TenantResponse`. New operation specs on the signup LiveView-backed routes. Swagger UI at `/api/docs` reflects the new schemas.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.11",
+      "description": "A system-scoped wiki article at slug `tenant-signup` is created (content authored in US-26.0.5) and the signup LiveView includes a `learn_more` link pointing at it. The article slug is reserved in this story even if the full content ships in US-26.0.5.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.1.12",
+      "description": "CHANGELOG entry added under an `[Unreleased]` section describing the new signup flow, the WebAuthn requirement, and the deprecation of any previous tenant creation path. CLAUDE.md's Security & Trust Model section gains a brief note pointing at `docs/chain-of-custody-v2.md` as the spec.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.1.1",
+      "name": "Successful tenant signup with a FIDO2 attestation creates tenant, authenticator record, and active status",
+      "type": "integration",
+      "preconditions": [
+        "No tenant with slug `test-signup` exists",
+        "Stub WebAuthn library returns a valid attestation for a test credential"
+      ],
+      "steps": [
+        "POST /signup with name, slug, email, and a stub WebAuthn attestation response",
+        "Query tenants table and root_authenticators table"
+      ],
+      "expected_results": [
+        "Response is 200 with the new tenant ID and redirect to /tenants/:id/onboarding",
+        "tenants row exists with status = active",
+        "root_authenticators row exists with the correct credential_id and public_key",
+        "tenants.inserted_at is within the last 60 seconds"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.2",
+      "name": "Invalid WebAuthn attestation rejects signup and creates no tenant record",
+      "type": "integration",
+      "preconditions": [
+        "Stub WebAuthn library returns invalid_attestation"
+      ],
+      "steps": [
+        "POST /signup with a malformed attestation"
+      ],
+      "expected_results": [
+        "Response is 422 with error.reason = invalid_attestation",
+        "No tenant row is created",
+        "No root_authenticators row is created",
+        "Response body includes remediation.learn_more URL"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.3",
+      "name": "Duplicate slug returns 422 with stable error code",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant, slug: \"taken\")"
+      ],
+      "steps": [
+        "POST /signup with slug `taken`"
+      ],
+      "expected_results": [
+        "Response is 422 with error.code = slug_taken",
+        "No new tenant is created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.4",
+      "name": "Multiple authenticators can be enrolled in a single signup ceremony",
+      "type": "integration",
+      "preconditions": [
+        "Stub returns valid attestations for two distinct credentials"
+      ],
+      "steps": [
+        "POST /signup with two attestation responses in sequence"
+      ],
+      "expected_results": [
+        "Tenant created",
+        "root_authenticators has 2 rows, both tied to the new tenant_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.5",
+      "name": "Pending enrollment tenant is cleaned up after 15 minutes",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant, status: :pending_enrollment, inserted_at: 16 minutes ago)",
+        "Run Loopctl.Workers.PendingEnrollmentCleanupWorker"
+      ],
+      "steps": [
+        "Perform the worker job"
+      ],
+      "expected_results": [
+        "The pending tenant is deleted",
+        "Any associated root_authenticators rows (there should be none) are also gone"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.6",
+      "name": "Tenant creation via any path other than /signup is rejected",
+      "type": "integration",
+      "preconditions": [
+        "No tenants exist"
+      ],
+      "steps": [
+        "POST /api/v1/tenants with metadata",
+        "POST /api/v1/admin/tenants with metadata"
+      ],
+      "expected_results": [
+        "Both requests return 404 or 403",
+        "No tenant is created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.1.7",
+      "name": "Signup LiveView renders with correct design-system classes",
+      "type": "integration",
+      "preconditions": [
+        "Conn is unauthenticated"
+      ],
+      "steps": [
+        "GET /signup"
+      ],
+      "expected_results": [
+        "Response HTML includes the expected form elements",
+        "CSS classes include slate-*, rounded-md, and Geist font references",
+        "No daisyUI classes (card, btn-primary, alert) in the output",
+        "No rounded-xl, no gradient-* classes"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "WebAuthn library: use Wax (https://github.com/tanguilp/wax) or equivalent FIDO2-verified Elixir package. Verify attestation type and format at enrollment time.",
+    "Relying party ID (rp_id): `loopctl.com` for production. `localhost` for dev. Configure per-env in config/*.exs.",
+    "Credential public key format: COSE-encoded, stored as bytea. Verification on subsequent authentications uses the same COSE key.",
+    "Sign count: stored for clone detection. Every subsequent WebAuthn assertion verification must check the sign count increases (or stays 0 for authenticators that don't implement it).",
+    "LiveView file: lib/loopctl_web/live/signup_live.ex — route configured in the existing public live_session with on_mount fetch_current_scope.",
+    "Client-side JS: a small hook in assets/js/hooks/webauthn.js wraps navigator.credentials.create() and posts the response back via LiveView push_event.",
+    "The signup form fields are built with Phoenix.Component.to_form/2 and <.input> from core_components.",
+    "Testing WebAuthn: use Wax.test_helpers or mock the library at the behaviour level per loopctl's DI convention (config/test.exs sets :loopctl, :webauthn_adapter).",
+    "Pending enrollment cleanup worker: lib/loopctl/workers/pending_enrollment_cleanup_worker.ex with Oban Cron schedule {\"*/5 * * * *\", PendingEnrollmentCleanupWorker}.",
+    "The /signup route is added to the public live_session (the :current_user or :guest scope depending on existing naming).",
+    "Tenant creation must remain atomic: the tenant, the root_authenticators row, and the initial audit_chain genesis entry all in a single Ecto.Multi.",
+    "Reference: docs/chain-of-custody-v2.md section 9 for the full signup ceremony spec."
+  ],
+  "dependencies": [],
+  "estimated_hours": 16
+}

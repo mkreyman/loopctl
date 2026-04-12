@@ -1,0 +1,204 @@
+{
+  "id": "US-26.0.5",
+  "title": "System Wiki Articles — Agent Bootstrap Set",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "self_discovery",
+  "story": {
+    "as_a": "new agent or integration developer who has just fetched the discovery endpoint",
+    "i_want_to": "read the canonical articles that explain how loopctl's trust model works at a conceptual level, how agents participate in it, what happens at tenant signup, and what the minimum viable bootstrap flow looks like",
+    "so_that": "I can understand the system without reading source code, follow a worked example from first contact to verified work, and recover from trust-model errors with actionable instructions"
+  },
+  "rationale": "The discovery endpoint (US-26.0.4) and every trust-model error response links to system articles that MUST exist with real, accurate content. Empty stubs or placeholder articles would break the self-discovery contract and leave agents stuck. This story authors the foundational article set that bootstraps a new agent into the platform. The articles are long-lived authoritative references — they describe stable concepts (trust model overview, agent lifecycle, signup flow) that don't change per release. Subsequent docs-content stories (US-26.3.3, US-26.4.5) cover phase-specific articles.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.5.1",
+      "description": "System article at slug `chain-of-custody` exists with scope `:system`. Content: 1500-3000 words explaining the trust model at a conceptual level (the two threat profiles, the six-layer enforcement stack, the rationale behind structural-over-policy enforcement). Includes at least one diagram rendered as ASCII or via a simple SVG embedded in markdown. Links to all other articles in this set.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.2",
+      "description": "System article at slug `agent-bootstrap` exists. Content: a step-by-step walkthrough for a brand-new agent from first contact (fetching /.well-known/loopctl) to the first successful API call (listing ready stories). Includes an actual curl-based worked example with placeholder UUIDs and a commentary on what each step does and why. This is the article the discovery endpoint points at as `discovery_bootstrap_url`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.3",
+      "description": "System article at slug `agent-pattern` exists. Content: describes the expected agent lifecycle (discover → dispatch → claim → work → report → wait → learn from re-review if rejected). Includes diagrams of the state machine, example MCP tool calls for each transition, and pointers to the specific articles that explain each step's trust-model requirements.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.4",
+      "description": "System article at slug `tenant-signup` exists. Content: explains the human-operator signup ceremony, WebAuthn requirements, what happens when you enroll an authenticator, how to add backup authenticators, how the audit-signing keypair is generated and stored, and how tenant recovery works if all authenticators are lost. Written for a human operator, not an agent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.5",
+      "description": "System article at slug `discovery` exists. Content: the .well-known/loopctl contract — the response schema, how URL fields are stable across deployments, how to use the document to construct subsequent URLs, how to cache it, and what changes when `spec_version` bumps.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.6",
+      "description": "Every article in this set is tagged with categories drawn from the existing knowledge wiki taxonomy (pattern, convention, decision, finding, reference). These articles are all `reference` category.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.7",
+      "description": "Articles cross-link using stable slug URLs like `/wiki/agent-bootstrap`. No broken internal links (verified by the link-checker from US-26.0.3). External links use full `https://` URLs to spec documents (RFCs, WebAuthn spec) and are validated to return 200 at article publish time.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.8",
+      "description": "Articles are authored in Markdown and stored as seed data in a migration (`priv/repo/migrations/<ts>_seed_epic_26_phase_0_articles.exs`). The seed uses the system-scope article path (US-26.0.3). Re-running the migration is idempotent (UPSERT on slug).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.9",
+      "description": "Each article includes a `last_updated` field in its frontmatter pointing at the epic/phase that authored it (`epic_26_phase_0`). Later updates bump this field and reference the updating story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.10",
+      "description": "Articles include at least one worked example using realistic placeholder data (fake UUIDs, fake tenant slugs). Examples are tagged with the `phx-no-curly-interpolation` attribute where they contain literal `{` or `}` in JSON/HEEx snippets.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.5.11",
+      "description": "A CI-level check verifies that every error response in the API with a `learn_more` URL actually resolves to a real article (either from this story or a stub slug reserved by a previous story). The check runs as part of `mix precommit`.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.5.1",
+      "name": "All five articles exist after the seed migration runs",
+      "type": "integration",
+      "preconditions": [
+        "Fresh database",
+        "Migration has run"
+      ],
+      "steps": [
+        "Query articles table for scope = system",
+        "Check for each of the 5 slugs"
+      ],
+      "expected_results": [
+        "5 system articles exist with slugs: chain-of-custody, agent-bootstrap, agent-pattern, tenant-signup, discovery",
+        "Each has body length > 1000 characters",
+        "Each has category set"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.5.2",
+      "name": "Articles render at /wiki/:slug without errors",
+      "type": "integration",
+      "preconditions": [
+        "Articles are seeded"
+      ],
+      "steps": [
+        "GET /wiki/chain-of-custody",
+        "GET /wiki/agent-bootstrap",
+        "GET /wiki/agent-pattern",
+        "GET /wiki/tenant-signup",
+        "GET /wiki/discovery"
+      ],
+      "expected_results": [
+        "All 5 requests return 200",
+        "Each response body is valid HTML with rendered markdown content",
+        "No broken internal link warnings in any response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.5.3",
+      "name": "Cross-links between articles resolve correctly",
+      "type": "integration",
+      "preconditions": [
+        "Articles are seeded"
+      ],
+      "steps": [
+        "GET /wiki/chain-of-custody",
+        "Parse the HTML for internal links",
+        "For each internal link, GET it"
+      ],
+      "expected_results": [
+        "Every /wiki/:slug link points at a real article",
+        "Every such GET returns 200"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.5.4",
+      "name": "Bootstrap walkthrough is reproducible end-to-end",
+      "type": "integration",
+      "preconditions": [
+        "Articles are seeded",
+        "api_key = fixture(:api_key, role: :agent)"
+      ],
+      "steps": [
+        "Fetch /.well-known/loopctl",
+        "Follow discovery_bootstrap_url",
+        "Parse the article body for curl examples",
+        "Execute the first curl example with a real api_key (substituting placeholders)"
+      ],
+      "expected_results": [
+        "Discovery response is 200",
+        "Article content is retrieved",
+        "The curl example executes successfully with a real response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.5.5",
+      "name": "Seed migration is idempotent",
+      "type": "integration",
+      "preconditions": [
+        "Articles are already seeded"
+      ],
+      "steps": [
+        "Re-run the seed migration",
+        "Query article count"
+      ],
+      "expected_results": [
+        "Article count is still 5 (no duplicates)",
+        "Article bodies are unchanged or updated if the migration body was updated"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.5.6",
+      "name": "Link-check test flags broken internal links",
+      "type": "unit",
+      "preconditions": [
+        "Test inserts a system article with a broken /wiki/:slug link"
+      ],
+      "steps": [
+        "Run the link-check script"
+      ],
+      "expected_results": [
+        "Script exits non-zero",
+        "Output includes the broken slug and the article that references it"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Writing Markdown articles is a significant part of this story — estimate at least 8 hours of research and drafting for the five articles together. Prioritize clarity and accuracy over prose polish.",
+    "Author articles as Elixir heredoc strings in the seed migration file: `@chain_of_custody_body \"\"\"\\n# Chain of Custody\\n...\\n\"\"\"`. Heredocs preserve Markdown formatting.",
+    "Category mapping: all 5 articles are category `reference` (stable authoritative content). In the future, pattern/decision/finding categories may be used for other article types.",
+    "Seed migration uses `repo.insert!/1` with ON CONFLICT (slug) UPDATE for idempotency. Use the existing Article context function if available.",
+    "The link-check script is a Mix task `mix loopctl.check_wiki_links` that crawls all system articles, extracts `/wiki/:slug` references, and verifies each slug exists. Exits 0 on success, non-zero on failure.",
+    "Hook the link-check into `mix precommit` by adding it to the precommit alias in mix.exs.",
+    "For the worked examples, use these placeholder UUIDs: tenant_id = `00000000-0000-0000-0000-000000000001`, agent_id = `00000000-0000-0000-0000-000000000002`, story_id = `00000000-0000-0000-0000-000000000003`. Mark them clearly as placeholders in the prose.",
+    "Diagrams: ASCII art is fine. For more complex diagrams, use inline SVG embedded in Markdown (Earmark passes through HTML). Keep diagrams simple — avoid Mermaid or other live-rendering deps.",
+    "Each article's body starts with a one-paragraph summary that serves as the search snippet, followed by a full section breakdown.",
+    "The five articles cross-reference each other via `/wiki/:slug` relative URLs. Do NOT use absolute URLs (https://loopctl.com/wiki/...) internally — keep them relative so dev/test environments work too.",
+    "Reference: docs/chain-of-custody-v2.md for all technical content. The articles are user-facing rewrites of sections from the design doc."
+  ],
+  "dependencies": [
+    "US-26.0.3"
+  ],
+  "estimated_hours": 8
+}

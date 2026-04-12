@@ -1,0 +1,190 @@
+{
+  "id": "US-26.0.4",
+  "title": "Discovery Endpoint at .well-known/loopctl",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "self_discovery",
+  "story": {
+    "as_a": "new agent or integration developer pointed at a loopctl deployment",
+    "i_want_to": "fetch a single well-known URL that tells me what version of the protocol this deployment speaks, where the MCP server lives, where to find the system articles, and what the trust model requires of me",
+    "so_that": "I can bootstrap myself into productive work without reading the source code, without asking a human, and without depending on documentation that might be out of date"
+  },
+  "rationale": "RFC 8615 defines a standard location (/.well-known/) for service discovery metadata that clients expect to find without prior configuration. Loopctl's self-organizing design (section 8 of chain-of-custody-v2.md) needs exactly this: a single public URL that an agent can query to learn everything required to participate in the chain of custody. Without this endpoint, agents would need out-of-band knowledge to find the MCP server, the system articles, and the spec version — creating a documentation-dependency loop that defeats self-discovery. This story ships a minimal but complete discovery document.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.0.4.1",
+      "description": "`GET /.well-known/loopctl` returns a JSON document with content-type `application/json`. No authentication required. The endpoint is served by the public Phoenix router (not under `/api/v1/` to match RFC 8615 conventions).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.2",
+      "description": "Response body includes these top-level fields: `spec_version` (string, currently \"2\"), `mcp_server` (object with `name`, `npm_version`, `repository_url`), `audit_signing_key_url` (URI template string with `{tenant_id}`), `capability_scheme_url`, `chain_of_custody_spec_url`, `discovery_bootstrap_url`, `required_agent_pattern_url`, `system_articles_endpoint`, `contact`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.3",
+      "description": "All URL fields point at stable resources: `chain_of_custody_spec_url` points at `https://loopctl.com/wiki/chain-of-custody`, `capability_scheme_url` at `https://loopctl.com/wiki/capability-tokens`, `discovery_bootstrap_url` at `https://loopctl.com/wiki/agent-bootstrap`, `required_agent_pattern_url` at `https://loopctl.com/wiki/agent-pattern`. URLs are hardcoded in the response handler, not derived from the request host, so they remain stable across deployments.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.4",
+      "description": "`mcp_server.name` is `\"loopctl-mcp-server\"`. `mcp_server.npm_version` reads from `mcp-server/package.json` at build time via a compile-time read (so the response reflects the version that shipped with the deployment). `mcp_server.repository_url` is `\"https://github.com/mkreyman/loopctl/tree/master/mcp-server\"`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.5",
+      "description": "Response includes a `Cache-Control: public, max-age=3600` header so agents can cache the document for an hour without hammering loopctl. A weak `ETag` header allows conditional GET.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.6",
+      "description": "The response schema is documented in the OpenAPI spec as `DiscoveryResponse`. The schema is also available machine-readably at `GET /.well-known/loopctl/schema.json` for clients that want to validate.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.7",
+      "description": "The endpoint returns the same response regardless of authentication — it does NOT leak tenant-specific information. Multi-tenant agents use the `{tenant_id}` template in `audit_signing_key_url` to construct their own URLs after they know their tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.8",
+      "description": "A system article at slug `discovery` documents the endpoint, its response schema, and a worked example of an agent bootstrapping from first contact to successful API use. The article slug is reserved in this story; full content is written in US-26.0.5.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.0.4.9",
+      "description": "An integration test walks a simulated naive agent through: (1) fetch /.well-known/loopctl, (2) fetch the discovery_bootstrap_url, (3) read the content, (4) make the next API call described in the article. The test asserts that the full chain works end-to-end with no prior knowledge baked in.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.0.4.1",
+      "name": "Well-known endpoint returns the expected JSON shape",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl (no auth)"
+      ],
+      "expected_results": [
+        "Response is 200 with content-type application/json",
+        "Body has fields spec_version, mcp_server, audit_signing_key_url, capability_scheme_url, chain_of_custody_spec_url, discovery_bootstrap_url, required_agent_pattern_url, system_articles_endpoint, contact",
+        "mcp_server.name is loopctl-mcp-server",
+        "mcp_server.npm_version matches the current mcp-server/package.json version",
+        "spec_version is the string \"2\""
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.4.2",
+      "name": "Response includes Cache-Control and ETag headers",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl",
+        "Re-fetch with If-None-Match using the returned ETag"
+      ],
+      "expected_results": [
+        "First response has Cache-Control: public, max-age=3600",
+        "First response has a weak ETag header",
+        "Second response is 304 Not Modified"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.4.3",
+      "name": "URL fields are stable regardless of request host",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running on localhost but configured for production URL generation"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl with Host: localhost:4000"
+      ],
+      "expected_results": [
+        "chain_of_custody_spec_url is https://loopctl.com/wiki/chain-of-custody (not localhost)",
+        "capability_scheme_url is https://loopctl.com/wiki/capability-tokens",
+        "All URL fields use https://loopctl.com as the base"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.4.4",
+      "name": "Schema endpoint returns valid JSON schema",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl/schema.json"
+      ],
+      "expected_results": [
+        "Response is 200 with content-type application/schema+json",
+        "Body is a valid JSON schema conforming to draft 2020-12"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.4.5",
+      "name": "Bootstrap walk: naive agent uses the endpoint to reach a successful API call",
+      "type": "integration",
+      "preconditions": [
+        "Phoenix server running",
+        "agent-bootstrap system article exists with instructions",
+        "api_key = fixture(:api_key, role: :agent)"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl (no auth)",
+        "Extract discovery_bootstrap_url from the response",
+        "GET that URL (parses the system article body)",
+        "Follow the article's example: GET /api/v1/projects with the api_key"
+      ],
+      "expected_results": [
+        "Discovery returns 200",
+        "Article fetch returns 200 with content",
+        "Projects list returns 200",
+        "No prior hardcoded knowledge about loopctl was needed beyond the .well-known URL and the api_key"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.0.4.6",
+      "name": "Response does not leak tenant-specific information",
+      "type": "integration",
+      "preconditions": [
+        "Multiple tenants exist"
+      ],
+      "steps": [
+        "GET /.well-known/loopctl"
+      ],
+      "expected_results": [
+        "Response does NOT include tenant count, tenant names, or any tenant-scoped data",
+        "The audit_signing_key_url is a template with {tenant_id} placeholder, not a specific URL"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Route definition: `get \"/.well-known/loopctl\", WellKnownController, :discovery` in the public router scope.",
+    "Controller: `LoopctlWeb.WellKnownController` (new module).",
+    "Version reading: use `Application.spec(:loopctl_mcp_server, :vsn)` at compile time, OR read mcp-server/package.json at compile time via `@external_resource` + `File.read!/1` + `Jason.decode!/1`. The second approach is required because the MCP server isn't an Elixir app. Cache at compile time so the version is baked into the beam.",
+    "Cache-Control: set via Phoenix's `put_resp_header/3`.",
+    "ETag: generate deterministically from the response body (sha256 hash, first 16 hex chars). Weak ETag because the response may vary slightly (e.g., formatting).",
+    "The schema endpoint is a static JSON file at priv/static/.well-known/loopctl/schema.json, served by Phoenix.Plug.Static or similar. Generated from the OpenAPI spec at build time OR hand-written and kept in sync via tests.",
+    "OpenAPI integration: add DiscoveryResponse schema to lib/loopctl/api_spec/schemas.ex. Add operation spec for the controller action.",
+    "The stable hardcoded URLs (https://loopctl.com/wiki/...) are configured in config/config.exs as a module attribute or application env so they can be overridden for dev/test.",
+    "Reference: docs/chain-of-custody-v2.md section 8.1 for the full discovery endpoint spec.",
+    "RFC 8615 for the /.well-known/ URI suffix convention."
+  ],
+  "dependencies": [
+    "US-26.0.3"
+  ],
+  "estimated_hours": 4
+}
