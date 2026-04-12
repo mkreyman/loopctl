@@ -85,13 +85,12 @@ defmodule Mix.Tasks.Loopctl.Audit.DiscoverViolators do
     now = DateTime.utc_now()
 
     for row <- rows do
-      %PendingViolation{}
+      %PendingViolation{tenant_id: Map.get(row, :tenant_id)}
       |> PendingViolation.changeset(%{
-        tenant_id: Map.get(row, :tenant_id),
         violation_type: violation_type,
         entity_type: entity_type,
         entity_id: Map.get(row, :id) || Map.get(row, :agent_id),
-        detail: Map.from_struct(row),
+        detail: row,
         discovered_at: now
       })
       |> AdminRepo.insert!(

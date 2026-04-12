@@ -38,7 +38,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   rescue
     error ->
       Logger.error("VerificationRunner: run #{run.id} failed: #{inspect(error)}")
-      {:ok, _} = Verification.complete_run(run, "error", %{"error" => inspect(error)})
-      :ok
+      Verification.complete_run(run, "error", %{"error" => Exception.message(error)})
+      # Return error to allow Oban retries
+      {:error, Exception.message(error)}
   end
 end

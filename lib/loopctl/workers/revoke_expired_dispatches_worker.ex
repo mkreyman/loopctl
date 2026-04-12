@@ -30,18 +30,19 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
       dispatch_ids = Enum.map(expired, & &1.id)
       key_ids = expired |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1)
 
-      # Revoke dispatches
-      {d_count, _} =
-        from(d in Dispatch, where: d.id in ^dispatch_ids)
-        |> AdminRepo.update_all(set: [revoked_at: now])
+      # Revoke dispatches and keys atomically in a single transaction
+      AdminRepo.transaction(fn ->
+        {d_count, _} =
+          from(d in Dispatch, where: d.id in ^dispatch_ids)
+          |> AdminRepo.update_all(set: [revoked_at: now])
 
-      # Revoke associated api_keys
-      if key_ids != [] do
-        from(k in ApiKey, where: k.id in ^key_ids and is_nil(k.revoked_at))
-        |> AdminRepo.update_all(set: [revoked_at: now])
-      end
+        if key_ids != [] do
+          from(k in ApiKey, where: k.id in ^key_ids and is_nil(k.revoked_at))
+          |> AdminRepo.update_all(set: [revoked_at: now])
+        end
 
-      Logger.info("RevokeExpiredDispatchesWorker: revoked #{d_count} expired dispatches")
+        Logger.info("RevokeExpiredDispatchesWorker: revoked #{d_count} expired dispatches")
+      end)
     end
 
     :ok

@@ -178,18 +178,49 @@ defmodule Loopctl.Dispatches do
   """
   @spec revoke(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, non_neg_integer()} | {:error, term()}
   def revoke(tenant_id, dispatch_id) do
+    alias Loopctl.Auth.ApiKey
     now = DateTime.utc_now()
 
-    {count, _} =
+    # Find all dispatches to revoke (target + descendants)
+    dispatches_query =
       from(d in Dispatch,
         where:
           d.tenant_id == ^tenant_id and
             is_nil(d.revoked_at) and
-            (d.id == ^dispatch_id or ^dispatch_id in d.lineage_path)
+            (d.id == ^dispatch_id or ^dispatch_id in d.lineage_path),
+        select: %{id: d.id, api_key_id: d.api_key_id}
       )
-      |> AdminRepo.update_all(set: [revoked_at: now])
 
-    {:ok, count}
+    to_revoke = AdminRepo.all(dispatches_query)
+    dispatch_ids = Enum.map(to_revoke, & &1.id)
+    key_ids = to_revoke |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1)
+
+    # Revoke dispatches and their linked api_keys atomically
+    multi =
+      Multi.new()
+      |> Multi.run(:revoke_dispatches, fn _repo, _ ->
+        {count, _} =
+          from(d in Dispatch, where: d.id in ^dispatch_ids)
+          |> AdminRepo.update_all(set: [revoked_at: now])
+
+        {:ok, count}
+      end)
+      |> Multi.run(:revoke_keys, fn _repo, _ ->
+        if key_ids != [] do
+          {count, _} =
+            from(k in ApiKey, where: k.id in ^key_ids and is_nil(k.revoked_at))
+            |> AdminRepo.update_all(set: [revoked_at: now])
+
+          {:ok, count}
+        else
+          {:ok, 0}
+        end
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{revoke_dispatches: count}} -> {:ok, count}
+      {:error, _step, reason, _} -> {:error, reason}
+    end
   end
 
   @doc "Checks if two lineage paths share a common prefix of length >= 1."

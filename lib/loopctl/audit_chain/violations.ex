@@ -53,7 +53,13 @@ defmodule Loopctl.AuditChain.Violations do
     |> AdminRepo.aggregate(:count, :id)
   end
 
-  @doc "Resolves a violation with a note."
+  @doc """
+  Resolves a violation with a note.
+
+  Fetches by ID without tenant scoping because violations are managed
+  by superadmins who operate cross-tenant. The controller enforces
+  RequireRole :superadmin.
+  """
   @spec resolve(Ecto.UUID.t(), String.t(), Ecto.UUID.t() | nil) ::
           {:ok, PendingViolation.t()} | {:error, term()}
   def resolve(violation_id, note, resolved_by_key_id \\ nil) do

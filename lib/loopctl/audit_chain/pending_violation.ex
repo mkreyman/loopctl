@@ -16,7 +16,7 @@ defmodule Loopctl.AuditChain.PendingViolation do
     orphaned_agent_ref
     nil_reviewer
     missing_chain_hash
-    unreviewd_reported_done
+    unreviewed_reported_done
   )
 
   @statuses ~w(pending resolved ignored)
@@ -40,7 +40,6 @@ defmodule Loopctl.AuditChain.PendingViolation do
   def changeset(violation \\ %__MODULE__{}, attrs) do
     violation
     |> cast(attrs, [
-      :tenant_id,
       :violation_type,
       :entity_type,
       :entity_id,
