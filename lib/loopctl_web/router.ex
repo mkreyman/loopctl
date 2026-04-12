@@ -39,6 +39,24 @@ defmodule LoopctlWeb.Router do
     get "/docs", PageController, :docs
     get "/terms", PageController, :terms
     get "/privacy", PageController, :privacy
+
+    # US-26.0.1 — tenant signup ceremony (LiveView with WebAuthn enrollment).
+    # Lives in the public `:browser` pipeline and a dedicated
+    # `:public_signup` live_session so it mounts without a current
+    # scope. The session and onboarding routes deliberately sit
+    # outside any authenticated pipeline — signup is the only way to
+    # create a tenant and the resulting onboarding page is reachable
+    # by URL until auth scoping is added in a follow-up story.
+    live_session :public_signup do
+      live "/signup", SignupLive, :index
+      live "/tenants/:id/onboarding", TenantOnboardingLive, :index
+    end
+
+    # US-26.0.3 — public wiki rendering for system-scoped articles
+    live_session :public_wiki do
+      live "/wiki", WikiIndexLive, :index
+      live "/wiki/:slug", WikiShowLive, :show
+    end
   end
 
   # Health check — unauthenticated JSON, outside /api/v1
@@ -46,6 +64,14 @@ defmodule LoopctlWeb.Router do
     pipe_through :api
 
     get "/health", HealthController, :check
+  end
+
+  # US-26.0.4 — RFC 8615 discovery endpoint (unauthenticated)
+  scope "/", LoopctlWeb do
+    pipe_through :api
+
+    get "/.well-known/loopctl", WellKnownController, :discovery
+    get "/.well-known/loopctl/schema.json", WellKnownController, :schema
   end
 
   # OpenAPI spec, Swagger UI, and API discovery — available in all environments
@@ -56,19 +82,22 @@ defmodule LoopctlWeb.Router do
     get "/", LoopctlWeb.WelcomeController, :index
   end
 
+  # US-26.0.2 — Public endpoint for tenant audit key (no auth required)
+  # US-26.0.3 — Public system article endpoints (no auth required)
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api]
+
+    get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
+    get "/articles/system", SystemArticleController, :index
+    get "/audit/sth/:tenant_id", AuditSthController, :show
+  end
+
   scope "/swaggerui" do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
 
   # Dev-only routes (dashboard, etc.)
   if Application.compile_env(:loopctl, :dev_routes, false) do
-  end
-
-  # Public API endpoints (no auth required)
-  scope "/api/v1", LoopctlWeb do
-    pipe_through [:api, :registration_rate_limit]
-
-    post "/tenants/register", TenantController, :register
   end
 
   # API v1 — all authenticated endpoints
@@ -79,6 +108,10 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+    post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
+
+    # US-26.2.1 — Dispatch lineage
+    resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
     # API key management
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
@@ -105,6 +138,9 @@ defmodule LoopctlWeb.Router do
 
     # Story history
     get "/stories/:id/history", StoryHistoryController, :show
+
+    # US-26.4.1 — First-class acceptance criteria
+    get "/stories/:story_id/acceptance_criteria", AcceptanceCriteriaController, :index
 
     # Story status transitions (agent side of two-tier trust model)
     post "/stories/:id/contract", StoryStatusController, :contract
@@ -313,5 +349,10 @@ defmodule LoopctlWeb.Router do
 
     # Cross-tenant audit log
     get "/audit", AdminAuditController, :index
+
+    # US-26.1.4 — Pre-existing violation management
+    get "/violators", AdminViolatorController, :index
+    post "/violators/:id/resolve", AdminViolatorController, :resolve
+    post "/violators/:id/ignore", AdminViolatorController, :ignore
   end
 end

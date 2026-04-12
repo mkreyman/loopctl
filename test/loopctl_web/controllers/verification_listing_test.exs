@@ -63,9 +63,17 @@ defmodule LoopctlWeb.VerificationListingTest do
   end
 
   # Creates a fresh review_record so the next POST /verify succeeds.
+  # Uses a dedicated reviewer agent to satisfy the nil-identity block (US-26.1.3).
   defp create_review_record(tenant_id, story_id) do
+    reviewer = fixture(:agent, %{tenant_id: tenant_id, agent_type: :orchestrator})
+
     {:ok, _} =
-      Progress.record_review(tenant_id, story_id, %{"review_type" => "enhanced"})
+      Progress.record_review(
+        tenant_id,
+        story_id,
+        %{"review_type" => "enhanced"},
+        reviewer_agent_id: reviewer.id
+      )
   end
 
   # --- Paginated verification listing ---

@@ -11,6 +11,7 @@ defmodule Loopctl.ProgressTest do
     project = fixture(:project, %{tenant_id: tenant.id})
     epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
     agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+    reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
     story_attrs =
       Map.merge(
@@ -28,7 +29,14 @@ defmodule Loopctl.ProgressTest do
 
     story = fixture(:story, story_attrs)
 
-    %{tenant: tenant, project: project, epic: epic, agent: agent, story: story}
+    %{
+      tenant: tenant,
+      project: project,
+      epic: epic,
+      agent: agent,
+      reviewer: reviewer,
+      story: story
+    }
   end
 
   describe "contract_story/4" do
@@ -353,12 +361,13 @@ defmodule Loopctl.ProgressTest do
 
       other_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
 
-      # Create review_record first
+      # Create review_record first (reviewer must differ from implementer)
       assert {:ok, _} =
                Progress.record_review(
                  tenant.id,
                  story.id,
-                 %{"review_type" => "enhanced", "summary" => "Review passed"}
+                 %{"review_type" => "enhanced", "summary" => "Review passed"},
+                 reviewer_agent_id: other_agent.id
                )
 
       assert {:ok, updated} =
@@ -547,12 +556,14 @@ defmodule Loopctl.ProgressTest do
           })
           |> Loopctl.AdminRepo.update!()
 
-        # Review record required for each story
+        # Review record required for each story (reviewer differs from implementer)
         assert {:ok, _} =
-                 Progress.record_review(tenant.id, story.id, %{
-                   "review_type" => "enhanced",
-                   "summary" => "Passed"
-                 })
+                 Progress.record_review(
+                   tenant.id,
+                   story.id,
+                   %{"review_type" => "enhanced", "summary" => "Passed"},
+                   reviewer_agent_id: orch_agent.id
+                 )
       end
 
       assert {:ok, result} =
@@ -631,7 +642,7 @@ defmodule Loopctl.ProgressTest do
 
   describe "record_review/4" do
     test "creates a review_record for a reported_done story" do
-      %{tenant: tenant, story: story} =
+      %{tenant: tenant, story: story, reviewer: reviewer} =
         setup_story(%{agent_status: :reported_done, reported_done_at: DateTime.utc_now()})
 
       assert {:ok, review_record} =
@@ -643,7 +654,8 @@ defmodule Loopctl.ProgressTest do
                    "findings_count" => 5,
                    "fixes_count" => 5,
                    "summary" => "Enhanced review completed. All findings fixed."
-                 }
+                 },
+                 reviewer_agent_id: reviewer.id
                )
 
       assert review_record.review_type == "enhanced"
@@ -930,7 +942,7 @@ defmodule Loopctl.ProgressTest do
         })
         |> Loopctl.AdminRepo.update!()
 
-      # Review completed after reported_done_at
+      # Review completed after reported_done_at (reviewer differs from implementer)
       assert {:ok, _} =
                Progress.record_review(
                  tenant.id,
@@ -938,7 +950,8 @@ defmodule Loopctl.ProgressTest do
                  %{
                    "review_type" => "enhanced",
                    "completed_at" => ~U[2026-03-30 01:00:00.000000Z]
-                 }
+                 },
+                 reviewer_agent_id: orch_agent.id
                )
 
       assert {:ok, updated} =

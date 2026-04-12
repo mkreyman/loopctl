@@ -148,20 +148,36 @@ defmodule LoopctlWeb.ArticleController do
 
   @doc "POST /api/v1/articles or POST /api/v1/projects/:project_id/articles"
   def create(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-    audit_opts = AuditContext.from_conn(conn)
+    scope = params["scope"] || "tenant"
+    api_key = conn.assigns.current_api_key
 
-    # If project_id comes from the path (project-scoped route), merge it into attrs
-    attrs = maybe_merge_project_id(params, params["project_id"])
+    # System articles require superadmin role
+    if scope == "system" and api_key.role != :superadmin do
+      conn
+      |> put_status(:forbidden)
+      |> json(%{
+        error: %{
+          status: 403,
+          code: "system_scope_forbidden",
+          message: "System-scoped articles require superadmin role"
+        }
+      })
+    else
+      tenant_id = api_key.tenant_id
+      audit_opts = AuditContext.from_conn(conn)
 
-    case Knowledge.create_article(tenant_id, attrs, audit_opts) do
-      {:ok, article} ->
-        conn
-        |> put_status(:created)
-        |> json(ArticleJSON.create(%{article: article}))
+      # If project_id comes from the path (project-scoped route), merge it into attrs
+      attrs = maybe_merge_project_id(params, params["project_id"])
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      case Knowledge.create_article(tenant_id, attrs, audit_opts) do
+        {:ok, article} ->
+          conn
+          |> put_status(:created)
+          |> json(ArticleJSON.create(%{article: article}))
+
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+      end
     end
   end
 

@@ -56,8 +56,8 @@ defmodule Loopctl.Workers.TokenDataArchivalWorker do
                     )
 
   @impl Oban.Worker
-  def perform(%Oban.Job{}) do
-    tenants = list_active_tenants()
+  def perform(%Oban.Job{args: args}) do
+    tenants = list_active_tenants(args)
     Logger.info("TokenDataArchivalWorker: processing #{length(tenants)} tenants")
 
     Enum.each(tenants, &process_tenant/1)
@@ -166,7 +166,13 @@ defmodule Loopctl.Workers.TokenDataArchivalWorker do
     end
   end
 
-  defp list_active_tenants do
+  defp list_active_tenants(%{"tenant_ids" => ids}) when is_list(ids) and ids != [] do
+    Tenant
+    |> where([t], t.status == :active and t.id in ^ids)
+    |> AdminRepo.all()
+  end
+
+  defp list_active_tenants(_args) do
     Tenant
     |> where([t], t.status == :active)
     |> AdminRepo.all()

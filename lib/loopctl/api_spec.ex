@@ -78,7 +78,7 @@ defmodule Loopctl.ApiSpec do
             type: "http",
             scheme: "bearer",
             description:
-              "API key obtained from tenant registration (POST /api/v1/tenants/register)"
+              "API key obtained after tenant signup at /signup (WebAuthn enrollment required)"
           }
         },
         responses: %{

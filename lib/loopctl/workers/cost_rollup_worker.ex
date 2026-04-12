@@ -41,7 +41,7 @@ defmodule Loopctl.Workers.CostRollupWorker do
     # Allow overriding the period for testing/backfills
     {period_start, period_end} = resolve_period(args)
 
-    tenants = list_active_tenants()
+    tenants = list_active_tenants(args)
     Logger.info("CostRollupWorker: starting rollup for #{length(tenants)} tenants")
 
     results =
@@ -161,7 +161,15 @@ defmodule Loopctl.Workers.CostRollupWorker do
     end
   end
 
-  defp list_active_tenants do
+  defp list_active_tenants(%{"tenant_ids" => ids}) when is_list(ids) and ids != [] do
+    import Ecto.Query
+
+    Tenant
+    |> where([t], t.status == :active and t.id in ^ids)
+    |> AdminRepo.all()
+  end
+
+  defp list_active_tenants(_args) do
     import Ecto.Query
 
     Tenant

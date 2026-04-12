@@ -55,12 +55,14 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
                CostRollupWorker.perform(%Oban.Job{
                  args: %{
                    "period_start" => "2026-04-02",
-                   "period_end" => "2026-04-02"
+                   "period_end" => "2026-04-02",
+                   "tenant_ids" => [tenant.id]
                  }
                })
 
       # Verify summaries were created
-      summaries = AdminRepo.all(CostSummary)
+      import Ecto.Query
+      summaries = from(c in CostSummary, where: c.tenant_id == ^tenant.id) |> AdminRepo.all()
       assert length(summaries) == 2
 
       project_summary = Enum.find(summaries, &(&1.scope_type == :project))
@@ -102,24 +104,24 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
         {:ok, rollup_data}
       end)
 
-      assert :ok =
-               CostRollupWorker.perform(%Oban.Job{
-                 args: %{"period_start" => "2026-04-02", "period_end" => "2026-04-02"}
-               })
+      job_args = %{
+        "period_start" => "2026-04-02",
+        "period_end" => "2026-04-02",
+        "tenant_ids" => [tenant.id]
+      }
 
-      assert :ok =
-               CostRollupWorker.perform(%Oban.Job{
-                 args: %{"period_start" => "2026-04-02", "period_end" => "2026-04-02"}
-               })
+      assert :ok = CostRollupWorker.perform(%Oban.Job{args: job_args})
+      assert :ok = CostRollupWorker.perform(%Oban.Job{args: job_args})
 
       # Should still have only 1 record (upserted, not duplicated)
-      summaries = AdminRepo.all(CostSummary)
+      import Ecto.Query
+      summaries = from(c in CostSummary, where: c.tenant_id == ^tenant.id) |> AdminRepo.all()
       assert length(summaries) == 1
       assert hd(summaries).total_cost_millicents == 15_000
     end
 
     test "handles rollup service errors gracefully" do
-      _tenant = fixture(:tenant)
+      tenant = fixture(:tenant)
 
       expect(Loopctl.MockCostRollup, :aggregate, fn _, _, _ ->
         {:error, "database timeout"}
@@ -128,12 +130,16 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
       # Should still return :ok (logs errors but doesn't fail job)
       assert :ok =
                CostRollupWorker.perform(%Oban.Job{
-                 args: %{"period_start" => "2026-04-02", "period_end" => "2026-04-02"}
+                 args: %{
+                   "period_start" => "2026-04-02",
+                   "period_end" => "2026-04-02",
+                   "tenant_ids" => [tenant.id]
+                 }
                })
     end
 
     test "defaults period to yesterday when not provided" do
-      _tenant = fixture(:tenant)
+      tenant = fixture(:tenant)
 
       yesterday = Date.add(Date.utc_today(), -1)
 
@@ -143,7 +149,10 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
         {:ok, []}
       end)
 
-      assert :ok = CostRollupWorker.perform(%Oban.Job{args: %{}})
+      assert :ok =
+               CostRollupWorker.perform(%Oban.Job{
+                 args: %{"tenant_ids" => [tenant.id]}
+               })
     end
 
     test "processes multiple tenants" do
@@ -157,13 +166,17 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
 
       assert :ok =
                CostRollupWorker.perform(%Oban.Job{
-                 args: %{"period_start" => "2026-04-02", "period_end" => "2026-04-02"}
+                 args: %{
+                   "period_start" => "2026-04-02",
+                   "period_end" => "2026-04-02",
+                   "tenant_ids" => [tenant_a.id, tenant_b.id]
+                 }
                })
     end
 
     test "skips suspended tenants" do
-      _active_tenant = fixture(:tenant)
-      _suspended_tenant = fixture(:tenant, %{status: :suspended})
+      active_tenant = fixture(:tenant)
+      suspended_tenant = fixture(:tenant, %{status: :suspended})
 
       # Should only be called once (for active tenant)
       expect(Loopctl.MockCostRollup, :aggregate, fn _, _, _ ->
@@ -172,7 +185,11 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
 
       assert :ok =
                CostRollupWorker.perform(%Oban.Job{
-                 args: %{"period_start" => "2026-04-02", "period_end" => "2026-04-02"}
+                 args: %{
+                   "period_start" => "2026-04-02",
+                   "period_end" => "2026-04-02",
+                   "tenant_ids" => [active_tenant.id, suspended_tenant.id]
+                 }
                })
     end
   end

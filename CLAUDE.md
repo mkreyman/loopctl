@@ -89,6 +89,11 @@ lib/loopctl_web/
 
 **EVERY change to loopctl must be evaluated against this checklist before merging.**
 
+**Design spec:** the Chain of Custody v2 design lives in `docs/chain-of-custody-v2.md`.
+Sections 2.1 and 9 in particular establish the human-rooted signup ceremony (WebAuthn)
+and the chain-of-custody invariants that the rest of the system relies on. Consult it
+before changing anything in the auth, signup, or audit pipelines.
+
 ### Role Hierarchy
 
 `superadmin (4) > user (3) > orchestrator (2) > agent (1)`
@@ -113,12 +118,28 @@ Ask these questions:
 3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
 4. **Does this affect RLS?** New tables must use `ENABLE ROW LEVEL SECURITY` (not `FORCE`) since the production role (`schema_admin`) is the table owner without BYPASSRLS.
 
-### Key Distribution Rules
+### Chain of Custody v2 (Epic 26)
 
-- `LOOPCTL_AGENT_KEY` — agent role, used by implementation agents
-- `LOOPCTL_ORCH_KEY` — orchestrator role, used by the orchestrator for reads and non-custody operations
-- `LOOPCTL_REVIEWER_KEY` — separate agent identity, used ONLY via curl by review agents (never in the same MCP server as the agent key)
-- `LOOPCTL_USER_KEY` — user role, used ONLY via curl for destructive/admin operations
+The trust model is enforced by six layers:
+- **L0** Human + hardware anchor (WebAuthn at tenant signup)
+- **L1** Capability tokens (signed, scoped, non-replayable)
+- **L2** Database invariants (FK, CHECK, triggers, partial indexes)
+- **L3** Independent re-execution (SWE-bench-style verification)
+- **L4** Structural role separation (dispatch lineage, rotating verifier)
+- **L5** Behavioral detection (lazy-bastard score, CoT sanity)
+- **L6** Halt on byzantine (divergent STH, custody halt)
+
+Full spec: `docs/chain-of-custody-v2.md`. Wiki: `https://loopctl.com/wiki/chain-of-custody`.
+
+### Key Distribution (v2 — Dispatch Pattern)
+
+Long-lived env-var keys are replaced by per-dispatch ephemeral keys minted via
+`POST /api/v1/dispatches`. Each dispatch carries its lineage path (root → self)
+and an ephemeral API key with a bounded TTL. The MCP server v2 tool
+`mcp__loopctl__dispatch` handles minting.
+
+Legacy env-var keys (`LOOPCTL_AGENT_KEY`, `LOOPCTL_ORCH_KEY`, etc.) continue to
+work during the deprecation window but will be removed at the epic merge.
 
 ## Dependency Injection — Config-Based (NOT Opts-Based)
 

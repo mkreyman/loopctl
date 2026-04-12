@@ -28,30 +28,14 @@ defmodule Loopctl.CLI.Commands.Tenants do
     Output.error("Usage: loopctl tenant register|info|update")
   end
 
-  defp register(args, opts) do
-    parsed = parse_kv_args(args)
-    name = Map.get(parsed, "name")
-    email = Map.get(parsed, "email")
-    slug = Map.get(parsed, "slug")
+  defp register(_args, _opts) do
+    Output.error("""
+    Tenant registration requires WebAuthn enrollment via the web UI.
+    Visit https://loopctl.com/signup to create a new tenant.
 
-    if name && email do
-      body =
-        %{"name" => name, "email" => email}
-        |> maybe_put("slug", slug)
-
-      case Client.post("/api/v1/tenants/register", body) do
-        {:ok, result} ->
-          Output.render(result, format: Keyword.get(opts, :format))
-
-        {:error, :no_server_configured} ->
-          Output.error("No server configured. Run: loopctl auth login --server <url> --key <key>")
-
-        {:error, {status, body}} ->
-          Output.error("Server returned #{status}: #{inspect(body)}")
-      end
-    else
-      Output.error("Usage: loopctl tenant register --name <name> --email <email> [--slug <slug>]")
-    end
+    CLI-based registration has been removed — a hardware authenticator
+    (YubiKey, Touch ID, Windows Hello) is now required at signup.
+    """)
   end
 
   defp info(opts) do
@@ -97,18 +81,6 @@ defmodule Loopctl.CLI.Commands.Tenants do
       end
     end
   end
-
-  defp parse_kv_args(args) do
-    args
-    |> Enum.chunk_every(2, 2, :discard)
-    |> Enum.reduce(%{}, fn
-      ["--" <> key, value], acc -> Map.put(acc, key, value)
-      _, acc -> acc
-    end)
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_parse_value("true"), do: true
   defp maybe_parse_value("false"), do: false
