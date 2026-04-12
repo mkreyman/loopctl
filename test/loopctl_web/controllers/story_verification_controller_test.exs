@@ -615,7 +615,13 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     test "verifies all reported_done unverified stories in an epic when review_records exist", %{
       conn: conn
     } do
-      %{tenant: tenant, epic: epic, impl_agent: impl_agent, orch_key: orch_key} =
+      %{
+        tenant: tenant,
+        epic: epic,
+        impl_agent: impl_agent,
+        orch_key: orch_key,
+        orch_agent: orch_agent
+      } =
         setup_reported_story()
 
       # Create 2 more reported_done stories in the same epic, each with a review_record
@@ -632,10 +638,12 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           |> Loopctl.AdminRepo.update!()
 
         {:ok, _} =
-          Progress.record_review(tenant.id, story.id, %{
-            "review_type" => "enhanced",
-            "summary" => "Passed"
-          })
+          Progress.record_review(
+            tenant.id,
+            story.id,
+            %{"review_type" => "enhanced", "summary" => "Passed"},
+            reviewer_agent_id: orch_agent.id
+          )
       end
 
       conn =

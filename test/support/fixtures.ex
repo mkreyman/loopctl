@@ -1064,10 +1064,11 @@ defmodule Loopctl.Fixtures do
 
   def fixture(:api_key, attrs) do
     attrs = Enum.into(attrs, %{})
+    role = Map.get(attrs, :role, :user)
 
     # Auto-create a tenant if not provided (unless superadmin)
     {tenant_id, attrs} =
-      case {Map.get(attrs, :tenant_id), Map.get(attrs, :role, :user)} do
+      case {Map.get(attrs, :tenant_id), role} do
         {nil, :superadmin} ->
           {nil, attrs}
 

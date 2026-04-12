@@ -1012,7 +1012,8 @@ defmodule Loopctl.Progress do
 
   # --- Verification/Rejection helpers ---
 
-  defp validate_not_self_verify(story, nil), do: {:ok, story}
+  # nil orchestrator identity: untrusted (US-26.1.3)
+  defp validate_not_self_verify(_story, nil), do: {:error, :self_verify_blocked}
 
   defp validate_not_self_verify(story, orchestrator_agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id do
@@ -1428,8 +1429,8 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # nil agent_id: no agent identity — cannot determine self-report, allow through
-  defp validate_not_self_report(_story, nil), do: :ok
+  # nil agent_id: unknown identity is treated as untrusted (US-26.1.3)
+  defp validate_not_self_report(_story, nil), do: {:error, :self_report_blocked}
 
   defp validate_not_self_report(story, agent_id) do
     if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
@@ -1439,7 +1440,10 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # nil reviewer_agent_id: no agent identity to compare — cannot self-review
+  # nil reviewer_agent_id: this is a human operator (user-role key with no agent).
+  # Humans are structurally different from the assigned implementing agent, so
+  # nil cannot equal any agent_id — pass through. The controller enforces that
+  # agent/orchestrator-role keys must provide a real reviewer_agent_id.
   defp validate_not_self_review(_story, nil), do: :ok
 
   defp validate_not_self_review(story, reviewer_agent_id) do
