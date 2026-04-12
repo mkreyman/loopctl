@@ -75,6 +75,11 @@ defmodule Loopctl.WorkBreakdown.Story do
     field :sort_key, :integer, default: 0
     field :metadata, :map, default: %{}
 
+    # US-26.2.2: Dispatch lineage for chain-of-custody enforcement
+    field :implementer_dispatch_id, Ecto.UUID
+    field :verifier_dispatch_id, Ecto.UUID
+    field :verifier_needed, :boolean, default: false
+
     timestamps()
   end
 
