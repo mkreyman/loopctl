@@ -1,0 +1,87 @@
+{
+  "id": "US-26.3.2",
+  "title": "HATEOAS Response Bodies with Embedded Caps and next_actions",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "capabilities",
+  "story": {
+    "as_a": "new agent encountering loopctl for the first time",
+    "i_want_to": "have every successful custody response include the exact next API call I can make (with any minted capability token embedded in the example body), and every error response include a machine-parseable reason code + remediation URL + sample request",
+    "so_that": "I can walk from first contact to verified work using only the response bodies as guidance, without reading source code or external documentation"
+  },
+  "rationale": "Self-discovery (section 8 of chain-of-custody-v2.md) requires responses to teach agents what to do next. Without HATEOAS, an agent holding a fresh capability token has no way to know where to use it. This story adds next_actions to successful responses and structured remediation to error responses — wiring together US-26.3.1 (cap minting), US-26.0.4 (discovery), and US-26.0.5 (system articles) into a complete self-organizing workflow.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.3.2.1",
+      "description": "Every successful custody response (claim, start, report, request_review, review_complete, verify, reject) includes a `next_actions` array of objects: `{action (string), method (HTTP verb), path (URL template), required_body (JSON example with placeholders), preconditions (array of strings), learn_more (URL)}`."
+    },
+    {
+      "id": "AC-26.3.2.2",
+      "description": "When a response includes a minted capability token, the `next_actions[i].required_body` field shows the exact cap value inlined — so the agent can copy the response body as its next request body."
+    },
+    {
+      "id": "AC-26.3.2.3",
+      "description": "Error responses for all capability- and lineage-related failures include `error.remediation: {description, next_action, learn_more, example}`. Error codes are stable and documented: `self_verify_blocked`, `missing_capability`, `wrong_lineage`, `expired_capability`, `consumed_nonce`, `replay`, `verifier_needed`."
+    },
+    {
+      "id": "AC-26.3.2.4",
+      "description": "Each error code has a dedicated system article at slug matching the code (e.g., `/wiki/self-verify-blocked`, `/wiki/missing-capability`). System articles are seeded with placeholder content by this story; full content is authored in US-26.3.3."
+    },
+    {
+      "id": "AC-26.3.2.5",
+      "description": "A state machine spec file `lib/loopctl/progress/state_machine.ex` declares the legal transitions from each state. The `next_actions` field in responses is auto-generated from this spec, so it cannot drift from the real legal transitions. Adding a new transition in the spec automatically updates all HATEOAS responses."
+    },
+    {
+      "id": "AC-26.3.2.6",
+      "description": "An integration test walks a naive agent through the full flow: discover → contract → claim → start → implement (no-op for the test) → request_review → verify (via a second lineage) — using ONLY the response bodies for guidance. No hardcoded paths in the test beyond `/.well-known/loopctl`."
+    },
+    {
+      "id": "AC-26.3.2.7",
+      "description": "The existing loopctl JSON views are updated to include `next_actions` without breaking backward-compatible clients. Clients ignoring the field continue to work."
+    },
+    {
+      "id": "AC-26.3.2.8",
+      "description": "Error responses include a stable `error.code` field (enum) separate from `error.message` (human-readable). Machine clients should key on `error.code`, not message text."
+    },
+    {
+      "id": "AC-26.3.2.9",
+      "description": "OpenAPI spec updates: `NextAction` schema, `ErrorRemediation` schema, all error response schemas include the new shape. CHANGELOG entry describing the HATEOAS addition and the stable error code contract."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.3.2.1",
+      "name": "Successful claim response includes next_actions with embedded start_cap",
+      "type": "integration",
+      "steps": ["POST /stories/:id/claim"],
+      "expected_results": ["Response.next_actions[0].action = 'start_story'", "required_body contains the minted start_cap", "learn_more points at /wiki/start-story or similar"]
+    },
+    {
+      "id": "TC-26.3.2.2",
+      "name": "self_verify_blocked error includes remediation",
+      "type": "integration",
+      "steps": ["Attempt verify with same lineage as implementer"],
+      "expected_results": ["error.code = self_verify_blocked", "error.remediation.next_action mentions requesting a new dispatch", "error.remediation.learn_more is https://loopctl.com/wiki/self-verify-blocked"]
+    },
+    {
+      "id": "TC-26.3.2.3",
+      "name": "Naive-agent walk: only response bodies guide the flow",
+      "type": "integration",
+      "preconditions": ["Two independent dispatch lineages exist", "Story in pending"],
+      "steps": ["GET /.well-known/loopctl", "Follow discovery_bootstrap_url", "Call each next_action in sequence using only the response bodies"],
+      "expected_results": ["Agent reaches verified state without any hardcoded URLs beyond /.well-known/loopctl"]
+    }
+  ],
+  "technical_notes": [
+    "State machine spec: Elixir module with a @transitions attribute listing tuples of (current_state, action, next_state, required_cap_typ).",
+    "JSON view refactor: a shared helper `LoopctlWeb.Hateoas.add_next_actions/2` that takes a struct and a conn, reads the state machine, and injects next_actions.",
+    "Error serialization: update FallbackController.call to wrap errors in the new shape.",
+    "The stable error codes should be documented in docs/error-codes.md and cross-linked from CLAUDE.md.",
+    "Reference: docs/chain-of-custody-v2.md sections 8.2 (HATEOAS)."
+  ],
+  "dependencies": ["US-26.3.1"],
+  "estimated_hours": 8
+}

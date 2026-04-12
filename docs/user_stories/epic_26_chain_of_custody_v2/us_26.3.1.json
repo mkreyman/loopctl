@@ -1,0 +1,133 @@
+{
+  "id": "US-26.3.1",
+  "title": "Capability Token Scheme: Mint, Verify, Consume",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "capabilities",
+  "story": {
+    "as_a": "loopctl operator relying on structural enforcement of chain-of-custody",
+    "i_want_to": "have every custody-critical endpoint (report, review-complete, verify) require a scoped, signed capability token that loopctl mints at the appropriate transition and that the caller cannot forge or reuse",
+    "so_that": "the forbidden operations become structurally unreachable — there is literally no cap for an implementer to verify their own story because no such cap was ever minted to their lineage"
+  },
+  "rationale": "Policy-level role checks can be reached around. Capability tokens make the forbidden operation unnameable: if you don't hold the cap, you literally cannot construct a valid verify request. This story ships the minting, verification, and consumption infrastructure. The HATEOAS response layer (US-26.3.2) wires caps into API responses so agents receive them at the right moment.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.3.1.1",
+      "description": "Migration creates `capability_tokens` table: id (uuid PK), tenant_id (FK), typ (enum: start_cap, report_cap, verify_cap, review_complete_cap), story_id (FK), issued_to_lineage (uuid[]), issued_at (timestamptz), expires_at (timestamptz), consumed_at (timestamptz nullable), nonce (bytea 32 bytes), signature (bytea 64 bytes for ed25519). Unique constraint on (tenant_id, nonce) for replay protection."
+    },
+    {
+      "id": "AC-26.3.1.2",
+      "description": "`Loopctl.Capabilities.mint/4` generates a new token with signature over canonical bytes: `tenant_id || typ || story_id || issued_to_lineage || issued_at || expires_at || nonce`. Signature uses the tenant's audit-signing private key (same key as STHs). Persists the row and returns a JSON-serializable representation with base64url-encoded nonce and signature."
+    },
+    {
+      "id": "AC-26.3.1.3",
+      "description": "`Loopctl.Capabilities.verify/2` takes a JSON-serialized cap and a lineage path. Validates: (a) signature matches tenant's public key, (b) typ matches the expected value for the endpoint, (c) story_id matches the path parameter, (d) issued_to_lineage exactly equals the caller's current lineage (not a prefix — exact match), (e) expires_at is in the future, (f) consumed_at is nil (not yet consumed), (g) nonce exists in the database. Returns `{:ok, cap}` or `{:error, reason}`."
+    },
+    {
+      "id": "AC-26.3.1.4",
+      "description": "`Loopctl.Capabilities.consume/1` atomically marks the token as consumed by setting consumed_at = now(). Runs in the same Ecto.Multi as the custody operation it authorizes, so the operation and consumption succeed or fail together. Attempt to consume an already-consumed nonce returns `{:error, :replay}`."
+    },
+    {
+      "id": "AC-26.3.1.5",
+      "description": "`Loopctl.Progress.claim_story/2` mints a `start_cap` for the claiming lineage after the claim succeeds. The cap's story_id is the claimed story. The cap is returned in the response body."
+    },
+    {
+      "id": "AC-26.3.1.6",
+      "description": "`Loopctl.Progress.start_story/2` consumes the `start_cap` and mints a `report_cap` for the same lineage. Both happen in a single Ecto.Multi with the state transition. If no valid start_cap is presented, the transition fails with 403 `missing_capability`."
+    },
+    {
+      "id": "AC-26.3.1.7",
+      "description": "`Loopctl.Progress.report_story/3` consumes the `report_cap`. `request_review` (part of the same function or a separate endpoint) mints a `verify_cap` for the rotating verifier lineage selected per US-26.2.2. The verify_cap is stored but NOT returned in the reporting agent's response — it's issued to a different lineage and retrieved via `list_ready_stories` by the verifier."
+    },
+    {
+      "id": "AC-26.3.1.8",
+      "description": "`Loopctl.Progress.verify_story/3` consumes the `verify_cap`. If the caller presents a cap issued to a different lineage than theirs, returns 403 `wrong_lineage` with remediation pointing at `/wiki/capability-tokens`."
+    },
+    {
+      "id": "AC-26.3.1.9",
+      "description": "`Loopctl.Progress.review_complete/3` consumes the `review_complete_cap`. Review caps are minted when a reviewer claims the review task (part of `request_review` flow or a new `claim_review` endpoint)."
+    },
+    {
+      "id": "AC-26.3.1.10",
+      "description": "All mint, verify, and consume operations write an audit_chain entry via `Loopctl.AuditChain.append/2`. Payload includes cap_id, typ, story_id, issued_to_lineage, and (for consumption) the consuming dispatch_id."
+    },
+    {
+      "id": "AC-26.3.1.11",
+      "description": "Replay protection test: consuming the same nonce twice in parallel returns `{:error, :replay}` for the second attempt. The first consumption succeeds. Verified via concurrent-transaction test with SELECT...FOR UPDATE on the cap row."
+    },
+    {
+      "id": "AC-26.3.1.12",
+      "description": "Tenant isolation: cross-tenant cap verification fails with 403. The signature would verify (if the adversary somehow stole a cap) but the tenant_id field mismatch catches it."
+    },
+    {
+      "id": "AC-26.3.1.13",
+      "description": "OpenAPI spec updates: `CapabilityToken` schema, new error codes. CHANGELOG entry. System article stubs reserved: `capability-tokens`, `missing-capability`, `wrong-lineage`, `expired-capability`."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.3.1.1",
+      "name": "Minted cap verifies against tenant public key",
+      "type": "unit",
+      "steps": ["Mint a start_cap", "Call verify with the same lineage"],
+      "expected_results": ["Returns {:ok, cap}", "Signature matches public key"]
+    },
+    {
+      "id": "TC-26.3.1.2",
+      "name": "Cap with wrong lineage rejected",
+      "type": "unit",
+      "steps": ["Mint a cap for lineage A", "Call verify with lineage B"],
+      "expected_results": ["Returns {:error, :wrong_lineage}"]
+    },
+    {
+      "id": "TC-26.3.1.3",
+      "name": "Expired cap rejected",
+      "type": "unit",
+      "steps": ["Mint a cap with expires_at in the past", "Call verify"],
+      "expected_results": ["Returns {:error, :expired}"]
+    },
+    {
+      "id": "TC-26.3.1.4",
+      "name": "Replay attack blocked: consume twice",
+      "type": "integration",
+      "steps": ["Mint cap", "Consume once", "Consume again"],
+      "expected_results": ["First consume succeeds", "Second returns {:error, :replay}"]
+    },
+    {
+      "id": "TC-26.3.1.5",
+      "name": "claim_story returns a start_cap in response",
+      "type": "integration",
+      "preconditions": ["story = fixture(:story, agent_status: :contracted)"],
+      "steps": ["POST /stories/:id/claim"],
+      "expected_results": ["Response body includes capability.typ = start_cap", "Cap has matching story_id and lineage"]
+    },
+    {
+      "id": "TC-26.3.1.6",
+      "name": "start_story without start_cap is rejected",
+      "type": "integration",
+      "steps": ["POST /stories/:id/start without the cap"],
+      "expected_results": ["403 with error.code = missing_capability", "Remediation links to /wiki/capability-tokens"]
+    },
+    {
+      "id": "TC-26.3.1.7",
+      "name": "verify_story consumes verify_cap and transitions state",
+      "type": "integration",
+      "steps": ["Dispatch to eligible verifier", "Retrieve the verify_cap via list_ready_stories", "Call verify with the cap"],
+      "expected_results": ["Story transitions to :verified", "Cap consumed_at is set", "Audit chain has verify entry"]
+    }
+  ],
+  "technical_notes": [
+    "Signing: use the same ed25519 key from US-26.0.2. Add Loopctl.Capabilities.Signer module that loads the key via TenantKeys.get_private_key/1.",
+    "Canonical serialization: define a fixed byte layout for the signature input. Document in a module attribute.",
+    "Nonce generation: :crypto.strong_rand_bytes(32).",
+    "Exact-match lineage comparison: `lineage_a == lineage_b` (list equality, order matters).",
+    "The SELECT...FOR UPDATE on the cap row prevents concurrent consumption.",
+    "Caps are short-lived: default expires_at = now + 2 hours, configurable per typ.",
+    "Reference: docs/chain-of-custody-v2.md section 5."
+  ],
+  "dependencies": ["US-26.0.2", "US-26.1.1", "US-26.2.1", "US-26.2.2"],
+  "estimated_hours": 12
+}
