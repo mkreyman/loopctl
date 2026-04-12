@@ -1,0 +1,181 @@
+{
+  "id": "US-26.2.3",
+  "title": "Orchestrator Skill and MCP Server Migration to Dispatch Pattern",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "lineage",
+  "story": {
+    "as_a": "orchestrator agent operating a loopctl-managed project",
+    "i_want_to": "mint ephemeral dispatch-scoped api_keys at the moment I spawn each sub-agent, via the new `POST /api/v1/dispatches` endpoint and a corresponding `mcp__loopctl__dispatch` tool, with the orchestrator skill and mcp-server README updated to reflect the new workflow",
+    "so_that": "I no longer share a long-lived LOOPCTL_AGENT_KEY across sub-agents, and my orchestration flow matches the chain-of-custody invariants the server now enforces"
+  },
+  "rationale": "The database invariants (US-26.1.3) and lineage-based self-check (US-26.2.2) will reject orchestration flows that rely on a shared LOOPCTL_AGENT_KEY. Without this story updating the orchestrator skill and the mcp-server, every existing orchestrator session would hit trust-model errors it doesn't know how to recover from. This story ships the agent-facing migration so existing orchestrators can cut over cleanly within a 30-day deprecation window.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.2.3.1",
+      "description": "`mcp-server/index.js` gains a new tool `mcp__loopctl__dispatch` that wraps `POST /api/v1/dispatches`. Input schema: `{parent_dispatch_id (optional uuid), role (enum), story_id (optional uuid), agent_id (uuid), expires_in_seconds (optional integer, default 3600)}`. Returns the dispatch record and the ephemeral raw_key in the response.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.2",
+      "description": "The new mcp-server tool includes tool-level instructions in its description telling agents: \"This tool mints an ephemeral api_key for a sub-agent. The raw_key is returned ONCE — pass it to the sub-agent via its launch arguments, never store it in env vars. The key expires after expires_in_seconds.\"",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.3",
+      "description": "mcp-server version bumps to 2.0.0 (breaking change). Changelog entry describes the new dispatch requirement. Old mcp-server v1.x clients will continue to work during the deprecation window with a warning in response metadata pointing at the new pattern.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.4",
+      "description": "`mcp-server/README.md` gains a new top section \"Chain of Custody v2 migration\" that describes: (a) the shift from shared LOOPCTL_AGENT_KEY to per-dispatch ephemeral keys, (b) how to update existing orchestrator prompts, (c) a worked example of the new dispatch flow from root ceremony to sub-agent launch, (d) a link to `https://loopctl.com/wiki/dispatch-lineage`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.5",
+      "description": "The existing `/loopctl:orchestrate` skill body (in the claude-config repo) is updated to replace the \"agents share LOOPCTL_AGENT_KEY\" pattern with \"call `mcp__loopctl__dispatch` to mint a scoped key for each sub-agent dispatch\". The update is committed in a separate PR in the claude-config repo (linked from this story).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.6",
+      "description": "The `/loopctl:implement` skill is similarly updated: the bootstrap flow calls `mcp__loopctl__dispatch` to obtain its own ephemeral key at session start, and the skill explains that the key is valid only for the current story.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.7",
+      "description": "During the deprecation window (30 days from Phase 2 ship), calls using a legacy long-lived LOOPCTL_AGENT_KEY receive a `X-Loopctl-Deprecation-Warning` response header and a `_meta.deprecation_warning` field in the body. The warning text includes the cutover date and a link to `/wiki/dispatch-lineage`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.8",
+      "description": "After the cutover date (configured via `config :loopctl, :lineage_cutover_date`), legacy calls receive `410 Gone` with the same remediation information.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.9",
+      "description": "The Epic 25 review pipeline (loopctl-enhanced-review skill) continues to function by wrapping each review sub-agent in a fresh dispatch under a different lineage root, ensuring the rotating verifier selection can pick the review lineage as non-overlapping with the implementer.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.10",
+      "description": "System article stub `dispatch-lineage` is reserved and linked from the tool description. Full article content is authored in US-26.3.3. A minimal placeholder article is seeded in this story so the links resolve to non-empty content during the deprecation window.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.11",
+      "description": "mcp-server CHANGELOG.md entry for 2.0.0: lists the new tool, the deprecation of the shared-key pattern, the migration URL, and the cutover date.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.2.3.12",
+      "description": "Release process: `npm publish` is NOT executed in this story. The release ceremony is handled by US-26.R.1 (the dedicated release story). This story ships the code to the research branch; publishing waits for approval.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.2.3.1",
+      "name": "New dispatch tool returns ephemeral raw_key and dispatch record",
+      "type": "unit",
+      "preconditions": [
+        "Mock HTTP transport in mcp-server test",
+        "Mock response with a dispatch object and raw_key"
+      ],
+      "steps": [
+        "Invoke mcp__loopctl__dispatch handler with parent_dispatch_id, role, agent_id, expires_in_seconds"
+      ],
+      "expected_results": [
+        "Outbound HTTP POST is to /api/v1/dispatches",
+        "Request body matches input",
+        "Handler returns {dispatch, api_key}"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.2",
+      "name": "Legacy long-lived key gets deprecation warning in response",
+      "type": "integration",
+      "preconditions": [
+        "tenant with a long-lived (pre-epic-26) agent api_key",
+        "Deprecation window active"
+      ],
+      "steps": [
+        "GET /api/v1/projects using the legacy key"
+      ],
+      "expected_results": [
+        "Response 200 (still works)",
+        "X-Loopctl-Deprecation-Warning header present",
+        "Body _meta.deprecation_warning mentions the cutover date"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.3",
+      "name": "Post-cutover legacy key returns 410 Gone",
+      "type": "integration",
+      "preconditions": [
+        "Config :lineage_cutover_date set to a past timestamp",
+        "Legacy long-lived key"
+      ],
+      "steps": [
+        "GET /api/v1/projects"
+      ],
+      "expected_results": [
+        "Response 410",
+        "Body includes remediation pointing at /wiki/dispatch-lineage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.4",
+      "name": "mcp-server README contains the migration section",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server/README.md exists"
+      ],
+      "steps": [
+        "Read README.md"
+      ],
+      "expected_results": [
+        "File contains a section titled 'Chain of Custody v2 migration'",
+        "Section includes a code example using mcp__loopctl__dispatch",
+        "Section links to https://loopctl.com/wiki/dispatch-lineage"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-26.2.3.5",
+      "name": "dispatch-lineage stub article exists",
+      "type": "integration",
+      "preconditions": [
+        "Seed migration has run"
+      ],
+      "steps": [
+        "GET /wiki/dispatch-lineage"
+      ],
+      "expected_results": [
+        "Response 200",
+        "Body contains placeholder content (at minimum: title, brief intro, and a pointer to full content in US-26.3.3)"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "mcp-server tool addition: edit mcp-server/index.js — add to the ListToolsResponse and the CallToolRequestSchema handler switch.",
+    "Version bump: mcp-server/package.json version 1.x → 2.0.0. Node engines stays >=18.",
+    "The claude-config update is a sibling PR, linked from this story's description. It lives in ~/workspace/claude-config/commands/loopctl/orchestrate.md. The story's AC tracks whether the sibling PR was opened, not its merge status.",
+    "Deprecation header: add to every response that used a legacy long-lived key. The check is at the plug level — if the key has no associated dispatch, it's legacy.",
+    "Cutover config: `config :loopctl, :lineage_cutover_date, ~U[2026-05-15 00:00:00Z]` (date TBD at operator discretion).",
+    "Legacy detection: a key is 'legacy' if its id is NOT referenced by any row in the dispatches table. New dispatches always create an associated row; old keys don't.",
+    "Stub article body is ~200 words with a 'full content coming in US-26.3.3' note. This prevents broken links during the 30-day window between Phase 2 and Phase 3 ship.",
+    "Reference: docs/chain-of-custody-v2.md sections 6 and 10.2."
+  ],
+  "dependencies": [
+    "US-26.2.1",
+    "US-26.2.2"
+  ],
+  "estimated_hours": 8
+}
