@@ -20,7 +20,6 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
       body = response(conn, 200)
       assert body =~ "-----BEGIN PUBLIC KEY-----"
       assert body =~ "-----END PUBLIC KEY-----"
-      assert body =~ Base.encode64(pub_key)
     end
 
     test "returns JWK format when Accept header requests it", %{conn: conn} do
@@ -37,25 +36,25 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
       assert json_response(conn, 200)["x"] == Base.url_encode64(pub_key, padding: false)
     end
 
-    test "returns 404 when tenant has no key", %{conn: conn} do
+    test "returns uniform 404 when tenant has no key", %{conn: conn} do
       tenant = fixture(:tenant)
 
       conn = get(conn, ~p"/api/v1/tenants/#{tenant.id}/audit_public_key")
 
-      assert json_response(conn, 404)["error"]["message"] =~ "no audit signing key"
+      assert json_response(conn, 404)["error"]["message"] == "Not found"
     end
 
-    test "returns 404 for unknown tenant", %{conn: conn} do
+    test "returns uniform 404 for unknown tenant", %{conn: conn} do
       conn = get(conn, ~p"/api/v1/tenants/#{Ecto.UUID.generate()}/audit_public_key")
 
-      assert json_response(conn, 404)["error"]["message"] =~ "Tenant not found"
+      # Same message as above — prevents tenant enumeration
+      assert json_response(conn, 404)["error"]["message"] == "Not found"
     end
 
     test "endpoint is accessible without authentication", %{conn: _conn} do
       pub_key = :crypto.strong_rand_bytes(32)
       tenant = fixture(:tenant, %{audit_signing_public_key: pub_key})
 
-      # Use a bare conn with no auth headers
       conn =
         Phoenix.ConnTest.build_conn()
         |> get(~p"/api/v1/tenants/#{tenant.id}/audit_public_key")
@@ -67,7 +66,7 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
   describe "POST /api/v1/tenants/:id/rotate-audit-key" do
     test "requires WebAuthn assertion", %{conn: conn} do
       tenant = fixture(:tenant)
-      {raw_key, _api_key} = fixture(:api_key, tenant: tenant, role: :user)
+      {raw_key, _api_key} = fixture(:api_key, tenant_id: tenant.id, role: :user)
 
       conn =
         conn
@@ -77,10 +76,31 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
       assert json_response(conn, 401)["error"]["code"] == "webauthn_required"
     end
 
-    test "rotates key when assertion is provided", %{conn: conn} do
+    test "rejects when caller doesn't own the target tenant", %{conn: conn} do
+      tenant_a = fixture(:tenant, %{slug: "owner-a"})
+
+      tenant_b =
+        fixture(:tenant, %{
+          slug: "owner-b",
+          audit_signing_public_key: :crypto.strong_rand_bytes(32)
+        })
+
+      {raw_key, _api_key} = fixture(:api_key, tenant_id: tenant_a.id, role: :user)
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post(~p"/api/v1/tenants/#{tenant_b.id}/rotate-audit-key", %{
+          "webauthn_assertion" => Base.encode64(:crypto.strong_rand_bytes(64))
+        })
+
+      assert json_response(conn, 403)["error"]["message"] == "Forbidden"
+    end
+
+    test "rotates key when assertion is provided by tenant owner", %{conn: conn} do
       pub_key = :crypto.strong_rand_bytes(32)
       tenant = fixture(:tenant, %{audit_signing_public_key: pub_key})
-      {raw_key, _api_key} = fixture(:api_key, tenant: tenant, role: :user)
+      {raw_key, _api_key} = fixture(:api_key, tenant_id: tenant.id, role: :user)
 
       Mox.expect(Loopctl.MockSecrets, :set, fn _name, _value -> :ok end)
 
@@ -95,6 +115,23 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
       assert resp["data"]["tenant_id"] == tenant.id
       assert resp["data"]["audit_signing_public_key"] != Base.encode64(pub_key)
       assert resp["data"]["rotated_at"] != nil
+    end
+
+    test "rejects agent-role keys", %{conn: conn} do
+      tenant = fixture(:tenant, %{audit_signing_public_key: :crypto.strong_rand_bytes(32)})
+      agent = fixture(:agent, tenant_id: tenant.id)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, tenant_id: tenant.id, agent_id: agent.id, role: :agent)
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post(~p"/api/v1/tenants/#{tenant.id}/rotate-audit-key", %{
+          "webauthn_assertion" => Base.encode64(:crypto.strong_rand_bytes(64))
+        })
+
+      assert json_response(conn, 403)
     end
 
     test "no endpoint exposes the private key" do

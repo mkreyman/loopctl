@@ -62,7 +62,9 @@ defmodule Loopctl.Secrets.FlyAdapter do
              headers: [
                {"authorization", "Bearer #{token}"},
                {"content-type", "application/json"}
-             ]
+             ],
+             connect_options: [timeout: 10_000],
+             receive_timeout: 15_000
            ) do
         {:ok, %{status: 200, body: %{"data" => %{"setSecrets" => _}}}} ->
           :ok
@@ -112,7 +114,9 @@ defmodule Loopctl.Secrets.FlyAdapter do
              headers: [
                {"authorization", "Bearer #{token}"},
                {"content-type", "application/json"}
-             ]
+             ],
+             connect_options: [timeout: 10_000],
+             receive_timeout: 15_000
            ) do
         {:ok, %{status: 200}} -> :ok
         {:error, reason} -> {:error, reason}

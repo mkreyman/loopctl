@@ -26,6 +26,9 @@ defmodule Loopctl.TenantKeys do
   """
   @spec init_cache() :: :ok
   def init_cache do
+    # Public access: rotation runs in request processes that need to
+    # invalidate cache entries. A GenServer wrapper would be cleaner
+    # but adds complexity for a cache that only holds ephemeral data.
     :ets.new(@cache_table, [:named_table, :set, :public, read_concurrency: true])
     :ok
   rescue
