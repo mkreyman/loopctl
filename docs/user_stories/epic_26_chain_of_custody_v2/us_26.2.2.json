@@ -61,7 +61,7 @@
     },
     {
       "id": "AC-26.2.2.10",
-      "description": "Migration adds `stories.implementer_dispatch_id`, `stories.verifier_dispatch_id`, `stories.verifier_needed` columns. The Phase 2 cutover is an atomic operation: Phase 1 ships the enforcement flag for `lineage_prefix_overlap` in :shadow mode; the operator runs a one-shot backfill script that creates dispatches for any in-flight stories (associating them with the legacy long-lived key as an implicit root dispatch); then the flag flips to :strict. After the flip, all stories have non-null dispatch references and the legacy agent_id comparison is removed from the call site entirely. No dual path remains.",
+      "description": "Migration adds `stories.implementer_dispatch_id`, `stories.verifier_dispatch_id`, `stories.verifier_needed` columns. The migration runs a one-shot backfill in the same transaction: for every in-flight story with a non-null `assigned_agent_id`, it synthesizes a dispatch row (from the agent's long-lived api_key, treated as an implicit root dispatch) and sets `implementer_dispatch_id`. After the backfill, all stories have non-null implementer_dispatch_id. The legacy agent_id comparison is deleted from the call site in the same commit. No dual path, no flag, no shadow mode — the migration either succeeds in full or the deploy rolls back.",
       "status": "pending"
     },
     {
@@ -173,11 +173,10 @@
     "Rotating verifier selection: use `:crypto.hash/2` seeded with `tenant_audit_private_key || story_id || current_day` to derive a deterministic but unpredictable index into the eligible pool. Document that this reseeds daily to prevent long-term prediction.",
     "Deterministic but unpredictable: the selection is reproducible given the seed, but the orchestrator cannot predict it without the private audit key.",
     "Webhook alert for verifier_needed: use the existing Loopctl.Webhooks infrastructure with event_type `story.verifier_needed`.",
-    "Legacy stories (implementer_dispatch_id is nil) during the deprecation window: fall back to the old agent_id comparison. After the cutover, require the dispatch-based check.",
+    "After the backfill migration, implementer_dispatch_id is NOT NULL for all rows. A NOT NULL constraint is added in the same migration after the backfill step runs. Any code path referencing the legacy agent_id comparison is deleted in the same commit.",
     "Reference: docs/chain-of-custody-v2.md sections 6.2 and 6.3."
   ],
   "dependencies": [
-    "US-26.0.0",
     "US-26.2.1"
   ],
   "estimated_hours": 10

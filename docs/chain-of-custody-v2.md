@@ -640,7 +640,7 @@ Loss of all enrolled authenticators is a fatal event for the tenant. Recovery re
 
 ## 10. Phase plan
 
-Seven phases, numbered to reflect dependency order. Each phase is independently shippable and strictly safer than the phase before.
+Seven phases, numbered to reflect dependency order. Each phase is a set of PRs that land on the long-running epic branch `research/chain-of-custody-v2`. Master stays on v1 throughout. The cutover is a single atomic event: the final PR that merges the epic branch into master.
 
 ### Phase 0 — Tenant signup ceremony + system articles foundation
 
@@ -657,8 +657,6 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - `GET /wiki/:slug` LiveView for rendering system articles as HTML
 - `POST /api/v1/articles` updated to honor scope, with scope `:system` requiring the root operator key
 
-**Shippable**: yes. Existing tenants remain on spec_version 1 and operate unchanged until upgraded.
-
 ### Phase 1 — Audit chain + nil-fall-through fixes
 
 **Goal**: close the nil-permissive bypasses and establish the tamper-evident audit log.
@@ -666,14 +664,12 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - `audit_chain` table with hash-chained entries
 - Triggers enforcing append-only semantics and hash chain validity
 - `audit_signed_tree_heads` table and the STH computation job (Oban)
-- Refactor every `validate_not_self_*` function in `Loopctl.Progress` to reject nil identity as `{:error, :self_*_blocked}`
+- Refactor every `validate_not_self_*` function in `Loopctl.Progress` to reject nil identity as `{:error, :self_*_blocked}` — the `:ok` fall-through is deleted from source
 - FK constraint on `api_keys.agent_id` (nullable only for `role = :user`)
 - Partial unique index on `api_keys (tenant_id, agent_id) WHERE revoked_at IS NULL AND role != 'user'`
 - Immutability trigger on `api_keys.role`
-- Discovery migration that flags pre-existing cross-role bindings and nil-agent keys for operator review (does not auto-revoke — operator triage)
+- Discovery mix task that surfaces pre-existing cross-role bindings and nil-agent keys for operator review before the epic merge
 - Error responses for the new rejection paths include `remediation` and `learn_more` fields pointing at the system articles
-
-**Shippable**: yes. Legacy API callers see new 403s for previously-permissive operations, with clear remediation.
 
 ### Phase 2 — Dispatch lineage + ephemeral keys
 
@@ -684,11 +680,9 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - Ephemeral api_key minting at dispatch time (new api_key with expires_at set)
 - Lineage-based `validate_not_self_*` replacement
 - Rotating verifier selection at `request_review` time
-- Deprecation of `LOOPCTL_AGENT_KEY` long-lived env var pattern with loud warnings
-- Orchestrator skill updated to use dispatches instead of the env var
-- Loopctl MCP server updated to present dispatch flow in tool descriptions
-
-**Shippable**: yes. The dispatch endpoint ships in shadow mode (legacy long-lived keys still resolve to an implicit root dispatch, shadow events log every resolution), then the flag flips to strict — from that moment the long-lived key path is removed entirely and only ephemeral dispatches are accepted.
+- One-shot backfill migration creating a synthesized root dispatch for every existing non-user api_key, writing `api_keys.dispatch_id` for each
+- Orchestrator skill updated (sibling PR in claude-config) to use dispatches instead of the env var
+- Loopctl MCP server v2 updated to present dispatch flow in tool descriptions (released at epic merge via US-26.R.1)
 
 ### Phase 3 — Capability tokens
 
@@ -702,8 +696,6 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - Error responses for cap failures include the remediation path
 - System articles updated with the cap scheme
 
-**Shippable**: yes. Cap verification ships in shadow mode for a 7-day observation window, then flips to strict via the enforcement flag. After the flip, the missing-capability path is the only behavior — no permissive fallback remains.
-
 ### Phase 4 — Independent re-execution
 
 **Goal**: SWE-bench-style verification of work.
@@ -714,22 +706,19 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - GitHub Actions integration: query CI status for a commit SHA and use it as verification evidence
 - Fallback verification runner on Fly.io (an ephemeral machine that clones, tests, reports)
 - Content-addressed commit SHA fetching and storage
-- `verify_story` endpoint refactored to enqueue a verification run instead of transitioning directly
+- `verify_story` endpoint refactored to enqueue a verification run instead of transitioning directly (200→202 shape change lands atomically with the epic merge)
 - Operator dashboard for `manual:` criteria requiring human review
-
-**Shippable**: yes. The one-time backfill converts existing stories' jsonb-blob ACs into `story_acceptance_criteria` rows with `{type: "manual", description: "legacy"}` bindings. Stories contracted after the phase ship must declare real bindings at contract time — the check ships in shadow mode first, then strict after a 7-day observation window.
+- One-time backfill converts existing stories' jsonb-blob ACs into `story_acceptance_criteria` rows with `{type: "manual", description: "legacy"}` bindings
 
 ### Phase 5 — Witness protocol
 
 **Goal**: cross-agent tamper evidence via PubSub-broadcast STHs.
 
 - PubSub topic per tenant for audit chain events
-- Agent-side STH caching (implemented in the MCP server library)
-- `X-Loopctl-Last-Known-STH` request header validation
+- Agent-side STH caching (implemented in the MCP server library, shipped in v2)
+- `X-Loopctl-Last-Known-STH` request header validation — required on every authenticated request after the epic merge
 - Divergence detection and halt
 - System article explaining how agents contribute to tamper evidence
-
-**Shippable**: yes. Header validation ships in shadow mode for 7 days (missing header is logged but allowed), then the enforcement flag flips to strict — from that moment the header is required on every custody request.
 
 ### Phase 6 — Behavioral telemetry
 
@@ -741,37 +730,42 @@ Seven phases, numbered to reflect dependency order. Each phase is independently 
 - CoT sanity monitor (non-blocking, non-trained) running on review records
 - Alert dashboard for anomalies
 
-**Shippable**: yes. Telemetry is non-blocking by design — scores route stories for stricter re-review, they never reject custody operations directly.
+Telemetry is non-blocking by design — scores route stories for stricter re-review, they never reject custody operations directly.
 
-## 11. Migration notes — hard cutover strategy
+## 11. Migration notes — epic branch workflow
 
-Loopctl.com is a single-tenant production deployment. The cutover from v1 to v2 is global and one-shot per invariant: every new check ships first in shadow mode (logs would-have-rejected events without blocking), then flips to strict via a single config change after the operator reviews the shadow-mode dashboard and confirms no false positives.
+Loopctl.com is a single-tenant production deployment. The cutover from v1 to v2 is global and atomic: one PR merges the long-running epic branch `research/chain-of-custody-v2` into master, and that merge is the cutover.
 
-No deprecation windows. No legacy compatibility shims. No `tenants.protocol_version` column. No per-story version gating. The `Loopctl.Enforcement.check/3` call site is the uniform enforcement path — the config flag controls whether it rejects or allows, but the call site is the same in both modes. At no point does the codebase contain a parallel "v1 path" and "v2 path" — there is one path, with one flag.
+**No flags. No shadow mode. No observation windows. No parallel v1/v2 call paths in the codebase. No deprecation period. No cleanup story after the fact.** The migration either succeeds in full at epic-merge time or the deploy rolls back and the epic branch gets another iteration.
 
-### Cutover sequence per phase
+### Epic branch workflow
 
-1. **Ship phase code with enforcement flags set to `:shadow`**. New checks log to `enforcement_shadow_events` but do not reject.
-2. **Observe for 7 days** via the `/admin/shadow-events` dashboard. Review every would-reject event. If any are false positives (a check rejecting a legitimate request the operator did not intend to block), fix the check and restart the observation window.
-3. **Flip the flag to `:strict`** via `PATCH /api/v1/admin/enforcement/:invariant`. The flip is immediate and global. From that moment, the check rejects matching requests. The flip is audit-logged.
-4. **No rollback to shadow** is expected in normal operation, but the flag can be flipped back via the same endpoint if a production issue surfaces. Flipping back does not require a deploy.
+1. **Long-running branch**: `research/chain-of-custody-v2`, forked from master at Phase 0 start. Master stays on v1 throughout the epic.
+2. **Phase PRs target the epic branch**, not master. Each phase is one or more PRs that land on `research/chain-of-custody-v2`. The usual review cycle applies. The epic branch is deployed to a staging Fly.io app for integration testing.
+3. **The epic branch is rebased onto master periodically** to keep master-side hotfixes reflected. Conflicts are resolved on the epic branch.
+4. **The final integration PR merges `research/chain-of-custody-v2` into master**. This PR is the cutover. Its merge commit is the only atom that matters — before the merge, prod is v1; after the merge, prod is v2.
+5. **The merge migration is transactional**: all schema changes (new tables, CHECK constraints, NOT NULL additions, backfill DML, FK constraints, immutability triggers) run inside a single Ecto.Migrator invocation. If any step fails — a pre-existing row violates a new CHECK, for example — the whole migration rolls back and the deploy is aborted.
+6. **Pre-merge violation triage**: the violator discovery dashboard (US-26.1.4) runs on the epic branch against a snapshot of prod data in staging. Every violation the dashboard surfaces must be resolved (via operator action on prod) before the integration PR is merged. When the dashboard reports zero pending violations, the merge is safe.
+7. **mcp-server v2 and claude-config skill updates land in sibling PRs** timed to the integration PR. The npm publish ceremony (US-26.R.1) runs immediately after the merge so the first post-merge orchestrator session restart picks up v2 transparently.
 
 ### Pre-existing data handling
 
-Every invariant that could be violated by pre-existing data gets a discovery pass before its strict cutover:
+Every invariant that could be violated by pre-existing data is enforced by a CHECK constraint or NOT NULL added in the merge migration. The migration includes in-transaction backfills for data it can fix automatically:
 
-- **Cross-role api_key bindings**: discovered at Phase 1 ship, surfaced in `/admin/violators`. Operator must revoke conflicting keys before flipping the `cross_role_binding` flag to strict. Migration checks the violator count and refuses to set strict if any unresolved.
-- **Nil-agent non-user keys**: same pattern — discovered, surfaced, operator resolves, then flag flips.
-- **Stories without `verification_criterion`**: backfilled with `manual:legacy` bindings. Operator can re-annotate them with real bindings via the admin dashboard before the `missing_verification_criterion_on_contract` flag flips.
-- **Audit chain gap before Phase 1**: the genesis entry is written at the moment Phase 1 ships. Historical data from the pre-v2 `audit_log` table remains readable but is NOT part of the hash-chained history. A followup migration after Phase 1 stabilizes can optionally copy historical entries into an immutable archive table if needed for compliance.
+- **Cross-role api_key bindings**: no automatic fix — the operator must revoke one of the conflicting keys via `/admin/violators` before the integration PR is merged. The partial unique index added at merge time will refuse to apply if any conflicts remain, causing the migration to roll back.
+- **Nil-agent non-user keys**: same pattern — operator resolves via the dashboard before merge; CHECK constraint refuses to apply otherwise.
+- **Long-lived api_keys without a dispatch row**: backfill migration synthesizes a root dispatch for each and writes `api_keys.dispatch_id`. Runs in the same transaction as the NOT NULL + FK add.
+- **Stories without an `implementer_dispatch_id`**: backfill synthesizes a dispatch from the `assigned_agent_id` and writes the column. Runs in the same transaction as the NOT NULL add.
+- **Stories without `story_acceptance_criteria` rows**: backfill converts the jsonb-blob ACs into rows with `manual:legacy` bindings. Operator can re-annotate after the merge via the admin dashboard; the schema accepts both legacy and real bindings on the same table.
+- **Audit chain gap before the merge**: the genesis entry is written as part of the merge migration. Historical data from the pre-v2 `audit_log` table remains readable but is NOT part of the hash-chained history. A followup story may copy historical entries into an archive table for compliance, but that is not part of the epic.
 
-### Observation-to-strict windows
+### Integration testing on the epic branch
 
-The 7-day shadow window per phase is the default; the operator can extend it for phases where the observation reveals more edge cases than expected. There is no fixed calendar deadline for each cutover — the flip happens when the shadow data looks clean, not on a clock.
+Before opening the final integration PR, the epic branch is deployed to a staging Fly.io app (`loopctl-v2-staging`) with a recent prod snapshot restored into its database. The violator dashboard runs against that snapshot. Any violation surfaced by staging is fixed on prod (operator action) and the snapshot is refreshed. When staging reports zero violations AND the full test suite passes AND the orchestrator can end-to-end drive a story through the new flow, the integration PR is opened.
 
-### After all flags are strict
+### Rollback plan
 
-Once every enforcement flag has been in `:strict` mode stably for 30 days post-Phase-6, a final cleanup story can remove the config flag machinery entirely and inline the strict behavior directly into the call sites. That cleanup is tracked as a future story after Epic 26 wraps — it is NOT part of any Phase 0-6 story to avoid coupling the feature work to the cleanup.
+If the merge migration rolls back post-deploy (e.g., a violation was missed in staging), master remains on v1 and the deploy is unchanged — the transaction guarantees this. The epic branch gets another iteration to address whatever the migration caught, and a new integration PR is opened. There is no "partial v2" state to clean up because the migration is all-or-nothing.
 
 ## 12. Open questions
 

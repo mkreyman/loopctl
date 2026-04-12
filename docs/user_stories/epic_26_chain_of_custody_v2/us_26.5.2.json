@@ -48,7 +48,7 @@
     },
     {
       "id": "AC-26.5.2.9",
-      "description": "The witness-header requirement is routed through enforcement flag `:witness_header_missing`. In shadow mode the plug logs every request missing the header (or carrying a stale one) but allows it through. When the operator flips the flag to `:strict`, the plug rejects the request with 412 Precondition Required and a remediation pointing at `/wiki/witness-protocol`. The shadow mode branch and the strict branch use the same plug — only the flag determines whether a violation results in reject."
+      "description": "The witness header is REQUIRED on every authenticated request post-merge. Missing header → 412 Precondition Required with error code `witness_header_missing` and remediation pointing at `/wiki/witness-protocol`. Stale header (position < server current STH position - 1) → same 412. The requirement ships atomically at the epic merge alongside the mcp-server v2 update that attaches the header — no flag, no shadow mode, no logging-only branch."
     },
     {
       "id": "AC-26.5.2.10",
@@ -92,9 +92,9 @@
     "Signature prefix comparison: compare the first 16 bytes of the STH signature (64 bytes total). Prefix is enough for divergence detection and keeps the header short.",
     "Halt state is stored on the tenants table. All custody endpoints check this at the plug level.",
     "Clear-halt endpoint is separate from the normal admin API to require WebAuthn.",
-    "Enforcement flag: :witness_header_missing starts in :shadow when Phase 5 ships. Operator observes the dashboard for 7 days, confirms all active agents have been updated, then flips to :strict via the admin endpoint.",
+    "Header requirement ships enforced from the epic merge commit. mcp-server v2 (released in the same merge window via US-26.R.1) attaches the header on every call, so there is no window where valid v2 clients lack it.",
     "Reference: docs/chain-of-custody-v2.md section 4.4 and section 2.7 (halt on byzantine)."
   ],
-  "dependencies": ["US-26.0.0", "US-26.5.1"],
+  "dependencies": ["US-26.5.1"],
   "estimated_hours": 10
 }

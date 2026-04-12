@@ -12,7 +12,7 @@
     "i_want_to": "mint ephemeral dispatch-scoped api_keys at the moment I spawn each sub-agent, via the new `POST /api/v1/dispatches` endpoint and a corresponding `mcp__loopctl__dispatch` tool, with the orchestrator skill and mcp-server README updated to reflect the new workflow",
     "so_that": "I no longer share a long-lived LOOPCTL_AGENT_KEY across sub-agents, and my orchestration flow matches the chain-of-custody invariants the server now enforces"
   },
-  "rationale": "The database invariants (US-26.1.3) and lineage-based self-check (US-26.2.2) will reject orchestration flows that rely on a shared LOOPCTL_AGENT_KEY. Without this story updating the orchestrator skill and the mcp-server, every existing orchestrator session would hit trust-model errors it doesn't know how to recover from. This story ships the agent-facing migration so existing orchestrators can cut over cleanly within a 30-day deprecation window.",
+  "rationale": "The database invariants (US-26.1.3) and lineage-based self-check (US-26.2.2) will reject orchestration flows that rely on a shared LOOPCTL_AGENT_KEY. Without this story updating the orchestrator skill and the mcp-server, every existing orchestrator session would hit trust-model errors it doesn't know how to recover from. This story ships the agent-facing migration so running sessions pick up the new dispatch-minting pattern on next restart after the epic merge.",
   "acceptance_criteria": [
     {
       "id": "AC-26.2.3.1",
@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-26.2.3.3",
-      "description": "mcp-server version bumps to 2.0.0 (breaking change). Changelog entry describes the new dispatch requirement. Old mcp-server v1.x clients will continue to work during the deprecation window with a warning in response metadata pointing at the new pattern.",
+      "description": "mcp-server version bumps to 2.0.0 (breaking change). Changelog entry describes the new dispatch requirement. The v1.x client is incompatible after the epic merge — users must update before their next session or calls will fail with `missing_dispatch`. The v2 release coordinates with the epic merge (US-26.R.1 handles the npm publish ceremony).",
       "status": "pending"
     },
     {
@@ -46,12 +46,12 @@
     },
     {
       "id": "AC-26.2.3.7",
-      "description": "While the `lineage_prefix_overlap` enforcement flag is `:shadow`, calls using a legacy long-lived LOOPCTL_AGENT_KEY are resolved via an implicit-root-dispatch shim: the auth plug looks up the key and synthesizes a dispatch row for it on the fly, binding it to the operator's root dispatch from tenant signup. The synthesis is invisible to callers — existing orchestrator sessions continue working unchanged. Every synthesis is logged as a shadow event so the operator can see how many calls still rely on the legacy path before flipping the flag.",
+      "description": "One-shot backfill migration runs at epic-merge time: every existing long-lived api_key (agent or orchestrator role) gets a synthesized root dispatch row inserted and its id written to `api_keys.dispatch_id`. After the backfill, every non-user api_key references a dispatches row. The backfill is part of the epic merge PR's migration — it either completes in full or the deploy rolls back.",
       "status": "pending"
     },
     {
       "id": "AC-26.2.3.8",
-      "description": "When the operator flips the enforcement flag to `:strict`, the implicit-root-dispatch shim is removed in the same deploy. From that moment, calls without a real dispatch fail with 403 `missing_dispatch` and remediation pointing at `/wiki/dispatch-lineage`. The orchestrator skill update (sibling PR in claude-config) is coordinated to land at the same cutover moment so running sessions get the new pattern on restart.",
+      "description": "After the backfill, the auth plug requires every non-user api_key to have a non-null dispatch_id. Requests authenticated with a key that has no dispatch reference fail with 403 `missing_dispatch` and remediation pointing at `/wiki/dispatch-lineage`. The claude-config repo's `/loopctl:orchestrate` skill update lands as a sibling PR merged immediately before the epic merge, so running sessions pick up the new dispatch-minting pattern on restart. No shim, no shadow mode, no dual-path detection — the backfill makes the invariant trivially true for all existing keys.",
       "status": "pending"
     },
     {
@@ -61,12 +61,12 @@
     },
     {
       "id": "AC-26.2.3.10",
-      "description": "System article stub `dispatch-lineage` is reserved and linked from the tool description. Full article content is authored in US-26.3.3. A minimal placeholder article is seeded in this story so the links resolve to non-empty content during the deprecation window.",
+      "description": "System article stub `dispatch-lineage` is reserved and linked from the tool description. Full article content is authored in US-26.3.3. A minimal placeholder article is seeded in this story so the links resolve to non-empty content while Phase 3 is still being built on the epic branch.",
       "status": "pending"
     },
     {
       "id": "AC-26.2.3.11",
-      "description": "mcp-server CHANGELOG.md entry for 2.0.0: lists the new tool, the deprecation of the shared-key pattern, the migration URL, and the cutover date.",
+      "description": "mcp-server CHANGELOG.md entry for 2.0.0: lists the new tool, the removal of the shared-key pattern, the migration URL, and the epic merge commit SHA as the cutover anchor (filled in by US-26.R.1 at release time).",
       "status": "pending"
     },
     {
@@ -96,35 +96,36 @@
     },
     {
       "id": "TC-26.2.3.2",
-      "name": "Legacy long-lived key gets deprecation warning in response",
+      "name": "Backfilled long-lived key has dispatch association",
       "type": "integration",
       "preconditions": [
-        "tenant with a long-lived (pre-epic-26) agent api_key",
-        "Deprecation window active"
+        "tenant with a pre-epic-26 agent api_key",
+        "Backfill migration has run"
       ],
       "steps": [
-        "GET /api/v1/projects using the legacy key"
+        "Query api_keys for the key's dispatch_id",
+        "Query dispatches for the synthesized row"
       ],
       "expected_results": [
-        "Response 200 (still works)",
-        "X-Loopctl-Deprecation-Warning header present",
-        "Body _meta.deprecation_warning mentions the cutover date"
+        "api_keys.dispatch_id is non-null",
+        "dispatches row has role matching the key, parent_dispatch_id is nil (root), lineage_path is [self_id]",
+        "GET /api/v1/projects using the key returns 200"
       ],
       "status": "pending"
     },
     {
       "id": "TC-26.2.3.3",
-      "name": "Post-cutover legacy key returns 410 Gone",
+      "name": "Api_key without dispatch association returns 403 missing_dispatch",
       "type": "integration",
       "preconditions": [
-        "Config :lineage_cutover_date set to a past timestamp",
-        "Legacy long-lived key"
+        "A raw api_key row inserted bypassing the backfill (simulating a test-only corruption or post-merge code path regression)"
       ],
       "steps": [
-        "GET /api/v1/projects"
+        "GET /api/v1/projects with that key"
       ],
       "expected_results": [
-        "Response 410",
+        "Response 403",
+        "Body error code is missing_dispatch",
         "Body includes remediation pointing at /wiki/dispatch-lineage"
       ],
       "status": "pending"
@@ -167,14 +168,12 @@
     "mcp-server tool addition: edit mcp-server/index.js — add to the ListToolsResponse and the CallToolRequestSchema handler switch.",
     "Version bump: mcp-server/package.json version 1.x → 2.0.0. Node engines stays >=18.",
     "The claude-config update is a sibling PR, linked from this story's description. It lives in ~/workspace/claude-config/commands/loopctl/orchestrate.md. The story's AC tracks whether the sibling PR was opened, not its merge status.",
-    "Deprecation header: add to every response that used a legacy long-lived key. The check is at the plug level — if the key has no associated dispatch, it's legacy.",
-    "Cutover config: `config :loopctl, :lineage_cutover_date, ~U[2026-05-15 00:00:00Z]` (date TBD at operator discretion).",
-    "Legacy detection: a key is 'legacy' if its id is NOT referenced by any row in the dispatches table. New dispatches always create an associated row; old keys don't.",
-    "Stub article body is ~200 words with a 'full content coming in US-26.3.3' note. This prevents broken links during the 30-day window between Phase 2 and Phase 3 ship.",
+    "Backfill migration: one-shot script in the Phase 2 merge PR that inserts a root dispatch for every existing non-user api_key and writes `api_keys.dispatch_id`. Runs inside the same transaction as the schema change — migration either succeeds in full or rolls back.",
+    "After the backfill, `api_keys.dispatch_id` is NOT NULL for all rows with `role IN ('agent', 'orchestrator')`. A CHECK constraint enforces this post-migration. The auth plug requires `dispatch_id` to resolve for every non-user key — any nil is a 403 `missing_dispatch` (only reachable via code regression since the invariant is enforced at the DB level).",
+    "Stub article body is ~200 words with a 'full content coming in US-26.3.3' note. Prevents broken links while Phase 3 is still building on the epic branch.",
     "Reference: docs/chain-of-custody-v2.md sections 6 and 10.2."
   ],
   "dependencies": [
-    "US-26.0.0",
     "US-26.2.1",
     "US-26.2.2"
   ],

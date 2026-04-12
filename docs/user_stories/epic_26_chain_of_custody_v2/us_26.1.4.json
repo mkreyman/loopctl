@@ -8,11 +8,11 @@
   "priority": "medium",
   "phase": "audit_foundation",
   "story": {
-    "as_a": "tenant operator rolling out the Chain of Custody v2 invariants to an existing deployment",
-    "i_want_to": "see a dashboard of pre-existing data that violates the new rules (cross-role agent bindings, nil-agent non-user keys, review records with nil reviewer, orphaned audit entries) with actionable remediation per row",
-    "so_that": "I can triage and resolve violations manually before the hard cutover without the system auto-deleting anything I might still need"
+    "as_a": "tenant operator preparing to merge the Chain of Custody v2 epic branch into master",
+    "i_want_to": "see a dashboard of pre-existing data that will violate the new invariants at merge time (cross-role agent bindings, nil-agent non-user keys, review records with nil reviewer, orphaned audit entries) with actionable remediation per row",
+    "so_that": "I can triage and resolve every violation manually before the epic merge, since the merge migration will roll back the entire deploy if any row violates the new CHECK constraints"
   },
-  "rationale": "Phase 1 ships new invariants that block future violations, but existing data that predates the rules is grandfathered in. Silently ignoring pre-existing violations creates false confidence — the operator will believe the system is protected when some tenants still hold exploit vectors. This story ships a read-only discovery pass + an operator-facing dashboard to surface every violation with context and remediation options. Resolution is always operator-driven, never automated.",
+  "rationale": "The epic merge adds CHECK constraints, NOT NULL columns, and FK invariants to the api_keys, stories, and audit tables. If any pre-existing row violates the new rules, the migration fails and the deploy rolls back — potentially leaving production unavailable while the operator investigates. This story ships a read-only discovery pass + an operator-facing dashboard that runs ON the epic branch (deployed to staging, or as a mix task on prod) BEFORE the final merge, surfacing every violation with context and remediation options. Resolution is always operator-driven, never automated.",
   "acceptance_criteria": [
     {
       "id": "AC-26.1.4.1",
@@ -46,7 +46,7 @@
     },
     {
       "id": "AC-26.1.4.7",
-      "description": "The dashboard shows a prominent summary: total violations, count per type, and a \"cutover countdown\" (days remaining until the hard cutover enforces the new rules strictly). The cutover date is configured in `config/config.exs` as a fixed timestamp.",
+      "description": "The dashboard shows a prominent summary: total violations, count per type, and a clear \"merge readiness\" indicator. Green when zero pending violations (the epic merge will succeed), red when any pending violation exists (the merge will roll back). No date-based countdown — the indicator is purely a function of the current violation count.",
       "status": "pending"
     },
     {
@@ -61,12 +61,12 @@
     },
     {
       "id": "AC-26.1.4.10",
-      "description": "System article at slug `pre-existing-violators` documents the triage process: what each violation type means, the recommended remediation, and what happens if a violation goes unresolved past the cutover date. Article is authored inline in this story (short — ~500-800 words).",
+      "description": "System article at slug `pre-existing-violators` documents the triage process: what each violation type means, the recommended remediation, and what happens if a violation is unresolved at epic merge time (migration fails, deploy rolls back). Article is authored inline in this story (short — ~500-800 words).",
       "status": "pending"
     },
     {
       "id": "AC-26.1.4.11",
-      "description": "CHANGELOG entry describes the discovery mechanism and the dashboard. Deployment notes explain how to configure the cutover date and how to interpret the violation counts.",
+      "description": "CHANGELOG entry describes the discovery mechanism and the dashboard. Deployment notes explain how to run the mix task on prod before the epic merge and how to interpret the violation counts.",
       "status": "pending"
     }
   ],
@@ -166,7 +166,7 @@
     "Each violation type corresponds to a specific SQL query. Example for cross-role: `SELECT tenant_id, agent_id, array_agg(DISTINCT role) FROM api_keys WHERE revoked_at IS NULL AND agent_id IS NOT NULL GROUP BY tenant_id, agent_id HAVING count(DISTINCT role) > 1`",
     "Migration for audit_pending_violations: standard fields + jsonb detail + enum status.",
     "LiveView: lib/loopctl_web/live/admin/violators_live.ex in the existing admin live_session.",
-    "Cutover date config: `config :loopctl, :chain_of_custody_v2_cutover, ~U[2026-05-15 00:00:00Z]`.",
+    "No cutover date config — the dashboard state is a pure function of the `audit_pending_violations` table row count per status.",
     "Action buttons: \"Revoke key\" calls Loopctl.Auth.revoke_api_key via the existing function. \"Reject story\" calls Progress.reject_story. Both write to audit_chain automatically.",
     "The wiki article is authored as a heredoc in the seed migration, matching the pattern from US-26.0.5.",
     "Reference: docs/chain-of-custody-v2.md section 11 (migration notes)."
