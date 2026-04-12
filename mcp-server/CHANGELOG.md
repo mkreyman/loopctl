@@ -5,6 +5,28 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.0.0 — 2026-04-12 (Chain of Custody v2)
+
+### Breaking
+
+- **Dispatch pattern required**: The shared `LOOPCTL_AGENT_KEY` pattern is
+  replaced by per-dispatch ephemeral keys minted via `POST /api/v1/dispatches`.
+  After the epic merge, long-lived agent keys without a dispatch association
+  will fail with `403 missing_dispatch`.
+
+### Added
+
+- `dispatch` tool wraps `POST /api/v1/dispatches`. Mints ephemeral api_keys
+  for sub-agents with bounded TTL and lineage tracking.
+- Tool description includes ephemeral key handling instructions.
+
+### Changed
+
+- Version bumped from 1.2.0 to 2.0.0 (semver breaking change).
+- All existing tools continue to work unchanged.
+
+---
+
 ## 1.2.0 — 2026-04-11
 
 ### Added
