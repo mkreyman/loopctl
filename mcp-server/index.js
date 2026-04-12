@@ -679,6 +679,22 @@ async function listRoutes() {
   return toContent(result);
 }
 
+// US-26.2.3: Dispatch lineage tool
+async function createDispatch({
+  parent_dispatch_id,
+  role,
+  story_id,
+  agent_id,
+  expires_in_seconds = 3600,
+}) {
+  const body = { role, agent_id, expires_in_seconds };
+  if (parent_dispatch_id) body.parent_dispatch_id = parent_dispatch_id;
+  if (story_id) body.story_id = story_id;
+
+  const result = await apiCall("POST", "/api/v1/dispatches", body);
+  return toContent(result);
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -1729,6 +1745,43 @@ const TOOLS = [
       required: [],
     },
   },
+
+  // Dispatch Tool (US-26.2.3)
+  {
+    name: "dispatch",
+    description:
+      "Mint an ephemeral api_key for a sub-agent dispatch. " +
+      "The raw_key is returned ONCE — pass it to the sub-agent via its launch arguments, " +
+      "never store it in env vars. The key expires after expires_in_seconds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent_dispatch_id: {
+          type: "string",
+          description: "UUID of the parent dispatch (omit for root dispatch).",
+        },
+        role: {
+          type: "string",
+          enum: ["agent", "orchestrator"],
+          description: "Role for the sub-agent.",
+        },
+        story_id: {
+          type: "string",
+          description: "Optional: UUID of the story this dispatch is for.",
+        },
+        agent_id: {
+          type: "string",
+          description: "UUID of the agent being dispatched.",
+        },
+        expires_in_seconds: {
+          type: "integer",
+          description: "Key lifetime in seconds (default 3600, max 14400).",
+          default: 3600,
+        },
+      },
+      required: ["role", "agent_id"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1890,6 +1943,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Discovery Tools
     case "list_routes":
       return await listRoutes();
+
+    case "dispatch":
+      return await createDispatch(args);
 
     default:
       throw new Error(`Unknown tool: ${name}`);
