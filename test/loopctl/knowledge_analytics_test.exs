@@ -519,11 +519,12 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
           name: "k1"
         })
 
+      # Use a different role for key 2 (unique index: one active key per agent+role)
       {_raw, api_key_2} =
         fixture(:api_key, %{
           tenant_id: tenant.id,
           agent_id: agent_record.id,
-          role: :orchestrator,
+          role: :agent,
           name: "k2"
         })
 
@@ -633,11 +634,12 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
           name: "k1"
         })
 
+      # Use a different role for key 2 (unique index: one active key per agent+role)
       {_raw, api_key_2} =
         fixture(:api_key, %{
           tenant_id: tenant.id,
           agent_id: agent_record.id,
-          role: :orchestrator,
+          role: :agent,
           name: "k2"
         })
 
