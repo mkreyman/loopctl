@@ -23,6 +23,8 @@ defmodule Loopctl.AuditChain do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.AuditChain.SignedTreeHead
+  alias Loopctl.TenantKeys
 
   @zero_hash :binary.copy(<<0>>, 32)
 
@@ -126,6 +128,127 @@ defmodule Loopctl.AuditChain do
       limit: 1
     )
     |> AdminRepo.one()
+  end
+
+  # --- STH functions ---
+
+  @doc """
+  Computes the SHA-256 merkle root of all entry_hashes for a tenant's chain.
+  Returns `{:ok, merkle_root_bytes}` or `{:ok, nil}` if the chain is empty.
+  """
+  @spec compute_merkle_root(Ecto.UUID.t()) :: {:ok, binary() | nil}
+  def compute_merkle_root(tenant_id) do
+    hashes =
+      from(e in Entry,
+        where: e.tenant_id == ^tenant_id,
+        order_by: [asc: e.chain_position],
+        select: e.entry_hash
+      )
+      |> AdminRepo.all()
+
+    case hashes do
+      [] -> {:ok, nil}
+      _ -> {:ok, merkle_tree(hashes)}
+    end
+  end
+
+  @doc """
+  Signs a tree head for a tenant using the tenant's audit-signing key.
+  Stores the result in `audit_signed_tree_heads`.
+
+  Returns `{:ok, %SignedTreeHead{}}` or `{:error, reason}`.
+  """
+  @spec sign_and_store_tree_head(Ecto.UUID.t()) :: {:ok, SignedTreeHead.t()} | {:error, term()}
+  def sign_and_store_tree_head(tenant_id) do
+    with {:ok, merkle_root} when not is_nil(merkle_root) <- compute_merkle_root(tenant_id),
+         %Entry{chain_position: position} <- latest_entry(tenant_id),
+         {:ok, private_key} <- TenantKeys.get_private_key(tenant_id) do
+      now = DateTime.utc_now()
+
+      message = build_sth_message(tenant_id, position, merkle_root, now)
+      signature = :crypto.sign(:eddsa, :sha512, message, [private_key, :ed25519])
+
+      sth =
+        %SignedTreeHead{tenant_id: tenant_id}
+        |> SignedTreeHead.changeset(%{
+          chain_position: position,
+          merkle_root: merkle_root,
+          signed_at: now,
+          signature: signature
+        })
+        |> AdminRepo.insert(
+          on_conflict: {:replace, [:merkle_root, :signed_at, :signature]},
+          conflict_target: [:tenant_id, :chain_position]
+        )
+
+      sth
+    else
+      {:ok, nil} -> {:error, :empty_chain}
+      nil -> {:error, :empty_chain}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Returns the latest STH for a tenant.
+  """
+  @spec get_latest_sth(Ecto.UUID.t()) :: SignedTreeHead.t() | nil
+  def get_latest_sth(tenant_id) do
+    from(s in SignedTreeHead,
+      where: s.tenant_id == ^tenant_id,
+      order_by: [desc: s.chain_position],
+      limit: 1
+    )
+    |> AdminRepo.one()
+  end
+
+  @doc """
+  Returns the smallest STH with chain_position >= the given position.
+  """
+  @spec get_sth_at_position(Ecto.UUID.t(), non_neg_integer()) :: SignedTreeHead.t() | nil
+  def get_sth_at_position(tenant_id, position) do
+    from(s in SignedTreeHead,
+      where: s.tenant_id == ^tenant_id and s.chain_position >= ^position,
+      order_by: [asc: s.chain_position],
+      limit: 1
+    )
+    |> AdminRepo.one()
+  end
+
+  @doc """
+  Checks if a new STH is needed (chain has grown since last STH).
+  """
+  @spec sth_needed?(Ecto.UUID.t()) :: boolean()
+  def sth_needed?(tenant_id) do
+    latest = latest_entry(tenant_id)
+    latest_sth = get_latest_sth(tenant_id)
+
+    case {latest, latest_sth} do
+      {nil, _} -> false
+      {_, nil} -> true
+      {entry, sth} -> entry.chain_position > sth.chain_position
+    end
+  end
+
+  # --- STH helpers ---
+
+  defp build_sth_message(tenant_id, position, merkle_root, signed_at) do
+    unix_ts = DateTime.to_unix(signed_at)
+    tenant_id <> Integer.to_string(position) <> merkle_root <> Integer.to_string(unix_ts)
+  end
+
+  defp merkle_tree([single]), do: single
+
+  defp merkle_tree(hashes) do
+    # Pad to even length by duplicating the last element
+    padded = if rem(length(hashes), 2) == 1, do: hashes ++ [List.last(hashes)], else: hashes
+
+    next_level =
+      padded
+      |> Enum.chunk_every(2)
+      |> Enum.map(fn [a, b] -> :crypto.hash(:sha256, a <> b) end)
+
+    merkle_tree(next_level)
   end
 
   # --- Private ---

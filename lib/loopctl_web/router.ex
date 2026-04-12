@@ -89,6 +89,7 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
     get "/articles/system", SystemArticleController, :index
+    get "/audit/sth/:tenant_id", AuditSthController, :show
   end
 
   scope "/swaggerui" do

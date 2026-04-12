@@ -91,7 +91,8 @@ config :loopctl, Oban,
     analytics: 3,
     maintenance: 2,
     embeddings: 5,
-    knowledge: 5
+    knowledge: 5,
+    audit: 3
   ],
   plugins: [
     {Oban.Plugins.Cron,
@@ -101,7 +102,8 @@ config :loopctl, Oban,
        {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
        {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
        {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
-       {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker}
+       {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
+       {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}}
      ]}
   ]
 
