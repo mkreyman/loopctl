@@ -10,8 +10,14 @@ defmodule Loopctl.Tenants do
   and are not subject to RLS policies.
   """
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
+  alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
+
+  @max_authenticators_per_signup 5
+  @pending_enrollment_ttl_seconds 15 * 60
 
   @doc """
   Creates a new tenant with the given attributes.
@@ -30,6 +36,177 @@ defmodule Loopctl.Tenants do
     |> Tenant.create_changeset(attrs)
     |> AdminRepo.insert()
   end
+
+  @doc """
+  US-26.0.1 — atomic tenant signup ceremony with WebAuthn enrollment.
+
+  The flow is wrapped in a single `Ecto.Multi` so a single failing
+  attestation rolls back every side effect (tenant, authenticators,
+  audit entries).
+
+  ## Params
+
+  Takes a single map with:
+  - `:name` — tenant display name (required)
+  - `:slug` — unique slug (required, validated)
+  - `:email` — contact email (required, validated)
+  - `:authenticators` — list of maps in the form
+    `%{attestation_result: %{credential_id, public_key, attestation_format, sign_count}, friendly_name: "..."}`
+    (required, length 1..5)
+
+  The caller is responsible for running WebAuthn verification on each
+  browser response and passing the normalized `attestation_result`
+  alongside the operator-supplied `friendly_name`.
+
+  ## Returns
+
+  - `{:ok, %{tenant: %Tenant{}, root_authenticators: [%RootAuthenticator{}]}}`
+  - `{:error, :no_authenticators}` — empty list
+  - `{:error, :too_many_authenticators}` — more than 5
+  - `{:error, :slug_taken}` | `{:error, :email_taken}`
+  - `{:error, %Ecto.Changeset{}}` — validation failure
+  """
+  @spec signup(map()) ::
+          {:ok, %{tenant: Tenant.t(), root_authenticators: [RootAuthenticator.t()]}}
+          | {:error, :no_authenticators}
+          | {:error, :too_many_authenticators}
+          | {:error, :slug_taken}
+          | {:error, :email_taken}
+          | {:error, Ecto.Changeset.t()}
+  def signup(attrs) when is_map(attrs) do
+    authenticators = Map.get(attrs, :authenticators) || Map.get(attrs, "authenticators") || []
+
+    cond do
+      authenticators == [] ->
+        {:error, :no_authenticators}
+
+      length(authenticators) > @max_authenticators_per_signup ->
+        {:error, :too_many_authenticators}
+
+      true ->
+        do_signup(attrs, authenticators)
+    end
+  end
+
+  defp do_signup(attrs, authenticators) do
+    # Drop the `authenticators` key from the changeset input so cast/3
+    # does not stumble over the mixed-key map.
+    tenant_attrs = Map.drop(attrs, [:authenticators, "authenticators"])
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:tenant, Tenant.signup_changeset(tenant_attrs))
+      |> insert_authenticators(authenticators)
+      |> Multi.update(:activate, fn %{tenant: tenant} ->
+        Tenant.activate_after_enrollment_changeset(tenant)
+      end)
+      |> Audit.log_in_multi(:audit_genesis, fn %{activate: tenant, authenticators: auths} ->
+        %{
+          tenant_id: tenant.id,
+          entity_type: "tenant",
+          entity_id: tenant.id,
+          action: "signed_up",
+          actor_type: "human",
+          actor_id: nil,
+          actor_label: "human:webauthn",
+          new_state: %{
+            "name" => tenant.name,
+            "slug" => tenant.slug,
+            "email" => tenant.email,
+            "authenticator_count" => length(auths),
+            "authenticator_fingerprints" => Enum.map(auths, &fingerprint(&1.credential_id))
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{activate: tenant, authenticators: authenticators}} ->
+        {:ok, %{tenant: tenant, root_authenticators: authenticators}}
+
+      {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
+        signup_changeset_error(changeset)
+
+      {:error, {:authenticator, _index}, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+    end
+  end
+
+  defp insert_authenticators(multi, authenticators) do
+    authenticators
+    |> Enum.with_index()
+    |> Enum.reduce(multi, fn {entry, index}, acc ->
+      Multi.run(acc, {:authenticator, index}, fn _repo, %{tenant: tenant} ->
+        attestation = Map.fetch!(entry, :attestation_result)
+        friendly_name = Map.get(entry, :friendly_name) || default_friendly_name(index)
+
+        attrs =
+          attestation
+          |> Map.put(:friendly_name, friendly_name)
+          |> Map.put_new(:sign_count, 0)
+
+        %RootAuthenticator{tenant_id: tenant.id}
+        |> RootAuthenticator.create_changeset(attrs)
+        |> AdminRepo.insert()
+      end)
+    end)
+    |> Multi.run(:authenticators, fn _repo, changes ->
+      result =
+        changes
+        |> Enum.filter(fn
+          {{:authenticator, _}, _} -> true
+          _ -> false
+        end)
+        |> Enum.sort_by(fn {{:authenticator, i}, _} -> i end)
+        |> Enum.map(fn {_, auth} -> auth end)
+
+      {:ok, result}
+    end)
+  end
+
+  defp default_friendly_name(0), do: "Primary authenticator"
+  defp default_friendly_name(n), do: "Backup authenticator #{n}"
+
+  defp signup_changeset_error(changeset) do
+    cond do
+      has_unique_constraint_error?(changeset, :slug) ->
+        {:error, :slug_taken}
+
+      has_unique_constraint_error?(changeset, :email) ->
+        {:error, :email_taken}
+
+      true ->
+        {:error, changeset}
+    end
+  end
+
+  defp has_unique_constraint_error?(changeset, field) do
+    Enum.any?(changeset.errors, fn
+      {^field, {_, opts}} -> Keyword.get(opts, :constraint) == :unique
+      _ -> false
+    end)
+  end
+
+  # Short, non-reversible label for the audit entry so we can tell
+  # authenticators apart in human-readable logs.
+  defp fingerprint(credential_id) when is_binary(credential_id) do
+    :crypto.hash(:sha256, credential_id)
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 16)
+  end
+
+  @doc """
+  Returns the TTL (in seconds) that the pending-enrollment cleanup
+  worker uses to expire half-finished signup attempts.
+  """
+  @spec pending_enrollment_ttl_seconds() :: pos_integer()
+  def pending_enrollment_ttl_seconds, do: @pending_enrollment_ttl_seconds
+
+  @doc """
+  Maximum number of authenticators that can be enrolled in the initial
+  signup ceremony.
+  """
+  @spec max_authenticators_per_signup() :: pos_integer()
+  def max_authenticators_per_signup, do: @max_authenticators_per_signup
 
   @doc """
   Gets a tenant by ID.

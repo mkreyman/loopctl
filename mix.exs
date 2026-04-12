@@ -98,8 +98,12 @@ defmodule Loopctl.MixProject do
       # Vector similarity search (pgvector)
       {:pgvector, "~> 0.3"},
 
+      # WebAuthn / FIDO2 attestation verification (US-26.0.1)
+      {:wax_, "~> 0.6"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
+      {:lazy_html, ">= 0.1.0", only: :test},
 
       # Code quality
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

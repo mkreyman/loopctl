@@ -19,7 +19,7 @@ defmodule Loopctl.Tenants.Tenant do
 
   @type t :: %__MODULE__{}
 
-  @statuses [:active, :suspended, :deactivated]
+  @statuses [:active, :suspended, :deactivated, :pending_enrollment]
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   @email_format ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/
   @min_retention_days 30
@@ -34,7 +34,40 @@ defmodule Loopctl.Tenants.Tenant do
     # AC-21.14.1: NULL means unlimited (no archival)
     field :token_data_retention_days, :integer
 
+    has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
+
     timestamps()
+  end
+
+  @doc """
+  US-26.0.1 — changeset for the WebAuthn signup ceremony.
+
+  The tenant is inserted with `status: :pending_enrollment` and flipped
+  to `:active` only after the authenticator rows are written. The slug
+  is normalized to lowercase kebab-case and validated against the
+  canonical regex + length rules.
+  """
+  @spec signup_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def signup_changeset(tenant \\ %__MODULE__{}, attrs) do
+    tenant
+    |> cast(normalize_signup_attrs(attrs), [:name, :slug, :email])
+    |> validate_required([:name, :slug, :email])
+    |> validate_length(:name, min: 1, max: 120)
+    |> validate_slug(min: 2, max: 64)
+    |> validate_email()
+    |> put_change(:status, :pending_enrollment)
+    |> put_change(:settings, %{})
+    |> unique_constraint(:slug)
+    |> unique_constraint(:email, name: :tenants_email_index)
+  end
+
+  @doc """
+  Marks a tenant previously created via the signup ceremony as fully
+  enrolled and ready for use.
+  """
+  @spec activate_after_enrollment_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def activate_after_enrollment_changeset(tenant) do
+    change(tenant, status: :active)
   end
 
   @doc """
@@ -83,14 +116,36 @@ defmodule Loopctl.Tenants.Tenant do
     change(tenant, status: status)
   end
 
-  defp validate_slug(changeset) do
+  defp validate_slug(changeset, opts \\ []) do
+    min = Keyword.get(opts, :min, 2)
+    max = Keyword.get(opts, :max, 63)
+
     changeset
     |> validate_format(:slug, @slug_format,
       message:
         "must be lowercase alphanumeric with hyphens, starting and ending with alphanumeric"
     )
-    |> validate_length(:slug, min: 2, max: 63)
+    |> validate_length(:slug, min: min, max: max)
   end
+
+  defp normalize_signup_attrs(attrs) when is_map(attrs) do
+    attrs
+    |> Map.new(fn
+      {key, value} when key in [:slug, "slug"] and is_binary(value) ->
+        {key, value |> String.trim() |> String.downcase()}
+
+      {key, value} when key in [:email, "email"] and is_binary(value) ->
+        {key, value |> String.trim() |> String.downcase()}
+
+      {key, value} when key in [:name, "name"] and is_binary(value) ->
+        {key, String.trim(value)}
+
+      kv ->
+        kv
+    end)
+  end
+
+  defp normalize_signup_attrs(attrs), do: attrs
 
   defp validate_email(changeset) do
     validate_format(changeset, :email, @email_format, message: "must be a valid email address")

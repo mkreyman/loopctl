@@ -100,7 +100,8 @@ config :loopctl, Oban,
        {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
        {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
        {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
-       {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker}
+       {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
+       {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker}
      ]}
   ]
 
@@ -117,6 +118,16 @@ config :loopctl, Loopctl.Vault,
 
 # DI: Content extractor for knowledge ingestion
 config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
+
+# DI: WebAuthn adapter — defaults to Wax (overridden in test env)
+config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
+
+# WebAuthn relying party configuration. `rp_id` must match the host the
+# signup LiveView is served from. Overridden in dev and prod as needed.
+config :loopctl, :webauthn,
+  rp_id: "loopctl.com",
+  origin: "https://loopctl.com",
+  user_verification: "preferred"
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

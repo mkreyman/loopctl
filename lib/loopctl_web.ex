@@ -27,6 +27,7 @@ defmodule LoopctlWeb do
       # Import common connection and controller functions to use in pipelines
       import Plug.Conn
       import Phoenix.Controller
+      import Phoenix.LiveView.Router
     end
   end
 
@@ -82,6 +83,12 @@ defmodule LoopctlWeb do
     quote do
       # HTML escaping functionality
       import Phoenix.HTML
+
+      # Core UI components (inputs, icons, flash)
+      import LoopctlWeb.CoreComponents
+
+      # Layouts — imported so LiveViews can reference `<Layouts.app .../>`
+      alias LoopctlWeb.Layouts
 
       # Shortcut for generating JS commands
       alias Phoenix.LiveView.JS

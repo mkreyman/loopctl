@@ -39,6 +39,18 @@ defmodule LoopctlWeb.Router do
     get "/docs", PageController, :docs
     get "/terms", PageController, :terms
     get "/privacy", PageController, :privacy
+
+    # US-26.0.1 — tenant signup ceremony (LiveView with WebAuthn enrollment).
+    # Lives in the public `:browser` pipeline and a dedicated
+    # `:public_signup` live_session so it mounts without a current
+    # scope. The session and onboarding routes deliberately sit
+    # outside any authenticated pipeline — signup is the only way to
+    # create a tenant and the resulting onboarding page is reachable
+    # by URL until auth scoping is added in a follow-up story.
+    live_session :public_signup do
+      live "/signup", SignupLive, :index
+      live "/tenants/:id/onboarding", TenantOnboardingLive, :index
+    end
   end
 
   # Health check — unauthenticated JSON, outside /api/v1
@@ -64,11 +76,14 @@ defmodule LoopctlWeb.Router do
   if Application.compile_env(:loopctl, :dev_routes, false) do
   end
 
-  # Public API endpoints (no auth required)
+  # Public API endpoints (no auth required).
+  #
+  # NOTE: Prior to US-26.0.1 this scope hosted `POST /api/v1/tenants/register`.
+  # Chain of Custody v2 makes `/signup` the ONLY path to create a tenant.
+  # Any POST to the old route now returns 404 via the Phoenix default
+  # router match, satisfying AC-26.0.1.7.
   scope "/api/v1", LoopctlWeb do
     pipe_through [:api, :registration_rate_limit]
-
-    post "/tenants/register", TenantController, :register
   end
 
   # API v1 — all authenticated endpoints
