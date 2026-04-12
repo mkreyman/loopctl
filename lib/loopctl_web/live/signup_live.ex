@@ -238,8 +238,14 @@ defmodule LoopctlWeb.SignupLive do
 
   defp decode_b64url(value) when is_binary(value) do
     case Base.url_decode64(value, padding: false) do
-      {:ok, decoded} -> {:ok, decoded}
-      :error -> Base.decode64(value, padding: false)
+      {:ok, decoded} ->
+        {:ok, decoded}
+
+      :error ->
+        case Base.decode64(value, padding: false) do
+          {:ok, decoded} -> {:ok, decoded}
+          :error -> {:error, :invalid_base64}
+        end
     end
   end
 

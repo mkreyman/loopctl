@@ -128,6 +128,12 @@ defmodule Loopctl.Tenants do
 
       {:error, {:authenticator, _index}, %Ecto.Changeset{} = changeset, _changes} ->
         {:error, changeset}
+
+      {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   end
 
