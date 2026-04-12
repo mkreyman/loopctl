@@ -35,8 +35,10 @@ defmodule LoopctlWeb.OpenApiTest do
       body = conn |> get("/api/v1/openapi") |> json_response(200)
       paths = Map.keys(body["paths"])
 
-      # Spot-check key endpoints are present
-      assert "/api/v1/tenants/register" in paths
+      # Spot-check key endpoints are present. US-26.0.1 removed
+      # `POST /api/v1/tenants/register` — signup is now the only
+      # tenant-creation path and it's a LiveView, not an API route.
+      assert "/api/v1/tenants/me" in paths
       assert "/health" in paths
       assert "/api/v1/projects" in paths
       assert "/api/v1/stories/{id}" in paths

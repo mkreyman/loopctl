@@ -125,6 +125,31 @@ defmodule Loopctl.DataCase do
     Req.Test.stub(Loopctl.CLI.Client, fn conn ->
       Req.Test.json(conn, %{"error" => "not stubbed"})
     end)
+
+    # Default stub for WebAuthn adapter — returns a deterministic fake
+    # registration challenge and a valid attestation result so tests that
+    # touch signup without opting in still work.
+    Mox.stub(Loopctl.MockWebAuthn, :new_registration_challenge, fn _opts ->
+      %{bytes: <<0::256>>, rp_id: "localhost"}
+    end)
+
+    Mox.stub(Loopctl.MockWebAuthn, :verify_registration, fn payload, _challenge, _opts ->
+      {:ok,
+       %{
+         credential_id: Map.get(payload, :credential_id) || :crypto.strong_rand_bytes(32),
+         public_key: <<"stub-cose-key-", :rand.uniform(1_000_000)::32>>,
+         attestation_format: "none",
+         sign_count: 0
+       }}
+    end)
+
+    Mox.stub(Loopctl.MockWebAuthn, :new_authentication_challenge, fn _opts ->
+      %{bytes: <<0::256>>, rp_id: "localhost"}
+    end)
+
+    Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _payload, _challenge, _opts ->
+      {:ok, %{sign_count: 1}}
+    end)
   end
 
   @doc """

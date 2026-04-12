@@ -121,7 +121,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         slug: %Schema{type: :string},
         email: %Schema{type: :string, format: :email},
         settings: %Schema{type: :object, additionalProperties: true},
-        status: %Schema{type: :string, enum: ["active", "suspended", "deactivated"]},
+        status: %Schema{
+          type: :string,
+          enum: ["active", "suspended", "deactivated", "pending_enrollment"]
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       },
@@ -138,20 +141,87 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
-  defmodule TenantRegistrationRequest do
+  # ---------- WebAuthn signup (US-26.0.1) ----------
+
+  defmodule WebAuthnChallenge do
     @moduledoc false
     require OpenApiSpex
 
     OpenApiSpex.schema(%{
-      title: "TenantRegistrationRequest",
-      description: "Request body for tenant registration",
+      title: "WebAuthnChallenge",
+      description:
+        "Registration challenge served by the signup LiveView and fed into " <>
+          "`navigator.credentials.create()`. All binary fields are base64url encoded.",
       type: :object,
-      required: [:name, :slug, :email],
+      required: [:challenge, :rp_id],
+      properties: %{
+        challenge: %Schema{
+          type: :string,
+          description: "Base64url-encoded challenge bytes (32 bytes by default)"
+        },
+        rp_id: %Schema{
+          type: :string,
+          description: "Relying party id — `loopctl.com` in prod, `localhost` in dev"
+        },
+        rp_name: %Schema{type: :string, example: "loopctl"},
+        user_verification: %Schema{
+          type: :string,
+          enum: ["discouraged", "preferred", "required"],
+          example: "preferred"
+        }
+      }
+    })
+  end
+
+  defmodule WebAuthnAttestation do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "WebAuthnAttestation",
+      description:
+        "Raw attestation payload posted back from the browser after calling " <>
+          "`navigator.credentials.create()`. All binary fields are base64url encoded.",
+      type: :object,
+      required: [:credential_id, :attestation_object, :client_data_json],
+      properties: %{
+        credential_id: %Schema{
+          type: :string,
+          description: "Base64url-encoded FIDO2 credential id"
+        },
+        attestation_object: %Schema{
+          type: :string,
+          description: "Base64url-encoded CBOR attestation object"
+        },
+        client_data_json: %Schema{
+          type: :string,
+          description: "Base64url-encoded JSON from the browser WebAuthn API"
+        },
+        friendly_name: %Schema{
+          type: :string,
+          description: "Operator-supplied label for this authenticator",
+          example: "Primary YubiKey"
+        }
+      }
+    })
+  end
+
+  defmodule TenantSignupRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TenantSignupRequest",
+      description:
+        "Request body submitted by the `/signup` LiveView after the operator " <>
+          "has enrolled at least one FIDO2 authenticator via WebAuthn.",
+      type: :object,
+      required: [:name, :slug, :email, :authenticators],
       properties: %{
         name: %Schema{type: :string, description: "Tenant display name", example: "My Org"},
         slug: %Schema{
           type: :string,
-          description: "Unique slug (lowercase, hyphens)",
+          description: "Unique slug (lowercase, hyphens, 2-64 chars)",
           example: "my-org"
         },
         email: %Schema{
@@ -159,52 +229,27 @@ defmodule Loopctl.ApiSpec.Schemas do
           format: :email,
           description: "Contact email",
           example: "admin@example.com"
-        }
-      },
-      example: %{name: "My Org", slug: "my-org", email: "admin@example.com"}
-    })
-  end
-
-  defmodule TenantRegistrationResponse do
-    @moduledoc false
-    require OpenApiSpex
-
-    OpenApiSpex.schema(%{
-      title: "TenantRegistrationResponse",
-      description: "Response from tenant registration, includes the raw API key (shown once)",
-      type: :object,
-      properties: %{
-        tenant: TenantResponse,
-        api_key: %Schema{
-          type: :object,
-          properties: %{
-            id: %Schema{type: :string, format: :uuid},
-            raw_key: %Schema{
-              type: :string,
-              description: "The raw API key (shown only once)",
-              example: "lc_abc123def456..."
-            },
-            key_prefix: %Schema{type: :string, example: "lc_abc1"},
-            role: %Schema{type: :string, example: "user"},
-            name: %Schema{type: :string, example: "default"}
-          }
+        },
+        authenticators: %Schema{
+          type: :array,
+          description: "1..5 WebAuthn attestations, each verified server-side",
+          items: WebAuthnAttestation,
+          minItems: 1,
+          maxItems: 5
         }
       },
       example: %{
-        tenant: %{
-          id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-          name: "My Org",
-          slug: "my-org",
-          email: "admin@example.com",
-          status: "active"
-        },
-        api_key: %{
-          id: "b2c3d4e5-f6a7-8901-bcde-f12345678901",
-          raw_key: "lc_abc123def456...",
-          key_prefix: "lc_abc1",
-          role: "user",
-          name: "default"
-        }
+        name: "My Org",
+        slug: "my-org",
+        email: "admin@example.com",
+        authenticators: [
+          %{
+            credential_id: "abc123...",
+            attestation_object: "xyz789...",
+            client_data_json: "eyJ0...",
+            friendly_name: "Primary YubiKey"
+          }
+        ]
       }
     })
   end

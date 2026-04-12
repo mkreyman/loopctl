@@ -65,6 +65,12 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Enable dev routes for dashboard and mailbox
 config :loopctl, dev_routes: true
 
+# WebAuthn relying party — localhost for development
+config :loopctl, :webauthn,
+  rp_id: "localhost",
+  origin: "http://localhost:4000",
+  user_verification: "preferred"
+
 # Do not include metadata nor timestamps in development logs
 config :logger, :default_handler,
   formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}

@@ -89,6 +89,11 @@ lib/loopctl_web/
 
 **EVERY change to loopctl must be evaluated against this checklist before merging.**
 
+**Design spec:** the Chain of Custody v2 design lives in `docs/chain-of-custody-v2.md`.
+Sections 2.1 and 9 in particular establish the human-rooted signup ceremony (WebAuthn)
+and the chain-of-custody invariants that the rest of the system relies on. Consult it
+before changing anything in the auth, signup, or audit pipelines.
+
 ### Role Hierarchy
 
 `superadmin (4) > user (3) > orchestrator (2) > agent (1)`

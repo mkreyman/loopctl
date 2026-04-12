@@ -160,13 +160,7 @@ Once running, the API is self-documenting:
 
 loopctl uses role-based API keys. Each role has specific permissions in the two-tier trust model.
 
-1. **Register as a tenant** (no auth required):
-   ```bash
-   curl -X POST http://localhost:4000/api/v1/tenants/register \
-     -H "Content-Type: application/json" \
-     -d '{"name": "My Org", "slug": "my-org", "email": "admin@example.com"}'
-   # Returns: user-role API key (lc_xxx...)
-   ```
+1. **Register as a tenant** — visit `https://loopctl.com/signup` (requires a hardware authenticator: YubiKey, Touch ID, or Windows Hello). CLI-based registration is no longer supported.
 
 2. **Create role-specific keys** (using your user key):
    ```bash
@@ -220,7 +214,7 @@ The chain-of-custody rule: nobody marks their own work as done. The implementer 
 
 ```
 Setup:
-1. Register tenant        POST /api/v1/tenants/register
+1. Register tenant        Visit /signup (WebAuthn required)
 2. Create project         POST /api/v1/projects
 3. Import stories         POST /api/v1/projects/:id/import
 4. Register agent         POST /api/v1/agents/register

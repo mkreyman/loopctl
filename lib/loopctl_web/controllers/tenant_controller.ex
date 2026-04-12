@@ -1,17 +1,20 @@
 defmodule LoopctlWeb.TenantController do
   @moduledoc """
-  Controller for tenant registration and tenant profile management.
+  Controller for tenant profile management.
 
-  - `POST /api/v1/tenants/register` — public, creates tenant + first API key
   - `GET /api/v1/tenants/me` — authenticated, returns current tenant profile
   - `PATCH /api/v1/tenants/me` — authenticated, updates current tenant
+
+  Prior to Chain of Custody v2 (US-26.0.1) this controller also hosted
+  `POST /api/v1/tenants/register`. That endpoint is removed —
+  `/signup` (the WebAuthn-gated LiveView) is now the only path to
+  create a tenant.
   """
 
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
-  alias Loopctl.Auth
   alias Loopctl.Tenants
 
   action_fallback LoopctlWeb.FallbackController
@@ -20,20 +23,6 @@ defmodule LoopctlWeb.TenantController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
 
   tags(["Tenants"])
-
-  operation(:register,
-    summary: "Register a new tenant",
-    description:
-      "Public endpoint. Creates a new tenant and first user-role API key. " <>
-        "The raw API key is returned only once.",
-    security: [],
-    request_body: {"Registration params", "application/json", Schemas.TenantRegistrationRequest},
-    responses: %{
-      201 => {"Tenant created", "application/json", Schemas.TenantRegistrationResponse},
-      409 => {"Conflict", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse}
-    }
-  )
 
   operation(:show,
     summary: "Get current tenant profile",
@@ -56,39 +45,6 @@ defmodule LoopctlWeb.TenantController do
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
-
-  @doc """
-  POST /api/v1/tenants/register
-
-  Public endpoint. Creates a new tenant and first user-role API key.
-  Returns the raw API key once.
-  """
-  def register(conn, params) do
-    case Auth.register_tenant(params) do
-      {:ok, %{tenant: tenant, raw_key: raw_key, api_key: api_key}} ->
-        conn
-        |> put_status(:created)
-        |> json(%{
-          tenant: tenant_json(tenant),
-          api_key: %{
-            id: api_key.id,
-            raw_key: raw_key,
-            key_prefix: api_key.key_prefix,
-            role: api_key.role,
-            name: api_key.name
-          }
-        })
-
-      {:error, :conflict} ->
-        {:error, :conflict}
-
-      {:error, :idempotency_key_too_long} ->
-        {:error, :unprocessable_entity, "idempotency_key must be 128 characters or fewer"}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
-    end
-  end
 
   @doc """
   GET /api/v1/tenants/me

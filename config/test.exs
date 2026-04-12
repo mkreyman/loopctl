@@ -84,6 +84,15 @@ config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 # DI: Use mock content extractor in tests
 config :loopctl, :content_extractor, Loopctl.MockContentExtractor
 
+# DI: Use mock WebAuthn adapter in tests
+config :loopctl, :webauthn_adapter, Loopctl.MockWebAuthn
+
+# WebAuthn relying party — test fixtures expect localhost
+config :loopctl, :webauthn,
+  rp_id: "localhost",
+  origin: "http://localhost:4002",
+  user_verification: "preferred"
+
 # DI: Use Req.Test plug for content ingestion URL fetching in tests
 config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
 
