@@ -100,9 +100,9 @@ defmodule Loopctl.Knowledge.SystemArticlesTest do
 
   describe "get_system_article_by_slug/1" do
     test "returns published system article by slug" do
-      article = create_system_article(%{slug: "chain-of-custody", status: :published})
+      article = create_system_article(%{slug: "test-get-by-slug", status: :published})
 
-      assert {:ok, found} = Knowledge.get_system_article_by_slug("chain-of-custody")
+      assert {:ok, found} = Knowledge.get_system_article_by_slug("test-get-by-slug")
       assert found.id == article.id
     end
 
