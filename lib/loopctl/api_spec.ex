@@ -27,7 +27,7 @@ defmodule Loopctl.ApiSpec do
     %OpenApi{
       info: %Info{
         title: "loopctl",
-        version: "0.1.0",
+        version: to_string(Application.spec(:loopctl, :vsn)),
         description:
           "Agent-native project state store for AI development loops. " <>
             "Provides multi-tenant project management, work breakdown, " <>

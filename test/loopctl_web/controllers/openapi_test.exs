@@ -13,7 +13,7 @@ defmodule LoopctlWeb.OpenApiTest do
       # Must have top-level OpenAPI keys
       assert body["openapi"] |> String.starts_with?("3.")
       assert body["info"]["title"] == "loopctl"
-      assert body["info"]["version"] == "0.1.0"
+      assert body["info"]["version"] == "1.0.0"
       assert is_map(body["paths"])
       assert is_map(body["components"])
     end
@@ -65,7 +65,7 @@ defmodule LoopctlWeb.OpenApiTest do
       body = conn |> get("/api/v1/") |> json_response(200)
 
       assert body["name"] == "loopctl"
-      assert body["version"] == "0.1.0"
+      assert body["version"] == "1.0.0"
       assert body["docs"] == "/api/v1/openapi"
       assert body["swagger_ui"] == "/swaggerui"
       assert body["health"] == "/health"

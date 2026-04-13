@@ -22,7 +22,7 @@ defmodule LoopctlWeb.WelcomeController do
            type: :object,
            properties: %{
              name: %OpenApiSpex.Schema{type: :string, example: "loopctl"},
-             version: %OpenApiSpex.Schema{type: :string, example: "0.1.0"},
+             version: %OpenApiSpex.Schema{type: :string, example: "1.0.0"},
              docs: %OpenApiSpex.Schema{type: :string, example: "/api/v1/openapi"},
              swagger_ui: %OpenApiSpex.Schema{type: :string, example: "/swaggerui"},
              health: %OpenApiSpex.Schema{type: :string, example: "/health"}
@@ -39,7 +39,7 @@ defmodule LoopctlWeb.WelcomeController do
   def index(conn, _params) do
     json(conn, %{
       name: "loopctl",
-      version: "0.1.0",
+      version: to_string(Application.spec(:loopctl, :vsn)),
       docs: "/api/v1/openapi",
       swagger_ui: "/swaggerui",
       health: "/health"
