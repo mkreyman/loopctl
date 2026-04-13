@@ -12,8 +12,14 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // ---------------------------------------------------------------------------
-// HTTP helper
+// HTTP helper — witness protocol state
 // ---------------------------------------------------------------------------
+
+// The witness protocol requires clients to echo back the last-known Signed
+// Tree Head (STH) on every authenticated request. On the very first request
+// we send X-Loopctl-STH-Bootstrap: true to receive the current STH without
+// needing one already. After that we cache and send X-Loopctl-Last-Known-STH.
+let lastKnownSTH = null;
 
 function getBaseUrl() {
   return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
@@ -43,13 +49,22 @@ async function apiCall(method, path, body, keyOverride) {
     return { error: true, status: 0, body: "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY." };
   }
 
+  const headers = {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+
+  // Witness protocol: send cached STH or request bootstrap
+  if (lastKnownSTH) {
+    headers["X-Loopctl-Last-Known-STH"] = lastKnownSTH;
+  } else {
+    headers["X-Loopctl-STH-Bootstrap"] = "true";
+  }
+
   const options = {
     method,
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
+    headers,
     signal: AbortSignal.timeout(30_000),
   };
 
@@ -66,6 +81,12 @@ async function apiCall(method, path, body, keyOverride) {
     }
     const cause = err.cause?.message ? ` (${err.cause.message})` : "";
     return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
+  }
+
+  // Witness protocol: cache the STH from response for subsequent requests
+  const sthHeader = response.headers.get("x-loopctl-current-sth");
+  if (sthHeader) {
+    lastKnownSTH = sthHeader;
   }
 
   if (response.status === 204) {
