@@ -111,6 +111,7 @@ defmodule LoopctlWeb.Router do
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
+    post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap
 
     # US-26.2.1 — Dispatch lineage
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
@@ -362,8 +363,5 @@ defmodule LoopctlWeb.Router do
 
     # US-26.5.2 — Custody halt management
     post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
-
-    # Legacy tenant audit key bootstrap
-    post "/tenants/:id/bootstrap-audit-key", AdminTenantController, :bootstrap_audit_key
   end
 end

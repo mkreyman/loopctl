@@ -11,8 +11,8 @@ defmodule LoopctlWeb.TenantAuditKeyController do
   alias Loopctl.Tenants
   alias Loopctl.WebAuthn
 
-  # Rotation requires user role — agents must not rotate keys
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:rotate]
+  # Key management requires user role — agents must not rotate/bootstrap keys
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:rotate, :bootstrap]
 
   @doc """
   GET /api/v1/tenants/:id/audit_public_key
@@ -158,6 +158,65 @@ defmodule LoopctlWeb.TenantAuditKeyController do
       challenge,
       tenant_id: tenant_id
     )
+  end
+
+  @doc """
+  POST /api/v1/tenants/:id/bootstrap-audit-key
+
+  Generates the initial ed25519 audit keypair for a legacy tenant that
+  predates the Chain of Custody v2 signup ceremony. Caller must own
+  the target tenant. Refuses if a key already exists.
+  """
+  def bootstrap(conn, %{"id" => tenant_id}) do
+    caller_tenant_id =
+      case conn.assigns do
+        %{current_api_key: %{tenant_id: tid}} -> tid
+        _ -> nil
+      end
+
+    if caller_tenant_id != tenant_id do
+      conn
+      |> put_status(:forbidden)
+      |> json(%{error: %{message: "Forbidden", status: 403}})
+    else
+      do_bootstrap(conn, tenant_id)
+    end
+  end
+
+  defp do_bootstrap(conn, tenant_id) do
+    case Tenants.bootstrap_audit_key(tenant_id) do
+      {:ok, tenant} ->
+        json(conn, %{
+          data: %{
+            tenant_id: tenant.id,
+            audit_signing_public_key: Base.encode64(tenant.audit_signing_public_key),
+            message: "Audit keypair generated. Trust layers L1, L2, L5, L6 are now active."
+          }
+        })
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+
+      {:error, :key_already_exists} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: %{
+            message: "Tenant already has an audit key. Use rotate-audit-key instead.",
+            status: 409
+          }
+        })
+
+      {:error, {:audit_key_storage_failed, _reason}} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Failed to store the audit key. Please retry.", status: 500}})
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Key bootstrap failed", status: 500}})
+    end
   end
 
   # Encode ed25519 public key as SubjectPublicKeyInfo DER wrapped in PEM.
