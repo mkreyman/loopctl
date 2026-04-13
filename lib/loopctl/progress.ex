@@ -12,6 +12,8 @@ defmodule Loopctl.Progress do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ArtifactReport
@@ -299,7 +301,9 @@ defmodule Loopctl.Progress do
       |> AdminRepo.update()
     end
   rescue
-    _ -> :ok
+    error ->
+      Logger.warning("compute_and_store_lazy_score failed: #{Exception.message(error)}")
+      :ok
   end
 
   # Adds a cap consumption step to an Ecto.Multi if cap_id is provided.

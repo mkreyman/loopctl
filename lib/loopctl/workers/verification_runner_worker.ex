@@ -80,6 +80,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       {:ok, %{status: "in_progress"}} ->
         {:snooze, 60}
 
+      {:ok, %{conclusion: other}} ->
+        Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
+
+        {:ok, _} =
+          Verification.complete_run(run, "error", %{"ci_conclusion" => other || "unknown"})
+
+        :ok
+
       {:error, reason} ->
         Logger.warning("VerificationRunner: CI check failed: #{inspect(reason)}")
         {:ok, _} = Verification.complete_run(run, "error", %{"ci_error" => inspect(reason)})

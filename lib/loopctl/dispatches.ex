@@ -69,13 +69,41 @@ defmodule Loopctl.Dispatches do
   defp do_create_dispatch(tenant_id, parsed, opts) do
     %{
       parent_id: parent_id,
-      role: role,
+      role: raw_role,
       agent_id: agent_id,
       story_id: story_id,
       expires_at: expires_at,
       now: now
     } = parsed
 
+    case normalize_role(raw_role) do
+      {:error, reason} ->
+        {:error, reason}
+
+      role ->
+        do_create_dispatch_multi(
+          tenant_id,
+          parent_id,
+          role,
+          agent_id,
+          story_id,
+          expires_at,
+          now,
+          opts
+        )
+    end
+  end
+
+  defp do_create_dispatch_multi(
+         tenant_id,
+         parent_id,
+         role,
+         agent_id,
+         story_id,
+         expires_at,
+         now,
+         opts
+       ) do
     multi =
       Multi.new()
       |> Multi.run(:resolve_lineage, fn _repo, _changes ->
@@ -90,7 +118,7 @@ defmodule Loopctl.Dispatches do
           parent_dispatch_id: parent_id,
           agent_id: agent_id,
           story_id: story_id,
-          role: normalize_role(role),
+          role: role,
           lineage_path: lineage_path,
           expires_at: expires_at,
           created_at: now

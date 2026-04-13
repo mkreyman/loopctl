@@ -28,7 +28,14 @@ defmodule LoopctlWeb.WikiIndexLive do
     # Push search to DB to avoid loading full article bodies into LiveView
     import Ecto.Query
 
-    pattern = "%#{String.downcase(query)}%"
+    escaped =
+      query
+      |> String.downcase()
+      |> String.replace("\\", "\\\\")
+      |> String.replace("%", "\\%")
+      |> String.replace("_", "\\_")
+
+    pattern = "%#{escaped}%"
 
     results =
       from(a in Loopctl.Knowledge.Article,

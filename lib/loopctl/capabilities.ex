@@ -88,10 +88,17 @@ defmodule Loopctl.Capabilities do
   an Ecto.Multi with the custody operation for atomicity.
   """
   @spec consume(CapabilityToken.t()) :: {:ok, CapabilityToken.t()} | {:error, term()}
-  def consume(%CapabilityToken{consumed_at: nil} = cap) do
-    cap
-    |> CapabilityToken.changeset(%{consumed_at: DateTime.utc_now()})
-    |> AdminRepo.update()
+  def consume(%CapabilityToken{id: id, consumed_at: nil}) do
+    import Ecto.Query
+
+    now = DateTime.utc_now()
+
+    # Atomic: only updates if consumed_at IS NULL, preventing TOCTOU race
+    case from(c in CapabilityToken, where: c.id == ^id and is_nil(c.consumed_at))
+         |> AdminRepo.update_all(set: [consumed_at: now]) do
+      {1, _} -> {:ok, %CapabilityToken{id: id, consumed_at: now}}
+      {0, _} -> {:error, :replay}
+    end
   end
 
   def consume(%CapabilityToken{consumed_at: _}), do: {:error, :replay}

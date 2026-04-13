@@ -26,6 +26,7 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.RateLimiter
     plug LoopctlWeb.Plugs.UpdateLastSeen
     plug LoopctlWeb.Plugs.ValidateWitnessHeader
+    plug LoopctlWeb.Plugs.CheckCustodyHalt
   end
 
   pipeline :registration_rate_limit do

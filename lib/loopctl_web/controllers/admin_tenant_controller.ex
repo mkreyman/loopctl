@@ -315,6 +315,17 @@ defmodule LoopctlWeb.AdminTenantController do
   def clear_halt(conn, %{"id" => id}) do
     case Tenants.clear_custody_halt(id) do
       {:ok, tenant} ->
+        # Break-glass: audit this critical operation
+        api_key = conn.assigns.current_api_key
+
+        Loopctl.AuditChain.append(tenant.id, %{
+          action: "halt_cleared",
+          actor_lineage: [],
+          entity_type: "tenant",
+          entity_id: tenant.id,
+          payload: %{"cleared_by" => api_key.id}
+        })
+
         json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
 
       {:error, :not_found} ->

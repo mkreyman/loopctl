@@ -88,6 +88,15 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
 
         _ ->
           conn
+          |> put_status(:precondition_required)
+          |> Phoenix.Controller.json(%{
+            error: %{
+              code: "witness_header_malformed",
+              status: 412,
+              message: "Position must be an integer"
+            }
+          })
+          |> halt()
       end
     else
       # No tenant context (superadmin or public) — skip divergence check
