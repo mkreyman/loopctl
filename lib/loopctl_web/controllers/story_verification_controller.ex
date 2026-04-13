@@ -156,6 +156,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, :review_not_conducted} ->
           {:error, :review_not_conducted}
 
+        {:error, :missing_capability} ->
+          {:error, :missing_capability}
+
         {:error, {:invalid_transition, _ctx} = err} ->
           {:error, err}
 
@@ -164,6 +167,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :not_found} ->
           {:error, :not_found}
+
+        {:error, other} ->
+          {:error, other}
       end
     end
   end

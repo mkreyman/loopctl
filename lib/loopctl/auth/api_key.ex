@@ -47,6 +47,10 @@ defmodule Loopctl.Auth.ApiKey do
     |> validate_required([:name, :role])
     |> validate_inclusion(:role, @roles)
     |> validate_tenant_for_role()
+    |> unique_constraint([:tenant_id, :agent_id],
+      name: :api_keys_one_role_per_agent_idx,
+      message: "agent already has an active key with this role"
+    )
   end
 
   @doc """
