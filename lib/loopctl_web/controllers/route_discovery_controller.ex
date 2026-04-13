@@ -21,6 +21,21 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/tenants/me",
         description: "Update current tenant (settings.knowledge_auto_extract, etc.)"
       },
+      %{
+        method: "POST",
+        path: "/api/v1/tenants/:id/rotate-audit-key",
+        description: "Rotate tenant audit signing keypair (requires WebAuthn)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/tenants/:id/bootstrap-audit-key",
+        description: "Generate initial audit keypair for legacy tenants (user role + ownership)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/tenants/:id/audit_public_key",
+        description: "Public endpoint — tenant Ed25519 audit signing public key (PEM or JWK)"
+      },
 
       # API key management
       %{
