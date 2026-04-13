@@ -35,19 +35,31 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
         validate_header(conn, header)
 
       [] ->
-        conn
-        |> put_status(:precondition_required)
-        |> Phoenix.Controller.json(%{
-          error: %{
-            code: "witness_header_missing",
-            status: 412,
-            message: "X-Loopctl-Last-Known-STH header is required",
-            remediation: %{
-              learn_more: "https://loopctl.com/wiki/witness-protocol"
+        # Bootstrap grace: new dispatches get their first request through
+        # with a warning header + the current STH in the response, so they
+        # can cache it. After the first request, enforcement is strict.
+        # Grace is signaled by the X-Loopctl-STH-Bootstrap: true header
+        # from the agent (opt-in, not automatic).
+        if get_req_header(conn, "x-loopctl-sth-bootstrap") == ["true"] do
+          handle_bootstrap_grace(conn)
+        else
+          conn
+          |> put_status(:precondition_required)
+          |> Phoenix.Controller.json(%{
+            error: %{
+              code: "witness_header_missing",
+              status: 412,
+              message:
+                "X-Loopctl-Last-Known-STH header is required. " <>
+                  "On your first request, include X-Loopctl-STH-Bootstrap: true " <>
+                  "to receive the current STH in the response headers.",
+              remediation: %{
+                learn_more: "https://loopctl.com/wiki/witness-protocol"
+              }
             }
-          }
-        })
-        |> halt()
+          })
+          |> halt()
+        end
     end
   end
 
@@ -144,6 +156,34 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
           })
           |> halt()
         end
+    end
+  end
+
+  defp handle_bootstrap_grace(conn) do
+    tenant_id = get_tenant_id(conn)
+    sth = if tenant_id, do: Loopctl.AuditChain.get_latest_sth(tenant_id)
+
+    sth_value =
+      if sth do
+        prefix =
+          Base.url_encode64(binary_part(sth.signature, 0, min(byte_size(sth.signature), 16)),
+            padding: false
+          )
+
+        "#{sth.chain_position}:#{prefix}"
+      else
+        "0:AAAAAAAAAAAAAAAAAAAAAA"
+      end
+
+    conn
+    |> put_resp_header("x-loopctl-current-sth", sth_value)
+    |> put_resp_header("x-loopctl-sth-warning", "missing_header_bootstrap_grace")
+  end
+
+  defp get_tenant_id(conn) do
+    case conn.assigns do
+      %{current_api_key: %{tenant_id: tid}} when not is_nil(tid) -> tid
+      _ -> nil
     end
   end
 end
