@@ -43,6 +43,7 @@ RUN mix deps.compile
 COPY priv priv
 COPY lib lib
 COPY assets assets
+COPY mcp-server/package.json mcp-server/package.json
 
 # Compile the release
 RUN mix compile
