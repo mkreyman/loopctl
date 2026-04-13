@@ -21,6 +21,15 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
 
   @impl true
   def call(conn, _opts) do
+    # Config-driven enforcement: disabled in test via config/test.exs
+    if Application.get_env(:loopctl, :enforce_witness_header, true) do
+      enforce(conn)
+    else
+      conn
+    end
+  end
+
+  defp enforce(conn) do
     case get_req_header(conn, "x-loopctl-last-known-sth") do
       [header] ->
         validate_header(conn, header)

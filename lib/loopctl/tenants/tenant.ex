@@ -36,6 +36,8 @@ defmodule Loopctl.Tenants.Tenant do
     # US-26.0.2: ed25519 public key for signing audit chain entries
     field :audit_signing_public_key, :binary
     field :audit_key_rotated_at, :utc_datetime_usec
+    # US-26.5.2: custody halt on witness divergence
+    field :custody_halted_at, :utc_datetime_usec
 
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
     has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id

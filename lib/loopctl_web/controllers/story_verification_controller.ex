@@ -16,7 +16,9 @@ defmodule LoopctlWeb.StoryVerificationController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.Progress
+  alias Loopctl.Verification
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.Workers.VerificationRunnerWorker
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -134,7 +136,19 @@ defmodule LoopctlWeb.StoryVerificationController do
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
-          json(conn, %{story: story})
+          run_id = enqueue_verification_run(tenant_id, story_id, params)
+
+          conn
+          |> put_status(:accepted)
+          |> json(%{
+            status: "verification_pending",
+            run_id: run_id,
+            story: story,
+            next_action: %{
+              description: "Poll GET /api/v1/stories/#{story_id}/verifications for results",
+              learn_more: "https://loopctl.com/wiki/verification-runs"
+            }
+          })
 
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
@@ -284,4 +298,24 @@ defmodule LoopctlWeb.StoryVerificationController do
   end
 
   defp validate_orchestrator_agent_linked(_api_key), do: :ok
+
+  # US-26.4.4.1: enqueue a verification_run and return the run_id
+  defp enqueue_verification_run(tenant_id, story_id, params) do
+    attrs = %{
+      commit_sha: Map.get(params, "commit_sha"),
+      runner_type: "ci_github"
+    }
+
+    case Verification.create_run(tenant_id, story_id, attrs) do
+      {:ok, run} ->
+        %{"run_id" => run.id, "tenant_id" => tenant_id}
+        |> VerificationRunnerWorker.new()
+        |> Oban.insert()
+
+        run.id
+
+      _ ->
+        nil
+    end
+  end
 end
