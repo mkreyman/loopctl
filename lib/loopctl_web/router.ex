@@ -355,5 +355,8 @@ defmodule LoopctlWeb.Router do
     get "/violators", AdminViolatorController, :index
     post "/violators/:id/resolve", AdminViolatorController, :resolve
     post "/violators/:id/ignore", AdminViolatorController, :ignore
+
+    # US-26.5.2 — Custody halt management
+    post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
   end
 end

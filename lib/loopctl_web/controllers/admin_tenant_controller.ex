@@ -310,4 +310,15 @@ defmodule LoopctlWeb.AdminTenantController do
   end
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
+
+  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass)"
+  def clear_halt(conn, %{"id" => id}) do
+    case Tenants.clear_custody_halt(id) do
+      {:ok, tenant} ->
+        json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+    end
+  end
 end

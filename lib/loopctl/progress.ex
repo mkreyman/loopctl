@@ -170,13 +170,22 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
+        dispatch_id = Keyword.get(opts, :dispatch_id)
 
-        story
-        |> Ecto.Changeset.change(%{
+        changes = %{
           agent_status: :assigned,
           assigned_agent_id: agent_id,
           assigned_at: now
-        })
+        }
+
+        # US-26.2.2 AC-3: record implementer's dispatch at claim time
+        changes =
+          if dispatch_id,
+            do: Map.put(changes, :implementer_dispatch_id, dispatch_id),
+            else: changes
+
+        story
+        |> Ecto.Changeset.change(changes)
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
