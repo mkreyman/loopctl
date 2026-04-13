@@ -362,5 +362,8 @@ defmodule LoopctlWeb.Router do
 
     # US-26.5.2 — Custody halt management
     post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
+
+    # Legacy tenant audit key bootstrap
+    post "/tenants/:id/bootstrap-audit-key", AdminTenantController, :bootstrap_audit_key
   end
 end

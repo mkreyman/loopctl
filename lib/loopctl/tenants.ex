@@ -230,6 +230,64 @@ defmodule Loopctl.Tenants do
   end
 
   @doc """
+  Generate an initial audit signing keypair for a legacy tenant that
+  doesn't have one yet. Refuses to overwrite an existing key — use
+  `rotate_audit_key/2` for that.
+
+  Returns `{:ok, updated_tenant}` or `{:error, reason}`.
+  """
+  @spec bootstrap_audit_key(Ecto.UUID.t()) :: {:ok, Tenant.t()} | {:error, term()}
+  def bootstrap_audit_key(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:error, _} = err ->
+        err
+
+      {:ok, %{audit_signing_public_key: existing}} when not is_nil(existing) ->
+        {:error, :key_already_exists}
+
+      {:ok, tenant} ->
+        do_bootstrap_audit_key(tenant)
+    end
+  end
+
+  defp do_bootstrap_audit_key(tenant) do
+    {pub, priv} = generate_ed25519_keypair()
+    secret_name = Secrets.audit_key_secret_name(tenant.slug)
+
+    multi =
+      Multi.new()
+      |> Multi.run(:store_secret, fn _repo, _changes ->
+        case Secrets.set(secret_name, priv) do
+          :ok -> {:ok, :stored}
+          {:error, reason} -> {:error, {:audit_key_storage_failed, reason}}
+        end
+      end)
+      |> Multi.update(:set_public_key, fn _ ->
+        Ecto.Changeset.change(tenant, audit_signing_public_key: pub)
+      end)
+      |> Audit.log_in_multi(:audit_bootstrap, fn %{set_public_key: updated} ->
+        %{
+          tenant_id: updated.id,
+          entity_type: "tenant",
+          entity_id: updated.id,
+          action: "audit_key_bootstrapped",
+          actor_type: "superadmin",
+          actor_id: nil,
+          actor_label: "superadmin:bootstrap",
+          new_state: %{
+            "audit_signing_public_key" => Base.encode64(pub),
+            "reason" => "Legacy tenant — no key existed prior to Chain of Custody v2"
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{set_public_key: tenant}} -> {:ok, tenant}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Rotate the tenant's audit signing key. Requires a WebAuthn assertion
   to authorize. Stores the old public key in `tenant_audit_key_history`,
   generates a new keypair, updates the Fly secret, and writes an audit
