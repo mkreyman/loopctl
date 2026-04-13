@@ -2,7 +2,10 @@
 
 All notable changes to loopctl are documented here.
 
-## [Unreleased]
+## [1.0.0] — 2026-04-12 — Chain of Custody v2
+
+27 stories across 7 phases implementing a six-layer trust model for
+AI agent development loops. Full spec: `docs/chain-of-custody-v2.md`.
 
 ### Added — Chain of Custody v2 / US-26.0.1
 
