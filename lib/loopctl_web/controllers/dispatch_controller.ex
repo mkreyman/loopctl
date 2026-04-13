@@ -7,6 +7,8 @@ defmodule LoopctlWeb.DispatchController do
 
   alias Loopctl.Dispatches
 
+  action_fallback LoopctlWeb.FallbackController
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :index]
 
