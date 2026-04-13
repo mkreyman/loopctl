@@ -98,6 +98,11 @@ defmodule LoopctlWeb.Router do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
 
+  # Convenience alias — agents and humans commonly try /swagger
+  scope "/" do
+    get "/swagger", LoopctlWeb.RedirectController, :swagger
+  end
+
   # Dev-only routes (dashboard, etc.)
   if Application.compile_env(:loopctl, :dev_routes, false) do
   end

@@ -606,7 +606,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       },
 
       # OpenAPI spec
-      %{method: "GET", path: "/api/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"},
+      %{method: "GET", path: "/api/v1/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"},
 
       # Superadmin endpoints
       %{

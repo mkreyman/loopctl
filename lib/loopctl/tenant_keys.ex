@@ -74,7 +74,10 @@ defmodule Loopctl.TenantKeys do
         secret_name = Secrets.audit_key_secret_name(slug)
 
         case Secrets.get(secret_name) do
-          {:ok, key} ->
+          {:ok, encoded} ->
+            # Fly secrets store keys as base64 (set via FlyAdapter.set/2).
+            # Decode to raw bytes for :crypto.sign/5.
+            key = decode_key(encoded)
             :ets.insert(@cache_table, {tenant_id, key, now + @ttl_seconds})
             {:ok, key}
 
@@ -85,6 +88,15 @@ defmodule Loopctl.TenantKeys do
 
             {:error, reason}
         end
+    end
+  end
+
+  # Keys may be stored as base64 (FlyAdapter encodes) or raw bytes (test mocks).
+  # Try base64 decode first; if it fails, assume raw bytes.
+  defp decode_key(value) when is_binary(value) do
+    case Base.decode64(value) do
+      {:ok, raw} when byte_size(raw) == 32 -> raw
+      _ -> value
     end
   end
 end
