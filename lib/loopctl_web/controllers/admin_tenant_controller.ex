@@ -311,6 +311,61 @@ defmodule LoopctlWeb.AdminTenantController do
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
 
+  @doc """
+  POST /api/v1/admin/tenants/:id/bootstrap-audit-key
+
+  Generates the initial ed25519 audit keypair for a legacy tenant that
+  predates the Chain of Custody v2 signup ceremony. Refuses to run if
+  the tenant already has a key — use rotate-audit-key for that.
+  """
+  def bootstrap_audit_key(conn, %{"id" => id}) do
+    case Tenants.bootstrap_audit_key(id) do
+      {:ok, tenant} ->
+        api_key = conn.assigns.current_api_key
+
+        Loopctl.AuditChain.append(tenant.id, %{
+          action: "audit_key_bootstrapped",
+          actor_lineage: [],
+          entity_type: "tenant",
+          entity_id: tenant.id,
+          payload: %{"bootstrapped_by" => api_key.id}
+        })
+
+        json(conn, %{
+          data: %{
+            tenant_id: tenant.id,
+            audit_signing_public_key: Base.encode64(tenant.audit_signing_public_key),
+            message: "Audit keypair generated. Trust layers L1, L2, L5, L6 are now active."
+          }
+        })
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+
+      {:error, :key_already_exists} ->
+        conn
+        |> put_status(:conflict)
+        |> json(%{
+          error: %{
+            message: "Tenant already has an audit key. Use rotate-audit-key instead.",
+            status: 409
+          }
+        })
+
+      {:error, {:audit_key_storage_failed, _reason}} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{
+          error: %{message: "Failed to store the audit key. Please retry.", status: 500}
+        })
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Key bootstrap failed", status: 500}})
+    end
+  end
+
   @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass, requires WebAuthn)"
   def clear_halt(conn, %{"id" => id} = params) do
     # G7: Break-glass requires WebAuthn assertion
