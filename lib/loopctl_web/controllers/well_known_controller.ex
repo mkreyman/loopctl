@@ -12,7 +12,10 @@ defmodule LoopctlWeb.WellKnownController do
   @base_url "https://loopctl.com"
 
   # Read the MCP server version from package.json at compile time.
-  @external_resource mcp_package = Path.join([__DIR__, "../../../../mcp-server/package.json"])
+  # Use project root (File.cwd!) rather than __DIR__ traversal — the latter
+  # breaks in Docker where __DIR__ is /app/lib/loopctl_web/controllers and
+  # ../../../../ resolves outside the /app WORKDIR.
+  @external_resource mcp_package = Path.join(File.cwd!(), "mcp-server/package.json")
   @mcp_version (case File.read(mcp_package) do
                   {:ok, contents} ->
                     contents |> Jason.decode!() |> Map.get("version", "0.0.0")
