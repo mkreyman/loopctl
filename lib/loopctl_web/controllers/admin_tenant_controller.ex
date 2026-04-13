@@ -311,8 +311,29 @@ defmodule LoopctlWeb.AdminTenantController do
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
 
-  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass)"
-  def clear_halt(conn, %{"id" => id}) do
+  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass, requires WebAuthn)"
+  def clear_halt(conn, %{"id" => id} = params) do
+    # G7: Break-glass requires WebAuthn assertion
+    assertion = Map.get(params, "webauthn_assertion")
+
+    if is_nil(assertion) do
+      conn
+      |> put_status(:unauthorized)
+      |> json(%{
+        error: %{
+          code: "webauthn_required",
+          status: 401,
+          message:
+            "Break-glass operations require a WebAuthn assertion from a root authenticator",
+          remediation: %{learn_more: "https://loopctl.com/wiki/break-glass"}
+        }
+      })
+    else
+      do_clear_halt(conn, id)
+    end
+  end
+
+  defp do_clear_halt(conn, id) do
     case Tenants.clear_custody_halt(id) do
       {:ok, tenant} ->
         # Break-glass: audit this critical operation

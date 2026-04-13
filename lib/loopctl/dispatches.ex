@@ -259,6 +259,56 @@ defmodule Loopctl.Dispatches do
   def lineage_shares_prefix?([a | _], [b | _]) when a == b, do: true
   def lineage_shares_prefix?(_, _), do: false
 
+  @doc """
+  Selects a verifier dispatch from the eligible pool for a story.
+
+  Eligible dispatches: active, non-expired, non-revoked, in the same tenant,
+  whose lineage does NOT share a prefix with the implementer's lineage.
+
+  Selection is deterministic but unpredictable to the orchestrator:
+  seeded with sha256(tenant_audit_public_key + story_id).
+
+  Returns `{:ok, dispatch}` or `{:error, :no_eligible_verifier}`.
+  """
+  @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
+          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier}
+  def select_verifier(tenant_id, story_id, implementer_lineage) do
+    now = DateTime.utc_now()
+
+    candidates =
+      from(d in Dispatch,
+        where:
+          d.tenant_id == ^tenant_id and
+            is_nil(d.revoked_at) and
+            d.expires_at > ^now and
+            d.role in [:orchestrator, :agent],
+        order_by: [asc: d.created_at]
+      )
+      |> AdminRepo.all()
+      |> Enum.reject(fn d -> lineage_shares_prefix?(d.lineage_path, implementer_lineage) end)
+
+    case candidates do
+      [] ->
+        {:error, :no_eligible_verifier}
+
+      pool ->
+        # Deterministic selection: hash(tenant_pub_key || story_id) → index
+        pub_key =
+          from(t in Loopctl.Tenants.Tenant,
+            where: t.id == ^tenant_id,
+            select: t.audit_signing_public_key
+          )
+          |> AdminRepo.one()
+
+        seed_data = (pub_key || "") <> story_id
+        hash = :crypto.hash(:sha256, seed_data)
+        <<index_seed::unsigned-64, _rest::binary>> = hash
+        selected = Enum.at(pool, rem(index_seed, length(pool)))
+
+        {:ok, selected}
+    end
+  end
+
   # --- Private ---
 
   defp mint_and_link_key(tenant_id, dispatch, agent_id, expires_at) do

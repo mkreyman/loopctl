@@ -60,7 +60,17 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       |> Loopctl.AdminRepo.one()
 
     if repo_url do
-      do_ci_check(run, repo_url)
+      case do_ci_check(run, repo_url) do
+        {:ok, :ci_checked} ->
+          :ok
+
+        {:error, :ci_unavailable} ->
+          # L3 fallback: independent test re-execution
+          do_local_test_run(run, repo_url)
+
+        other ->
+          other
+      end
     else
       {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "no_repo_url"})
       :ok
@@ -71,26 +81,45 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     case @ci_adapter.get_status(repo_url, run.commit_sha) do
       {:ok, %{conclusion: "success"}} ->
         {:ok, _} = Verification.complete_run(run, "pass", %{"source" => "ci"})
-        :ok
+        {:ok, :ci_checked}
 
       {:ok, %{conclusion: "failure"}} ->
         {:ok, _} = Verification.complete_run(run, "fail", %{"source" => "ci"})
-        :ok
+        {:ok, :ci_checked}
 
       {:ok, %{status: "in_progress"}} ->
         {:snooze, 60}
 
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
+        {:error, :ci_unavailable}
 
+      {:error, _reason} ->
+        {:error, :ci_unavailable}
+    end
+  end
+
+  # L3: independent test re-execution — clone repo, run tests, check results
+  defp do_local_test_run(run, repo_url) do
+    alias Loopctl.Verification.TestRunner
+
+    Logger.info("VerificationRunner: falling back to local test execution for #{run.id}")
+
+    case TestRunner.run_tests(repo_url, run.commit_sha) do
+      {:ok, results} ->
         {:ok, _} =
-          Verification.complete_run(run, "error", %{"ci_conclusion" => other || "unknown"})
+          Verification.complete_run(run, results.status, %{
+            "source" => "local_test_runner",
+            "tests_run" => results.tests_run,
+            "tests_passed" => results.tests_passed,
+            "tests_failed" => results.tests_failed
+          })
 
         :ok
 
       {:error, reason} ->
-        Logger.warning("VerificationRunner: CI check failed: #{inspect(reason)}")
-        {:ok, _} = Verification.complete_run(run, "error", %{"ci_error" => inspect(reason)})
+        Logger.error("VerificationRunner: local test run failed: #{inspect(reason)}")
+        {:ok, _} = Verification.complete_run(run, "error", %{"local_error" => inspect(reason)})
         :ok
     end
   end

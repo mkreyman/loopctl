@@ -125,27 +125,60 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   def call(conn, {:error, :self_verify_blocked}) do
+    # L6: self-verify is a byzantine condition — halt the tenant
+    halt_tenant_on_violation(conn, "self_verify_blocked")
+
     conn
     |> put_status(:conflict)
     |> json(%{
       error: %{
         status: 409,
-        message:
-          "Cannot verify your own implementation. " <>
-            "The orchestrator agent must be different from the implementing agent."
+        code: "self_verify_blocked",
+        message: "Cannot verify your own implementation. Custody operations halted.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/self-verify-blocked"}
       }
     })
   end
 
   def call(conn, {:error, :self_report_blocked}) do
+    halt_tenant_on_violation(conn, "self_report_blocked")
+
     conn
     |> put_status(:conflict)
     |> json(%{
       error: %{
         status: 409,
-        message:
-          "Cannot report your own implementation as done. " <>
-            "A different agent (the reviewer) must call POST /stories/:id/report to confirm."
+        code: "self_report_blocked",
+        message: "Cannot report your own implementation. Custody operations halted.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/self-report-blocked"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :missing_capability}) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "missing_capability",
+        message: "A capability token is required for this operation.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
+      }
+    })
+  end
+
+  def call(conn, {:error, {:cap_rejected, reason}}) do
+    halt_tenant_on_violation(conn, "cap_rejected")
+
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "cap_rejected",
+        message: "Capability token rejected: #{reason}. Custody operations halted.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/capability-tokens"}
       }
     })
   end
@@ -246,5 +279,28 @@ defmodule LoopctlWeb.FallbackController do
         opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
       end)
     end)
+  end
+
+  # L6: halt the tenant's custody operations on trust violations
+  defp halt_tenant_on_violation(conn, violation_type) do
+    tenant_id =
+      case conn.assigns do
+        %{current_api_key: %{tenant_id: tid}} when not is_nil(tid) -> tid
+        _ -> nil
+      end
+
+    if tenant_id do
+      Loopctl.Tenants.halt_custody(tenant_id)
+
+      Loopctl.AuditChain.append(tenant_id, %{
+        action: "custody_halted",
+        actor_lineage: [],
+        entity_type: "tenant",
+        entity_id: tenant_id,
+        payload: %{"reason" => violation_type}
+      })
+    end
+  rescue
+    _ -> :ok
   end
 end

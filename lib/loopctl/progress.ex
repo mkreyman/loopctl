@@ -296,8 +296,17 @@ defmodule Loopctl.Progress do
           "lazy_flagged" => LazyScore.flagged?(score)
         })
 
+      # If flagged: route to re-review by resetting verifier
+      changes =
+        if LazyScore.flagged?(score) do
+          Logger.warning("Lazy-bastard flagged: story=#{story.id} score=#{score}")
+          %{metadata: metadata, verifier_needed: true, verifier_dispatch_id: nil}
+        else
+          %{metadata: metadata}
+        end
+
       story
-      |> Ecto.Changeset.change(metadata: metadata)
+      |> Ecto.Changeset.change(changes)
       |> AdminRepo.update()
     end
   rescue
@@ -306,10 +315,19 @@ defmodule Loopctl.Progress do
       :ok
   end
 
-  # Adds a cap consumption step to an Ecto.Multi if cap_id is provided.
-  # When cap_id is nil, passes through (backward compatible with callers
-  # that don't yet provide caps).
-  defp maybe_consume_cap(multi, _tenant_id, _story_id, nil, _typ, _lineage), do: multi
+  # Adds a cap consumption step to an Ecto.Multi.
+  # When cap_id is nil: rejects with :missing_capability if the tenant
+  # has an audit key (v2 tenant). Pre-v2 tenants (no audit key) pass
+  # through for backward compatibility during migration.
+  defp maybe_consume_cap(multi, tenant_id, _story_id, nil, _typ, _lineage) do
+    Multi.run(multi, :consume_cap, fn _repo, _changes ->
+      if tenant_has_audit_key?(tenant_id) do
+        {:error, :missing_capability}
+      else
+        {:ok, :pre_v2_tenant}
+      end
+    end)
+  end
 
   defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
     Multi.run(multi, :consume_cap, fn _repo, _changes ->
@@ -323,6 +341,38 @@ defmodule Loopctl.Progress do
         {:error, reason} -> {:error, {:cap_rejected, reason}}
       end
     end)
+  end
+
+  # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator
+  defp assign_rotating_verifier(tenant_id, story_id, story) do
+    impl_lineage =
+      if story.implementer_dispatch_id,
+        do: get_dispatch_lineage(tenant_id, story.implementer_dispatch_id),
+        else: []
+
+    case Dispatches.select_verifier(tenant_id, story_id, impl_lineage) do
+      {:ok, verifier} ->
+        story |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id) |> AdminRepo.update()
+        mint_cap_best_effort(tenant_id, "verify_cap", story_id, verifier.lineage_path)
+
+        Loopctl.AuditChain.append(tenant_id, %{
+          action: "verifier_selected",
+          actor_lineage: [],
+          entity_type: "story",
+          entity_id: story_id,
+          payload: %{"verifier_dispatch_id" => verifier.id}
+        })
+
+      {:error, :no_eligible_verifier} ->
+        story |> Ecto.Changeset.change(verifier_needed: true) |> AdminRepo.update()
+    end
+  end
+
+  defp tenant_has_audit_key?(tenant_id) do
+    case AdminRepo.get(Loopctl.Tenants.Tenant, tenant_id) do
+      %{audit_signing_public_key: key} when not is_nil(key) -> true
+      _ -> false
+    end
   end
 
   @doc """
@@ -350,6 +400,7 @@ defmodule Loopctl.Progress do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    cap_id = Keyword.get(opts, :cap_id)
 
     multi =
       Multi.new()
@@ -362,6 +413,13 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
+      |> maybe_consume_cap(
+        tenant_id,
+        story_id,
+        cap_id,
+        "start_cap",
+        Keyword.get(opts, :lineage, [])
+      )
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
         |> Ecto.Changeset.change(%{
@@ -414,6 +472,9 @@ defmodule Loopctl.Progress do
         {:error, reason}
 
       {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :consume_cap, reason, _} ->
         {:error, reason}
 
       {:error, :story, changeset, _} ->
@@ -524,6 +585,7 @@ defmodule Loopctl.Progress do
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :consume_cap, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
       {:error, :artifact, changeset, _} -> {:error, changeset}
       {:error, :token_usage_report, changeset, _} -> {:error, changeset}
@@ -574,9 +636,8 @@ defmodule Loopctl.Progress do
             "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           })
 
-          # US-26.3.1 AC-7: mint a verify_cap for the verifier lineage
-          verifier_lineage = Keyword.get(opts, :verifier_lineage, [])
-          mint_cap_best_effort(tenant_id, "verify_cap", story_id, verifier_lineage)
+          # US-26.2.2 AC-4: rotating verifier selection
+          assign_rotating_verifier(tenant_id, story_id, story)
 
           # US-26.6.2: compute and store lazy-bastard score
           compute_and_store_lazy_score(tenant_id, story)
