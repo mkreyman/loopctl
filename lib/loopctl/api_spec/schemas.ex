@@ -2334,4 +2334,123 @@ defmodule Loopctl.ApiSpec.Schemas do
       }
     })
   end
+
+  # ---------- Chain of Custody v2 (Epic 26) ----------
+
+  defmodule DispatchResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "DispatchResponse",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        parent_dispatch_id: %Schema{type: :string, format: :uuid, nullable: true},
+        role: %Schema{type: :string, enum: ["agent", "orchestrator", "user"]},
+        lineage_path: %Schema{type: :array, items: %Schema{type: :string, format: :uuid}},
+        expires_at: %Schema{type: :string, format: :"date-time"},
+        revoked_at: %Schema{type: :string, format: :"date-time", nullable: true}
+      }
+    })
+  end
+
+  defmodule CapabilityTokenResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "CapabilityTokenResponse",
+      type: :object,
+      properties: %{
+        cap_id: %Schema{type: :string, format: :uuid},
+        typ: %Schema{
+          type: :string,
+          enum: ["start_cap", "report_cap", "verify_cap", "review_complete_cap"]
+        },
+        story_id: %Schema{type: :string, format: :uuid},
+        issued_to_lineage: %Schema{type: :array, items: %Schema{type: :string, format: :uuid}},
+        expires_at: %Schema{type: :string, format: :"date-time"},
+        nonce: %Schema{type: :string, description: "base64url-encoded 32-byte nonce"},
+        signature: %Schema{type: :string, description: "base64url-encoded ed25519 signature"}
+      }
+    })
+  end
+
+  defmodule SignedTreeHeadResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "SignedTreeHeadResponse",
+      type: :object,
+      properties: %{
+        tenant_id: %Schema{type: :string, format: :uuid},
+        chain_position: %Schema{type: :integer},
+        merkle_root: %Schema{type: :string, description: "base64url-encoded SHA-256"},
+        signed_at: %Schema{type: :string, format: :"date-time"},
+        signature: %Schema{type: :string, description: "base64url-encoded ed25519 signature"}
+      }
+    })
+  end
+
+  defmodule AuditChainEntryResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuditChainEntryResponse",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        chain_position: %Schema{type: :integer},
+        action: %Schema{type: :string},
+        entity_type: %Schema{type: :string},
+        entity_id: %Schema{type: :string, format: :uuid, nullable: true},
+        actor_lineage: %Schema{type: :array, items: %Schema{type: :string}},
+        payload: %Schema{type: :object},
+        inserted_at: %Schema{type: :string, format: :"date-time"}
+      }
+    })
+  end
+
+  defmodule VerificationRunResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "VerificationRunResponse",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        story_id: %Schema{type: :string, format: :uuid},
+        commit_sha: %Schema{type: :string, nullable: true},
+        status: %Schema{type: :string, enum: ["pending", "running", "pass", "fail", "error"]},
+        runner_type: %Schema{type: :string, nullable: true},
+        ac_results: %Schema{type: :object},
+        started_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        completed_at: %Schema{type: :string, format: :"date-time", nullable: true}
+      }
+    })
+  end
+
+  defmodule AcceptanceCriterionResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AcceptanceCriterionResponse",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        ac_id: %Schema{type: :string},
+        description: %Schema{type: :string},
+        verification_criterion: %Schema{type: :object},
+        status: %Schema{type: :string, enum: ["pending", "verified", "failed", "unverifiable"]},
+        verified_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        evidence_path: %Schema{type: :string, nullable: true}
+      }
+    })
+  end
 end

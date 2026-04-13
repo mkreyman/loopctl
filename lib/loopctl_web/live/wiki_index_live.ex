@@ -25,12 +25,27 @@ defmodule LoopctlWeb.WikiIndexLive do
 
   @impl true
   def handle_event("search", %{"q" => query}, socket) when byte_size(query) > 0 do
+    # Push search to DB to avoid loading full article bodies into LiveView
+    import Ecto.Query
+
+    escaped =
+      query
+      |> String.downcase()
+      |> String.replace("\\", "\\\\")
+      |> String.replace("%", "\\%")
+      |> String.replace("_", "\\_")
+
+    pattern = "%#{escaped}%"
+
     results =
-      Knowledge.list_system_articles()
-      |> Enum.filter(fn a ->
-        String.contains?(String.downcase(a.title), String.downcase(query)) or
-          String.contains?(String.downcase(a.body || ""), String.downcase(query))
-      end)
+      from(a in Loopctl.Knowledge.Article,
+        where:
+          a.scope == :system and a.status == :published and
+            (ilike(a.title, ^pattern) or ilike(a.body, ^pattern)),
+        order_by: [asc: a.title],
+        select: %{id: a.id, title: a.title, slug: a.slug, category: a.category}
+      )
+      |> Loopctl.AdminRepo.all()
 
     {:noreply,
      socket

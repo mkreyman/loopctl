@@ -39,14 +39,22 @@ defmodule Loopctl.TokenUsage.LazyScore do
       check_tests_run(metrics)
     ]
 
-    active = Enum.reject(factors, &is_nil/1)
+    # Small stories (estimated_hours <= 1 or nil) get a floor score of 0.0.
+    # You can't be "lazy" on a 15-minute fix.
+    estimated = Map.get(metrics, :estimated_hours)
 
-    if active == [] do
+    if is_number(estimated) and estimated <= 1.0 do
       {0.0, []}
     else
-      score = Enum.sum(Enum.map(active, &elem(&1, 0))) / length(active)
-      reasons = Enum.flat_map(active, &elem(&1, 1))
-      {Float.round(score, 2), reasons}
+      active = Enum.reject(factors, &is_nil/1)
+
+      if active == [] do
+        {0.0, []}
+      else
+        score = Enum.sum(Enum.map(active, &elem(&1, 0))) / length(active)
+        reasons = Enum.flat_map(active, &elem(&1, 1))
+        {Float.round(score, 2), reasons}
+      end
     end
   end
 

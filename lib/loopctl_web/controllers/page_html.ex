@@ -103,6 +103,45 @@ defmodule LoopctlWeb.PageHTML do
   }</pre>
   """
 
+  @trust_model_section ~S"""
+  <div class="space-y-4">
+    <p class="text-sm text-slate-400">
+      loopctl prevents two agent failure modes: <strong class="text-slate-200">sneaky agents</strong>
+      that bypass review to self-approve work, and <strong class="text-slate-200">lazy agents</strong>
+      that declare incomplete work done.
+    </p>
+    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L0 Human anchor</div>
+        <div class="text-xs text-slate-500">WebAuthn hardware key at signup. Agents can't press a button.</div>
+      </div>
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L1 Capability tokens</div>
+        <div class="text-xs text-slate-500">Signed, scoped, non-replayable. No cap = no operation.</div>
+      </div>
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L2 DB invariants</div>
+        <div class="text-xs text-slate-500">FK, triggers, hash chains. Invalid states are unrepresentable.</div>
+      </div>
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L3 Re-execution</div>
+        <div class="text-xs text-slate-500">Tests re-run independently. Self-reporting is not trusted.</div>
+      </div>
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L4 Role separation</div>
+        <div class="text-xs text-slate-500">Dispatch lineage + rotating verifier. No sock-puppets.</div>
+      </div>
+      <div class="rounded-md border border-slate-800 bg-slate-900/60 p-4">
+        <div class="font-mono text-xs text-accent-400 mb-1">L5+L6 Detection &amp; halt</div>
+        <div class="text-xs text-slate-500">Lazy scoring, witness divergence, automatic custody halt.</div>
+      </div>
+    </div>
+    <p class="text-xs text-slate-500">
+      Full spec: <a href="/wiki/chain-of-custody" class="text-accent-400 hover:text-accent-300">loopctl.com/wiki/chain-of-custody</a>
+    </p>
+  </div>
+  """
+
   @cost_intelligence_table ~S"""
   <table class="w-full text-xs font-mono border-collapse">
     <thead>
@@ -151,6 +190,11 @@ defmodule LoopctlWeb.PageHTML do
     </tbody>
   </table>
   """
+
+  def trust_model_section(assigns) do
+    _ = assigns
+    Phoenix.HTML.raw(@trust_model_section)
+  end
 
   def cost_intelligence_table(assigns) do
     _ = assigns

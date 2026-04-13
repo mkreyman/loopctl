@@ -13,7 +13,45 @@ defmodule LoopctlWeb.DispatchController do
   @doc "POST /api/v1/dispatches"
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
+    parent_id = params["parent_dispatch_id"]
 
+    # G6: Non-root dispatches must provide their parent's dispatch ID.
+    # The parent must be active (not revoked, not expired). Root dispatches
+    # (parent_id is nil) are only created at tenant signup.
+    if parent_id do
+      validate_parent_and_create(conn, tenant_id, parent_id, params)
+    else
+      do_create_dispatch(conn, tenant_id, params)
+    end
+  end
+
+  defp validate_parent_and_create(conn, tenant_id, parent_id, params) do
+    case Dispatches.get_dispatch(tenant_id, parent_id) do
+      {:ok, parent} ->
+        now = DateTime.utc_now()
+
+        if parent.revoked_at || DateTime.compare(parent.expires_at, now) != :gt do
+          conn
+          |> put_status(:forbidden)
+          |> json(%{
+            error: %{
+              code: "parent_dispatch_expired",
+              status: 403,
+              message: "Parent dispatch is expired or revoked"
+            }
+          })
+        else
+          do_create_dispatch(conn, tenant_id, params)
+        end
+
+      {:error, :not_found} ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: %{message: "Parent dispatch not found", status: 404}})
+    end
+  end
+
+  defp do_create_dispatch(conn, tenant_id, params) do
     case Dispatches.create_dispatch(tenant_id, params) do
       {:ok, %{dispatch: dispatch, raw_key: raw_key}} ->
         conn

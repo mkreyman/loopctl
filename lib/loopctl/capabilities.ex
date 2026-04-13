@@ -77,14 +77,7 @@ defmodule Loopctl.Capabilities do
         {:error, :invalid_capability}
 
       cap ->
-        cond do
-          cap.typ != expected_typ -> {:error, :wrong_type}
-          cap.story_id != expected_story_id -> {:error, :wrong_story}
-          cap.issued_to_lineage != caller_lineage -> {:error, :wrong_lineage}
-          DateTime.compare(cap.expires_at, now) != :gt -> {:error, :expired}
-          cap.consumed_at != nil -> {:error, :replay}
-          true -> {:ok, cap}
-        end
+        validate_cap(cap, tenant_id, expected_typ, expected_story_id, caller_lineage, now)
     end
   end
 
@@ -95,10 +88,17 @@ defmodule Loopctl.Capabilities do
   an Ecto.Multi with the custody operation for atomicity.
   """
   @spec consume(CapabilityToken.t()) :: {:ok, CapabilityToken.t()} | {:error, term()}
-  def consume(%CapabilityToken{consumed_at: nil} = cap) do
-    cap
-    |> CapabilityToken.changeset(%{consumed_at: DateTime.utc_now()})
-    |> AdminRepo.update()
+  def consume(%CapabilityToken{id: id, consumed_at: nil}) do
+    import Ecto.Query
+
+    now = DateTime.utc_now()
+
+    # Atomic: only updates if consumed_at IS NULL, preventing TOCTOU race
+    case from(c in CapabilityToken, where: c.id == ^id and is_nil(c.consumed_at))
+         |> AdminRepo.update_all(set: [consumed_at: now]) do
+      {1, _} -> {:ok, %CapabilityToken{id: id, consumed_at: now}}
+      {0, _} -> {:error, :replay}
+    end
   end
 
   def consume(%CapabilityToken{consumed_at: _}), do: {:error, :replay}
@@ -121,6 +121,47 @@ defmodule Loopctl.Capabilities do
   end
 
   # --- Private ---
+
+  defp validate_cap(cap, tenant_id, expected_typ, expected_story_id, caller_lineage, now) do
+    cond do
+      cap.typ != expected_typ -> {:error, :wrong_type}
+      cap.story_id != expected_story_id -> {:error, :wrong_story}
+      cap.issued_to_lineage != caller_lineage -> {:error, :wrong_lineage}
+      DateTime.compare(cap.expires_at, now) != :gt -> {:error, :expired}
+      cap.consumed_at != nil -> {:error, :replay}
+      not verify_signature(tenant_id, cap) -> {:error, :invalid_signature}
+      true -> {:ok, cap}
+    end
+  end
+
+  defp verify_signature(tenant_id, cap) do
+    import Ecto.Query
+
+    pub_key =
+      from(t in Loopctl.Tenants.Tenant,
+        where: t.id == ^tenant_id,
+        select: t.audit_signing_public_key
+      )
+      |> AdminRepo.one()
+
+    if pub_key do
+      message =
+        build_message(
+          tenant_id,
+          cap.typ,
+          cap.story_id,
+          cap.issued_to_lineage,
+          cap.issued_at,
+          cap.expires_at,
+          cap.nonce
+        )
+
+      :crypto.verify(:eddsa, :sha512, message, cap.signature, [pub_key, :ed25519])
+    else
+      # No public key — can't verify, reject
+      false
+    end
+  end
 
   defp build_message(tenant_id, typ, story_id, lineage, issued_at, expires_at, nonce) do
     tenant_id <>

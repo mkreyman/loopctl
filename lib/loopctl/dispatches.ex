@@ -69,13 +69,41 @@ defmodule Loopctl.Dispatches do
   defp do_create_dispatch(tenant_id, parsed, opts) do
     %{
       parent_id: parent_id,
-      role: role,
+      role: raw_role,
       agent_id: agent_id,
       story_id: story_id,
       expires_at: expires_at,
       now: now
     } = parsed
 
+    case normalize_role(raw_role) do
+      {:error, reason} ->
+        {:error, reason}
+
+      role ->
+        do_create_dispatch_multi(
+          tenant_id,
+          parent_id,
+          role,
+          agent_id,
+          story_id,
+          expires_at,
+          now,
+          opts
+        )
+    end
+  end
+
+  defp do_create_dispatch_multi(
+         tenant_id,
+         parent_id,
+         role,
+         agent_id,
+         story_id,
+         expires_at,
+         now,
+         opts
+       ) do
     multi =
       Multi.new()
       |> Multi.run(:resolve_lineage, fn _repo, _changes ->
@@ -90,7 +118,7 @@ defmodule Loopctl.Dispatches do
           parent_dispatch_id: parent_id,
           agent_id: agent_id,
           story_id: story_id,
-          role: normalize_role(role),
+          role: role,
           lineage_path: lineage_path,
           expires_at: expires_at,
           created_at: now
@@ -231,6 +259,56 @@ defmodule Loopctl.Dispatches do
   def lineage_shares_prefix?([a | _], [b | _]) when a == b, do: true
   def lineage_shares_prefix?(_, _), do: false
 
+  @doc """
+  Selects a verifier dispatch from the eligible pool for a story.
+
+  Eligible dispatches: active, non-expired, non-revoked, in the same tenant,
+  whose lineage does NOT share a prefix with the implementer's lineage.
+
+  Selection is deterministic but unpredictable to the orchestrator:
+  seeded with sha256(tenant_audit_public_key + story_id).
+
+  Returns `{:ok, dispatch}` or `{:error, :no_eligible_verifier}`.
+  """
+  @spec select_verifier(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
+          {:ok, Dispatch.t()} | {:error, :no_eligible_verifier}
+  def select_verifier(tenant_id, story_id, implementer_lineage) do
+    now = DateTime.utc_now()
+
+    candidates =
+      from(d in Dispatch,
+        where:
+          d.tenant_id == ^tenant_id and
+            is_nil(d.revoked_at) and
+            d.expires_at > ^now and
+            d.role in [:orchestrator, :agent],
+        order_by: [asc: d.created_at]
+      )
+      |> AdminRepo.all()
+      |> Enum.reject(fn d -> lineage_shares_prefix?(d.lineage_path, implementer_lineage) end)
+
+    case candidates do
+      [] ->
+        {:error, :no_eligible_verifier}
+
+      pool ->
+        # Deterministic selection: hash(tenant_pub_key || story_id) → index
+        pub_key =
+          from(t in Loopctl.Tenants.Tenant,
+            where: t.id == ^tenant_id,
+            select: t.audit_signing_public_key
+          )
+          |> AdminRepo.one()
+
+        seed_data = (pub_key || "") <> story_id
+        hash = :crypto.hash(:sha256, seed_data)
+        <<index_seed::unsigned-64, _rest::binary>> = hash
+        selected = Enum.at(pool, rem(index_seed, length(pool)))
+
+        {:ok, selected}
+    end
+  end
+
   # --- Private ---
 
   defp mint_and_link_key(tenant_id, dispatch, agent_id, expires_at) do
@@ -260,9 +338,9 @@ defmodule Loopctl.Dispatches do
     end
   end
 
-  defp normalize_role(role) when is_atom(role), do: role
+  defp normalize_role(role) when role in [:agent, :orchestrator, :user], do: role
   defp normalize_role("agent"), do: :agent
   defp normalize_role("orchestrator"), do: :orchestrator
   defp normalize_role("user"), do: :user
-  defp normalize_role(other), do: other
+  defp normalize_role(invalid), do: {:error, {:invalid_role, invalid}}
 end

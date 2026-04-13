@@ -96,6 +96,10 @@ config :loopctl, :webauthn,
 # DI: Use mock secrets adapter in tests
 config :loopctl, :secrets_adapter, Loopctl.MockSecrets
 
+# Witness header enforcement disabled in tests — dedicated tests verify
+# the plug directly. Other tests don't send the header on secondary conns.
+config :loopctl, :enforce_witness_header, false
+
 # DI: Use Req.Test plug for content ingestion URL fetching in tests
 config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
 

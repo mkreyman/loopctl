@@ -85,7 +85,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           "review_type" => "enhanced_review"
         })
 
-      body = json_response(conn, 200)
+      body = json_response(conn, 202)
       assert body["story"]["verified_status"] == "verified"
       assert body["story"]["verified_at"] != nil
 
@@ -112,7 +112,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           "review_type" => "enhanced_review"
         })
 
-      body = json_response(conn, 200)
+      body = json_response(conn, 202)
       assert body["story"]["verified_status"] == "verified"
 
       # Check verification_result has result=partial
@@ -135,7 +135,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           "review_type" => "enhanced"
         })
 
-      body = json_response(conn, 200)
+      body = json_response(conn, 202)
       assert body["story"]["verified_status"] == "verified"
 
       results =
@@ -172,7 +172,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         |> auth_conn(orch_key)
         |> post(~p"/api/v1/stories/#{story.id}/verify", %{})
 
-      body = json_response(conn, 200)
+      body = json_response(conn, 202)
       assert body["story"]["verified_status"] == "verified"
     end
 
@@ -409,7 +409,10 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           "review_type" => "enhanced"
         })
 
-      assert json_response(conn, 200)["story"]["verified_status"] == "verified"
+      # US-26.4.4.1: verify now returns 202 with verification_pending
+      resp = json_response(conn, 202)
+      assert resp["story"]["verified_status"] == "verified"
+      assert resp["status"] == "verification_pending"
     end
   end
 
@@ -565,7 +568,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       statuses = Enum.sort([result_1.status, result_2.status])
 
       # One succeeds, the other gets 409 (already verified, not reported_done anymore)
-      assert statuses == [200, 409]
+      assert statuses == [202, 409]
     end
   end
 
@@ -847,7 +850,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
           "summary" => "All good"
         })
 
-      body = json_response(conn, 200)
+      body = json_response(conn, 202)
       assert body["story"]["verified_status"] == "verified"
 
       # Verify a verification_result was created

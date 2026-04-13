@@ -28,6 +28,8 @@ defmodule Loopctl.Workers.CotSanityMonitorWorker do
 
     recent_reports =
       from(r in "token_usage_reports",
+        join: s in "stories",
+        on: r.story_id == s.id,
         where: r.inserted_at > ^cutoff,
         select: %{
           story_id: r.story_id,
@@ -35,7 +37,8 @@ defmodule Loopctl.Workers.CotSanityMonitorWorker do
           total_tokens: fragment("? + ?", r.input_tokens, r.output_tokens),
           tool_call_count: r.tool_call_count,
           cot_length_tokens: r.cot_length_tokens,
-          tests_run_count: r.tests_run_count
+          tests_run_count: r.tests_run_count,
+          estimated_hours: s.estimated_hours
         }
       )
       |> AdminRepo.all()

@@ -695,6 +695,35 @@ async function createDispatch({
   return toContent(result);
 }
 
+// US-26: Signed Tree Head retrieval
+async function getSth({ tenant_id }) {
+  const result = await apiCall("GET", `/api/v1/audit/sth/${tenant_id}`);
+  return toContent(result);
+}
+
+// US-26: System article retrieval
+async function getSystemArticles({ slug, category } = {}) {
+  const params = new URLSearchParams();
+  if (slug) params.set("slug", slug);
+  if (category) params.set("category", category);
+  const qs = params.toString();
+  const result = await apiCall("GET", `/api/v1/articles/system${qs ? "?" + qs : ""}`);
+  return toContent(result);
+}
+
+// US-26: Cap recovery after session crash
+async function recoverCap({ story_id, cap_type, lineage }) {
+  const body = { cap_type: cap_type || "start_cap", lineage: lineage || [] };
+  const result = await apiCall("POST", `/api/v1/stories/${story_id}/recover-cap`, body);
+  return toContent(result);
+}
+
+// US-26: Acceptance criteria for a story
+async function getAcceptanceCriteria({ story_id }) {
+  const result = await apiCall("GET", `/api/v1/stories/${story_id}/acceptance_criteria`);
+  return toContent(result);
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -1782,6 +1811,54 @@ const TOOLS = [
       required: ["role", "agent_id"],
     },
   },
+
+  // Chain of Custody v2 tools
+  {
+    name: "get_sth",
+    description: "Get the latest Signed Tree Head for a tenant's audit chain. Public — no auth required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Tenant UUID." },
+      },
+      required: ["tenant_id"],
+    },
+  },
+  {
+    name: "get_system_articles",
+    description: "List or retrieve system-scoped wiki articles. Public — no auth required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "Optional: fetch a single article by slug." },
+        category: { type: "string", description: "Optional: filter by category (pattern, convention, decision, finding, reference)." },
+      },
+    },
+  },
+  {
+    name: "recover_cap",
+    description: "Re-mint a capability token for a story you're assigned to. Use after a session crash when you've lost your cap.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "Story UUID." },
+        cap_type: { type: "string", enum: ["start_cap", "report_cap"], description: "Which cap to recover (default: start_cap)." },
+        lineage: { type: "array", items: { type: "string" }, description: "Your dispatch lineage path." },
+      },
+      required: ["story_id"],
+    },
+  },
+  {
+    name: "get_acceptance_criteria",
+    description: "List acceptance criteria for a story with their verification status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "Story UUID." },
+      },
+      required: ["story_id"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1946,6 +2023,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "get_sth":
+      return await getSth(args);
+
+    case "get_system_articles":
+      return await getSystemArticles(args);
+
+    case "recover_cap":
+      return await recoverCap(args);
+
+    case "get_acceptance_criteria":
+      return await getAcceptanceCriteria(args);
 
     default:
       throw new Error(`Unknown tool: ${name}`);

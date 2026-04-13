@@ -25,6 +25,8 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.Impersonate
     plug LoopctlWeb.Plugs.RateLimiter
     plug LoopctlWeb.Plugs.UpdateLastSeen
+    plug LoopctlWeb.Plugs.ValidateWitnessHeader
+    plug LoopctlWeb.Plugs.CheckCustodyHalt
   end
 
   pipeline :registration_rate_limit do
@@ -141,6 +143,9 @@ defmodule LoopctlWeb.Router do
 
     # US-26.4.1 — First-class acceptance criteria
     get "/stories/:story_id/acceptance_criteria", AcceptanceCriteriaController, :index
+
+    # Cap recovery for session-crash resilience
+    post "/stories/:id/recover-cap", CapRecoveryController, :recover
 
     # Story status transitions (agent side of two-tier trust model)
     post "/stories/:id/contract", StoryStatusController, :contract
@@ -354,5 +359,8 @@ defmodule LoopctlWeb.Router do
     get "/violators", AdminViolatorController, :index
     post "/violators/:id/resolve", AdminViolatorController, :resolve
     post "/violators/:id/ignore", AdminViolatorController, :ignore
+
+    # US-26.5.2 — Custody halt management
+    post "/tenants/:id/clear-halt", AdminTenantController, :clear_halt
   end
 end

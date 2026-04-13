@@ -37,6 +37,12 @@ defmodule LoopctlWeb.ConnCase do
     Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     Loopctl.DataCase.stub_all_defaults()
-    {:ok, conn: Phoenix.ConnTest.build_conn()}
+    # Include the witness STH header on all test connections so the
+    # ValidateWitnessHeader plug doesn't block authenticated requests.
+    conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_req_header("x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
+
+    {:ok, conn: conn}
   end
 end

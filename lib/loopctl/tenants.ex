@@ -348,6 +348,39 @@ defmodule Loopctl.Tenants do
     end
   end
 
+  @doc "Halts a tenant's custody operations due to witness divergence."
+  @spec halt_custody(Ecto.UUID.t()) :: {:ok, Tenant.t()} | {:error, term()}
+  def halt_custody(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:ok, tenant} ->
+        tenant
+        |> Ecto.Changeset.change(custody_halted_at: DateTime.utc_now())
+        |> AdminRepo.update()
+
+      error ->
+        error
+    end
+  end
+
+  @doc "Clears a custody halt (break-glass operation)."
+  @spec clear_custody_halt(Ecto.UUID.t()) :: {:ok, Tenant.t()} | {:error, term()}
+  def clear_custody_halt(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:ok, tenant} ->
+        tenant
+        |> Ecto.Changeset.change(custody_halted_at: nil)
+        |> AdminRepo.update()
+
+      error ->
+        error
+    end
+  end
+
+  @doc "Returns true if tenant's custody operations are halted."
+  @spec custody_halted?(Tenant.t()) :: boolean()
+  def custody_halted?(%Tenant{custody_halted_at: nil}), do: false
+  def custody_halted?(%Tenant{}), do: true
+
   @doc """
   Updates a tenant with the given attributes.
 

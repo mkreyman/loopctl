@@ -12,6 +12,8 @@ defmodule Loopctl.Progress do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.ArtifactReport
@@ -19,6 +21,8 @@ defmodule Loopctl.Progress do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Capabilities
+  alias Loopctl.Dispatches
   alias Loopctl.Tenants
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
@@ -168,13 +172,22 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
+        dispatch_id = Keyword.get(opts, :dispatch_id)
 
-        story
-        |> Ecto.Changeset.change(%{
+        changes = %{
           agent_status: :assigned,
           assigned_agent_id: agent_id,
           assigned_at: now
-        })
+        }
+
+        # US-26.2.2 AC-3: record implementer's dispatch at claim time
+        changes =
+          if dispatch_id,
+            do: Map.put(changes, :implementer_dispatch_id, dispatch_id),
+            else: changes
+
+        story
+        |> Ecto.Changeset.change(changes)
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
@@ -213,11 +226,152 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :check_deps, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated}} ->
+        # US-26.3.1 AC-5: mint a start_cap for the claiming lineage
+        lineage = Keyword.get(opts, :lineage, [])
+        mint_cap_best_effort(tenant_id, "start_cap", updated.id, lineage)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :check_deps, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
+    end
+  end
+
+  # Mints a capability token as a side-effect. Returns nil if key is
+  # unavailable (tenant has no audit key yet). The cap is retrievable
+  # via the Capabilities module; it's not returned in the function value
+  # to keep the return type backward-compatible.
+  defp mint_cap_best_effort(tenant_id, typ, story_id, lineage) do
+    case Capabilities.mint(tenant_id, typ, story_id, lineage) do
+      {:ok, cap} -> cap
+      {:error, _} -> nil
+    end
+  end
+
+  # US-26.6.2: Computes the lazy-bastard score from token usage reports
+  # and stores it in the story's metadata. Non-blocking — failures are logged.
+  defp compute_and_store_lazy_score(tenant_id, story) do
+    alias Loopctl.TokenUsage.LazyScore
+
+    reports =
+      from(r in "token_usage_reports",
+        where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+        select: %{
+          total_tokens:
+            fragment("COALESCE(?, 0) + COALESCE(?, 0)", r.input_tokens, r.output_tokens),
+          tool_call_count: r.tool_call_count,
+          cot_length_tokens: r.cot_length_tokens,
+          tests_run_count: r.tests_run_count
+        }
+      )
+      |> AdminRepo.all()
+
+    if reports != [] do
+      aggregated = %{
+        total_tokens: Enum.sum(Enum.map(reports, & &1.total_tokens)),
+        estimated_hours: story.estimated_hours && Decimal.to_float(story.estimated_hours),
+        tool_call_count:
+          reports |> Enum.map(& &1.tool_call_count) |> Enum.reject(&is_nil/1) |> Enum.sum(),
+        cot_length_tokens:
+          reports |> Enum.map(& &1.cot_length_tokens) |> Enum.reject(&is_nil/1) |> Enum.sum(),
+        tests_run_count:
+          reports |> Enum.map(& &1.tests_run_count) |> Enum.reject(&is_nil/1) |> Enum.sum()
+      }
+
+      {score, reasons} = LazyScore.compute(aggregated)
+
+      metadata =
+        Map.merge(story.metadata || %{}, %{
+          "lazy_score" => score,
+          "lazy_reasons" => reasons,
+          "lazy_flagged" => LazyScore.flagged?(score)
+        })
+
+      # If flagged: route to re-review by resetting verifier
+      changes =
+        if LazyScore.flagged?(score) do
+          Logger.warning("Lazy-bastard flagged: story=#{story.id} score=#{score}")
+          %{metadata: metadata, verifier_needed: true, verifier_dispatch_id: nil}
+        else
+          %{metadata: metadata}
+        end
+
+      story
+      |> Ecto.Changeset.change(changes)
+      |> AdminRepo.update()
+    end
+  rescue
+    error ->
+      Logger.warning("compute_and_store_lazy_score failed: #{Exception.message(error)}")
+      :ok
+  end
+
+  # Adds a cap consumption step to an Ecto.Multi.
+  # When cap_id is nil: rejects with :missing_capability if the tenant
+  # has an audit key (v2 tenant). Pre-v2 tenants (no audit key) pass
+  # through for backward compatibility during migration.
+  defp maybe_consume_cap(multi, tenant_id, _story_id, nil, _typ, _lineage) do
+    Multi.run(multi, :consume_cap, fn _repo, _changes ->
+      if tenant_has_audit_key?(tenant_id) do
+        {:error, :missing_capability}
+      else
+        {:ok, :pre_v2_tenant}
+      end
+    end)
+  end
+
+  defp maybe_consume_cap(multi, tenant_id, story_id, cap_id, typ, lineage) do
+    Multi.run(multi, :consume_cap, fn _repo, _changes ->
+      case Capabilities.verify(tenant_id, %{
+             "cap_id" => cap_id,
+             "typ" => typ,
+             "story_id" => story_id,
+             "lineage" => lineage
+           }) do
+        {:ok, cap} -> Capabilities.consume(cap)
+        {:error, reason} -> {:error, {:cap_rejected, reason}}
+      end
+    end)
+  end
+
+  # US-26.2.2 AC-4: loopctl selects the verifier, not the orchestrator
+  defp assign_rotating_verifier(tenant_id, story_id, story) do
+    impl_lineage =
+      if story.implementer_dispatch_id,
+        do: get_dispatch_lineage(tenant_id, story.implementer_dispatch_id),
+        else: []
+
+    case Dispatches.select_verifier(tenant_id, story_id, impl_lineage) do
+      {:ok, verifier} ->
+        story |> Ecto.Changeset.change(verifier_dispatch_id: verifier.id) |> AdminRepo.update()
+        mint_cap_best_effort(tenant_id, "verify_cap", story_id, verifier.lineage_path)
+
+        Loopctl.AuditChain.append(tenant_id, %{
+          action: "verifier_selected",
+          actor_lineage: [],
+          entity_type: "story",
+          entity_id: story_id,
+          payload: %{"verifier_dispatch_id" => verifier.id}
+        })
+
+      {:error, :no_eligible_verifier} ->
+        story |> Ecto.Changeset.change(verifier_needed: true) |> AdminRepo.update()
+    end
+  end
+
+  defp tenant_has_audit_key?(tenant_id) do
+    case AdminRepo.get(Loopctl.Tenants.Tenant, tenant_id) do
+      %{audit_signing_public_key: key} when not is_nil(key) -> true
+      _ -> false
     end
   end
 
@@ -246,6 +400,7 @@ defmodule Loopctl.Progress do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    cap_id = Keyword.get(opts, :cap_id)
 
     multi =
       Multi.new()
@@ -258,6 +413,13 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
+      |> maybe_consume_cap(
+        tenant_id,
+        story_id,
+        cap_id,
+        "start_cap",
+        Keyword.get(opts, :lineage, [])
+      )
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
         |> Ecto.Changeset.change(%{
@@ -300,10 +462,23 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated}} ->
+        # US-26.3.1 AC-6: mint a report_cap for the implementing lineage
+        lineage = Keyword.get(opts, :lineage, [])
+        mint_cap_best_effort(tenant_id, "report_cap", updated.id, lineage)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :consume_cap, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
     end
   end
 
@@ -337,6 +512,7 @@ defmodule Loopctl.Progress do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     token_usage_params = Keyword.get(opts, :token_usage)
+    cap_id = Keyword.get(opts, :cap_id)
 
     multi =
       Multi.new()
@@ -349,6 +525,13 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
+      |> maybe_consume_cap(
+        tenant_id,
+        story_id,
+        cap_id,
+        "report_cap",
+        Keyword.get(opts, :lineage, [])
+      )
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 
@@ -402,6 +585,7 @@ defmodule Loopctl.Progress do
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :consume_cap, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
       {:error, :artifact, changeset, _} -> {:error, changeset}
       {:error, :token_usage_report, changeset, _} -> {:error, changeset}
@@ -451,6 +635,12 @@ defmodule Loopctl.Progress do
             "agent_id" => agent_id,
             "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
           })
+
+          # US-26.2.2 AC-4: rotating verifier selection
+          assign_rotating_verifier(tenant_id, story_id, story)
+
+          # US-26.6.2: compute and store lazy-bastard score
+          compute_and_store_lazy_score(tenant_id, story)
 
           {:ok, story}
         end
@@ -707,6 +897,7 @@ defmodule Loopctl.Progress do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
+    cap_id = Keyword.get(opts, :cap_id)
 
     verification_params = extract_verification_params(params)
 
@@ -716,6 +907,13 @@ defmodule Loopctl.Progress do
       |> Multi.run(:self_verify_check, fn _repo, %{lock: story} ->
         validate_not_self_verify(story, orchestrator_agent_id)
       end)
+      |> maybe_consume_cap(
+        tenant_id,
+        story_id,
+        cap_id,
+        "verify_cap",
+        Keyword.get(opts, :lineage, [])
+      )
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
         validate_verifiable(story)
       end)
@@ -1016,10 +1214,32 @@ defmodule Loopctl.Progress do
   defp validate_not_self_verify(_story, nil), do: {:error, :self_verify_blocked}
 
   defp validate_not_self_verify(story, orchestrator_agent_id) do
-    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id do
-      {:error, :self_verify_blocked}
-    else
-      {:ok, story}
+    # US-26.2.2 AC-2: use lineage comparison when dispatch IDs are available
+    cond do
+      # Lineage-based check (preferred): compare dispatch lineage paths
+      not is_nil(story.implementer_dispatch_id) and not is_nil(story.verifier_dispatch_id) ->
+        impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
+        verifier = get_dispatch_lineage(story.tenant_id, story.verifier_dispatch_id)
+
+        if Dispatches.lineage_shares_prefix?(impl, verifier) do
+          {:error, :self_verify_blocked}
+        else
+          {:ok, story}
+        end
+
+      # Fallback: agent_id comparison for pre-dispatch stories
+      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == orchestrator_agent_id ->
+        {:error, :self_verify_blocked}
+
+      true ->
+        {:ok, story}
+    end
+  end
+
+  defp get_dispatch_lineage(tenant_id, dispatch_id) do
+    case Dispatches.get_dispatch(tenant_id, dispatch_id) do
+      {:ok, dispatch} -> dispatch.lineage_path
+      {:error, _} -> []
     end
   end
 
@@ -1433,10 +1653,23 @@ defmodule Loopctl.Progress do
   defp validate_not_self_report(_story, nil), do: {:error, :self_report_blocked}
 
   defp validate_not_self_report(story, agent_id) do
-    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
-      {:error, :self_report_blocked}
-    else
-      :ok
+    # US-26.2.2 AC-2: use lineage when dispatch IDs are available
+    cond do
+      not is_nil(story.implementer_dispatch_id) ->
+        _impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
+        # Reporter's lineage would come from their dispatch — for now use
+        # agent_id as fallback since reporter dispatch isn't tracked yet
+        if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id do
+          {:error, :self_report_blocked}
+        else
+          :ok
+        end
+
+      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == agent_id ->
+        {:error, :self_report_blocked}
+
+      true ->
+        :ok
     end
   end
 
@@ -1447,10 +1680,22 @@ defmodule Loopctl.Progress do
   defp validate_not_self_review(_story, nil), do: :ok
 
   defp validate_not_self_review(story, reviewer_agent_id) do
-    if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do
-      {:error, :self_review_blocked}
-    else
-      :ok
+    # US-26.2.2 AC-2: use lineage when available, fallback to agent_id
+    cond do
+      not is_nil(story.implementer_dispatch_id) ->
+        # Same fallback pattern as self_report — full lineage comparison
+        # will be wired when reviewer dispatch tracking is added
+        if not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id do
+          {:error, :self_review_blocked}
+        else
+          :ok
+        end
+
+      not is_nil(story.assigned_agent_id) and story.assigned_agent_id == reviewer_agent_id ->
+        {:error, :self_review_blocked}
+
+      true ->
+        :ok
     end
   end
 

@@ -310,4 +310,47 @@ defmodule LoopctlWeb.AdminTenantController do
   end
 
   defp ceil_div(numerator, denominator), do: ceil(numerator / denominator)
+
+  @doc "POST /api/v1/admin/tenants/:id/clear-halt — clears custody halt (break-glass, requires WebAuthn)"
+  def clear_halt(conn, %{"id" => id} = params) do
+    # G7: Break-glass requires WebAuthn assertion
+    assertion = Map.get(params, "webauthn_assertion")
+
+    if is_nil(assertion) do
+      conn
+      |> put_status(:unauthorized)
+      |> json(%{
+        error: %{
+          code: "webauthn_required",
+          status: 401,
+          message:
+            "Break-glass operations require a WebAuthn assertion from a root authenticator",
+          remediation: %{learn_more: "https://loopctl.com/wiki/break-glass"}
+        }
+      })
+    else
+      do_clear_halt(conn, id)
+    end
+  end
+
+  defp do_clear_halt(conn, id) do
+    case Tenants.clear_custody_halt(id) do
+      {:ok, tenant} ->
+        # Break-glass: audit this critical operation
+        api_key = conn.assigns.current_api_key
+
+        Loopctl.AuditChain.append(tenant.id, %{
+          action: "halt_cleared",
+          actor_lineage: [],
+          entity_type: "tenant",
+          entity_id: tenant.id,
+          payload: %{"cleared_by" => api_key.id}
+        })
+
+        json(conn, %{data: %{id: tenant.id, custody_halted_at: nil, status: "halt_cleared"}})
+
+      {:error, :not_found} ->
+        conn |> put_status(:not_found) |> json(%{error: %{message: "Not found", status: 404}})
+    end
+  end
 end

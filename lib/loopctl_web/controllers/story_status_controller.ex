@@ -17,6 +17,7 @@ defmodule LoopctlWeb.StoryStatusController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Progress
+  alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -192,7 +193,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.contract_story(tenant_id, story_id, params, opts) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :title_mismatch} ->
         {:error, :unprocessable_entity, "story_title does not match"}
@@ -223,7 +225,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
@@ -254,7 +257,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.start_story(tenant_id, story_id, opts) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
@@ -289,7 +293,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.request_review(tenant_id, story_id, opts) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
@@ -330,7 +335,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.report_story(tenant_id, story_id, opts, artifact_params) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :self_report_blocked} ->
         {:error, :self_report_blocked}
@@ -361,7 +367,8 @@ defmodule LoopctlWeb.StoryStatusController do
 
     case Progress.unclaim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
-        json(conn, %{story: story})
+        role = conn.assigns.current_api_key.role
+        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
