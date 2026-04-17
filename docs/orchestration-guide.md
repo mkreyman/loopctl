@@ -203,6 +203,28 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
 
 Use this pattern when you know the status of work at import time.
 
+**Adding stories incrementally.** To add stories to an epic that already
+exists, pass `merge: true` to `import_stories` or use `create_story` for a
+single story:
+
+```
+mcp__loopctl__import_stories({
+  project_id: "<uuid>",
+  merge: true,
+  payload: { epics: [{ number: 1, title: "Foundation", stories: [...] }] }
+})
+
+mcp__loopctl__create_story({
+  project_id: "<uuid>",
+  epic_number: 1,
+  story: { number: "1.7", title: "New story added later" }
+})
+```
+
+Without `merge: true`, a duplicate epic number returns 409. The merge path
+is also type-tolerant — epic numbers can be sent as integers or numeric
+strings; they normalize to integers before the DB lookup.
+
 ### Pattern 2: Bulk mark-complete after import
 
 Import stories normally (they start as `pending`), then bulk-complete them in one call:
@@ -221,7 +243,52 @@ curl -X POST http://localhost:4000/api/v1/stories/bulk/mark-complete \
 
 Use this pattern when you need to import first and then batch-verify after reviewing what exists.
 
-### Pattern 3: Epic-wide verification
+### Pattern 3: Per-story backfill with provenance
+
+When onboarding a project where you need to mark individual stories as verified
+*with a paper trail* (PR number, evidence URL, reason), use
+`POST /stories/:id/backfill`. This is the preferred pattern when the work was
+done outside loopctl and you want the audit log to show why:
+
+```bash
+curl -X POST https://loopctl.com/api/v1/stories/:id/backfill \
+  -H "Authorization: Bearer $LOOPCTL_ORCH_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reason": "completed before loopctl onboarding",
+    "evidence_url": "https://github.com/acme/app/pull/232",
+    "pr_number": 232
+  }'
+```
+
+Or via MCP:
+
+```
+mcp__loopctl__backfill_story({
+  story_id: "<uuid>",
+  reason: "completed before loopctl onboarding",
+  evidence_url: "https://github.com/acme/app/pull/232",
+  pr_number: 232
+})
+```
+
+**Structural guard.** Backfill is refused for any story that has loopctl
+dispatch lineage — non-pending `agent_status`, `assigned_agent_id`,
+`implementer_dispatch_id`, or `verifier_dispatch_id` set. That prevents
+using backfill as a chain-of-custody shortcut to "verify" dispatched work
+without review. Use Pattern 1 or 2 for bulk onboarding; use Pattern 3 for
+surgical per-story backfill with provenance.
+
+**Idempotent retry.** Retrying a backfill with the same payload returns 200
+(same story). Retrying with different `reason`/`evidence_url`/`pr_number`
+returns 422 — investigate before overwriting.
+
+Sets `agent_status=:reported_done`, `verified_status=:verified`, records the
+provenance in `metadata.backfill`, writes an audit entry with
+`action: "backfilled"` and `new_state.source: "pre_loopctl"`, and emits a
+`story.backfilled` webhook.
+
+### Pattern 4: Epic-wide verification
 
 After implementation agents have reported done on all stories in an epic, the orchestrator can
 verify the entire epic in a single call instead of verifying each story individually:
