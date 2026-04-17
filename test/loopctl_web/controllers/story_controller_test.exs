@@ -164,6 +164,30 @@ defmodule LoopctlWeb.StoryControllerTest do
       assert body["error"]["message"] =~ "epic_number"
     end
 
+    test "tenant isolation: cannot create a story in another tenant's project", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      {raw_key_a, _} =
+        fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      _epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id, number: 1})
+
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> post(~p"/api/v1/projects/#{project_b.id}/stories", %{
+          "epic_number" => 1,
+          "number" => "1.1",
+          "title" => "Cross-tenant"
+        })
+
+      # Project lookup is tenant-scoped, so this should 404 — not leak that the
+      # project exists elsewhere.
+      assert json_response(conn, 404)
+    end
+
     test "orchestrator role accepted on direct epic_id creation too", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})

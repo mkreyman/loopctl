@@ -227,33 +227,51 @@ defmodule LoopctlWeb.StoryVerificationController do
       {:ok, story} ->
         json(conn, %{story: story})
 
-      {:error, :reason_required} ->
-        {:error, :unprocessable_entity,
-         "`reason` is required and cannot be blank. " <>
-           "Describe why this story is being backfilled (e.g. 'completed before loopctl onboarding, see PR #232')."}
-
-      {:error, :already_verified} ->
-        {:error, :unprocessable_entity,
-         "Story is already verified. Backfill is a no-op in that state."}
-
-      {:error, :story_rejected} ->
-        {:error, :unprocessable_entity,
-         "Story is in `verified_status=:rejected`. " <>
-           "Backfill refuses to overwrite a rejection — investigate the rejection reason " <>
-           "and either re-run the normal verify flow or unreject the story first."}
-
-      {:error, :story_has_dispatch_lineage} ->
-        {:error, :unprocessable_entity,
-         "Story has an `assigned_agent_id` set, which means it was dispatched through loopctl. " <>
-           "Backfill is only for work completed OUTSIDE the loopctl dispatch lifecycle. " <>
-           "Use the normal report_story → review_complete → verify_story flow instead."}
-
       {:error, :not_found} ->
         {:error, :not_found}
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
+
+      {:error, atom} when is_atom(atom) ->
+        {:error, :unprocessable_entity, backfill_error_message(atom)}
     end
+  end
+
+  defp backfill_error_message(:reason_required) do
+    "`reason` is required and cannot be blank. " <>
+      "Describe why this story is being backfilled (e.g. 'completed before loopctl onboarding, see PR #232')."
+  end
+
+  defp backfill_error_message(:reason_too_long), do: "`reason` must be <= 2000 characters."
+
+  defp backfill_error_message(:invalid_pr_number),
+    do: "`pr_number` must be a positive integer or a numeric string."
+
+  defp backfill_error_message(:invalid_evidence_url) do
+    "`evidence_url` must be an http(s):// URL without credentials in the userinfo segment."
+  end
+
+  defp backfill_error_message(:evidence_url_too_long),
+    do: "`evidence_url` must be <= 2000 characters."
+
+  defp backfill_error_message(:already_verified) do
+    "Story is already verified and the previous backfill metadata differs from this request. " <>
+      "If this is a retry of a different backfill, nothing further is needed; otherwise " <>
+      "investigate who verified the story and why."
+  end
+
+  defp backfill_error_message(:story_rejected) do
+    "Story is in `verified_status=:rejected`. Backfill refuses to overwrite a rejection. " <>
+      "Investigate the rejection reason in the audit trail, and if the rejection was wrong, " <>
+      "create a new story to track the corrected work."
+  end
+
+  defp backfill_error_message(:story_has_dispatch_lineage) do
+    "Story has loopctl dispatch lineage (non-pending agent_status, assigned_agent_id, " <>
+      "implementer_dispatch_id, or verifier_dispatch_id is set). " <>
+      "Backfill is only for work completed OUTSIDE the loopctl dispatch lifecycle. " <>
+      "Use the normal report_story → review_complete → verify_story flow instead."
   end
 
   @doc """

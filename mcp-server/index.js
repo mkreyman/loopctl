@@ -295,24 +295,67 @@ async function importStories({ project_id, payload, payload_path, merge }) {
 
 // Reads JSON payload from either an inline object or an absolute file path.
 // Returns the object on success, or an { error, body } shape on failure.
-async function resolvePayload(inline, path) {
+//
+// Security: `payload_path` is read with the MCP process's filesystem
+// privileges. Because agents can set this argument via prompt injection,
+// we validate aggressively:
+//   * require absolute path
+//   * reject /proc, /dev, /sys (pseudo-filesystems that could DoS or leak)
+//   * stat first and cap at 5 MiB (server also enforces a body size limit)
+async function resolvePayload(inline, payloadPath) {
   if (inline && typeof inline === "object") return inline;
-  if (!path) {
+  if (!payloadPath) {
     return {
       error: true,
       status: 0,
       body: "Must provide either `payload` (object) or `payload_path` (absolute JSON file path).",
     };
   }
+
+  const nodePath = await import("node:path");
+  if (!nodePath.isAbsolute(payloadPath)) {
+    return {
+      error: true,
+      status: 0,
+      body: `payload_path must be absolute (got '${payloadPath}').`,
+    };
+  }
+
+  const blockedPrefixes = ["/proc/", "/dev/", "/sys/", "/proc", "/dev", "/sys"];
+  if (blockedPrefixes.some((p) => payloadPath === p.replace(/\/$/, "") || payloadPath.startsWith(p))) {
+    return {
+      error: true,
+      status: 0,
+      body: `payload_path refused: '${payloadPath}' targets a pseudo-filesystem path.`,
+    };
+  }
+
+  const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
   const fs = await import("node:fs/promises");
+
   try {
-    const raw = await fs.readFile(path, "utf8");
+    const stat = await fs.stat(payloadPath);
+    if (!stat.isFile()) {
+      return {
+        error: true,
+        status: 0,
+        body: `payload_path '${payloadPath}' is not a regular file.`,
+      };
+    }
+    if (stat.size > MAX_PAYLOAD_BYTES) {
+      return {
+        error: true,
+        status: 0,
+        body: `payload_path '${payloadPath}' is ${stat.size} bytes, exceeds max ${MAX_PAYLOAD_BYTES}.`,
+      };
+    }
+    const raw = await fs.readFile(payloadPath, "utf8");
     return JSON.parse(raw);
   } catch (err) {
     return {
       error: true,
       status: 0,
-      body: `Could not read payload_path '${path}': ${err.message}`,
+      body: `Could not read payload_path '${payloadPath}': ${err.message}`,
     };
   }
 }
@@ -924,10 +967,11 @@ const TOOLS = [
   {
     name: "backfill_story",
     description:
-      "Mark a story as verified when the work was completed outside loopctl (e.g. before the project was onboarded, or during manual ops). " +
-      "Bypasses the usual contract/claim/report/review/verify lifecycle because there is no agent lineage to enforce chain-of-custody against. " +
-      "Records a provenance marker in `metadata.backfill` plus an audit event so the trust chain stays legible. " +
-      "REQUIRES `reason`. Strongly recommend passing `evidence_url` or `pr_number` so future auditors can see what was done.",
+      "Mark a story as verified when the work was completed outside loopctl (e.g. before the project was onboarded). " +
+      "REFUSED for stories that have any loopctl dispatch lineage — non-pending agent_status, assigned_agent_id, implementer_dispatch_id, " +
+      "or verifier_dispatch_id set. Also refused for stories already `:verified` (idempotent no-op when the same payload is sent) or `:rejected`. " +
+      "Records a provenance marker in `metadata.backfill` plus an audit event and a `story.backfilled` webhook. " +
+      "REQUIRES `reason`. Strongly recommend passing `evidence_url` (http/https, no credentials in userinfo) and `pr_number`.",
     inputSchema: {
       type: "object",
       properties: {

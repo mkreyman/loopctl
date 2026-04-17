@@ -306,9 +306,15 @@ defmodule LoopctlWeb.FallbackController do
 
   defp changeset_error_message(_), do: "Validation failed"
 
+  # Epic/Story schemas put a single unique_constraint on (tenant_id,
+  # project_id, number); Ecto auto-names the index to include "_number_index".
+  # We detect the number-collision case by inspecting constraint_name so that
+  # future schemas adding unrelated unique constraints (e.g. external_id,
+  # slug) don't get falsely reported as "X already exists".
   defp unique_constraint_violation?(%Changeset{errors: errors}) do
     Enum.any?(errors, fn {_field, {_msg, opts}} ->
-      Keyword.get(opts, :constraint) == :unique
+      Keyword.get(opts, :constraint) == :unique and
+        (Keyword.get(opts, :constraint_name) || "") |> String.contains?("number")
     end)
   end
 

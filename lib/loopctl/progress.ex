@@ -989,6 +989,10 @@ defmodule Loopctl.Progress do
           | {:error,
              :not_found
              | :reason_required
+             | :reason_too_long
+             | :invalid_pr_number
+             | :invalid_evidence_url
+             | :evidence_url_too_long
              | :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
@@ -998,71 +1002,179 @@ defmodule Loopctl.Progress do
     actor_label = Keyword.get(opts, :actor_label)
     reason = params |> Map.get("reason") |> normalize_string()
 
-    if reason == nil do
-      {:error, :reason_required}
-    else
-      evidence_url = params |> Map.get("evidence_url") |> normalize_string()
-      pr_number = Map.get(params, "pr_number")
-
-      multi =
-        Multi.new()
-        |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
-        |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfillable(story) end)
-        |> Multi.run(:story, fn _repo, %{lock: story} ->
-          apply_backfill_status(story, reason, evidence_url, pr_number)
-        end)
-        |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "story",
-            entity_id: updated.id,
-            action: "backfilled",
-            actor_type: "api_key",
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: %{
-              "agent_status" => to_string(old.agent_status),
-              "verified_status" => to_string(old.verified_status)
-            },
-            new_state: %{
-              "agent_status" => to_string(updated.agent_status),
-              "verified_status" => to_string(updated.verified_status),
-              "source" => "pre_loopctl",
-              "reason" => reason,
-              "evidence_url" => evidence_url,
-              "pr_number" => pr_number
-            }
-          }
-        end)
-        |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
-          %{
-            tenant_id: tenant_id,
-            event_type: "story.backfilled",
-            project_id: updated.project_id,
-            payload: %{
-              "event" => "story.backfilled",
-              "story_id" => updated.id,
-              "project_id" => updated.project_id,
-              "epic_id" => updated.epic_id,
-              "reason" => reason,
-              "evidence_url" => evidence_url,
-              "pr_number" => pr_number,
-              "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-            }
-          }
-        end)
-
-      case AdminRepo.transaction(multi) do
-        {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, _step, err, _changes} -> {:error, err}
-      end
+    with :ok <- validate_backfill_reason(reason),
+         {:ok, pr_number} <- cast_pr_number(Map.get(params, "pr_number")),
+         {:ok, evidence_url} <-
+           validate_evidence_url(params |> Map.get("evidence_url") |> normalize_string()) do
+      do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, actor_id, actor_label)
     end
   end
 
+  defp validate_backfill_reason(nil), do: {:error, :reason_required}
+
+  defp validate_backfill_reason(reason) when byte_size(reason) > 2_000,
+    do: {:error, :reason_too_long}
+
+  defp validate_backfill_reason(_reason), do: :ok
+
+  defp cast_pr_number(nil), do: {:ok, nil}
+  defp cast_pr_number(n) when is_integer(n) and n > 0, do: {:ok, n}
+
+  defp cast_pr_number(n) when is_binary(n) do
+    case Integer.parse(n) do
+      {int, ""} when int > 0 -> {:ok, int}
+      _ -> {:error, :invalid_pr_number}
+    end
+  end
+
+  defp cast_pr_number(_), do: {:error, :invalid_pr_number}
+
+  defp validate_evidence_url(nil), do: {:ok, nil}
+
+  defp validate_evidence_url(url) when is_binary(url) do
+    cond do
+      byte_size(url) > 2_000 ->
+        {:error, :evidence_url_too_long}
+
+      not String.match?(url, ~r{\Ahttps?://}) ->
+        {:error, :invalid_evidence_url}
+
+      # Reject userinfo (user:password@) — common place for leaked tokens
+      String.match?(url, ~r{\Ahttps?://[^/]*@}) ->
+        {:error, :invalid_evidence_url}
+
+      true ->
+        {:ok, url}
+    end
+  end
+
+  defp do_backfill(tenant_id, story_id, reason, evidence_url, pr_number, actor_id, actor_label) do
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+      |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfillable(story) end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        apply_backfill_status(story, reason, evidence_url, pr_number)
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "backfilled",
+          actor_type: "api_key",
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: %{
+            "agent_status" => to_string(old.agent_status),
+            "verified_status" => to_string(old.verified_status)
+          },
+          new_state: %{
+            "agent_status" => to_string(updated.agent_status),
+            "verified_status" => to_string(updated.verified_status),
+            "source" => "pre_loopctl",
+            "reason" => reason,
+            "evidence_url" => evidence_url,
+            "pr_number" => pr_number
+          }
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.backfilled",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.backfilled",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "source" => "pre_loopctl",
+            "actor_id" => actor_id,
+            "actor_label" => actor_label,
+            "reason" => reason,
+            "evidence_url" => evidence_url,
+            "pr_number" => pr_number,
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} ->
+        handle_backfill_success(updated)
+
+      {:error, :guard, :already_verified, %{lock: story}} ->
+        idempotent_check(
+          story,
+          tenant_id,
+          story_id,
+          reason,
+          evidence_url,
+          pr_number,
+          actor_id,
+          actor_label
+        )
+
+      {:error, _step, err, _changes} ->
+        {:error, err}
+    end
+  end
+
+  # Idempotency: if the story is already verified AND its existing backfill
+  # metadata matches the incoming params, treat the retry as success and
+  # return 200 instead of 422. This makes backfill_story safe to retry after
+  # a client-side timeout.
+  defp idempotent_check(
+         story,
+         _tenant_id,
+         _story_id,
+         reason,
+         evidence_url,
+         pr_number,
+         _actor_id,
+         _actor_label
+       ) do
+    existing = get_in(story.metadata, ["backfill"]) || %{}
+
+    same_payload? =
+      Map.get(existing, "reason") == reason and
+        Map.get(existing, "evidence_url") == evidence_url and
+        Map.get(existing, "pr_number") == pr_number
+
+    if same_payload? do
+      {:ok, story}
+    else
+      {:error, :already_verified}
+    end
+  end
+
+  defp handle_backfill_success(story), do: {:ok, story}
+
+  # Backfill is ONLY for stories that never entered loopctl's dispatch lifecycle.
+  # The refusal conditions are:
+  #
+  #   - verified (nothing to do)
+  #   - rejected (investigate, don't paper over)
+  #   - agent_status is past :pending (contract/claim/start/report all indicate
+  #     an agent engaged with this story)
+  #   - any dispatch lineage field is set (implementer_dispatch_id,
+  #     verifier_dispatch_id). These are the "ever-dispatched" markers that
+  #     force_unclaim_story does NOT clear — relying on assigned_agent_id alone
+  #     is bypassable via force_unclaim → backfill.
   defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
   defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
 
+  defp guard_backfillable(%{agent_status: status}) when status != :pending,
+    do: {:error, :story_has_dispatch_lineage}
+
   defp guard_backfillable(%{assigned_agent_id: agent_id}) when not is_nil(agent_id),
+    do: {:error, :story_has_dispatch_lineage}
+
+  defp guard_backfillable(%{implementer_dispatch_id: id}) when not is_nil(id),
+    do: {:error, :story_has_dispatch_lineage}
+
+  defp guard_backfillable(%{verifier_dispatch_id: id}) when not is_nil(id),
     do: {:error, :story_has_dispatch_lineage}
 
   defp guard_backfillable(_story), do: {:ok, :ok}

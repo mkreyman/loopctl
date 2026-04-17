@@ -303,14 +303,189 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         })
 
       body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "assigned_agent_id"
-      assert body["error"]["message"] =~ "dispatched through loopctl"
+      assert body["error"]["message"] =~ "dispatch lineage"
+      assert body["error"]["message"] =~ "OUTSIDE the loopctl dispatch"
 
       # Story state is unchanged — backfill refused cleanly
       reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
       assert reloaded.verified_status == :unverified
       assert reloaded.agent_status == :implementing
       assert reloaded.assigned_agent_id == agent.id
+    end
+
+    test "refuses backfill after force_unclaim clears assigned_agent_id", %{conn: conn} do
+      # SECURITY: force_unclaim_story clears assigned_agent_id but leaves
+      # agent_status in a non-:pending state (typically :pending is set back
+      # but only after unclaim actually happens through the real path). A
+      # simpler attack model: a story with agent_status=:implementing but
+      # assigned_agent_id=nil (impossible in practice — the guard catches
+      # this too via the agent_status check). The broader defense is that
+      # guard_backfillable refuses any non-:pending agent_status.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # force_unclaim sets agent_status=:pending and clears assigned_agent_id.
+      # BUT it does NOT clear implementer_dispatch_id. Test that the guard
+      # catches a story with only implementer_dispatch_id set by asserting
+      # agent_status check works — the pragmatic attack scenario is blocked
+      # by agent_status != :pending (tested in the next test) and the
+      # strict guard is a defense in depth.
+
+      # For now: test the obvious case — agent_status=:implementing should
+      # refuse regardless of assigned_agent_id.
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :implementing,
+          assigned_agent_id: nil
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "bypass attempt"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "dispatch lineage"
+
+      # Story state unchanged
+      reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.verified_status == :unverified
+    end
+
+    test "refuses backfill when agent_status is past :pending (contracted, etc)", %{conn: conn} do
+      # An agent that contracted but hasn't claimed yet has non-:pending
+      # agent_status but nil assigned_agent_id. Must still be refused.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :contracted
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "contract skip"})
+
+      assert json_response(conn, 422)
+    end
+
+    test "idempotent retry with same payload returns 200, not 422", %{conn: conn} do
+      # A client that retries a successful backfill (because the first response
+      # was lost to a timeout) must not see a 422. Compare the incoming payload
+      # against metadata.backfill and treat match as success.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      payload = %{
+        "reason" => "completed pre-loopctl",
+        "evidence_url" => "https://github.com/acme/app/pull/232",
+        "pr_number" => 232
+      }
+
+      # First call succeeds
+      conn1 =
+        conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/#{story.id}/backfill", payload)
+
+      assert json_response(conn1, 200)
+
+      # Second identical call also succeeds (idempotent)
+      conn2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", payload)
+
+      assert json_response(conn2, 200)
+    end
+
+    test "retry with DIFFERENT payload after success returns 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn1 =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "first"})
+
+      assert json_response(conn1, 200)
+
+      conn2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "different"})
+
+      assert json_response(conn2, 422)
+    end
+
+    test "rejects non-integer pr_number", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "valid",
+          "pr_number" => %{"nested" => true}
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "pr_number"
+    end
+
+    test "rejects evidence_url with credentials in userinfo", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "valid",
+          "evidence_url" => "https://user:ghp_token@github.com/acme/app/pull/1"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "evidence_url"
     end
 
     test "refuses to backfill a rejected story", %{conn: conn} do

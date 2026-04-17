@@ -112,7 +112,14 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{
         method: "POST",
         path: "/api/v1/epics/:epic_id/stories",
-        description: "Create story in epic"
+        description: "Create story in epic (by epic UUID)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/projects/:project_id/stories",
+        description:
+          "Create story by epic_number (friendlier for agents who know the epic number but not the UUID). " <>
+            "Body must include epic_number plus the usual story fields."
       },
       %{method: "GET", path: "/api/v1/stories/:id", description: "Get story details"},
       %{method: "PATCH", path: "/api/v1/stories/:id", description: "Update story metadata"},
@@ -227,6 +234,13 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "POST",
         path: "/api/v1/stories/:id/reject",
         description: "Reject story (requires reason)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/backfill",
+        description:
+          "Mark story verified for work done outside loopctl (no dispatch lineage allowed). " <>
+            "Requires reason; accepts evidence_url, pr_number."
       },
       %{
         method: "GET",
