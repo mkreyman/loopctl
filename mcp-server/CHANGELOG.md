@@ -5,6 +5,40 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.1.0 — 2026-04-17 (Agent ergonomics)
+
+### Added
+
+- `import_stories` now accepts `merge: true` to append stories to epics that
+  already exist (previously duplicates returned 409 with no way forward).
+- `import_stories` now accepts `payload_path` (absolute JSON file path) so
+  large imports can bypass inline tool-call size limits. When both
+  `payload` and `payload_path` are passed, inline wins.
+- `create_story` — create a single story inside an existing epic. Accepts
+  either `epic_id` (UUID) or (`project_id` + `epic_number`). No more
+  wrapping a single story in a bulk import payload.
+- `backfill_story` — mark a story as verified when the work was completed
+  outside loopctl. Records provenance (`reason`, `evidence_url`,
+  `pr_number`) in `metadata.backfill` plus an audit entry and a
+  `story.backfilled` webhook. Refused for any story with dispatch
+  lineage (non-pending `agent_status`, `assigned_agent_id`,
+  `implementer_dispatch_id`, or `verifier_dispatch_id` set) — cannot be
+  used as a chain-of-custody shortcut.
+
+### Changed
+
+- `import_stories` is type-tolerant on epic numbers. Integer and numeric
+  string both normalize to integers before DB lookup, fixing the
+  `epics[0].tenant_id: has already been taken for this project` error
+  when clients serialized epic numbers as strings.
+- `resolvePayload` validates `payload_path` before reading: requires an
+  absolute path, refuses `/proc`, `/dev`, `/sys` prefixes, rejects
+  non-regular files, enforces a 5 MiB size cap.
+- Domain error translation for Epic/Story unique-number violations —
+  duplicate imports and direct creates now return
+  `"Epic 72 already exists in this project. Use merge=true..."` instead
+  of the raw Ecto constraint message.
+
 ## 2.0.0 — 2026-04-12 (Chain of Custody v2)
 
 ### Breaking

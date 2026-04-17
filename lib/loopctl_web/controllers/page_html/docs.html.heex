@@ -825,7 +825,7 @@
           <h2 class="font-display text-xl font-semibold text-slate-100">MCP Tools</h2>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The loopctl MCP server provides 41 typed tools for Claude Code agents.
+              The loopctl MCP server provides 50 typed tools for Claude Code agents.
               Install via
               <span class="font-mono text-slate-300">npm install loopctl-mcp-server</span>
               and configure in <span class="font-mono text-slate-300">.mcp.json</span>.
@@ -976,11 +976,56 @@
           </div>
 
           <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
+            Work Breakdown Tools
+          </h3>
+          <div class="mt-4 space-y-3">
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">import_stories</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Bulk-import epics and stories into a project. Pass
+                <span class="font-mono text-slate-300">merge: true</span>
+                to add to epics that already exist (without it, duplicates return 409).
+                For large payloads, <span class="font-mono text-slate-300">payload_path</span>
+                accepts an absolute file path instead of the inline object.
+                Epic numbers are type-tolerant -- integers and numeric strings both work.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">create_story</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Create a single story in an existing epic. Accepts either
+                <span class="font-mono text-slate-300">epic_id</span>
+                (UUID) or (<span class="font-mono text-slate-300">project_id</span> + <span class="font-mono text-slate-300">epic_number</span>) --
+                the latter is friendlier when you know the epic number but not the UUID.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">backfill_story</span>
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Mark a story as verified when the work was completed outside loopctl
+                (pre-onboarding, external delivery). Requires <span class="font-mono text-slate-300">reason</span>;
+                accepts <span class="font-mono text-slate-300">evidence_url</span>
+                and <span class="font-mono text-slate-300">pr_number</span>.
+                Refused for any story with dispatch lineage -- you cannot use backfill
+                as a chain-of-custody shortcut. Emits a
+                <span class="font-mono text-slate-300">story.backfilled</span>
+                webhook and records provenance in <span class="font-mono text-slate-300">metadata.backfill</span>.
+              </p>
+            </div>
+          </div>
+
+          <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
             Other Notable Tools
           </h3>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
             <p>
-              The full set of 42 tools covers projects, stories, epics, verification,
+              The full set of 50 tools covers projects, stories, epics, verification,
               artifacts, orchestrator state, webhooks, skills, token usage, analytics,
               and knowledge. See the
               <a
