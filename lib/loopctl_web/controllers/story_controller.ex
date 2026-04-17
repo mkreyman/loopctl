@@ -2,11 +2,12 @@ defmodule LoopctlWeb.StoryController do
   @moduledoc """
   Controller for story CRUD operations.
 
-  - `POST /api/v1/epics/:epic_id/stories` -- user role, creates a story
+  - `POST /api/v1/epics/:epic_id/stories` -- orchestrator+, creates a story
+  - `POST /api/v1/projects/:project_id/stories` -- orchestrator+, creates a story by epic_number
   - `GET /api/v1/epics/:epic_id/stories` -- agent+, lists stories with filters
   - `GET /api/v1/stories/:id` -- agent+, story detail
-  - `PATCH /api/v1/stories/:id` -- user role, updates metadata fields
-  - `DELETE /api/v1/stories/:id` -- user role, deletes a story
+  - `PATCH /api/v1/stories/:id` -- orchestrator+, updates metadata fields
+  - `DELETE /api/v1/stories/:id` -- user+ (destructive), deletes a story
   """
 
   use LoopctlWeb, :controller
@@ -22,9 +23,10 @@ defmodule LoopctlWeb.StoryController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :orchestrator]
-       when action in [:create, :create_in_project, :update, :delete]
+       [role: :orchestrator] when action in [:create, :create_in_project, :update]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index, :show, :index_by_project]
@@ -244,14 +246,19 @@ defmodule LoopctlWeb.StoryController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
-         {:ok, epic} <- Epics.get_epic_by_number(tenant_id, project_id, epic_number) do
+    with {:project, {:ok, _project}} <-
+           {:project, Projects.get_project(tenant_id, project_id)},
+         {:epic, {:ok, epic}} <-
+           {:epic, Epics.get_epic_by_number(tenant_id, project_id, epic_number)} do
       do_create_story(conn, tenant_id, epic.id, params)
     else
-      {:error, :not_found} ->
+      {:project, {:error, :not_found}} ->
+        {:error, :not_found}
+
+      {:epic, {:error, :not_found}} ->
         {:error, :unprocessable_entity,
          "Epic number #{inspect(epic_number)} not found in this project. " <>
-           "Use import_stories to create the epic first, or pick an existing one."}
+           "Use import_stories or POST /projects/:id/epics to create it first."}
     end
   end
 
@@ -406,7 +413,7 @@ defmodule LoopctlWeb.StoryController do
   PATCH /api/v1/stories/:id
 
   Updates story metadata fields. Cannot update agent_status or verified_status.
-  Requires user+ role.
+  Requires orchestrator+ role.
   """
   def update(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key

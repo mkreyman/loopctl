@@ -67,8 +67,10 @@ defmodule LoopctlWeb.StoryVerificationController do
     summary: "Backfill verified status",
     description:
       "Marks a story as verified for work completed outside loopctl (e.g. before onboarding). " <>
-        "Bypasses the normal lifecycle and records provenance. Requires a non-empty `reason`; " <>
-        "`evidence_url` and `pr_number` are optional but strongly recommended.",
+        "Only permitted for stories that never entered loopctl's dispatch lifecycle — " <>
+        "stories with `assigned_agent_id` set, or already `:verified`/`:rejected`, are refused. " <>
+        "Requires a non-empty `reason`; `evidence_url` and `pr_number` are optional but strongly recommended. " <>
+        "Emits a `story.backfilled` webhook event on success.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Backfill params", "application/json",
@@ -83,8 +85,12 @@ defmodule LoopctlWeb.StoryVerificationController do
        }},
     responses: %{
       200 => {"Story backfilled", "application/json", Schemas.StoryStatusResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation or already verified", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Insufficient role (orchestrator+ required)", "application/json", Schemas.ErrorResponse},
+      404 => {"Story not found", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error: missing reason, already verified, already rejected, or has dispatch lineage",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -228,10 +234,25 @@ defmodule LoopctlWeb.StoryVerificationController do
 
       {:error, :already_verified} ->
         {:error, :unprocessable_entity,
-         "Story is already verified. Backfill is idempotent — no further action needed."}
+         "Story is already verified. Backfill is a no-op in that state."}
+
+      {:error, :story_rejected} ->
+        {:error, :unprocessable_entity,
+         "Story is in `verified_status=:rejected`. " <>
+           "Backfill refuses to overwrite a rejection — investigate the rejection reason " <>
+           "and either re-run the normal verify flow or unreject the story first."}
+
+      {:error, :story_has_dispatch_lineage} ->
+        {:error, :unprocessable_entity,
+         "Story has an `assigned_agent_id` set, which means it was dispatched through loopctl. " <>
+           "Backfill is only for work completed OUTSIDE the loopctl dispatch lifecycle. " <>
+           "Use the normal report_story → review_complete → verify_story flow instead."}
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
     end
   end
 

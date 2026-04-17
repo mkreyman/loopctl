@@ -1507,10 +1507,15 @@ defmodule Loopctl.ImportExport do
 
   defp translate_domain_error(_changeset, _path), do: nil
 
+  # Epic and Story schemas each have exactly one unique_constraint:
+  # [:tenant_id, :project_id, :number]. Any :unique constraint error on those
+  # schemas IS a duplicate-number violation, regardless of the human-readable
+  # `message:` value. Matching on `constraint: :unique` in opts is more stable
+  # than matching on the message string (which can be reworded without touching
+  # this code).
   defp unique_number_violation?(changeset) do
-    Enum.any?(changeset.errors, fn {_field, {msg, opts}} ->
-      Keyword.get(opts, :constraint) == :unique and
-        (msg == "has already been taken for this project" or msg == "has already been taken")
+    Enum.any?(changeset.errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique
     end)
   end
 

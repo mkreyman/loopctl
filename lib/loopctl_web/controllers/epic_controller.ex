@@ -2,11 +2,11 @@ defmodule LoopctlWeb.EpicController do
   @moduledoc """
   Controller for epic CRUD operations and progress summary.
 
-  - `POST /api/v1/projects/:project_id/epics` -- user role, creates an epic
+  - `POST /api/v1/projects/:project_id/epics` -- orchestrator+, creates an epic
   - `GET /api/v1/projects/:project_id/epics` -- agent+, lists epics with pagination
   - `GET /api/v1/epics/:id` -- agent+, epic detail with stories
-  - `PATCH /api/v1/epics/:id` -- user role, updates an epic
-  - `DELETE /api/v1/epics/:id` -- user role, deletes an epic
+  - `PATCH /api/v1/epics/:id` -- orchestrator+, updates an epic
+  - `DELETE /api/v1/epics/:id` -- user+ (destructive), deletes an epic
   - `GET /api/v1/epics/:id/progress` -- agent+, epic progress summary
   """
 
@@ -20,8 +20,8 @@ defmodule LoopctlWeb.EpicController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole,
-       [role: :orchestrator] when action in [:create, :update, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
 
@@ -29,7 +29,7 @@ defmodule LoopctlWeb.EpicController do
 
   operation(:create,
     summary: "Create epic",
-    description: "Creates a new epic within a project. Requires user+ role.",
+    description: "Creates a new epic within a project. Requires orchestrator+ role.",
     parameters: [project_id: [in: :path, type: :string, description: "Project UUID"]],
     request_body:
       {"Epic params", "application/json",
@@ -89,7 +89,7 @@ defmodule LoopctlWeb.EpicController do
 
   operation(:update,
     summary: "Update epic",
-    description: "Updates an epic. Number cannot be changed. Requires user+ role.",
+    description: "Updates an epic. Number cannot be changed. Requires orchestrator+ role.",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body:
       {"Update params", "application/json",
@@ -129,7 +129,7 @@ defmodule LoopctlWeb.EpicController do
   @doc """
   POST /api/v1/projects/:project_id/epics
 
-  Creates a new epic. Requires user+ role.
+  Creates a new epic. Requires orchestrator+ role.
   """
   def create(conn, %{"project_id" => project_id} = params) do
     api_key = conn.assigns.current_api_key
@@ -210,7 +210,7 @@ defmodule LoopctlWeb.EpicController do
   @doc """
   PATCH /api/v1/epics/:id
 
-  Updates an epic. Requires user+ role. Number cannot be changed.
+  Updates an epic. Requires orchestrator+ role. Number cannot be changed.
   """
   def update(conn, %{"id" => epic_id} = params) do
     api_key = conn.assigns.current_api_key

@@ -259,17 +259,140 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
       assert body["story"]["metadata"]["backfill"]["pr_number"] == 232
 
-      # Audit event recorded with backfill action
+      # Audit event recorded with "backfilled" action (taxonomy: name the transition)
+      # and `source: "pre_loopctl"` in new_state (names the reason).
       {:ok, audit_page} =
         Loopctl.Audit.list_entries(tenant.id,
           entity_type: "story",
-          action: "backfilled_pre_loopctl"
+          action: "backfilled"
         )
 
       assert length(audit_page.data) == 1
       audit = hd(audit_page.data)
+      assert audit.new_state["source"] == "pre_loopctl"
       assert audit.new_state["reason"] == "completed before loopctl onboarding"
       assert audit.new_state["pr_number"] == 232
+    end
+
+    test "refuses to backfill a story with dispatch lineage", %{conn: conn} do
+      # If the story has an assigned_agent_id, it went through loopctl's dispatch
+      # flow. Backfill must refuse so agents cannot use it as a chain-of-custody
+      # shortcut to "verify" their own implementation.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :implementing,
+          assigned_agent_id: agent.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "self-verify attempt"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "assigned_agent_id"
+      assert body["error"]["message"] =~ "dispatched through loopctl"
+
+      # Story state is unchanged — backfill refused cleanly
+      reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.verified_status == :unverified
+      assert reloaded.agent_status == :implementing
+      assert reloaded.assigned_agent_id == agent.id
+    end
+
+    test "refuses to backfill a rejected story", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          verified_status: :rejected
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "try to paper over rejection"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "rejected"
+    end
+
+    test "backfill is tenant-scoped (cannot reach another tenant's story)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id})
+      story_b = fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> post(~p"/api/v1/stories/#{story_b.id}/backfill", %{"reason" => "cross-tenant"})
+
+      assert json_response(conn, 404)
+    end
+
+    test "emits story.backfilled webhook event when a subscriber is configured", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      # Subscribe a webhook to the new event type. Without this, no event row
+      # is persisted even though the Multi step runs — that's by design in
+      # EventGenerator, which only creates rows for matching subscribers.
+      _webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          events: ["story.backfilled"]
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "pre-existing"})
+
+      assert json_response(conn, 200)
+
+      events =
+        from(e in Loopctl.Webhooks.WebhookEvent,
+          where: e.tenant_id == ^tenant.id and e.event_type == "story.backfilled"
+        )
+        |> Loopctl.AdminRepo.all()
+
+      assert length(events) == 1
+      [event] = events
+      assert event.payload["story_id"] == story.id
+      assert event.payload["reason"] == "pre-existing"
     end
 
     test "rejects missing reason", %{conn: conn} do
@@ -332,6 +455,22 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
       body = json_response(conn, 422)
       assert body["error"]["message"] =~ "already verified"
+    end
+
+    test "returns 404 when story does not exist", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{Ecto.UUID.generate()}/backfill", %{
+          "reason" => "missing"
+        })
+
+      assert json_response(conn, 404)
     end
 
     test "agent role is forbidden (below orchestrator)", %{conn: conn} do

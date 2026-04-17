@@ -999,12 +999,12 @@ const TOOLS = [
         payload: {
           type: "object",
           description:
-            "The import payload object (epics + stories structure). Either this or `payload_path` is required.",
+            "The import payload object (epics + stories structure). Either this or `payload_path` is required. If BOTH are passed, `payload` wins.",
         },
         payload_path: {
           type: "string",
           description:
-            "Absolute path to a JSON file with the import payload. Avoids inline size limits for large epics. Either this or `payload` is required.",
+            "Absolute path to a JSON file with the import payload. Avoids inline size limits for large epics. Ignored if `payload` is also passed.",
         },
         merge: {
           type: "boolean",

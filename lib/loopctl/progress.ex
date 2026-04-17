@@ -955,11 +955,17 @@ defmodule Loopctl.Progress do
   Backfills a story's status when the work was completed outside loopctl.
 
   Sets both `agent_status` and `verified_status` to fully-done values in one
-  shot without going through the contract/claim/report/review/verify dance.
+  shot, BUT only for stories that never entered loopctl's dispatch lifecycle
+  (`assigned_agent_id IS NULL` and `verified_status` not already `:verified`
+  or `:rejected`). This structural guard is what keeps backfill from being a
+  chain-of-custody shortcut: if a story was dispatched to an agent, the
+  normal report/review/verify flow must be used — NOT backfill.
+
   Records a provenance marker in `metadata.backfill` and writes an audit
-  event with `action: "backfilled_pre_loopctl"` so the trust chain is
-  preserved: the work is marked done, but it's explicitly labeled as
-  pre-existing rather than loopctl-verified.
+  event with `action: "backfilled"` (source: `"pre_loopctl"`) so the trust
+  chain is legible: the work is marked done but explicitly labeled as
+  pre-existing rather than loopctl-verified. Emits `story.backfilled` on
+  the webhook channel.
 
   ## Parameters
 
@@ -971,12 +977,22 @@ defmodule Loopctl.Progress do
   ## Returns
 
     * `{:ok, %Story{}}` on success
-    * `{:error, :not_found}` if story not found
-    * `{:error, :already_verified}` if the story is already `verified` (idempotency guard)
-    * `{:error, :reason_required}` if `reason` is missing or blank
+    * `{:error, :not_found}` — story not in tenant
+    * `{:error, :reason_required}` — `reason` missing or blank
+    * `{:error, :already_verified}` — story already `:verified` (idempotent no-op)
+    * `{:error, :story_rejected}` — story is `:rejected`; investigate instead of papering over
+    * `{:error, :story_has_dispatch_lineage}` — story has an `assigned_agent_id`; use the normal verify flow
+    * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, :not_found | :already_verified | :reason_required}
+          {:ok, Story.t()}
+          | {:error,
+             :not_found
+             | :reason_required
+             | :already_verified
+             | :story_rejected
+             | :story_has_dispatch_lineage
+             | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -991,7 +1007,7 @@ defmodule Loopctl.Progress do
       multi =
         Multi.new()
         |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
-        |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_not_verified(story) end)
+        |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_backfillable(story) end)
         |> Multi.run(:story, fn _repo, %{lock: story} ->
           apply_backfill_status(story, reason, evidence_url, pr_number)
         end)
@@ -1000,7 +1016,7 @@ defmodule Loopctl.Progress do
             tenant_id: tenant_id,
             entity_type: "story",
             entity_id: updated.id,
-            action: "backfilled_pre_loopctl",
+            action: "backfilled",
             actor_type: "api_key",
             actor_id: actor_id,
             actor_label: actor_label,
@@ -1011,22 +1027,45 @@ defmodule Loopctl.Progress do
             new_state: %{
               "agent_status" => to_string(updated.agent_status),
               "verified_status" => to_string(updated.verified_status),
+              "source" => "pre_loopctl",
               "reason" => reason,
               "evidence_url" => evidence_url,
               "pr_number" => pr_number
             }
           }
         end)
+        |> EventGenerator.generate_events(:webhook_events, fn %{story: updated} ->
+          %{
+            tenant_id: tenant_id,
+            event_type: "story.backfilled",
+            project_id: updated.project_id,
+            payload: %{
+              "event" => "story.backfilled",
+              "story_id" => updated.id,
+              "project_id" => updated.project_id,
+              "epic_id" => updated.epic_id,
+              "reason" => reason,
+              "evidence_url" => evidence_url,
+              "pr_number" => pr_number,
+              "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+            }
+          }
+        end)
 
       case AdminRepo.transaction(multi) do
         {:ok, %{story: updated}} -> {:ok, updated}
-        {:error, _step, reason, _changes} -> {:error, reason}
+        {:error, _step, err, _changes} -> {:error, err}
       end
     end
   end
 
-  defp guard_not_verified(%{verified_status: :verified}), do: {:error, :already_verified}
-  defp guard_not_verified(_story), do: {:ok, :ok}
+  defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
+  defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
+
+  defp guard_backfillable(%{assigned_agent_id: agent_id}) when not is_nil(agent_id),
+    do: {:error, :story_has_dispatch_lineage}
+
+  defp guard_backfillable(_story), do: {:ok, :ok}
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()

@@ -2,8 +2,8 @@ defmodule LoopctlWeb.StoryDependencyController do
   @moduledoc """
   Controller for story dependency CRUD operations.
 
-  - `POST /api/v1/story_dependencies` -- user role, creates a story dependency
-  - `DELETE /api/v1/story_dependencies/:id` -- user role, deletes a story dependency
+  - `POST /api/v1/story_dependencies` -- orchestrator+, creates a story dependency
+  - `DELETE /api/v1/story_dependencies/:id` -- user+ (destructive), deletes a story dependency
   - `GET /api/v1/epics/:id/story_dependencies` -- agent+, lists story deps for epic
   """
 
@@ -17,7 +17,8 @@ defmodule LoopctlWeb.StoryDependencyController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
 
   tags(["Dependencies"])

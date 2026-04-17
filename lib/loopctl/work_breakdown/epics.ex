@@ -94,7 +94,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
   Used by endpoints that accept epic numbers from agents (who rarely know
   UUIDs) instead of forcing a lookup round-trip.
   """
-  @spec get_epic_by_number(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+  @spec get_epic_by_number(Ecto.UUID.t(), Ecto.UUID.t(), integer() | String.t()) ::
           {:ok, Epic.t()} | {:error, :not_found}
   def get_epic_by_number(tenant_id, project_id, number) when is_integer(number) do
     case AdminRepo.get_by(Epic, tenant_id: tenant_id, project_id: project_id, number: number) do
