@@ -33,7 +33,7 @@ defmodule LoopctlWeb.StoryController do
 
   operation(:create,
     summary: "Create story",
-    description: "Creates a new story within an epic. Requires user+ role.",
+    description: "Creates a new story within an epic. Requires orchestrator+ role.",
     parameters: [epic_id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body:
       {"Story params", "application/json",
@@ -57,6 +57,40 @@ defmodule LoopctlWeb.StoryController do
       201 => {"Story created", "application/json", Schemas.StoryResponse},
       404 => {"Epic not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:create_in_project,
+    summary: "Create story (by epic number)",
+    description:
+      "Creates a new story by looking up the epic by its human-readable `number` instead of UUID. " <>
+        "Friendlier for agents who know the epic number (e.g. 72) but not the UUID. Requires orchestrator+ role.",
+    parameters: [project_id: [in: :path, type: :string, description: "Project UUID"]],
+    request_body:
+      {"Story params with epic_number", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:epic_number, :number, :title],
+         properties: %{
+           epic_number: %OpenApiSpex.Schema{type: :integer},
+           number: %OpenApiSpex.Schema{type: :string},
+           title: %OpenApiSpex.Schema{type: :string},
+           description: %OpenApiSpex.Schema{type: :string, nullable: true},
+           acceptance_criteria: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :object},
+             nullable: true
+           },
+           estimated_hours: %OpenApiSpex.Schema{type: :number, nullable: true},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 => {"Story created", "application/json", Schemas.StoryResponse},
+      404 => {"Project not found", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error or epic_number not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

@@ -63,6 +63,32 @@ defmodule LoopctlWeb.StoryVerificationController do
     }
   )
 
+  operation(:backfill,
+    summary: "Backfill verified status",
+    description:
+      "Marks a story as verified for work completed outside loopctl (e.g. before onboarding). " <>
+        "Bypasses the normal lifecycle and records provenance. Requires a non-empty `reason`; " <>
+        "`evidence_url` and `pr_number` are optional but strongly recommended.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Backfill params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:reason],
+         properties: %{
+           reason: %OpenApiSpex.Schema{type: :string},
+           evidence_url: %OpenApiSpex.Schema{type: :string, nullable: true},
+           pr_number: %OpenApiSpex.Schema{type: :integer, nullable: true}
+         }
+       }},
+    responses: %{
+      200 => {"Story backfilled", "application/json", Schemas.StoryStatusResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation or already verified", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   operation(:index,
     summary: "List verifications",
     description: "Lists verification results for a story with pagination.",
