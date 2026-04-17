@@ -17,7 +17,7 @@ defmodule LoopctlWeb.StoryDependencyController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :delete]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
 
   tags(["Dependencies"])

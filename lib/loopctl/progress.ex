@@ -952,6 +952,118 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
+  Backfills a story's status when the work was completed outside loopctl.
+
+  Sets both `agent_status` and `verified_status` to fully-done values in one
+  shot without going through the contract/claim/report/review/verify dance.
+  Records a provenance marker in `metadata.backfill` and writes an audit
+  event with `action: "backfilled_pre_loopctl"` so the trust chain is
+  preserved: the work is marked done, but it's explicitly labeled as
+  pre-existing rather than loopctl-verified.
+
+  ## Parameters
+
+    * `tenant_id` — the tenant UUID
+    * `story_id` — the story UUID
+    * `params` — map with `reason` (required, string), optional `evidence_url`, `pr_number`
+    * `opts` — keyword list with `:actor_id`, `:actor_label`
+
+  ## Returns
+
+    * `{:ok, %Story{}}` on success
+    * `{:error, :not_found}` if story not found
+    * `{:error, :already_verified}` if the story is already `verified` (idempotency guard)
+    * `{:error, :reason_required}` if `reason` is missing or blank
+  """
+  @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Story.t()} | {:error, :not_found | :already_verified | :reason_required}
+  def backfill_story(tenant_id, story_id, params, opts \\ []) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    reason = params |> Map.get("reason") |> normalize_string()
+
+    if reason == nil do
+      {:error, :reason_required}
+    else
+      evidence_url = params |> Map.get("evidence_url") |> normalize_string()
+      pr_number = Map.get(params, "pr_number")
+
+      multi =
+        Multi.new()
+        |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+        |> Multi.run(:guard, fn _repo, %{lock: story} -> guard_not_verified(story) end)
+        |> Multi.run(:story, fn _repo, %{lock: story} ->
+          apply_backfill_status(story, reason, evidence_url, pr_number)
+        end)
+        |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+          %{
+            tenant_id: tenant_id,
+            entity_type: "story",
+            entity_id: updated.id,
+            action: "backfilled_pre_loopctl",
+            actor_type: "api_key",
+            actor_id: actor_id,
+            actor_label: actor_label,
+            old_state: %{
+              "agent_status" => to_string(old.agent_status),
+              "verified_status" => to_string(old.verified_status)
+            },
+            new_state: %{
+              "agent_status" => to_string(updated.agent_status),
+              "verified_status" => to_string(updated.verified_status),
+              "reason" => reason,
+              "evidence_url" => evidence_url,
+              "pr_number" => pr_number
+            }
+          }
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{story: updated}} -> {:ok, updated}
+        {:error, _step, reason, _changes} -> {:error, reason}
+      end
+    end
+  end
+
+  defp guard_not_verified(%{verified_status: :verified}), do: {:error, :already_verified}
+  defp guard_not_verified(_story), do: {:ok, :ok}
+
+  defp apply_backfill_status(story, reason, evidence_url, pr_number) do
+    now = DateTime.utc_now()
+
+    backfill_meta = %{
+      "reason" => reason,
+      "evidence_url" => evidence_url,
+      "pr_number" => pr_number,
+      "backfilled_at" => DateTime.to_iso8601(now)
+    }
+
+    new_metadata = Map.put(story.metadata || %{}, "backfill", backfill_meta)
+
+    story
+    |> Ecto.Changeset.change(%{
+      agent_status: :reported_done,
+      verified_status: :verified,
+      reported_done_at: story.reported_done_at || now,
+      verified_at: now,
+      metadata: new_metadata
+    })
+    |> AdminRepo.update()
+  end
+
+  defp normalize_string(nil), do: nil
+  defp normalize_string(""), do: nil
+
+  defp normalize_string(s) when is_binary(s) do
+    case String.trim(s) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_string(_), do: nil
+
+  @doc """
   Rejects a story: orchestrator marks it as failing verification.
 
   Sets verified_status to `rejected` and creates a verification_result

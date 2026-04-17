@@ -198,7 +198,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # Hash the content_hash with SHA256 to ensure we always have 32 bytes,
     # then format the first 16 bytes as a UUID string.
     <<a::binary-size(4), b::binary-size(2), c::binary-size(2), d::binary-size(2),
-      e::binary-size(6), _rest::binary>> =
+      e::binary-size(6),
+      _rest::binary>> =
       :crypto.hash(:sha256, content_hash)
 
     raw_uuid = a <> b <> c <> d <> e

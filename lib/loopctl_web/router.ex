@@ -174,6 +174,8 @@ defmodule LoopctlWeb.Router do
     # Story verification (orchestrator side of two-tier trust model)
     post "/stories/:id/verify", StoryVerificationController, :verify
     post "/stories/:id/reject", StoryVerificationController, :reject
+    # Backfill: mark as verified for work completed outside loopctl.
+    post "/stories/:id/backfill", StoryVerificationController, :backfill
     get "/stories/:story_id/verifications", StoryVerificationController, :index
     post "/stories/:id/force-unclaim", StoryVerificationController, :force_unclaim
 
@@ -211,6 +213,8 @@ defmodule LoopctlWeb.Router do
     # Story management
     get "/epics/:epic_id/stories", StoryController, :index
     post "/epics/:epic_id/stories", StoryController, :create
+    # Agent-friendly alias: create a story by epic number instead of UUID.
+    post "/projects/:project_id/stories", StoryController, :create_in_project
     get "/stories/:id", StoryController, :show
     patch "/stories/:id", StoryController, :update
     delete "/stories/:id", StoryController, :delete

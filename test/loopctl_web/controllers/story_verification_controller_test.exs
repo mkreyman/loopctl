@@ -228,6 +228,131 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     end
   end
 
+  # --- Backfill tests ---
+
+  describe "POST /api/v1/stories/:id/backfill" do
+    test "marks a pending story as verified with provenance", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "completed before loopctl onboarding",
+          "evidence_url" => "https://github.com/acme/app/pull/232",
+          "pr_number" => 232
+        })
+
+      body = json_response(conn, 200)
+      assert body["story"]["agent_status"] == "reported_done"
+      assert body["story"]["verified_status"] == "verified"
+
+      assert body["story"]["metadata"]["backfill"]["reason"] ==
+               "completed before loopctl onboarding"
+
+      assert body["story"]["metadata"]["backfill"]["pr_number"] == 232
+
+      # Audit event recorded with backfill action
+      {:ok, audit_page} =
+        Loopctl.Audit.list_entries(tenant.id,
+          entity_type: "story",
+          action: "backfilled_pre_loopctl"
+        )
+
+      assert length(audit_page.data) == 1
+      audit = hd(audit_page.data)
+      assert audit.new_state["reason"] == "completed before loopctl onboarding"
+      assert audit.new_state["pr_number"] == 232
+    end
+
+    test "rejects missing reason", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "reason"
+    end
+
+    test "rejects blank reason", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "   "})
+
+      assert json_response(conn, 422)
+    end
+
+    test "returns 422 when story already verified", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          verified_status: :verified
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "retry"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "already verified"
+    end
+
+    test "agent role is forbidden (below orchestrator)", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "yes"})
+
+      assert json_response(conn, 403)
+    end
+  end
+
   # --- Reject tests ---
 
   describe "POST /api/v1/stories/:id/reject" do

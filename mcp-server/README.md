@@ -77,7 +77,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `create_project` | Create a new project in the current tenant. |
 | `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
-| `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). |
+| `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). For large payloads, use `payload_path` to read JSON from disk instead of passing it inline. |
 
 ### Story Tools
 
@@ -86,6 +86,8 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `list_stories` | List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. Pass `include_token_totals=true` for per-story token data. |
 | `list_ready_stories` | List stories that are ready to be worked on (contracted, dependencies met). |
 | `get_story` | Get full details for a single story by ID. |
+| `create_story` | Create a single story inside an existing epic. Use instead of wrapping a story in a bulk import. Accepts either `epic_id` (UUID) or (`project_id` + `epic_number`). |
+| `backfill_story` | Mark a story as verified when the work was completed outside loopctl (e.g. before onboarding). Bypasses the normal lifecycle and records provenance (`reason`, `evidence_url`, `pr_number`) in metadata and the audit log. |
 
 ### Workflow Tools (agent key)
 

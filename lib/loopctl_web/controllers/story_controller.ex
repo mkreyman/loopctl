@@ -23,7 +23,8 @@ defmodule LoopctlWeb.StoryController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:create, :update, :delete]
+       [role: :orchestrator]
+       when action in [:create, :create_in_project, :update, :delete]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index, :show, :index_by_project]
@@ -182,34 +183,70 @@ defmodule LoopctlWeb.StoryController do
   @doc """
   POST /api/v1/epics/:epic_id/stories
 
-  Creates a new story. Requires user+ role.
+  Creates a new story. Requires orchestrator+ role.
   """
   def create(conn, %{"epic_id" => epic_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
     with {:ok, _epic} <- Epics.get_epic(tenant_id, epic_id) do
-      attrs = %{
-        epic_id: epic_id,
-        number: params["number"],
-        title: params["title"],
-        description: params["description"],
-        acceptance_criteria: params["acceptance_criteria"],
-        estimated_hours: parse_decimal(params["estimated_hours"]),
-        metadata: params["metadata"] || %{}
-      }
+      do_create_story(conn, tenant_id, epic_id, params)
+    end
+  end
 
-      audit_opts = AuditContext.from_conn(conn)
+  @doc """
+  POST /api/v1/projects/:project_id/stories
 
-      case Stories.create_story(tenant_id, attrs, audit_opts) do
-        {:ok, story} ->
-          conn
-          |> put_status(:created)
-          |> json(%{story: story_json(story)})
+  Creates a story by looking up the epic by its `number` within the project.
+  Agents typically know the epic number (e.g. 72) but not the UUID; this
+  endpoint lets them skip the lookup round-trip.
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
-      end
+  Expects `epic_number` in the body alongside the usual story fields.
+  """
+  def create_in_project(
+        conn,
+        %{"project_id" => project_id, "epic_number" => epic_number} = params
+      ) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
+         {:ok, epic} <- Epics.get_epic_by_number(tenant_id, project_id, epic_number) do
+      do_create_story(conn, tenant_id, epic.id, params)
+    else
+      {:error, :not_found} ->
+        {:error, :unprocessable_entity,
+         "Epic number #{inspect(epic_number)} not found in this project. " <>
+           "Use import_stories to create the epic first, or pick an existing one."}
+    end
+  end
+
+  def create_in_project(_conn, %{"project_id" => _}) do
+    {:error, :unprocessable_entity,
+     "`epic_number` is required. Pass it in the request body alongside the story fields."}
+  end
+
+  defp do_create_story(conn, tenant_id, epic_id, params) do
+    attrs = %{
+      epic_id: epic_id,
+      number: params["number"],
+      title: params["title"],
+      description: params["description"],
+      acceptance_criteria: params["acceptance_criteria"],
+      estimated_hours: parse_decimal(params["estimated_hours"]),
+      metadata: params["metadata"] || %{}
+    }
+
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Stories.create_story(tenant_id, attrs, audit_opts) do
+      {:ok, story} ->
+        conn
+        |> put_status(:created)
+        |> json(%{story: story_json(story)})
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
     end
   end
 

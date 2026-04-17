@@ -20,7 +20,9 @@ defmodule LoopctlWeb.EpicController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :update, :delete]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :orchestrator] when action in [:create, :update, :delete]
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
 
   tags(["Epics"])

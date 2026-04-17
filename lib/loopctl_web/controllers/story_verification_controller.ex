@@ -27,7 +27,7 @@ defmodule LoopctlWeb.StoryVerificationController do
        [exact_role: :orchestrator] when action in [:verify, :reject, :force_unclaim, :verify_all]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :orchestrator] when action in [:index]
+       [role: :orchestrator] when action in [:index, :backfill]
 
   tags(["Progress"])
 
@@ -171,6 +171,41 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, other} ->
           {:error, other}
       end
+    end
+  end
+
+  @doc """
+  POST /api/v1/stories/:id/backfill
+
+  Marks a story as verified for work completed outside loopctl. Bypasses the
+  usual contract/claim/report/review/verify lifecycle because there is no
+  agent dispatch to enforce chain-of-custody against. The provenance is
+  recorded in `metadata.backfill` and in an audit event so the trust chain
+  remains legible.
+
+  Requires a non-empty `reason`. Evidence (`evidence_url`, `pr_number`) is
+  optional but strongly recommended.
+  """
+  def backfill(conn, %{"id" => story_id} = params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    opts = AuditContext.from_conn(conn)
+
+    case Progress.backfill_story(tenant_id, story_id, params, opts) do
+      {:ok, story} ->
+        json(conn, %{story: story})
+
+      {:error, :reason_required} ->
+        {:error, :unprocessable_entity,
+         "`reason` is required and cannot be blank. " <>
+           "Describe why this story is being backfilled (e.g. 'completed before loopctl onboarding, see PR #232')."}
+
+      {:error, :already_verified} ->
+        {:error, :unprocessable_entity,
+         "Story is already verified. Backfill is idempotent — no further action needed."}
+
+      {:error, :not_found} ->
+        {:error, :not_found}
     end
   end
 

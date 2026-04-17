@@ -114,7 +114,7 @@ The API enforces that nobody marks their own work as done:
 Ask these questions:
 
 1. **Does this weaken chain-of-custody?** If a single session could now both implement and verify/report, the change is WRONG.
-2. **Does this give agents destructive capabilities?** Destructive operations (DELETE, archive) must stay at `role: :user`. Agents and orchestrators should not be able to delete projects, budgets, or resolve anomalies via MCP tools.
+2. **Does this give agents destructive capabilities?** Project-level destructive operations (DELETE project, delete budget, resolve cost anomalies, archive articles, rotate tenant audit keys) must stay at `role: :user`. Work-breakdown data operations (create/update/delete epics, stories, dependencies, imports, backfills) are intentionally at `role: :orchestrator` so an autonomous orchestrator can recover from partial imports and undo its own mistakes without human intervention. Agents (`role: :agent`) can still never write work-breakdown data — only read it.
 3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
 4. **Does this affect RLS?** New tables must use `ENABLE ROW LEVEL SECURITY` (not `FORCE`) since the production role (`schema_admin`) is the table owner without BYPASSRLS.
 

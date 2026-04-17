@@ -363,6 +363,76 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       assert json_response(conn, 404)
     end
 
+    test "reproduces prod bug: orchestrator merges existing epic with new stories", %{conn: conn} do
+      # Mimics the exact scenario that failed in production:
+      # 1. Orchestrator creates epic 72 via fresh import (with 1 story)
+      # 2. Orchestrator merge-imports epic 72 with 10 stories (1 existing, 9 new)
+      # Expected: 9 stories created, 1 updated. Actual (pre-fix): 422 epics[0].tenant_id.
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 72})
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        number: "72.1",
+        title: "Existing 72.1"
+      })
+
+      payload = %{
+        "epics" => [
+          %{
+            "number" => 72,
+            "title" => "Morning Agenda & Smart Reminders",
+            "stories" =>
+              for n <- 1..10 do
+                %{"number" => "72.#{n}", "title" => "Story 72.#{n}"}
+              end
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", payload)
+
+      body = json_response(conn, 200)
+      assert body["import"]["stories_created"] == 9
+      assert body["import"]["stories_updated"] == 1
+      assert body["import"]["epics_updated"] == 1
+    end
+
+    test "reproduces prod bug: merge with string epic number from client payload", %{conn: conn} do
+      # When a client serializes the payload and epic number is passed as string
+      # (e.g. JS/Python JSON with "number": "72"), the merge lookup misses.
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      _epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 72})
+
+      payload = %{
+        "epics" => [
+          %{
+            # String instead of integer -- the fix should coerce
+            "number" => "72",
+            "title" => "Morning Agenda",
+            "stories" => []
+          }
+        ]
+      }
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", payload)
+
+      body = json_response(conn, 200)
+      assert body["import"]["epics_updated"] == 1
+      assert body["import"]["epics_created"] == 0
+    end
+
     test "duplicate import without merge flag returns 409", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
