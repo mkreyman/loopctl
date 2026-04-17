@@ -89,6 +89,30 @@ defmodule Loopctl.WorkBreakdown.Epics do
   end
 
   @doc """
+  Gets an epic by its human-readable `number` within a project.
+
+  Used by endpoints that accept epic numbers from agents (who rarely know
+  UUIDs) instead of forcing a lookup round-trip.
+  """
+  @spec get_epic_by_number(Ecto.UUID.t(), Ecto.UUID.t(), integer() | String.t()) ::
+          {:ok, Epic.t()} | {:error, :not_found}
+  def get_epic_by_number(tenant_id, project_id, number) when is_integer(number) do
+    case AdminRepo.get_by(Epic, tenant_id: tenant_id, project_id: project_id, number: number) do
+      nil -> {:error, :not_found}
+      epic -> {:ok, epic}
+    end
+  end
+
+  def get_epic_by_number(tenant_id, project_id, number) when is_binary(number) do
+    case Integer.parse(number) do
+      {int, ""} -> get_epic_by_number(tenant_id, project_id, int)
+      _ -> {:error, :not_found}
+    end
+  end
+
+  def get_epic_by_number(_tenant_id, _project_id, _number), do: {:error, :not_found}
+
+  @doc """
   Gets an epic by ID with stories preloaded, scoped to a tenant.
 
   ## Returns

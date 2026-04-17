@@ -2,8 +2,8 @@ defmodule LoopctlWeb.EpicDependencyController do
   @moduledoc """
   Controller for epic dependency CRUD operations.
 
-  - `POST /api/v1/epic_dependencies` -- user role, creates an epic dependency
-  - `DELETE /api/v1/epic_dependencies/:id` -- user role, deletes an epic dependency
+  - `POST /api/v1/epic_dependencies` -- orchestrator+, creates an epic dependency
+  - `DELETE /api/v1/epic_dependencies/:id` -- user+ (destructive), deletes an epic dependency
   - `GET /api/v1/projects/:id/epic_dependencies` -- agent+, lists epic deps for project
   """
 
@@ -17,7 +17,8 @@ defmodule LoopctlWeb.EpicDependencyController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:create, :delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
 
   tags(["Dependencies"])

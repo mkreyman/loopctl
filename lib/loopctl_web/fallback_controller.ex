@@ -258,7 +258,13 @@ defmodule LoopctlWeb.FallbackController do
 
     conn
     |> put_status(:unprocessable_entity)
-    |> json(%{error: %{status: 422, message: "Validation failed", details: details}})
+    |> json(%{
+      error: %{
+        status: 422,
+        message: changeset_error_message(changeset),
+        details: details
+      }
+    })
   end
 
   def call(conn, {:error, :bad_request, message}) when is_binary(message) do
@@ -278,6 +284,37 @@ defmodule LoopctlWeb.FallbackController do
       Regex.replace(~r"%{(\w+)}", msg, fn _, key ->
         opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
       end)
+    end)
+  end
+
+  # Translate recognized changeset errors into actionable domain messages.
+  # Falls back to the generic "Validation failed" when no domain rule matches
+  # so callers still get the field-level details array.
+  defp changeset_error_message(%Changeset{data: %mod{}} = changeset)
+       when mod in [Loopctl.WorkBreakdown.Epic, Loopctl.WorkBreakdown.Story] do
+    if unique_constraint_violation?(changeset) do
+      number = Changeset.get_field(changeset, :number)
+      entity = if mod == Loopctl.WorkBreakdown.Epic, do: "Epic", else: "Story"
+
+      "#{entity} #{number} already exists in this project. " <>
+        "Pick a different number, or use the import endpoint with `merge=true` " <>
+        "to update the existing record."
+    else
+      "Validation failed"
+    end
+  end
+
+  defp changeset_error_message(_), do: "Validation failed"
+
+  # Epic/Story schemas put a single unique_constraint on (tenant_id,
+  # project_id, number); Ecto auto-names the index to include "_number_index".
+  # We detect the number-collision case by inspecting constraint_name so that
+  # future schemas adding unrelated unique constraints (e.g. external_id,
+  # slug) don't get falsely reported as "X already exists".
+  defp unique_constraint_violation?(%Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        (Keyword.get(opts, :constraint_name) || "") |> String.contains?("number")
     end)
   end
 

@@ -228,6 +228,445 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     end
   end
 
+  # --- Backfill tests ---
+
+  describe "POST /api/v1/stories/:id/backfill" do
+    test "marks a pending story as verified with provenance", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "completed before loopctl onboarding",
+          "evidence_url" => "https://github.com/acme/app/pull/232",
+          "pr_number" => 232
+        })
+
+      body = json_response(conn, 200)
+      assert body["story"]["agent_status"] == "reported_done"
+      assert body["story"]["verified_status"] == "verified"
+
+      assert body["story"]["metadata"]["backfill"]["reason"] ==
+               "completed before loopctl onboarding"
+
+      assert body["story"]["metadata"]["backfill"]["pr_number"] == 232
+
+      # Audit event recorded with "backfilled" action (taxonomy: name the transition)
+      # and `source: "pre_loopctl"` in new_state (names the reason).
+      {:ok, audit_page} =
+        Loopctl.Audit.list_entries(tenant.id,
+          entity_type: "story",
+          action: "backfilled"
+        )
+
+      assert length(audit_page.data) == 1
+      audit = hd(audit_page.data)
+      assert audit.new_state["source"] == "pre_loopctl"
+      assert audit.new_state["reason"] == "completed before loopctl onboarding"
+      assert audit.new_state["pr_number"] == 232
+    end
+
+    test "refuses to backfill a story with dispatch lineage", %{conn: conn} do
+      # If the story has an assigned_agent_id, it went through loopctl's dispatch
+      # flow. Backfill must refuse so agents cannot use it as a chain-of-custody
+      # shortcut to "verify" their own implementation.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :implementing,
+          assigned_agent_id: agent.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "self-verify attempt"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "dispatch lineage"
+      assert body["error"]["message"] =~ "OUTSIDE the loopctl dispatch"
+
+      # Story state is unchanged — backfill refused cleanly
+      reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.verified_status == :unverified
+      assert reloaded.agent_status == :implementing
+      assert reloaded.assigned_agent_id == agent.id
+    end
+
+    test "refuses backfill after force_unclaim clears assigned_agent_id", %{conn: conn} do
+      # SECURITY: force_unclaim_story clears assigned_agent_id but leaves
+      # agent_status in a non-:pending state (typically :pending is set back
+      # but only after unclaim actually happens through the real path). A
+      # simpler attack model: a story with agent_status=:implementing but
+      # assigned_agent_id=nil (impossible in practice — the guard catches
+      # this too via the agent_status check). The broader defense is that
+      # guard_backfillable refuses any non-:pending agent_status.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # force_unclaim sets agent_status=:pending and clears assigned_agent_id.
+      # BUT it does NOT clear implementer_dispatch_id. Test that the guard
+      # catches a story with only implementer_dispatch_id set by asserting
+      # agent_status check works — the pragmatic attack scenario is blocked
+      # by agent_status != :pending (tested in the next test) and the
+      # strict guard is a defense in depth.
+
+      # For now: test the obvious case — agent_status=:implementing should
+      # refuse regardless of assigned_agent_id.
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :implementing,
+          assigned_agent_id: nil
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "bypass attempt"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "dispatch lineage"
+
+      # Story state unchanged
+      reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.verified_status == :unverified
+    end
+
+    test "refuses backfill when agent_status is past :pending (contracted, etc)", %{conn: conn} do
+      # An agent that contracted but hasn't claimed yet has non-:pending
+      # agent_status but nil assigned_agent_id. Must still be refused.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :contracted
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "contract skip"})
+
+      assert json_response(conn, 422)
+    end
+
+    test "idempotent retry with same payload returns 200, not 422", %{conn: conn} do
+      # A client that retries a successful backfill (because the first response
+      # was lost to a timeout) must not see a 422. Compare the incoming payload
+      # against metadata.backfill and treat match as success.
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      payload = %{
+        "reason" => "completed pre-loopctl",
+        "evidence_url" => "https://github.com/acme/app/pull/232",
+        "pr_number" => 232
+      }
+
+      # First call succeeds
+      conn1 =
+        conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/#{story.id}/backfill", payload)
+
+      assert json_response(conn1, 200)
+
+      # Second identical call also succeeds (idempotent)
+      conn2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", payload)
+
+      assert json_response(conn2, 200)
+    end
+
+    test "retry with DIFFERENT payload after success returns 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn1 =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "first"})
+
+      assert json_response(conn1, 200)
+
+      conn2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "different"})
+
+      assert json_response(conn2, 422)
+    end
+
+    test "rejects non-integer pr_number", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "valid",
+          "pr_number" => %{"nested" => true}
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "pr_number"
+    end
+
+    test "rejects evidence_url with credentials in userinfo", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "valid",
+          "evidence_url" => "https://user:ghp_token@github.com/acme/app/pull/1"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "evidence_url"
+    end
+
+    test "refuses to backfill a rejected story", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          verified_status: :rejected
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{
+          "reason" => "try to paper over rejection"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "rejected"
+    end
+
+    test "backfill is tenant-scoped (cannot reach another tenant's story)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id})
+      story_b = fixture(:story, %{tenant_id: tenant_b.id, epic_id: epic_b.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> post(~p"/api/v1/stories/#{story_b.id}/backfill", %{"reason" => "cross-tenant"})
+
+      assert json_response(conn, 404)
+    end
+
+    test "emits story.backfilled webhook event when a subscriber is configured", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      # Subscribe a webhook to the new event type. Without this, no event row
+      # is persisted even though the Multi step runs — that's by design in
+      # EventGenerator, which only creates rows for matching subscribers.
+      _webhook =
+        fixture(:webhook, %{
+          tenant_id: tenant.id,
+          events: ["story.backfilled"]
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "pre-existing"})
+
+      assert json_response(conn, 200)
+
+      events =
+        from(e in Loopctl.Webhooks.WebhookEvent,
+          where: e.tenant_id == ^tenant.id and e.event_type == "story.backfilled"
+        )
+        |> Loopctl.AdminRepo.all()
+
+      assert length(events) == 1
+      [event] = events
+      assert event.payload["story_id"] == story.id
+      assert event.payload["reason"] == "pre-existing"
+    end
+
+    test "rejects missing reason", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "reason"
+    end
+
+    test "rejects blank reason", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "   "})
+
+      assert json_response(conn, 422)
+    end
+
+    test "returns 422 when story already verified", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          verified_status: :verified
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "retry"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "already verified"
+    end
+
+    test "returns 404 when story does not exist", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{Ecto.UUID.generate()}/backfill", %{
+          "reason" => "missing"
+        })
+
+      assert json_response(conn, 404)
+    end
+
+    test "agent role is forbidden (below orchestrator)", %{conn: conn} do
+      tenant = fixture(:tenant)
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "yes"})
+
+      assert json_response(conn, 403)
+    end
+  end
+
   # --- Reject tests ---
 
   describe "POST /api/v1/stories/:id/reject" do

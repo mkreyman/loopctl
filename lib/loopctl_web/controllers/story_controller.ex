@@ -2,11 +2,12 @@ defmodule LoopctlWeb.StoryController do
   @moduledoc """
   Controller for story CRUD operations.
 
-  - `POST /api/v1/epics/:epic_id/stories` -- user role, creates a story
+  - `POST /api/v1/epics/:epic_id/stories` -- orchestrator+, creates a story
+  - `POST /api/v1/projects/:project_id/stories` -- orchestrator+, creates a story by epic_number
   - `GET /api/v1/epics/:epic_id/stories` -- agent+, lists stories with filters
   - `GET /api/v1/stories/:id` -- agent+, story detail
-  - `PATCH /api/v1/stories/:id` -- user role, updates metadata fields
-  - `DELETE /api/v1/stories/:id` -- user role, deletes a story
+  - `PATCH /api/v1/stories/:id` -- orchestrator+, updates metadata fields
+  - `DELETE /api/v1/stories/:id` -- user+ (destructive), deletes a story
   """
 
   use LoopctlWeb, :controller
@@ -22,8 +23,10 @@ defmodule LoopctlWeb.StoryController do
 
   action_fallback LoopctlWeb.FallbackController
 
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
+
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:create, :update, :delete]
+       [role: :orchestrator] when action in [:create, :create_in_project, :update]
 
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index, :show, :index_by_project]
@@ -32,7 +35,7 @@ defmodule LoopctlWeb.StoryController do
 
   operation(:create,
     summary: "Create story",
-    description: "Creates a new story within an epic. Requires user+ role.",
+    description: "Creates a new story within an epic. Requires orchestrator+ role.",
     parameters: [epic_id: [in: :path, type: :string, description: "Epic UUID"]],
     request_body:
       {"Story params", "application/json",
@@ -56,6 +59,40 @@ defmodule LoopctlWeb.StoryController do
       201 => {"Story created", "application/json", Schemas.StoryResponse},
       404 => {"Epic not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:create_in_project,
+    summary: "Create story (by epic number)",
+    description:
+      "Creates a new story by looking up the epic by its human-readable `number` instead of UUID. " <>
+        "Friendlier for agents who know the epic number (e.g. 72) but not the UUID. Requires orchestrator+ role.",
+    parameters: [project_id: [in: :path, type: :string, description: "Project UUID"]],
+    request_body:
+      {"Story params with epic_number", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:epic_number, :number, :title],
+         properties: %{
+           epic_number: %OpenApiSpex.Schema{type: :integer},
+           number: %OpenApiSpex.Schema{type: :string},
+           title: %OpenApiSpex.Schema{type: :string},
+           description: %OpenApiSpex.Schema{type: :string, nullable: true},
+           acceptance_criteria: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :object},
+             nullable: true
+           },
+           estimated_hours: %OpenApiSpex.Schema{type: :number, nullable: true},
+           metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
+         }
+       }},
+    responses: %{
+      201 => {"Story created", "application/json", Schemas.StoryResponse},
+      404 => {"Project not found", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error or epic_number not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -182,34 +219,75 @@ defmodule LoopctlWeb.StoryController do
   @doc """
   POST /api/v1/epics/:epic_id/stories
 
-  Creates a new story. Requires user+ role.
+  Creates a new story. Requires orchestrator+ role.
   """
   def create(conn, %{"epic_id" => epic_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
     with {:ok, _epic} <- Epics.get_epic(tenant_id, epic_id) do
-      attrs = %{
-        epic_id: epic_id,
-        number: params["number"],
-        title: params["title"],
-        description: params["description"],
-        acceptance_criteria: params["acceptance_criteria"],
-        estimated_hours: parse_decimal(params["estimated_hours"]),
-        metadata: params["metadata"] || %{}
-      }
+      do_create_story(conn, tenant_id, epic_id, params)
+    end
+  end
 
-      audit_opts = AuditContext.from_conn(conn)
+  @doc """
+  POST /api/v1/projects/:project_id/stories
 
-      case Stories.create_story(tenant_id, attrs, audit_opts) do
-        {:ok, story} ->
-          conn
-          |> put_status(:created)
-          |> json(%{story: story_json(story)})
+  Creates a story by looking up the epic by its `number` within the project.
+  Agents typically know the epic number (e.g. 72) but not the UUID; this
+  endpoint lets them skip the lookup round-trip.
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
-      end
+  Expects `epic_number` in the body alongside the usual story fields.
+  """
+  def create_in_project(
+        conn,
+        %{"project_id" => project_id, "epic_number" => epic_number} = params
+      ) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    with {:project, {:ok, _project}} <-
+           {:project, Projects.get_project(tenant_id, project_id)},
+         {:epic, {:ok, epic}} <-
+           {:epic, Epics.get_epic_by_number(tenant_id, project_id, epic_number)} do
+      do_create_story(conn, tenant_id, epic.id, params)
+    else
+      {:project, {:error, :not_found}} ->
+        {:error, :not_found}
+
+      {:epic, {:error, :not_found}} ->
+        {:error, :unprocessable_entity,
+         "Epic number #{inspect(epic_number)} not found in this project. " <>
+           "Use import_stories or POST /projects/:id/epics to create it first."}
+    end
+  end
+
+  def create_in_project(_conn, %{"project_id" => _}) do
+    {:error, :unprocessable_entity,
+     "`epic_number` is required. Pass it in the request body alongside the story fields."}
+  end
+
+  defp do_create_story(conn, tenant_id, epic_id, params) do
+    attrs = %{
+      epic_id: epic_id,
+      number: params["number"],
+      title: params["title"],
+      description: params["description"],
+      acceptance_criteria: params["acceptance_criteria"],
+      estimated_hours: parse_decimal(params["estimated_hours"]),
+      metadata: params["metadata"] || %{}
+    }
+
+    audit_opts = AuditContext.from_conn(conn)
+
+    case Stories.create_story(tenant_id, attrs, audit_opts) do
+      {:ok, story} ->
+        conn
+        |> put_status(:created)
+        |> json(%{story: story_json(story)})
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
     end
   end
 
@@ -335,7 +413,7 @@ defmodule LoopctlWeb.StoryController do
   PATCH /api/v1/stories/:id
 
   Updates story metadata fields. Cannot update agent_status or verified_status.
-  Requires user+ role.
+  Requires orchestrator+ role.
   """
   def update(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key

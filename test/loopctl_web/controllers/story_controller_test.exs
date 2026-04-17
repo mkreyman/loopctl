@@ -105,6 +105,107 @@ defmodule LoopctlWeb.StoryControllerTest do
     end
   end
 
+  describe "POST /api/v1/projects/:project_id/stories (by epic number)" do
+    test "creates a story using epic_number instead of epic_id", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 72})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/stories", %{
+          "epic_number" => 72,
+          "number" => "72.3",
+          "title" => "Morning agenda page",
+          "acceptance_criteria" => [%{"id" => "AC-72.3.1", "description" => "Renders dashboard"}]
+        })
+
+      body = json_response(conn, 201)
+      assert body["story"]["epic_id"] == epic.id
+      assert body["story"]["number"] == "72.3"
+      assert body["story"]["title"] == "Morning agenda page"
+    end
+
+    test "returns 422 when epic_number is not found", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/stories", %{
+          "epic_number" => 999,
+          "number" => "999.1",
+          "title" => "Orphan"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "Epic number"
+      assert body["error"]["message"] =~ "not found"
+    end
+
+    test "returns 422 when epic_number is missing", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/stories", %{
+          "number" => "1.1",
+          "title" => "No epic"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "epic_number"
+    end
+
+    test "tenant isolation: cannot create a story in another tenant's project", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      {raw_key_a, _} =
+        fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      _epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id, number: 1})
+
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> post(~p"/api/v1/projects/#{project_b.id}/stories", %{
+          "epic_number" => 1,
+          "number" => "1.1",
+          "title" => "Cross-tenant"
+        })
+
+      # Project lookup is tenant-scoped, so this should 404 — not leak that the
+      # project exists elsewhere.
+      assert json_response(conn, 404)
+    end
+
+    test "orchestrator role accepted on direct epic_id creation too", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/epics/#{epic.id}/stories", %{
+          "number" => "1.1",
+          "title" => "Works for orchestrator"
+        })
+
+      assert json_response(conn, 201)
+    end
+  end
+
   describe "GET /api/v1/epics/:epic_id/stories" do
     test "lists stories for epic", %{conn: conn} do
       tenant = fixture(:tenant)

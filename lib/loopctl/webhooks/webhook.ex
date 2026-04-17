@@ -25,6 +25,7 @@ defmodule Loopctl.Webhooks.Webhook do
     story.status_changed
     story.verified
     story.rejected
+    story.backfilled
     story.auto_reset
     story.force_unclaimed
     story.review_requested

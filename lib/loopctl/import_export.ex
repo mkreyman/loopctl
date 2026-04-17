@@ -62,6 +62,7 @@ defmodule Loopctl.ImportExport do
     epic_deps_data = Map.get(data, "epic_dependencies", [])
 
     with :ok <- validate_payload_structure(epics_data),
+         {:ok, epics_data} <- normalize_numbers(epics_data),
          :ok <- validate_no_duplicate_numbers(epics_data),
          :ok <- check_no_existing_conflicts(tenant_id, project_id, epics_data) do
       execute_fresh_import(
@@ -108,6 +109,7 @@ defmodule Loopctl.ImportExport do
     epic_deps_data = Map.get(data, "epic_dependencies", [])
 
     with :ok <- validate_payload_structure(epics_data),
+         {:ok, epics_data} <- normalize_numbers(epics_data),
          :ok <- validate_no_duplicate_numbers(epics_data) do
       execute_merge_import(
         tenant_id,
@@ -870,6 +872,53 @@ defmodule Loopctl.ImportExport do
        "e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
   end
 
+  # Normalizes epic numbers to integers and story numbers to strings so the
+  # merge lookup keys (pulled from DB rows) match the payload. Clients often
+  # serialize these as the "wrong" JSON type (integer epic numbers as strings,
+  # or string story numbers as integers) and the merge path used to silently
+  # treat those as "epic does not exist" -> insert -> unique constraint 422.
+  defp normalize_numbers(epics_data) do
+    epics_data
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {epic, index}, {:ok, acc} ->
+      case normalize_epic_number(epic["number"]) do
+        {:ok, n} ->
+          stories = normalize_story_numbers(Map.get(epic, "stories", []))
+          normalized_epic = epic |> Map.put("number", n) |> Map.put("stories", stories)
+          {:cont, {:ok, [normalized_epic | acc]}}
+
+        :error ->
+          {:halt,
+           {:error, :validation,
+            "epics[#{index}].number: must be a positive integer (got #{inspect(epic["number"])})"}}
+      end
+    end)
+    |> case do
+      {:ok, rev} -> {:ok, Enum.reverse(rev)}
+      other -> other
+    end
+  end
+
+  defp normalize_epic_number(n) when is_integer(n) and n > 0, do: {:ok, n}
+
+  defp normalize_epic_number(n) when is_binary(n) do
+    case Integer.parse(n) do
+      {int, ""} when int > 0 -> {:ok, int}
+      _ -> :error
+    end
+  end
+
+  defp normalize_epic_number(_), do: :error
+
+  defp normalize_story_numbers(stories) when is_list(stories) do
+    Enum.map(stories, fn
+      %{"number" => n} = story when is_integer(n) -> Map.put(story, "number", to_string(n))
+      story -> story
+    end)
+  end
+
+  defp normalize_story_numbers(other), do: other
+
   defp validate_no_duplicate_numbers(epics_data) do
     # Check duplicate epic numbers
     epic_numbers = Enum.map(epics_data, & &1["number"])
@@ -1428,12 +1477,45 @@ defmodule Loopctl.ImportExport do
         end)
       end)
 
-    error_details =
-      Enum.map_join(errors, "; ", fn {field, messages} ->
-        "#{path}.#{field}: #{Enum.join(messages, ", ")}"
-      end)
+    case translate_domain_error(changeset, path) do
+      nil -> format_raw_changeset_errors(errors, path)
+      domain_message -> domain_message
+    end
+  end
 
-    error_details
+  defp format_raw_changeset_errors(errors, path) do
+    Enum.map_join(errors, "; ", fn {field, messages} ->
+      "#{path}.#{field}: #{Enum.join(messages, ", ")}"
+    end)
+  end
+
+  # Converts opaque changeset errors into actionable domain messages.
+  # Ecto reports a composite unique_constraint violation on the FIRST field of
+  # the constraint (e.g. `tenant_id` for `[:tenant_id, :project_id, :number]`),
+  # which reads nonsensically to API clients. Translate those into "Epic N
+  # already exists -- use merge=true".
+  defp translate_domain_error(%Ecto.Changeset{data: %mod{}} = changeset, path)
+       when mod in [Epic, Story] do
+    if unique_number_violation?(changeset) do
+      number = Ecto.Changeset.get_field(changeset, :number)
+      entity = if mod == Epic, do: "Epic", else: "Story"
+
+      "#{path}: #{entity} #{number} already exists in this project. " <>
+        "Use `merge=true` to update the existing record or pick a new number."
+    end
+  end
+
+  defp translate_domain_error(_changeset, _path), do: nil
+
+  # Epic/Story unique_constraint is on (tenant_id, project_id, number), and
+  # Ecto auto-names the index with "_number_index". Match on that substring in
+  # `constraint_name` so future unique constraints on other fields don't
+  # trigger a misleading "X already exists" translation.
+  defp unique_number_violation?(changeset) do
+    Enum.any?(changeset.errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        (Keyword.get(opts, :constraint_name) || "") |> String.contains?("number")
+    end)
   end
 
   defp handle_import_error(_step, reason) when is_binary(reason) do

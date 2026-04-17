@@ -208,14 +208,156 @@ async function getProgress({ project_id, include_cost }) {
   return toContent(result);
 }
 
-async function importStories({ project_id, payload }) {
+async function backfillStory({ story_id, reason, evidence_url, pr_number }) {
+  if (!story_id) {
+    return toContent({
+      error: true,
+      status: 0,
+      body: "`story_id` is required.",
+    });
+  }
+  if (!reason || typeof reason !== "string" || reason.trim() === "") {
+    return toContent({
+      error: true,
+      status: 0,
+      body:
+        "`reason` is required. Describe why this story is being marked verified without going through the normal lifecycle (e.g. 'completed before loopctl onboarding, see PR #232').",
+    });
+  }
+
+  const body = { reason };
+  if (evidence_url) body.evidence_url = evidence_url;
+  if (pr_number != null) body.pr_number = pr_number;
+
   const result = await apiCall(
     "POST",
-    `/api/v1/projects/${project_id}/import`,
-    payload,
+    `/api/v1/stories/${story_id}/backfill`,
+    body,
     process.env.LOOPCTL_ORCH_KEY
   );
   return toContent(result);
+}
+
+async function createStory({ project_id, epic_number, epic_id, story }) {
+  if (!story || typeof story !== "object") {
+    return toContent({
+      error: true,
+      status: 0,
+      body: "`story` is required and must be an object with at least `number` and `title`.",
+    });
+  }
+
+  // Prefer epic_id path if provided, fall back to project_id + epic_number.
+  if (epic_id) {
+    const result = await apiCall(
+      "POST",
+      `/api/v1/epics/${epic_id}/stories`,
+      story,
+      process.env.LOOPCTL_ORCH_KEY
+    );
+    return toContent(result);
+  }
+
+  if (!project_id || epic_number == null) {
+    return toContent({
+      error: true,
+      status: 0,
+      body:
+        "Must provide either `epic_id` OR (`project_id` + `epic_number`). " +
+        "Use epic_number when you know the epic's human-readable number (e.g. 72) but not its UUID.",
+    });
+  }
+
+  const body = { epic_number, ...story };
+  const result = await apiCall(
+    "POST",
+    `/api/v1/projects/${project_id}/stories`,
+    body,
+    process.env.LOOPCTL_ORCH_KEY
+  );
+  return toContent(result);
+}
+
+async function importStories({ project_id, payload, payload_path, merge }) {
+  const effectivePayload = await resolvePayload(payload, payload_path);
+  if (effectivePayload && effectivePayload.error) {
+    return toContent(effectivePayload);
+  }
+  const query = merge ? "?merge=true" : "";
+  const result = await apiCall(
+    "POST",
+    `/api/v1/projects/${project_id}/import${query}`,
+    effectivePayload,
+    process.env.LOOPCTL_ORCH_KEY
+  );
+  return toContent(result);
+}
+
+// Reads JSON payload from either an inline object or an absolute file path.
+// Returns the object on success, or an { error, body } shape on failure.
+//
+// Security: `payload_path` is read with the MCP process's filesystem
+// privileges. Because agents can set this argument via prompt injection,
+// we validate aggressively:
+//   * require absolute path
+//   * reject /proc, /dev, /sys (pseudo-filesystems that could DoS or leak)
+//   * stat first and cap at 5 MiB (server also enforces a body size limit)
+async function resolvePayload(inline, payloadPath) {
+  if (inline && typeof inline === "object") return inline;
+  if (!payloadPath) {
+    return {
+      error: true,
+      status: 0,
+      body: "Must provide either `payload` (object) or `payload_path` (absolute JSON file path).",
+    };
+  }
+
+  const nodePath = await import("node:path");
+  if (!nodePath.isAbsolute(payloadPath)) {
+    return {
+      error: true,
+      status: 0,
+      body: `payload_path must be absolute (got '${payloadPath}').`,
+    };
+  }
+
+  const blockedPrefixes = ["/proc/", "/dev/", "/sys/", "/proc", "/dev", "/sys"];
+  if (blockedPrefixes.some((p) => payloadPath === p.replace(/\/$/, "") || payloadPath.startsWith(p))) {
+    return {
+      error: true,
+      status: 0,
+      body: `payload_path refused: '${payloadPath}' targets a pseudo-filesystem path.`,
+    };
+  }
+
+  const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
+  const fs = await import("node:fs/promises");
+
+  try {
+    const stat = await fs.stat(payloadPath);
+    if (!stat.isFile()) {
+      return {
+        error: true,
+        status: 0,
+        body: `payload_path '${payloadPath}' is not a regular file.`,
+      };
+    }
+    if (stat.size > MAX_PAYLOAD_BYTES) {
+      return {
+        error: true,
+        status: 0,
+        body: `payload_path '${payloadPath}' is ${stat.size} bytes, exceeds max ${MAX_PAYLOAD_BYTES}.`,
+      };
+    }
+    const raw = await fs.readFile(payloadPath, "utf8");
+    return JSON.parse(raw);
+  } catch (err) {
+    return {
+      error: true,
+      status: 0,
+      body: `Could not read payload_path '${payloadPath}': ${err.message}`,
+    };
+  }
 }
 
 // --- Story Tools ---
@@ -823,8 +965,74 @@ const TOOLS = [
     },
   },
   {
+    name: "backfill_story",
+    description:
+      "Mark a story as verified when the work was completed outside loopctl (e.g. before the project was onboarded). " +
+      "REFUSED for stories that have any loopctl dispatch lineage — non-pending agent_status, assigned_agent_id, implementer_dispatch_id, " +
+      "or verifier_dispatch_id set. Also refused for stories already `:verified` (idempotent no-op when the same payload is sent) or `:rejected`. " +
+      "Records a provenance marker in `metadata.backfill` plus an audit event and a `story.backfilled` webhook. " +
+      "REQUIRES `reason`. Strongly recommend passing `evidence_url` (http/https, no credentials in userinfo) and `pr_number`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story to backfill.",
+        },
+        reason: {
+          type: "string",
+          description:
+            "Why this story is being marked verified without the normal flow (e.g. 'completed before loopctl onboarding, see PR #232').",
+        },
+        evidence_url: {
+          type: "string",
+          description: "URL to the evidence (PR, commit, deploy log, etc.).",
+        },
+        pr_number: {
+          type: "integer",
+          description: "GitHub/GitLab PR number that delivered the work.",
+        },
+      },
+      required: ["story_id", "reason"],
+    },
+  },
+  {
+    name: "create_story",
+    description:
+      "Create a single story inside an existing epic. " +
+      "Use this for one-off additions instead of wrapping the story in a bulk import payload. " +
+      "Pass either `epic_id` (UUID) or (`project_id` + `epic_number`) -- the latter is friendlier for agents who know the epic number but not its UUID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "The UUID of the project (required if using epic_number).",
+        },
+        epic_number: {
+          type: "integer",
+          description:
+            "The human-readable epic number (e.g. 72). Used together with project_id to locate the epic.",
+        },
+        epic_id: {
+          type: "string",
+          description: "The epic UUID. Alternative to project_id+epic_number.",
+        },
+        story: {
+          type: "object",
+          description:
+            "The full story payload: { number, title, description?, acceptance_criteria?, estimated_hours?, metadata? }. `number` is a string like '72.3'; `title` is required.",
+        },
+      },
+      required: ["story"],
+    },
+  },
+  {
     name: "import_stories",
-    description: "Import stories into a project from a structured payload (Epic 12 import format).",
+    description:
+      "Import stories into a project from a structured payload (Epic 12 import format). " +
+      "Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). " +
+      "For large payloads, use `payload_path` to read JSON from disk instead of passing it inline.",
     inputSchema: {
       type: "object",
       properties: {
@@ -834,10 +1042,23 @@ const TOOLS = [
         },
         payload: {
           type: "object",
-          description: "The import payload object (epics + stories structure).",
+          description:
+            "The import payload object (epics + stories structure). Either this or `payload_path` is required. If BOTH are passed, `payload` wins.",
+        },
+        payload_path: {
+          type: "string",
+          description:
+            "Absolute path to a JSON file with the import payload. Avoids inline size limits for large epics. Ignored if `payload` is also passed.",
+        },
+        merge: {
+          type: "boolean",
+          description:
+            "When true, existing epics/stories are updated and new ones added. " +
+            "When false or omitted, duplicates return 409.",
+          default: false,
         },
       },
-      required: ["project_id", "payload"],
+      required: ["project_id"],
     },
   },
 
@@ -1919,6 +2140,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "get_progress":
       return await getProgress(args);
+
+    case "backfill_story":
+      return await backfillStory(args);
+
+    case "create_story":
+      return await createStory(args);
 
     case "import_stories":
       return await importStories(args);
