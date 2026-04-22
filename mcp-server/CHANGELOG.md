@@ -5,6 +5,27 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.2.0 — 2026-04-22 (Wiki curation tools)
+
+### Added
+
+- `knowledge_unpublish` — revert a published article back to draft. Hides it
+  from agent search/context without deleting; re-publish via
+  `knowledge_publish`. Requires `LOOPCTL_USER_KEY` (destructive, `role: :user`).
+- `knowledge_archive` — soft-delete an article (draft or published). Hidden
+  from search/context/index; row retained for audit. Requires
+  `LOOPCTL_USER_KEY`.
+- `knowledge_delete` — alias for `knowledge_archive` (DELETE verb on the REST
+  API archives under the hood). Requires `LOOPCTL_USER_KEY`.
+
+### Rationale
+
+Previously agents could create and publish articles but had no way to retract
+bad drafts via MCP — low-signal articles (session summaries, commit recaps)
+were piling up in the wiki with no cleanup path short of curl. These three
+tools close the curation loop. All three stay at `role: :user` per the
+"destructive ops above orchestrator" rule in `CLAUDE.md`.
+
 ## 2.1.0 — 2026-04-17 (Agent ergonomics)
 
 ### Added
