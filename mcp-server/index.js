@@ -652,6 +652,36 @@ async function knowledgeBulkPublish({ article_ids }) {
   return toContent(result);
 }
 
+async function knowledgeUnpublish({ article_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/unpublish`,
+    null,
+    process.env.LOOPCTL_USER_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeArchive({ article_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/archive`,
+    null,
+    process.env.LOOPCTL_USER_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeDelete({ article_id }) {
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/articles/${article_id}`,
+    null,
+    process.env.LOOPCTL_USER_KEY
+  );
+  return toContent(result);
+}
+
 async function knowledgeDrafts({ limit, offset, project_id }) {
   const params = new URLSearchParams();
   params.set(
@@ -1727,6 +1757,60 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_unpublish",
+    description:
+      "Revert a published article back to draft state. The article stops being visible " +
+      "in agent search/context but is not deleted — re-publish with knowledge_publish. " +
+      "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator role is NOT sufficient for " +
+      "this destructive operation).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the published article to unpublish.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_archive",
+    description:
+      "Archive an article (soft delete). The article is hidden from search, context, " +
+      "and the index but the row is retained for audit/history. Works for drafts and " +
+      "published articles. REQUIRES LOOPCTL_USER_KEY (user role — orchestrator role is " +
+      "NOT sufficient for this destructive operation).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to archive.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_delete",
+    description:
+      "Delete an article. Under the hood this performs the same soft-delete (archive) " +
+      "as knowledge_archive — use whichever name is clearer at the call site. The row " +
+      "is retained for audit; there is no hard delete. REQUIRES LOOPCTL_USER_KEY (user " +
+      "role — orchestrator role is NOT sufficient for this destructive operation).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to delete.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_drafts",
     description:
       "List draft (unpublished) knowledge articles. Requires orchestrator role. " +
@@ -2232,6 +2316,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_bulk_publish":
       return await knowledgeBulkPublish(args);
+
+    case "knowledge_unpublish":
+      return await knowledgeUnpublish(args);
+
+    case "knowledge_archive":
+      return await knowledgeArchive(args);
+
+    case "knowledge_delete":
+      return await knowledgeDelete(args);
 
     case "knowledge_drafts":
       return await knowledgeDrafts(args);

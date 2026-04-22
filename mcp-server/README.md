@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (42)
+## Tools (45)
 
 ### Project Tools
 
@@ -145,6 +145,9 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 |---|---|
 | `knowledge_publish` | Publish a draft article, making it visible to all agents. Required: `article_id`. |
 | `knowledge_bulk_publish` | **Requires `LOOPCTL_USER_KEY`.** Atomically publish up to 100 drafts in a single call. Required: `article_ids` (array). |
+| `knowledge_unpublish` | **Requires `LOOPCTL_USER_KEY`.** Revert a published article back to draft (hidden from search/context, not deleted). Required: `article_id`. |
+| `knowledge_archive` | **Requires `LOOPCTL_USER_KEY`.** Soft-delete an article (draft or published). Row retained for audit; hidden from all reads. Required: `article_id`. |
+| `knowledge_delete` | **Requires `LOOPCTL_USER_KEY`.** Alias for `knowledge_archive` — DELETE verb on the REST API archives under the hood. Required: `article_id`. |
 | `knowledge_drafts` | List draft (unpublished) knowledge articles with pagination. Optional: `limit` (default 20, max 20), `offset` (default 0), `project_id`. Returns `meta.total_count`. |
 | `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`, `max_per_category` (default 50, max 500). True totals returned in `summary.total_per_category`. |
 | `knowledge_export` | Export all knowledge articles as a ZIP archive. Returns a curl command for direct download (ZIP binary cannot be returned as MCP content). Optional: `project_id`. |
