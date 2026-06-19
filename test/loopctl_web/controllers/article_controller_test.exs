@@ -60,12 +60,17 @@ defmodule LoopctlWeb.ArticleControllerTest do
       }
 
       first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
-      first_id = json_response(first, 201)["data"]["id"]
+      first_body = json_response(first, 201)
+      first_id = first_body["data"]["id"]
+      refute first_body["deduplicated"]
 
       # A concurrent/retried publish of the same content returns the same row with
-      # a 200 (not 201), so callers/observers can distinguish a dedup from a create.
+      # a 200 (not 201) AND deduplicated: true, so callers/observers (incl. the MCP
+      # layer that only sees a 2xx) can distinguish a dedup from a create.
       second = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
-      assert json_response(second, 200)["data"]["id"] == first_id
+      second_body = json_response(second, 200)
+      assert second_body["data"]["id"] == first_id
+      assert second_body["deduplicated"] == true
     end
 
     test "duplicate title with different content returns a clear 409 (not a retried 422)", %{

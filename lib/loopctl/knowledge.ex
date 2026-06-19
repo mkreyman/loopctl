@@ -148,6 +148,13 @@ defmodule Loopctl.Knowledge do
   # Otherwise it is a genuine different-body title collision ->
   # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
   # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
+  #
+  # The recovery SELECT runs after the insert's transaction has rolled back, so
+  # there is a tiny window in which a THIRD writer mutates or archives the winning
+  # row between its commit and our SELECT. That only produces a transient,
+  # self-healing outcome — a 409 (body now differs), or the original 422 (row now
+  # archived → SELECT returns nil) — which the client's next attempt resolves
+  # cleanly. We accept that rather than re-running the whole create under a lock.
   defp resolve_create_conflict(tenant_id, attrs, changeset) do
     title = attrs[:title] || attrs["title"]
 
