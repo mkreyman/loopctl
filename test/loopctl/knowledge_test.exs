@@ -106,6 +106,79 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  describe "create_article/3 concurrent-title conflict resolution (#113/#114)" do
+    test "idempotently returns the existing article when a url-<hash> dedupe tag matches" do
+      %{tenant: tenant} = setup_tenant()
+
+      attrs = %{
+        title: "Same Source Note",
+        body: "v1",
+        category: :reference,
+        tags: ["url-abc123", "hub"]
+      }
+
+      assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
+      # A retry/concurrent duplicate of the same content returns the same row.
+      assert {:ok, second} = Knowledge.create_article(tenant.id, Map.put(attrs, :body, "v2"))
+      assert second.id == first.id
+      assert second.body == "v1", "idempotent return does not overwrite the existing article"
+    end
+
+    test "idempotently returns the existing article when source_type + source_id match" do
+      %{tenant: tenant} = setup_tenant()
+      sid = Ecto.UUID.generate()
+
+      attrs = %{
+        title: "Sourced Note",
+        body: "body",
+        category: :finding,
+        source_type: "web_article",
+        source_id: sid
+      }
+
+      assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
+      assert {:ok, second} = Knowledge.create_article(tenant.id, attrs)
+      assert second.id == first.id
+    end
+
+    test "returns {:error, :duplicate_title, existing} when content differs (no dedupe signal)" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, existing} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Unique Title",
+                 body: "original",
+                 category: :pattern
+               })
+
+      assert {:error, :duplicate_title, returned} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Unique Title",
+                 body: "different content",
+                 category: :convention
+               })
+
+      assert returned.id == existing.id
+      # The existing article is untouched.
+      {:ok, reloaded} = Knowledge.get_article(tenant.id, existing.id)
+      assert reloaded.body == "original"
+      assert reloaded.category == :pattern
+    end
+
+    test "the active-title unique constraint is attributed to :title, not :tenant_id" do
+      changeset =
+        Article.create_changeset(%Article{}, %{title: "x", body: "b", category: :pattern})
+
+      assert Enum.any?(changeset.constraints, fn c ->
+               c.field == :title and c.constraint == "articles_tenant_title_active_idx"
+             end)
+
+      refute Enum.any?(changeset.constraints, fn c ->
+               c.field == :tenant_id and c.constraint == "articles_tenant_title_active_idx"
+             end)
+    end
+  end
+
   # --- TC-19.3.2: List with tag overlap filtering ---
 
   describe "list_articles/2 tag filtering" do

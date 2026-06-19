@@ -175,6 +175,21 @@ defmodule LoopctlWeb.ArticleController do
           |> put_status(:created)
           |> json(ArticleJSON.create(%{article: article}))
 
+        {:error, :duplicate_title, existing} ->
+          conn
+          |> put_status(:conflict)
+          |> json(%{
+            error: %{
+              status: 409,
+              code: "title_conflict",
+              message:
+                "An article titled \"#{existing.title}\" already exists in this tenant. " <>
+                  "Use a different title, or include the existing article's dedupe tag " <>
+                  "(url-<hash>) / source_type+source_id to update it idempotently.",
+              details: %{existing_article_id: existing.id}
+            }
+          })
+
         {:error, %Ecto.Changeset{} = changeset} ->
           {:error, changeset}
       end

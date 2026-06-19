@@ -47,6 +47,60 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["error"]["status"] == 422
       assert body["error"]["details"]["title"] != nil
     end
+
+    test "duplicate title with the same dedupe tag is idempotent (201, same id)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      payload = %{
+        "title" => "Captured Video",
+        "body" => "v1",
+        "category" => "reference",
+        "tags" => ["url-deadbeef", "hub"]
+      }
+
+      first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
+      first_id = json_response(first, 201)["data"]["id"]
+
+      # A concurrent/retried publish of the same source returns the same row.
+      second =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", Map.put(payload, "body", "v2"))
+
+      assert json_response(second, 201)["data"]["id"] == first_id
+    end
+
+    test "duplicate title with different content returns a clear 409 (not a retried 422)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      _first =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Shared Heading",
+          "body" => "first",
+          "category" => "pattern"
+        })
+        |> json_response(201)
+
+      second =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Shared Heading",
+          "body" => "second",
+          "category" => "convention"
+        })
+
+      body = json_response(second, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["code"] == "title_conflict"
+      assert body["error"]["details"]["existing_article_id"]
+    end
   end
 
   describe "POST /api/v1/projects/:project_id/articles" do

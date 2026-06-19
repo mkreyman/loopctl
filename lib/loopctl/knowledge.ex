@@ -60,11 +60,17 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, %Article{}}` on success
-  - `{:error, changeset}` on validation failure
+  - `{:ok, %Article{}}` on success, or idempotently when a concurrent/retried
+    create collides on the active title with the SAME content (matching
+    `url-<hash>` dedupe tag, or source_type + source_id)
+  - `{:error, :duplicate_title, %Article{}}` when the active title is taken by a
+    DIFFERENT-content article (the caller should answer 409, not retry)
+  - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Article.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :duplicate_title, Article.t()}
+          | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
     scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
@@ -118,9 +124,86 @@ defmodule Loopctl.Knowledge do
 
       case AdminRepo.transaction(multi) do
         {:ok, %{article: article}} -> {:ok, article}
-        {:error, :article, changeset, _} -> {:error, changeset}
+        {:error, :article, changeset, _} -> resolve_create_conflict(tenant_id, attrs, changeset)
       end
     end
+  end
+
+  # Make concurrent/retried creates safe on the (tenant_id, title) active unique
+  # index. By the time the insert fails the constraint, the winning transaction
+  # has committed, so the existing row is visible. If the incoming payload is the
+  # SAME content (matching `url-<hash>` dedupe tag, or matching source_type +
+  # source_id), the conflict is a duplicate/retry -> return the existing article
+  # idempotently. Otherwise it is a genuine different-content title collision ->
+  # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
+  # retry-into-the-same-422). Non-title failures pass through unchanged.
+  defp resolve_create_conflict(tenant_id, attrs, changeset) do
+    title = attrs[:title] || attrs["title"]
+
+    with true <- title_conflict?(changeset),
+         %Article{} = existing <- get_active_article_by_title(tenant_id, title) do
+      if same_content?(existing, attrs) do
+        {:ok, existing}
+      else
+        {:error, :duplicate_title, existing}
+      end
+    else
+      _ -> {:error, changeset}
+    end
+  end
+
+  @title_conflict_constraints ~w(articles_tenant_title_active_idx
+                                 articles_tenant_slug_idx
+                                 articles_system_slug_idx)
+  defp title_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        Keyword.get(opts, :constraint_name) in @title_conflict_constraints
+    end)
+  end
+
+  defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+
+  defp get_active_article_by_title(tenant_id, title) do
+    AdminRepo.one(
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and a.title == ^title and
+            a.status not in [:archived, :superseded],
+        order_by: [asc: a.inserted_at],
+        limit: 1
+      )
+    )
+  end
+
+  @dedupe_tag_pattern ~r/^url-[0-9a-f]+$/
+
+  # Two payloads describe the same content when they share a content-hash dedupe
+  # tag (`url-<hash>`), or carry the same non-nil (source_type, source_id).
+  defp same_content?(existing, attrs) do
+    dedupe_tag_match?(existing, attrs) or source_match?(existing, attrs)
+  end
+
+  defp dedupe_tag_match?(existing, attrs) do
+    incoming = dedupe_tags(attrs[:tags] || attrs["tags"] || [])
+
+    incoming != [] and
+      not MapSet.disjoint?(MapSet.new(incoming), MapSet.new(dedupe_tags(existing.tags)))
+  end
+
+  defp dedupe_tags(tags) when is_list(tags) do
+    Enum.filter(tags, fn t -> is_binary(t) and Regex.match?(@dedupe_tag_pattern, t) end)
+  end
+
+  defp dedupe_tags(_), do: []
+
+  defp source_match?(existing, attrs) do
+    st = attrs[:source_type] || attrs["source_type"]
+    sid = attrs[:source_id] || attrs["source_id"]
+
+    not is_nil(st) and not is_nil(sid) and existing.source_id != nil and
+      to_string(existing.source_type) == to_string(st) and
+      to_string(existing.source_id) == to_string(sid)
   end
 
   @doc """
