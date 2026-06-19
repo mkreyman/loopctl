@@ -126,10 +126,15 @@ defmodule LoopctlWeb.OKFController do
   def import(conn, params) do
     api_key = conn.assigns.current_api_key
 
-    with {:ok, files} <- fetch_files(params) do
-      opts = import_opts(params, api_key)
-      {:ok, report} = OKF.import_files(api_key.tenant_id, files, opts)
+    with {:ok, files} <- fetch_files(params),
+         {:ok, report} <- OKF.import_files(api_key.tenant_id, files, import_opts(params, api_key)) do
       json(conn, %{data: report})
+    else
+      {:error, :too_many_concepts} ->
+        {:error, :bad_request, "Bundle exceeds the maximum number of concepts; split it up."}
+
+      other ->
+        other
     end
   end
 

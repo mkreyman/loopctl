@@ -906,19 +906,21 @@ async function knowledgeOkfExport({ project_id, out_dir }) {
   if (pathErr) {
     return { content: [{ type: "text", text: `Error: ${pathErr}` }], isError: true };
   }
+  // Normalize so `..`/trailing-slash can't defeat the per-file fence below.
+  const root = nodePath.resolve(out_dir);
 
   const fs = await import("node:fs/promises");
   let written = 0;
   for (const [rel, content] of Object.entries(files)) {
-    // Keep writes inside out_dir even if a path is adversarial.
-    const dest = nodePath.resolve(out_dir, rel);
-    if (dest !== out_dir && !dest.startsWith(out_dir + nodePath.sep)) continue;
+    // Keep writes inside root even if a server-supplied path is adversarial.
+    const dest = nodePath.resolve(root, rel);
+    if (dest !== root && !dest.startsWith(root + nodePath.sep)) continue;
     await fs.mkdir(nodePath.dirname(dest), { recursive: true });
     await fs.writeFile(dest, content, "utf8");
     written += 1;
   }
 
-  return toContent({ meta, out_dir, written });
+  return toContent({ meta, out_dir: root, written });
 }
 
 async function knowledgeOkfImport({ bundle_dir, project_id, merge, dry_run }) {
@@ -940,8 +942,9 @@ async function knowledgeOkfImport({ bundle_dir, project_id, merge, dry_run }) {
     return { content: [{ type: "text", text: `Error: bundle_dir '${bundle_dir}' is not a directory.` }], isError: true };
   }
 
+  // Kept in step with the server-side caps in okf_controller.ex.
   const MAX_FILES = 10_000;
-  const MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+  const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
   const files = {};
   let totalBytes = 0;
 

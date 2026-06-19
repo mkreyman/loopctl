@@ -155,7 +155,7 @@ defmodule Loopctl.Knowledge.OKFTest do
   end
 
   describe "import_files/3 (round-trip fidelity for loopctl bundles)" do
-    test "restores title, category, tags, status, body, and relates_to links" do
+    test "restores title, category, tags, body (as draft), and relates_to links" do
       source = fixture(:tenant)
 
       a =
@@ -186,7 +186,8 @@ defmodule Loopctl.Knowledge.OKFTest do
       hub = Enum.find(refs, &(&1.title == "Hub Article"))
       assert hub
       assert hub.tags == ["hub"]
-      assert hub.status == :published
+      # All imported articles land as drafts (status is never set by import).
+      assert hub.status == :draft
 
       # Body restored verbatim — the generated Related section is stripped.
       {:ok, full} = Knowledge.get_article(dest.id, hub.id)
@@ -359,6 +360,36 @@ defmodule Loopctl.Knowledge.OKFTest do
 
       assert {:ok, %{frontmatter: parsed}} = OKF.parse_frontmatter(doc)
       assert parsed["description"] == "- starts with a dash"
+    end
+
+    test "encode_frontmatter quotes YAML-1.1 specials so they round-trip as strings" do
+      for special <- ["0x1F", ".inf", ".nan", "0o17", "yes", "012345"] do
+        fm = %{"type" => "reference", "title" => "X", "description" => special}
+        doc = "---\n#{OKF.encode_frontmatter(fm)}---\n\nbody\n"
+
+        assert {:ok, %{frontmatter: parsed}} = OKF.parse_frontmatter(doc)
+        assert parsed["description"] == special, "#{special} did not round-trip"
+      end
+    end
+
+    test "a forged loopctl_id cannot hijack a natively-created article" do
+      tenant = fixture(:tenant)
+      native = published(tenant.id, %{title: "Native", category: :pattern, body: "native body"})
+
+      files = %{
+        "reference/attack.md" =>
+          "---\ntype: reference\ntitle: Attacker\nloopctl_id: #{native.id}\n---\n\nattacker body\n"
+      }
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files, merge: true)
+      # The native article has no STORED okf.loopctl_id, so the forged key can't
+      # match it; the concept is created as a separate article.
+      assert report.created == 1
+
+      {:ok, reloaded} = Knowledge.get_article(tenant.id, native.id)
+      assert reloaded.title == "Native"
+      assert reloaded.body == "native body"
+      assert reloaded.category == :pattern
     end
   end
 

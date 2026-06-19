@@ -24,11 +24,20 @@ defmodule Loopctl.Knowledge.OKF do
 
   Exported concept files carry loopctl-namespaced producer keys
   (`loopctl_id`, `loopctl_category`, `loopctl_status`) plus a marked `# Related`
-  section, so a loopctl-origin bundle re-imports losslessly. Foreign bundles
-  (no `loopctl_*` keys) import permissively: unknown frontmatter keys are
-  preserved under `metadata["okf"]`, unknown `type` values fall back to the
-  `reference` category, and bodies are stored verbatim — per the OKF §9
-  permissive-consumer rule, a bundle is never rejected for unknown types/keys.
+  section, so a loopctl-origin bundle re-imports its content, category, tags, and
+  `relates_to`/`derived_from` graph faithfully. Foreign bundles (no `loopctl_*`
+  keys) import permissively: unknown frontmatter keys are preserved under
+  `metadata["okf"]`, unknown `type` values fall back to the `reference` category,
+  and bodies are stored verbatim — per the OKF §9 permissive-consumer rule, a
+  bundle is never rejected for unknown types/keys.
+
+  Import is deliberately conservative on anything that affects trust or
+  lifecycle: every imported article lands as a `:draft` (publication is a
+  separate, explicit step, so a forged `loopctl_status` can't auto-publish), and
+  `:supersedes`/`:contradicts` edges are not reconstructed (they would retire a
+  target article). A `loopctl_id` resolves a re-import only against an article we
+  ourselves previously imported (its stored `loopctl_id`), never an arbitrary
+  same-id row, so it can't be used as a cross-article overwrite primitive.
 
   The public surface works on a **files map** (`%{"path/to.md" => "content"}`)
   so the HTTP/MCP layers can choose zip or JSON transport without this module
@@ -348,9 +357,17 @@ defmodule Loopctl.Knowledge.OKF do
 
   `{:ok, report}` where report is a map with `:created`, `:updated`, `:skipped`,
   `:links_created`, `:partial?`, `:errors` (list of `%{path, reason}`), and
-  `:conformance`.
+  `:conformance`. Returns `{:error, :too_many_concepts}` when the bundle exceeds
+  #{@max_articles} concepts (the same bound the exporter enforces).
+
+  The import is non-atomic (per-file) and runs synchronously; it is bounded by
+  the concept cap above. Concurrent imports of the same bundle are serialized by
+  the `(tenant_id, title)` active unique index rather than an advisory lock, so a
+  rare double-submit surfaces a reported skip (`partial?: true`) instead of a
+  duplicate.
   """
-  @spec import_files(Ecto.UUID.t(), files(), keyword()) :: {:ok, map()}
+  @spec import_files(Ecto.UUID.t(), files(), keyword()) ::
+          {:ok, map()} | {:error, :too_many_concepts}
   def import_files(tenant_id, files, opts \\ []) when is_map(files) do
     merge? = Keyword.get(opts, :merge, true)
     dry_run? = Keyword.get(opts, :dry_run, false)
@@ -364,6 +381,14 @@ defmodule Loopctl.Knowledge.OKF do
       |> Enum.reject(fn {path, _} -> reserved?(path) end)
       |> Enum.sort_by(fn {path, _} -> path end)
 
+    if length(concepts) > @max_articles do
+      {:error, :too_many_concepts}
+    else
+      do_import(tenant_id, concepts, conformance, merge?, dry_run?, project_id, audit_opts)
+    end
+  end
+
+  defp do_import(tenant_id, concepts, conformance, merge?, dry_run?, project_id, audit_opts) do
     initial = %{
       created: 0,
       updated: 0,
@@ -398,7 +423,8 @@ defmodule Loopctl.Knowledge.OKF do
   Imports an OKF bundle delivered as a zip binary. Unzips in memory, then
   delegates to `import_files/3`.
   """
-  @spec import_zip(Ecto.UUID.t(), binary(), keyword()) :: {:ok, map()} | {:error, :invalid_zip}
+  @spec import_zip(Ecto.UUID.t(), binary(), keyword()) ::
+          {:ok, map()} | {:error, :invalid_zip | :too_many_concepts}
   def import_zip(tenant_id, zip_binary, opts \\ []) when is_binary(zip_binary) do
     case unzip(zip_binary) do
       {:ok, files} -> import_files(tenant_id, files, opts)
@@ -418,20 +444,46 @@ defmodule Loopctl.Knowledge.OKF do
 
   defp upsert_concept(tenant_id, path, attrs, project_id, merge?, dry_run?, acc) do
     attrs = maybe_put_project(attrs, project_id)
-    existing = find_existing(tenant_id, attrs)
+    match = find_existing(tenant_id, attrs)
 
     cond do
-      # Mirror the real create/update/skip decision so the preview is faithful.
-      dry_run? -> bump(acc, dry_run_outcome(existing, merge?))
-      existing && merge? -> do_update(tenant_id, path, existing, attrs, acc)
-      existing -> bump(acc, :skipped)
+      # Mirror the real create/update/skip/conflict decision so the preview is faithful.
+      dry_run? -> bump(acc, dry_run_outcome(match, attrs, merge?))
+      title_conflict?(match, attrs) -> record_conflict(acc, path, match)
+      match && merge? -> do_update(tenant_id, path, elem(match, 1), attrs, acc)
+      match -> bump(acc, :skipped)
       true -> do_create(tenant_id, path, attrs, acc)
     end
   end
 
-  defp dry_run_outcome(nil, _merge?), do: :created
-  defp dry_run_outcome(_existing, true), do: :updated
-  defp dry_run_outcome(_existing, false), do: :skipped
+  # A title-only match whose category or project scope differs from the concept
+  # is NOT the same logical article — merging would clobber unrelated curated
+  # content, and creating would hit the (tenant_id, title) active unique index.
+  # Treat it as a reported skip instead. loopctl_id matches are our own prior
+  # imports, so they never conflict.
+  defp title_conflict?({:title, existing}, attrs) do
+    existing.category != attrs.category or existing.project_id != attrs[:project_id]
+  end
+
+  defp title_conflict?(_match, _attrs), do: false
+
+  defp dry_run_outcome(match, attrs, merge?) do
+    cond do
+      title_conflict?(match, attrs) -> :skipped
+      is_nil(match) -> :created
+      merge? -> :updated
+      true -> :skipped
+    end
+  end
+
+  defp record_conflict(acc, path, {:title, existing}) do
+    record_error(
+      acc,
+      path,
+      "title conflict: an active #{existing.category} article with this title " <>
+        "already exists in a different category/project scope"
+    )
+  end
 
   defp do_create(tenant_id, path, attrs, acc) do
     case Knowledge.create_article(tenant_id, attrs, acc.audit_opts) do
@@ -443,8 +495,14 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
+  # Status is intentionally NOT updated on merge: lifecycle transitions go
+  # through the publish/archive workflow, never a bulk import. Slug is
+  # regenerated so a renamed (loopctl_id-matched) article keeps a valid slug.
   defp do_update(tenant_id, path, existing, attrs, acc) do
-    update_attrs = Map.take(attrs, [:title, :body, :category, :tags, :metadata, :status])
+    update_attrs =
+      attrs
+      |> Map.take([:title, :body, :category, :tags, :metadata])
+      |> put_slug(attrs[:title])
 
     case Knowledge.update_article(tenant_id, existing.id, update_attrs, acc.audit_opts) do
       {:ok, article} ->
@@ -455,55 +513,60 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
-  # Resolve the merge target. First the loopctl_id producer key (a same-tenant
-  # restore, where article.id == loopctl_id) or a prior import of this bundle
-  # (its stored metadata["okf"]["loopctl_id"]). Otherwise an active article with
-  # the SAME title AND category AND project scope — never a merely same-titled
-  # but unrelated article, so a foreign import can't silently clobber curated
-  # first-party knowledge.
+  defp put_slug(attrs, nil), do: attrs
+  defp put_slug(attrs, title), do: Map.put(attrs, :slug, Knowledge.slugify(title))
+
+  # Resolve the merge target, returning `{:loopctl, article}` (an idempotent
+  # re-import of a bundle we previously imported, matched by the stored
+  # `loopctl_id`), `{:title, article}` (an active same-title article — the caller
+  # then checks category/project scope before merging), or `nil`.
+  #
+  # NOTE: only the STORED `metadata["okf"]["loopctl_id"]` is matched — never a
+  # raw `article.id == loopctl_id` lookup. A forged `loopctl_id` in a foreign
+  # bundle therefore can't target a natively-created article (those carry no
+  # stored loopctl_id), so it can't be used as an arbitrary-overwrite primitive.
   defp find_existing(tenant_id, attrs) do
     loopctl_id = get_in(attrs, [:metadata, "okf", "loopctl_id"])
+    project_id = attrs[:project_id]
 
-    find_by_loopctl_id(tenant_id, loopctl_id) ||
-      get_active_article(tenant_id, attrs[:title], attrs[:category], attrs[:project_id])
-  end
-
-  defp find_by_loopctl_id(_tenant_id, id) when not is_binary(id), do: nil
-
-  defp find_by_loopctl_id(tenant_id, id) do
-    by_stored =
-      AdminRepo.one(
-        from(a in Article,
-          where:
-            a.tenant_id == ^tenant_id and
-              fragment("?->'okf'->>'loopctl_id' = ?", a.metadata, ^id),
-          order_by: [asc: a.inserted_at],
-          limit: 1
-        )
-      )
-
-    by_stored || by_id(tenant_id, id)
-  end
-
-  defp by_id(tenant_id, id) do
-    case Ecto.UUID.cast(id) do
-      {:ok, uuid} -> AdminRepo.get_by(Article, id: uuid, tenant_id: tenant_id)
-      :error -> nil
+    case find_by_stored_loopctl_id(tenant_id, loopctl_id, project_id) do
+      nil -> wrap(:title, get_active_article_by_title(tenant_id, attrs[:title]))
+      article -> {:loopctl, article}
     end
   end
 
-  defp get_active_article(_tenant_id, nil, _category, _project_id), do: nil
+  defp wrap(_tag, nil), do: nil
+  defp wrap(tag, article), do: {tag, article}
 
-  defp get_active_article(tenant_id, title, category, project_id) do
+  defp find_by_stored_loopctl_id(_tenant_id, id, _project_id) when not is_binary(id), do: nil
+
+  defp find_by_stored_loopctl_id(tenant_id, id, project_id) do
     from(a in Article,
       where:
-        a.tenant_id == ^tenant_id and a.title == ^title and a.category == ^category and
-          a.status not in [:archived, :superseded],
+        a.tenant_id == ^tenant_id and
+          fragment("?->'okf'->>'loopctl_id' = ?", a.metadata, ^id),
       order_by: [asc: a.inserted_at],
       limit: 1
     )
     |> scope_project(project_id)
     |> AdminRepo.one()
+  end
+
+  # Title-only, mirroring the partial unique index (tenant_id, title) WHERE
+  # status NOT IN ('archived','superseded') — this is exactly the row a create
+  # would collide with. Category/project are checked by the caller.
+  defp get_active_article_by_title(_tenant_id, nil), do: nil
+
+  defp get_active_article_by_title(tenant_id, title) do
+    AdminRepo.one(
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and a.title == ^title and
+            a.status not in [:archived, :superseded],
+        order_by: [asc: a.inserted_at],
+        limit: 1
+      )
+    )
   end
 
   defp scope_project(query, nil), do: where(query, [a], is_nil(a.project_id))
@@ -550,20 +613,12 @@ defmodule Loopctl.Knowledge.OKF do
 
   defp sanitize_tag(_), do: ""
 
-  # loopctl-origin bundles restore their original status; foreign bundles import
-  # as drafts so unvetted external knowledge isn't auto-published. Status is only
-  # honored for bundles that carry the `loopctl_id` producer key — otherwise a
-  # forged `loopctl_status: published` in a foreign bundle could auto-publish
-  # unreviewed content.
-  @import_statuses ~w(draft published archived superseded)
-  defp status_for(fm) do
-    with true <- is_binary(Map.get(fm, "loopctl_id")),
-         s when s in @import_statuses <- Map.get(fm, "loopctl_status") do
-      String.to_existing_atom(s)
-    else
-      _ -> :draft
-    end
-  end
+  # ALL imported articles are created as drafts and never have their status
+  # changed by an import — publication and lifecycle transitions go through the
+  # explicit publish/archive workflow. A bundle's `loopctl_status` is therefore
+  # advisory only: it can neither auto-publish unreviewed content nor demote a
+  # curated article, regardless of forged producer keys.
+  defp status_for(_fm), do: :draft
 
   defp fetch_type(fm) do
     case Map.get(fm, "type") do
@@ -925,45 +980,17 @@ defmodule Loopctl.Knowledge.OKF do
   defp yaml_scalar(value), do: ~s("#{escape_yaml(to_string(value))}")
 
   defp needs_quote?(""), do: true
+  defp needs_quote?(str), do: String.contains?(str, "\n") or not safe_bare?(str)
 
-  defp needs_quote?(str) do
-    String.contains?(str, [
-      ":",
-      "#",
-      "\"",
-      "'",
-      "\n",
-      "[",
-      "]",
-      "{",
-      "}",
-      ",",
-      "&",
-      "*",
-      "!",
-      "|",
-      ">",
-      "%",
-      "@",
-      "`"
-    ]) or
-      str != String.trim(str) or
-      leading_indicator?(str) or
-      looks_scalarish?(str)
-  end
-
-  # YAML block/flow indicators are only special in leading position; a bare value
-  # like "- see notes" or "...end" would re-parse incorrectly. Quote those too.
-  defp leading_indicator?(str) do
-    String.match?(str, ~r/^[-?:!&*\[\]{}#|>@`"'%,]/) or
-      String.starts_with?(str, ["- ", "? ", "---", "..."])
-  end
-
-  defp looks_scalarish?(str) do
-    down = String.downcase(str)
-
-    down in ~w(true false null yes no ~) or match?({_, ""}, Integer.parse(str)) or
-      match?({_, ""}, Float.parse(str))
+  # Definitive ambiguity check: a bare scalar is safe only if YAML parses it back
+  # to the IDENTICAL string. This catches every special-token class at once —
+  # numbers, bools, null, YAML-1.1 specials (.inf/.nan/0x1F/octal), dates,
+  # leading block/flow indicators (`- `, `? `, `---`), and embedded `: `/`#` —
+  # without trying to enumerate them by hand.
+  defp safe_bare?(str) do
+    match?({:ok, ^str}, YamlElixir.read_from_string(str))
+  rescue
+    _ -> false
   end
 
   defp escape_yaml(str) do
