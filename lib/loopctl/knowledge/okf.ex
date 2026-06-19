@@ -490,12 +490,12 @@ defmodule Loopctl.Knowledge.OKF do
       {:ok, article} ->
         acc |> bump(:created) |> index_path(path, article.id)
 
-      # A concurrent/duplicate title with different content (the importer already
-      # resolves same-title merges up front, so this is a race or a foreign
-      # collision) — skip rather than crash, but index the existing article so
-      # link reconstruction can still resolve this path.
+      # A concurrent/duplicate title with DIFFERENT content (the importer resolves
+      # same-title merges up front, so this is a race or a foreign collision).
+      # Report it as a conflict; do NOT index the unrelated existing article for
+      # this path, which would mis-point link reconstruction.
       {:error, :duplicate_title, existing} ->
-        acc |> bump(:skipped) |> index_path(path, existing.id)
+        record_error(acc, path, "title conflict with existing article #{existing.id}")
 
       {:error, changeset} ->
         record_error(acc, path, changeset_error(changeset))

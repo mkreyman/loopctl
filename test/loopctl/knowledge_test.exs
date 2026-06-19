@@ -107,41 +107,25 @@ defmodule Loopctl.KnowledgeTest do
   end
 
   describe "create_article/3 concurrent-title conflict resolution (#113/#114)" do
-    test "idempotently returns the existing article when a url-<hash> dedupe tag matches" do
+    test "idempotently returns the existing article when the body is identical" do
       %{tenant: tenant} = setup_tenant()
 
-      attrs = %{
-        title: "Same Source Note",
-        body: "v1",
-        category: :reference,
-        tags: ["url-abc123", "hub"]
-      }
+      attrs = %{title: "Captured Note", body: "  the same body\n", category: :reference}
 
       assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
-      # A retry/concurrent duplicate of the same content returns the same row.
-      assert {:ok, second} = Knowledge.create_article(tenant.id, Map.put(attrs, :body, "v2"))
+      # A retry/concurrent duplicate of the same content returns the same row,
+      # even with cosmetic whitespace differences and unrelated tag changes.
+      assert {:ok, second} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{attrs | body: "the same body"} |> Map.put(:tags, ["extra"])
+               )
+
       assert second.id == first.id
-      assert second.body == "v1", "idempotent return does not overwrite the existing article"
+      assert second.body == "  the same body\n", "idempotent return does not overwrite the row"
     end
 
-    test "idempotently returns the existing article when source_type + source_id match" do
-      %{tenant: tenant} = setup_tenant()
-      sid = Ecto.UUID.generate()
-
-      attrs = %{
-        title: "Sourced Note",
-        body: "body",
-        category: :finding,
-        source_type: "web_article",
-        source_id: sid
-      }
-
-      assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
-      assert {:ok, second} = Knowledge.create_article(tenant.id, attrs)
-      assert second.id == first.id
-    end
-
-    test "returns {:error, :duplicate_title, existing} when content differs (no dedupe signal)" do
+    test "returns {:error, :duplicate_title, existing} when the body differs" do
       %{tenant: tenant} = setup_tenant()
 
       assert {:ok, existing} =

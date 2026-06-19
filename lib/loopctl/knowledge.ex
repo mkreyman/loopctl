@@ -61,10 +61,10 @@ defmodule Loopctl.Knowledge do
   ## Returns
 
   - `{:ok, %Article{}}` on success, or idempotently when a concurrent/retried
-    create collides on the active title with the SAME content (matching
-    `url-<hash>` dedupe tag, or source_type + source_id)
-  - `{:error, :duplicate_title, %Article{}}` when the active title is taken by a
-    DIFFERENT-content article (the caller should answer 409, not retry)
+    create collides on the active title and the incoming body is byte-identical
+    (whitespace-normalized) to the existing article's
+  - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
+    article with DIFFERENT body content (the caller should answer 409, not retry)
   - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
@@ -123,24 +123,28 @@ defmodule Loopctl.Knowledge do
         |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
 
       case AdminRepo.transaction(multi) do
-        {:ok, %{article: article}} -> {:ok, article}
-        {:error, :article, changeset, _} -> resolve_create_conflict(tenant_id, attrs, changeset)
+        {:ok, %{article: article}} ->
+          {:ok, article}
+
+        {:error, :article, changeset, _} ->
+          resolve_create_conflict(effective_tenant_id, attrs, changeset)
       end
     end
   end
 
   # Make concurrent/retried creates safe on the (tenant_id, title) active unique
   # index. By the time the insert fails the constraint, the winning transaction
-  # has committed, so the existing row is visible. If the incoming payload is the
-  # SAME content (matching `url-<hash>` dedupe tag, or matching source_type +
-  # source_id), the conflict is a duplicate/retry -> return the existing article
-  # idempotently. Otherwise it is a genuine different-content title collision ->
+  # has committed, so the existing row is visible. The idempotency signal is the
+  # article BODY itself (server-side, unforgeable): if the colliding payload's
+  # body is byte-identical (whitespace-normalized) to the existing article's, the
+  # conflict is a duplicate/retry -> return the existing article idempotently.
+  # Otherwise it is a genuine different-content title collision ->
   # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
-  # retry-into-the-same-422). Non-title failures pass through unchanged.
+  # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
   defp resolve_create_conflict(tenant_id, attrs, changeset) do
     title = attrs[:title] || attrs["title"]
 
-    with true <- title_conflict?(changeset),
+    with true <- active_title_conflict?(changeset),
          %Article{} = existing <- get_active_article_by_title(tenant_id, title) do
       if same_content?(existing, attrs) do
         {:ok, existing}
@@ -152,17 +156,20 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  @title_conflict_constraints ~w(articles_tenant_title_active_idx
-                                 articles_tenant_slug_idx
-                                 articles_system_slug_idx)
-  defp title_conflict?(%Ecto.Changeset{errors: errors}) do
+  # Only the active-title index — NOT the slug indexes, whose conflicts are on a
+  # different field and must not be recovered via a title lookup.
+  defp active_title_conflict?(%Ecto.Changeset{errors: errors}) do
     Enum.any?(errors, fn {_field, {_msg, opts}} ->
       Keyword.get(opts, :constraint) == :unique and
-        Keyword.get(opts, :constraint_name) in @title_conflict_constraints
+        Keyword.get(opts, :constraint_name) == "articles_tenant_title_active_idx"
     end)
   end
 
   defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+
+  # tenant_id is nil for system-scoped articles; a NULL `=` never matches, so the
+  # recovery simply doesn't apply to system scope (its conflicts are slug-based).
+  defp get_active_article_by_title(nil, _title), do: nil
 
   defp get_active_article_by_title(tenant_id, title) do
     AdminRepo.one(
@@ -176,34 +183,14 @@ defmodule Loopctl.Knowledge do
     )
   end
 
-  @dedupe_tag_pattern ~r/^url-[0-9a-f]+$/
-
-  # Two payloads describe the same content when they share a content-hash dedupe
-  # tag (`url-<hash>`), or carry the same non-nil (source_type, source_id).
+  # Same content == same (whitespace-normalized) body. Derived server-side from
+  # the actual content, so a caller cannot forge a match to alias/read back a
+  # different article, and two genuinely-different bodies never silently merge.
   defp same_content?(existing, attrs) do
-    dedupe_tag_match?(existing, attrs) or source_match?(existing, attrs)
-  end
+    incoming = attrs[:body] || attrs["body"]
 
-  defp dedupe_tag_match?(existing, attrs) do
-    incoming = dedupe_tags(attrs[:tags] || attrs["tags"] || [])
-
-    incoming != [] and
-      not MapSet.disjoint?(MapSet.new(incoming), MapSet.new(dedupe_tags(existing.tags)))
-  end
-
-  defp dedupe_tags(tags) when is_list(tags) do
-    Enum.filter(tags, fn t -> is_binary(t) and Regex.match?(@dedupe_tag_pattern, t) end)
-  end
-
-  defp dedupe_tags(_), do: []
-
-  defp source_match?(existing, attrs) do
-    st = attrs[:source_type] || attrs["source_type"]
-    sid = attrs[:source_id] || attrs["source_id"]
-
-    not is_nil(st) and not is_nil(sid) and existing.source_id != nil and
-      to_string(existing.source_type) == to_string(st) and
-      to_string(existing.source_id) == to_string(sid)
+    is_binary(incoming) and is_binary(existing.body) and
+      String.trim(incoming) == String.trim(existing.body)
   end
 
   @doc """
