@@ -304,6 +304,10 @@ defmodule LoopctlWeb.Router do
     # Knowledge Export (Obsidian-compatible ZIP)
     get "/knowledge/export", KnowledgeExportController, :export
 
+    # OKF (Open Knowledge Format) interchange — export bundle / import bundle
+    get "/knowledge/okf/export", OKFController, :export
+    post "/knowledge/okf/import", OKFController, :import
+
     # Knowledge Lint (quality analysis report)
     get "/knowledge/lint", KnowledgeLintController, :lint
 
@@ -340,6 +344,7 @@ defmodule LoopctlWeb.Router do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
       get "/knowledge/export", KnowledgeExportController, :export
+      get "/knowledge/okf/export", OKFController, :export
       get "/knowledge/lint", KnowledgeLintController, :lint
     end
 

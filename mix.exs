@@ -104,6 +104,9 @@ defmodule Loopctl.MixProject do
       # Markdown rendering for wiki articles (US-26.0.3)
       {:earmark, "~> 1.4"},
 
+      # YAML frontmatter parsing for OKF (Open Knowledge Format) interchange (#110)
+      {:yaml_elixir, "~> 2.11"},
+
       # Testing
       {:mox, "~> 1.2", only: :test},
       {:lazy_html, ">= 0.1.0", only: :test},

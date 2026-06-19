@@ -871,6 +871,136 @@ async function knowledgeExport({ project_id }) {
   };
 }
 
+// --- OKF (Open Knowledge Format) interchange ---
+
+// Guard a user-supplied absolute filesystem path against pseudo-filesystems.
+function assertSafeAbsolutePath(nodePath, p, label) {
+  if (!nodePath.isAbsolute(p)) {
+    return `${label} must be an absolute path (got '${p}').`;
+  }
+  const blocked = ["/proc", "/dev", "/sys"];
+  if (blocked.some((b) => p === b || p.startsWith(b + "/"))) {
+    return `${label} refused: '${p}' targets a pseudo-filesystem path.`;
+  }
+  return null;
+}
+
+async function knowledgeOkfExport({ project_id, out_dir }) {
+  const basePath = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/okf/export`
+    : "/api/v1/knowledge/okf/export";
+
+  const result = await apiCall(
+    "GET",
+    `${basePath}?format=json`,
+    null,
+    process.env.LOOPCTL_USER_KEY,
+  );
+
+  if (result.error) return toContent(result);
+
+  const bundle = result.data || result;
+  const files = bundle.files || {};
+  const meta = bundle.meta || {};
+
+  if (!out_dir) {
+    return toContent({ meta, file_count: Object.keys(files).length, files });
+  }
+
+  const nodePath = await import("node:path");
+  const pathErr = assertSafeAbsolutePath(nodePath, out_dir, "out_dir");
+  if (pathErr) {
+    return { content: [{ type: "text", text: `Error: ${pathErr}` }], isError: true };
+  }
+  // Normalize so `..`/trailing-slash can't defeat the per-file fence below.
+  const root = nodePath.resolve(out_dir);
+
+  const fs = await import("node:fs/promises");
+  let written = 0;
+  for (const [rel, content] of Object.entries(files)) {
+    // Keep writes inside root even if a server-supplied path is adversarial.
+    const dest = nodePath.resolve(root, rel);
+    if (dest !== root && !dest.startsWith(root + nodePath.sep)) continue;
+    await fs.mkdir(nodePath.dirname(dest), { recursive: true });
+    await fs.writeFile(dest, content, "utf8");
+    written += 1;
+  }
+
+  return toContent({ meta, out_dir: root, written });
+}
+
+async function knowledgeOkfImport({ bundle_dir, project_id, merge, dry_run }) {
+  const nodePath = await import("node:path");
+  const pathErr = assertSafeAbsolutePath(nodePath, bundle_dir, "bundle_dir");
+  if (pathErr) {
+    return { content: [{ type: "text", text: `Error: ${pathErr}` }], isError: true };
+  }
+
+  const fs = await import("node:fs/promises");
+
+  let stat;
+  try {
+    stat = await fs.stat(bundle_dir);
+  } catch {
+    return { content: [{ type: "text", text: `Error: bundle_dir '${bundle_dir}' not found.` }], isError: true };
+  }
+  if (!stat.isDirectory()) {
+    return { content: [{ type: "text", text: `Error: bundle_dir '${bundle_dir}' is not a directory.` }], isError: true };
+  }
+
+  // Kept in step with the server-side caps in okf_controller.ex.
+  const MAX_FILES = 10_000;
+  const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+  const files = {};
+  let totalBytes = 0;
+
+  async function walk(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = nodePath.join(dir, entry.name);
+      // Never traverse or read through symlinks (escape out of bundle_dir).
+      if (entry.isSymbolicLink()) {
+        continue;
+      } else if (entry.isDirectory()) {
+        await walk(abs);
+      } else if (entry.isFile() && entry.name.endsWith(".md")) {
+        if (Object.keys(files).length >= MAX_FILES) {
+          throw new Error(`bundle exceeds ${MAX_FILES} files`);
+        }
+        const content = await fs.readFile(abs, "utf8");
+        totalBytes += Buffer.byteLength(content, "utf8");
+        if (totalBytes > MAX_TOTAL_BYTES) {
+          throw new Error("bundle exceeds 25 MiB total");
+        }
+        files[nodePath.relative(bundle_dir, abs).split(nodePath.sep).join("/")] = content;
+      }
+    }
+  }
+
+  try {
+    await walk(bundle_dir);
+  } catch (e) {
+    return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+  }
+
+  if (Object.keys(files).length === 0) {
+    return { content: [{ type: "text", text: `Error: no .md files found under '${bundle_dir}'.` }], isError: true };
+  }
+
+  const payload = { files };
+  if (project_id) payload.project_id = project_id;
+  if (merge != null) payload.merge = merge;
+  if (dry_run != null) payload.dry_run = dry_run;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/okf/import",
+    payload,
+    process.env.LOOPCTL_USER_KEY,
+  );
+  return toContent(result);
+}
+
 // --- Discovery Tools ---
 
 async function listRoutes() {
@@ -1924,6 +2054,62 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: "knowledge_okf_export",
+    description:
+      "Export the knowledge wiki as a portable OKF (Open Knowledge Format) v0.1 bundle — a tree of " +
+      "markdown files with YAML frontmatter. Requires LOOPCTL_USER_KEY. If out_dir is given, the bundle " +
+      "is written there (one .md file per concept, plus index.md/log.md) and a summary is returned; " +
+      "otherwise the bundle is returned inline as {files, meta}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: scope the export to a project (includes tenant-wide articles too).",
+        },
+        out_dir: {
+          type: "string",
+          description:
+            "Optional: absolute path of a directory to write the bundle into. When omitted, the " +
+            "bundle is returned inline.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_okf_import",
+    description:
+      "Import an OKF (Open Knowledge Format) v0.1 bundle from a local directory into the wiki. " +
+      "Requires LOOPCTL_USER_KEY. Reserved files (index.md/log.md) are skipped; each concept is created, " +
+      "or (with merge=true, the default) updated in place when it matches an existing article. Unknown " +
+      "frontmatter types/keys are tolerated and preserved. Returns a per-file import report.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bundle_dir: {
+          type: "string",
+          description: "Absolute path of the OKF bundle directory to read .md files from.",
+        },
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: assign imported articles to a project.",
+        },
+        merge: {
+          type: "boolean",
+          description: "Update existing articles instead of skipping them (default true).",
+        },
+        dry_run: {
+          type: "boolean",
+          description: "Validate and plan only; write nothing (default false).",
+        },
+      },
+      required: ["bundle_dir"],
+    },
+  },
 
   // Knowledge Ingestion Tools
   {
@@ -2367,6 +2553,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_export":
       return await knowledgeExport(args);
+
+    case "knowledge_okf_export":
+      return await knowledgeOkfExport(args);
+
+    case "knowledge_okf_import":
+      return await knowledgeOkfImport(args);
 
     // Knowledge Ingestion Tools
     case "knowledge_ingest":

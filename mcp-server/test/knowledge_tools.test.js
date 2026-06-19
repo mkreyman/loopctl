@@ -536,6 +536,103 @@ describe("TC-25.3.8: README Wiki Attribution section", () => {
 });
 
 // ---------------------------------------------------------------------------
+// OKF export/import tools — re-implemented handlers (mirror index.js)
+// ---------------------------------------------------------------------------
+
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+
+async function knowledgeOkfExport({ project_id, out_dir }) {
+  const basePath = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/okf/export`
+    : "/api/v1/knowledge/okf/export";
+  const result = await apiCall("GET", `${basePath}?format=json`, null, process.env.LOOPCTL_USER_KEY);
+  if (result.error) return toContent(result);
+  const bundle = result.data || result;
+  const files = bundle.files || {};
+  const meta = bundle.meta || {};
+  if (!out_dir) return toContent({ meta, file_count: Object.keys(files).length, files });
+  return toContent({ meta, out_dir, written: Object.keys(files).length });
+}
+
+async function knowledgeOkfImport({ bundle_dir, project_id, merge, dry_run }) {
+  const nodePath = await import("node:path");
+  const fs = await import("node:fs/promises");
+  const files = {};
+  async function walk(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = nodePath.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(abs);
+      else if (entry.isFile() && entry.name.endsWith(".md")) {
+        files[nodePath.relative(bundle_dir, abs).split(nodePath.sep).join("/")] =
+          await fs.readFile(abs, "utf8");
+      }
+    }
+  }
+  await walk(bundle_dir);
+  const payload = { files };
+  if (project_id) payload.project_id = project_id;
+  if (merge != null) payload.merge = merge;
+  if (dry_run != null) payload.dry_run = dry_run;
+  const result = await apiCall("POST", "/api/v1/knowledge/okf/import", payload, process.env.LOOPCTL_USER_KEY);
+  return toContent(result);
+}
+
+describe("knowledge_okf_export", () => {
+  test("requests the JSON bundle with the user key and returns files inline", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    const calls = mockFetch({ data: { files: { "index.md": "# Bundle\n" }, meta: { okf_version: "0.1" } } });
+
+    const res = await knowledgeOkfExport({});
+
+    assert.equal(calls.length, 1);
+    const url = new URL(calls[0].url);
+    assert.equal(url.pathname, "/api/v1/knowledge/okf/export");
+    assert.equal(url.searchParams.get("format"), "json");
+    assert.equal(calls[0].options.headers.Authorization, "Bearer lc_test_user_key");
+    const payload = JSON.parse(res.content[0].text);
+    assert.equal(payload.file_count, 1);
+  });
+
+  test("uses the project-scoped path when project_id is given", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    const calls = mockFetch({ data: { files: {}, meta: {} } });
+    await knowledgeOkfExport({ project_id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0" });
+    const url = new URL(calls[0].url);
+    assert.equal(
+      url.pathname,
+      "/api/v1/projects/b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0/knowledge/okf/export"
+    );
+  });
+});
+
+describe("knowledge_okf_import", () => {
+  test("walks a directory of .md files and POSTs them as a files map", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+
+    const dir = mkdtempSync(`${tmpdir()}/okf-`);
+    mkdirSync(`${dir}/reference`, { recursive: true });
+    writeFileSync(`${dir}/reference/a.md`, "---\ntype: reference\ntitle: A\n---\n\nbody\n");
+    writeFileSync(`${dir}/index.md`, "# Bundle\n");
+
+    const calls = mockFetch({ data: { created: 1, errors: [] } });
+    await knowledgeOkfImport({ bundle_dir: dir, merge: true });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.method, "POST");
+    assert.equal(calls[0].options.headers.Authorization, "Bearer lc_test_user_key");
+    const body = JSON.parse(calls[0].options.body);
+    assert.ok(body.files["reference/a.md"].includes("type: reference"));
+    assert.ok(body.files["index.md"]);
+    assert.equal(body.merge, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Issue #108: knowledge_search enumeration (q optional + offset)
 // ---------------------------------------------------------------------------
 
