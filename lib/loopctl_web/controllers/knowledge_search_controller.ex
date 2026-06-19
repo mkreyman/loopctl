@@ -18,6 +18,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -26,6 +27,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   tags(["Knowledge Wiki"])
 
   @valid_modes ~w(keyword semantic combined)
+  @valid_categories Ecto.Enum.values(Article, :category)
 
   operation(:search,
     summary: "Search knowledge articles",
@@ -192,28 +194,39 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp validate_mode(_), do: {:ok, "combined"}
 
   defp build_opts(params) do
-    opts =
-      []
-      |> maybe_add_opt(:project_id, params["project_id"])
-      |> maybe_add_category(params["category"])
-      |> maybe_add_tags(params["tags"])
-      |> maybe_add_limit(params["limit"])
-      |> maybe_add_offset(params["offset"])
+    with {:ok, category} <- validate_category(params["category"]) do
+      opts =
+        []
+        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:category, category)
+        |> maybe_add_tags(params["tags"])
+        |> maybe_add_limit(params["limit"])
+        |> maybe_add_offset(params["offset"])
 
-    {:ok, opts}
+      {:ok, opts}
+    end
   end
 
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, _key, ""), do: opts
   defp maybe_add_opt(opts, key, value), do: [{key, value} | opts]
 
-  defp maybe_add_category(opts, nil), do: opts
-  defp maybe_add_category(opts, ""), do: opts
+  # Reject an unknown OR non-category-but-existing atom (e.g. "published") with a
+  # 400, mirroring the index controller. Without this, list mode would either
+  # crash on a CastError or silently drop the filter and return the whole catalog.
+  defp validate_category(nil), do: {:ok, nil}
+  defp validate_category(""), do: {:ok, nil}
 
-  defp maybe_add_category(opts, category) do
-    [{:category, String.to_existing_atom(category)} | opts]
+  defp validate_category(category) when is_binary(category) do
+    atom = String.to_existing_atom(category)
+    if atom in @valid_categories, do: {:ok, atom}, else: invalid_category()
   rescue
-    ArgumentError -> opts
+    ArgumentError -> invalid_category()
+  end
+
+  defp invalid_category do
+    valid = Enum.map_join(@valid_categories, ", ", &to_string/1)
+    {:error, :bad_request, "Invalid category. Valid categories: #{valid}"}
   end
 
   defp maybe_add_tags(opts, nil), do: opts

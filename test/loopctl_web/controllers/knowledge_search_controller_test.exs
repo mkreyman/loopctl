@@ -193,6 +193,30 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["error"]["message"] =~ "combined"
     end
 
+    test "unknown category returns 400 instead of silently enumerating everything", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub", category: "bogus"})
+
+      assert json_response(conn, 400)["error"]["message"] =~ "category"
+    end
+
+    test "a valid-but-non-category atom (e.g. published) returns 400, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", category: "published"})
+
+      assert json_response(conn, 400)["error"]["status"] == 400
+    end
+
     test "pagination with limit and offset", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
