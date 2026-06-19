@@ -48,7 +48,7 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["error"]["details"]["title"] != nil
     end
 
-    test "duplicate title with an identical body is idempotent (201, same id)", %{conn: conn} do
+    test "duplicate title with an identical body is idempotent (200, same id)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
@@ -62,9 +62,10 @@ defmodule LoopctlWeb.ArticleControllerTest do
       first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
       first_id = json_response(first, 201)["data"]["id"]
 
-      # A concurrent/retried publish of the same content returns the same row.
+      # A concurrent/retried publish of the same content returns the same row with
+      # a 200 (not 201), so callers/observers can distinguish a dedup from a create.
       second = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
-      assert json_response(second, 201)["data"]["id"] == first_id
+      assert json_response(second, 200)["data"]["id"] == first_id
     end
 
     test "duplicate title with different content returns a clear 409 (not a retried 422)", %{

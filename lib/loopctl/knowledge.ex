@@ -60,15 +60,19 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, %Article{}}` on success, or idempotently when a concurrent/retried
-    create collides on the active title and the incoming body is byte-identical
-    (whitespace-normalized) to the existing article's
+  - `{:ok, %Article{}}` on a fresh create
+  - `{:ok, :deduplicated, %Article{}}` when a concurrent/retried create collided
+    on the active title and the incoming body is identical to the existing
+    article's after trimming leading/trailing whitespace — the existing row is
+    returned unchanged (this is a no-op: no second audit/webhook/embedding), so
+    callers can answer HTTP 200 rather than 201
   - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
-    article with DIFFERENT body content (the caller should answer 409, not retry)
+    article with a DIFFERENT body (the caller should answer 409, not retry)
   - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Article.t()}
+          | {:ok, :deduplicated, Article.t()}
           | {:error, :duplicate_title, Article.t()}
           | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
@@ -134,11 +138,14 @@ defmodule Loopctl.Knowledge do
 
   # Make concurrent/retried creates safe on the (tenant_id, title) active unique
   # index. By the time the insert fails the constraint, the winning transaction
-  # has committed, so the existing row is visible. The idempotency signal is the
-  # article BODY itself (server-side, unforgeable): if the colliding payload's
-  # body is byte-identical (whitespace-normalized) to the existing article's, the
-  # conflict is a duplicate/retry -> return the existing article idempotently.
-  # Otherwise it is a genuine different-content title collision ->
+  # has committed, so the existing row is visible (the recovery SELECT below
+  # deliberately mirrors the partial index's predicate, so the conflicting row is
+  # guaranteed visible unless it was concurrently archived). The idempotency
+  # signal is the article BODY itself (server-side, unforgeable): if the colliding
+  # payload's body equals the existing article's (after trimming leading/trailing
+  # whitespace), the conflict is a duplicate/retry -> return the existing row
+  # idempotently as `{:ok, :deduplicated, existing}` (a no-op the API answers 200).
+  # Otherwise it is a genuine different-body title collision ->
   # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
   # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
   defp resolve_create_conflict(tenant_id, attrs, changeset) do
@@ -147,7 +154,7 @@ defmodule Loopctl.Knowledge do
     with true <- active_title_conflict?(changeset),
          %Article{} = existing <- get_active_article_by_title(tenant_id, title) do
       if same_content?(existing, attrs) do
-        {:ok, existing}
+        {:ok, :deduplicated, existing}
       else
         {:error, :duplicate_title, existing}
       end

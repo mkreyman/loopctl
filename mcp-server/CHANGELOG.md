@@ -12,9 +12,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `knowledge_create` (and the underlying `POST /articles`) is now concurrency-
   safe. A create that races/retries into the `(tenant_id, title)` active unique
   index no longer returns a spurious `422 "tenant_id has already been taken"`:
-  if the colliding payload has a **byte-identical body** (the unforgeable
-  server-side content signal) the existing article is returned idempotently; a
-  **different-body** same-title collision returns a clear `409 title_conflict`
+  if the colliding payload has an **identical body** (ignoring surrounding
+  whitespace — the unforgeable server-side content signal) the existing article
+  is returned idempotently (HTTP 200); a **different-body** same-title collision
+  returns a clear `409 title_conflict`
   (with the existing article id) instead of a 422 the client retries into. The
   unique-violation message is also corrected to be attributed to `title` rather
   than the misleading `tenant_id`. Fixes #113/#114.

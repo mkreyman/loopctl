@@ -175,6 +175,13 @@ defmodule LoopctlWeb.ArticleController do
           |> put_status(:created)
           |> json(ArticleJSON.create(%{article: article}))
 
+        # Idempotent: a concurrent/retried create with an identical body. 200 (not
+        # 201) lets clients/observers distinguish a real create from a no-op dedup.
+        {:ok, :deduplicated, existing} ->
+          conn
+          |> put_status(:ok)
+          |> json(ArticleJSON.create(%{article: existing}))
+
         {:error, :duplicate_title, existing} ->
           conn
           |> put_status(:conflict)
@@ -183,9 +190,9 @@ defmodule LoopctlWeb.ArticleController do
               status: 409,
               code: "title_conflict",
               message:
-                "An article titled \"#{existing.title}\" already exists in this tenant. " <>
-                  "Use a different title, or include the existing article's dedupe tag " <>
-                  "(url-<hash>) / source_type+source_id to update it idempotently.",
+                "An article titled \"#{existing.title}\" already exists in this tenant " <>
+                  "with different content. Choose a different title, or update the existing " <>
+                  "article directly via PATCH /articles/#{existing.id}.",
               details: %{existing_article_id: existing.id}
             }
           })

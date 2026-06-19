@@ -113,9 +113,9 @@ defmodule Loopctl.KnowledgeTest do
       attrs = %{title: "Captured Note", body: "  the same body\n", category: :reference}
 
       assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
-      # A retry/concurrent duplicate of the same content returns the same row,
-      # even with cosmetic whitespace differences and unrelated tag changes.
-      assert {:ok, second} =
+      # A retry/concurrent duplicate of the same content returns the same row
+      # (tagged :deduplicated), even with cosmetic whitespace and tag changes.
+      assert {:ok, :deduplicated, second} =
                Knowledge.create_article(
                  tenant.id,
                  %{attrs | body: "the same body"} |> Map.put(:tags, ["extra"])

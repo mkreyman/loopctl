@@ -362,9 +362,10 @@ defmodule Loopctl.Knowledge.OKF do
 
   The import is non-atomic (per-file) and runs synchronously; it is bounded by
   the concept cap above. Concurrent imports of the same bundle are serialized by
-  the `(tenant_id, title)` active unique index rather than an advisory lock, so a
-  rare double-submit surfaces a reported skip (`partial?: true`) instead of a
-  duplicate.
+  `create_article`'s active-title conflict resolution: an identical-body race is
+  absorbed idempotently (counted under `:skipped`), and a different-body title
+  collision is reported (`:skipped` + an `errors` entry, `partial?: true`) — never
+  a duplicate.
   """
   @spec import_files(Ecto.UUID.t(), files(), keyword()) ::
           {:ok, map()} | {:error, :too_many_concepts}
@@ -489,6 +490,11 @@ defmodule Loopctl.Knowledge.OKF do
     case Knowledge.create_article(tenant_id, attrs, acc.audit_opts) do
       {:ok, article} ->
         acc |> bump(:created) |> index_path(path, article.id)
+
+      # A concurrent create that resolved to an existing identical-body article —
+      # a no-op; index it so link reconstruction resolves this path.
+      {:ok, :deduplicated, existing} ->
+        acc |> bump(:skipped) |> index_path(path, existing.id)
 
       # A concurrent/duplicate title with DIFFERENT content (the importer resolves
       # same-title merges up front, so this is a race or a foreign collision).
