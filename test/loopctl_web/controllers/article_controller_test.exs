@@ -47,6 +47,62 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["error"]["status"] == 422
       assert body["error"]["details"]["title"] != nil
     end
+
+    test "duplicate title with an identical body is idempotent (200, same id)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      payload = %{
+        "title" => "Captured Video",
+        "body" => "the captured summary",
+        "category" => "reference",
+        "tags" => ["hub"]
+      }
+
+      first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
+      first_body = json_response(first, 201)
+      first_id = first_body["data"]["id"]
+      refute first_body["deduplicated"]
+
+      # A concurrent/retried publish of the same content returns the same row with
+      # a 200 (not 201) AND deduplicated: true, so callers/observers (incl. the MCP
+      # layer that only sees a 2xx) can distinguish a dedup from a create.
+      second = conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload)
+      second_body = json_response(second, 200)
+      assert second_body["data"]["id"] == first_id
+      assert second_body["deduplicated"] == true
+    end
+
+    test "duplicate title with different content returns a clear 409 (not a retried 422)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      _first =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Shared Heading",
+          "body" => "first",
+          "category" => "pattern"
+        })
+        |> json_response(201)
+
+      second =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Shared Heading",
+          "body" => "second",
+          "category" => "convention"
+        })
+
+      body = json_response(second, 409)
+      assert body["error"]["status"] == 409
+      assert body["error"]["code"] == "title_conflict"
+      assert body["error"]["details"]["existing_article_id"]
+    end
   end
 
   describe "POST /api/v1/projects/:project_id/articles" do

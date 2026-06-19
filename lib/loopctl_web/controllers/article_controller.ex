@@ -64,6 +64,13 @@ defmodule LoopctlWeb.ArticleController do
       201 =>
         {"Article created", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      200 =>
+        {"Idempotent: an active article with the same title and an identical body " <>
+           "already exists; it is returned unchanged with `deduplicated: true`.",
+         "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      409 =>
+        {"Title taken by an article with different content", "application/json",
+         Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -174,6 +181,30 @@ defmodule LoopctlWeb.ArticleController do
           conn
           |> put_status(:created)
           |> json(ArticleJSON.create(%{article: article}))
+
+        # Idempotent: a concurrent/retried create with an identical body. 200 (not
+        # 201), plus an explicit `deduplicated: true` flag in the body so clients
+        # that only see a 2xx (e.g. the MCP layer) can still tell a dedup from a
+        # real create.
+        {:ok, :deduplicated, existing} ->
+          conn
+          |> put_status(:ok)
+          |> json(Map.put(ArticleJSON.create(%{article: existing}), :deduplicated, true))
+
+        {:error, :duplicate_title, existing} ->
+          conn
+          |> put_status(:conflict)
+          |> json(%{
+            error: %{
+              status: 409,
+              code: "title_conflict",
+              message:
+                "An article titled \"#{existing.title}\" already exists in this tenant " <>
+                  "with different content. Choose a different (more specific) title. " <>
+                  "(Editing the existing article requires role :user via PATCH /articles/:id.)",
+              details: %{existing_article_id: existing.id}
+            }
+          })
 
         {:error, %Ecto.Changeset{} = changeset} ->
           {:error, changeset}

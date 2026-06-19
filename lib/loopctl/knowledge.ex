@@ -60,11 +60,21 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, %Article{}}` on success
-  - `{:error, changeset}` on validation failure
+  - `{:ok, %Article{}}` on a fresh create
+  - `{:ok, :deduplicated, %Article{}}` when a concurrent/retried create collided
+    on the active title and the incoming body is identical to the existing
+    article's after trimming leading/trailing whitespace — the existing row is
+    returned unchanged (this is a no-op: no second audit/webhook/embedding), so
+    callers can answer HTTP 200 rather than 201
+  - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
+    article with a DIFFERENT body (the caller should answer 409, not retry)
+  - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Article.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:ok, :deduplicated, Article.t()}
+          | {:error, :duplicate_title, Article.t()}
+          | {:error, Ecto.Changeset.t()}
   def create_article(tenant_id, attrs, opts \\ []) do
     scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
@@ -117,10 +127,84 @@ defmodule Loopctl.Knowledge do
         |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
 
       case AdminRepo.transaction(multi) do
-        {:ok, %{article: article}} -> {:ok, article}
-        {:error, :article, changeset, _} -> {:error, changeset}
+        {:ok, %{article: article}} ->
+          {:ok, article}
+
+        {:error, :article, changeset, _} ->
+          resolve_create_conflict(effective_tenant_id, attrs, changeset)
       end
     end
+  end
+
+  # Make concurrent/retried creates safe on the (tenant_id, title) active unique
+  # index. By the time the insert fails the constraint, the winning transaction
+  # has committed, so the existing row is visible (the recovery SELECT below
+  # deliberately mirrors the partial index's predicate, so the conflicting row is
+  # guaranteed visible unless it was concurrently archived). The idempotency
+  # signal is the article BODY itself (server-side, unforgeable): if the colliding
+  # payload's body equals the existing article's (after trimming leading/trailing
+  # whitespace), the conflict is a duplicate/retry -> return the existing row
+  # idempotently as `{:ok, :deduplicated, existing}` (a no-op the API answers 200).
+  # Otherwise it is a genuine different-body title collision ->
+  # `{:error, :duplicate_title, existing}` so the API can answer 409 (not a
+  # retry-into-the-same-422). Non-(active-title) failures pass through unchanged.
+  #
+  # The recovery SELECT runs after the insert's transaction has rolled back, so
+  # there is a tiny window in which a THIRD writer mutates or archives the winning
+  # row between its commit and our SELECT. That only produces a transient,
+  # self-healing outcome — a 409 (body now differs), or the original 422 (row now
+  # archived → SELECT returns nil) — which the client's next attempt resolves
+  # cleanly. We accept that rather than re-running the whole create under a lock.
+  defp resolve_create_conflict(tenant_id, attrs, changeset) do
+    title = attrs[:title] || attrs["title"]
+
+    with true <- active_title_conflict?(changeset),
+         %Article{} = existing <- get_active_article_by_title(tenant_id, title) do
+      if same_content?(existing, attrs) do
+        {:ok, :deduplicated, existing}
+      else
+        {:error, :duplicate_title, existing}
+      end
+    else
+      _ -> {:error, changeset}
+    end
+  end
+
+  # Only the active-title index — NOT the slug indexes, whose conflicts are on a
+  # different field and must not be recovered via a title lookup.
+  defp active_title_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        Keyword.get(opts, :constraint_name) == "articles_tenant_title_active_idx"
+    end)
+  end
+
+  defp get_active_article_by_title(_tenant_id, title) when not is_binary(title), do: nil
+
+  # tenant_id is nil for system-scoped articles; a NULL `=` never matches, so the
+  # recovery simply doesn't apply to system scope (its conflicts are slug-based).
+  defp get_active_article_by_title(nil, _title), do: nil
+
+  defp get_active_article_by_title(tenant_id, title) do
+    AdminRepo.one(
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and a.title == ^title and
+            a.status not in [:archived, :superseded],
+        order_by: [asc: a.inserted_at],
+        limit: 1
+      )
+    )
+  end
+
+  # Same content == same (whitespace-normalized) body. Derived server-side from
+  # the actual content, so a caller cannot forge a match to alias/read back a
+  # different article, and two genuinely-different bodies never silently merge.
+  defp same_content?(existing, attrs) do
+    incoming = attrs[:body] || attrs["body"]
+
+    is_binary(incoming) and is_binary(existing.body) and
+      String.trim(incoming) == String.trim(existing.body)
   end
 
   @doc """

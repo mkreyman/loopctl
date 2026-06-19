@@ -93,9 +93,9 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_metadata()
     |> maybe_generate_slug()
     |> foreign_key_constraint(:project_id)
-    |> unique_constraint([:tenant_id, :title],
+    |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
-      message: "has already been taken for this tenant"
+      message: "is already taken in this tenant"
     )
     |> unique_constraint(:slug,
       name: :articles_system_slug_idx,
@@ -123,9 +123,9 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_tags()
     |> validate_metadata()
     |> foreign_key_constraint(:project_id)
-    |> unique_constraint([:tenant_id, :title],
+    |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
-      message: "has already been taken for this tenant"
+      message: "is already taken in this tenant"
     )
     |> unique_constraint(:slug,
       name: :articles_system_slug_idx,

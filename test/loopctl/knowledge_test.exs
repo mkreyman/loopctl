@@ -106,6 +106,63 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  describe "create_article/3 concurrent-title conflict resolution (#113/#114)" do
+    test "idempotently returns the existing article when the body is identical" do
+      %{tenant: tenant} = setup_tenant()
+
+      attrs = %{title: "Captured Note", body: "  the same body\n", category: :reference}
+
+      assert {:ok, first} = Knowledge.create_article(tenant.id, attrs)
+      # A retry/concurrent duplicate of the same content returns the same row
+      # (tagged :deduplicated), even with cosmetic whitespace and tag changes.
+      assert {:ok, :deduplicated, second} =
+               Knowledge.create_article(
+                 tenant.id,
+                 %{attrs | body: "the same body"} |> Map.put(:tags, ["extra"])
+               )
+
+      assert second.id == first.id
+      assert second.body == "  the same body\n", "idempotent return does not overwrite the row"
+    end
+
+    test "returns {:error, :duplicate_title, existing} when the body differs" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, existing} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Unique Title",
+                 body: "original",
+                 category: :pattern
+               })
+
+      assert {:error, :duplicate_title, returned} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Unique Title",
+                 body: "different content",
+                 category: :convention
+               })
+
+      assert returned.id == existing.id
+      # The existing article is untouched.
+      {:ok, reloaded} = Knowledge.get_article(tenant.id, existing.id)
+      assert reloaded.body == "original"
+      assert reloaded.category == :pattern
+    end
+
+    test "the active-title unique constraint is attributed to :title, not :tenant_id" do
+      changeset =
+        Article.create_changeset(%Article{}, %{title: "x", body: "b", category: :pattern})
+
+      assert Enum.any?(changeset.constraints, fn c ->
+               c.field == :title and c.constraint == "articles_tenant_title_active_idx"
+             end)
+
+      refute Enum.any?(changeset.constraints, fn c ->
+               c.field == :tenant_id and c.constraint == "articles_tenant_title_active_idx"
+             end)
+    end
+  end
+
   # --- TC-19.3.2: List with tag overlap filtering ---
 
   describe "list_articles/2 tag filtering" do

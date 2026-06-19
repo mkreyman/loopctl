@@ -2,6 +2,19 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-18 — Concurrent article create (PR #116)
+
+### Changed
+
+- `POST /api/v1/articles` (and MCP `knowledge_create`) is now concurrency-safe.
+  A create that races/retries into the `(tenant_id, title)` active unique index
+  no longer returns a spurious `422 "tenant_id has already been taken"`: an
+  **identical-body** collision returns the existing article idempotently as
+  **HTTP 200**, and a **different-body** collision returns **`409 title_conflict`**
+  (with `existing_article_id`) instead of a 422 the client retries into. The
+  unique-violation is attributed to `title` rather than the misleading
+  `tenant_id`. Fixes #113/#114.
+
 ## [Unreleased] — 2026-04-17 — Import merge + agent ergonomics (PR #105)
 
 ### Added

@@ -1852,7 +1852,11 @@ const TOOLS = [
     name: "knowledge_create",
     description:
       "Create a new knowledge article. Use to file findings, document patterns, or record decisions " +
-      "discovered during implementation.",
+      "discovered during implementation. Concurrency-safe: if a create races/retries against an " +
+      "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
+      "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
+      "with a DIFFERENT body returns 409 title_conflict — do not retry; choose a different title or PATCH " +
+      "the existing article.",
     inputSchema: {
       type: "object",
       properties: {

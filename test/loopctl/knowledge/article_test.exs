@@ -426,7 +426,11 @@ defmodule Loopctl.Knowledge.ArticleTest do
         |> Article.create_changeset(%{attrs | body: "Second body"})
 
       assert {:error, changeset} = Loopctl.AdminRepo.insert(changeset2)
-      assert errors_on(changeset)[:tenant_id]
+      # The active-title unique violation is now attributed to :title (not the
+      # misleading :tenant_id), with a clear message.
+      assert errors_on(changeset)[:title]
+      assert "is already taken in this tenant" in errors_on(changeset)[:title]
+      refute errors_on(changeset)[:tenant_id]
     end
 
     test "allows same title across different tenants" do
