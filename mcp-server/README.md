@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 42 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 47 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (45)
+## Tools (47)
 
 ### Project Tools
 
@@ -138,6 +138,8 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. |
+| `knowledge_okf_export` | **Requires `LOOPCTL_USER_KEY`.** Export the wiki as a portable OKF (Open Knowledge Format) v0.1 bundle of markdown files. Writes to `out_dir`, or returns `{files, meta}` inline. |
+| `knowledge_okf_import` | **Requires `LOOPCTL_USER_KEY`.** Import an OKF v0.1 bundle from a local directory. Creates or (with `merge`) updates articles; tolerates and preserves unknown frontmatter. |
 
 ### Knowledge Management Tools (orchestrator key)
 

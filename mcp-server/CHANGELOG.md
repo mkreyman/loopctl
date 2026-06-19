@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.4.0 — 2026-06-18 (OKF interchange)
+
+> Follows 2.3.0 (knowledge enumeration & pagination). If you only see 2.2.0
+> below, this entry was authored on a branch cut before 2.3.0 merged.
+
+### Added
+
+- `knowledge_okf_export` — export the wiki as a portable OKF (Open Knowledge
+  Format) v0.1 bundle: a tree of markdown files with YAML frontmatter. Writes
+  the bundle to `out_dir` (one `.md` per concept, plus `index.md`/`log.md`) or
+  returns it inline as `{files, meta}`. Requires `LOOPCTL_USER_KEY`.
+- `knowledge_okf_import` — import an OKF bundle from a local directory. Reserved
+  files are skipped; each concept is created or (with `merge`, default true)
+  updated in place when it matches by `loopctl_id` or title. Unknown frontmatter
+  types/keys are tolerated and preserved. Returns a per-file report. Requires
+  `LOOPCTL_USER_KEY`.
+
+### Rationale
+
+OKF (Google Cloud's vendor-neutral spec, v0.1) makes the wiki portable —
+git-shippable, GitHub-renderable, and interoperable with other agents/tools —
+as an interchange layer without changing loopctl's DB-backed internals. Both
+tools stay at `role: :user` because export is a bulk knowledge egress and import
+bulk-mutates curated articles.
+
 ## 2.2.0 — 2026-04-22 (Wiki curation tools)
 
 ### Added
