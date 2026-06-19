@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.3.0 — 2026-06-18 (Knowledge enumeration & pagination)
+
+### Added
+
+- `knowledge_search` now accepts `offset` for pagination, and `q` is now
+  **optional** when `tags` and/or `category` are supplied. In that list mode the
+  server returns the complete filtered set (no relevance ranking) paginated via
+  `offset`/`limit` over `meta.total_count`, so an agent can enumerate every
+  article carrying a tag/category instead of unioning many keyword queries.
+  Fixes #108.
+- `knowledge_index` now accepts `category`, `tags`, `offset`, and `limit`.
+  Results are ordered deterministically so pagination reaches every article
+  (previously a fixed cap silently dropped whole categories), and
+  `meta.categories` reports per-category totals over the entire filtered set.
+  An unknown `category` is rejected with `400` rather than silently ignored.
+  Fixes #109.
+
+### Rationale
+
+There was no reliable way to enumerate all articles for a given tag/category:
+`knowledge_search` forced a keyword that was AND-ed with the filter and capped
+per query, and `knowledge_index` silently ignored `category`/`tags`/`offset`
+while truncating later categories. Both paths now support complete, paginated
+enumeration.
+
 ## 2.2.0 — 2026-04-22 (Wiki curation tools)
 
 ### Added

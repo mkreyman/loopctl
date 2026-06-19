@@ -81,26 +81,32 @@ function toContent(result) {
 // Handler implementations (mirror index.js exactly)
 // ---------------------------------------------------------------------------
 
-async function knowledgeIndex({ project_id, story_id }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
   const params = new URLSearchParams();
   if (story_id) params.set("story_id", story_id);
+  if (category) params.set("category", category);
+  if (tags) params.set("tags", tags);
+  if (offset != null) params.set("offset", String(offset));
+  if (limit != null) params.set("limit", String(limit));
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
 
-async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit }) {
-  const params = new URLSearchParams({ q });
+async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
+  const params = new URLSearchParams();
+  if (q != null && q !== "") params.set("q", q);
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
   if (tags) params.set("tags", tags);
   if (mode) params.set("mode", mode);
   if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
   const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
@@ -526,5 +532,104 @@ describe("TC-25.3.8: README Wiki Attribution section", () => {
       readme.includes("deprecated") || readme.includes("Deprecated"),
       'README should mention deprecated behavior'
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #108: knowledge_search enumeration (q optional + offset)
+// ---------------------------------------------------------------------------
+
+describe("Issue #108: knowledge_search list mode (q optional)", () => {
+  test("omits q from URL when q is absent but tags supplied", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeSearch({ tags: "hub", limit: 50, offset: 100 });
+
+    assert.equal(calls.length, 1);
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.has("q"), false, "q omitted when not provided");
+    assert.equal(url.searchParams.get("tags"), "hub");
+    assert.equal(url.searchParams.get("limit"), "50");
+    assert.equal(url.searchParams.get("offset"), "100");
+  });
+
+  test("omits empty-string q from URL", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: {} });
+
+    await knowledgeSearch({ q: "", category: "reference" });
+
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.has("q"), false, "empty q omitted");
+    assert.equal(url.searchParams.get("category"), "reference");
+  });
+
+  test("forwards offset for keyword search pagination", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: {} });
+
+    await knowledgeSearch({ q: "elixir", offset: 20 });
+
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.get("q"), "elixir");
+    assert.equal(url.searchParams.get("offset"), "20");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #109: knowledge_index filtering + pagination
+// ---------------------------------------------------------------------------
+
+describe("Issue #109: knowledge_index category/tags/offset/limit", () => {
+  test("forwards category, tags, offset, and limit", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: { total_count: 0 } });
+
+    await knowledgeIndex({
+      category: "reference",
+      tags: "hub",
+      offset: 50,
+      limit: 200,
+    });
+
+    assert.equal(calls.length, 1);
+    const url = new URL(calls[0].url);
+    assert.equal(url.pathname, "/api/v1/knowledge/index");
+    assert.equal(url.searchParams.get("category"), "reference");
+    assert.equal(url.searchParams.get("tags"), "hub");
+    assert.equal(url.searchParams.get("offset"), "50");
+    assert.equal(url.searchParams.get("limit"), "200");
+  });
+
+  test("forwards pagination on the project-scoped path", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: {} });
+
+    await knowledgeIndex({
+      project_id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+      offset: 0,
+      limit: 1000,
+    });
+
+    const url = new URL(calls[0].url);
+    assert.equal(
+      url.pathname,
+      "/api/v1/projects/b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0/knowledge/index"
+    );
+    assert.equal(url.searchParams.get("limit"), "1000");
+  });
+
+  test("omits filter params when none supplied", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: {} });
+
+    await knowledgeIndex({});
+
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.has("category"), false);
+    assert.equal(url.searchParams.has("tags"), false);
+    assert.equal(url.searchParams.has("offset"), false);
+    assert.equal(url.searchParams.has("limit"), false);
   });
 });

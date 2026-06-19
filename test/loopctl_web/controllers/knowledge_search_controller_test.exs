@@ -193,6 +193,30 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["error"]["message"] =~ "combined"
     end
 
+    test "unknown category returns 400 instead of silently enumerating everything", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub", category: "bogus"})
+
+      assert json_response(conn, 400)["error"]["message"] =~ "category"
+    end
+
+    test "a valid-but-non-category atom (e.g. published) returns 400, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", category: "published"})
+
+      assert json_response(conn, 400)["error"]["status"] == 400
+    end
+
     test "pagination with limit and offset", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -276,6 +300,198 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
 
       body = json_response(conn, 400)
       assert body["error"]["status"] == 400
+    end
+  end
+
+  describe "list mode enumeration (Issue #108)" do
+    test "tags filter without q enumerates the complete tagged set", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Articles whose bodies share no common keyword, so only a query-less
+      # enumeration can return all of them.
+      for i <- 1..3 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Hub #{i}",
+          body: "wholly distinct prose number #{i} zzz#{i}",
+          category: :reference,
+          status: :published,
+          tags: ["hub"]
+        })
+      end
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Not Tagged",
+        body: "unrelated",
+        category: :reference,
+        status: :published,
+        tags: ["other"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub", limit: "50"})
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["total_count"] == 3
+      assert length(body["data"]) == 3
+      titles = body["data"] |> Enum.map(& &1["title"]) |> Enum.sort()
+      assert titles == ["Hub 1", "Hub 2", "Hub 3"]
+
+      # List mode has no relevance ranking; score defaults to 0.0
+      assert Enum.all?(body["data"], &(&1["score"] == 0.0))
+    end
+
+    test "category filter without q enumerates the category", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Reference Doc",
+        body: "anything",
+        category: :reference,
+        status: :published
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "A Pattern",
+        body: "anything",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{category: "reference"})
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["total_count"] == 1
+      assert List.first(body["data"])["title"] == "Reference Doc"
+    end
+
+    test "offset pagination over a tag reaches every article exactly once", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      for i <- 1..5 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Hub #{i}",
+          body: "body #{i}",
+          category: :reference,
+          status: :published,
+          tags: ["hub"]
+        })
+      end
+
+      collect = fn offset ->
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub", limit: "2", offset: "#{offset}"})
+        |> json_response(200)
+      end
+
+      ids =
+        [0, 2, 4]
+        |> Enum.flat_map(fn off -> collect.(off)["data"] |> Enum.map(& &1["id"]) end)
+
+      assert length(ids) == 5
+      assert length(Enum.uniq(ids)) == 5
+    end
+
+    test "blank q with a filter falls into list mode (not a 400)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Hub Only",
+        body: "x",
+        category: :reference,
+        status: :published,
+        tags: ["hub"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "   ", tags: "hub"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+    end
+
+    test "tenant isolation holds in list mode", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant_a.id,
+        title: "A Hub",
+        body: "x",
+        category: :reference,
+        status: :published,
+        tags: ["hub"]
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant_b.id,
+        title: "B Hub",
+        body: "x",
+        category: :reference,
+        status: :published,
+        tags: ["hub"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key_a)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      assert List.first(body["data"])["title"] == "A Hub"
+    end
+
+    test "list mode only returns published articles", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Published Hub",
+        body: "x",
+        category: :reference,
+        status: :published,
+        tags: ["hub"]
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Draft Hub",
+        body: "x",
+        category: :reference,
+        status: :draft,
+        tags: ["hub"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "hub"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      assert List.first(body["data"])["title"] == "Published Hub"
     end
   end
 end

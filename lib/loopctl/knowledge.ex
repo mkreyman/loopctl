@@ -312,12 +312,16 @@ defmodule Loopctl.Knowledge do
   Returns a lightweight knowledge index of published articles.
 
   The index includes only metadata fields (no body, embedding, or metadata)
-  and groups results by category, sorted by `updated_at` descending within
-  each group.
+  and groups the current page of results by category. Within the full filtered
+  set, articles are ordered deterministically by `category` ascending,
+  `updated_at` descending, then `id` ascending — so `offset`/`limit`
+  pagination reaches every article without skipping or repeating.
 
-  Results are capped at 1000 articles. When the total exceeds 1000,
-  `meta.truncated` is set to `true` and `meta.total_count` reflects the
-  full count.
+  Unlike a relevance search, this endpoint honors `category`/`tags` filters
+  and real pagination. `meta.categories` reports the per-category counts over
+  the **entire** filtered set (not just the returned page) so callers can plan
+  pagination and discover categories that fall on later pages. `meta.truncated`
+  is `true` whenever more rows remain beyond the returned page.
 
   ## Parameters
 
@@ -325,6 +329,10 @@ defmodule Loopctl.Knowledge do
   - `opts` -- keyword list with:
     - `:project_id` -- when provided, includes both tenant-wide (nil project_id)
       and project-specific articles
+    - `:category` -- filter to a single category atom (optional)
+    - `:tags` -- filter to articles matching ANY of the given tags (optional)
+    - `:limit` -- max articles to return (default 1000, max 1000, min 1)
+    - `:offset` -- rows to skip for pagination (default 0)
     - `:story_id` -- accepted for caller ergonomics (US-25.1); index listings
       are intentionally not recorded as access events so the value is not
       persisted anywhere
@@ -340,53 +348,68 @@ defmodule Loopctl.Knowledge do
              meta: %{
                total_count: non_neg_integer(),
                categories: %{optional(String.t()) => non_neg_integer()},
+               offset: non_neg_integer(),
+               limit: pos_integer(),
                truncated: boolean()
              }
            }}
   def list_index(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
+    limit = opts |> Keyword.get(:limit, 1000) |> max(1) |> min(1000)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
-    query =
+    base =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
-        where: a.status == :published,
-        select: %{
-          id: a.id,
-          title: a.title,
-          category: a.category,
-          tags: a.tags,
-          status: a.status,
-          updated_at: a.updated_at
-        },
-        order_by: [asc: a.category, desc: a.updated_at]
+        where: a.status == :published
       )
 
-    query =
+    base =
       if project_id do
-        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
       else
-        query
+        base
       end
 
-    # Get total count via subquery
-    count_query = from(q in subquery(query), select: count())
-    total_count = AdminRepo.one(count_query)
+    base =
+      base
+      |> maybe_filter_by_category(Keyword.get(opts, :category))
+      |> maybe_filter_by_tags(Keyword.get(opts, :tags))
 
-    # Cap at 1000
+    total_count = AdminRepo.aggregate(base, :count, :id)
+
+    # Per-category counts over the ENTIRE filtered set (not just the page),
+    # so callers can see categories that live on later pages.
+    categories =
+      base
+      |> group_by([a], a.category)
+      |> select([a], {a.category, count(a.id)})
+      |> AdminRepo.all()
+      |> Map.new(fn {cat, n} -> {to_string(cat), n} end)
+
+    # Deterministic ordering so offset/limit reaches every article exactly once.
     results =
-      query
-      |> limit(1000)
+      base
+      |> select([a], %{
+        id: a.id,
+        title: a.title,
+        category: a.category,
+        tags: a.tags,
+        status: a.status,
+        updated_at: a.updated_at
+      })
+      |> order_by([a], asc: a.category, desc: a.updated_at, asc: a.id)
+      |> limit(^limit)
+      |> offset(^offset)
       |> AdminRepo.all()
 
-    truncated = total_count > 1000
+    truncated = total_count > offset + length(results)
 
-    # Group by category (convert enum atoms to strings for JSON)
+    # Group the current page by category (convert enum atoms to strings for JSON)
     grouped =
       Enum.group_by(results, fn article ->
         to_string(article.category)
       end)
-
-    categories = Map.new(grouped, fn {cat, arts} -> {cat, length(arts)} end)
 
     {:ok,
      %{
@@ -394,6 +417,8 @@ defmodule Loopctl.Knowledge do
        meta: %{
          total_count: total_count,
          categories: categories,
+         offset: offset,
+         limit: limit,
          truncated: truncated
        }
      }}
@@ -722,6 +747,66 @@ defmodule Loopctl.Knowledge do
         {:ok,
          %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
     end
+  end
+
+  @doc """
+  Lists articles matching `tags`/`category`/`project_id` filters **without** a
+  keyword-relevance query, so callers can enumerate the complete set of articles
+  carrying a tag or category.
+
+  This is the query-less companion to `search_keyword/3`: it returns the same
+  result shape (`%{results: [...], meta: %{total_count, limit, offset}}`) but
+  performs no `tsquery` matching, has no relevance score or snippet, and orders
+  deterministically by `updated_at` descending then `id` ascending so
+  `offset`/`limit` pagination reaches every matching article exactly once.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list with:
+    - `:project_id` -- filter by project UUID (optional)
+    - `:category` -- filter by category atom (optional)
+    - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
+    - `:status` -- filter by status atom (default: `:published`)
+    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:offset` -- results to skip for pagination (default 0)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}`
+  """
+  @spec list_filtered(Ecto.UUID.t(), keyword()) :: {:ok, %{results: [map()], meta: map()}}
+  def list_filtered(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    status = Keyword.get(opts, :status, :published)
+
+    base = from(a in Article, where: a.tenant_id == ^tenant_id)
+    filtered = apply_search_filters(base, status, opts)
+
+    total_count = AdminRepo.aggregate(filtered, :count, :id)
+
+    results =
+      filtered
+      |> select([a], %{
+        id: a.id,
+        tenant_id: a.tenant_id,
+        project_id: a.project_id,
+        title: a.title,
+        category: a.category,
+        status: a.status,
+        tags: a.tags,
+        inserted_at: a.inserted_at,
+        updated_at: a.updated_at
+      })
+      |> order_by([a], desc: a.updated_at, asc: a.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    maybe_record_search_access(tenant_id, results, "", opts, "list")
+
+    {:ok, %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
   end
 
   defp apply_search_filters(query, status, opts) do
