@@ -7,9 +7,6 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## 2.4.0 — 2026-06-18 (OKF interchange)
 
-> Follows 2.3.0 (knowledge enumeration & pagination). If you only see 2.2.0
-> below, this entry was authored on a branch cut before 2.3.0 merged.
-
 ### Added
 
 - `knowledge_okf_export` — export the wiki as a portable OKF (Open Knowledge
@@ -18,9 +15,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   returns it inline as `{files, meta}`. Requires `LOOPCTL_USER_KEY`.
 - `knowledge_okf_import` — import an OKF bundle from a local directory. Reserved
   files are skipped; each concept is created or (with `merge`, default true)
-  updated in place when it matches by `loopctl_id` or title. Unknown frontmatter
-  types/keys are tolerated and preserved. Returns a per-file report. Requires
-  `LOOPCTL_USER_KEY`.
+  updated in place when it matches an article we previously imported. Unknown
+  frontmatter types/keys are tolerated and preserved; all imports land as drafts.
+  Returns a per-file report. Requires `LOOPCTL_USER_KEY`.
 
 ### Rationale
 
@@ -29,6 +26,31 @@ git-shippable, GitHub-renderable, and interoperable with other agents/tools —
 as an interchange layer without changing loopctl's DB-backed internals. Both
 tools stay at `role: :user` because export is a bulk knowledge egress and import
 bulk-mutates curated articles.
+
+## 2.3.0 — 2026-06-18 (Knowledge enumeration & pagination)
+
+### Added
+
+- `knowledge_search` now accepts `offset` for pagination, and `q` is now
+  **optional** when `tags` and/or `category` are supplied. In that list mode the
+  server returns the complete filtered set (no relevance ranking) paginated via
+  `offset`/`limit` over `meta.total_count`, so an agent can enumerate every
+  article carrying a tag/category instead of unioning many keyword queries.
+  Fixes #108.
+- `knowledge_index` now accepts `category`, `tags`, `offset`, and `limit`.
+  Results are ordered deterministically so pagination reaches every article
+  (previously a fixed cap silently dropped whole categories), and
+  `meta.categories` reports per-category totals over the entire filtered set.
+  An unknown `category` is rejected with `400` rather than silently ignored.
+  Fixes #109.
+
+### Rationale
+
+There was no reliable way to enumerate all articles for a given tag/category:
+`knowledge_search` forced a keyword that was AND-ed with the filter and capped
+per query, and `knowledge_index` silently ignored `category`/`tags`/`offset`
+while truncating later categories. Both paths now support complete, paginated
+enumeration.
 
 ## 2.2.0 — 2026-04-22 (Wiki curation tools)
 
