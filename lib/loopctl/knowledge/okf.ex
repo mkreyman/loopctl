@@ -321,29 +321,41 @@ defmodule Loopctl.Knowledge.OKF do
 
   Reserved files (`index.md`, `log.md`) are skipped. Each remaining `.md` is
   parsed as a concept and created (or, with `merge: true`, updated in place when
-  an existing article matches by `loopctl_id` or title). After concepts are
-  upserted, the `relates_to` graph is reconstructed from each concept's marked
-  `# Related` section.
+  an existing article matches by `loopctl_id`, or by the same title **and**
+  category **and** project scope — never a merely same-titled but unrelated
+  article). After concepts are upserted, the `relates_to`/`derived_from` graph is
+  reconstructed from each concept's marked `# Related` section; `:supersedes`
+  edges are intentionally NOT reconstructed (they would retire a target article
+  as a side effect).
+
+  Status handling: a concept's status is restored only when the bundle carries a
+  `loopctl_id` producer key (a loopctl-origin bundle); foreign bundles always
+  import as `:draft`, so a forged `loopctl_status` can't auto-publish content.
 
   Per OKF's permissive-consumer rule the import never aborts on a non-conformant
   or unknown-`type` document; per-file outcomes are returned in the report.
+  Import is non-atomic (per-file); `report.partial?` is `true` if any file failed.
 
   ## Options
 
   - `:project_id` — assign imported articles to a project.
   - `:merge` (default `true`) — update existing articles instead of skipping them.
   - `:dry_run` (default `false`) — validate + plan only; write nothing.
+  - `:actor_id` / `:actor_label` / `:actor_type` — audit attribution for the
+    create/update/link writes.
 
   ## Returns
 
   `{:ok, report}` where report is a map with `:created`, `:updated`, `:skipped`,
-  `:links_created`, `:errors` (list of `%{path, reason}`), and `:conformance`.
+  `:links_created`, `:partial?`, `:errors` (list of `%{path, reason}`), and
+  `:conformance`.
   """
   @spec import_files(Ecto.UUID.t(), files(), keyword()) :: {:ok, map()}
   def import_files(tenant_id, files, opts \\ []) when is_map(files) do
     merge? = Keyword.get(opts, :merge, true)
     dry_run? = Keyword.get(opts, :dry_run, false)
     project_id = Keyword.get(opts, :project_id)
+    audit_opts = Keyword.take(opts, [:actor_id, :actor_label, :actor_type])
 
     conformance = validate_files(files)
 
@@ -360,8 +372,9 @@ defmodule Loopctl.Knowledge.OKF do
       errors: [],
       conformance: conformance,
       dry_run: dry_run?,
-      # internal: path -> article_id, for link reconstruction
-      path_index: %{}
+      # internal: path -> article_id (link reconstruction) and audit attribution
+      path_index: %{},
+      audit_opts: audit_opts
     }
 
     result =
@@ -376,7 +389,9 @@ defmodule Loopctl.Knowledge.OKF do
         reconstruct_links(tenant_id, concepts, result)
       end
 
-    {:ok, Map.delete(result, :path_index)}
+    # `partial?` tells callers some files failed without diffing counts.
+    report = Map.put(result, :partial?, result.errors != [])
+    {:ok, Map.drop(report, [:path_index, :audit_opts])}
   end
 
   @doc """
@@ -406,22 +421,20 @@ defmodule Loopctl.Knowledge.OKF do
     existing = find_existing(tenant_id, attrs)
 
     cond do
-      dry_run? ->
-        bump(acc, if(existing, do: :updated, else: :created))
-
-      existing && merge? ->
-        do_update(tenant_id, path, existing, attrs, acc)
-
-      existing ->
-        bump(acc, :skipped)
-
-      true ->
-        do_create(tenant_id, path, attrs, acc)
+      # Mirror the real create/update/skip decision so the preview is faithful.
+      dry_run? -> bump(acc, dry_run_outcome(existing, merge?))
+      existing && merge? -> do_update(tenant_id, path, existing, attrs, acc)
+      existing -> bump(acc, :skipped)
+      true -> do_create(tenant_id, path, attrs, acc)
     end
   end
 
+  defp dry_run_outcome(nil, _merge?), do: :created
+  defp dry_run_outcome(_existing, true), do: :updated
+  defp dry_run_outcome(_existing, false), do: :skipped
+
   defp do_create(tenant_id, path, attrs, acc) do
-    case Knowledge.create_article(tenant_id, attrs) do
+    case Knowledge.create_article(tenant_id, attrs, acc.audit_opts) do
       {:ok, article} ->
         acc |> bump(:created) |> index_path(path, article.id)
 
@@ -431,9 +444,9 @@ defmodule Loopctl.Knowledge.OKF do
   end
 
   defp do_update(tenant_id, path, existing, attrs, acc) do
-    update_attrs = Map.take(attrs, [:title, :body, :category, :tags, :metadata])
+    update_attrs = Map.take(attrs, [:title, :body, :category, :tags, :metadata, :status])
 
-    case Knowledge.update_article(tenant_id, existing.id, update_attrs) do
+    case Knowledge.update_article(tenant_id, existing.id, update_attrs, acc.audit_opts) do
       {:ok, article} ->
         acc |> bump(:updated) |> index_path(path, article.id)
 
@@ -442,40 +455,59 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
-  # Resolve an existing article by loopctl_id first, then by (active) title.
+  # Resolve the merge target. First the loopctl_id producer key (a same-tenant
+  # restore, where article.id == loopctl_id) or a prior import of this bundle
+  # (its stored metadata["okf"]["loopctl_id"]). Otherwise an active article with
+  # the SAME title AND category AND project scope — never a merely same-titled
+  # but unrelated article, so a foreign import can't silently clobber curated
+  # first-party knowledge.
   defp find_existing(tenant_id, attrs) do
-    by_id =
-      case get_in(attrs, [:metadata, "okf", "loopctl_id"]) do
-        id when is_binary(id) -> get_article(tenant_id, id)
-        _ -> nil
-      end
+    loopctl_id = get_in(attrs, [:metadata, "okf", "loopctl_id"])
 
-    by_id || get_active_article_by_title(tenant_id, attrs[:title])
+    find_by_loopctl_id(tenant_id, loopctl_id) ||
+      get_active_article(tenant_id, attrs[:title], attrs[:category], attrs[:project_id])
   end
 
-  defp get_article(tenant_id, id) do
+  defp find_by_loopctl_id(_tenant_id, id) when not is_binary(id), do: nil
+
+  defp find_by_loopctl_id(tenant_id, id) do
+    by_stored =
+      AdminRepo.one(
+        from(a in Article,
+          where:
+            a.tenant_id == ^tenant_id and
+              fragment("?->'okf'->>'loopctl_id' = ?", a.metadata, ^id),
+          order_by: [asc: a.inserted_at],
+          limit: 1
+        )
+      )
+
+    by_stored || by_id(tenant_id, id)
+  end
+
+  defp by_id(tenant_id, id) do
     case Ecto.UUID.cast(id) do
       {:ok, uuid} -> AdminRepo.get_by(Article, id: uuid, tenant_id: tenant_id)
       :error -> nil
     end
   end
 
-  defp get_active_article_by_title(_tenant_id, nil), do: nil
+  defp get_active_article(_tenant_id, nil, _category, _project_id), do: nil
 
-  # Match the partial unique index (tenant_id, title) WHERE status NOT IN
-  # ('archived', 'superseded'): that is exactly the row a create would collide
-  # with, so it is the right merge target.
-  defp get_active_article_by_title(tenant_id, title) do
-    AdminRepo.one(
-      from(a in Article,
-        where:
-          a.tenant_id == ^tenant_id and a.title == ^title and
-            a.status not in [:archived, :superseded],
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  defp get_active_article(tenant_id, title, category, project_id) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.title == ^title and a.category == ^category and
+          a.status not in [:archived, :superseded],
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> scope_project(project_id)
+    |> AdminRepo.one()
   end
+
+  defp scope_project(query, nil), do: where(query, [a], is_nil(a.project_id))
+  defp scope_project(query, project_id), do: where(query, [a], a.project_id == ^project_id)
 
   # Parse one concept file into create_article attrs.
   defp parse_concept(path, content) do
@@ -519,11 +551,16 @@ defmodule Loopctl.Knowledge.OKF do
   defp sanitize_tag(_), do: ""
 
   # loopctl-origin bundles restore their original status; foreign bundles import
-  # as drafts so unvetted external knowledge isn't auto-published.
+  # as drafts so unvetted external knowledge isn't auto-published. Status is only
+  # honored for bundles that carry the `loopctl_id` producer key — otherwise a
+  # forged `loopctl_status: published` in a foreign bundle could auto-publish
+  # unreviewed content.
   @import_statuses ~w(draft published archived superseded)
   defp status_for(fm) do
-    case Map.get(fm, "loopctl_status") do
-      s when s in @import_statuses -> String.to_existing_atom(s)
+    with true <- is_binary(Map.get(fm, "loopctl_id")),
+         s when s in @import_statuses <- Map.get(fm, "loopctl_status") do
+      String.to_existing_atom(s)
+    else
       _ -> :draft
     end
   end
@@ -585,6 +622,9 @@ defmodule Loopctl.Knowledge.OKF do
     |> maybe_put_string("description", Map.get(fm, "description"))
     |> maybe_put_string("resource", Map.get(fm, "resource"))
     |> maybe_put_string("timestamp", Map.get(fm, "timestamp"))
+    # Stash the source loopctl_id so a re-import resolves the same row by identity
+    # (it is NOT re-emitted on export, which always uses the live article.id).
+    |> maybe_put_string("loopctl_id", Map.get(fm, "loopctl_id"))
     |> maybe_put_original_tags(raw_tags, sanitized_tags)
     |> put_extra(extra)
   end
@@ -636,17 +676,23 @@ defmodule Loopctl.Knowledge.OKF do
     end)
   end
 
+  # Relationship types that are safe to reconstruct on import. `:supersedes`
+  # (and `:contradicts`) are deliberately excluded: re-creating a `:supersedes`
+  # edge would flip a curated target article to `:superseded` as a side effect
+  # (Knowledge.create_link -> maybe_supersede_target), an unadvertised
+  # destructive mutation. The relates_to/derived_from graph round-trips; lifecycle
+  # transitions do not.
+  @reconstructable_rel_types [:relates_to, :derived_from]
+
   defp create_related_links(tenant_id, source_id, related, index, acc) do
     Enum.reduce(related, acc, fn {target_path, rel_type}, acc ->
-      case Map.get(index, normalize_bundle_path(target_path)) do
-        nil ->
-          acc
+      target_id = Map.get(index, normalize_bundle_path(target_path))
 
-        target_id when target_id == source_id ->
-          acc
-
-        target_id ->
-          maybe_create_link(tenant_id, source_id, target_id, rel_type, acc)
+      cond do
+        rel_type not in @reconstructable_rel_types -> acc
+        is_nil(target_id) -> acc
+        target_id == source_id -> acc
+        true -> maybe_create_link(tenant_id, source_id, target_id, rel_type, acc)
       end
     end)
   end
@@ -664,7 +710,7 @@ defmodule Loopctl.Knowledge.OKF do
         relationship_type: rel_type
       }
 
-      case Knowledge.create_link(tenant_id, attrs) do
+      case Knowledge.create_link(tenant_id, attrs, Map.get(acc, :audit_opts, [])) do
         {:ok, _} -> bump(acc, :links_created)
         {:error, _} -> acc
       end
@@ -902,7 +948,15 @@ defmodule Loopctl.Knowledge.OKF do
       "`"
     ]) or
       str != String.trim(str) or
+      leading_indicator?(str) or
       looks_scalarish?(str)
+  end
+
+  # YAML block/flow indicators are only special in leading position; a bare value
+  # like "- see notes" or "...end" would re-parse incorrectly. Quote those too.
+  defp leading_indicator?(str) do
+    String.match?(str, ~r/^[-?:!&*\[\]{}#|>@`"'%,]/) or
+      String.starts_with?(str, ["- ", "? ", "---", "..."])
   end
 
   defp looks_scalarish?(str) do
@@ -937,18 +991,27 @@ defmodule Loopctl.Knowledge.OKF do
     |> Map.new()
   end
 
+  # Defense-in-depth caps so `import_zip/3` can't be used as a zip bomb.
+  @max_zip_entries 20_000
+  @max_zip_bytes 50 * 1024 * 1024
+
   defp unzip(zip_binary) do
     case :zip.extract(zip_binary, [:memory]) do
-      {:ok, entries} ->
-        files =
-          Map.new(entries, fn {name, content} ->
-            {to_string(name), content}
-          end)
+      {:ok, entries} -> collect_zip_entries(entries)
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-        {:ok, files}
+  defp collect_zip_entries(entries) when length(entries) > @max_zip_entries,
+    do: {:error, :too_many_entries}
 
-      {:error, reason} ->
-        {:error, reason}
+  defp collect_zip_entries(entries) do
+    total = Enum.reduce(entries, 0, fn {_name, content}, acc -> acc + byte_size(content) end)
+
+    if total > @max_zip_bytes do
+      {:error, :bundle_too_large}
+    else
+      {:ok, Map.new(entries, fn {name, content} -> {to_string(name), content} end)}
     end
   end
 

@@ -28,9 +28,10 @@ defmodule LoopctlWeb.OKFController do
 
   tags(["Knowledge Wiki"])
 
-  # Defensive cap so a hostile/huge import can't exhaust memory before the
+  # Defensive caps so a hostile/huge import can't exhaust memory before the
   # per-article work even starts.
   @max_import_files 10_000
+  @max_import_bytes 50 * 1024 * 1024
 
   operation(:export,
     summary: "Export knowledge as an OKF bundle",
@@ -123,10 +124,11 @@ defmodule LoopctlWeb.OKFController do
 
   @doc "POST /api/v1/knowledge/okf/import"
   def import(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
 
     with {:ok, files} <- fetch_files(params) do
-      {:ok, report} = OKF.import_files(tenant_id, files, import_opts(params))
+      opts = import_opts(params, api_key)
+      {:ok, report} = OKF.import_files(api_key.tenant_id, files, opts)
       json(conn, %{data: report})
     end
   end
@@ -167,6 +169,9 @@ defmodule LoopctlWeb.OKFController do
       not valid_files?(files) ->
         {:error, :bad_request, "`files` must map string paths to string contents"}
 
+      total_bytes(files) > @max_import_bytes ->
+        {:error, :bad_request, "`files` exceeds the 50 MiB total-size limit"}
+
       true ->
         {:ok, files}
     end
@@ -180,11 +185,17 @@ defmodule LoopctlWeb.OKFController do
     Enum.all?(files, fn {k, v} -> is_binary(k) and is_binary(v) end)
   end
 
-  defp import_opts(params) do
+  defp total_bytes(files) do
+    Enum.reduce(files, 0, fn {k, v}, acc -> acc + byte_size(k) + byte_size(v) end)
+  end
+
+  defp import_opts(params, api_key) do
     []
     |> put_if_present(:project_id, params["project_id"])
     |> Keyword.put(:merge, parse_bool(params["merge"], true))
     |> Keyword.put(:dry_run, parse_bool(params["dry_run"], false))
+    |> Keyword.put(:actor_id, api_key.id)
+    |> Keyword.put(:actor_label, "okf_import")
   end
 
   defp put_if_present(opts, _key, nil), do: opts

@@ -949,7 +949,10 @@ async function knowledgeOkfImport({ bundle_dir, project_id, merge, dry_run }) {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
       const abs = nodePath.join(dir, entry.name);
-      if (entry.isDirectory()) {
+      // Never traverse or read through symlinks (escape out of bundle_dir).
+      if (entry.isSymbolicLink()) {
+        continue;
+      } else if (entry.isDirectory()) {
         await walk(abs);
       } else if (entry.isFile() && entry.name.endsWith(".md")) {
         if (Object.keys(files).length >= MAX_FILES) {

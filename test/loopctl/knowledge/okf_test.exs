@@ -299,6 +299,69 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
+  describe "review hardening" do
+    test "a forged loopctl_status without loopctl_id imports as draft, not published" do
+      tenant = fixture(:tenant)
+
+      files = %{
+        "reference/forged.md" =>
+          "---\ntype: reference\ntitle: Forged Publish\nloopctl_status: published\n---\n\nbody\n"
+      }
+
+      assert {:ok, %{created: 1}} = OKF.import_files(tenant.id, files)
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :reference)
+      assert a.status == :draft
+    end
+
+    test "a supersedes Related link does not retire the target article on import" do
+      tenant = fixture(:tenant)
+
+      files = %{
+        "reference/a.md" =>
+          "---\ntype: reference\ntitle: Superseder\n---\n\nbody\n\n" <>
+            "# Related\n<!-- okf:related -->\n\n- [Victim](/reference/b.md) — supersedes\n",
+        "reference/b.md" => "---\ntype: reference\ntitle: Victim\n---\n\nbody\n"
+      }
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files)
+      assert report.created == 2
+      # supersedes is not reconstructed (no destructive lifecycle side effect)
+      assert report.links_created == 0
+
+      %{data: arts} = Knowledge.list_articles(tenant.id, category: :reference)
+      victim = Enum.find(arts, &(&1.title == "Victim"))
+      assert victim.status != :superseded
+    end
+
+    test "merge does not clobber a same-title article in a different category" do
+      tenant = fixture(:tenant)
+
+      keep =
+        published(tenant.id, %{title: "Shared Title", category: :pattern, body: "original body"})
+
+      files = %{
+        "reference/x.md" => "---\ntype: reference\ntitle: Shared Title\n---\n\nforeign body\n"
+      }
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files, merge: true)
+      # The reference concept can't merge onto the pattern article, and can't
+      # create (active-title unique index) — so it is reported, not silently applied.
+      assert report.created == 0
+
+      {:ok, reloaded} = Knowledge.get_article(tenant.id, keep.id)
+      assert reloaded.category == :pattern
+      assert reloaded.body == "original body"
+    end
+
+    test "encode_frontmatter quotes leading-indicator strings so they round-trip" do
+      fm = %{"type" => "reference", "title" => "X", "description" => "- starts with a dash"}
+      doc = "---\n#{OKF.encode_frontmatter(fm)}---\n\nbody\n"
+
+      assert {:ok, %{frontmatter: parsed}} = OKF.parse_frontmatter(doc)
+      assert parsed["description"] == "- starts with a dash"
+    end
+  end
+
   describe "validate_files/1" do
     test "flags a concept missing a type" do
       files = %{"x.md" => "---\ntitle: No Type\n---\n\nbody\n"}
