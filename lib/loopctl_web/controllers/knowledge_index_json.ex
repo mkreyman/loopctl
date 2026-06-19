@@ -16,6 +16,8 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
       meta: %{
         total_count: meta.total_count,
         categories: meta.categories,
+        offset: meta.offset,
+        limit: meta.limit,
         truncated: meta.truncated
       }
     }

@@ -579,26 +579,32 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
   const params = new URLSearchParams();
   if (story_id) params.set("story_id", story_id);
+  if (category) params.set("category", category);
+  if (tags) params.set("tags", tags);
+  if (offset != null) params.set("offset", String(offset));
+  if (limit != null) params.set("limit", String(limit));
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
 
-async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit }) {
-  const params = new URLSearchParams({ q });
+async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
+  const params = new URLSearchParams();
+  if (q != null && q !== "") params.set("q", q);
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
   if (tags) params.set("tags", tags);
   if (mode) params.set("mode", mode);
   if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
 
   const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
@@ -1560,8 +1566,10 @@ const TOOLS = [
   {
     name: "knowledge_index",
     description:
-      "Load the knowledge wiki catalog at session start. Returns article metadata grouped by category. " +
-      "Pass story_id when working on a loopctl story so reads attribute correctly.",
+      "Browse/paginate the knowledge wiki catalog. Returns article metadata grouped by category. " +
+      "Honors category/tags filters and offset/limit pagination with deterministic ordering, so " +
+      "every article is reachable (meta.categories reports per-category counts over the whole " +
+      "filtered set). Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1575,6 +1583,23 @@ const TOOLS = [
           format: "uuid",
           description: "Optional: loopctl story UUID for attribution tracking.",
         },
+        category: {
+          type: "string",
+          enum: ["pattern", "convention", "decision", "finding", "reference"],
+          description: "Optional: filter to a single category. Rejected (400) if unknown.",
+        },
+        tags: {
+          type: "string",
+          description: "Optional: comma-separated tags; matches articles carrying ANY of them.",
+        },
+        offset: {
+          type: "integer",
+          description: "Optional: rows to skip for pagination (default 0).",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: max articles per page (default 1000, max 1000).",
+        },
       },
       required: [],
     },
@@ -1583,13 +1608,17 @@ const TOOLS = [
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. " +
+      "q is optional when tags and/or category are supplied: in that list mode it returns the " +
+      "COMPLETE filtered set (no relevance ranking) paginated via offset/limit over " +
+      "meta.total_count, so you can enumerate every article carrying a tag/category. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
         q: {
           type: "string",
-          description: "Search query string.",
+          description:
+            "Search query string. Optional when tags/category are supplied (enumeration mode).",
         },
         project_id: {
           type: "string",
@@ -1618,8 +1647,12 @@ const TOOLS = [
           type: "integer",
           description: "Optional: maximum number of results to return.",
         },
+        offset: {
+          type: "integer",
+          description: "Optional: results to skip for pagination (default 0).",
+        },
       },
-      required: ["q"],
+      required: [],
     },
   },
   {

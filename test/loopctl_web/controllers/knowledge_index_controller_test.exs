@@ -243,6 +243,138 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
     end
   end
 
+  describe "filtering and pagination (Issue #109)" do
+    test "category filter returns only that category", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "A Reference",
+        category: :reference,
+        status: :published
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "A Convention",
+        category: :convention,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?category=reference")
+
+      body = json_response(conn, 200)
+
+      assert Map.keys(body["data"]) == ["reference"]
+      assert body["meta"]["total_count"] == 1
+      assert body["meta"]["categories"] == %{"reference" => 1}
+    end
+
+    test "tags filter matches articles carrying ANY listed tag", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Hub One",
+        category: :reference,
+        status: :published,
+        tags: ["hub", "elixir"]
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Not A Hub",
+        category: :reference,
+        status: :published,
+        tags: ["elixir"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?tags=hub")
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["total_count"] == 1
+      [article] = body["data"]["reference"]
+      assert article["title"] == "Hub One"
+    end
+
+    test "offset/limit paginate deterministically without dropping later categories", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # 2 articles per category across all 5 categories = 10 total.
+      categories = [:pattern, :convention, :decision, :finding, :reference]
+
+      for cat <- categories, i <- 1..2 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "#{cat}-#{i}",
+          category: cat,
+          status: :published
+        })
+      end
+
+      # Page through with limit=3 and collect every id; assert full coverage,
+      # including the alphabetically-last category (reference) which the old
+      # truncation-at-1000 behavior would have dropped.
+      collect_ids = fn offset ->
+        body =
+          conn
+          |> auth_conn(raw_key)
+          |> get(~p"/api/v1/knowledge/index?limit=3&offset=#{offset}")
+          |> json_response(200)
+
+        body
+      end
+
+      pages = Enum.map([0, 3, 6, 9], collect_ids)
+
+      all_ids =
+        pages
+        |> Enum.flat_map(fn body ->
+          body["data"] |> Map.values() |> List.flatten() |> Enum.map(& &1["id"])
+        end)
+
+      assert length(all_ids) == 10
+      assert length(Enum.uniq(all_ids)) == 10, "pagination must not repeat rows"
+
+      # categories meta reports the full distribution even on a partial page
+      first_page = hd(pages)
+      assert first_page["meta"]["total_count"] == 10
+      assert first_page["meta"]["offset"] == 0
+      assert first_page["meta"]["limit"] == 3
+      assert first_page["meta"]["truncated"] == true
+      assert first_page["meta"]["categories"]["reference"] == 2
+
+      # last page is not truncated
+      last_page = List.last(pages)
+      assert last_page["meta"]["truncated"] == false
+    end
+
+    test "invalid category returns 400 rather than silently ignoring it", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?category=bogus")
+
+      body = json_response(conn, 400)
+      assert body["error"]
+    end
+  end
+
   describe "correct grouping with many articles" do
     test "20 articles return correct grouping (no N+1)", %{conn: conn} do
       tenant = fixture(:tenant)

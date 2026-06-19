@@ -33,13 +33,18 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       "Unified search endpoint supporting keyword, semantic, and combined modes. " <>
         "Returns article metadata with scores and snippets (max 300 chars). " <>
         "No full body is returned. Combined mode is the default and falls back to " <>
-        "keyword-only if embedding generation fails. Role: agent+.",
+        "keyword-only if embedding generation fails. " <>
+        "`q` is optional when `tags` and/or `category` are supplied: in that " <>
+        "**list mode** the endpoint returns the complete filtered set (no relevance " <>
+        "ranking, score 0.0, no snippet) ordered by recency, fully reachable via " <>
+        "`offset`/`limit` pagination over `meta.total_count`. Role: agent+.",
     parameters: [
       q: [
         in: :query,
         type: :string,
-        description: "Search query (required, max 500 characters)",
-        required: true
+        description:
+          "Search query (max 500 characters). Optional when tags/category are supplied.",
+        required: false
       ],
       mode: [
         in: :query,
@@ -122,12 +127,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
 
-    with {:ok, q} <- validate_query(params),
+    with {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.put(base_opts, :api_key_id, api_key_id)
 
-      case execute_search(tenant_id, q, mode, opts) do
+      case execute_search(tenant_id, query_spec, mode, opts) do
         {:ok, result} ->
           json(conn, LoopctlWeb.KnowledgeSearchJSON.search(result, mode))
 
@@ -145,24 +150,38 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     end
   end
 
-  defp validate_query(%{"q" => q}) when is_binary(q) do
-    trimmed = String.trim(q)
+  # Resolves the query parameter into either a relevance search (`{:search, q}`)
+  # or a query-less enumeration (`:list`). `q` is optional only when a `tags`
+  # and/or `category` filter is supplied, otherwise it is required.
+  defp resolve_query(params) do
+    trimmed = params |> Map.get("q") |> trim_query()
 
     cond do
-      trimmed == "" ->
-        {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
-
-      String.length(trimmed) > 500 ->
+      trimmed != "" and String.length(trimmed) > 500 ->
         {:error, :bad_request, "Query parameter 'q' exceeds maximum length of 500 characters"}
 
+      trimmed != "" ->
+        {:ok, {:search, trimmed}}
+
+      filter_present?(params) ->
+        {:ok, :list}
+
       true ->
-        {:ok, trimmed}
+        {:error, :bad_request,
+         "Query parameter 'q' is required (or supply 'tags' and/or 'category' " <>
+           "to enumerate the full filtered set)"}
     end
   end
 
-  defp validate_query(_) do
-    {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
+  defp trim_query(q) when is_binary(q), do: String.trim(q)
+  defp trim_query(_), do: ""
+
+  defp filter_present?(params) do
+    present?(params["tags"]) or present?(params["category"])
   end
+
+  defp present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present?(_), do: false
 
   defp validate_mode(%{"mode" => mode}) when mode in @valid_modes, do: {:ok, mode}
 
@@ -240,18 +259,23 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   defp maybe_add_offset(opts, _), do: [{:offset, 0} | opts]
 
-  defp execute_search(tenant_id, q, "keyword", opts) do
+  # List mode: query-less enumeration of the filtered set, regardless of `mode`.
+  defp execute_search(tenant_id, :list, _mode, opts) do
+    Knowledge.list_filtered(tenant_id, opts)
+  end
+
+  defp execute_search(tenant_id, {:search, q}, "keyword", opts) do
     Knowledge.search_keyword(tenant_id, q, opts)
   end
 
-  defp execute_search(tenant_id, q, "semantic", opts) do
+  defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
     case Knowledge.generate_embedding(q) do
       {:ok, embedding} -> Knowledge.search_semantic(tenant_id, embedding, opts)
       {:error, _} -> {:error, :embedding_unavailable}
     end
   end
 
-  defp execute_search(tenant_id, q, "combined", opts) do
+  defp execute_search(tenant_id, {:search, q}, "combined", opts) do
     Knowledge.search_combined(tenant_id, q, opts)
   end
 end

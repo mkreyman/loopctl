@@ -416,4 +416,84 @@ defmodule Loopctl.KnowledgeSearchTest do
       assert result.title == "Architecture Guide"
     end
   end
+
+  describe "list_filtered/2 - query-less enumeration (Issue #108)" do
+    test "returns the full set for a tag regardless of keyword content" do
+      %{tenant: tenant} = setup_tenant()
+
+      for i <- 1..3 do
+        create_published_article(tenant.id, %{
+          title: "Hub #{i}",
+          body: "entirely unique prose #{i}",
+          category: :reference,
+          tags: ["hub"]
+        })
+      end
+
+      create_published_article(tenant.id, %{
+        title: "Other",
+        body: "x",
+        category: :reference,
+        tags: ["other"]
+      })
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.list_filtered(tenant.id, tags: ["hub"], limit: 50)
+
+      assert meta.total_count == 3
+      assert length(results) == 3
+      assert Enum.all?(results, &(&1.tags == ["hub"]))
+    end
+
+    test "filters by category and respects limit/offset for complete pagination" do
+      %{tenant: tenant} = setup_tenant()
+
+      for i <- 1..5 do
+        create_published_article(tenant.id, %{
+          title: "Ref #{i}",
+          body: "b#{i}",
+          category: :reference
+        })
+      end
+
+      assert {:ok, %{meta: %{total_count: 5}}} =
+               Knowledge.list_filtered(tenant.id, category: :reference, limit: 2, offset: 0)
+
+      ids =
+        [0, 2, 4]
+        |> Enum.flat_map(fn off ->
+          {:ok, %{results: r}} =
+            Knowledge.list_filtered(tenant.id, category: :reference, limit: 2, offset: off)
+
+          Enum.map(r, & &1.id)
+        end)
+
+      assert length(Enum.uniq(ids)) == 5
+    end
+
+    test "only published articles are returned" do
+      %{tenant: tenant} = setup_tenant()
+
+      create_published_article(tenant.id, %{title: "Pub", body: "x", tags: ["hub"]})
+      fixture(:article, %{tenant_id: tenant.id, title: "Draft", tags: ["hub"], status: :draft})
+
+      assert {:ok, %{meta: %{total_count: 1}, results: [only]}} =
+               Knowledge.list_filtered(tenant.id, tags: ["hub"])
+
+      assert only.title == "Pub"
+    end
+
+    test "tenant isolation — tenant A cannot enumerate tenant B's tagged articles" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      create_published_article(tenant_a.id, %{title: "A", body: "x", tags: ["hub"]})
+      create_published_article(tenant_b.id, %{title: "B", body: "x", tags: ["hub"]})
+
+      assert {:ok, %{meta: %{total_count: 1}, results: [only]}} =
+               Knowledge.list_filtered(tenant_a.id, tags: ["hub"])
+
+      assert only.title == "A"
+    end
+  end
 end
