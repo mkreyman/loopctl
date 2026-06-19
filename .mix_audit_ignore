@@ -1,0 +1,25 @@
+# mix_audit ignore list
+#
+# Advisory IDs listed here are excluded from `mix deps.audit` (wired into the
+# `precommit` alias via `--ignore-file`). Only advisories with NO usable fix
+# belong here — every advisory that has a compatible patched release must be
+# upgraded instead of ignored. Review this list whenever deps change.
+#
+# ---------------------------------------------------------------------------
+# GHSA-rhv4-8758-jx7v — Decimal: unbounded exponent in `Decimal.new` (DoS)
+#   Have: decimal 2.4.1. First patched version: 3.0.0.
+#   Cannot upgrade: ecto and postgrex both pin `decimal ~> 2.0`, so 3.0.0 is
+#   out of range until those libraries support decimal 3.x. loopctl only
+#   constructs Decimal values from its own numeric columns (e.g. token cost
+#   millicents), not from untrusted free-form strings, so exposure is low.
+#   Revisit when ecto relaxes its decimal constraint.
+GHSA-rhv4-8758-jx7v
+#
+# ---------------------------------------------------------------------------
+# GHSA-52mm-h59v-f3c7 — earmark: stored XSS via unescaped HTML attribute values
+#   Have: earmark 1.4.48. No patched version has been published upstream.
+#   earmark renders wiki article markdown to HTML in WikiShowLive. Content is
+#   authored by authenticated tenant agents/users (not anonymous input).
+#   Tracked separately for output sanitization hardening; no dependency fix is
+#   available to clear this advisory today.
+GHSA-52mm-h59v-f3c7
