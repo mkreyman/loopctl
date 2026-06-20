@@ -1763,7 +1763,9 @@ const TOOLS = [
       "Returns { total, by_category, by_status } via cheap COUNT(*) GROUP BY. This is the " +
       "right tool to answer \"how many articles are in this project?\" — knowledge_index " +
       "pages article metadata and knowledge_search's total_count is query-dependent. Counts " +
-      "span all statuses (draft/published/archived/superseded); see by_status for the split.",
+      "span all statuses (draft/published/archived/superseded); see by_status for the split. " +
+      "Note: `total` is NOT the same as knowledge_index's meta.total_count (which counts only " +
+      "published) — they differ whenever drafts/archived exist.",
     inputSchema: {
       type: "object",
       properties: {

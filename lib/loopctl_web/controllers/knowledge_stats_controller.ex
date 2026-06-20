@@ -64,14 +64,23 @@ defmodule LoopctlWeb.KnowledgeStatsController do
   def stats(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      case params["project_id"] do
-        nil -> []
-        "" -> []
-        project_id -> [project_id: project_id]
-      end
-
-    result = Knowledge.stats(tenant_id, opts)
+    result = Knowledge.stats(tenant_id, project_opts(params["project_id"]))
     json(conn, LoopctlWeb.KnowledgeStatsJSON.stats(result))
   end
+
+  # Best-effort project filter (mirrors KnowledgeAnalyticsController.put_project_id):
+  # a missing or malformed project_id yields tenant-wide counts rather than
+  # crashing on an Ecto.Query.CastError (a non-UUID path segment would otherwise
+  # 500). A valid-but-nonexistent project already yields tenant-wide counts, so
+  # this keeps malformed and nonexistent consistent.
+  defp project_opts(value) when value in [nil, ""], do: []
+
+  defp project_opts(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, project_id} -> [project_id: project_id]
+      :error -> []
+    end
+  end
+
+  defp project_opts(_), do: []
 end

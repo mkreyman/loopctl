@@ -171,7 +171,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     with {:ok, category} <- validate_category(params["category"]) do
       opts =
         []
-        |> maybe_put(:project_id, params["project_id"])
+        |> maybe_put(:project_id, parse_project_id(params["project_id"]))
         |> maybe_put(:category, category)
         |> maybe_put(:tags, parse_tags(params["tags"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
@@ -180,6 +180,21 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       {:ok, opts}
     end
   end
+
+  # Best-effort project filter: a malformed (non-UUID) project_id yields
+  # tenant-wide results rather than crashing on an Ecto.Query.CastError (a
+  # non-UUID path segment would otherwise 500). Consistent with a valid-but-
+  # nonexistent project, which already returns tenant-wide articles.
+  defp parse_project_id(value) when value in [nil, ""], do: nil
+
+  defp parse_project_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, project_id} -> project_id
+      :error -> nil
+    end
+  end
+
+  defp parse_project_id(_), do: nil
 
   defp validate_category(nil), do: {:ok, nil}
   defp validate_category(""), do: {:ok, nil}

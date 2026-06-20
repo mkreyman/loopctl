@@ -87,6 +87,22 @@ defmodule LoopctlWeb.KnowledgeStatsControllerTest do
       assert body["by_category"] == %{"pattern" => 1, "convention" => 1}
       assert body["by_status"] == %{"published" => 1, "draft" => 1}
     end
+
+    test "a malformed (non-UUID) project_id yields tenant-wide counts, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{tenant_id: tenant.id, category: :pattern, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/projects/not-a-uuid/knowledge/stats")
+
+      body = json_response(conn, 200)
+      assert body["total"] == 1
+      assert body["by_category"] == %{"pattern" => 1}
+    end
   end
 
   describe "tenant isolation" do

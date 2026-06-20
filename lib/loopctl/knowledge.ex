@@ -514,7 +514,9 @@ defmodule Loopctl.Knowledge do
   Cheap `COUNT(*) ... GROUP BY` aggregates — no article rows or metadata are
   loaded — so a caller can answer "how many articles are here?" without paging
   the index. Counts span ALL statuses (draft, published, archived, superseded);
-  the `by_status` breakdown makes the split explicit.
+  the `by_status` breakdown makes the split explicit. Consequently `total` is
+  NOT comparable to `list_index/2`'s `meta.total_count`, which counts only
+  published articles — the two differ whenever drafts/archived/superseded exist.
 
   ## Parameters
 
@@ -547,6 +549,11 @@ defmodule Loopctl.Knowledge do
 
     by_category = count_by(base, :category)
     by_status = count_by(base, :status)
+
+    # `status` is NOT NULL (Ecto.Enum, default :draft), so every row falls into
+    # exactly one by_status bucket — summing them equals COUNT(*) and avoids a
+    # third aggregate query. If status ever becomes nullable, switch `total` to
+    # an explicit `AdminRepo.aggregate(base, :count, :id)`.
     total = by_status |> Map.values() |> Enum.sum()
 
     %{total: total, by_category: by_category, by_status: by_status}

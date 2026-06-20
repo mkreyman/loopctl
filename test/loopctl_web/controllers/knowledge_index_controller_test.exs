@@ -245,6 +245,28 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
       [convention] = body["data"]["convention"]
       assert convention["title"] == "Project Convention"
     end
+
+    test "a malformed (non-UUID) project_id yields tenant-wide results, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Tenant Wide Pattern",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/projects/not-a-uuid/knowledge/index")
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      [pattern] = body["data"]["pattern"]
+      assert pattern["title"] == "Tenant Wide Pattern"
+    end
   end
 
   describe "tenant isolation" do
