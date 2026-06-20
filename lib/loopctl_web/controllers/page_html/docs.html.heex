@@ -812,7 +812,13 @@
                 <span class="text-accent-400">GET</span> /api/v1/knowledge/index
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Lightweight catalog of all published articles with titles, tags, and category metadata.
+                Lightweight catalog of published articles grouped by category, with <span class="font-mono text-slate-300">category</span>/<span class="font-mono text-slate-300">tags</span> filters and <span class="font-mono text-slate-300">offset</span>/<span class="font-mono text-slate-300">limit</span> pagination. Use
+                <span class="font-mono text-slate-300">fields</span>
+                to control the
+                projection (default <span class="font-mono text-slate-300">id,title,category</span>;
+                request <span class="font-mono text-slate-300">tags,status,updated_at</span>
+                explicitly)
+                to keep the payload small.
               </p>
             </div>
           </div>

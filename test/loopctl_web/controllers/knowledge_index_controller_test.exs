@@ -61,14 +61,15 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
       refute Map.has_key?(body["data"], "finding")
       refute Map.has_key?(body["data"], "decision")
 
-      # Verify article fields are lightweight (no body/embedding/metadata)
+      # Default projection is id, title, category only (Issue #117): tags,
+      # status, and updated_at are dropped unless requested via `fields`.
       [pattern_article] = body["data"]["pattern"]
       assert pattern_article["id"]
       assert pattern_article["title"] == "Pattern A"
       assert pattern_article["category"] == "pattern"
-      assert pattern_article["tags"] == ["elixir"]
-      assert pattern_article["status"] == "published"
-      assert pattern_article["updated_at"]
+      refute Map.has_key?(pattern_article, "tags")
+      refute Map.has_key?(pattern_article, "status")
+      refute Map.has_key?(pattern_article, "updated_at")
       refute Map.has_key?(pattern_article, "body")
       refute Map.has_key?(pattern_article, "embedding")
       refute Map.has_key?(pattern_article, "metadata")
@@ -99,6 +100,49 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
     test "unauthenticated returns 401", %{conn: conn} do
       conn = get(conn, ~p"/api/v1/knowledge/index")
       assert json_response(conn, 401)
+    end
+  end
+
+  describe "fields projection (Issue #117)" do
+    test "fields param adds requested fields and always includes id", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Pattern A",
+        category: :pattern,
+        status: :published,
+        tags: ["elixir", "ecto"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?fields=tags,updated_at")
+
+      body = json_response(conn, 200)
+      [article] = body["data"]["pattern"]
+
+      # id is always included even though it was not requested.
+      assert article["id"]
+      assert article["tags"] == ["elixir", "ecto"]
+      assert article["updated_at"]
+      refute Map.has_key?(article, "title")
+      refute Map.has_key?(article, "category")
+      refute Map.has_key?(article, "status")
+    end
+
+    test "invalid fields returns 400 rather than silently ignoring them", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?fields=title,bogus")
+
+      assert json_response(conn, 400)
     end
   end
 

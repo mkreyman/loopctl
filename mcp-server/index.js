@@ -579,7 +579,7 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit, fields }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
@@ -589,6 +589,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
   if (tags) params.set("tags", tags);
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
+  if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -1699,7 +1700,9 @@ const TOOLS = [
       "Browse/paginate the knowledge wiki catalog. Returns article metadata grouped by category. " +
       "Honors category/tags filters and offset/limit pagination with deterministic ordering, so " +
       "every article is reachable (meta.categories reports per-category counts over the whole " +
-      "filtered set). Pass story_id when working on a loopctl story so reads attribute correctly.",
+      "filtered set). Use `fields` to control the projection (default id,title,category; request " +
+      "tags/status/updated_at explicitly) to keep the payload small on large catalogs. " +
+      "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1729,6 +1732,15 @@ const TOOLS = [
         limit: {
           type: "integer",
           description: "Optional: max articles per page (default 1000, max 1000).",
+        },
+        fields: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["id", "title", "category", "tags", "status", "updated_at"],
+          },
+          description:
+            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included.",
         },
       },
       required: [],

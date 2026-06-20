@@ -7,7 +7,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
 
   Returns article metadata (no body) grouped by category. Honors `category`,
   `tags`, `offset`, and `limit` query params with deterministic pagination over
-  the full filtered set (up to 1000 articles per page).
+  the full filtered set (up to 1000 articles per page). A `fields` projection
+  (default `id,title,category`) keeps the payload small — request `tags`,
+  `status`, or `updated_at` explicitly when needed.
   """
 
   use LoopctlWeb, :controller
@@ -24,6 +26,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   tags(["Knowledge Wiki"])
 
   @valid_categories Ecto.Enum.values(Article, :category)
+  @valid_fields ~w(id title category tags status updated_at)
+  @default_fields ~w(id title category)
 
   operation(:index,
     summary: "Knowledge index",
@@ -34,7 +38,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         "tenant-wide and project-specific articles. Honors category/tags filters and " <>
         "offset/limit pagination (default limit 1000, max 1000) with deterministic " <>
         "ordering, so every article is reachable. `meta.categories` reports per-category " <>
-        "counts over the entire filtered set. Role: agent+.",
+        "counts over the entire filtered set. Use `fields` to control the projection " <>
+        "(default id,title,category; request tags/status/updated_at explicitly) to keep " <>
+        "the payload small. Role: agent+.",
     parameters: [
       project_id: [
         in: :path,
@@ -66,6 +72,14 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         in: :query,
         type: :integer,
         description: "Articles to skip for pagination (default 0)",
+        required: false
+      ],
+      fields: [
+        in: :query,
+        type: :string,
+        description:
+          "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
+            "Default id,title,category. `id` is always included. Returns 400 for unknown fields.",
         required: false
       ]
     ],
@@ -100,9 +114,36 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, opts} <- build_opts(params) do
+    with {:ok, fields} <- parse_fields(params["fields"]),
+         {:ok, opts} <- build_opts(params) do
       {:ok, result} = Knowledge.list_index(tenant_id, opts)
-      json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result))
+      json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
+    end
+  end
+
+  defp parse_fields(nil), do: {:ok, @default_fields}
+  defp parse_fields(""), do: {:ok, @default_fields}
+
+  defp parse_fields(str) when is_binary(str) do
+    requested =
+      str
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    invalid = requested -- @valid_fields
+
+    cond do
+      requested == [] ->
+        {:ok, @default_fields}
+
+      invalid != [] ->
+        {:error, :bad_request,
+         "Invalid fields: #{Enum.join(invalid, ", ")}. Valid fields: #{Enum.join(@valid_fields, ", ")}"}
+
+      true ->
+        # Always include id so every article in the response is identifiable.
+        {:ok, Enum.uniq(["id" | requested])}
     end
   end
 
