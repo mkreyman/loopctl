@@ -746,6 +746,10 @@
                 Unified search across knowledge articles. Supports
                 <span class="font-mono text-slate-300">mode=keyword|semantic|combined</span>
                 for full-text search, pgvector embeddings, or both.
+                <span class="font-mono text-slate-300">meta.total_count_scope</span>
+                says what <span class="font-mono text-slate-300">total_count</span>
+                counts for
+                the mode (it is not a corpus total — use list mode or <span class="font-mono text-slate-300">/knowledge/stats</span>).
               </p>
             </div>
             <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
@@ -830,6 +834,19 @@
                 <span class="font-mono text-slate-300">COUNT(*) GROUP BY</span>
                 — no article
                 metadata loaded. Answers "how many articles are here?" without paging the index.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/articles
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Create an article. Created as a
+                <span class="font-mono text-slate-300">draft</span>
+                (NOT visible in search/index/context) — the response
+                <span class="font-mono text-slate-300">note</span>
+                says so. Pass <span class="font-mono text-slate-300">publish: true</span>
+                to create-and-publish in one call (requires orchestrator role).
               </p>
             </div>
           </div>
