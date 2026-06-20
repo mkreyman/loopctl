@@ -114,7 +114,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    enum: ["keyword_matches", "ranked_corpus", "merged_candidates", "filtered_set"],
                    description: "What total_count counts for this mode"
                  },
-                 search_mode: %OpenApiSpex.Schema{type: :string},
+                 search_mode: %OpenApiSpex.Schema{
+                   type: :string,
+                   enum: ["keyword", "list", "semantic_only", "combined", "keyword_only"],
+                   description:
+                     "The mode that actually ran (keyword_only = combined degraded to keyword)"
+                 },
                  limit: %OpenApiSpex.Schema{type: :integer},
                  offset: %OpenApiSpex.Schema{type: :integer}
                }

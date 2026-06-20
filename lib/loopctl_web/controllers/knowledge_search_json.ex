@@ -44,7 +44,10 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   end
 
   defp extract_score(result, "combined") do
-    result[:final_score] || 0.0
+    # Normal combined results carry :final_score; when combined degrades to a
+    # keyword-only fallback the results carry :relevance_score instead, so fall
+    # back to it (then similarity) rather than reporting a misleading 0.0.
+    result[:final_score] || result[:relevance_score] || result[:similarity_score] || 0.0
   end
 
   defp maybe_add_snippet(base, result) do

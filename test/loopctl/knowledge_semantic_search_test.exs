@@ -401,6 +401,8 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       assert meta.fallback == true
       assert meta.search_mode == "keyword_only"
+      # The fallback ran keyword-only, so total_count is the keyword match count.
+      assert meta.total_count_scope == "keyword_matches"
 
       # Should still find via keyword match
       assert results != []

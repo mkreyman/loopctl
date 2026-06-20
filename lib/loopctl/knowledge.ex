@@ -909,6 +909,7 @@ defmodule Loopctl.Knowledge do
              total_count: total_count,
              limit: limit,
              offset: offset,
+             search_mode: "keyword",
              # Exact number of articles whose search_vector matches the
              # stop-word-filtered tsquery — not a corpus total.
              total_count_scope: "keyword_matches"
@@ -981,6 +982,7 @@ defmodule Loopctl.Knowledge do
          total_count: total_count,
          limit: limit,
          offset: offset,
+         search_mode: "list",
          # Complete count of the filtered set — safe to paginate over with
          # offset/limit to enumerate every matching article.
          total_count_scope: "filtered_set"

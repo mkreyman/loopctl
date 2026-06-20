@@ -1801,7 +1801,7 @@ const TOOLS = [
       "IMPORTANT: meta.total_count is mode-dependent — read meta.total_count_scope to know what " +
       "it counts: keyword_matches (stop-word-filtered tsquery matches; 'the' matches ~nothing), " +
       "ranked_corpus (semantic ranks ALL embedded articles — it's the corpus size, not a match " +
-      "count), merged_candidates (combined: deduped candidate pool, capped ~100), or filtered_set " +
+      "count), merged_candidates (combined: deduped candidate pool, capped at 50 per sub-search), or filtered_set " +
       "(list mode: the full set). Do NOT use a relevance-mode total_count to size the wiki — use " +
       "list mode or knowledge_stats. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly.",
