@@ -43,10 +43,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         "**`meta.total_count` is mode-dependent** — `meta.total_count_scope` says " <>
         "exactly what it counts: `keyword_matches` (articles matching the " <>
         "stop-word-filtered Postgres tsquery — a pure stop-word query like 'the' " <>
-        "matches almost nothing), `ranked_corpus` (semantic ranks ALL embedded " <>
-        "articles, so the count is the corpus size, not a match count), " <>
-        "`merged_candidates` (combined mode: size of the deduped keyword+semantic " <>
-        "candidate pool, capped at the 50-per-sub-search limit), or `filtered_set` " <>
+        "matches almost nothing), `ranked_corpus` (semantic ranks all EMBEDDED " <>
+        "published articles, so the count is the size of that embedded set — not a " <>
+        "match count, and <= the total published count), `merged_candidates` " <>
+        "(combined mode: the deduped UNION of a keyword and a semantic sub-search, " <>
+        "each capped at 50, so up to ~100), or `filtered_set` " <>
         "(list mode: the complete filtered set). Do NOT use a relevance-mode " <>
         "`total_count` to size the corpus — use list mode or `GET /knowledge/stats`. " <>
         "Role: agent+.",

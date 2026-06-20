@@ -11,8 +11,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - `knowledge_search` responses now include `meta.total_count_scope`, a
   self-describing label for what `meta.total_count` counts in the active mode
-  (`keyword_matches`, `ranked_corpus`, `merged_candidates`, or `filtered_set`),
-  plus `meta.search_mode`. The tool description documents the per-mode
+  (`keyword_matches`; `ranked_corpus` = embedded published set, ≤ published
+  count; `merged_candidates` = deduped union of two 50-capped sub-searches, up
+  to ~100; or `filtered_set`), plus `meta.search_mode`. The tool description
+  documents the per-mode
   semantics and stop-word behavior so callers stop misreading `total_count` as
   a corpus total (issue #119). For sizing the wiki, use list mode or
   `knowledge_stats`.

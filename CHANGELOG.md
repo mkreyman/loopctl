@@ -9,9 +9,11 @@ All notable changes to loopctl are documented here.
 - `GET /api/v1/knowledge/search` now returns `meta.total_count_scope` (and
   `meta.search_mode`) so callers can tell what `meta.total_count` counts in the
   active mode: `keyword_matches` (stop-word-filtered tsquery matches),
-  `ranked_corpus` (semantic ranks the whole embedded corpus — not a match
-  count), `merged_candidates` (combined: deduped candidate pool, capped at the
-  50-per-sub-search limit), or `filtered_set` (list mode: complete set). The
+  `ranked_corpus` (semantic ranks all embedded published articles — that
+  embedded set's size, not a match count, and ≤ the published count),
+  `merged_candidates` (combined: deduped union of a keyword and a semantic
+  sub-search, each capped at 50, so up to ~100), or `filtered_set` (list mode:
+  complete set). The
   OpenAPI description and MCP tool docs now spell out the per-mode semantics and
   stop-word behavior, and direct corpus-sizing to list mode or
   `GET /knowledge/stats` (#119). No value changed — `total_count` was already

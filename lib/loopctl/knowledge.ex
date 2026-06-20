@@ -2238,9 +2238,11 @@ defmodule Loopctl.Knowledge do
          limit: limit,
          offset: offset,
          search_mode: "semantic_only",
-         # All embedded candidate articles are ranked by similarity (no
-         # relevance cutoff), so total_count is the size of the ranked corpus,
-         # NOT a count of articles that "match" the query.
+         # Every EMBEDDED article passing the filters is ranked by similarity
+         # (no relevance cutoff), so total_count is the size of that embedded
+         # set — NOT a match count, and <= the total published count (articles
+         # without an embedding are excluded). Use knowledge_stats for the
+         # full wiki size.
          total_count_scope: "ranked_corpus"
        }
      }}
@@ -2410,9 +2412,9 @@ defmodule Loopctl.Knowledge do
          limit: paginated.limit,
          offset: paginated.offset,
          search_mode: "combined",
-         # Size of the deduplicated keyword+semantic candidate pool (each
-         # sub-search is capped at 50), NOT a corpus total or full match count.
-         # Use list mode or knowledge_stats to size the corpus.
+         # Size of the deduplicated UNION of a keyword and a semantic sub-search
+         # (each capped at 50, so up to ~100 with no overlap), NOT a corpus total
+         # or full match count. Use list mode or knowledge_stats to size the corpus.
          total_count_scope: "merged_candidates"
        }
      }}

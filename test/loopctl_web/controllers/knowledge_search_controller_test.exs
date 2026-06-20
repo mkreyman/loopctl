@@ -141,6 +141,24 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["error"]["message"] =~ "Embedding service unavailable"
     end
 
+    test "semantic mode labels total_count as ranked_corpus", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+        {:ok, [1.0 | List.duplicate(0.0, 1535)]}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", mode: "semantic"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["search_mode"] == "semantic_only"
+      assert body["meta"]["total_count_scope"] == "ranked_corpus"
+    end
+
     test "combined mode degrades to keyword-only when embedding fails, with real scores", %{
       conn: conn
     } do
