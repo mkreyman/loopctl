@@ -43,10 +43,11 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert is_binary(result["snippet"]) or is_nil(result["snippet"])
       refute Map.has_key?(result, "body")
 
-      # Meta is present
+      # Meta is present, and total_count is self-described as keyword matches.
       assert body["meta"]["total_count"] >= 1
       assert body["meta"]["limit"] == 10
       assert body["meta"]["offset"] == 0
+      assert body["meta"]["total_count_scope"] == "keyword_matches"
     end
 
     test "combined mode is default when mode param is omitted", %{conn: conn} do
@@ -72,6 +73,9 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       # Should succeed (combined is default)
       assert is_list(body["data"])
       assert is_map(body["meta"])
+      # Combined total_count is the merged candidate pool, labeled as such.
+      assert body["meta"]["total_count_scope"] == "merged_candidates"
+      assert body["meta"]["search_mode"] == "combined"
     end
 
     test "missing q returns 400", %{conn: conn} do
@@ -338,6 +342,8 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       body = json_response(conn, 200)
 
       assert body["meta"]["total_count"] == 3
+      # List mode total_count is the complete filtered set — labeled as such.
+      assert body["meta"]["total_count_scope"] == "filtered_set"
       assert length(body["data"]) == 3
       titles = body["data"] |> Enum.map(& &1["title"]) |> Enum.sort()
       assert titles == ["Hub 1", "Hub 2", "Hub 3"]

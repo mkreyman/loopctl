@@ -67,16 +67,24 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   defp truncate_snippet(_), do: nil
 
   defp render_meta(meta) do
-    base = %{
+    %{
       total_count: meta[:total_count] || meta.total_count,
       limit: meta[:limit] || meta.limit,
       offset: meta[:offset] || meta.offset
     }
-
-    # Include fallback flag when present (combined mode falling back to keyword)
-    case meta[:fallback] do
-      true -> Map.put(base, :fallback, true)
-      _ -> base
-    end
+    # `total_count_scope` documents what `total_count` actually counts for this
+    # mode (keyword_matches | ranked_corpus | merged_candidates | filtered_set),
+    # so callers don't mistake it for a corpus total. `search_mode` reflects the
+    # effective mode (e.g. keyword_only when combined fell back). `fallback` is
+    # surfaced only when combined mode degraded to keyword-only.
+    |> maybe_put(:total_count_scope, meta[:total_count_scope])
+    |> maybe_put(:search_mode, meta[:search_mode])
+    |> maybe_put_fallback(meta[:fallback])
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_fallback(map, true), do: Map.put(map, :fallback, true)
+  defp maybe_put_fallback(map, _), do: map
 end

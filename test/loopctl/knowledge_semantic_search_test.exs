@@ -93,6 +93,8 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert length(results) == 2
       assert meta.total_count == 2
       assert meta.search_mode == "semantic_only"
+      # total_count is the ranked embedded corpus, not a relevance-match count.
+      assert meta.total_count_scope == "ranked_corpus"
 
       # Close article should rank first
       [first, second] = results
