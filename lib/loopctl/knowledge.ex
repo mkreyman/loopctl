@@ -508,6 +508,59 @@ defmodule Loopctl.Knowledge do
      }}
   end
 
+  @doc """
+  Returns aggregate article counts for a tenant (optionally scoped to a project).
+
+  Cheap `COUNT(*) ... GROUP BY` aggregates — no article rows or metadata are
+  loaded — so a caller can answer "how many articles are here?" without paging
+  the index. Counts span ALL statuses (draft, published, archived, superseded);
+  the `by_status` breakdown makes the split explicit.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list with:
+    - `:project_id` -- when provided, counts both tenant-wide (nil project_id)
+      and project-specific articles (same visibility as `list_index/2`)
+
+  ## Returns
+
+  - `%{total: non_neg_integer(), by_category: %{String.t() => non_neg_integer()},
+      by_status: %{String.t() => non_neg_integer()}}`
+  """
+  @spec stats(Ecto.UUID.t(), keyword()) :: %{
+          total: non_neg_integer(),
+          by_category: %{optional(String.t()) => non_neg_integer()},
+          by_status: %{optional(String.t()) => non_neg_integer()}
+        }
+  def stats(tenant_id, opts \\ []) do
+    project_id = Keyword.get(opts, :project_id)
+
+    base = from(a in Article, where: a.tenant_id == ^tenant_id)
+
+    base =
+      if project_id do
+        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+      else
+        base
+      end
+
+    by_category = count_by(base, :category)
+    by_status = count_by(base, :status)
+    total = by_status |> Map.values() |> Enum.sum()
+
+    %{total: total, by_category: by_category, by_status: by_status}
+  end
+
+  # COUNT(*) GROUP BY <field>, returning a %{string_value => count} map.
+  defp count_by(base, field) do
+    base
+    |> group_by([a], field(a, ^field))
+    |> select([a], {field(a, ^field), count(a.id)})
+    |> AdminRepo.all()
+    |> Map.new(fn {value, n} -> {to_string(value), n} end)
+  end
+
   # --- Context Retrieval ---
 
   @doc """

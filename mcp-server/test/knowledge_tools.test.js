@@ -98,6 +98,14 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
   return toContent(result);
 }
 
+async function knowledgeStats({ project_id }) {
+  const path = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/stats`
+    : "/api/v1/knowledge/stats";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
 async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
   const params = new URLSearchParams();
   if (q != null && q !== "") params.set("q", q);
@@ -752,5 +760,32 @@ describe("Issue #117: knowledge_index fields projection", () => {
 
     const url = new URL(calls[0].url);
     assert.equal(url.searchParams.get("fields"), "id,updated_at");
+  });
+});
+
+describe("Issue #118: knowledge_stats", () => {
+  test("routes to the tenant-wide stats endpoint with the agent key", async () => {
+    setupEnv();
+    const calls = mockFetch({ total: 0, by_category: {}, by_status: {} });
+
+    await knowledgeStats({});
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, "/api/v1/knowledge/stats");
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+  });
+
+  test("routes to the project-scoped stats endpoint when project_id is given", async () => {
+    setupEnv();
+    const calls = mockFetch({ total: 0, by_category: {}, by_status: {} });
+
+    await knowledgeStats({ project_id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0" });
+
+    assert.equal(
+      new URL(calls[0].url).pathname,
+      "/api/v1/projects/b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0/knowledge/stats"
+    );
   });
 });

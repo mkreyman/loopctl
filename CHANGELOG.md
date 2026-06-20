@@ -2,6 +2,17 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-19 — knowledge stats endpoint (#118)
+
+### Added
+
+- `GET /api/v1/knowledge/stats` (and `GET /api/v1/projects/:project_id/knowledge/stats`)
+  — aggregate article counts (`total`, `by_category`, `by_status`) via cheap
+  `COUNT(*) GROUP BY` with no article metadata loaded. Answers "how many
+  articles are here?" without paging the index. Counts span all statuses;
+  `by_status` shows the published/draft/archived/superseded split. Role: agent+.
+  Exposed via the MCP `knowledge_stats` tool.
+
 ## [Unreleased] — 2026-06-19 — knowledge_index field projection (PR #126)
 
 ### Added

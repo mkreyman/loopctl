@@ -596,6 +596,14 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
   return toContent(result);
 }
 
+async function knowledgeStats({ project_id }) {
+  const path = project_id
+    ? `/api/v1/projects/${project_id}/knowledge/stats`
+    : "/api/v1/knowledge/stats";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
 async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
   const params = new URLSearchParams();
   if (q != null && q !== "") params.set("q", q);
@@ -1749,6 +1757,27 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_stats",
+    description:
+      "Get aggregate article counts for the wiki without pulling any article metadata. " +
+      "Returns { total, by_category, by_status } via cheap COUNT(*) GROUP BY. This is the " +
+      "right tool to answer \"how many articles are in this project?\" — knowledge_index " +
+      "pages article metadata and knowledge_search's total_count is query-dependent. Counts " +
+      "span all statuses (draft/published/archived/superseded); see by_status for the split.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description:
+            "Optional: scope counts to a project (counts both tenant-wide and project-specific articles).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. " +
@@ -2534,6 +2563,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Knowledge Wiki Tools
     case "knowledge_index":
       return await knowledgeIndex(args);
+
+    case "knowledge_stats":
+      return await knowledgeStats(args);
 
     case "knowledge_search":
       return await knowledgeSearch(args);

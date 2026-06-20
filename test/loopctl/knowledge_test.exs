@@ -769,4 +769,67 @@ defmodule Loopctl.KnowledgeTest do
       end)
     end
   end
+
+  describe "stats/2" do
+    test "aggregates total, by_category, and by_status across all statuses" do
+      tenant = fixture(:tenant)
+
+      fixture(:article, %{tenant_id: tenant.id, category: :pattern, status: :published})
+      fixture(:article, %{tenant_id: tenant.id, category: :pattern, status: :draft})
+      fixture(:article, %{tenant_id: tenant.id, category: :reference, status: :archived})
+
+      stats = Knowledge.stats(tenant.id)
+
+      assert stats.total == 3
+      assert stats.by_category == %{"pattern" => 2, "reference" => 1}
+      assert stats.by_status == %{"published" => 1, "draft" => 1, "archived" => 1}
+    end
+
+    test "returns zeros for a tenant with no articles" do
+      tenant = fixture(:tenant)
+      assert Knowledge.stats(tenant.id) == %{total: 0, by_category: %{}, by_status: %{}}
+    end
+
+    test "project scope counts tenant-wide + project articles, not other projects" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      other = fixture(:project, %{tenant_id: tenant.id})
+
+      fixture(:article, %{tenant_id: tenant.id, category: :pattern, status: :published})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        category: :convention,
+        status: :published
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: other.id,
+        category: :finding,
+        status: :published
+      })
+
+      stats = Knowledge.stats(tenant.id, project_id: project.id)
+
+      assert stats.total == 2
+      assert stats.by_category == %{"pattern" => 1, "convention" => 1}
+    end
+
+    test "tenant isolation: counts never include another tenant's articles" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      fixture(:article, %{tenant_id: tenant_a.id, category: :pattern, status: :published})
+      fixture(:article, %{tenant_id: tenant_b.id, category: :pattern, status: :published})
+      fixture(:article, %{tenant_id: tenant_b.id, category: :convention, status: :draft})
+
+      assert Knowledge.stats(tenant_a.id) == %{
+               total: 1,
+               by_category: %{"pattern" => 1},
+               by_status: %{"published" => 1}
+             }
+    end
+  end
 end
