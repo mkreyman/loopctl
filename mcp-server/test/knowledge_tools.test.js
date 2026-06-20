@@ -152,6 +152,22 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
+async function knowledgeCreate({ title, body, category, tags, project_id, publish }) {
+  const payload = { title, body };
+  if (category) payload.category = category;
+  if (tags) payload.tags = tags;
+  if (project_id) payload.project_id = project_id;
+
+  let key = process.env.LOOPCTL_AGENT_KEY;
+  if (publish) {
+    payload.publish = true;
+    key = process.env.LOOPCTL_ORCH_KEY;
+  }
+
+  const result = await apiCall("POST", "/api/v1/articles", payload, key);
+  return toContent(result);
+}
+
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
@@ -820,5 +836,32 @@ describe("Issue #118: knowledge_stats", () => {
 
     assert.equal(result.isError, true);
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("Issue #120: knowledge_create publish routing", () => {
+  test("a plain create uses the agent key and sends no publish flag", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { status: "draft" }, note: "draft" });
+
+    await knowledgeCreate({ title: "T", body: "B", category: "pattern" });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, "/api/v1/articles");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    assert.equal(JSON.parse(options.body).publish, undefined);
+  });
+
+  test("publish: true routes through the orchestrator key and sets publish in the payload", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { status: "published" } });
+
+    await knowledgeCreate({ title: "T", body: "B", category: "pattern", publish: true });
+
+    assert.equal(calls.length, 1);
+    const { options } = calls[0];
+    assert.equal(options.headers.Authorization, `Bearer ${ORCH_KEY}`);
+    assert.equal(JSON.parse(options.body).publish, true);
   });
 });

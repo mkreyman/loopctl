@@ -28,6 +28,86 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["data"]["tags"] == ["ecto", "transactions"]
       assert body["data"]["status"] == "draft"
       assert is_nil(body["data"]["project_id"])
+      # The draft outcome is made explicit so the two-step flow isn't missed (#120).
+      assert body["note"] =~ "draft"
+      assert body["note"] =~ "publish"
+    end
+
+    test "publish: true requires orchestrator role (agent gets 403)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Agent Tries To Publish",
+          "body" => "should not be allowed to publish",
+          "category" => "pattern",
+          "publish" => true
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "publish_requires_orchestrator"
+    end
+
+    test "orchestrator can create-and-publish in one call", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Published On Create",
+          "body" => "visible immediately",
+          "category" => "pattern",
+          "publish" => true
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "published"
+      assert body["note"] =~ "published"
+    end
+
+    test "an agent cannot self-publish via a status: published payload (gate, not bypass)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Sneaky Publish",
+          "body" => "trying to publish via status field",
+          "category" => "pattern",
+          "status" => "published"
+        })
+
+      # status:"published" is treated as a publish request and gated the same way.
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "publish_requires_orchestrator"
+    end
+
+    test "a caller-supplied non-publish status is ignored; article is created as draft", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Cannot Create Archived",
+          "body" => "archived is a workflow transition, not a create-time status",
+          "category" => "pattern",
+          "status" => "archived"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "draft"
     end
 
     test "returns 422 on invalid input", %{conn: conn} do

@@ -652,13 +652,23 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
-async function knowledgeCreate({ title, body, category, tags, project_id }) {
+async function knowledgeCreate({ title, body, category, tags, project_id, publish }) {
   const payload = { title, body };
   if (category) payload.category = category;
   if (tags) payload.tags = tags;
   if (project_id) payload.project_id = project_id;
 
-  const result = await apiCall("POST", "/api/v1/articles", payload, process.env.LOOPCTL_AGENT_KEY);
+  // Publishing on create requires orchestrator role, so route through the
+  // orchestrator key (mirrors knowledge_publish). A plain draft create uses
+  // the agent key. The server returns 403 if publish is requested without the
+  // role, so this just routes the request rather than escalating privilege.
+  let key = process.env.LOOPCTL_AGENT_KEY;
+  if (publish) {
+    payload.publish = true;
+    key = process.env.LOOPCTL_ORCH_KEY;
+  }
+
+  const result = await apiCall("POST", "/api/v1/articles", payload, key);
   return toContent(result);
 }
 
@@ -1916,7 +1926,12 @@ const TOOLS = [
     name: "knowledge_create",
     description:
       "Create a new knowledge article. Use to file findings, document patterns, or record decisions " +
-      "discovered during implementation. Concurrency-safe: if a create races/retries against an " +
+      "discovered during implementation. IMPORTANT: articles are created as a DRAFT and are NOT visible " +
+      "to agents (search/index/context) until published — the response `note` says so. Either publish " +
+      "later with knowledge_publish, or pass publish: true here to create-and-publish in one call " +
+      "(requires LOOPCTL_ORCH_KEY — orchestrator role; this tool routes a publish request through the " +
+      "orchestrator key, and the server returns 403 if that role is missing). " +
+      "Concurrency-safe: if a create races/retries against an " +
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
       "with a DIFFERENT body returns 409 title_conflict — do not retry; choose a different title or PATCH " +
@@ -1944,6 +1959,12 @@ const TOOLS = [
         project_id: {
           type: "string",
           description: "Optional: associate the article with a project UUID.",
+        },
+        publish: {
+          type: "boolean",
+          description:
+            "Optional: create AND publish in one call (default false → draft). Requires " +
+            "LOOPCTL_ORCH_KEY (orchestrator role); routed through the orchestrator key.",
         },
       },
       required: ["title", "body"],

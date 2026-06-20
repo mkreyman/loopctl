@@ -5,6 +5,23 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.7.0 — 2026-06-19 (knowledge_create publish-in-one-call)
+
+### Added
+
+- `knowledge_create` accepts `publish: true` to create-and-publish in one call.
+  A publish request is routed through `LOOPCTL_ORCH_KEY` (orchestrator role,
+  mirroring `knowledge_publish`); the server returns 403 if that role is
+  missing. Without it, articles are still created as **draft**.
+
+### Changed
+
+- The `knowledge_create` description now states up front that articles are
+  created as a draft and are NOT visible to agents until published, and the
+  underlying `POST /articles` response carries a `note` making the draft (or
+  published) outcome explicit (issue #120). The two-step draft→publish flow was
+  easy to miss, leaving articles silently invisible.
+
 ## 2.6.1 — 2026-06-19 (search total_count clarity)
 
 ### Changed
