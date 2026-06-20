@@ -26,7 +26,12 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
         categories: meta.categories,
         offset: meta.offset,
         limit: meta.limit,
-        truncated: meta.truncated
+        truncated: meta.truncated,
+        # `has_more` is a synonym for `truncated` (more rows beyond this page).
+        has_more: meta.truncated,
+        # Echo the applied projection so a consumer can tell a projected-out
+        # field from a genuinely absent value.
+        fields: fields
       }
     }
   end

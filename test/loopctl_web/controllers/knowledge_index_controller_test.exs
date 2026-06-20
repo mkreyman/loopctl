@@ -124,13 +124,19 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
       body = json_response(conn, 200)
       [article] = body["data"]["pattern"]
 
-      # id is always included even though it was not requested.
+      # id and category are always included even when not requested (category is
+      # the grouping key, so the object stays self-describing when flattened).
       assert article["id"]
+      assert article["category"] == "pattern"
       assert article["tags"] == ["elixir", "ecto"]
       assert article["updated_at"]
       refute Map.has_key?(article, "title")
-      refute Map.has_key?(article, "category")
       refute Map.has_key?(article, "status")
+
+      # meta echoes the applied projection and exposes has_more (alias of truncated).
+      assert body["meta"]["fields"] == ["id", "category", "tags", "updated_at"]
+      assert body["meta"]["has_more"] == false
+      assert body["meta"]["truncated"] == false
     end
 
     test "invalid fields returns 400 rather than silently ignoring them", %{conn: conn} do
@@ -141,6 +147,20 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/index?fields=title,bogus")
+
+      assert json_response(conn, 400)
+    end
+
+    test "a non-string fields param returns 400, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # ?fields[]=x parses to a list, which must be rejected cleanly (400),
+      # not raise a FunctionClauseError (500).
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/knowledge/index?fields[]=tags")
 
       assert json_response(conn, 400)
     end

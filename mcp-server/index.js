@@ -1697,11 +1697,13 @@ const TOOLS = [
   {
     name: "knowledge_index",
     description:
-      "Browse/paginate the knowledge wiki catalog. Returns article metadata grouped by category. " +
+      "Browse/paginate the knowledge wiki catalog. Returns LIGHTWEIGHT article metadata grouped by " +
+      "category — by default only id, title, category per article (NOT full metadata). " +
       "Honors category/tags filters and offset/limit pagination with deterministic ordering, so " +
       "every article is reachable (meta.categories reports per-category counts over the whole " +
-      "filtered set). Use `fields` to control the projection (default id,title,category; request " +
-      "tags/status/updated_at explicitly) to keep the payload small on large catalogs. " +
+      "filtered set; meta.has_more/meta.truncated signal more pages). Use `fields` to control the " +
+      "projection (request tags/status/updated_at explicitly; id and category are always included) " +
+      "to keep the payload small on large catalogs. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",

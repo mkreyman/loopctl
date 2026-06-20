@@ -26,10 +26,14 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   tags(["Knowledge Wiki"])
 
   @valid_categories Ecto.Enum.values(Article, :category)
-  # The projectable field set is mirrored in three other places that must stay
-  # in sync when a field is added/removed: the SELECT in `Knowledge.list_index/2`,
-  # `LoopctlWeb.KnowledgeIndexJSON.field_value/2`, and the MCP `knowledge_index`
-  # tool's `fields` enum (mcp-server/index.js).
+  # The projectable field set is duplicated in three other places that must stay
+  # in sync when a field is added/removed:
+  #   1. the SELECT in `Knowledge.list_index/2` — must remain a SUPERSET of this
+  #      list (it is fixed and projection-independent; the JSON view trims it),
+  #   2. `LoopctlWeb.KnowledgeIndexJSON.field_value/2` — one clause per field,
+  #   3. the MCP `knowledge_index` tool's `fields` enum in mcp-server/index.js —
+  #      a SEPARATELY-RELEASED npm package with no compile-time coupling here, so
+  #      an added field must be shipped to both.
   @valid_fields ~w(id title category tags status updated_at)
   @default_fields ~w(id title category)
 
@@ -84,7 +88,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         type: :string,
         description:
           "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
-            "Default id,title,category. `id` is always included. Returns 400 for unknown fields.",
+            "Default id,title,category. `id` and `category` are always included " <>
+            "(category is the grouping key). Returns 400 for unknown fields.",
         required: false
       ]
     ],
@@ -105,7 +110,12 @@ defmodule LoopctlWeb.KnowledgeIndexController do
                  categories: %OpenApiSpex.Schema{type: :object},
                  offset: %OpenApiSpex.Schema{type: :integer},
                  limit: %OpenApiSpex.Schema{type: :integer},
-                 truncated: %OpenApiSpex.Schema{type: :boolean}
+                 truncated: %OpenApiSpex.Schema{type: :boolean},
+                 has_more: %OpenApiSpex.Schema{type: :boolean},
+                 fields: %OpenApiSpex.Schema{
+                   type: :array,
+                   items: %OpenApiSpex.Schema{type: :string}
+                 }
                }
              }
            }
@@ -148,10 +158,14 @@ defmodule LoopctlWeb.KnowledgeIndexController do
          "Invalid fields: #{Enum.join(invalid, ", ")}. Valid fields: #{Enum.join(@valid_fields, ", ")}"}
 
       true ->
-        # Always include id so every article in the response is identifiable.
-        {:ok, Enum.uniq(["id" | requested])}
+        # Always include id (identity) and category (the grouping key, so each
+        # article object stays self-describing when `data` is flattened).
+        {:ok, Enum.uniq(["id", "category" | requested])}
     end
   end
+
+  # Non-string fields param (e.g. ?fields[]=x or ?fields[k]=v) → 400, not a 500.
+  defp parse_fields(_), do: {:error, :bad_request, "fields must be a comma-separated string"}
 
   defp build_opts(params) do
     with {:ok, category} <- validate_category(params["category"]) do
@@ -182,6 +196,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     ArgumentError -> invalid_category()
   end
 
+  # Non-string category param (e.g. ?category[]=x) → 400, not a 500.
+  defp validate_category(_), do: invalid_category()
+
   defp invalid_category do
     valid = @valid_categories |> Enum.map_join(", ", &to_string/1)
     {:error, :bad_request, "Invalid category. Valid categories: #{valid}"}
@@ -200,6 +217,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     if tags == [], do: nil, else: tags
   end
 
+  # Non-string tags param (e.g. ?tags[]=x) → treated as no tag filter, not a 500.
+  defp parse_tags(_), do: nil
+
   defp parse_int(nil), do: nil
 
   defp parse_int(value) when is_integer(value), do: value
@@ -210,6 +230,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       _ -> nil
     end
   end
+
+  # Non-scalar limit/offset param (e.g. ?limit[]=x) → ignored, not a 500.
+  defp parse_int(_), do: nil
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: [{key, value} | opts]

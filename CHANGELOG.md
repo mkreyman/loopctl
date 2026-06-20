@@ -8,9 +8,13 @@ All notable changes to loopctl are documented here.
 
 - `GET /api/v1/knowledge/index` accepts a `fields` query param — a
   comma-separated projection of `id, title, category, tags, status,
-  updated_at`. `id` is always included; unknown fields return `400` (matching
-  the existing `category` validation). The MCP `knowledge_index` tool gains a
-  matching `fields` parameter (array or csv).
+  updated_at`. `id` and `category` (the grouping key) are always included;
+  unknown fields return `400` (matching the existing `category` validation).
+  `meta` now echoes the applied `fields` and adds `has_more` (a synonym for the
+  existing `truncated`). The MCP `knowledge_index` tool gains a matching
+  `fields` parameter (array or csv). Non-string `fields`/`category`/`tags`/
+  `limit`/`offset` params now return `400`/are ignored rather than raising a
+  `500`.
 
 ### Changed
 
