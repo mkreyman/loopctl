@@ -43,10 +43,12 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert is_binary(result["snippet"]) or is_nil(result["snippet"])
       refute Map.has_key?(result, "body")
 
-      # Meta is present
+      # Meta is present, and total_count is self-described as keyword matches.
       assert body["meta"]["total_count"] >= 1
       assert body["meta"]["limit"] == 10
       assert body["meta"]["offset"] == 0
+      assert body["meta"]["total_count_scope"] == "keyword_matches"
+      assert body["meta"]["search_mode"] == "keyword"
     end
 
     test "combined mode is default when mode param is omitted", %{conn: conn} do
@@ -72,6 +74,9 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       # Should succeed (combined is default)
       assert is_list(body["data"])
       assert is_map(body["meta"])
+      # Combined total_count is the merged candidate pool, labeled as such.
+      assert body["meta"]["total_count_scope"] == "merged_candidates"
+      assert body["meta"]["search_mode"] == "combined"
     end
 
     test "missing q returns 400", %{conn: conn} do
@@ -134,6 +139,62 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       body = json_response(conn, 503)
       assert body["error"]["status"] == 503
       assert body["error"]["message"] =~ "Embedding service unavailable"
+    end
+
+    test "semantic mode labels total_count as ranked_corpus", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+        {:ok, [1.0 | List.duplicate(0.0, 1535)]}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", mode: "semantic"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["search_mode"] == "semantic_only"
+      assert body["meta"]["total_count_scope"] == "ranked_corpus"
+    end
+
+    test "combined mode degrades to keyword-only when embedding fails, with real scores", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      Loopctl.Knowledge.reset_circuit_breaker()
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Ecto Multi Pattern",
+        body: "Use Ecto.Multi for atomic multi-step database operations.",
+        category: :pattern,
+        status: :published,
+        tags: ["ecto"]
+      })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+        {:error, :service_unavailable}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "Ecto"})
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["search_mode"] == "keyword_only"
+      assert body["meta"]["total_count_scope"] == "keyword_matches"
+
+      # Fallback results carry the keyword relevance score, not a misleading 0.0.
+      result = List.first(body["data"])
+      assert result["title"] == "Ecto Multi Pattern"
+      assert result["score"] > 0
     end
 
     test "filters by project_id, category, and tags", %{conn: conn} do
@@ -338,6 +399,9 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       body = json_response(conn, 200)
 
       assert body["meta"]["total_count"] == 3
+      # List mode total_count is the complete filtered set — labeled as such.
+      assert body["meta"]["total_count_scope"] == "filtered_set"
+      assert body["meta"]["search_mode"] == "list"
       assert length(body["data"]) == 3
       titles = body["data"] |> Enum.map(& &1["title"]) |> Enum.sort()
       assert titles == ["Hub 1", "Hub 2", "Hub 3"]

@@ -903,7 +903,18 @@ defmodule Loopctl.Knowledge do
         maybe_record_search_access(tenant_id, results, query_string, opts, "keyword")
 
         {:ok,
-         %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
+         %{
+           results: results,
+           meta: %{
+             total_count: total_count,
+             limit: limit,
+             offset: offset,
+             search_mode: "keyword",
+             # Exact number of articles whose search_vector matches the
+             # stop-word-filtered tsquery — not a corpus total.
+             total_count_scope: "keyword_matches"
+           }
+         }}
     end
   end
 
@@ -964,7 +975,19 @@ defmodule Loopctl.Knowledge do
 
     maybe_record_search_access(tenant_id, results, "", opts, "list")
 
-    {:ok, %{results: results, meta: %{total_count: total_count, limit: limit, offset: offset}}}
+    {:ok,
+     %{
+       results: results,
+       meta: %{
+         total_count: total_count,
+         limit: limit,
+         offset: offset,
+         search_mode: "list",
+         # Complete count of the filtered set — safe to paginate over with
+         # offset/limit to enumerate every matching article.
+         total_count_scope: "filtered_set"
+       }
+     }}
   end
 
   defp apply_search_filters(query, status, opts) do
@@ -2214,7 +2237,13 @@ defmodule Loopctl.Knowledge do
          total_count: total_count,
          limit: limit,
          offset: offset,
-         search_mode: "semantic_only"
+         search_mode: "semantic_only",
+         # Every EMBEDDED article passing the filters is ranked by similarity
+         # (no relevance cutoff), so total_count is the size of that embedded
+         # set — NOT a match count, and <= the total published count (articles
+         # without an embedding are excluded). Use knowledge_stats for the
+         # full wiki size.
+         total_count_scope: "ranked_corpus"
        }
      }}
   end
@@ -2382,7 +2411,11 @@ defmodule Loopctl.Knowledge do
          total_count: length(sorted),
          limit: paginated.limit,
          offset: paginated.offset,
-         search_mode: "combined"
+         search_mode: "combined",
+         # Size of the deduplicated UNION of a keyword and a semantic sub-search
+         # (each capped at 50, so up to ~100 with no overlap), NOT a corpus total
+         # or full match count. Use list mode or knowledge_stats to size the corpus.
+         total_count_scope: "merged_candidates"
        }
      }}
   end

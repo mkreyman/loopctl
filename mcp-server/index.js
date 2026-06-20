@@ -1798,6 +1798,13 @@ const TOOLS = [
       "q is optional when tags and/or category are supplied: in that list mode it returns the " +
       "COMPLETE filtered set (no relevance ranking) paginated via offset/limit over " +
       "meta.total_count, so you can enumerate every article carrying a tag/category. " +
+      "IMPORTANT: meta.total_count is mode-dependent — read meta.total_count_scope to know what " +
+      "it counts: keyword_matches (stop-word-filtered tsquery matches; 'the' matches ~nothing), " +
+      "ranked_corpus (semantic ranks all EMBEDDED published articles — that embedded set's size, " +
+      "not a match count, and <= the published count), merged_candidates (combined: deduped UNION of " +
+      "a keyword and a semantic sub-search, each capped at 50, so up to ~100), or filtered_set " +
+      "(list mode: the full set). Do NOT use a relevance-mode total_count to size the wiki — use " +
+      "list mode or knowledge_stats. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly.",
     inputSchema: {
       type: "object",
