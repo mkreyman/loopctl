@@ -133,7 +133,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 | Tool | Description |
 |---|---|
-| `knowledge_index` | Browse/paginate the knowledge wiki catalog grouped by category. Honors `category`, `tags`, `offset`, `limit` with deterministic ordering so every article is reachable (`meta.categories` reports per-category totals over the whole filtered set). Optional: `project_id`, `story_id`. |
+| `knowledge_index` | Browse/paginate the knowledge wiki catalog grouped by category. Honors `category`, `tags`, `offset`, `limit` with deterministic ordering so every article is reachable (`meta.categories` reports per-category totals over the whole filtered set). Use `fields` (default `id,title,category`; request `tags`/`status`/`updated_at` explicitly; `id` and `category` are always included) to keep the payload small. Optional: `project_id`, `story_id`, `category`, `tags`, `offset`, `limit`, `fields`. |
 | `knowledge_search` | Search the knowledge wiki by topic (keyword, semantic, or combined). Returns snippets. `q` is optional when `tags`/`category` are supplied — that **list mode** returns the complete filtered set paginated via `offset`/`limit` over `meta.total_count`, so you can enumerate every article carrying a tag/category. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. Optional: `project_id`, `story_id` for attribution. |

@@ -7,7 +7,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
 
   Returns article metadata (no body) grouped by category. Honors `category`,
   `tags`, `offset`, and `limit` query params with deterministic pagination over
-  the full filtered set (up to 1000 articles per page).
+  the full filtered set (up to 1000 articles per page). A `fields` projection
+  (default `id,title,category`) keeps the payload small — request `tags`,
+  `status`, or `updated_at` explicitly when needed.
   """
 
   use LoopctlWeb, :controller
@@ -24,17 +26,30 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   tags(["Knowledge Wiki"])
 
   @valid_categories Ecto.Enum.values(Article, :category)
+  # The projectable field set is duplicated in three other places that must stay
+  # in sync when a field is added/removed:
+  #   1. the SELECT in `Knowledge.list_index/2` — must remain a SUPERSET of this
+  #      list (it is fixed and projection-independent; the JSON view trims it),
+  #   2. `LoopctlWeb.KnowledgeIndexJSON.field_value/2` — one clause per field,
+  #   3. the MCP `knowledge_index` tool's `fields` enum in mcp-server/index.js —
+  #      a SEPARATELY-RELEASED npm package with no compile-time coupling here, so
+  #      an added field must be shipped to both.
+  @valid_fields ~w(id title category tags status updated_at)
+  @default_fields ~w(id title category)
 
   operation(:index,
     summary: "Knowledge index",
     description:
       "Returns a lightweight catalog of published articles grouped by category. " <>
-        "Each article includes only id, title, category, tags, status, and updated_at. " <>
+        "Each article object includes only the projected fields (default " <>
+        "id, title, category — see `fields`). " <>
         "When called via GET /projects/:project_id/knowledge/index, includes both " <>
         "tenant-wide and project-specific articles. Honors category/tags filters and " <>
         "offset/limit pagination (default limit 1000, max 1000) with deterministic " <>
         "ordering, so every article is reachable. `meta.categories` reports per-category " <>
-        "counts over the entire filtered set. Role: agent+.",
+        "counts over the entire filtered set. Use `fields` to control the projection " <>
+        "(default id,title,category; request tags/status/updated_at explicitly) to keep " <>
+        "the payload small. Role: agent+.",
     parameters: [
       project_id: [
         in: :path,
@@ -67,6 +82,15 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         type: :integer,
         description: "Articles to skip for pagination (default 0)",
         required: false
+      ],
+      fields: [
+        in: :query,
+        type: :string,
+        description:
+          "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
+            "Default id,title,category. `id` and `category` are always included " <>
+            "(category is the grouping key). Returns 400 for unknown fields.",
+        required: false
       ]
     ],
     responses: %{
@@ -86,7 +110,12 @@ defmodule LoopctlWeb.KnowledgeIndexController do
                  categories: %OpenApiSpex.Schema{type: :object},
                  offset: %OpenApiSpex.Schema{type: :integer},
                  limit: %OpenApiSpex.Schema{type: :integer},
-                 truncated: %OpenApiSpex.Schema{type: :boolean}
+                 truncated: %OpenApiSpex.Schema{type: :boolean},
+                 has_more: %OpenApiSpex.Schema{type: :boolean},
+                 fields: %OpenApiSpex.Schema{
+                   type: :array,
+                   items: %OpenApiSpex.Schema{type: :string}
+                 }
                }
              }
            }
@@ -100,11 +129,43 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, opts} <- build_opts(params) do
+    with {:ok, fields} <- parse_fields(params["fields"]),
+         {:ok, opts} <- build_opts(params) do
       {:ok, result} = Knowledge.list_index(tenant_id, opts)
-      json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result))
+      json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
     end
   end
+
+  defp parse_fields(nil), do: {:ok, @default_fields}
+  defp parse_fields(""), do: {:ok, @default_fields}
+
+  defp parse_fields(str) when is_binary(str) do
+    requested =
+      str
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    invalid = Enum.reject(requested, &(&1 in @valid_fields))
+
+    cond do
+      requested == [] ->
+        {:ok, @default_fields}
+
+      invalid != [] ->
+        {:error, :bad_request,
+         "Invalid fields: #{Enum.join(invalid, ", ")}. Valid fields: #{Enum.join(@valid_fields, ", ")}"}
+
+      true ->
+        # Always include id (identity) and category (the grouping key, so each
+        # article object stays self-describing when `data` is flattened).
+        {:ok, Enum.uniq(["id", "category" | requested])}
+    end
+  end
+
+  # Non-string fields param (e.g. ?fields[]=x or ?fields[k]=v) → 400, not a 500.
+  defp parse_fields(_), do: {:error, :bad_request, "fields must be a comma-separated string"}
 
   defp build_opts(params) do
     with {:ok, category} <- validate_category(params["category"]) do
@@ -135,6 +196,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     ArgumentError -> invalid_category()
   end
 
+  # Non-string category param (e.g. ?category[]=x) → 400, not a 500.
+  defp validate_category(_), do: invalid_category()
+
   defp invalid_category do
     valid = @valid_categories |> Enum.map_join(", ", &to_string/1)
     {:error, :bad_request, "Invalid category. Valid categories: #{valid}"}
@@ -153,6 +217,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     if tags == [], do: nil, else: tags
   end
 
+  # Non-string tags param (e.g. ?tags[]=x) → treated as no tag filter, not a 500.
+  defp parse_tags(_), do: nil
+
   defp parse_int(nil), do: nil
 
   defp parse_int(value) when is_integer(value), do: value
@@ -163,6 +230,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       _ -> nil
     end
   end
+
+  # Non-scalar limit/offset param (e.g. ?limit[]=x) → ignored, not a 500.
+  defp parse_int(_), do: nil
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: [{key, value} | opts]

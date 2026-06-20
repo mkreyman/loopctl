@@ -61,14 +61,15 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
       refute Map.has_key?(body["data"], "finding")
       refute Map.has_key?(body["data"], "decision")
 
-      # Verify article fields are lightweight (no body/embedding/metadata)
+      # Default projection is id, title, category only (Issue #117): tags,
+      # status, and updated_at are dropped unless requested via `fields`.
       [pattern_article] = body["data"]["pattern"]
       assert pattern_article["id"]
       assert pattern_article["title"] == "Pattern A"
       assert pattern_article["category"] == "pattern"
-      assert pattern_article["tags"] == ["elixir"]
-      assert pattern_article["status"] == "published"
-      assert pattern_article["updated_at"]
+      refute Map.has_key?(pattern_article, "tags")
+      refute Map.has_key?(pattern_article, "status")
+      refute Map.has_key?(pattern_article, "updated_at")
       refute Map.has_key?(pattern_article, "body")
       refute Map.has_key?(pattern_article, "embedding")
       refute Map.has_key?(pattern_article, "metadata")
@@ -99,6 +100,95 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
     test "unauthenticated returns 401", %{conn: conn} do
       conn = get(conn, ~p"/api/v1/knowledge/index")
       assert json_response(conn, 401)
+    end
+  end
+
+  describe "fields projection (Issue #117)" do
+    test "fields param adds requested fields and always includes id", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Pattern A",
+        category: :pattern,
+        status: :published,
+        tags: ["elixir", "ecto"]
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?fields=tags,updated_at")
+
+      body = json_response(conn, 200)
+      [article] = body["data"]["pattern"]
+
+      # id and category are always included even when not requested (category is
+      # the grouping key, so the object stays self-describing when flattened).
+      assert article["id"]
+      assert article["category"] == "pattern"
+      assert article["tags"] == ["elixir", "ecto"]
+      assert article["updated_at"]
+      refute Map.has_key?(article, "title")
+      refute Map.has_key?(article, "status")
+
+      # meta echoes the applied projection and exposes has_more (alias of truncated).
+      assert body["meta"]["fields"] == ["id", "category", "tags", "updated_at"]
+      assert body["meta"]["has_more"] == false
+      assert body["meta"]["truncated"] == false
+    end
+
+    test "invalid fields returns 400 rather than silently ignoring them", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/index?fields=title,bogus")
+
+      assert json_response(conn, 400)
+    end
+
+    test "a non-string fields param returns 400, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # ?fields[]=x parses to a list, which must be rejected cleanly (400),
+      # not raise a FunctionClauseError (500).
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/knowledge/index?fields[]=tags")
+
+      assert json_response(conn, 400)
+    end
+
+    test "a repeated valid field is de-duplicated, not rejected as invalid", %{conn: _conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Pattern A",
+        category: :pattern,
+        status: :published,
+        tags: ["elixir"]
+      })
+
+      # `fields=id,id` / `fields=tags,tags` must succeed (200), not 400 — a
+      # repeated valid field is not an invalid field.
+      for query <- ["fields=id,id", "fields=tags,tags", "fields=id,title,title"] do
+        conn =
+          build_conn()
+          |> auth_conn(raw_key)
+          |> get(~p"/api/v1/knowledge/index?#{query}")
+
+        body = json_response(conn, 200)
+        [article] = body["data"]["pattern"]
+        assert article["id"]
+      end
     end
   end
 

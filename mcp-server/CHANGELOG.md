@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.5.0 — 2026-06-19 (knowledge_index field projection)
+
+### Added
+
+- `knowledge_index` now accepts a `fields` projection (default
+  `id,title,category`; request `tags`/`status`/`updated_at` explicitly; `id`
+  and `category` are always included). Previously the index always serialized
+  every metadata field — including the `tags` array — for up to 1,000 articles
+  per page, producing payloads large enough to overflow an MCP client's token
+  limit (issue #117). The default projection keeps the catalog small while
+  leaving the heavier fields available on request. `meta` echoes the applied
+  `fields` and adds `has_more` (a synonym for `truncated`).
+
 ## 2.4.1 — 2026-06-18 (Concurrency-safe article create)
 
 ### Changed

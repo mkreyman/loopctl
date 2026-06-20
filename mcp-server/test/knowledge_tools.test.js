@@ -81,7 +81,7 @@ function toContent(result) {
 // Handler implementations (mirror index.js exactly)
 // ---------------------------------------------------------------------------
 
-async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit, fields }) {
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
@@ -91,6 +91,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
   if (tags) params.set("tags", tags);
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
+  if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -728,5 +729,28 @@ describe("Issue #109: knowledge_index category/tags/offset/limit", () => {
     assert.equal(url.searchParams.has("tags"), false);
     assert.equal(url.searchParams.has("offset"), false);
     assert.equal(url.searchParams.has("limit"), false);
+    assert.equal(url.searchParams.has("fields"), false);
+  });
+});
+
+describe("Issue #117: knowledge_index fields projection", () => {
+  test("forwards fields as a comma-separated array", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: {} });
+
+    await knowledgeIndex({ fields: ["id", "title", "tags"] });
+
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.get("fields"), "id,title,tags");
+  });
+
+  test("accepts fields as a pre-joined string", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: {} });
+
+    await knowledgeIndex({ fields: "id,updated_at" });
+
+    const url = new URL(calls[0].url);
+    assert.equal(url.searchParams.get("fields"), "id,updated_at");
   });
 });
