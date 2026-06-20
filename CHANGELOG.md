@@ -2,6 +2,29 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-19 — create-and-publish + draft note (#120)
+
+### Added
+
+- `POST /api/v1/articles` accepts `publish: true` to create-and-publish in one
+  call. This is gated at **orchestrator+** (mirrors `POST /articles/:id/publish`);
+  an agent requesting publish gets `403 publish_requires_orchestrator`.
+
+### Changed
+
+- The create response now carries a `note` making the lifecycle explicit —
+  articles are created as **draft** (not visible in search/index/context) unless
+  published, which the two-step flow made easy to miss (#120).
+
+### Security
+
+- The initial article status is now set **server-side** on create; a
+  caller-supplied `status` is ignored except that `status: "published"` is
+  treated as `publish: true` (and gated the same way). This closes a gap where
+  an agent could self-publish — or set `archived`/`superseded` — by passing
+  `status` directly in the create payload, bypassing the orchestrator publish
+  gate.
+
 ## [Unreleased] — 2026-06-19 — search total_count semantics (#119)
 
 ### Changed

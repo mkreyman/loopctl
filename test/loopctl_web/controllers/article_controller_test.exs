@@ -28,6 +28,192 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["data"]["tags"] == ["ecto", "transactions"]
       assert body["data"]["status"] == "draft"
       assert is_nil(body["data"]["project_id"])
+      # The draft outcome is made explicit so the two-step flow isn't missed (#120).
+      assert body["note"] =~ "draft"
+      assert body["note"] =~ "publish"
+    end
+
+    test "publish: true requires orchestrator role (agent gets 403)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Agent Tries To Publish",
+          "body" => "should not be allowed to publish",
+          "category" => "pattern",
+          "publish" => true
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "publish_requires_orchestrator"
+    end
+
+    test "orchestrator can create-and-publish in one call", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Published On Create",
+          "body" => "visible immediately",
+          "category" => "pattern",
+          "publish" => true
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "published"
+      assert body["note"] =~ "published"
+    end
+
+    test "publish: true that dedups onto an existing draft says it was NOT published", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      payload = %{
+        "title" => "Dedup Draft",
+        "body" => "identical body content",
+        "category" => "pattern"
+      }
+
+      # Agent creates the draft.
+      conn |> auth_conn(agent_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      # Orchestrator asks to create-and-publish the same title+body → dedups onto
+      # the existing draft (a no-op), so it is NOT published.
+      resp =
+        build_conn()
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", Map.put(payload, "publish", true))
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["status"] == "draft"
+      assert resp["note"] =~ "NOT"
+      assert resp["note"] =~ "publish"
+    end
+
+    test "dedup onto an existing published article does not claim it was 'created' now", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      payload = %{
+        "title" => "Dedup Published",
+        "body" => "identical published body",
+        "category" => "pattern",
+        "publish" => true
+      }
+
+      # First call creates-and-publishes.
+      first =
+        conn |> auth_conn(orch_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      assert first["data"]["status"] == "published"
+
+      # Second identical call dedups onto the published article — a no-op.
+      resp =
+        build_conn()
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", payload)
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["status"] == "published"
+      assert resp["note"] =~ "already existed"
+      refute resp["note"] =~ "Created"
+    end
+
+    test "system scope is checked before the publish gate (agent gets system_scope_forbidden)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "System And Publish",
+          "body" => "agent attempting a system-scoped publish",
+          "category" => "pattern",
+          "scope" => "system",
+          "publish" => true
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "system_scope_forbidden"
+    end
+
+    test "publish: true with another tenant's project_id returns 422, not a publish", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      other_tenant = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other_tenant.id})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Cross Tenant Project Publish",
+          "body" => "project ownership is validated before any side effect",
+          "category" => "pattern",
+          "project_id" => other_project.id,
+          "publish" => true
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["details"]["project_id"] != nil
+    end
+
+    test "an agent cannot self-publish via a status: published payload (gate, not bypass)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Sneaky Publish",
+          "body" => "trying to publish via status field",
+          "category" => "pattern",
+          "status" => "published"
+        })
+
+      # status:"published" is treated as a publish request and gated the same way.
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "publish_requires_orchestrator"
+    end
+
+    test "a caller-supplied non-publish status is ignored; article is created as draft", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Cannot Create Archived",
+          "body" => "archived is a workflow transition, not a create-time status",
+          "category" => "pattern",
+          "status" => "archived"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "draft"
     end
 
     test "returns 422 on invalid input", %{conn: conn} do
