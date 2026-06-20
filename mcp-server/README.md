@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 47 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 55 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (47)
+## Tools (55)
 
 ### Project Tools
 
@@ -88,6 +88,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `get_story` | Get full details for a single story by ID. |
 | `create_story` | Create a single story inside an existing epic. Use instead of wrapping a story in a bulk import. Accepts either `epic_id` (UUID) or (`project_id` + `epic_number`). |
 | `backfill_story` | **Bypasses the review/verify chain.** Marks a story as verified when the work was completed outside loopctl (e.g. before the project was onboarded). Refused for any story with `assigned_agent_id` set — those must go through the normal report → review → verify flow, not backfill. Also refused for already `:verified` or `:rejected` stories. Records provenance (`reason`, `evidence_url`, `pr_number`) in `metadata.backfill` and emits a `story.backfilled` webhook. |
+| `get_acceptance_criteria` | List a story's acceptance criteria with each one's verification status. Required: `story_id`. |
 
 ### Workflow Tools (agent key)
 
@@ -172,6 +173,17 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | Tool | Description |
 |---|---|
 | `list_routes` | List all available API routes on the loopctl server. |
+| `get_system_articles` | List or fetch system-scoped (global, cross-tenant) wiki articles. Public — no auth required. Optional: `slug` (fetch one), `category`. |
+
+### Dispatch & Chain of Custody (v2) Tools
+
+Key distribution for the dispatch pattern (Epic 26): per-dispatch ephemeral keys and capability-token recovery. See `docs/chain-of-custody-v2.md`.
+
+| Tool | Description |
+|---|---|
+| `dispatch` | Mint an ephemeral, scoped api_key for a sub-agent dispatch, carrying its lineage path. The `raw_key` is returned ONCE — pass it to the sub-agent's launch args, never store it in env vars; it expires after `expires_in_seconds` (default 3600, max 14400). Required: `role` (`agent`/`orchestrator`), `agent_id`. Optional: `parent_dispatch_id`, `story_id`. |
+| `recover_cap` | Re-mint a capability token for a story you're assigned to, after a session crash lost your cap. Required: `story_id`. Optional: `cap_type` (`start_cap`/`report_cap`, default `start_cap`), `lineage`. |
+| `get_sth` | Get the latest Signed Tree Head for a tenant's tamper-evident audit chain. Public — no auth required. Required: `tenant_id`. |
 
 ## Wiki Attribution
 

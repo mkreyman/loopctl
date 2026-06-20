@@ -775,18 +775,24 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (33)
+### Available Tools (55)
+
+Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summary:
 
 | Tool | Description | API Key Used |
 |------|------------|-------------|
 | `get_tenant` | Verify connectivity (current tenant info) | orchestrator |
 | `list_projects` | List all projects | orchestrator |
 | `create_project` | Create a new project | orchestrator |
+| `delete_project` | Delete a project and all dependents (irreversible) | user |
 | `get_progress` | Project progress summary (supports `include_cost`) | orchestrator |
-| `import_stories` | Import epics and stories | orchestrator |
+| `import_stories` | Import epics and stories (supports `merge`) | orchestrator |
 | `list_stories` | List stories with filters (supports `include_token_totals`) | orchestrator |
 | `list_ready_stories` | Stories ready for work | orchestrator |
 | `get_story` | Get story details | orchestrator |
+| `create_story` | Create a single story in an existing epic | orchestrator |
+| `get_acceptance_criteria` | Story acceptance criteria with verification status | orchestrator |
+| `backfill_story` | Mark a story verified for work done outside loopctl | orchestrator |
 | `contract_story` | Contract a story | agent |
 | `claim_story` | Claim a story | agent |
 | `start_story` | Start implementation | agent |
@@ -802,16 +808,33 @@ Keys must be in the `env` block — the MCP server process does not inherit the 
 | `get_story_token_usage` | Token usage records for a story | orchestrator |
 | `get_cost_anomalies` | Cost anomaly alerts | orchestrator |
 | `set_token_budget` | Set token budget for a scope | orchestrator |
-| `knowledge_index` | Load knowledge wiki catalog | agent |
+| `knowledge_index` | Load knowledge wiki catalog (per-category, `fields` projection) | agent |
 | `knowledge_stats` | Aggregate article counts (total, by_category, by_status) | agent |
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query | agent |
-| `knowledge_create` | Create a knowledge article (draft by default; `publish: true` for create-and-publish, orchestrator role) | agent |
+| `knowledge_create` | Create an article (draft by default; `publish: true`, orchestrator) | agent |
 | `knowledge_publish` | Publish a draft article | orchestrator |
+| `knowledge_bulk_publish` | Atomically publish up to 100 drafts | user |
+| `knowledge_unpublish` | Revert a published article back to draft | user |
+| `knowledge_archive` | Soft-delete an article (retained for audit) | user |
+| `knowledge_delete` | Alias for archive (DELETE verb archives) | user |
 | `knowledge_drafts` | List draft (unpublished) articles | orchestrator |
 | `knowledge_lint` | Lint check for stale or low-coverage articles | orchestrator |
-| `knowledge_export` | Export all articles as ZIP archive | orchestrator |
+| `knowledge_export` | Export all articles as a ZIP archive | orchestrator |
+| `knowledge_okf_export` | Export the wiki as an OKF v0.1 bundle | user |
+| `knowledge_okf_import` | Import an OKF v0.1 bundle from a directory | user |
+| `knowledge_ingest` | Submit a URL/content for knowledge extraction | orchestrator |
+| `knowledge_ingest_batch` | Submit up to 50 ingestion items | orchestrator |
+| `knowledge_ingestion_jobs` | List recent ingestion jobs | orchestrator |
+| `knowledge_analytics_top` | Top accessed articles | orchestrator |
+| `knowledge_article_stats` | Per-article usage stats | orchestrator |
+| `knowledge_agent_usage` | Per-agent knowledge usage | orchestrator |
+| `knowledge_unused_articles` | Published articles with zero accesses | orchestrator |
+| `get_system_articles` | List/fetch system-scoped wiki articles (public) | none |
+| `dispatch` | Mint an ephemeral key for a sub-agent dispatch (Chain of Custody v2) | orchestrator |
+| `recover_cap` | Re-mint a capability token after a session crash | agent |
+| `get_sth` | Get the latest Signed Tree Head for the audit chain (public) | none |
 | `list_routes` | Discover all API endpoints | orchestrator |
 
 Agents call tools directly: `mcp__loopctl__get_tenant()`, `mcp__loopctl__list_projects()`, `mcp__loopctl__create_project({name: "MyApp", slug: "myapp"})`. No curl or bash needed.
