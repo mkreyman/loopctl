@@ -12,7 +12,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `knowledge_create` accepts `publish: true` to create-and-publish in one call.
   A publish request is routed through `LOOPCTL_ORCH_KEY` (orchestrator role,
   mirroring `knowledge_publish`); the server returns 403 if that role is
-  missing. Without it, articles are still created as **draft**.
+  missing. On an agent-only install (no `LOOPCTL_ORCH_KEY`/`LOOPCTL_API_KEY`) a
+  `publish: true` request returns a clear "requires orchestrator role" tool
+  error instead of a cryptic keyless failure. Without publish, articles are
+  still created as **draft**.
 
 ### Changed
 

@@ -664,6 +664,22 @@ async function knowledgeCreate({ title, body, category, tags, project_id, publis
   // role, so this just routes the request rather than escalating privilege.
   let key = process.env.LOOPCTL_AGENT_KEY;
   if (publish) {
+    // Surface the orchestrator-role requirement up front rather than letting the
+    // request go out keyless and return a cryptic "No API key configured" error
+    // (an agent-only install has no LOOPCTL_ORCH_KEY).
+    if (!process.env.LOOPCTL_ORCH_KEY && !process.env.LOOPCTL_API_KEY) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Publishing on create requires orchestrator role: set LOOPCTL_ORCH_KEY, or omit " +
+              "publish to create a draft and have an orchestrator publish it via knowledge_publish.",
+          },
+        ],
+        isError: true,
+      };
+    }
     payload.publish = true;
     key = process.env.LOOPCTL_ORCH_KEY;
   }

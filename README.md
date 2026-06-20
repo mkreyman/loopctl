@@ -803,10 +803,11 @@ Keys must be in the `env` block — the MCP server process does not inherit the 
 | `get_cost_anomalies` | Cost anomaly alerts | orchestrator |
 | `set_token_budget` | Set token budget for a scope | orchestrator |
 | `knowledge_index` | Load knowledge wiki catalog | agent |
+| `knowledge_stats` | Aggregate article counts (total, by_category, by_status) | agent |
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query | agent |
-| `knowledge_create` | Create a new knowledge article | agent |
+| `knowledge_create` | Create a knowledge article (draft by default; `publish: true` for create-and-publish, orchestrator role) | agent |
 | `knowledge_publish` | Publish a draft article | orchestrator |
 | `knowledge_drafts` | List draft (unpublished) articles | orchestrator |
 | `knowledge_lint` | Lint check for stale or low-coverage articles | orchestrator |

@@ -100,6 +100,82 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert resp["note"] =~ "publish"
     end
 
+    test "dedup onto an existing published article does not claim it was 'created' now", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      payload = %{
+        "title" => "Dedup Published",
+        "body" => "identical published body",
+        "category" => "pattern",
+        "publish" => true
+      }
+
+      # First call creates-and-publishes.
+      first =
+        conn |> auth_conn(orch_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      assert first["data"]["status"] == "published"
+
+      # Second identical call dedups onto the published article — a no-op.
+      resp =
+        build_conn()
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", payload)
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["status"] == "published"
+      assert resp["note"] =~ "already existed"
+      refute resp["note"] =~ "Created"
+    end
+
+    test "system scope is checked before the publish gate (agent gets system_scope_forbidden)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "System And Publish",
+          "body" => "agent attempting a system-scoped publish",
+          "category" => "pattern",
+          "scope" => "system",
+          "publish" => true
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "system_scope_forbidden"
+    end
+
+    test "publish: true with another tenant's project_id returns 422, not a publish", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      other_tenant = fixture(:tenant)
+      other_project = fixture(:project, %{tenant_id: other_tenant.id})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Cross Tenant Project Publish",
+          "body" => "project ownership is validated before any side effect",
+          "category" => "pattern",
+          "project_id" => other_project.id,
+          "publish" => true
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["details"]["project_id"] != nil
+    end
+
     test "an agent cannot self-publish via a status: published payload (gate, not bypass)",
          %{conn: conn} do
       tenant = fixture(:tenant)

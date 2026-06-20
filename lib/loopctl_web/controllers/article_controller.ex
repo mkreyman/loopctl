@@ -228,11 +228,13 @@ defmodule LoopctlWeb.ArticleController do
       # that only see a 2xx (e.g. the MCP layer) can still tell a dedup from a
       # real create.
       {:ok, :deduplicated, existing} ->
+        # The article already existed (identical title+body) — dedup is a pure
+        # no-op, so the note must NOT claim it was "created" or "published" now.
         response =
-          existing
-          |> create_response()
+          %{article: existing}
+          |> ArticleJSON.create()
           |> Map.put(:deduplicated, true)
-          |> maybe_dedup_publish_note(existing, publish?)
+          |> Map.put(:note, dedup_note(existing, publish?))
 
         conn
         |> put_status(:ok)
@@ -371,19 +373,26 @@ defmodule LoopctlWeb.ArticleController do
         "knowledge_publish, orchestrator role), or pass publish: true on create " <>
         "(orchestrator role) to create-and-publish in one call."
 
-  # A `publish: true` request can dedup onto a pre-existing DRAFT (dedup is a
-  # pure no-op, so it does NOT publish). Make that explicit so the caller knows
-  # the article they meant to publish is still invisible.
-  defp maybe_dedup_publish_note(response, %{status: :draft}, true) do
-    Map.put(
-      response,
-      :note,
+  # Note for the deduplicated (no-op) case. The article already existed and was
+  # returned unchanged, so nothing was created OR published in this call —
+  # spelled out per existing status (and whether publish was requested) so the
+  # caller isn't misled by a "Created…"/"published…" message.
+  defp dedup_note(%{status: :published}, _publish?),
+    do:
+      "An identical published article already existed and was returned unchanged (already visible to agents)."
+
+  defp dedup_note(%{status: :draft}, true),
+    do:
       "An identical draft already existed and was returned unchanged — it was NOT " <>
         "published. Publish it via POST /articles/:id/publish."
-    )
-  end
 
-  defp maybe_dedup_publish_note(response, _existing, _publish?), do: response
+  defp dedup_note(%{status: :draft}, _publish?),
+    do:
+      "An identical draft already existed and was returned unchanged. It is a draft " <>
+        "(NOT visible to agents); publish it via POST /articles/:id/publish."
+
+  defp dedup_note(_existing, _publish?),
+    do: "An identical article already existed and was returned unchanged."
 
   defp maybe_merge_project_id(attrs, nil), do: attrs
   defp maybe_merge_project_id(attrs, project_id), do: Map.put(attrs, "project_id", project_id)

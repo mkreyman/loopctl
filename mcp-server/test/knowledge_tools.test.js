@@ -160,6 +160,19 @@ async function knowledgeCreate({ title, body, category, tags, project_id, publis
 
   let key = process.env.LOOPCTL_AGENT_KEY;
   if (publish) {
+    if (!process.env.LOOPCTL_ORCH_KEY && !process.env.LOOPCTL_API_KEY) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Publishing on create requires orchestrator role: set LOOPCTL_ORCH_KEY, or omit " +
+              "publish to create a draft and have an orchestrator publish it via knowledge_publish.",
+          },
+        ],
+        isError: true,
+      };
+    }
     payload.publish = true;
     key = process.env.LOOPCTL_ORCH_KEY;
   }
@@ -863,5 +876,18 @@ describe("Issue #120: knowledge_create publish routing", () => {
     const { options } = calls[0];
     assert.equal(options.headers.Authorization, `Bearer ${ORCH_KEY}`);
     assert.equal(JSON.parse(options.body).publish, true);
+  });
+
+  test("publish: true on an agent-only install returns a helpful error, not a keyless request", async () => {
+    setupEnv();
+    delete process.env.LOOPCTL_ORCH_KEY;
+    delete process.env.LOOPCTL_API_KEY;
+    const calls = mockFetch({ data: {} });
+
+    const result = await knowledgeCreate({ title: "T", body: "B", publish: true });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /orchestrator role/);
+    assert.equal(calls.length, 0, "no HTTP request should be made without an orchestrator key");
   });
 });
