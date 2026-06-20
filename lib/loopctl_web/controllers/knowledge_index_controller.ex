@@ -26,6 +26,10 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   tags(["Knowledge Wiki"])
 
   @valid_categories Ecto.Enum.values(Article, :category)
+  # The projectable field set is mirrored in three other places that must stay
+  # in sync when a field is added/removed: the SELECT in `Knowledge.list_index/2`,
+  # `LoopctlWeb.KnowledgeIndexJSON.field_value/2`, and the MCP `knowledge_index`
+  # tool's `fields` enum (mcp-server/index.js).
   @valid_fields ~w(id title category tags status updated_at)
   @default_fields ~w(id title category)
 
@@ -33,7 +37,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
     summary: "Knowledge index",
     description:
       "Returns a lightweight catalog of published articles grouped by category. " <>
-        "Each article includes only id, title, category, tags, status, and updated_at. " <>
+        "Each article object includes only the projected fields (default " <>
+        "id, title, category — see `fields`). " <>
         "When called via GET /projects/:project_id/knowledge/index, includes both " <>
         "tenant-wide and project-specific articles. Honors category/tags filters and " <>
         "offset/limit pagination (default limit 1000, max 1000) with deterministic " <>
@@ -130,8 +135,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       |> String.split(",")
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
 
-    invalid = requested -- @valid_fields
+    invalid = Enum.reject(requested, &(&1 in @valid_fields))
 
     cond do
       requested == [] ->

@@ -2,6 +2,26 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-19 — knowledge_index field projection (PR #126)
+
+### Added
+
+- `GET /api/v1/knowledge/index` accepts a `fields` query param — a
+  comma-separated projection of `id, title, category, tags, status,
+  updated_at`. `id` is always included; unknown fields return `400` (matching
+  the existing `category` validation). The MCP `knowledge_index` tool gains a
+  matching `fields` parameter (array or csv).
+
+### Changed
+
+- **Default response shape changed** (intentional): without `fields`, each
+  article object now includes only `id, title, category` instead of all six
+  metadata fields. This shrinks the catalog payload dramatically — previously
+  the index serialized every field (including the full `tags` array) for up to
+  1000 articles per page, producing ~545 KB responses that overflowed MCP
+  clients' token limits (#117). Callers that need `tags`/`status`/`updated_at`
+  must now request them explicitly via `fields`.
+
 ## [Unreleased] — 2026-06-18 — Concurrent article create (PR #116)
 
 ### Changed

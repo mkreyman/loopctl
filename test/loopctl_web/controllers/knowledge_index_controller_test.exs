@@ -144,6 +144,32 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
 
       assert json_response(conn, 400)
     end
+
+    test "a repeated valid field is de-duplicated, not rejected as invalid", %{conn: _conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Pattern A",
+        category: :pattern,
+        status: :published,
+        tags: ["elixir"]
+      })
+
+      # `fields=id,id` / `fields=tags,tags` must succeed (200), not 400 — a
+      # repeated valid field is not an invalid field.
+      for query <- ["fields=id,id", "fields=tags,tags", "fields=id,title,title"] do
+        conn =
+          build_conn()
+          |> auth_conn(raw_key)
+          |> get(~p"/api/v1/knowledge/index?#{query}")
+
+        body = json_response(conn, 200)
+        [article] = body["data"]["pattern"]
+        assert article["id"]
+      end
+    end
   end
 
   describe "GET /api/v1/projects/:project_id/knowledge/index" do
