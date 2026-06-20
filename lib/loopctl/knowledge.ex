@@ -508,6 +508,80 @@ defmodule Loopctl.Knowledge do
      }}
   end
 
+  @doc """
+  Returns aggregate article counts for a tenant (optionally scoped to a project).
+
+  Cheap `COUNT(*) ... GROUP BY` aggregates — no article rows or metadata are
+  loaded — so a caller can answer "how many articles are here?" without paging
+  the index. Counts span ALL statuses (draft, published, archived, superseded);
+  the `by_status` breakdown makes the split explicit. Consequently `total` is
+  NOT comparable to the published-only counts elsewhere — `list_index/2`'s
+  `meta.total_count` and `search_keyword/3` list-mode `total_count` both count
+  published articles only, so they differ from `total` whenever
+  drafts/archived/superseded exist.
+
+  `by_category` and `by_status` are **dense**: every category/status is present,
+  with a count of 0 when no article matches (so callers never get `nil` for a
+  known key and need not enumerate the key universe themselves).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `opts` -- keyword list with:
+    - `:project_id` -- when provided, counts both tenant-wide (nil project_id)
+      and project-specific articles (same visibility as `list_index/2`)
+
+  ## Returns
+
+  - `%{total: non_neg_integer(), by_category: %{String.t() => non_neg_integer()},
+      by_status: %{String.t() => non_neg_integer()}}`
+  """
+  @spec stats(Ecto.UUID.t(), keyword()) :: %{
+          total: non_neg_integer(),
+          by_category: %{optional(String.t()) => non_neg_integer()},
+          by_status: %{optional(String.t()) => non_neg_integer()}
+        }
+  def stats(tenant_id, opts \\ []) do
+    project_id = Keyword.get(opts, :project_id)
+
+    base = from(a in Article, where: a.tenant_id == ^tenant_id)
+
+    base =
+      if project_id do
+        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+      else
+        base
+      end
+
+    # Zero-fill every category/status so the maps are dense: a caller can read
+    # `by_status["published"]` and get 0 (not nil) for a wiki with no published
+    # articles, and never has to know the key universe to interpret the result.
+    by_category = count_by(base, :category, Ecto.Enum.values(Article, :category))
+    by_status = count_by(base, :status, Ecto.Enum.values(Article, :status))
+
+    # `status` is NOT NULL (Ecto.Enum, default :draft), so every row falls into
+    # exactly one by_status bucket — summing them equals COUNT(*) and avoids a
+    # third aggregate query. If status ever becomes nullable, switch `total` to
+    # an explicit `AdminRepo.aggregate(base, :count, :id)`.
+    total = by_status |> Map.values() |> Enum.sum()
+
+    %{total: total, by_category: by_category, by_status: by_status}
+  end
+
+  # COUNT(*) GROUP BY <field>, returning a dense %{string_value => count} map
+  # with every value in `all_values` present (0 when no rows match).
+  defp count_by(base, field, all_values) do
+    counts =
+      base
+      |> group_by([a], field(a, ^field))
+      |> select([a], {field(a, ^field), count(a.id)})
+      |> AdminRepo.all()
+      |> Map.new(fn {value, n} -> {to_string(value), n} end)
+
+    zero_base = Map.new(all_values, fn value -> {to_string(value), 0} end)
+    Map.merge(zero_base, counts)
+  end
+
   # --- Context Retrieval ---
 
   @doc """

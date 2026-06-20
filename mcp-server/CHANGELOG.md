@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.6.0 — 2026-06-19 (knowledge_stats)
+
+### Added
+
+- `knowledge_stats` — aggregate article counts (`{ total, by_category,
+  by_status }`) via a cheap `COUNT(*) GROUP BY`, with no article metadata
+  loaded. This is the tool to answer "how many articles are in this project?":
+  `knowledge_index` pages article metadata (capped per request) and
+  `knowledge_search`'s `total_count` is query-dependent, so neither could give a
+  reliable project total (issue #118). Optional `project_id` scopes the counts.
+  Backed by `GET /api/v1/knowledge/stats` (and the project-scoped variant).
+
 ## 2.5.0 — 2026-06-19 (knowledge_index field projection)
 
 ### Added

@@ -295,6 +295,9 @@ defmodule LoopctlWeb.Router do
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index
 
+    # Knowledge Stats (aggregate counts by category/status)
+    get "/knowledge/stats", KnowledgeStatsController, :stats
+
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 
@@ -343,6 +346,7 @@ defmodule LoopctlWeb.Router do
     scope "/projects/:project_id" do
       resources "/articles", ArticleController, only: [:create, :index], as: :project_article
       get "/knowledge/index", KnowledgeIndexController, :index
+      get "/knowledge/stats", KnowledgeStatsController, :stats
       get "/knowledge/export", KnowledgeExportController, :export
       get "/knowledge/okf/export", OKFController, :export
       get "/knowledge/lint", KnowledgeLintController, :lint

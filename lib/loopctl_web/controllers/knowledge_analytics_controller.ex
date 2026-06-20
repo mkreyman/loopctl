@@ -292,7 +292,10 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   defp put_project_id(opts, nil), do: opts
   defp put_project_id(opts, ""), do: opts
 
-  defp put_project_id(opts, value) when is_binary(value) do
+  # Require the canonical 36-char dashed form. `Ecto.UUID.cast/1` also accepts a
+  # raw 16-byte binary, so a 16-char junk value would otherwise coerce into a
+  # bogus-but-valid UUID and silently narrow results instead of being ignored.
+  defp put_project_id(opts, value) when is_binary(value) and byte_size(value) == 36 do
     case Ecto.UUID.cast(value) do
       {:ok, cast_id} -> Keyword.put(opts, :project_id, cast_id)
       :error -> opts
