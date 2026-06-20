@@ -187,7 +187,11 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   # nonexistent project, which already returns tenant-wide articles.
   defp parse_project_id(value) when value in [nil, ""], do: nil
 
-  defp parse_project_id(value) when is_binary(value) do
+  # Require the canonical 36-char dashed form. `Ecto.UUID.cast/1` also accepts a
+  # raw 16-byte binary, so a 16-char junk segment would otherwise coerce into a
+  # bogus-but-valid UUID and silently narrow results instead of falling back to
+  # tenant-wide.
+  defp parse_project_id(value) when is_binary(value) and byte_size(value) == 36 do
     case Ecto.UUID.cast(value) do
       {:ok, project_id} -> project_id
       :error -> nil

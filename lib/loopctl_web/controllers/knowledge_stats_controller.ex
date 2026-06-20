@@ -75,7 +75,11 @@ defmodule LoopctlWeb.KnowledgeStatsController do
   # this keeps malformed and nonexistent consistent.
   defp project_opts(value) when value in [nil, ""], do: []
 
-  defp project_opts(value) when is_binary(value) do
+  # Require the canonical 36-char dashed form. `Ecto.UUID.cast/1` also accepts a
+  # raw 16-byte binary, so a 16-char junk segment would otherwise coerce into a
+  # bogus-but-valid UUID and silently narrow the counts instead of falling back
+  # to tenant-wide.
+  defp project_opts(value) when is_binary(value) and byte_size(value) == 36 do
     case Ecto.UUID.cast(value) do
       {:ok, project_id} -> [project_id: project_id]
       :error -> []

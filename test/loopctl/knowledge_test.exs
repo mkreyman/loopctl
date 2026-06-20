@@ -781,13 +781,43 @@ defmodule Loopctl.KnowledgeTest do
       stats = Knowledge.stats(tenant.id)
 
       assert stats.total == 3
-      assert stats.by_category == %{"pattern" => 2, "reference" => 1}
-      assert stats.by_status == %{"published" => 1, "draft" => 1, "archived" => 1}
+
+      # Dense maps: all 5 categories and all 4 statuses present, 0 when none.
+      assert stats.by_category == %{
+               "pattern" => 2,
+               "convention" => 0,
+               "decision" => 0,
+               "finding" => 0,
+               "reference" => 1
+             }
+
+      assert stats.by_status == %{
+               "draft" => 1,
+               "published" => 1,
+               "archived" => 1,
+               "superseded" => 0
+             }
     end
 
-    test "returns zeros for a tenant with no articles" do
+    test "returns dense zero-filled maps for a tenant with no articles" do
       tenant = fixture(:tenant)
-      assert Knowledge.stats(tenant.id) == %{total: 0, by_category: %{}, by_status: %{}}
+
+      assert Knowledge.stats(tenant.id) == %{
+               total: 0,
+               by_category: %{
+                 "pattern" => 0,
+                 "convention" => 0,
+                 "decision" => 0,
+                 "finding" => 0,
+                 "reference" => 0
+               },
+               by_status: %{
+                 "draft" => 0,
+                 "published" => 0,
+                 "archived" => 0,
+                 "superseded" => 0
+               }
+             }
     end
 
     test "project scope counts tenant-wide + project articles, not other projects" do
@@ -814,7 +844,10 @@ defmodule Loopctl.KnowledgeTest do
       stats = Knowledge.stats(tenant.id, project_id: project.id)
 
       assert stats.total == 2
-      assert stats.by_category == %{"pattern" => 1, "convention" => 1}
+      assert stats.by_category["pattern"] == 1
+      assert stats.by_category["convention"] == 1
+      # other project's :finding article is excluded
+      assert stats.by_category["finding"] == 0
     end
 
     test "tenant isolation: counts never include another tenant's articles" do
@@ -825,11 +858,12 @@ defmodule Loopctl.KnowledgeTest do
       fixture(:article, %{tenant_id: tenant_b.id, category: :pattern, status: :published})
       fixture(:article, %{tenant_id: tenant_b.id, category: :convention, status: :draft})
 
-      assert Knowledge.stats(tenant_a.id) == %{
-               total: 1,
-               by_category: %{"pattern" => 1},
-               by_status: %{"published" => 1}
-             }
+      stats = Knowledge.stats(tenant_a.id)
+      assert stats.total == 1
+      assert stats.by_category["pattern"] == 1
+      # tenant B's convention article must not leak in
+      assert stats.by_category["convention"] == 0
+      assert stats.by_status["published"] == 1
     end
   end
 end

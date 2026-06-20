@@ -82,6 +82,12 @@ function toContent(result) {
 // ---------------------------------------------------------------------------
 
 async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit, fields }) {
+  if (project_id && !UUID_RE.test(project_id)) {
+    return {
+      content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
@@ -99,6 +105,12 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
 }
 
 async function knowledgeStats({ project_id }) {
+  if (project_id && !UUID_RE.test(project_id)) {
+    return {
+      content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
   const path = project_id
     ? `/api/v1/projects/${project_id}/knowledge/stats`
     : "/api/v1/knowledge/stats";
@@ -787,5 +799,26 @@ describe("Issue #118: knowledge_stats", () => {
       new URL(calls[0].url).pathname,
       "/api/v1/projects/b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0/knowledge/stats"
     );
+  });
+
+  test("rejects a non-UUID project_id client-side without a network call", async () => {
+    setupEnv();
+    const calls = mockFetch({ total: 0 });
+
+    // A path-traversal-style value must never reach fetch().
+    const result = await knowledgeStats({ project_id: "../../admin" });
+
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0, "no HTTP request should be made");
+  });
+
+  test("knowledge_index also rejects a non-UUID project_id client-side", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: {}, meta: {} });
+
+    const result = await knowledgeIndex({ project_id: "not-a-uuid" });
+
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
   });
 });

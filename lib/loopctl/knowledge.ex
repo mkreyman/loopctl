@@ -515,8 +515,14 @@ defmodule Loopctl.Knowledge do
   loaded — so a caller can answer "how many articles are here?" without paging
   the index. Counts span ALL statuses (draft, published, archived, superseded);
   the `by_status` breakdown makes the split explicit. Consequently `total` is
-  NOT comparable to `list_index/2`'s `meta.total_count`, which counts only
-  published articles — the two differ whenever drafts/archived/superseded exist.
+  NOT comparable to the published-only counts elsewhere — `list_index/2`'s
+  `meta.total_count` and `search_keyword/3` list-mode `total_count` both count
+  published articles only, so they differ from `total` whenever
+  drafts/archived/superseded exist.
+
+  `by_category` and `by_status` are **dense**: every category/status is present,
+  with a count of 0 when no article matches (so callers never get `nil` for a
+  known key and need not enumerate the key universe themselves).
 
   ## Parameters
 
@@ -547,8 +553,11 @@ defmodule Loopctl.Knowledge do
         base
       end
 
-    by_category = count_by(base, :category)
-    by_status = count_by(base, :status)
+    # Zero-fill every category/status so the maps are dense: a caller can read
+    # `by_status["published"]` and get 0 (not nil) for a wiki with no published
+    # articles, and never has to know the key universe to interpret the result.
+    by_category = count_by(base, :category, Ecto.Enum.values(Article, :category))
+    by_status = count_by(base, :status, Ecto.Enum.values(Article, :status))
 
     # `status` is NOT NULL (Ecto.Enum, default :draft), so every row falls into
     # exactly one by_status bucket — summing them equals COUNT(*) and avoids a
@@ -559,13 +568,18 @@ defmodule Loopctl.Knowledge do
     %{total: total, by_category: by_category, by_status: by_status}
   end
 
-  # COUNT(*) GROUP BY <field>, returning a %{string_value => count} map.
-  defp count_by(base, field) do
-    base
-    |> group_by([a], field(a, ^field))
-    |> select([a], {field(a, ^field), count(a.id)})
-    |> AdminRepo.all()
-    |> Map.new(fn {value, n} -> {to_string(value), n} end)
+  # COUNT(*) GROUP BY <field>, returning a dense %{string_value => count} map
+  # with every value in `all_values` present (0 when no rows match).
+  defp count_by(base, field, all_values) do
+    counts =
+      base
+      |> group_by([a], field(a, ^field))
+      |> select([a], {field(a, ^field), count(a.id)})
+      |> AdminRepo.all()
+      |> Map.new(fn {value, n} -> {to_string(value), n} end)
+
+    zero_base = Map.new(all_values, fn value -> {to_string(value), 0} end)
+    Map.merge(zero_base, counts)
   end
 
   # --- Context Retrieval ---

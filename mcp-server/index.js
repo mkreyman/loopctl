@@ -580,6 +580,12 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 // --- Knowledge Wiki Tools (agent key) ---
 
 async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit, fields }) {
+  if (project_id && !UUID_RE.test(project_id)) {
+    return {
+      content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
   const basePath = project_id
     ? `/api/v1/projects/${project_id}/knowledge/index`
     : "/api/v1/knowledge/index";
@@ -597,6 +603,12 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
 }
 
 async function knowledgeStats({ project_id }) {
+  if (project_id && !UUID_RE.test(project_id)) {
+    return {
+      content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
   const path = project_id
     ? `/api/v1/projects/${project_id}/knowledge/stats`
     : "/api/v1/knowledge/stats";
