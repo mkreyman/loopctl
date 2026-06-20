@@ -212,11 +212,11 @@ defmodule LoopctlWeb.ArticleController do
           |> maybe_merge_project_id(params["project_id"])
           |> put_create_status(publish?)
 
-        create_article(conn, tenant_id, attrs, audit_opts)
+        create_article(conn, tenant_id, attrs, audit_opts, publish?)
     end
   end
 
-  defp create_article(conn, tenant_id, attrs, audit_opts) do
+  defp create_article(conn, tenant_id, attrs, audit_opts, publish?) do
     case Knowledge.create_article(tenant_id, attrs, audit_opts) do
       {:ok, article} ->
         conn
@@ -228,9 +228,15 @@ defmodule LoopctlWeb.ArticleController do
       # that only see a 2xx (e.g. the MCP layer) can still tell a dedup from a
       # real create.
       {:ok, :deduplicated, existing} ->
+        response =
+          existing
+          |> create_response()
+          |> Map.put(:deduplicated, true)
+          |> maybe_dedup_publish_note(existing, publish?)
+
         conn
         |> put_status(:ok)
-        |> json(Map.put(create_response(existing), :deduplicated, true))
+        |> json(response)
 
       {:error, :duplicate_title, existing} ->
         conn
@@ -364,6 +370,20 @@ defmodule LoopctlWeb.ArticleController do
         "search/index/context. Publish it via POST /articles/:id/publish (MCP " <>
         "knowledge_publish, orchestrator role), or pass publish: true on create " <>
         "(orchestrator role) to create-and-publish in one call."
+
+  # A `publish: true` request can dedup onto a pre-existing DRAFT (dedup is a
+  # pure no-op, so it does NOT publish). Make that explicit so the caller knows
+  # the article they meant to publish is still invisible.
+  defp maybe_dedup_publish_note(response, %{status: :draft}, true) do
+    Map.put(
+      response,
+      :note,
+      "An identical draft already existed and was returned unchanged — it was NOT " <>
+        "published. Publish it via POST /articles/:id/publish."
+    )
+  end
+
+  defp maybe_dedup_publish_note(response, _existing, _publish?), do: response
 
   defp maybe_merge_project_id(attrs, nil), do: attrs
   defp maybe_merge_project_id(attrs, project_id), do: Map.put(attrs, "project_id", project_id)

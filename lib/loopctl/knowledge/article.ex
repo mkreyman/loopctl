@@ -79,6 +79,14 @@ defmodule Loopctl.Knowledge.Article do
 
   `tenant_id` is set programmatically and must not appear in attrs.
   Defaults `status` to `:draft` if not provided.
+
+  NOTE: `:status` is castable here and is **trusted from `attrs`** — this
+  changeset does NOT enforce who may create a `:published` (or
+  `:archived`/`:superseded`) article. Publish authorization is the caller's
+  responsibility: `LoopctlWeb.ArticleController.create/2` gates it at
+  orchestrator+ and sets the status server-side, and `Loopctl.Knowledge.OKF`
+  forces `:draft`. A future caller of `create_article/3` MUST likewise sanitize
+  `:status` (or gate the role) rather than pass an unvalidated caller value.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(article \\ %__MODULE__{}, attrs) do

@@ -70,6 +70,36 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["note"] =~ "published"
     end
 
+    test "publish: true that dedups onto an existing draft says it was NOT published", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      payload = %{
+        "title" => "Dedup Draft",
+        "body" => "identical body content",
+        "category" => "pattern"
+      }
+
+      # Agent creates the draft.
+      conn |> auth_conn(agent_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      # Orchestrator asks to create-and-publish the same title+body → dedups onto
+      # the existing draft (a no-op), so it is NOT published.
+      resp =
+        build_conn()
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/articles", Map.put(payload, "publish", true))
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["status"] == "draft"
+      assert resp["note"] =~ "NOT"
+      assert resp["note"] =~ "publish"
+    end
+
     test "an agent cannot self-publish via a status: published payload (gate, not bypass)",
          %{conn: conn} do
       tenant = fixture(:tenant)
