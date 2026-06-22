@@ -110,6 +110,10 @@ defmodule LoopctlWeb.ArticleController do
     description:
       "Lists articles with optional filters and pagination. " <>
         "When called via GET /projects/:project_id/articles, project_id is set from path. " <>
+        "Unlike search (which ranks and returns **published** articles only and lags writes " <>
+        "while embeddings index), this is the **lag-free, all-status** read of the DB of " <>
+        "record — use it for dedup/idempotency/repair (\"does an article with this tag/" <>
+        "source/idempotency_key exist?\"). `meta.total_count` is the exact filtered count. " <>
         "Role: agent+.",
     parameters: [
       category: [in: :query, type: :string, description: "Filter by category"],
@@ -117,7 +121,14 @@ defmodule LoopctlWeb.ArticleController do
       tags: [
         in: :query,
         type: :string,
-        description: "Filter by tags (comma-separated)"
+        description: "Filter by tags (comma-separated, ANY match)"
+      ],
+      source_type: [in: :query, type: :string, description: "Filter by source_type"],
+      source_id: [in: :query, type: :string, description: "Filter by source_id"],
+      idempotency_key: [
+        in: :query,
+        type: :string,
+        description: "Filter by exact idempotency_key (lag-free existence check)"
       ],
       limit: [in: :query, type: :integer, description: "Max results (default 20, max 100)"],
       offset: [in: :query, type: :integer, description: "Records to skip"]
@@ -260,6 +271,9 @@ defmodule LoopctlWeb.ArticleController do
       |> maybe_add_opt(:category, params["category"])
       |> maybe_add_opt(:status, params["status"])
       |> maybe_add_opt(:tags, parse_tags(params["tags"]))
+      |> maybe_add_opt(:source_type, params["source_type"])
+      |> maybe_add_opt(:source_id, params["source_id"])
+      |> maybe_add_opt(:idempotency_key, params["idempotency_key"])
       |> maybe_add_opt(:limit, parse_int(params["limit"]))
       |> maybe_add_opt(:offset, parse_int(params["offset"]))
 

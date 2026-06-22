@@ -521,6 +521,67 @@ defmodule LoopctlWeb.ArticleControllerTest do
   end
 
   describe "GET /api/v1/articles" do
+    test "filters by source_type, source_id, and idempotency_key (lag-free existence check)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      src = Ecto.UUID.generate()
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "From Source",
+        source_type: "web_article",
+        source_id: src,
+        idempotency_key: "ik-1"
+      })
+
+      fixture(:article, %{tenant_id: tenant.id, title: "Unrelated"})
+
+      # by source_type
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?source_type=web_article")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+      assert hd(body["data"])["title"] == "From Source"
+
+      # by source_id
+      body2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?source_id=#{src}")
+        |> json_response(200)
+
+      assert body2["meta"]["total_count"] == 1
+
+      # by idempotency_key — the canonical existence check
+      body3 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?idempotency_key=ik-1")
+        |> json_response(200)
+
+      assert body3["meta"]["total_count"] == 1
+      assert hd(body3["data"])["idempotency_key"] == "ik-1"
+    end
+
+    test "a malformed source_id matches nothing (no 500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, title: "X"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?source_id=not-a-uuid")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 0
+    end
+
     test "lists articles with category and tags filters", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

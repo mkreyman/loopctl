@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.11.0 — 2026-06-22 (knowledge_list: lag-free enumeration)
+
+### Added
+
+- New `knowledge_list` tool: lists articles with full fields (status, tags,
+  source_type, source_id, idempotency_key, timestamps), filtered by
+  tags/status/source_type/source_id/idempotency_key/category and paginated. It
+  wraps `GET /api/v1/articles` — the lag-free, all-status read of the DB of
+  record — so MCP-only clients can enumerate/dedup/repair and run idempotency/
+  existence checks reliably right after a write, instead of the ranked,
+  published-only, write-lagging `knowledge_search`. (loopctl #134, #135)
+- `GET /api/v1/articles` now also filters by `source_type`, `source_id`, and
+  `idempotency_key`.
+
 ## 2.10.0 — 2026-06-22 (knowledge_create idempotency_key + provenance)
 
 ### Added

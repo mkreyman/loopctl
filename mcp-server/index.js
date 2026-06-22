@@ -631,6 +631,37 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, 
   return toContent(result);
 }
 
+async function knowledgeList({
+  project_id,
+  category,
+  status,
+  tags,
+  source_type,
+  source_id,
+  idempotency_key,
+  limit,
+  offset,
+}) {
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (category) params.set("category", category);
+  if (status) params.set("status", status);
+  if (tags) params.set("tags", tags);
+  if (source_type) params.set("source_type", source_type);
+  if (source_id) params.set("source_id", source_id);
+  if (idempotency_key) params.set("idempotency_key", idempotency_key);
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+
+  const result = await apiCall(
+    "GET",
+    `/api/v1/articles?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeGet({ article_id, project_id, story_id }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
@@ -1808,6 +1839,63 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_list",
+    description:
+      "List articles with FULL fields (id, title, body, category, status, tags, source_type, " +
+      "source_id, idempotency_key, timestamps), filtered and paginated. Unlike knowledge_search " +
+      "(ranked, PUBLISHED-only, and lags writes while embeddings index) and knowledge_index " +
+      "(lightweight id/title/category only), this is the LAG-FREE, ALL-STATUS read of the DB of " +
+      "record — the right tool to enumerate, dedup, or repair. Use it for idempotency/existence " +
+      "checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read " +
+      "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
+      "right after a write. Paginate via offset/limit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: scope to a project UUID.",
+        },
+        category: {
+          type: "string",
+          description: "Optional: filter by category.",
+        },
+        status: {
+          type: "string",
+          description: "Optional: filter by status (draft, published, archived, superseded).",
+        },
+        tags: {
+          type: "string",
+          description: "Optional: comma-separated tags; matches articles carrying ANY of them.",
+        },
+        source_type: {
+          type: "string",
+          description: "Optional: filter by source_type.",
+        },
+        source_id: {
+          type: "string",
+          description: "Optional: filter by source_id (a malformed id matches nothing).",
+        },
+        idempotency_key: {
+          type: "string",
+          description:
+            "Optional: filter by exact idempotency_key — the lag-free existence check for a " +
+            "prior capture.",
+        },
+        offset: {
+          type: "integer",
+          description: "Optional: rows to skip for pagination (default 0).",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: max articles per page (default 20, max 100).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_stats",
     description:
       "Get aggregate article counts for the wiki without pulling any article metadata. " +
@@ -2665,6 +2753,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_search":
       return await knowledgeSearch(args);
+
+    case "knowledge_list":
+      return await knowledgeList(args);
 
     case "knowledge_get":
       return await knowledgeGet(args);
