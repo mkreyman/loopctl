@@ -1845,10 +1845,11 @@ const TOOLS = [
       "source_id, idempotency_key, timestamps), filtered and paginated. Unlike knowledge_search " +
       "(ranked, PUBLISHED-only, and lags writes while embeddings index) and knowledge_index " +
       "(lightweight id/title/category only), this is the LAG-FREE, ALL-STATUS read of the DB of " +
-      "record — the right tool to enumerate, dedup, or repair. Use it for idempotency/existence " +
-      "checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read " +
-      "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
-      "right after a write. Paginate via offset/limit.",
+      "record — the right tool to enumerate, dedup, or repair. Returns articles in all statuses " +
+      "(draft, published, archived, superseded visible) — intended for dedup/repair tooling. Use " +
+      "for idempotency/existence checks: filter by `tags`, `source_type`+`source_id`, or " +
+      "`idempotency_key` and read `meta.total_count` (exact) to answer \"does an article for X " +
+      "already exist?\" reliably right after a write. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1921,7 +1922,10 @@ const TOOLS = [
   {
     name: "knowledge_search",
     description:
-      "Search the knowledge wiki by topic. Returns snippets. " +
+      "Search the knowledge wiki by topic. Returns snippets. Ranked, and returns PUBLISHED " +
+      "articles only; it LAGS writes by minutes while embeddings index. Do NOT use it for " +
+      "existence/idempotency/dedup checks ('already captured?') — a freshly-written article will " +
+      "false-negative. Use knowledge_list (lag-free, all-status, exact meta.total_count) for that. " +
       "q is optional when tags and/or category are supplied: in that list mode it returns the " +
       "COMPLETE filtered set (no relevance ranking) paginated via offset/limit over " +
       "meta.total_count, so you can enumerate every article carrying a tag/category. " +
