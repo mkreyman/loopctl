@@ -152,32 +152,23 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
-async function knowledgeCreate({ title, body, category, tags, project_id, publish }) {
+async function knowledgeCreate({ title, body, category, tags, project_id, draft }) {
   const payload = { title, body };
   if (category) payload.category = category;
   if (tags) payload.tags = tags;
   if (project_id) payload.project_id = project_id;
 
-  let key = process.env.LOOPCTL_AGENT_KEY;
-  if (publish) {
-    if (!process.env.LOOPCTL_ORCH_KEY && !process.env.LOOPCTL_API_KEY) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Publishing on create requires orchestrator role: set LOOPCTL_ORCH_KEY, or omit " +
-              "publish to create a draft and have an orchestrator publish it via knowledge_publish.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    payload.publish = true;
-    key = process.env.LOOPCTL_ORCH_KEY;
-  }
+  // Articles publish on create by default for every role (including agent), so a
+  // plain create routes through the agent key and is immediately visible. Pass
+  // draft:true to stage it for later review instead.
+  if (draft) payload.draft = true;
 
-  const result = await apiCall("POST", "/api/v1/articles", payload, key);
+  const result = await apiCall(
+    "POST",
+    "/api/v1/articles",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
   return toContent(result);
 }
 
@@ -852,10 +843,10 @@ describe("Issue #118: knowledge_stats", () => {
   });
 });
 
-describe("Issue #120: knowledge_create publish routing", () => {
-  test("a plain create uses the agent key and sends no publish flag", async () => {
+describe("knowledge_create: publish-on-create by default (#133)", () => {
+  test("a default create uses the agent key and sends no draft/publish flag", async () => {
     setupEnv();
-    const calls = mockFetch({ data: { status: "draft" }, note: "draft" });
+    const calls = mockFetch({ data: { status: "published" }, note: "published" });
 
     await knowledgeCreate({ title: "T", body: "B", category: "pattern" });
 
@@ -863,31 +854,47 @@ describe("Issue #120: knowledge_create publish routing", () => {
     const { url, options } = calls[0];
     assert.equal(new URL(url).pathname, "/api/v1/articles");
     assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
-    assert.equal(JSON.parse(options.body).publish, undefined);
+    const sent = JSON.parse(options.body);
+    assert.equal(sent.draft, undefined);
+    assert.equal(sent.publish, undefined, "the removed publish flag must never be sent");
   });
 
-  test("publish: true routes through the orchestrator key and sets publish in the payload", async () => {
+  test("draft: true stages a draft on the agent key (no orchestrator key consulted)", async () => {
     setupEnv();
-    const calls = mockFetch({ data: { status: "published" } });
+    const calls = mockFetch({ data: { status: "draft" }, note: "draft" });
 
-    await knowledgeCreate({ title: "T", body: "B", category: "pattern", publish: true });
+    await knowledgeCreate({ title: "T", body: "B", category: "pattern", draft: true });
 
     assert.equal(calls.length, 1);
     const { options } = calls[0];
-    assert.equal(options.headers.Authorization, `Bearer ${ORCH_KEY}`);
-    assert.equal(JSON.parse(options.body).publish, true);
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    const sent = JSON.parse(options.body);
+    assert.equal(sent.draft, true);
+    assert.equal(sent.publish, undefined);
   });
 
-  test("publish: true on an agent-only install returns a helpful error, not a keyless request", async () => {
+  test("draft: false is the same as omitting it — publishes on the agent key", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { status: "published" } });
+
+    await knowledgeCreate({ title: "T", body: "B", category: "pattern", draft: false });
+
+    assert.equal(calls.length, 1);
+    const { options } = calls[0];
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    assert.equal(JSON.parse(options.body).draft, undefined);
+  });
+
+  test("publishing on create needs no orchestrator key (agent-only install works)", async () => {
     setupEnv();
     delete process.env.LOOPCTL_ORCH_KEY;
     delete process.env.LOOPCTL_API_KEY;
-    const calls = mockFetch({ data: {} });
+    const calls = mockFetch({ data: { status: "published" } });
 
-    const result = await knowledgeCreate({ title: "T", body: "B", publish: true });
+    const result = await knowledgeCreate({ title: "T", body: "B", category: "pattern" });
 
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /orchestrator role/);
-    assert.equal(calls.length, 0, "no HTTP request should be made without an orchestrator key");
+    assert.equal(result.isError, undefined, "default publish-on-create must not error");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.headers.Authorization, `Bearer ${AGENT_KEY}`);
   });
 });

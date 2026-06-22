@@ -813,8 +813,8 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query | agent |
-| `knowledge_create` | Create an article (draft by default; `publish: true`, orchestrator) | agent |
-| `knowledge_publish` | Publish a draft article | orchestrator |
+| `knowledge_create` | Create an article (published by default; `draft: true` to stage) | agent |
+| `knowledge_publish` | Publish an existing draft article | orchestrator |
 | `knowledge_bulk_publish` | Atomically publish up to 100 drafts | user |
 | `knowledge_unpublish` | Revert a published article back to draft | user |
 | `knowledge_archive` | Soft-delete an article (retained for audit) | user |

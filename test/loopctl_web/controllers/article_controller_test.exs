@@ -98,7 +98,37 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       assert resp["deduplicated"] == true
       assert resp["data"]["status"] == "draft"
+      # The note honestly explains the publish intent did not apply (an identical
+      # draft was staged earlier) and gives an actually-reachable remedy.
+      assert resp["note"] =~ "did not change it"
       assert resp["note"] =~ "publish"
+      refute resp["note"] =~ "Created"
+    end
+
+    test "draft: true that dedups onto an existing draft says the intent is satisfied", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      payload = %{
+        "title" => "Dedup Draft Intent",
+        "body" => "identical staged body",
+        "category" => "pattern",
+        "draft" => true
+      }
+
+      conn |> auth_conn(agent_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      resp =
+        build_conn()
+        |> auth_conn(agent_key)
+        |> post(~p"/api/v1/articles", payload)
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["status"] == "draft"
+      assert resp["note"] =~ "already existed"
     end
 
     test "dedup onto an existing published article does not claim it was 'created' now", %{
@@ -194,6 +224,49 @@ defmodule LoopctlWeb.ArticleControllerTest do
       # the server ignores them and applies the publish-on-create default.
       body = json_response(conn, 201)
       assert body["data"]["status"] == "published"
+    end
+
+    test "a legacy publish: true payload is harmless — it just publishes (the default)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Legacy Publish Flag",
+          "body" => "old clients still send publish: true",
+          "category" => "pattern",
+          "publish" => true
+        })
+
+      # The `publish` flag is dropped server-side; the article publishes by default
+      # anyway, so an old client gets a sensible result (no 403, no draft).
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "published"
+    end
+
+    test "status: \"draft\" wins over draft: false (explicit stage beats the absent opt-in)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Draft Precedence",
+          "body" => "status draft is an explicit stage request; draft:false is not an opt-out",
+          "category" => "pattern",
+          "status" => "draft",
+          "draft" => false
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "draft"
     end
 
     test "returns 422 on invalid input", %{conn: conn} do
