@@ -891,6 +891,46 @@
           </div>
 
           <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
+            Witness / STH request headers (non-MCP clients)
+          </h3>
+          <div class="mt-4 space-y-3">
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="text-sm text-slate-400">
+                Every authenticated <span class="font-mono text-slate-300">/api/v1</span>
+                request participates in the witness protocol (the MCP server handles this for
+                you; raw HTTP clients must do it themselves):
+              </p>
+              <ul class="mt-2 space-y-1.5 text-sm text-slate-400 list-disc pl-5">
+                <li>
+                  <span class="text-slate-300">First request (bootstrap):</span>
+                  send <span class="font-mono text-slate-300">X-Loopctl-STH-Bootstrap: true</span>
+                  (no known STH yet). The response is a
+                  <span class="font-mono text-slate-300">200</span>
+                  carrying <span class="font-mono text-slate-300">X-Loopctl-Current-STH</span>
+                  (format <span class="font-mono text-slate-300">position:base64url_sig_prefix</span>) —
+                  cache that value.
+                </li>
+                <li>
+                  <span class="text-slate-300">Every subsequent request:</span>
+                  echo the cached value in <span class="font-mono text-slate-300">X-Loopctl-Last-Known-STH</span>.
+                  The STH is a witnessed point on the tenant's immutable audit chain, so the
+                  same bootstrap value stays valid — the server verifies it against its chain at
+                  that position on each request. (To re-anchor to a newer head at any time, just
+                  bootstrap again.)
+                </li>
+                <li>
+                  A missing/malformed header returns
+                  <span class="font-mono text-slate-300">412 Precondition</span>
+                  (bootstrap as above); a genuine divergence (your STH doesn't match the
+                  server's chain at that position) returns
+                  <span class="font-mono text-slate-300">409 witness_divergence</span>
+                  and halts custody. See <span class="font-mono text-slate-300">docs/chain-of-custody-v2.md</span>.
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <h3 class="mt-8 text-sm font-semibold text-accent-400 uppercase tracking-wider text-xs">
             Orchestration &amp; Observability
           </h3>
           <div class="mt-4 space-y-3">

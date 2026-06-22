@@ -521,6 +521,81 @@ defmodule LoopctlWeb.ArticleControllerTest do
   end
 
   describe "GET /api/v1/articles" do
+    test "an invalid status returns 400 with the allowed values (not 404/500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?status=active")
+
+      body = json_response(conn, 400)
+      assert body["error"]["status"] == 400
+      assert body["error"]["code"] == "invalid_status"
+      assert body["error"]["message"] =~ "draft"
+      assert body["error"]["message"] =~ "published"
+    end
+
+    test "an invalid category returns 400 with the allowed values", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?category=nonsense")
+
+      body = json_response(conn, 400)
+      assert body["error"]["code"] == "invalid_category"
+      assert body["error"]["message"] =~ "pattern"
+    end
+
+    test "an empty status param is treated as no filter (not a 400/500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "P"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?status=")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+    end
+
+    test "malformed list/map query params don't 500 (treated as no filter)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "X"})
+
+      # ?project_id[]=x&limit[]=1&tags[]=a decode to lists; must degrade to
+      # "no filter", never a FunctionClauseError / Ecto cast 500.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/articles?project_id[]=x&limit[]=1&source_id[]=y&tags[]=a")
+
+      assert json_response(conn, 200)["meta"]["total_count"] == 1
+    end
+
+    test "a valid status filter still works", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "Pub"})
+      fixture(:article, %{tenant_id: tenant.id, status: :draft, title: "Draf"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?status=published")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+      assert hd(body["data"])["status"] == "published"
+    end
+
     test "filters by source_type, source_id, and idempotency_key (lag-free existence check)", %{
       conn: conn
     } do
