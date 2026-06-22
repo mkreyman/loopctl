@@ -57,19 +57,24 @@ defmodule Loopctl.Knowledge do
 
   - `tenant_id` -- the tenant UUID
   - `attrs` -- map with title (required), body (required), category (required),
-    and optional: status, tags, source_type, source_id, metadata, project_id
+    and optional: status, tags, source_type, source_id, idempotency_key,
+    metadata, project_id
   - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
 
   ## Returns
 
   - `{:ok, %Article{}}` on a fresh create
-  - `{:ok, :deduplicated, %Article{}}` when a concurrent/retried create collided
-    on the active title and the incoming body is identical to the existing
-    article's after trimming leading/trailing whitespace — the existing row is
-    returned unchanged (this is a no-op: no second audit/webhook/embedding), so
-    callers can answer HTTP 200 rather than 201
+  - `{:ok, :deduplicated, %Article{}}` for an idempotent no-op (existing row
+    returned unchanged; no second audit/webhook/embedding; callers answer HTTP
+    200 not 201). Two triggers:
+      1. **idempotency_key** matches an existing article — returned **regardless
+         of body** (the key is the identity), taking precedence over the title
+         check; a changed title/body is NOT applied.
+      2. a concurrent/retried create collided on the **active title** AND the
+         incoming body is identical after trimming leading/trailing whitespace.
   - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
-    article with a DIFFERENT body (the caller should answer 409, not retry)
+    article with a DIFFERENT body and no idempotency_key matched (the caller
+    should answer 409, not retry)
   - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::
@@ -84,7 +89,12 @@ defmodule Loopctl.Knowledge do
     # System articles have no tenant — set tenant_id to nil
     effective_tenant_id = if scope in [:system, "system"], do: nil, else: tenant_id
 
-    with :ok <- validate_project_ownership(tenant_id, project_id) do
+    with :ok <- validate_project_ownership(tenant_id, project_id),
+         # Idempotent fast path: a prior capture with the same idempotency_key is
+         # a clean no-op — return it unchanged regardless of body (the key IS the
+         # identity), so a re-run can't create a partial duplicate.
+         nil <-
+           get_article_by_idempotency_key(effective_tenant_id, idempotency_key_from_attrs(attrs)) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -135,6 +145,15 @@ defmodule Loopctl.Knowledge do
         {:error, :article, changeset, _} ->
           resolve_create_conflict(effective_tenant_id, attrs, changeset)
       end
+    else
+      # validate_project_ownership/2 failure
+      {:error, _reason} = error ->
+        error
+
+      # Idempotency fast path hit: an article with this idempotency_key already
+      # exists — return it as a no-op dedup (the API answers 200).
+      %Article{} = existing ->
+        {:ok, :deduplicated, existing}
     end
   end
 
@@ -158,19 +177,67 @@ defmodule Loopctl.Knowledge do
   # archived → SELECT returns nil) — which the client's next attempt resolves
   # cleanly. We accept that rather than re-running the whole create under a lock.
   defp resolve_create_conflict(tenant_id, attrs, changeset) do
-    title = attrs[:title] || attrs["title"]
+    cond do
+      # A single failed INSERT raises exactly one unique violation, so the
+      # changeset carries at most one of these constraint names — the cond order
+      # is not a tie-breaker, just which recovery to run. An idempotency_key
+      # violation (a create that raced past the pre-check) returns the winner as
+      # a no-op dedup regardless of body.
+      idempotency_conflict?(changeset) ->
+        case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs)) do
+          %Article{} = existing -> {:ok, :deduplicated, existing}
+          _ -> {:error, changeset}
+        end
 
-    with true <- active_title_conflict?(changeset),
-         %Article{} = existing <- get_active_article_by_title(tenant_id, title) do
-      if same_content?(existing, attrs) do
-        {:ok, :deduplicated, existing}
-      else
-        {:error, :duplicate_title, existing}
-      end
-    else
-      _ -> {:error, changeset}
+      active_title_conflict?(changeset) ->
+        resolve_title_conflict(tenant_id, attrs, changeset)
+
+      true ->
+        {:error, changeset}
     end
   end
+
+  defp resolve_title_conflict(tenant_id, attrs, changeset) do
+    title = attrs[:title] || attrs["title"]
+
+    case get_active_article_by_title(tenant_id, title) do
+      %Article{} = existing ->
+        if same_content?(existing, attrs) do
+          {:ok, :deduplicated, existing}
+        else
+          {:error, :duplicate_title, existing}
+        end
+
+      _ ->
+        {:error, changeset}
+    end
+  end
+
+  defp idempotency_key_from_attrs(attrs), do: attrs[:idempotency_key] || attrs["idempotency_key"]
+
+  defp idempotency_conflict?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_msg, opts}} ->
+      Keyword.get(opts, :constraint) == :unique and
+        Keyword.get(opts, :constraint_name) == "articles_tenant_idempotency_key_idx"
+    end)
+  end
+
+  # Look up by idempotency_key across ALL statuses, mirroring the partial unique
+  # index (which has no status predicate) so the conflicting row is always found.
+  defp get_article_by_idempotency_key(_tenant_id, nil), do: nil
+  defp get_article_by_idempotency_key(nil, _key), do: nil
+
+  defp get_article_by_idempotency_key(tenant_id, key) when is_binary(key) do
+    AdminRepo.one(
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
+        order_by: [asc: a.inserted_at],
+        limit: 1
+      )
+    )
+  end
+
+  defp get_article_by_idempotency_key(_tenant_id, _key), do: nil
 
   # Only the active-title index — NOT the slug indexes, whose conflicts are on a
   # different field and must not be recovered via a title lookup.

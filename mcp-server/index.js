@@ -652,11 +652,24 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
-async function knowledgeCreate({ title, body, category, tags, project_id, draft }) {
+async function knowledgeCreate({
+  title,
+  body,
+  category,
+  tags,
+  project_id,
+  draft,
+  source_type,
+  source_id,
+  idempotency_key,
+}) {
   const payload = { title, body };
   if (category) payload.category = category;
   if (tags) payload.tags = tags;
   if (project_id) payload.project_id = project_id;
+  if (source_type) payload.source_type = source_type;
+  if (source_id) payload.source_id = source_id;
+  if (idempotency_key) payload.idempotency_key = idempotency_key;
 
   // Articles publish on create by default for every role (including agent), so a
   // plain create routes through the agent key and is immediately visible. Pass
@@ -1980,6 +1993,28 @@ const TOOLS = [
           description:
             "Optional: stage as a draft instead of publishing on create (default false → " +
             "published immediately). Publish later with knowledge_publish.",
+        },
+        idempotency_key: {
+          type: "string",
+          description:
+            "Optional: stable per-article key for idempotent capture (max 255). Re-creating " +
+            "with the same key is a no-op that returns a reference to the existing article " +
+            "(deduplicated; id only, not its body) instead of a partial duplicate. Use a " +
+            "HIGH-ENTROPY value (e.g. a content hash) — it is a per-tenant lookup key, not a " +
+            "secret, so a guessable key lets another agent in your tenant probe which keys " +
+            "exist. Distinct from source_type/source_id (which mark a shared source).",
+        },
+        source_type: {
+          type: "string",
+          description:
+            "Optional: advisory provenance for the originating source (e.g. 'web_article', " +
+            "'newsletter'). Shared across articles from the same source; not an idempotency key.",
+        },
+        source_id: {
+          type: "string",
+          description:
+            "Optional: UUID of the originating source entity (shared across articles from " +
+            "that source). Pair with source_type.",
         },
       },
       required: ["title", "body"],

@@ -38,6 +38,7 @@ defmodule LoopctlWeb.ArticleJSON do
       tags: article.tags,
       source_type: article.source_type,
       source_id: article.source_id,
+      idempotency_key: article.idempotency_key,
       metadata: article.metadata,
       inserted_at: article.inserted_at,
       updated_at: article.updated_at

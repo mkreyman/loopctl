@@ -163,6 +163,66 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  describe "create_article/3 idempotency_key (#137)" do
+    test "a repeat capture with the same idempotency_key returns the existing row, body ignored" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, first} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Note 1",
+                 body: "original body",
+                 category: :reference,
+                 idempotency_key: "k1"
+               })
+
+      # Same key, different title AND body — the key is the identity, so this is a
+      # clean no-op (no partial duplicate, existing row unchanged).
+      assert {:ok, :deduplicated, second} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Note 1 renamed",
+                 body: "changed body",
+                 category: :reference,
+                 idempotency_key: "k1"
+               })
+
+      assert second.id == first.id
+      assert second.body == "original body"
+    end
+
+    test "distinct idempotency_keys create distinct articles" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, a} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "A",
+                 body: "a",
+                 category: :reference,
+                 idempotency_key: "ka"
+               })
+
+      assert {:ok, b} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "B",
+                 body: "b",
+                 category: :reference,
+                 idempotency_key: "kb"
+               })
+
+      assert a.id != b.id
+    end
+
+    test "the same idempotency_key in another tenant does not collide (isolation)" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+
+      attrs = %{title: "Iso", body: "x", category: :reference, idempotency_key: "shared"}
+
+      assert {:ok, a} = Knowledge.create_article(tenant_a.id, attrs)
+      assert {:ok, b} = Knowledge.create_article(tenant_b.id, attrs)
+      assert a.id != b.id
+    end
+  end
+
   # --- TC-19.3.2: List with tag overlap filtering ---
 
   describe "list_articles/2 tag filtering" do
