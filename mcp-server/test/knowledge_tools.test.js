@@ -118,6 +118,36 @@ async function knowledgeStats({ project_id }) {
   return toContent(result);
 }
 
+async function knowledgeList({
+  project_id,
+  category,
+  status,
+  tags,
+  source_type,
+  source_id,
+  idempotency_key,
+  limit,
+  offset,
+}) {
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (category) params.set("category", category);
+  if (status) params.set("status", status);
+  if (tags) params.set("tags", tags);
+  if (source_type) params.set("source_type", source_type);
+  if (source_id) params.set("source_id", source_id);
+  if (idempotency_key) params.set("idempotency_key", idempotency_key);
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const result = await apiCall(
+    "GET",
+    `/api/v1/articles?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
   const params = new URLSearchParams();
   if (q != null && q !== "") params.set("q", q);
@@ -896,5 +926,60 @@ describe("knowledge_create: publish-on-create by default (#133)", () => {
     assert.equal(result.isError, undefined, "default publish-on-create must not error");
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+  });
+});
+
+describe("knowledge_list: lag-free enumeration (#134/#135)", () => {
+  test("routes to GET /api/v1/articles on the agent key", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeList({});
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, "/api/v1/articles");
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+  });
+
+  test("forwards every filter as a query param (no dropped params)", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeList({
+      project_id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+      category: "reference",
+      status: "published",
+      tags: "a,b",
+      source_type: "web_article",
+      source_id: "11111111-1111-1111-1111-111111111111",
+      idempotency_key: "ik-1",
+      limit: 50,
+      offset: 100,
+    });
+
+    const q = new URL(calls[0].url).searchParams;
+    assert.equal(q.get("project_id"), "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0");
+    assert.equal(q.get("category"), "reference");
+    assert.equal(q.get("status"), "published");
+    assert.equal(q.get("tags"), "a,b");
+    assert.equal(q.get("source_type"), "web_article");
+    assert.equal(q.get("source_id"), "11111111-1111-1111-1111-111111111111");
+    assert.equal(q.get("idempotency_key"), "ik-1");
+    assert.equal(q.get("limit"), "50");
+    assert.equal(q.get("offset"), "100");
+  });
+
+  test("omits unset filters", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeList({ idempotency_key: "only-this" });
+
+    const q = new URL(calls[0].url).searchParams;
+    assert.equal(q.get("idempotency_key"), "only-this");
+    assert.equal(q.get("source_type"), null);
+    assert.equal(q.get("status"), null);
   });
 });

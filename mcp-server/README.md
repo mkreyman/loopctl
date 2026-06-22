@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 55 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 56 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (55)
+## Tools (56)
 
 ### Project Tools
 
@@ -132,11 +132,21 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 ### Knowledge Wiki Tools (agent key)
 
+**Which read tool?**
+
+| Need | Use |
+|---|---|
+| How many articles? (counts only) | `knowledge_stats` |
+| Browse the catalog (lightweight id/title/category) | `knowledge_index` |
+| Find by topic / relevance (ranked, published-only, lags writes) | `knowledge_search` |
+| Enumerate / dedup / repair, or "does X exist?" (full fields, lag-free, all-status) | `knowledge_list` |
+
 | Tool | Description |
 |---|---|
 | `knowledge_index` | Browse/paginate the knowledge wiki catalog grouped by category. Honors `category`, `tags`, `offset`, `limit` with deterministic ordering so every article is reachable (`meta.categories` reports per-category totals over the whole filtered set). Use `fields` (default `id,title,category`; request `tags`/`status`/`updated_at` explicitly; `id` and `category` are always included) to keep the payload small. Optional: `project_id`, `story_id`, `category`, `tags`, `offset`, `limit`, `fields`. |
 | `knowledge_stats` | Aggregate article counts (`total`, `by_category`, `by_status`) via cheap `COUNT(*) GROUP BY` — no article metadata loaded. The right tool for "how many articles are in this project?" (`knowledge_index` pages metadata; `knowledge_search`'s `total_count` is query-dependent). Counts span all statuses. Optional: `project_id`. |
-| `knowledge_search` | Search the knowledge wiki by topic (keyword, semantic, or combined). Returns snippets. `q` is optional when `tags`/`category` are supplied — that **list mode** returns the complete filtered set paginated via `offset`/`limit` over `meta.total_count`, so you can enumerate every article carrying a tag/category. `meta.total_count` is mode-dependent — read `meta.total_count_scope` (`keyword_matches`/`ranked_corpus`/`merged_candidates`/`filtered_set`) and don't use a relevance-mode count to size the wiki (use list mode or `knowledge_stats`). Optional: `project_id`, `story_id` for attribution. |
+| `knowledge_search` | Search the knowledge wiki by topic (keyword, semantic, or combined). Returns snippets. **Ranked, published-only, and LAGS writes by minutes while embeddings index — do NOT use for existence/idempotency/dedup checks (a fresh write false-negatives); use `knowledge_list` for that.** `q` is optional when `tags`/`category` are supplied — that **list mode** returns the complete filtered set paginated via `offset`/`limit` over `meta.total_count`. `meta.total_count` is mode-dependent — read `meta.total_count_scope` (`keyword_matches`/`ranked_corpus`/`merged_candidates`/`filtered_set`) and don't use a relevance-mode count to size the wiki (use `knowledge_list` or `knowledge_stats`). Optional: `project_id`, `story_id` for attribution. |
+| `knowledge_list` | List articles with **full fields** (incl. `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, timestamps), filtered + paginated. **Lag-free, all-status** read of the DB of record — unlike `knowledge_search` (ranked, published-only, lags writes) and `knowledge_index` (id/title/category only). The right tool to enumerate/dedup/repair and for idempotency/existence checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read `meta.total_count` (exact). Optional: `project_id`, `category`, `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, `offset`, `limit`. |
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. **Published immediately by default** (visible to agents in search/index/context) for every role — the response `note` says which outcome occurred. Pass `draft: true` to stage it for later review instead (publish afterwards with `knowledge_publish`). Pass `idempotency_key` for idempotent capture (re-creating with the same key is a no-op returning the existing article — no partial duplicates). Optional: `category`, `tags`, `project_id`, `draft`, `idempotency_key`, `source_type`, `source_id`. |

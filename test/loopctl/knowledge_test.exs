@@ -225,6 +225,71 @@ defmodule Loopctl.KnowledgeTest do
 
   # --- TC-19.3.2: List with tag overlap filtering ---
 
+  describe "list_articles/2 source + idempotency filters (#134)" do
+    test "filters by source_type, source_id, and idempotency_key" do
+      %{tenant: tenant} = setup_tenant()
+      src = Ecto.UUID.generate()
+
+      {:ok, _a} =
+        Knowledge.create_article(tenant.id, %{
+          title: "From Source",
+          body: "b",
+          category: :reference,
+          source_type: "web_article",
+          source_id: src,
+          idempotency_key: "ik-1"
+        })
+
+      {:ok, _b} =
+        Knowledge.create_article(tenant.id, %{title: "Other", body: "b", category: :reference})
+
+      assert %{meta: %{total_count: 1}} =
+               Knowledge.list_articles(tenant.id, source_type: "web_article")
+
+      assert %{meta: %{total_count: 1}} = Knowledge.list_articles(tenant.id, source_id: src)
+
+      assert %{meta: %{total_count: 1}} =
+               Knowledge.list_articles(tenant.id, idempotency_key: "ik-1")
+    end
+
+    test "a well-formed but absent source_id returns zero (the common 'exists? no')" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, _} =
+        Knowledge.create_article(tenant.id, %{title: "X", body: "b", category: :reference})
+
+      assert %{meta: %{total_count: 0}} =
+               Knowledge.list_articles(tenant.id, source_id: Ecto.UUID.generate())
+    end
+
+    test "a malformed source_id matches nothing (no raise)" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, _} =
+        Knowledge.create_article(tenant.id, %{title: "X", body: "b", category: :reference})
+
+      assert %{meta: %{total_count: 0}} =
+               Knowledge.list_articles(tenant.id, source_id: "not-a-uuid")
+    end
+
+    test "source/idempotency filters are tenant-scoped (no cross-tenant leak)" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+
+      {:ok, _} =
+        Knowledge.create_article(tenant_b.id, %{
+          title: "B's",
+          body: "b",
+          category: :reference,
+          idempotency_key: "shared-key"
+        })
+
+      # Tenant A cannot see tenant B's article by the shared key.
+      assert %{meta: %{total_count: 0}} =
+               Knowledge.list_articles(tenant_a.id, idempotency_key: "shared-key")
+    end
+  end
+
   describe "list_articles/2 tag filtering" do
     test "filters articles by tag overlap (ANY match)" do
       %{tenant: tenant} = setup_tenant()

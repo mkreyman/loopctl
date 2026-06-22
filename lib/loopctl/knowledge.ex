@@ -376,6 +376,8 @@ defmodule Loopctl.Knowledge do
     - `:status` -- filter by status atom (optional)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
     - `:source_type` -- filter by source_type string (optional)
+    - `:source_id` -- filter by source_id (optional; a malformed id matches nothing)
+    - `:idempotency_key` -- filter by exact idempotency_key (optional)
     - `:limit` -- max records to return (default 20, max 100)
     - `:offset` -- records to skip for pagination (default 0)
 
@@ -2190,6 +2192,8 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_status(Keyword.get(opts, :status))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags))
     |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
+    |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
+    |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
   end
 
   defp maybe_filter_by_project_id(query, nil), do: query
@@ -2221,6 +2225,24 @@ defmodule Loopctl.Knowledge do
 
   defp maybe_filter_by_source_type(query, source_type) do
     where(query, [a], a.source_type == ^source_type)
+  end
+
+  defp maybe_filter_by_source_id(query, nil), do: query
+
+  defp maybe_filter_by_source_id(query, source_id) do
+    # source_id is a binary_id; a malformed value would raise on cast, so match
+    # nothing instead (a clean "exists? no" rather than a 500).
+    if valid_uuid?(source_id) do
+      where(query, [a], a.source_id == ^source_id)
+    else
+      where(query, [a], false)
+    end
+  end
+
+  defp maybe_filter_by_idempotency_key(query, nil), do: query
+
+  defp maybe_filter_by_idempotency_key(query, key) do
+    where(query, [a], a.idempotency_key == ^key)
   end
 
   defp validate_articles_exist(tenant_id, source_id, target_id) do
