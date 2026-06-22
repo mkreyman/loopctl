@@ -50,7 +50,8 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   @max_body_length 100_000
   @valid_categories ~w(pattern convention decision finding reference)a
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
-  @max_tags 20
+  # Single source of truth: the Article schema's tag cap (avoids drift).
+  @max_tags Loopctl.Knowledge.Article.max_tags()
   @max_tag_length 100
 
   @impl Oban.Worker

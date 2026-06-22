@@ -551,6 +551,20 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["error"]["message"] =~ "pattern"
     end
 
+    test "an empty status param is treated as no filter (not a 400/500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "P"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?status=")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+    end
+
     test "a valid status filter still works", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

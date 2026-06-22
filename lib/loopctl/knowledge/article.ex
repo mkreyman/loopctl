@@ -34,6 +34,9 @@ defmodule Loopctl.Knowledge.Article do
   @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
+  # Topical tags only. Structural identity (e.g. a "hub", or an article's source)
+  # is carried by source_type/source_id and idempotency_key (#137), so we raise
+  # the cap (#138) rather than add a separate kind/type field.
   @max_tags 50
   @max_tag_length 100
 
@@ -159,6 +162,9 @@ defmodule Loopctl.Knowledge.Article do
 
   @doc false
   def known_source_types, do: @known_source_types
+
+  @doc "Maximum number of tags allowed per article (single source of truth)."
+  def max_tags, do: @max_tags
 
   @valid_transitions [
     {:draft, :published},

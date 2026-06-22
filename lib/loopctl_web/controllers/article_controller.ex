@@ -312,8 +312,10 @@ defmodule LoopctlWeb.ArticleController do
     end
   end
 
-  # nil/absent filter is fine; a present value must be one of the enum's values.
+  # nil/absent (or empty-string, meaning "no filter") is fine; a present value
+  # must be one of the enum's values.
   defp validate_enum(nil, _allowed, _field), do: :ok
+  defp validate_enum("", _allowed, _field), do: :ok
 
   defp validate_enum(value, allowed, field) do
     if value in allowed, do: :ok, else: {:error, field, Enum.join(allowed, ", ")}
@@ -491,6 +493,9 @@ defmodule LoopctlWeb.ArticleController do
 
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, _key, []), do: opts
+  # An empty-string query param ("?status=") means "no filter", not a value to
+  # match (matching status == "" would fail the Ecto.Enum cast).
+  defp maybe_add_opt(opts, _key, ""), do: opts
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp parse_tags(nil), do: nil

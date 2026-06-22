@@ -902,27 +902,27 @@
               </p>
               <ul class="mt-2 space-y-1.5 text-sm text-slate-400 list-disc pl-5">
                 <li>
-                  <span class="text-slate-300">First request:</span>
+                  <span class="text-slate-300">First request (bootstrap):</span>
                   send <span class="font-mono text-slate-300">X-Loopctl-STH-Bootstrap: true</span>
-                  (no known STH yet). You get a <span class="font-mono text-slate-300">200</span>
-                  with the current STH in the response.
-                </li>
-                <li>
-                  <span class="text-slate-300">Every response</span>
-                  carries <span class="font-mono text-slate-300">X-Loopctl-Current-STH</span>
+                  (no known STH yet). The response is a
+                  <span class="font-mono text-slate-300">200</span>
+                  carrying <span class="font-mono text-slate-300">X-Loopctl-Current-STH</span>
                   (format <span class="font-mono text-slate-300">position:base64url_sig_prefix</span>) —
-                  cache it.
+                  cache that value.
                 </li>
                 <li>
                   <span class="text-slate-300">Every subsequent request:</span>
-                  echo the last value back in <span class="font-mono text-slate-300">X-Loopctl-Last-Known-STH</span>.
-                  Note that read endpoints (list, search, get) ALSO advance the STH, so update
-                  your cached value from every response, not just writes.
+                  echo the cached value in <span class="font-mono text-slate-300">X-Loopctl-Last-Known-STH</span>.
+                  The STH is a witnessed point on the tenant's immutable audit chain, so the
+                  same bootstrap value stays valid — the server verifies it against its chain at
+                  that position on each request. (To re-anchor to a newer head at any time, just
+                  bootstrap again.)
                 </li>
                 <li>
                   A missing/malformed header returns
                   <span class="font-mono text-slate-300">412 Precondition</span>
-                  (bootstrap as above); a genuine divergence returns
+                  (bootstrap as above); a genuine divergence (your STH doesn't match the
+                  server's chain at that position) returns
                   <span class="font-mono text-slate-300">409 witness_divergence</span>
                   and halts custody. See <span class="font-mono text-slate-300">docs/chain-of-custody-v2.md</span>.
                 </li>
