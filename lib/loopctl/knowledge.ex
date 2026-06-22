@@ -1521,19 +1521,8 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_bulk_publish(tenant_id, article_ids, opts) do
-    # Only well-formed UUIDs can be looked up; a malformed string would raise on
-    # the `id in ^ids` cast, so keep it out of the query — it resolves to a clean
-    # "not_found" via the absent `existing` entry below.
-    queryable_ids = Enum.filter(article_ids, &valid_uuid?/1)
-
     # Load every requested article once, keyed by id (lag-free, DB-of-record).
-    existing =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.id in ^queryable_ids
-      )
-      |> AdminRepo.all()
-      |> Map.new(&{&1.id, &1})
+    existing = load_existing_by_ids(tenant_id, article_ids)
 
     drafts =
       for id <- article_ids,
@@ -1541,8 +1530,20 @@ defmodule Loopctl.Knowledge do
           do: Map.fetch!(existing, id)
 
     # Publish drafts in bounded chunks; collect what actually published and any
-    # ids whose chunk failed unexpectedly.
-    {published, errored_ids} = publish_drafts_in_chunks(tenant_id, drafts, opts)
+    # ids whose chunk failed unexpectedly. Embeddings are enqueued AFTER each
+    # chunk commits (post-commit), only for rows that actually published — Oban
+    # runs on a separate repo/pool from AdminRepo, so enqueuing inside the
+    # transaction would leak jobs for rolled-back rows.
+    {published, errored_ids} =
+      transition_in_chunks(
+        tenant_id,
+        drafts,
+        :published,
+        "article.published",
+        opts,
+        &enqueue_bulk_embeddings(tenant_id, &1)
+      )
+
     published_ids = MapSet.new(published, & &1.id)
     errored_set = MapSet.new(errored_ids)
 
@@ -1595,62 +1596,71 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp publish_drafts_in_chunks(tenant_id, drafts, opts) do
-    drafts
+  # Shared bulk status-transition runner (used by bulk_publish -> :published and
+  # bulk_archive -> :archived). Processes `articles` in bounded chunks; returns
+  # `{transitioned, errored_ids}`. `post_commit` runs after each chunk's
+  # transaction commits, with the rows that actually transitioned (publish uses
+  # it to enqueue embeddings; archive passes a no-op).
+  defp transition_in_chunks(tenant_id, articles, target_status, audit_action, opts, post_commit) do
+    articles
     |> Enum.chunk_every(@bulk_publish_chunk_size)
-    |> Enum.reduce({[], []}, fn chunk, {pub_acc, err_acc} ->
-      {published, errored_ids} = publish_chunk_isolating_failures(tenant_id, chunk, opts)
-      # Embeddings are enqueued AFTER the publish transaction commits, and only
-      # for rows that actually published — Oban runs on a separate repo/pool from
-      # AdminRepo, so enqueuing inside the transaction would leak jobs for rows
-      # that rolled back.
-      enqueue_bulk_embeddings(tenant_id, published)
-      {pub_acc ++ published, err_acc ++ errored_ids}
+    |> Enum.reduce({[], []}, fn chunk, {ok_acc, err_acc} ->
+      {done, errored_ids} =
+        transition_chunk_isolating_failures(tenant_id, chunk, target_status, audit_action, opts)
+
+      post_commit.(done)
+      {ok_acc ++ done, err_acc ++ errored_ids}
     end)
   end
 
-  # Publish a chunk in one transaction; if it fails, retry each draft alone so a
+  # Transition a chunk in one transaction; if it fails, retry each row alone so a
   # single bad row doesn't sink the whole chunk (true partial success). The retry
   # is bounded: at most @bulk_publish_max single-row transactions per request
   # (50 chunks x 100), so a pathological all-failing request can't run unbounded.
   #
-  # NB: a draft -> published status update has no validation that can fail for a
-  # well-formed draft, so the `{:error, _}` branch is a defensive fallback for
-  # genuine DB-level failures (serialization, connection loss, a constraint
-  # regression). It is therefore not exercised by the integration tests without
-  # fault injection (which this codebase has no DI seam for) — the partial-success
-  # accounting around it (counts/results) is what the tests cover.
-  defp publish_chunk_isolating_failures(tenant_id, chunk, opts) do
-    case execute_bulk_publish(tenant_id, chunk, opts) do
-      {:ok, published} ->
-        {published, []}
+  # NB: a draft->published / draft|published->archived update has no validation
+  # that can fail for a well-formed row, so the `{:error, _}` branch is a
+  # defensive fallback for genuine DB-level failures (serialization, connection
+  # loss, a constraint regression). It is therefore not exercised by the
+  # integration tests without fault injection (which this codebase has no DI seam
+  # for) — the partial-success accounting around it (counts/results) is tested.
+  defp transition_chunk_isolating_failures(tenant_id, chunk, target_status, audit_action, opts) do
+    case execute_bulk_transition(tenant_id, chunk, target_status, audit_action, opts) do
+      {:ok, done} ->
+        {done, []}
 
       {:error, _changeset} ->
-        {pub, err} = Enum.reduce(chunk, {[], []}, &publish_one_isolated(tenant_id, &1, opts, &2))
-        log_chunk_failures(chunk, err)
-        {pub, err}
+        {ok, err} =
+          Enum.reduce(
+            chunk,
+            {[], []},
+            &transition_one_isolated(tenant_id, &1, target_status, audit_action, opts, &2)
+          )
+
+        log_chunk_failures(audit_action, chunk, err)
+        {ok, err}
     end
   end
 
-  defp publish_one_isolated(tenant_id, article, opts, {pub, err}) do
-    case execute_bulk_publish(tenant_id, [article], opts) do
-      {:ok, published} -> {pub ++ published, err}
-      {:error, _cs} -> {pub, err ++ [article.id]}
+  defp transition_one_isolated(tenant_id, article, target_status, audit_action, opts, {ok, err}) do
+    case execute_bulk_transition(tenant_id, [article], target_status, audit_action, opts) do
+      {:ok, done} -> {ok ++ done, err}
+      {:error, _cs} -> {ok, err ++ [article.id]}
     end
   end
 
   # One aggregated log line per failing chunk (not one per row) so a systemic
   # failure of a large request can't flood the logs with thousands of lines.
-  defp log_chunk_failures(_chunk, []), do: :ok
+  defp log_chunk_failures(_audit_action, _chunk, []), do: :ok
 
-  defp log_chunk_failures(chunk, errored_ids) do
+  defp log_chunk_failures(audit_action, chunk, errored_ids) do
     Logger.error(
-      "bulk_publish: #{length(errored_ids)}/#{length(chunk)} drafts failed to publish: " <>
+      "#{audit_action}: #{length(errored_ids)}/#{length(chunk)} rows failed: " <>
         Enum.join(errored_ids, ", ")
     )
   end
 
-  defp execute_bulk_publish(tenant_id, articles, opts) do
+  defp execute_bulk_transition(tenant_id, articles, target_status, audit_action, opts) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -1662,19 +1672,26 @@ defmodule Loopctl.Knowledge do
     multi =
       indexed_articles
       |> Enum.reduce(Multi.new(), fn {article, idx}, multi ->
-        changeset = Article.update_changeset(article, %{status: :published})
-        Multi.update(multi, {:publish, idx}, changeset)
+        changeset = Article.update_changeset(article, %{status: target_status})
+        Multi.update(multi, {:item, idx}, changeset)
       end)
-      |> add_bulk_audit_entries(tenant_id, indexed_articles, actor_id, actor_label, actor_type)
+      |> add_bulk_audit_entries(
+        tenant_id,
+        indexed_articles,
+        audit_action,
+        actor_id,
+        actor_label,
+        actor_type
+      )
 
     case AdminRepo.transaction(multi) do
       {:ok, results} ->
-        published =
+        done =
           indexed_articles
-          |> Enum.map(fn {_article, idx} -> Map.get(results, {:publish, idx}) end)
+          |> Enum.map(fn {_article, idx} -> Map.get(results, {:item, idx}) end)
           |> Enum.reject(&is_nil/1)
 
-        {:ok, published}
+        {:ok, done}
 
       {:error, _key, changeset, _completed} ->
         {:error, changeset}
@@ -1707,27 +1724,169 @@ defmodule Loopctl.Knowledge do
          multi,
          tenant_id,
          indexed_articles,
+         audit_action,
          actor_id,
          actor_label,
          actor_type
        ) do
-    Enum.reduce(indexed_articles, multi, fn {_article, idx}, multi ->
+    Enum.reduce(indexed_articles, multi, fn {article, idx}, multi ->
+      old_status = to_string(article.status)
+
       Audit.log_in_multi(multi, {:audit, idx}, fn changes ->
-        updated = Map.get(changes, {:publish, idx})
+        updated = Map.get(changes, {:item, idx})
 
         %{
           tenant_id: tenant_id,
           entity_type: "article",
           entity_id: updated.id,
-          action: "article.published",
+          action: audit_action,
           actor_type: actor_type,
           actor_id: actor_id,
           actor_label: actor_label,
-          old_state: %{"status" => "draft"},
+          old_state: %{"status" => old_status},
           new_state: %{"status" => to_string(updated.status)}
         }
       end)
     end)
+  end
+
+  @doc """
+  Archives articles in bulk (soft delete), **partial-success** style — the
+  delete analogue of `bulk_publish/3`.
+
+  Each requested id resolves to one of:
+
+  - `"archived"` -- it was draft/published and is now archived
+  - `"skipped"` -- already archived (idempotent no-op), or superseded
+    (`reason` says which)
+  - `"not_found"` -- no such article in this tenant
+  - `"errored"` -- the archive transaction failed unexpectedly
+
+  Duplicate ids are de-duplicated; malformed ids resolve to `"not_found"`.
+  Bounded to #{@bulk_publish_max} ids per call (auto-chunked). Returns
+  `{:ok, %{archived: [...], results: [...], counts: %{...}}}` or
+  `{:error, :bad_request, msg}` when `article_ids` is empty/over the cap.
+  """
+  @spec bulk_archive(Ecto.UUID.t(), [Ecto.UUID.t()], keyword()) ::
+          {:ok, %{archived: [Article.t()], results: [map()], counts: map()}}
+          | {:error, :bad_request, String.t()}
+  def bulk_archive(_tenant_id, article_ids, _opts) when article_ids in [nil, []] do
+    {:error, :bad_request, "article_ids must not be empty"}
+  end
+
+  def bulk_archive(tenant_id, article_ids, opts) do
+    ids = article_ids |> List.wrap() |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    cond do
+      ids == [] ->
+        {:error, :bad_request, "article_ids must contain at least one UUID string"}
+
+      length(ids) > @bulk_publish_max ->
+        {:error, :bad_request,
+         "Maximum #{@bulk_publish_max} article ids per bulk delete; split into smaller calls"}
+
+      true ->
+        {:ok, do_bulk_archive(tenant_id, ids, opts)}
+    end
+  end
+
+  defp do_bulk_archive(tenant_id, article_ids, opts) do
+    existing = load_existing_by_ids(tenant_id, article_ids)
+
+    archivable =
+      for id <- article_ids,
+          match?(%Article{status: s} when s in [:draft, :published], Map.get(existing, id)),
+          do: Map.fetch!(existing, id)
+
+    # Archiving has no post-commit side effect (archived rows are hidden from
+    # search, so no embedding work is needed).
+    {archived, errored_ids} =
+      transition_in_chunks(tenant_id, archivable, :archived, "article.archived", opts, fn _ ->
+        :ok
+      end)
+
+    archived_ids = MapSet.new(archived, & &1.id)
+    errored_set = MapSet.new(errored_ids)
+
+    results = Enum.map(article_ids, &bulk_archive_result(&1, existing, archived_ids, errored_set))
+    by_outcome = Enum.frequencies_by(results, & &1.outcome)
+
+    %{
+      archived: archived,
+      results: results,
+      counts: %{
+        requested: length(article_ids),
+        archived: Map.get(by_outcome, "archived", 0),
+        skipped: Map.get(by_outcome, "skipped", 0),
+        not_found: Map.get(by_outcome, "not_found", 0),
+        errored: Map.get(by_outcome, "errored", 0)
+      }
+    }
+  end
+
+  defp bulk_archive_result(id, existing, archived_ids, errored_set) do
+    cond do
+      MapSet.member?(errored_set, id) ->
+        %{id: id, outcome: "errored", reason: "archive_failed"}
+
+      MapSet.member?(archived_ids, id) ->
+        %{id: id, outcome: "archived", status: "archived"}
+
+      true ->
+        case Map.get(existing, id) do
+          nil ->
+            %{id: id, outcome: "not_found"}
+
+          %Article{status: :archived} ->
+            %{id: id, outcome: "skipped", reason: "already_archived", status: "archived"}
+
+          %Article{status: status} ->
+            %{
+              id: id,
+              outcome: "skipped",
+              reason: "not_archivable_from_#{status}",
+              status: to_string(status)
+            }
+        end
+    end
+  end
+
+  # Load the requested articles once, keyed by id. Malformed (non-UUID) ids are
+  # kept out of the `id in ^ids` query (which would raise on cast) so they
+  # resolve to a clean "not_found" via the absent map entry.
+  defp load_existing_by_ids(tenant_id, article_ids) do
+    queryable_ids = Enum.filter(article_ids, &valid_uuid?/1)
+
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.id in ^queryable_ids
+    )
+    |> AdminRepo.all()
+    |> Map.new(&{&1.id, &1})
+  end
+
+  @doc """
+  Returns the ids of active (draft/published) articles matching `opts` (the same
+  filters as `list_articles/2` — `:source_type`/`:source_id`/`:tags`/`:category`/
+  `:project_id`) for a selector-based bulk archive. The bulk-delete endpoint
+  currently drives it with the source and tag filters. Bounded: returns
+  `{:error, :too_many}` when the match set exceeds #{@bulk_publish_max} (the
+  caller should narrow the selector).
+  """
+  @spec list_archivable_ids(Ecto.UUID.t(), keyword()) ::
+          {:ok, [Ecto.UUID.t()]} | {:error, :too_many}
+  def list_archivable_ids(tenant_id, opts) do
+    ids =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status in [:draft, :published],
+        select: a.id,
+        limit: ^(@bulk_publish_max + 1)
+      )
+      |> apply_article_filters(opts)
+      |> AdminRepo.all()
+
+    if length(ids) > @bulk_publish_max, do: {:error, :too_many}, else: {:ok, ids}
   end
 
   # --- Obsidian Export ---

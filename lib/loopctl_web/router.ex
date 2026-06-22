@@ -288,8 +288,9 @@ defmodule LoopctlWeb.Router do
     post "/articles/:id/archive", ArticleWorkflowController, :archive
     resources "/articles", ArticleController, except: [:new, :edit]
 
-    # Knowledge bulk-publish and drafts queue
+    # Knowledge bulk-publish, bulk-delete, and drafts queue
     post "/knowledge/bulk-publish", ArticleWorkflowController, :bulk_publish
+    post "/knowledge/bulk-delete", ArticleWorkflowController, :bulk_delete
     get "/knowledge/drafts", ArticleWorkflowController, :drafts
 
     # Knowledge Index (lightweight catalog)

@@ -223,6 +223,76 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  describe "bulk_archive/3 (#136)" do
+    test "archives draft/published, skips archived/superseded, reports not_found, partial-success" do
+      %{tenant: tenant} = setup_tenant()
+      d = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      p = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      arch = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      missing = Ecto.UUID.generate()
+
+      assert {:ok, result} =
+               Knowledge.bulk_archive(tenant.id, [d.id, p.id, arch.id, missing], [])
+
+      assert result.counts == %{requested: 4, archived: 2, skipped: 1, not_found: 1, errored: 0}
+      assert AdminRepo.get!(Article, d.id).status == :archived
+      assert AdminRepo.get!(Article, p.id).status == :archived
+    end
+
+    test "empty / over-cap article_ids are rejected" do
+      %{tenant: tenant} = setup_tenant()
+      assert {:error, :bad_request, _} = Knowledge.bulk_archive(tenant.id, [], [])
+    end
+
+    test "is tenant-scoped (cannot archive another tenant's article)" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+      b = fixture(:article, %{tenant_id: tenant_b.id, status: :published})
+
+      assert {:ok, result} = Knowledge.bulk_archive(tenant_a.id, [b.id], [])
+      assert result.counts.not_found == 1
+      assert AdminRepo.get!(Article, b.id).status == :published
+    end
+
+    test "list_archivable_ids returns active matches and is tenant-scoped" do
+      %{tenant: tenant} = setup_tenant()
+      %{tenant: other} = setup_tenant()
+      src = Ecto.UUID.generate()
+
+      keep =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      _archived =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :archived,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      _other =
+        fixture(:article, %{
+          tenant_id: other.id,
+          status: :published,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      assert {:ok, ids} =
+               Knowledge.list_archivable_ids(tenant.id,
+                 source_type: "web_article",
+                 source_id: src
+               )
+
+      assert ids == [keep.id]
+    end
+  end
+
   # --- TC-19.3.2: List with tag overlap filtering ---
 
   describe "list_articles/2 source + idempotency filters (#134)" do

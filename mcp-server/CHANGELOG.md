@@ -5,6 +5,23 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.12.0 — 2026-06-22 (knowledge_bulk_delete)
+
+### Added
+
+- New `knowledge_bulk_delete` tool (requires `LOOPCTL_USER_KEY`): bulk
+  soft-delete (archive), partial-success. Selectors: `article_ids`,
+  `source_type`+`source_id` (dedup cleanup), or `tag`+`confirm:true`
+  (high-blast-radius, confirm required). Per-id outcomes
+  (archived/skipped/not_found/errored) in `meta.results`; idempotent
+  (already-archived skipped); auto-chunked, ≤5000/call; emits a warning when
+  the run is partial. Wraps the new `POST /api/v1/knowledge/bulk-delete`. (loopctl #136)
+
+### Note
+
+- 429 responses carry a `Retry-After` header (always ≥1s) plus
+  `X-RateLimit-*`; default limit 300 req/min/key (3x/tenant). (loopctl #136)
+
 ## 2.11.0 — 2026-06-22 (knowledge_list: lag-free enumeration)
 
 ### Added

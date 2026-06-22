@@ -404,6 +404,231 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
     end
   end
 
+  describe "POST /api/v1/knowledge/bulk-delete" do
+    test "archives valid ids and reports per-id outcomes for the rest", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      already = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      superseded = fixture(:article, %{tenant_id: tenant.id, status: :superseded})
+      missing = Ecto.UUID.generate()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "article_ids" => [draft.id, published.id, already.id, superseded.id, missing]
+        })
+
+      body = json_response(conn, 200)
+      assert body["meta"]["count"] == 2
+      assert body["meta"]["counts"]["archived"] == 2
+      assert body["meta"]["counts"]["skipped"] == 2
+      assert body["meta"]["counts"]["not_found"] == 1
+
+      by_id = Map.new(body["meta"]["results"], &{&1["id"], &1})
+      assert by_id[draft.id]["outcome"] == "archived"
+      assert by_id[published.id]["outcome"] == "archived"
+      assert by_id[already.id]["outcome"] == "skipped"
+      assert by_id[already.id]["reason"] == "already_archived"
+      assert by_id[superseded.id]["outcome"] == "skipped"
+      assert by_id[superseded.id]["reason"] == "not_archivable_from_superseded"
+      assert by_id[missing]["outcome"] == "not_found"
+
+      assert AdminRepo.get!(Article, draft.id).status == :archived
+      assert AdminRepo.get!(Article, published.id).status == :archived
+      assert AdminRepo.get!(Article, superseded.id).status == :superseded
+    end
+
+    test "supplying more than one selector is rejected (no silent confirm bypass)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dupe"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "article_ids" => [a.id],
+          "tag" => "dupe",
+          "confirm" => true
+        })
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "exactly ONE"
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "a half-specified source selector returns a clear pairing error", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"source_type" => "web_article"})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "provided together"
+    end
+
+    test "already-archived ids are idempotent (skipped, not errored)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      archived = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"article_ids" => [archived.id]})
+        |> json_response(200)
+
+      assert body["meta"]["count"] == 0
+      [r] = body["meta"]["results"]
+      assert r["outcome"] == "skipped"
+      assert r["reason"] == "already_archived"
+    end
+
+    test "deletes by source_type + source_id", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      src = Ecto.UUID.generate()
+
+      a =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      b =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :draft,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      other = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "source_type" => "web_article",
+          "source_id" => src
+        })
+        |> json_response(200)
+
+      assert body["meta"]["count"] == 2
+      assert AdminRepo.get!(Article, a.id).status == :archived
+      assert AdminRepo.get!(Article, b.id).status == :archived
+      assert AdminRepo.get!(Article, other.id).status == :published
+    end
+
+    test "delete by tag requires confirm: true", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      tagged = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dupe"]})
+
+      # Without confirm → 400, nothing archived.
+      refused =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe"})
+        |> json_response(400)
+
+      assert refused["error"]["message"] =~ "confirm"
+      assert AdminRepo.get!(Article, tagged.id).status == :published
+
+      # With confirm → archived.
+      ok =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe", "confirm" => true})
+        |> json_response(200)
+
+      assert ok["meta"]["count"] == 1
+      assert AdminRepo.get!(Article, tagged.id).status == :archived
+    end
+
+    test "an ambiguous/empty selector returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "Selectors"
+    end
+
+    test "an empty article_ids list returns 400 (not a no-op 200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"article_ids" => []})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "empty"
+    end
+
+    test "an empty tag with confirm archives nothing (zero-match 400, not everything)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["real"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "", "confirm" => true})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "No active articles"
+      # An empty-tag selector must NOT archive real articles.
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "agent role is forbidden (destructive, user+)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn
+      |> auth_conn(agent_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"article_ids" => [a.id]})
+      |> json_response(403)
+
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "cannot archive another tenant's articles (reported not_found)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+      b_article = fixture(:article, %{tenant_id: tenant_b.id, status: :published})
+
+      body =
+        conn
+        |> auth_conn(key_a)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"article_ids" => [b_article.id]})
+        |> json_response(200)
+
+      assert body["meta"]["counts"]["not_found"] == 1
+      assert AdminRepo.get!(Article, b_article.id).status == :published
+    end
+  end
+
   # --- TC-21.3.5: Drafts listing excludes published, includes source info ---
 
   describe "GET /api/v1/knowledge/drafts" do

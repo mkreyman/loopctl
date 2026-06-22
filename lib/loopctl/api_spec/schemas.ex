@@ -50,7 +50,13 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "RateLimitError",
-      description: "Rate limit exceeded response",
+      description:
+        "Rate limit exceeded. Default limits: 300 requests/minute per API key and 3x that " <>
+          "per tenant (superadmin keys are exempt; per-tenant overrides via the " <>
+          "`rate_limit_requests_per_minute` setting). Back off using the response headers: " <>
+          "`Retry-After` (seconds until the window resets, always >= 1), plus `X-RateLimit-Limit`, " <>
+          "`X-RateLimit-Remaining`, and `X-RateLimit-Reset` (Unix epoch seconds), which are set " <>
+          "on every response.",
       type: :object,
       properties: %{
         error: %Schema{
@@ -60,16 +66,10 @@ defmodule Loopctl.ApiSpec.Schemas do
             status: %Schema{type: :integer, example: 429},
             message: %Schema{type: :string, example: "Rate limit exceeded"}
           }
-        },
-        retry_after: %Schema{
-          type: :integer,
-          description: "Seconds until rate limit resets",
-          example: 45
         }
       },
       example: %{
-        error: %{status: 429, message: "Rate limit exceeded"},
-        retry_after: 45
+        error: %{status: 429, message: "Rate limit exceeded"}
       }
     })
   end
