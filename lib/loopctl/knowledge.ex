@@ -1315,7 +1315,7 @@ defmodule Loopctl.Knowledge do
 
     cond do
       ids == [] ->
-        {:error, :bad_request, "article_ids must not be empty"}
+        {:error, :bad_request, "article_ids must contain at least one UUID string"}
 
       length(ids) > @bulk_publish_max ->
         {:error, :bad_request,
@@ -1541,26 +1541,44 @@ defmodule Loopctl.Knowledge do
   end
 
   # Publish a chunk in one transaction; if it fails, retry each draft alone so a
-  # single bad row doesn't sink the whole chunk (true partial success).
+  # single bad row doesn't sink the whole chunk (true partial success). The retry
+  # is bounded: at most @bulk_publish_max single-row transactions per request
+  # (50 chunks x 100), so a pathological all-failing request can't run unbounded.
+  #
+  # NB: a draft -> published status update has no validation that can fail for a
+  # well-formed draft, so the `{:error, _}` branch is a defensive fallback for
+  # genuine DB-level failures (serialization, connection loss, a constraint
+  # regression). It is therefore not exercised by the integration tests without
+  # fault injection (which this codebase has no DI seam for) — the partial-success
+  # accounting around it (counts/results) is what the tests cover.
   defp publish_chunk_isolating_failures(tenant_id, chunk, opts) do
     case execute_bulk_publish(tenant_id, chunk, opts) do
       {:ok, published} ->
         {published, []}
 
       {:error, _changeset} ->
-        Enum.reduce(chunk, {[], []}, &publish_one_isolated(tenant_id, &1, opts, &2))
+        {pub, err} = Enum.reduce(chunk, {[], []}, &publish_one_isolated(tenant_id, &1, opts, &2))
+        log_chunk_failures(chunk, err)
+        {pub, err}
     end
   end
 
   defp publish_one_isolated(tenant_id, article, opts, {pub, err}) do
     case execute_bulk_publish(tenant_id, [article], opts) do
-      {:ok, published} ->
-        {pub ++ published, err}
-
-      {:error, _cs} ->
-        Logger.error("bulk_publish: failed to publish article #{article.id}")
-        {pub, err ++ [article.id]}
+      {:ok, published} -> {pub ++ published, err}
+      {:error, _cs} -> {pub, err ++ [article.id]}
     end
+  end
+
+  # One aggregated log line per failing chunk (not one per row) so a systemic
+  # failure of a large request can't flood the logs with thousands of lines.
+  defp log_chunk_failures(_chunk, []), do: :ok
+
+  defp log_chunk_failures(chunk, errored_ids) do
+    Logger.error(
+      "bulk_publish: #{length(errored_ids)}/#{length(chunk)} drafts failed to publish: " <>
+        Enum.join(errored_ids, ", ")
+    )
   end
 
   defp execute_bulk_publish(tenant_id, articles, opts) do
@@ -1594,16 +1612,26 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  # Enqueue embedding jobs for the just-published rows in a single insert_all,
-  # after the publish transaction has committed.
+  # Enqueue embedding jobs for the just-published rows, AFTER the publish
+  # transaction has committed. Best-effort and crash-proof: the publish is
+  # already durable, so a transient enqueue failure must never 500 the request or
+  # abort the remaining chunks — we log and move on (the embedding is
+  # re-derivable). Per-row `Oban.insert/1` (NOT `insert_all`) so the worker's
+  # `unique: [keys: [:article_id], period: 300]` window is honored — the basic
+  # Oban engine ignores `unique:` for `insert_all`. Bounded to <= 100 inserts per
+  # chunk.
   defp enqueue_bulk_embeddings(_tenant_id, []), do: :ok
 
   defp enqueue_bulk_embeddings(tenant_id, published) do
-    published
-    |> Enum.map(&ArticleEmbeddingWorker.new(%{article_id: &1.id, tenant_id: tenant_id}))
-    |> Oban.insert_all()
-
-    :ok
+    Enum.each(published, fn article ->
+      %{article_id: article.id, tenant_id: tenant_id}
+      |> ArticleEmbeddingWorker.new()
+      |> Oban.insert()
+    end)
+  rescue
+    e ->
+      Logger.error("bulk_publish: embedding enqueue failed: #{Exception.message(e)}")
+      :ok
   end
 
   defp add_bulk_audit_entries(
