@@ -1990,19 +1990,23 @@ const TOOLS = [
   {
     name: "knowledge_bulk_publish",
     description:
-      "Atomically publish up to 100 draft articles in a single call. " +
-      "REQUIRES LOOPCTL_USER_KEY to be set in the MCP server env (user role — " +
-      "orchestrator role is NOT sufficient for this destructive operation). " +
-      "All articles must be drafts belonging to the tenant; if any fail validation, " +
-      "the entire operation rolls back.",
+      "Publish draft articles, partial-success style. REQUIRES LOOPCTL_USER_KEY " +
+      "(user role — orchestrator is NOT sufficient). Every valid draft is published; " +
+      "each other id gets a per-id outcome instead of failing the whole call: " +
+      "published, skipped (already published — idempotent — or archived/superseded), " +
+      "not_found, or errored. Duplicate ids are de-duplicated and there is NO 100-id " +
+      "cap (larger requests are auto-chunked server-side). The response's meta.count " +
+      "is the number actually published; meta.counts has the full breakdown and " +
+      "meta.results is the per-id list in request order. Safe to retry — already " +
+      "published ids are skipped, not errored.",
     inputSchema: {
       type: "object",
       properties: {
         article_ids: {
           type: "array",
           items: { type: "string" },
-          description: "List of draft article UUIDs to publish (max 100).",
-          maxItems: 100,
+          description:
+            "Article UUIDs to publish. Any length (auto-chunked); duplicates ignored.",
         },
       },
       required: ["article_ids"],

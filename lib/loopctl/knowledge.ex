@@ -1248,41 +1248,55 @@ defmodule Loopctl.Knowledge do
     transition_article(tenant_id, article_id, :archived, "article.archived", opts)
   end
 
-  @doc """
-  Atomically publishes multiple draft articles.
+  # Drafts are published in batches of this size; a request with more ids than
+  # this is auto-chunked server-side rather than rejected.
+  @bulk_publish_chunk_size 100
 
-  Validates that all article IDs belong to the tenant and that all
-  articles are in `:draft` status. If any article fails validation,
-  the entire operation is rolled back (atomic Multi).
+  @doc """
+  Publishes draft articles, **partial-success** style.
+
+  Unlike the previous all-or-nothing behaviour, this publishes every valid
+  draft and reports a per-id outcome for the rest instead of failing the whole
+  call. Each requested id resolves to one of:
+
+  - `"published"` -- it was a draft and is now published
+  - `"skipped"` -- already published (idempotent no-op), or archived/superseded
+    (`reason` says which); publishing those is not applicable
+  - `"not_found"` -- no such article in this tenant
+  - `"errored"` -- the publish transaction for its chunk failed unexpectedly
+
+  Duplicate ids are de-duplicated. There is **no 100-id cap**: more than
+  #{@bulk_publish_chunk_size} ids are processed server-side in chunks, each its
+  own transaction, so one bad chunk never rolls back the others.
 
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
-  - `article_ids` -- list of article UUIDs (max 100)
+  - `article_ids` -- list of article UUIDs (any length; deduplicated)
   - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
 
   ## Returns
 
-  - `{:ok, %{published: [%Article{}], count: integer}}` on success
-  - `{:error, :bad_request, message}` when article_ids exceeds 100
-  - `{:error, :bad_request, message}` when article_ids is empty
-  - `{:error, :unprocessable_entity, message}` when any article is not a draft
-  - `{:error, :not_found}` when any article ID is not found in the tenant
+  - `{:ok, %{published: [%Article{}], results: [map()], counts: map()}}`
+  - `{:error, :bad_request, message}` when `article_ids` is empty/nil
+
+  `counts` has `:requested`, `:published`, `:skipped`, `:not_found`, `:errored`.
+  Each entry in `results` is `%{id:, outcome:, ...}` in request order.
   """
   @spec bulk_publish(Ecto.UUID.t(), [Ecto.UUID.t()], keyword()) ::
-          {:ok, %{published: [Article.t()], count: non_neg_integer()}}
-          | {:error, atom(), String.t()}
-          | {:error, :not_found}
-  def bulk_publish(tenant_id, article_ids, opts \\ []) do
-    cond do
-      article_ids == [] or is_nil(article_ids) ->
-        {:error, :bad_request, "article_ids must not be empty"}
+          {:ok, %{published: [Article.t()], results: [map()], counts: map()}}
+          | {:error, :bad_request, String.t()}
+  def bulk_publish(_tenant_id, article_ids, _opts) when article_ids in [nil, []] do
+    {:error, :bad_request, "article_ids must not be empty"}
+  end
 
-      length(article_ids) > 100 ->
-        {:error, :bad_request, "Maximum 100 articles per bulk publish"}
+  def bulk_publish(tenant_id, article_ids, opts) do
+    ids = article_ids |> List.wrap() |> Enum.uniq()
 
-      true ->
-        do_bulk_publish(tenant_id, article_ids, opts)
+    if ids == [] do
+      {:error, :bad_request, "article_ids must not be empty"}
+    else
+      {:ok, do_bulk_publish(tenant_id, ids, opts)}
     end
   end
 
@@ -1412,40 +1426,81 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_bulk_publish(tenant_id, article_ids, opts) do
-    # Fetch all articles up front and validate
-    articles =
+    # Load every requested article once, keyed by id (lag-free, DB-of-record).
+    existing =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.id in ^article_ids
       )
       |> AdminRepo.all()
+      |> Map.new(&{&1.id, &1})
 
-    with :ok <- validate_bulk_all_found(articles, article_ids),
-         :ok <- validate_bulk_all_drafts(articles) do
-      execute_bulk_publish(tenant_id, articles, article_ids, opts)
+    drafts =
+      for id <- article_ids,
+          match?(%Article{status: :draft}, Map.get(existing, id)),
+          do: Map.fetch!(existing, id)
+
+    # Publish drafts in bounded chunks; collect what actually published and any
+    # ids whose chunk failed unexpectedly.
+    {published, errored_ids} = publish_drafts_in_chunks(tenant_id, drafts, opts)
+    published_ids = MapSet.new(published, & &1.id)
+    errored_set = MapSet.new(errored_ids)
+
+    results =
+      Enum.map(article_ids, &bulk_publish_result(&1, existing, published_ids, errored_set))
+
+    by_outcome = Enum.frequencies_by(results, & &1.outcome)
+
+    %{
+      published: published,
+      results: results,
+      counts: %{
+        requested: length(article_ids),
+        published: Map.get(by_outcome, "published", 0),
+        skipped: Map.get(by_outcome, "skipped", 0),
+        not_found: Map.get(by_outcome, "not_found", 0),
+        errored: Map.get(by_outcome, "errored", 0)
+      }
+    }
+  end
+
+  # Per-id outcome, in request order. Precedence: errored > published > existing-state.
+  defp bulk_publish_result(id, existing, published_ids, errored_set) do
+    cond do
+      MapSet.member?(errored_set, id) ->
+        %{id: id, outcome: "errored"}
+
+      MapSet.member?(published_ids, id) ->
+        %{id: id, outcome: "published", status: "published"}
+
+      true ->
+        case Map.get(existing, id) do
+          nil ->
+            %{id: id, outcome: "not_found"}
+
+          %Article{status: :published} ->
+            %{id: id, outcome: "skipped", reason: "already_published", status: "published"}
+
+          %Article{status: status} ->
+            %{
+              id: id,
+              outcome: "skipped",
+              reason: "not_publishable_from_#{status}",
+              status: to_string(status)
+            }
+        end
     end
   end
 
-  defp validate_bulk_all_found(articles, article_ids) do
-    found_ids = MapSet.new(articles, & &1.id)
-    requested_ids = MapSet.new(article_ids)
-
-    if MapSet.subset?(requested_ids, found_ids) do
-      :ok
-    else
-      {:error, :not_found}
-    end
-  end
-
-  defp validate_bulk_all_drafts(articles) do
-    case Enum.find(articles, &(&1.status != :draft)) do
-      nil ->
-        :ok
-
-      non_draft ->
-        {:error, :unprocessable_entity,
-         "Article #{non_draft.id} is in status #{non_draft.status}, expected draft"}
-    end
+  defp publish_drafts_in_chunks(tenant_id, drafts, opts) do
+    drafts
+    |> Enum.chunk_every(@bulk_publish_chunk_size)
+    |> Enum.reduce({[], []}, fn chunk, {pub_acc, err_acc} ->
+      case execute_bulk_publish(tenant_id, chunk, Enum.map(chunk, & &1.id), opts) do
+        {:ok, %{published: published}} -> {pub_acc ++ published, err_acc}
+        {:error, _changeset} -> {pub_acc, err_acc ++ Enum.map(chunk, & &1.id)}
+      end
+    end)
   end
 
   defp execute_bulk_publish(tenant_id, articles, article_ids, opts) do

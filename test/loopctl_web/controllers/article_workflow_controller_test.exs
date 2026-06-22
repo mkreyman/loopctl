@@ -234,49 +234,101 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert audit_count == 3
     end
 
-    # --- TC-21.3.4: Bulk publish fails atomically when one is non-draft ---
+    # --- #132: partial success — publish the valid drafts, report the rest ---
 
-    test "fails atomically when one article is not a draft", %{conn: conn} do
+    test "publishes valid drafts and reports per-id outcomes for the rest", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
-      a1 = fixture(:article, %{tenant_id: tenant.id, status: :draft})
-      a2 = fixture(:article, %{tenant_id: tenant.id, status: :published})
-      a3 = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      already = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      archived = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      missing = Ecto.UUID.generate()
 
       conn =
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-publish", %{
-          "article_ids" => [a1.id, a2.id, a3.id]
+          "article_ids" => [draft.id, already.id, archived.id, missing]
         })
 
-      body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "expected draft"
+      body = json_response(conn, 200)
 
-      # None should have changed (atomic rollback)
-      assert AdminRepo.get!(Article, a1.id).status == :draft
-      assert AdminRepo.get!(Article, a2.id).status == :published
-      assert AdminRepo.get!(Article, a3.id).status == :draft
+      # Only the genuine draft is published; the call does NOT fail.
+      assert body["meta"]["count"] == 1
+      assert body["meta"]["counts"]["published"] == 1
+      assert body["meta"]["counts"]["skipped"] == 2
+      assert body["meta"]["counts"]["not_found"] == 1
+      assert body["meta"]["counts"]["requested"] == 4
+
+      outcomes = Map.new(body["meta"]["results"], &{&1["id"], &1["outcome"]})
+      assert outcomes[draft.id] == "published"
+      assert outcomes[already.id] == "skipped"
+      assert outcomes[archived.id] == "skipped"
+      assert outcomes[missing] == "not_found"
+
+      # The draft really published; the others are untouched.
+      assert AdminRepo.get!(Article, draft.id).status == :published
+      assert AdminRepo.get!(Article, already.id).status == :published
+      assert AdminRepo.get!(Article, archived.id).status == :archived
     end
 
-    test "returns 404 when an article ID does not belong to tenant", %{conn: conn} do
+    test "already-published ids are an idempotent no-op (skipped, not 422)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{"article_ids" => [published.id]})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["count"] == 0
+      assert body["meta"]["counts"]["skipped"] == 1
+      [result] = body["meta"]["results"]
+      assert result["outcome"] == "skipped"
+      assert result["reason"] == "already_published"
+    end
+
+    test "duplicate ids are de-duplicated", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{
+          "article_ids" => [draft.id, draft.id, draft.id]
+        })
+
+      body = json_response(conn, 200)
+      assert body["meta"]["counts"]["requested"] == 1
+      assert body["meta"]["counts"]["published"] == 1
+      assert length(body["meta"]["results"]) == 1
+    end
+
+    test "another tenant's article id is reported not_found, not a hard failure", %{conn: conn} do
       tenant = fixture(:tenant)
       other_tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
       a1 = fixture(:article, %{tenant_id: tenant.id, status: :draft})
-      # Article belongs to a different tenant
       a2 = fixture(:article, %{tenant_id: other_tenant.id, status: :draft})
 
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-publish", %{
-          "article_ids" => [a1.id, a2.id]
-        })
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{"article_ids" => [a1.id, a2.id]})
 
-      assert json_response(conn, 404)
+      body = json_response(conn, 200)
+      assert body["meta"]["counts"]["published"] == 1
+      assert body["meta"]["counts"]["not_found"] == 1
+      # The other tenant's article is untouched.
+      assert AdminRepo.get!(Article, a2.id).status == :draft
     end
 
     test "returns 400 when article_ids is empty", %{conn: conn} do
@@ -294,21 +346,26 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["error"]["message"] =~ "must not be empty"
     end
 
-    test "returns 400 when article_ids exceeds 100", %{conn: conn} do
+    test "accepts more than 100 ids (auto-chunked server-side)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
-      ids = Enum.map(1..101, fn _ -> Ecto.UUID.generate() end)
+      drafts =
+        for n <- 1..105 do
+          fixture(:article, %{tenant_id: tenant.id, status: :draft, title: "Bulk #{n}"})
+        end
+
+      ids = Enum.map(drafts, & &1.id)
 
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-publish", %{
-          "article_ids" => ids
-        })
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{"article_ids" => ids})
 
-      body = json_response(conn, 400)
-      assert body["error"]["message"] =~ "Maximum 100"
+      body = json_response(conn, 200)
+      assert body["meta"]["count"] == 105
+      assert body["meta"]["counts"]["published"] == 105
+      assert Enum.all?(drafts, &(AdminRepo.get!(Article, &1.id).status == :published))
     end
   end
 
@@ -454,7 +511,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert json_response(conn, 404)
     end
 
-    test "bulk publish cannot see other tenant's articles", %{conn: conn} do
+    test "bulk publish cannot see or touch other tenant's articles", %{conn: conn} do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
       {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
@@ -469,8 +526,12 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "article_ids" => [a_own.id, a_other.id]
         })
 
-      # The other tenant's article is not found
-      assert json_response(conn, 404)
+      body = json_response(conn, 200)
+      outcomes = Map.new(body["meta"]["results"], &{&1["id"], &1["outcome"]})
+      assert outcomes[a_own.id] == "published"
+      # The other tenant's article is invisible → reported not_found and untouched.
+      assert outcomes[a_other.id] == "not_found"
+      assert AdminRepo.get!(Article, a_other.id).status == :draft
     end
 
     test "drafts listing is tenant-scoped", %{conn: conn} do

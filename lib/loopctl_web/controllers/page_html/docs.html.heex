@@ -1016,7 +1016,8 @@
                 <span class="text-accent-400">knowledge_bulk_publish</span>
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Publish up to 100 draft articles in a single call. Requires
+                Publish draft articles (partial-success; no 100-id cap, auto-chunked).
+                Already-published ids are skipped idempotently; per-id outcomes in <span class="font-mono text-slate-300">meta.results</span>. Requires
                 <span class="font-mono text-slate-300">LOOPCTL_USER_KEY</span>
                 env var (destructive operation).
               </p>
