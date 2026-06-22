@@ -843,24 +843,28 @@ async function knowledgeLint({ project_id, stale_days, min_coverage, max_per_cat
   return toContent(result);
 }
 
-async function knowledgeIngest({ url, content, source_type, project_id }) {
+async function knowledgeIngest({ url, content, source_type, project_id, publish }) {
   const body = { source_type };
   if (url) body.url = url;
   if (content) body.content = content;
   if (project_id) body.project_id = project_id;
+  if (publish) body.publish = true;
   const result = await apiCall("POST", "/api/v1/knowledge/ingest", body, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
 
-async function knowledgeIngestBatch({ items, project_id }) {
-  // If a batch-level project_id is supplied, apply it as a default to every
-  // item that doesn't already set its own.
+async function knowledgeIngestBatch({ items, project_id, publish }) {
+  // Apply batch-level project_id / publish as defaults to any item that doesn't
+  // set its own.
   const resolvedItems = Array.isArray(items)
-    ? items.map((item) =>
-        project_id && item && item.project_id == null
-          ? { ...item, project_id }
-          : item
-      )
+    ? items.map((item) => {
+        if (!item) return item;
+        let resolved = item;
+        if (project_id && resolved.project_id == null)
+          resolved = { ...resolved, project_id };
+        if (publish && resolved.publish == null) resolved = { ...resolved, publish: true };
+        return resolved;
+      })
     : items;
 
   const result = await apiCall(
@@ -2429,7 +2433,9 @@ const TOOLS = [
     description:
       "Submit a URL or raw content for knowledge extraction. " +
       "Enqueues an Oban job that fetches the content (if URL), extracts knowledge articles via LLM, " +
-      "and inserts them as draft articles. Requires orchestrator role.",
+      "and inserts them. Extracted articles are DRAFTS by default (lower-trust LLM output, staged " +
+      "for review) — unlike knowledge_create which publishes by default. Pass publish:true to " +
+      "publish them on extraction. Requires orchestrator role.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2448,6 +2454,11 @@ const TOOLS = [
         project_id: {
           type: "string",
           description: "Optional: scope extracted articles to a specific project UUID.",
+        },
+        publish: {
+          type: "boolean",
+          description:
+            "Optional: publish extracted articles immediately instead of staging them as drafts (default false).",
         },
       },
       required: ["source_type"],
@@ -2487,6 +2498,11 @@ const TOOLS = [
                 type: "string",
                 description: "Optional: scope the item to a specific project UUID.",
               },
+              publish: {
+                type: "boolean",
+                description:
+                  "Optional: publish this item's extracted articles immediately (default false → draft).",
+              },
               metadata: {
                 type: "object",
                 description: "Optional metadata map.",
@@ -2498,6 +2514,10 @@ const TOOLS = [
         project_id: {
           type: "string",
           description: "Optional batch-level default project UUID applied to items that don't specify their own.",
+        },
+        publish: {
+          type: "boolean",
+          description: "Optional batch-level default publish flag applied to items that don't specify their own.",
         },
       },
       required: ["items"],

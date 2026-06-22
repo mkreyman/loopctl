@@ -2,6 +2,57 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-22 — knowledge wiki harvest-hardening (#132–#138)
+
+A batch of Knowledge Wiki API changes for reliable agent/harvest workflows.
+(Supersedes the #120 draft-by-default + orchestrator-publish-gate notes below.)
+
+### Added
+
+- **Idempotency_key (#137):** `POST /api/v1/articles` accepts `idempotency_key`
+  (per-article, max 255). Re-creating with the same key is a no-op that returns
+  a reference to the existing article (`deduplicated: true`, id only — no body),
+  preventing partial duplicates on re-capture. Distinct from
+  `source_type`/`source_id` (a shared source identifier).
+- **Lag-free enumeration (#134/#135):** `GET /api/v1/articles` filters by
+  `source_type`, `source_id`, and `idempotency_key`; new MCP `knowledge_list`
+  wraps it. This is the lag-free, all-status read of record for
+  dedup/idempotency/repair — vs `knowledge_search`, which is ranked,
+  published-only, and lags writes.
+- **Bulk delete (#136):** `POST /api/v1/knowledge/bulk-delete` (role user) —
+  partial-success soft-delete by `article_ids`, `source_type`+`source_id`, or
+  `tag`+`confirm:true` (exactly one selector). MCP `knowledge_bulk_delete`.
+- **Ingest publish opt-in (#133):** `POST /api/v1/knowledge/ingest` + `/batch`
+  accept `publish: true`; extracted articles stay **draft by default**
+  (lower-trust LLM output) but can be published in one step.
+
+### Changed
+
+- **Publish-on-create is the default for every role, including agent (#133)** —
+  `POST /api/v1/articles` publishes immediately; draft is now the opt-in
+  (`draft: true` / `status: "draft"`). The orchestrator-only publish gate is
+  removed on the create path (publishing a wiki article is neither destructive
+  nor story chain-of-custody); the standalone publish endpoint and system-scope
+  gate are unchanged.
+- **Bulk-publish is partial-success + uncapped (#132, #138.3):** publishes every
+  valid draft and returns per-id outcomes (published/skipped/not_found/errored)
+  in `meta.results` instead of failing the whole call; already-published ids are
+  skipped (idempotent); the 100-id cap is gone (auto-chunked, ≤5000).
+- **Tag cap raised 20 → 50 (#138.2).**
+
+### Fixed
+
+- **Invalid `?status=`/`?category=` → 400 with allowed values (#138.1)** on
+  `GET /api/v1/articles` (was a 404/500 from an `Ecto.Enum` cast); malformed
+  list/map query params no longer 500.
+- **429 `Retry-After` is always ≥ 1s (#136)** (was `reset_at - now`, which could
+  be ≤ 0 at a window boundary); rate limits documented on `RateLimitError`.
+
+### Docs
+
+- Documented the witness/STH request-header workflow for non-MCP clients (#138.4)
+  and the search-vs-list distinction.
+
 ## [Unreleased] — 2026-06-19 — create-and-publish + draft note (#120)
 
 ### Added

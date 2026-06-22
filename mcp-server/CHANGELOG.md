@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.13.0 — 2026-06-22 (ingest publish opt-in)
+
+### Added
+
+- `knowledge_ingest` and `knowledge_ingest_batch` accept `publish: true` to
+  publish extracted articles immediately. Ingested (LLM-extracted) articles
+  remain **drafts by default** — lower-trust output staged for review, distinct
+  from `knowledge_create`'s publish-by-default — but can now be published in one
+  step. `knowledge_ingest_batch` supports a batch-level `publish` default and a
+  per-item override. Completes loopctl #133 (the ingest half).
+
 ## 2.12.0 — 2026-06-22 (knowledge_bulk_delete)
 
 ### Added
