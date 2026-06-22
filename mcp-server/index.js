@@ -779,6 +779,37 @@ async function knowledgeDelete({ article_id }) {
   return toContent(result);
 }
 
+async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, confirm }) {
+  const payload = {};
+  if (article_ids) payload.article_ids = article_ids;
+  if (source_type) payload.source_type = source_type;
+  if (source_id) payload.source_id = source_id;
+  if (tag) payload.tag = tag;
+  if (confirm) payload.confirm = confirm;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/bulk-delete",
+    payload,
+    process.env.LOOPCTL_USER_KEY,
+  );
+
+  // Partial success returns 200 even when some ids didn't archive — surface a
+  // warning so the agent doesn't treat not_found/errored as success.
+  const counts = result?.meta?.counts;
+  if (counts && (counts.not_found > 0 || counts.errored > 0)) {
+    const warning =
+      `WARNING: bulk-delete was partial — archived ${counts.archived}, ` +
+      `skipped ${counts.skipped}, not_found ${counts.not_found}, errored ${counts.errored} ` +
+      `(of ${counts.requested}). Inspect meta.results; not_found/errored ids were NOT archived.`;
+    return {
+      content: [{ type: "text", text: warning }, ...toContent(result).content],
+    };
+  }
+
+  return toContent(result);
+}
+
 async function knowledgeDrafts({ limit, offset, project_id }) {
   const params = new URLSearchParams();
   params.set(
@@ -2209,6 +2240,46 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_bulk_delete",
+    description:
+      "Bulk soft-delete (archive) articles, partial-success style. REQUIRES LOOPCTL_USER_KEY " +
+      "(user role — orchestrator is NOT sufficient). Provide EXACTLY ONE selector: " +
+      "article_ids (explicit list), source_type + source_id (every active article from that " +
+      "source — clean dedup cleanup), or tag + confirm:true (every active article carrying the " +
+      "tag — high blast radius, so confirm:true is required). Honors soft-delete (rows move to " +
+      "archived, never dropped). Each id gets a per-id outcome (archived / skipped / not_found / " +
+      "errored); meta.count = archived, meta.counts/meta.results give the breakdown. Already-" +
+      "archived ids are skipped (idempotent). Bounded to 5000 per call. Safe to retry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Explicit article UUIDs to archive (selector 1).",
+        },
+        source_type: {
+          type: "string",
+          description: "With source_id: archive every active article from this source (selector 2).",
+        },
+        source_id: {
+          type: "string",
+          description: "With source_type: the source entity UUID (selector 2).",
+        },
+        tag: {
+          type: "string",
+          description:
+            "Archive every active article carrying this tag (selector 3). Requires confirm:true.",
+        },
+        confirm: {
+          type: "boolean",
+          description: "Required (true) when deleting by tag — guards the high blast radius.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_drafts",
     description:
       "List draft (unpublished) knowledge articles. Requires orchestrator role. " +
@@ -2785,6 +2856,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_delete":
       return await knowledgeDelete(args);
+
+    case "knowledge_bulk_delete":
+      return await knowledgeBulkDelete(args);
 
     case "knowledge_drafts":
       return await knowledgeDrafts(args);

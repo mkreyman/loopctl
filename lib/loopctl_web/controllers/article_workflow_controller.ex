@@ -6,6 +6,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   - `POST /api/v1/articles/:id/unpublish` -- unpublish a published article (user+)
   - `POST /api/v1/articles/:id/archive` -- archive an article (user+)
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
+  - `POST /api/v1/knowledge/bulk-delete` -- bulk archive/soft-delete (user+)
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
   """
 
@@ -22,7 +23,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:drafts, :publish]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:unpublish, :archive, :bulk_publish]
+       [role: :user] when action in [:unpublish, :archive, :bulk_publish, :bulk_delete]
 
   tags(["Knowledge Wiki"])
 
@@ -119,6 +120,53 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     }
   )
 
+  operation(:bulk_delete,
+    summary: "Bulk delete (archive) articles",
+    description:
+      "Soft-deletes (archives) articles **partial-success** style. Provide exactly one " <>
+        "selector: `article_ids` (explicit list), `source_type` + `source_id` (every active " <>
+        "article from that source — clean dedup cleanup), or `tag` + `confirm: true` (every " <>
+        "active article carrying the tag — high blast radius, so `confirm: true` is required). " <>
+        "Honors soft-delete: rows move to `archived`, not dropped. Each id gets a per-id " <>
+        "`outcome` (`archived`; `skipped` with `already_archived`/`not_archivable_from_superseded`; " <>
+        "`not_found`; `errored`). `meta.count` = number archived; `meta.counts`/`meta.results` " <>
+        "give the breakdown. Bounded to 5000 per call. Role: user+.",
+    request_body:
+      {"Bulk delete selector", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           article_ids: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string, format: :uuid}
+           },
+           source_type: %OpenApiSpex.Schema{type: :string},
+           source_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           tag: %OpenApiSpex.Schema{type: :string},
+           confirm: %OpenApiSpex.Schema{
+             type: :boolean,
+             description: "Required (true) when deleting by tag."
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Bulk delete result (partial success; see meta.results / meta.counts)",
+         "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      400 =>
+        {"Bad request (no/ambiguous selector, tag without confirm, empty match, or over cap)",
+         "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   operation(:drafts,
     summary: "List draft articles",
     description:
@@ -196,6 +244,69 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       })
     end
   end
+
+  @doc "POST /api/v1/knowledge/bulk-delete"
+  def bulk_delete(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    with {:ok, ids} <- resolve_bulk_delete_ids(tenant_id, params),
+         {:ok, result} <- Knowledge.bulk_archive(tenant_id, ids, audit_opts) do
+      json(conn, %{
+        data: Enum.map(result.archived, &ArticleJSON.article_data/1),
+        meta: %{
+          # `count` = number actually archived.
+          count: result.counts.archived,
+          counts: result.counts,
+          results: result.results
+        }
+      })
+    end
+  end
+
+  # Resolve the bulk-delete selector to a concrete id list. Exactly one of:
+  #   - article_ids: [..]                  (explicit list)
+  #   - source_type + source_id            (every active article from that source)
+  #   - tag + confirm: true                (every active article carrying the tag;
+  #                                         confirm required — high blast radius)
+  defp resolve_bulk_delete_ids(_tenant_id, %{"article_ids" => ids}) when is_list(ids),
+    do: {:ok, ids}
+
+  defp resolve_bulk_delete_ids(tenant_id, %{"source_type" => type, "source_id" => src})
+       when is_binary(type) and is_binary(src) do
+    archivable_ids_or_error(tenant_id, source_type: type, source_id: src)
+  end
+
+  defp resolve_bulk_delete_ids(tenant_id, %{"tag" => tag} = params) when is_binary(tag) do
+    if truthy?(params["confirm"]) do
+      archivable_ids_or_error(tenant_id, tags: [tag])
+    else
+      {:error, :bad_request,
+       "Deleting by tag archives every active article carrying it — pass confirm: true to proceed."}
+    end
+  end
+
+  defp resolve_bulk_delete_ids(_tenant_id, _params) do
+    {:error, :bad_request,
+     "Provide exactly one selector: article_ids (list), source_type + source_id, or tag + confirm: true."}
+  end
+
+  defp archivable_ids_or_error(tenant_id, filters) do
+    case Knowledge.list_archivable_ids(tenant_id, filters) do
+      {:ok, []} ->
+        {:error, :bad_request, "No active articles match the selector."}
+
+      {:ok, ids} ->
+        {:ok, ids}
+
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
+    end
+  end
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?(_), do: false
 
   @doc "GET /api/v1/knowledge/drafts"
   def drafts(conn, params) do

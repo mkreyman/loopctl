@@ -118,6 +118,28 @@ async function knowledgeStats({ project_id }) {
   return toContent(result);
 }
 
+async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, confirm }) {
+  const payload = {};
+  if (article_ids) payload.article_ids = article_ids;
+  if (source_type) payload.source_type = source_type;
+  if (source_id) payload.source_id = source_id;
+  if (tag) payload.tag = tag;
+  if (confirm) payload.confirm = confirm;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/bulk-delete",
+    payload,
+    process.env.LOOPCTL_USER_KEY,
+  );
+  const counts = result?.meta?.counts;
+  if (counts && (counts.not_found > 0 || counts.errored > 0)) {
+    return {
+      content: [{ type: "text", text: "WARNING: partial" }, ...toContent(result).content],
+    };
+  }
+  return toContent(result);
+}
+
 async function knowledgeList({
   project_id,
   category,
@@ -981,5 +1003,51 @@ describe("knowledge_list: lag-free enumeration (#134/#135)", () => {
     assert.equal(q.get("idempotency_key"), "only-this");
     assert.equal(q.get("source_type"), null);
     assert.equal(q.get("status"), null);
+  });
+});
+
+describe("knowledge_bulk_delete (#136)", () => {
+  test("routes to POST /api/v1/knowledge/bulk-delete on the user key with article_ids", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    const calls = mockFetch({ data: [], meta: { count: 0, counts: {}, results: [] } });
+
+    await knowledgeBulkDelete({ article_ids: ["11111111-1111-1111-1111-111111111111"] });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, "/api/v1/knowledge/bulk-delete");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, "Bearer lc_test_user_key");
+    assert.deepEqual(JSON.parse(options.body).article_ids, [
+      "11111111-1111-1111-1111-111111111111",
+    ]);
+  });
+
+  test("forwards the source and tag selectors", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    const calls = mockFetch({ data: [], meta: { count: 0, counts: {}, results: [] } });
+
+    await knowledgeBulkDelete({ source_type: "web_article", source_id: "s", tag: "t", confirm: true });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.equal(sent.source_type, "web_article");
+    assert.equal(sent.source_id, "s");
+    assert.equal(sent.tag, "t");
+    assert.equal(sent.confirm, true);
+    assert.equal(sent.article_ids, undefined);
+  });
+
+  test("prepends a warning when the run is partial (not_found/errored > 0)", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    mockFetch({
+      data: [],
+      meta: { count: 0, counts: { archived: 0, skipped: 0, not_found: 1, errored: 0 }, results: [] },
+    });
+
+    const result = await knowledgeBulkDelete({ article_ids: ["x"] });
+    assert.match(result.content[0].text, /WARNING/);
   });
 });

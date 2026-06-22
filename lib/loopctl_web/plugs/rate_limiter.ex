@@ -75,9 +75,13 @@ defmodule LoopctlWeb.Plugs.RateLimiter do
   end
 
   defp deny_response(conn, limit, reset_at) do
+    # Seconds until the window resets; always >= 1 so a client at the window
+    # boundary still backs off rather than hot-looping on a 0/negative value.
+    retry_after = max(1, reset_at - System.system_time(:second))
+
     conn
     |> put_rate_limit_headers(limit, 0, reset_at)
-    |> put_resp_header("retry-after", to_string(reset_at - System.system_time(:second)))
+    |> put_resp_header("retry-after", to_string(retry_after))
     |> put_status(:too_many_requests)
     |> Phoenix.Controller.json(%{
       error: %{status: 429, message: "Rate limit exceeded"}
