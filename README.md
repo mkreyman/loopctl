@@ -775,7 +775,7 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (55)
+### Available Tools (57)
 
 Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summary:
 
@@ -813,19 +813,21 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query | agent |
-| `knowledge_create` | Create an article (published by default; `draft: true` to stage) | agent |
+| `knowledge_list` | List articles (full fields, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair | agent |
+| `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture) | agent |
 | `knowledge_publish` | Publish an existing draft article | orchestrator |
-| `knowledge_bulk_publish` | Atomically publish up to 100 drafts | user |
+| `knowledge_bulk_publish` | Publish drafts, partial-success (per-id results, idempotent, no 100-cap) | user |
 | `knowledge_unpublish` | Revert a published article back to draft | user |
 | `knowledge_archive` | Soft-delete an article (retained for audit) | user |
 | `knowledge_delete` | Alias for archive (DELETE verb archives) | user |
+| `knowledge_bulk_delete` | Bulk soft-delete (archive), partial-success — by id-list, source, or tag+confirm | user |
 | `knowledge_drafts` | List draft (unpublished) articles | orchestrator |
 | `knowledge_lint` | Lint check for stale or low-coverage articles | orchestrator |
 | `knowledge_export` | Export all articles as a ZIP archive | orchestrator |
 | `knowledge_okf_export` | Export the wiki as an OKF v0.1 bundle | user |
 | `knowledge_okf_import` | Import an OKF v0.1 bundle from a directory | user |
-| `knowledge_ingest` | Submit a URL/content for knowledge extraction | orchestrator |
-| `knowledge_ingest_batch` | Submit up to 50 ingestion items | orchestrator |
+| `knowledge_ingest` | Submit a URL/content for knowledge extraction (draft by default; `publish: true` to publish) | orchestrator |
+| `knowledge_ingest_batch` | Submit up to 50 ingestion items (per-item / batch `publish`) | orchestrator |
 | `knowledge_ingestion_jobs` | List recent ingestion jobs | orchestrator |
 | `knowledge_analytics_top` | Top accessed articles | orchestrator |
 | `knowledge_article_stats` | Per-article usage stats | orchestrator |
