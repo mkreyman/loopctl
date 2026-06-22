@@ -231,3 +231,99 @@ loopctl supports external observability tooling through its API and data model:
 - **`/loopctl:observe` pattern**: Orchestrators can POST structured audit events to loopctl (session
   start/end, rule violations, review outcomes) and query them back via the audit API. This allows
   post-run analysis of orchestrator behavior without coupling to any specific AI tool's log format.
+
+## Elixir / Phoenix guidelines
+
+These are the stock `phx.new` rules, condensed. Each line is a hard rule.
+
+### Elixir
+- Lists have no index access (`list[i]`) — use `Enum.at/2`, pattern match, or `List`.
+- No `else if` / `elsif` — use `cond` or `case` for multiple conditionals.
+- Block expressions (`if`/`case`/`cond`) must have their result bound to a var; never rebind inside the block (`socket = if ... do assign(...) end`, not assigning inside).
+- Use `with` for chaining `{:ok, _}` / `{:error, _}`.
+- One module per file (nesting risks cyclic deps / compile errors).
+- No map-access syntax on structs (`struct[:field]`) — access fields directly, or `Ecto.Changeset.get_field/2` for changesets.
+- Use stdlib `Time`/`Date`/`DateTime`/`Calendar` for date/time; add no deps except `date_time_parser` for parsing.
+- Never `String.to_atom/1` on user input (memory leak).
+- Predicate fns end in `?`, not an `is_` prefix (reserve `is_` for guards).
+- `DynamicSupervisor`/`Registry` need a `name:` in the child spec.
+- `Task.async_stream/3` for concurrent enumeration with backpressure (usually `timeout: :infinity`).
+
+### Mix
+- Read `mix help <task>` before using a task.
+- Debug tests with `mix test path/to_test.exs` or `mix test --failed`.
+- Avoid `mix deps.clean --all` (almost never needed).
+
+### Phoenix
+- A `scope` block's alias prefixes all routes inside it — never add your own alias; watch for double prefixes.
+- `Phoenix.View` is gone — don't use it.
+- `mix precommit` when done. HTTP via `Req` only (not httpoison/tesla/httpc).
+
+### Ecto
+- Preload associations that templates will access.
+- `import Ecto.Query` (and friends) in `seeds.exs`.
+- Schema fields use `:string` even for `:text` columns.
+- `validate_number/2` has no `:allow_nil` option (validations already skip nil/absent changes).
+- Access changeset fields via `Ecto.Changeset.get_field/2`.
+- Programmatic fields (e.g. `user_id`) are never in `cast` — set them explicitly on the struct.
+
+### HEEx
+- Templates use `~H` or `.heex` files, never `~E`.
+- Forms: `Phoenix.Component.form/1` + `inputs_for/1` + `to_form/2`; never `Phoenix.HTML.form_for`/`inputs_for`. Access fields as `@form[:field]`.
+- Unique DOM IDs on forms/buttons/key elements (for tests).
+- App-wide imports go in `my_app_web.ex`'s `html_helpers` block.
+- Literal `{`/`}` in `<pre>`/`<code>` needs `phx-no-curly-interpolation` on the parent tag.
+- `class` conditionals must use list syntax and wrap inline `if` in parens:
+  `class={["px-2", @flag && "py-5", if(@cond, do: "a", else: "b")]}`. Bare `{...}` without `[]` is a compile error.
+- Generate template content with `<%= for item <- @col do %>`, never `<% Enum.each %>`.
+- Comments are `<%!-- comment --%>`.
+- Interpolation: use `{...}` in attrs and in tag bodies; use `<%= ... %>` ONLY for block constructs (if/cond/case/for) inside tag bodies. Never `<%= %>` inside an attribute.
+
+### LiveView
+- No `live_redirect`/`live_patch` — use `<.link navigate=/patch=>` and `push_navigate`/`push_patch`.
+- Avoid LiveComponents unless strongly justified.
+- Name LiveViews `AppWeb.FooLive`; the `:browser` scope is already aliased (`live "/foo", FooLive`).
+- A `phx-hook` that manages its own DOM also needs `phx-update="ignore"`.
+- No inline `<script>` in HEEx — put JS in `assets/js` and wire it through `app.js`.
+
+#### Streams
+- Use streams for collections (avoids memory ballooning). Parent needs a DOM `id` + `phx-update="stream"`; each child uses the stream-provided id as its DOM id:
+  ```
+  <div id="messages" phx-update="stream">
+    <div :for={{id, msg} <- @streams.messages} id={id}>{msg.text}</div>
+  </div>
+  ```
+- Streams aren't enumerable — to filter/refresh, refetch and re-stream with `reset: true`.
+- No built-in count or empty-state: track count in a separate assign; empty state via `<div class="hidden only:block">…</div>` (only works when it's the sole sibling of the for-comprehension).
+- Never `phx-update="append"`/`"prepend"`.
+
+#### LiveView tests
+- `Phoenix.LiveViewTest` + `LazyHTML`; forms via `render_submit/2` / `render_change/2`.
+- Assert on elements and IDs (`has_element?/2`, `element/2`), never raw HTML; test outcomes, not implementation.
+- Debug by scoping output with `LazyHTML.from_fragment` + `LazyHTML.filter`.
+
+#### Forms
+- From params: `to_form(params)` (string keys), or `to_form(params, as: :user)` to nest.
+- From changeset: `changeset |> to_form()` — `:as` is auto-computed; submit yields `%{"user" => params}`.
+- Always drive the UI from a `to_form/2` assign: `<.form for={@form} id="x-form">` + `<.input field={@form[:field]}>`. FORBIDDEN: passing a changeset to `<.form>`, or `<.form let={f}>`.
+
+### Phoenix v1.8
+- LiveView templates begin with `<Layouts.app flash={@flash} ...>` (wraps all content); `Layouts` is already aliased.
+- `current_scope` errors → move routes to the proper `live_session` and pass `current_scope` to `<Layouts.app>`.
+- `<.flash_group>` only inside `layouts.ex`.
+- Icons via `<.icon name="hero-x-mark" class="w-5 h-5"/>`, never `Heroicons`.
+- Use the imported `<.input>` for inputs; overriding its `class` drops ALL default classes (style fully).
+
+### CSS / JS
+- Tailwind v4: no `tailwind.config.js`. Keep app.css's `@import "tailwindcss" source(none);` + `@source` lines.
+- No `@apply`; hand-write Tailwind components (no daisyUI) for a unique look.
+- Only `app.js` / `app.css` bundles ship — import vendor deps there; no external `src`/`href`, no inline `<script>`.
+- UI/UX: world-class, usable, modern — subtle micro-interactions, clean typography/spacing/balance, delightful hover/loading/transition details.
+
+### Authentication (`phx.gen.auth`)
+- Handle auth at the router level with proper redirects.
+- It creates two live_sessions: `:current_user` (works with or without auth) and `:require_authenticated_user` (auth required). Both assign `@current_scope` — NOT `@current_user`.
+- Access the user via `current_scope.user`; never use `@current_user` in templates/LiveViews.
+- Always state which scope / live_session / pipeline a route goes in, AND WHY.
+- Auth-required routes → the existing `:require_authenticated_user` block. Optional-auth routes → the existing `:current_user` block.
+- Never duplicate a `live_session` name — all routes for a name live in one block.
