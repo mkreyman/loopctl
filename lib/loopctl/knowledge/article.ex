@@ -50,6 +50,7 @@ defmodule Loopctl.Knowledge.Article do
     field :tags, {:array, :string}, default: []
     field :source_type, :string
     field :source_id, :binary_id
+    field :idempotency_key, :string
     field :metadata, :map, default: %{}
 
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
@@ -70,9 +71,12 @@ defmodule Loopctl.Knowledge.Article do
     :tags,
     :source_type,
     :source_id,
+    :idempotency_key,
     :metadata,
     :project_id
   ]
+
+  @max_idempotency_key_length 255
 
   @doc """
   Changeset for creating a new article.
@@ -98,6 +102,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_required([:title, :body, :category])
     |> validate_length(:title, max: 500)
     |> validate_length(:body, max: 100_000)
+    |> validate_length(:idempotency_key, max: @max_idempotency_key_length)
     |> validate_slug()
     |> validate_tags()
     |> validate_source_type()
@@ -107,6 +112,10 @@ defmodule Loopctl.Knowledge.Article do
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
       message: "is already taken in this tenant"
+    )
+    |> unique_constraint(:idempotency_key,
+      name: :articles_tenant_idempotency_key_idx,
+      message: "has already been captured (idempotency_key)"
     )
     |> unique_constraint(:slug,
       name: :articles_system_slug_idx,

@@ -344,6 +344,118 @@ defmodule LoopctlWeb.ArticleControllerTest do
     end
   end
 
+  describe "POST /api/v1/articles idempotency_key (#137)" do
+    test "re-create with the same idempotency_key is a no-op (returns existing, even with a different body)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      first =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Captured Note One",
+          "body" => "first capture",
+          "category" => "reference",
+          "idempotency_key" => "book:42:note:1"
+        })
+        |> json_response(201)
+
+      first_id = first["data"]["id"]
+      assert first["data"]["idempotency_key"] == "book:42:note:1"
+
+      # Same key, DIFFERENT title + body → still a no-op (the key is the identity),
+      # so no partial duplicate is created.
+      resp =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Captured Note One (re-titled)",
+          "body" => "a re-capture with changed content",
+          "category" => "reference",
+          "idempotency_key" => "book:42:note:1"
+        })
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      assert resp["data"]["id"] == first_id
+      assert resp["data"]["body"] == "first capture"
+    end
+
+    test "different idempotency_keys create distinct articles", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      a =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Note A",
+          "body" => "a",
+          "category" => "reference",
+          "idempotency_key" => "k-a"
+        })
+        |> json_response(201)
+
+      b =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Note B",
+          "body" => "b",
+          "category" => "reference",
+          "idempotency_key" => "k-b"
+        })
+        |> json_response(201)
+
+      assert a["data"]["id"] != b["data"]["id"]
+    end
+
+    test "the same idempotency_key in two tenants does not collide", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})
+
+      payload = %{
+        "title" => "Shared Key Note",
+        "body" => "content",
+        "category" => "reference",
+        "idempotency_key" => "shared"
+      }
+
+      a = conn |> auth_conn(key_a) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      b =
+        build_conn()
+        |> auth_conn(key_b)
+        |> post(~p"/api/v1/articles", payload)
+        |> json_response(201)
+
+      refute a["data"]["deduplicated"]
+      refute b["data"]["deduplicated"]
+      assert a["data"]["id"] != b["data"]["id"]
+    end
+
+    test "an over-long idempotency_key is rejected with 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Long Key",
+          "body" => "x",
+          "category" => "reference",
+          "idempotency_key" => String.duplicate("a", 256)
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["details"]["idempotency_key"] != nil
+    end
+  end
+
   describe "POST /api/v1/projects/:project_id/articles" do
     test "creates a project-scoped article", %{conn: conn} do
       tenant = fixture(:tenant)

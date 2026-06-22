@@ -67,6 +67,15 @@ defmodule LoopctlWeb.ArticleController do
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
            source_type: %OpenApiSpex.Schema{type: :string, nullable: true},
            source_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
+           idempotency_key: %OpenApiSpex.Schema{
+             type: :string,
+             nullable: true,
+             description:
+               "Optional stable per-article key for idempotent capture (max 255). " <>
+                 "Re-creating with the same key is a no-op that returns the existing " <>
+                 "article (200, `deduplicated: true`) instead of a partial duplicate. " <>
+                 "Distinct from source_type/source_id, which identify a shared source."
+           },
            metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
          }
        }},

@@ -848,7 +848,10 @@
                 says which outcome occurred. Pass
                 <span class="font-mono text-slate-300">draft: true</span>
                 (or <span class="font-mono text-slate-300">status: "draft"</span>)
-                to stage it for later review instead.
+                to stage it for later review instead. Pass
+                <span class="font-mono text-slate-300">idempotency_key</span>
+                for idempotent capture — re-creating with the same key returns the
+                existing article instead of a duplicate.
               </p>
             </div>
           </div>

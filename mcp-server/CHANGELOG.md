@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.10.0 — 2026-06-22 (knowledge_create idempotency_key + provenance)
+
+### Added
+
+- `knowledge_create` now accepts `idempotency_key` for idempotent capture:
+  re-creating with the same key is a clean no-op that returns the existing
+  article (`deduplicated: true`) instead of a partial duplicate — distinct from
+  `source_type`/`source_id`, which mark a shared source across many articles.
+- `knowledge_create` now forwards `source_type` and `source_id` (previously
+  dropped by the tool) so provenance can be recorded on create. (loopctl #137)
+
 ## 2.9.0 — 2026-06-22 (knowledge_bulk_publish partial success)
 
 ### Changed
