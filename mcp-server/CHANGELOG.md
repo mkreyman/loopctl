@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.9.0 — 2026-06-22 (knowledge_bulk_publish partial success)
+
+### Changed
+
+- `knowledge_bulk_publish` is now **partial-success** and **idempotent**: every
+  valid draft is published; other ids are reported per-id as `skipped` (already
+  published, or archived/superseded), `not_found`, or `errored` instead of
+  failing the whole call with a 422/404. The **100-id cap is removed** (larger
+  requests are auto-chunked server-side) and duplicate ids are de-duplicated.
+  The response gains `meta.counts` and `meta.results`; `meta.count` still equals
+  the number actually published. Safe to retry. (loopctl #132, #138)
+
 ## 2.8.0 — 2026-06-22 (knowledge_create publishes by default)
 
 ### Changed

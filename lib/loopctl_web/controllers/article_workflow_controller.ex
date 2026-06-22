@@ -77,9 +77,20 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   operation(:bulk_publish,
     summary: "Bulk publish articles",
     description:
-      "Atomically publishes up to 100 draft articles. " <>
-        "All articles must be drafts belonging to the tenant. " <>
-        "If any article fails validation, the entire operation is rolled back. Role: user+.",
+      "Publishes draft articles **partial-success** style. Every valid draft is " <>
+        "published; each other id gets a per-id `outcome` instead of failing the whole " <>
+        "call: `published`; `skipped` (with `reason` `already_published` — idempotent — " <>
+        "or `not_publishable_from_archived`/`not_publishable_from_superseded`); " <>
+        "`not_found` (no such article in this tenant, incl. malformed ids); or " <>
+        "`errored` (`reason` `publish_failed`). **A 200 does NOT mean everything " <>
+        "published** — inspect `meta.counts`: a request of all already-published or " <>
+        "not-found ids still returns 200 with `count: 0`. Duplicate ids are " <>
+        "de-duplicated. There is **no 100-id cap** (auto-chunked server-side, each " <>
+        "chunk its own transaction; a failing chunk is retried row-by-row so one bad " <>
+        "row never sinks the rest), but a single request is bounded to 5000 ids " <>
+        "(400 above that). `meta.count` = number actually published; `meta.counts` has " <>
+        "requested/published/skipped/not_found/errored; `meta.results` is the per-id " <>
+        "breakdown in request order. Role: user+.",
     request_body:
       {"Bulk publish params", "application/json",
        %OpenApiSpex.Schema{
@@ -88,14 +99,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
          properties: %{
            article_ids: %OpenApiSpex.Schema{
              type: :array,
-             items: %OpenApiSpex.Schema{type: :string, format: :uuid},
-             maxItems: 100
+             items: %OpenApiSpex.Schema{type: :string, format: :uuid}
            }
          }
        }},
     responses: %{
       200 =>
-        {"Bulk publish result", "application/json",
+        {"Bulk publish result (partial success; see meta.results / meta.counts)",
+         "application/json",
          %OpenApiSpex.Schema{
            type: :object,
            properties: %{
@@ -103,9 +114,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              meta: %OpenApiSpex.Schema{type: :object}
            }
          }},
-      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
-      404 => {"Article not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Non-draft article", "application/json", Schemas.ErrorResponse},
+      400 => {"Bad request (empty article_ids)", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -176,7 +185,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     with {:ok, result} <- Knowledge.bulk_publish(tenant_id, article_ids, audit_opts) do
       json(conn, %{
         data: Enum.map(result.published, &ArticleJSON.article_data/1),
-        meta: %{count: result.count}
+        meta: %{
+          # `count` kept for backward compatibility = number actually published.
+          count: result.counts.published,
+          counts: result.counts,
+          # Per-id breakdown so a partial run is actionable (published / skipped /
+          # not_found / errored), in request order.
+          results: result.results
+        }
       })
     end
   end

@@ -33,6 +33,8 @@ defmodule Loopctl.Knowledge do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -1248,41 +1250,79 @@ defmodule Loopctl.Knowledge do
     transition_article(tenant_id, article_id, :archived, "article.archived", opts)
   end
 
-  @doc """
-  Atomically publishes multiple draft articles.
+  # Drafts are published in batches of this size; a request with more ids than
+  # this is auto-chunked server-side rather than rejected.
+  @bulk_publish_chunk_size 100
 
-  Validates that all article IDs belong to the tenant and that all
-  articles are in `:draft` status. If any article fails validation,
-  the entire operation is rolled back (atomic Multi).
+  # Hard ceiling on a single bulk-publish request. High enough that the old
+  # 100-cap is gone for real workloads, but bounded so one request can't load an
+  # unbounded set of full article rows into memory (mirrors export_obsidian).
+  @bulk_publish_max 5_000
+
+  @doc """
+  Publishes draft articles, **partial-success** style.
+
+  Unlike the previous all-or-nothing behaviour, this publishes every valid
+  draft and reports a per-id outcome for the rest instead of failing the whole
+  call. Each requested id resolves to one of:
+
+  - `"published"` -- it was a draft and is now published
+  - `"skipped"` -- already published (idempotent no-op), or archived/superseded
+    (`reason` says which); publishing those is not applicable
+  - `"not_found"` -- no such article in this tenant
+  - `"errored"` -- the publish transaction failed unexpectedly (a failing chunk
+    is retried row-by-row, so only the genuinely-bad rows are marked errored)
+
+  Duplicate ids are de-duplicated and malformed (non-UUID) ids resolve to
+  `"not_found"`. There is **no 100-id cap**: ids are published server-side in
+  chunks of #{@bulk_publish_chunk_size}, each its own transaction, so one bad
+  row never rolls back the others. A single request is still bounded to
+  #{@bulk_publish_max} ids (beyond that, `{:error, :bad_request, _}`) so it
+  can't load an unbounded set of full rows into memory.
+
+  Because this is partial-success, a `2xx`/`{:ok, _}` does NOT imply everything
+  published — callers must inspect `counts` (a request of all already-published
+  or not-found ids still returns `{:ok, _}` with `published: 0`).
 
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
-  - `article_ids` -- list of article UUIDs (max 100)
+  - `article_ids` -- list of article UUIDs (any length up to #{@bulk_publish_max};
+    deduplicated)
   - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
 
   ## Returns
 
-  - `{:ok, %{published: [%Article{}], count: integer}}` on success
-  - `{:error, :bad_request, message}` when article_ids exceeds 100
-  - `{:error, :bad_request, message}` when article_ids is empty
-  - `{:error, :unprocessable_entity, message}` when any article is not a draft
-  - `{:error, :not_found}` when any article ID is not found in the tenant
+  - `{:ok, %{published: [%Article{}], results: [map()], counts: map()}}`
+  - `{:error, :bad_request, message}` when `article_ids` is empty/nil or exceeds
+    #{@bulk_publish_max}
+
+  `counts` has `:requested`, `:published`, `:skipped`, `:not_found`, `:errored`.
+  Each entry in `results` is `%{id:, outcome:, ...}` in request order.
   """
   @spec bulk_publish(Ecto.UUID.t(), [Ecto.UUID.t()], keyword()) ::
-          {:ok, %{published: [Article.t()], count: non_neg_integer()}}
-          | {:error, atom(), String.t()}
-          | {:error, :not_found}
-  def bulk_publish(tenant_id, article_ids, opts \\ []) do
-    cond do
-      article_ids == [] or is_nil(article_ids) ->
-        {:error, :bad_request, "article_ids must not be empty"}
+          {:ok, %{published: [Article.t()], results: [map()], counts: map()}}
+          | {:error, :bad_request, String.t()}
+  def bulk_publish(_tenant_id, article_ids, _opts) when article_ids in [nil, []] do
+    {:error, :bad_request, "article_ids must not be empty"}
+  end
 
-      length(article_ids) > 100 ->
-        {:error, :bad_request, "Maximum 100 articles per bulk publish"}
+  def bulk_publish(tenant_id, article_ids, opts) do
+    # Drop non-string junk up front (real callers send JSON string ids); a
+    # non-UUID string survives here and resolves to a clean "not_found" rather
+    # than crashing the `id in ^ids` query.
+    ids = article_ids |> List.wrap() |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    cond do
+      ids == [] ->
+        {:error, :bad_request, "article_ids must contain at least one UUID string"}
+
+      length(ids) > @bulk_publish_max ->
+        {:error, :bad_request,
+         "Maximum #{@bulk_publish_max} article ids per bulk publish; split into smaller calls"}
 
       true ->
-        do_bulk_publish(tenant_id, article_ids, opts)
+        {:ok, do_bulk_publish(tenant_id, ids, opts)}
     end
   end
 
@@ -1412,43 +1452,136 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_bulk_publish(tenant_id, article_ids, opts) do
-    # Fetch all articles up front and validate
-    articles =
+    # Only well-formed UUIDs can be looked up; a malformed string would raise on
+    # the `id in ^ids` cast, so keep it out of the query — it resolves to a clean
+    # "not_found" via the absent `existing` entry below.
+    queryable_ids = Enum.filter(article_ids, &valid_uuid?/1)
+
+    # Load every requested article once, keyed by id (lag-free, DB-of-record).
+    existing =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
-        where: a.id in ^article_ids
+        where: a.id in ^queryable_ids
       )
       |> AdminRepo.all()
+      |> Map.new(&{&1.id, &1})
 
-    with :ok <- validate_bulk_all_found(articles, article_ids),
-         :ok <- validate_bulk_all_drafts(articles) do
-      execute_bulk_publish(tenant_id, articles, article_ids, opts)
+    drafts =
+      for id <- article_ids,
+          match?(%Article{status: :draft}, Map.get(existing, id)),
+          do: Map.fetch!(existing, id)
+
+    # Publish drafts in bounded chunks; collect what actually published and any
+    # ids whose chunk failed unexpectedly.
+    {published, errored_ids} = publish_drafts_in_chunks(tenant_id, drafts, opts)
+    published_ids = MapSet.new(published, & &1.id)
+    errored_set = MapSet.new(errored_ids)
+
+    results =
+      Enum.map(article_ids, &bulk_publish_result(&1, existing, published_ids, errored_set))
+
+    by_outcome = Enum.frequencies_by(results, & &1.outcome)
+
+    %{
+      published: published,
+      results: results,
+      counts: %{
+        requested: length(article_ids),
+        published: Map.get(by_outcome, "published", 0),
+        skipped: Map.get(by_outcome, "skipped", 0),
+        not_found: Map.get(by_outcome, "not_found", 0),
+        errored: Map.get(by_outcome, "errored", 0)
+      }
+    }
+  end
+
+  defp valid_uuid?(id) when is_binary(id), do: match?({:ok, _}, Ecto.UUID.cast(id))
+  defp valid_uuid?(_), do: false
+
+  # Per-id outcome, in request order. Precedence: errored > published > existing-state.
+  defp bulk_publish_result(id, existing, published_ids, errored_set) do
+    cond do
+      MapSet.member?(errored_set, id) ->
+        %{id: id, outcome: "errored", reason: "publish_failed"}
+
+      MapSet.member?(published_ids, id) ->
+        %{id: id, outcome: "published", status: "published"}
+
+      true ->
+        case Map.get(existing, id) do
+          nil ->
+            %{id: id, outcome: "not_found"}
+
+          %Article{status: :published} ->
+            %{id: id, outcome: "skipped", reason: "already_published", status: "published"}
+
+          %Article{status: status} ->
+            %{
+              id: id,
+              outcome: "skipped",
+              reason: "not_publishable_from_#{status}",
+              status: to_string(status)
+            }
+        end
     end
   end
 
-  defp validate_bulk_all_found(articles, article_ids) do
-    found_ids = MapSet.new(articles, & &1.id)
-    requested_ids = MapSet.new(article_ids)
+  defp publish_drafts_in_chunks(tenant_id, drafts, opts) do
+    drafts
+    |> Enum.chunk_every(@bulk_publish_chunk_size)
+    |> Enum.reduce({[], []}, fn chunk, {pub_acc, err_acc} ->
+      {published, errored_ids} = publish_chunk_isolating_failures(tenant_id, chunk, opts)
+      # Embeddings are enqueued AFTER the publish transaction commits, and only
+      # for rows that actually published — Oban runs on a separate repo/pool from
+      # AdminRepo, so enqueuing inside the transaction would leak jobs for rows
+      # that rolled back.
+      enqueue_bulk_embeddings(tenant_id, published)
+      {pub_acc ++ published, err_acc ++ errored_ids}
+    end)
+  end
 
-    if MapSet.subset?(requested_ids, found_ids) do
-      :ok
-    else
-      {:error, :not_found}
+  # Publish a chunk in one transaction; if it fails, retry each draft alone so a
+  # single bad row doesn't sink the whole chunk (true partial success). The retry
+  # is bounded: at most @bulk_publish_max single-row transactions per request
+  # (50 chunks x 100), so a pathological all-failing request can't run unbounded.
+  #
+  # NB: a draft -> published status update has no validation that can fail for a
+  # well-formed draft, so the `{:error, _}` branch is a defensive fallback for
+  # genuine DB-level failures (serialization, connection loss, a constraint
+  # regression). It is therefore not exercised by the integration tests without
+  # fault injection (which this codebase has no DI seam for) — the partial-success
+  # accounting around it (counts/results) is what the tests cover.
+  defp publish_chunk_isolating_failures(tenant_id, chunk, opts) do
+    case execute_bulk_publish(tenant_id, chunk, opts) do
+      {:ok, published} ->
+        {published, []}
+
+      {:error, _changeset} ->
+        {pub, err} = Enum.reduce(chunk, {[], []}, &publish_one_isolated(tenant_id, &1, opts, &2))
+        log_chunk_failures(chunk, err)
+        {pub, err}
     end
   end
 
-  defp validate_bulk_all_drafts(articles) do
-    case Enum.find(articles, &(&1.status != :draft)) do
-      nil ->
-        :ok
-
-      non_draft ->
-        {:error, :unprocessable_entity,
-         "Article #{non_draft.id} is in status #{non_draft.status}, expected draft"}
+  defp publish_one_isolated(tenant_id, article, opts, {pub, err}) do
+    case execute_bulk_publish(tenant_id, [article], opts) do
+      {:ok, published} -> {pub ++ published, err}
+      {:error, _cs} -> {pub, err ++ [article.id]}
     end
   end
 
-  defp execute_bulk_publish(tenant_id, articles, article_ids, opts) do
+  # One aggregated log line per failing chunk (not one per row) so a systemic
+  # failure of a large request can't flood the logs with thousands of lines.
+  defp log_chunk_failures(_chunk, []), do: :ok
+
+  defp log_chunk_failures(chunk, errored_ids) do
+    Logger.error(
+      "bulk_publish: #{length(errored_ids)}/#{length(chunk)} drafts failed to publish: " <>
+        Enum.join(errored_ids, ", ")
+    )
+  end
+
+  defp execute_bulk_publish(tenant_id, articles, opts) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -1464,7 +1597,6 @@ defmodule Loopctl.Knowledge do
         Multi.update(multi, {:publish, idx}, changeset)
       end)
       |> add_bulk_audit_entries(tenant_id, indexed_articles, actor_id, actor_label, actor_type)
-      |> add_bulk_embedding_jobs(tenant_id, article_ids)
 
     case AdminRepo.transaction(multi) do
       {:ok, results} ->
@@ -1473,11 +1605,33 @@ defmodule Loopctl.Knowledge do
           |> Enum.map(fn {_article, idx} -> Map.get(results, {:publish, idx}) end)
           |> Enum.reject(&is_nil/1)
 
-        {:ok, %{published: published, count: length(published)}}
+        {:ok, published}
 
       {:error, _key, changeset, _completed} ->
         {:error, changeset}
     end
+  end
+
+  # Enqueue embedding jobs for the just-published rows, AFTER the publish
+  # transaction has committed. Best-effort and crash-proof: the publish is
+  # already durable, so a transient enqueue failure must never 500 the request or
+  # abort the remaining chunks — we log and move on (the embedding is
+  # re-derivable). Per-row `Oban.insert/1` (NOT `insert_all`) so the worker's
+  # `unique: [keys: [:article_id], period: 300]` window is honored — the basic
+  # Oban engine ignores `unique:` for `insert_all`. Bounded to <= 100 inserts per
+  # chunk.
+  defp enqueue_bulk_embeddings(_tenant_id, []), do: :ok
+
+  defp enqueue_bulk_embeddings(tenant_id, published) do
+    Enum.each(published, fn article ->
+      %{article_id: article.id, tenant_id: tenant_id}
+      |> ArticleEmbeddingWorker.new()
+      |> Oban.insert()
+    end)
+  rescue
+    e ->
+      Logger.error("bulk_publish: embedding enqueue failed: #{Exception.message(e)}")
+      :ok
   end
 
   defp add_bulk_audit_entries(
@@ -1504,17 +1658,6 @@ defmodule Loopctl.Knowledge do
           new_state: %{"status" => to_string(updated.status)}
         }
       end)
-    end)
-  end
-
-  defp add_bulk_embedding_jobs(multi, tenant_id, article_ids) do
-    Multi.run(multi, :embedding_jobs, fn _repo, _changes ->
-      Enum.each(article_ids, fn article_id ->
-        ArticleEmbeddingWorker.new(%{article_id: article_id, tenant_id: tenant_id})
-        |> Oban.insert()
-      end)
-
-      {:ok, :enqueued}
     end)
   end
 
