@@ -15,7 +15,6 @@ defmodule LoopctlWeb.ArticleController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
-  alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
@@ -37,12 +36,13 @@ defmodule LoopctlWeb.ArticleController do
     description:
       "Creates a tenant-wide or project-scoped article. " <>
         "When called via POST /projects/:project_id/articles, project_id is set from path. " <>
-        "Articles are created as **draft** (not visible in search/index/context) and the " <>
-        "response carries a `note` saying so. Pass `publish: true` to create-and-publish in " <>
-        "one call — this requires role **orchestrator+** (mirrors POST /articles/:id/publish); " <>
-        "an agent requesting publish gets 403. The initial status is set by the server: a " <>
-        "caller-supplied `status` is ignored except that `status: \"published\"` is treated as " <>
-        "`publish: true` (and likewise gated). Role: agent+ (publish: orchestrator+).",
+        "Articles are **published immediately by default** (visible in search/index/context) " <>
+        "for every role, including agent. To stage an article for later review instead, pass " <>
+        "`draft: true` (or `status: \"draft\"`); the response `note` says which outcome " <>
+        "occurred. The initial status is set by the server — a caller-supplied `status` is " <>
+        "ignored except that `status: \"draft\"` is honoured as the draft opt-in (so " <>
+        "archived/superseded can't be conjured at create time; those are workflow " <>
+        "transitions). Role: agent+.",
     request_body:
       {"Article params", "application/json",
        %OpenApiSpex.Schema{
@@ -55,10 +55,11 @@ defmodule LoopctlWeb.ArticleController do
              type: :string,
              enum: ["pattern", "convention", "decision", "finding", "reference"]
            },
-           publish: %OpenApiSpex.Schema{
+           draft: %OpenApiSpex.Schema{
              type: :boolean,
              description:
-               "Create and publish in one call (requires orchestrator+). Default false (draft)."
+               "Stage as a draft instead of publishing on create. Default false " <>
+                 "(article is published immediately)."
            },
            tags: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :string}},
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
@@ -69,11 +70,11 @@ defmodule LoopctlWeb.ArticleController do
        }},
     responses: %{
       201 =>
-        {"Article created (response includes a `note`; `status` is draft unless published)",
+        {"Article created (response includes a `note`; `status` is published unless draft)",
          "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       403 =>
-        {"Publish requested without orchestrator role, or system scope without superadmin",
-         "application/json", Schemas.ErrorResponse},
+        {"System scope requested without superadmin role", "application/json",
+         Schemas.ErrorResponse},
       200 =>
         {"Idempotent: an active article with the same title and an identical body " <>
            "already exists; it is returned unchanged with `deduplicated: true`.",
@@ -167,56 +168,37 @@ defmodule LoopctlWeb.ArticleController do
   def create(conn, params) do
     scope = params["scope"] || "tenant"
     api_key = conn.assigns.current_api_key
-    publish? = publish_requested?(params)
+    draft? = draft_requested?(params)
 
-    cond do
-      # System articles require superadmin role
-      scope == "system" and api_key.role != :superadmin ->
-        conn
-        |> put_status(:forbidden)
-        |> json(%{
-          error: %{
-            status: 403,
-            code: "system_scope_forbidden",
-            message: "System-scoped articles require superadmin role"
-          }
-        })
+    # System articles require superadmin role; everything else is agent+.
+    if scope == "system" and api_key.role != :superadmin do
+      conn
+      |> put_status(:forbidden)
+      |> json(%{
+        error: %{
+          status: 403,
+          code: "system_scope_forbidden",
+          message: "System-scoped articles require superadmin role"
+        }
+      })
+    else
+      tenant_id = api_key.tenant_id
+      audit_opts = AuditContext.from_conn(conn)
 
-      # Publishing on create is gated like POST /articles/:id/publish — agents
-      # cannot self-publish. This also closes the prior gap where a caller could
-      # set status: "published" directly in the create payload.
-      publish? and not Role.role_at_least?(api_key.role, :orchestrator) ->
-        conn
-        |> put_status(:forbidden)
-        |> json(%{
-          error: %{
-            status: 403,
-            code: "publish_requires_orchestrator",
-            message:
-              "Creating a published article requires role :orchestrator or higher. " <>
-                "Create it as a draft (omit publish/status), then publish it via " <>
-                "POST /articles/:id/publish."
-          }
-        })
+      # If project_id comes from the path (project-scoped route), merge it into
+      # attrs, then set the initial status server-side (never trusting the
+      # caller's `status`): published by default, draft only when the caller
+      # explicitly opted in via draft:true / status:"draft".
+      attrs =
+        params
+        |> maybe_merge_project_id(params["project_id"])
+        |> put_create_status(draft?)
 
-      true ->
-        tenant_id = api_key.tenant_id
-        audit_opts = AuditContext.from_conn(conn)
-
-        # If project_id comes from the path (project-scoped route), merge it into
-        # attrs, then set the initial status server-side (never trusting the
-        # caller's `status`): draft by default, published only when an
-        # orchestrator+ explicitly asked.
-        attrs =
-          params
-          |> maybe_merge_project_id(params["project_id"])
-          |> put_create_status(publish?)
-
-        create_article(conn, tenant_id, attrs, audit_opts, publish?)
+      create_article(conn, tenant_id, attrs, audit_opts)
     end
   end
 
-  defp create_article(conn, tenant_id, attrs, audit_opts, publish?) do
+  defp create_article(conn, tenant_id, attrs, audit_opts) do
     case Knowledge.create_article(tenant_id, attrs, audit_opts) do
       {:ok, article} ->
         conn
@@ -234,7 +216,7 @@ defmodule LoopctlWeb.ArticleController do
           %{article: existing}
           |> ArticleJSON.create()
           |> Map.put(:deduplicated, true)
-          |> Map.put(:note, dedup_note(existing, publish?))
+          |> Map.put(:note, dedup_note(existing))
 
         conn
         |> put_status(:ok)
@@ -338,10 +320,10 @@ defmodule LoopctlWeb.ArticleController do
 
   # --- Private helpers ---
 
-  # A caller asks to publish-on-create via `publish: true` (or the legacy
-  # `status: "published"`, which is treated the same and gated the same way).
-  defp publish_requested?(params) do
-    truthy?(params["publish"]) or params["status"] == "published"
+  # A caller opts into staging a draft (instead of the publish-on-create default)
+  # via `draft: true` or the equivalent `status: "draft"`.
+  defp draft_requested?(params) do
+    truthy?(params["draft"]) or params["status"] == "draft"
   end
 
   defp truthy?(true), do: true
@@ -349,13 +331,16 @@ defmodule LoopctlWeb.ArticleController do
   defp truthy?(_), do: false
 
   # The initial status is set by the server, never trusted from the caller:
-  # create only ever yields a draft, or (for an authorized publish request) a
-  # published article. A caller-supplied `status` is dropped so archived/
-  # superseded can't be conjured at create time (those are workflow transitions).
+  # create yields a published article by default, or a draft when the caller
+  # explicitly opted in. Any caller-supplied `status`/`draft`/`publish` is
+  # dropped so archived/superseded can't be conjured at create time (those are
+  # workflow transitions) and an old `publish:`/`status:"published"` payload is
+  # harmless (it just gets the default published outcome).
   defp put_create_status(attrs, true),
-    do: attrs |> Map.delete("publish") |> Map.put("status", "published")
+    do: attrs |> Map.drop(["publish", "draft"]) |> Map.put("status", "draft")
 
-  defp put_create_status(attrs, false), do: Map.drop(attrs, ["publish", "status"])
+  defp put_create_status(attrs, false),
+    do: attrs |> Map.drop(["publish", "draft"]) |> Map.put("status", "published")
 
   defp create_response(article) do
     %{article: article}
@@ -370,28 +355,22 @@ defmodule LoopctlWeb.ArticleController do
     do:
       "Created as a draft (status: \"draft\"). It is NOT yet visible to agents in " <>
         "search/index/context. Publish it via POST /articles/:id/publish (MCP " <>
-        "knowledge_publish, orchestrator role), or pass publish: true on create " <>
-        "(orchestrator role) to create-and-publish in one call."
+        "knowledge_publish), or omit `draft` to publish on create."
 
   # Note for the deduplicated (no-op) case. The article already existed and was
   # returned unchanged, so nothing was created OR published in this call —
-  # spelled out per existing status (and whether publish was requested) so the
-  # caller isn't misled by a "Created…"/"published…" message.
-  defp dedup_note(%{status: :published}, _publish?),
+  # spelled out per existing status so the caller isn't misled by a
+  # "Created…"/"published…" message.
+  defp dedup_note(%{status: :published}),
     do:
       "An identical published article already existed and was returned unchanged (already visible to agents)."
 
-  defp dedup_note(%{status: :draft}, true),
-    do:
-      "An identical draft already existed and was returned unchanged — it was NOT " <>
-        "published. Publish it via POST /articles/:id/publish."
-
-  defp dedup_note(%{status: :draft}, _publish?),
+  defp dedup_note(%{status: :draft}),
     do:
       "An identical draft already existed and was returned unchanged. It is a draft " <>
         "(NOT visible to agents); publish it via POST /articles/:id/publish."
 
-  defp dedup_note(_existing, _publish?),
+  defp dedup_note(_existing),
     do: "An identical article already existed and was returned unchanged."
 
   defp maybe_merge_project_id(attrs, nil), do: attrs
