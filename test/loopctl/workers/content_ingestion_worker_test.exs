@@ -56,6 +56,37 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert is_binary(article.source_id)
       assert article.tags == ["genserver", "otp"]
     end
+
+    test "publishes extracted articles when publish: true is set" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        {:ok,
+         [
+           %{
+             title: "Published from ingest",
+             body: "Visible immediately.",
+             category: :pattern,
+             tags: ["x"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 43,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "raw",
+                   "content_hash" => "pub123",
+                   "source_type" => "newsletter",
+                   "publish" => true
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.status == :published
+    end
   end
 
   # --- Success: fetches URL and extracts ---

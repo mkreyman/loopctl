@@ -37,6 +37,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
+  alias Loopctl.Workers.ArticleEmbeddingWorker
 
   @content_extractor Application.compile_env(
                        :loopctl,
@@ -64,6 +65,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     url = args["url"]
     raw_content = args["content"]
     project_id = args["project_id"]
+    # Default draft; publish only when the ingest request opted in (#133).
+    publish = args["publish"] == true
 
     # Generate a deterministic source_id from the content_hash.
     # source_id must be a UUID (:binary_id), so we derive one from the hash.
@@ -72,7 +75,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     with {:ok, content} <- resolve_content(url, raw_content),
          {:ok, raw_articles} <- extract_with_chunking(content, source_type) do
       articles = validate_and_filter(raw_articles)
-      insert_articles(tenant_id, source_id, source_type, project_id, articles, url)
+      insert_articles(tenant_id, source_id, source_type, project_id, articles, url, publish)
     end
   end
 
@@ -282,11 +285,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     is_binary(tag) and String.length(tag) <= @max_tag_length and Regex.match?(@tag_pattern, tag)
   end
 
-  defp insert_articles(_tenant_id, _job_id, _source_type, _project_id, [], _url) do
+  defp insert_articles(_tenant_id, _job_id, _source_type, _project_id, [], _url, _publish) do
     :ok
   end
 
-  defp insert_articles(tenant_id, job_id, source_type, project_id, articles, url) do
+  defp insert_articles(tenant_id, job_id, source_type, project_id, articles, url, publish) do
+    status = if publish, do: :published, else: :draft
+
     multi =
       articles
       |> Enum.with_index()
@@ -296,7 +301,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         article = %Article{
           tenant_id: tenant_id,
           source_type: source_type,
-          source_id: job_id
+          source_id: job_id,
+          status: status
         }
 
         article =
@@ -334,10 +340,16 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, _changes} ->
+      {:ok, changes} ->
+        # Published articles need embeddings to be semantically searchable;
+        # enqueue AFTER commit (Oban runs on a separate repo/pool). Drafts get
+        # none. Best-effort: a transient enqueue failure must not fail the job
+        # (the rows are durably committed).
+        if publish, do: enqueue_embeddings(tenant_id, changes)
+
         Logger.info(
           "ContentIngestionWorker: extracted #{length(articles)} articles " <>
-            "(source_type=#{source_type}, url=#{url || "inline"})"
+            "(source_type=#{source_type}, url=#{url || "inline"}, publish=#{publish})"
         )
 
         :ok
@@ -350,6 +362,23 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
         {:error, {:insert_failed, step, changeset}}
     end
+  end
+
+  # Enqueue an embedding job for each just-inserted (published) article. Runs
+  # post-commit and is best-effort: a transient enqueue failure is logged, never
+  # raised, so it can't fail/retry the whole ingestion job.
+  defp enqueue_embeddings(tenant_id, changes) do
+    changes
+    |> Enum.filter(fn {key, _} -> match?({:article, _}, key) end)
+    |> Enum.each(fn {_key, article} ->
+      %{article_id: article.id, tenant_id: tenant_id}
+      |> ArticleEmbeddingWorker.new()
+      |> Oban.insert()
+    end)
+  rescue
+    e ->
+      Logger.error("ContentIngestionWorker: embedding enqueue failed: #{Exception.message(e)}")
+      :ok
   end
 
   defp normalize_attrs(attrs) when is_map(attrs) do

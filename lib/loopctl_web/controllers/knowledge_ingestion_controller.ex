@@ -23,7 +23,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     description:
       "Submit a URL or raw content for knowledge extraction. " <>
         "Enqueues an Oban job that fetches the content (if URL), extracts knowledge " <>
-        "articles via LLM, and inserts them as drafts. Role: orchestrator+.",
+        "articles via LLM, and inserts them. Extracted articles are created as " <>
+        "**drafts by default** (lower-trust LLM output, staged for review) — unlike " <>
+        "direct POST /articles which publishes by default. Pass `publish: true` to " <>
+        "publish them on extraction instead. Role: orchestrator+.",
     request_body:
       {"Ingestion request", "application/json",
        %OpenApiSpex.Schema{
@@ -45,6 +48,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            project_id: %OpenApiSpex.Schema{
              type: :string,
              description: "Optional project UUID to scope extracted articles"
+           },
+           publish: %OpenApiSpex.Schema{
+             type: :boolean,
+             description:
+               "Publish extracted articles immediately instead of staging them as " <>
+                 "drafts. Default false (draft)."
            },
            metadata: %OpenApiSpex.Schema{
              type: :object,
@@ -143,7 +152,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
              description:
                "Array of ingestion items (max 50). Each item has the same shape as " <>
                  "POST /knowledge/ingest: url or content, source_type (required), " <>
-                 "project_id (optional), metadata (optional).",
+                 "project_id (optional), publish (optional, default false → draft), " <>
+                 "metadata (optional).",
              maxItems: 50
            }
          },
@@ -238,6 +248,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     source_type = params["source_type"]
     project_id = params["project_id"]
     metadata = params["metadata"]
+    # Ingested (LLM-extracted) articles stay DRAFT by default — they're
+    # lower-trust and meant for review. Opt in with publish: true to have the
+    # worker create them published (mirrors create-time publish, but off by
+    # default for ingest). Only true/"true" enables it; anything else is draft.
+    publish = params["publish"] == true or params["publish"] == "true"
 
     with :ok <- validate_content_source(url, content),
          :ok <- validate_source_type(source_type) do
@@ -253,6 +268,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         |> maybe_put("content", content)
         |> maybe_put("project_id", project_id)
         |> maybe_put("metadata", metadata)
+        |> maybe_put("publish", if(publish, do: true))
 
       case ContentIngestionWorker.new(job_args) |> Oban.insert() do
         {:ok, %Oban.Job{conflict?: true} = job} ->

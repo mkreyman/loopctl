@@ -1,10 +1,21 @@
 defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Knowledge
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # Oban runs :inline in tests, so the ingestion worker executes within the
+  # request; stub the extractor to yield exactly one article so we can assert the
+  # resulting article's status (draft by default, published with publish: true).
+  defp expect_one_extracted_article(title) do
+    expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      {:ok, [%{title: title, body: "Body for #{title}.", category: :pattern, tags: ["t"]}]}
+    end)
   end
 
   # --- POST /api/v1/knowledge/ingest ---
@@ -44,6 +55,38 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       body = json_response(conn, 202)
       assert body["data"]["status"] == "queued"
       assert body["data"]["source_type"] == "newsletter"
+    end
+
+    test "extracted articles default to draft", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      expect_one_extracted_article("Drafted by ingest")
+
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/ingest", %{content: "raw", source_type: "newsletter"})
+      |> json_response(202)
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.status == :draft
+    end
+
+    test "publish: true publishes the extracted articles", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      expect_one_extracted_article("Published by ingest")
+
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/ingest", %{
+        content: "raw",
+        source_type: "newsletter",
+        publish: true
+      })
+      |> json_response(202)
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.status == :published
     end
 
     test "returns 422 when both url and content provided", %{conn: conn} do
