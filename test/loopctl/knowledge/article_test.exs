@@ -208,8 +208,8 @@ defmodule Loopctl.Knowledge.ArticleTest do
   end
 
   describe "create_changeset/2 tag validation" do
-    test "rejects more than 20 tags" do
-      too_many_tags = Enum.map(1..21, &"tag-#{&1}")
+    test "rejects more than 50 tags" do
+      too_many_tags = Enum.map(1..51, &"tag-#{&1}")
 
       changeset =
         Article.create_changeset(%Article{}, %{
@@ -220,11 +220,11 @@ defmodule Loopctl.Knowledge.ArticleTest do
         })
 
       refute changeset.valid?
-      assert "must not exceed 20 tags" in errors_on(changeset)[:tags]
+      assert "must not exceed 50 tags" in errors_on(changeset)[:tags]
     end
 
-    test "accepts exactly 20 tags" do
-      tags = Enum.map(1..20, &"tag-#{&1}")
+    test "accepts exactly 50 tags" do
+      tags = Enum.map(1..50, &"tag-#{&1}")
 
       changeset =
         Article.create_changeset(%Article{}, %{

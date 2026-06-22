@@ -34,7 +34,7 @@ defmodule Loopctl.Knowledge.Article do
   @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
-  @max_tags 20
+  @max_tags 50
   @max_tag_length 100
 
   schema "articles" do
