@@ -55,6 +55,10 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       # source_id is a deterministic UUID derived from the content_hash
       assert is_binary(article.source_id)
       assert article.tags == ["genserver", "otp"]
+
+      # Drafts are not embedded.
+      {:ok, with_embedding} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert is_nil(with_embedding.embedding)
     end
 
     test "publishes extracted articles when publish: true is set" do
@@ -86,6 +90,11 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
       assert article.status == :published
+
+      # Published articles are embedded (Oban runs :inline in tests, so the
+      # enqueued ArticleEmbeddingWorker has already populated the vector).
+      {:ok, with_embedding} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      refute is_nil(with_embedding.embedding)
     end
   end
 

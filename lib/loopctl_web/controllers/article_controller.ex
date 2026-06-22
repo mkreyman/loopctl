@@ -65,7 +65,9 @@ defmodule LoopctlWeb.ArticleController do
                "Stage as a draft instead of publishing on create. Default false " <>
                  "(article is published immediately). Equivalent alias: status: \"draft\". " <>
                  "Publishing a staged draft afterwards (POST /articles/:id/publish) " <>
-                 "requires orchestrator role; publish-on-create does not."
+                 "requires orchestrator role; publish-on-create does not. (Note: the " <>
+                 "ingestion path has the OPPOSITE polarity — POST /knowledge/ingest is " <>
+                 "draft-by-default; pass publish: true there.)"
            },
            tags: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :string}},
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},

@@ -296,7 +296,10 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       articles
       |> Enum.with_index()
       |> Enum.reduce(Multi.new(), fn {attrs, index}, multi ->
-        attrs = normalize_attrs(attrs)
+        # normalize_attrs already whitelists keys, but drop :status explicitly so
+        # the server-set status (above) can never be overridden by extractor
+        # output, independent of future normalize_attrs changes.
+        attrs = normalize_attrs(attrs) |> Map.delete(:status)
 
         article = %Article{
           tenant_id: tenant_id,
@@ -334,7 +337,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
             "source_type" => source_type,
             "url" => url,
             "article_count" => length(article_ids),
-            "article_ids" => article_ids
+            "article_ids" => article_ids,
+            # Record whether ingested articles went live (publish opt-in) or were
+            # staged as drafts, so an operator can tell auto-published content
+            # apart from review-staged content in the audit trail.
+            "status" => to_string(status)
           }
         }
       end)
