@@ -412,29 +412,66 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
       published = fixture(:article, %{tenant_id: tenant.id, status: :published})
       already = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      superseded = fixture(:article, %{tenant_id: tenant.id, status: :superseded})
       missing = Ecto.UUID.generate()
 
       conn =
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
-          "article_ids" => [draft.id, published.id, already.id, missing]
+          "article_ids" => [draft.id, published.id, already.id, superseded.id, missing]
         })
 
       body = json_response(conn, 200)
       assert body["meta"]["count"] == 2
       assert body["meta"]["counts"]["archived"] == 2
-      assert body["meta"]["counts"]["skipped"] == 1
+      assert body["meta"]["counts"]["skipped"] == 2
       assert body["meta"]["counts"]["not_found"] == 1
 
-      outcomes = Map.new(body["meta"]["results"], &{&1["id"], &1["outcome"]})
-      assert outcomes[draft.id] == "archived"
-      assert outcomes[published.id] == "archived"
-      assert outcomes[already.id] == "skipped"
-      assert outcomes[missing] == "not_found"
+      by_id = Map.new(body["meta"]["results"], &{&1["id"], &1})
+      assert by_id[draft.id]["outcome"] == "archived"
+      assert by_id[published.id]["outcome"] == "archived"
+      assert by_id[already.id]["outcome"] == "skipped"
+      assert by_id[already.id]["reason"] == "already_archived"
+      assert by_id[superseded.id]["outcome"] == "skipped"
+      assert by_id[superseded.id]["reason"] == "not_archivable_from_superseded"
+      assert by_id[missing]["outcome"] == "not_found"
 
       assert AdminRepo.get!(Article, draft.id).status == :archived
       assert AdminRepo.get!(Article, published.id).status == :archived
+      assert AdminRepo.get!(Article, superseded.id).status == :superseded
+    end
+
+    test "supplying more than one selector is rejected (no silent confirm bypass)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dupe"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "article_ids" => [a.id],
+          "tag" => "dupe",
+          "confirm" => true
+        })
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "exactly ONE"
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "a half-specified source selector returns a clear pairing error", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"source_type" => "web_article"})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "provided together"
     end
 
     test "already-archived ids are idempotent (skipped, not errored)", %{conn: conn} do
@@ -528,7 +565,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{})
         |> json_response(400)
 
-      assert body["error"]["message"] =~ "selector"
+      assert body["error"]["message"] =~ "Selectors"
     end
 
     test "agent role is forbidden (destructive, user+)", %{conn: conn} do

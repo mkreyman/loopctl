@@ -794,10 +794,16 @@ async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, c
     process.env.LOOPCTL_USER_KEY,
   );
 
-  // Partial success returns 200 even when some ids didn't archive — surface a
-  // warning so the agent doesn't treat not_found/errored as success.
+  // Partial success returns 200 even when some/none archived — surface a warning
+  // so the agent doesn't treat not_found/errored, or a nothing-archived run, as
+  // success.
   const counts = result?.meta?.counts;
-  if (counts && (counts.not_found > 0 || counts.errored > 0)) {
+  if (
+    counts &&
+    (counts.not_found > 0 ||
+      counts.errored > 0 ||
+      (counts.archived === 0 && counts.requested > 0))
+  ) {
     const warning =
       `WARNING: bulk-delete was partial — archived ${counts.archived}, ` +
       `skipped ${counts.skipped}, not_found ${counts.not_found}, errored ${counts.errored} ` +

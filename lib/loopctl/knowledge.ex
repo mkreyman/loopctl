@@ -1866,10 +1866,12 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Returns the ids of active (draft/published) articles matching `opts`
-  (`:source_type`/`:source_id`/`:tags`/`:category`/`:project_id`) for a
-  selector-based bulk archive. Bounded: returns `{:error, :too_many}` when the
-  match set exceeds #{@bulk_publish_max} (the caller should narrow the selector).
+  Returns the ids of active (draft/published) articles matching `opts` (the same
+  filters as `list_articles/2` — `:source_type`/`:source_id`/`:tags`/`:category`/
+  `:project_id`) for a selector-based bulk archive. The bulk-delete endpoint
+  currently drives it with the source and tag filters. Bounded: returns
+  `{:error, :too_many}` when the match set exceeds #{@bulk_publish_max} (the
+  caller should narrow the selector).
   """
   @spec list_archivable_ids(Ecto.UUID.t(), keyword()) ::
           {:ok, [Ecto.UUID.t()]} | {:error, :too_many}

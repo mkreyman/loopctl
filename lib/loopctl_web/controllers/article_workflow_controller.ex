@@ -123,14 +123,19 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   operation(:bulk_delete,
     summary: "Bulk delete (archive) articles",
     description:
-      "Soft-deletes (archives) articles **partial-success** style. Provide exactly one " <>
-        "selector: `article_ids` (explicit list), `source_type` + `source_id` (every active " <>
-        "article from that source — clean dedup cleanup), or `tag` + `confirm: true` (every " <>
-        "active article carrying the tag — high blast radius, so `confirm: true` is required). " <>
+      "Soft-deletes (archives) articles **partial-success** style. Provide **exactly one** " <>
+        "selector (supplying more than one is a 400): `article_ids` (explicit list), " <>
+        "`source_type` + `source_id` (every active article from that source — clean dedup " <>
+        "cleanup; not confirm-gated, can be large), or `tag` + `confirm: true` (every active " <>
+        "article carrying the tag — high blast radius, so `confirm: true` is required). " <>
         "Honors soft-delete: rows move to `archived`, not dropped. Each id gets a per-id " <>
         "`outcome` (`archived`; `skipped` with `already_archived`/`not_archivable_from_superseded`; " <>
         "`not_found`; `errored`). `meta.count` = number archived; `meta.counts`/`meta.results` " <>
-        "give the breakdown. Bounded to 5000 per call. Role: user+.",
+        "give the breakdown. A 200 does not imply everything archived — inspect `meta.counts`. " <>
+        "Bounded to 5000 per call; a `source_type`/`tag` selector matching more than 5000 active " <>
+        "articles returns 400 (narrow the selector). An `article_ids` request with zero matches " <>
+        "still returns 200 (per-id `not_found`); a `source`/`tag` selector matching nothing " <>
+        "returns 400. Role: user+.",
     request_body:
       {"Bulk delete selector", "application/json",
        %OpenApiSpex.Schema{
@@ -264,20 +269,61 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
-  # Resolve the bulk-delete selector to a concrete id list. Exactly one of:
+  # Resolve the bulk-delete selector to a concrete id list. EXACTLY ONE selector
+  # must be supplied (enforced — not first-match-wins — so a stray second
+  # selector can't silently win and, e.g., bypass the by-tag confirm gate):
   #   - article_ids: [..]                  (explicit list)
   #   - source_type + source_id            (every active article from that source)
   #   - tag + confirm: true                (every active article carrying the tag;
   #                                         confirm required — high blast radius)
-  defp resolve_bulk_delete_ids(_tenant_id, %{"article_ids" => ids}) when is_list(ids),
-    do: {:ok, ids}
+  defp resolve_bulk_delete_ids(tenant_id, params) do
+    # `source_type`/`source_id` count as one selector ("source"); supplying only
+    # one half still selects "source" so the pairing error fires (not the generic
+    # one).
+    present =
+      [
+        {:article_ids, params["article_ids"]},
+        {:source, params["source_type"] || params["source_id"]},
+        {:tag, params["tag"]}
+      ]
+      |> Enum.filter(fn {_k, v} -> not is_nil(v) end)
+      |> Enum.map(&elem(&1, 0))
 
-  defp resolve_bulk_delete_ids(tenant_id, %{"source_type" => type, "source_id" => src})
+    case present do
+      [:article_ids] ->
+        resolve_ids_selector(params["article_ids"])
+
+      [:source] ->
+        resolve_source_selector(tenant_id, params)
+
+      [:tag] ->
+        resolve_tag_selector(tenant_id, params)
+
+      [] ->
+        {:error, :bad_request, selector_help()}
+
+      _ ->
+        {:error, :bad_request, "Provide exactly ONE selector (got several). " <> selector_help()}
+    end
+  end
+
+  defp selector_help do
+    "Selectors: article_ids (list), source_type + source_id, or tag + confirm: true."
+  end
+
+  defp resolve_ids_selector(ids) when is_list(ids), do: {:ok, ids}
+  defp resolve_ids_selector(_), do: {:error, :bad_request, "article_ids must be a JSON array."}
+
+  defp resolve_source_selector(tenant_id, %{"source_type" => type, "source_id" => src})
        when is_binary(type) and is_binary(src) do
     archivable_ids_or_error(tenant_id, source_type: type, source_id: src)
   end
 
-  defp resolve_bulk_delete_ids(tenant_id, %{"tag" => tag} = params) when is_binary(tag) do
+  defp resolve_source_selector(_tenant_id, _params) do
+    {:error, :bad_request, "source_type and source_id must be provided together."}
+  end
+
+  defp resolve_tag_selector(tenant_id, %{"tag" => tag} = params) when is_binary(tag) do
     if truthy?(params["confirm"]) do
       archivable_ids_or_error(tenant_id, tags: [tag])
     else
@@ -286,9 +332,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
-  defp resolve_bulk_delete_ids(_tenant_id, _params) do
-    {:error, :bad_request,
-     "Provide exactly one selector: article_ids (list), source_type + source_id, or tag + confirm: true."}
+  defp resolve_tag_selector(_tenant_id, _params) do
+    {:error, :bad_request, "tag must be a string."}
   end
 
   defp archivable_ids_or_error(tenant_id, filters) do
