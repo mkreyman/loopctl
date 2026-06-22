@@ -568,6 +568,37 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["error"]["message"] =~ "Selectors"
     end
 
+    test "an empty article_ids list returns 400 (not a no-op 200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"article_ids" => []})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "empty"
+    end
+
+    test "an empty tag with confirm archives nothing (zero-match 400, not everything)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["real"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "", "confirm" => true})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "No active articles"
+      # An empty-tag selector must NOT archive real articles.
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
     test "agent role is forbidden (destructive, user+)", %{conn: conn} do
       tenant = fixture(:tenant)
       {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
