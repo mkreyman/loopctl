@@ -59,7 +59,9 @@ defmodule LoopctlWeb.ArticleController do
              type: :boolean,
              description:
                "Stage as a draft instead of publishing on create. Default false " <>
-                 "(article is published immediately)."
+                 "(article is published immediately). Equivalent alias: status: \"draft\". " <>
+                 "Publishing a staged draft afterwards (POST /articles/:id/publish) " <>
+                 "requires orchestrator role; publish-on-create does not."
            },
            tags: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :string}},
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
@@ -194,11 +196,11 @@ defmodule LoopctlWeb.ArticleController do
         |> maybe_merge_project_id(params["project_id"])
         |> put_create_status(draft?)
 
-      create_article(conn, tenant_id, attrs, audit_opts)
+      create_article(conn, tenant_id, attrs, audit_opts, draft?)
     end
   end
 
-  defp create_article(conn, tenant_id, attrs, audit_opts) do
+  defp create_article(conn, tenant_id, attrs, audit_opts, draft?) do
     case Knowledge.create_article(tenant_id, attrs, audit_opts) do
       {:ok, article} ->
         conn
@@ -211,12 +213,16 @@ defmodule LoopctlWeb.ArticleController do
       # real create.
       {:ok, :deduplicated, existing} ->
         # The article already existed (identical title+body) — dedup is a pure
-        # no-op, so the note must NOT claim it was "created" or "published" now.
+        # no-op (it never flips a draft to published), so the note must NOT claim
+        # it was "created" or "published" now. `draft?` is the caller's intent on
+        # THIS request, so a publish-intent create that lands on a pre-existing
+        # draft gets an accurate, agent-reachable explanation rather than a
+        # dead-end "publish it (orchestrator)" message.
         response =
           %{article: existing}
           |> ArticleJSON.create()
           |> Map.put(:deduplicated, true)
-          |> Map.put(:note, dedup_note(existing))
+          |> Map.put(:note, dedup_note(existing, draft?))
 
         conn
         |> put_status(:ok)
@@ -355,22 +361,38 @@ defmodule LoopctlWeb.ArticleController do
     do:
       "Created as a draft (status: \"draft\"). It is NOT yet visible to agents in " <>
         "search/index/context. Publish it via POST /articles/:id/publish (MCP " <>
-        "knowledge_publish), or omit `draft` to publish on create."
+        "knowledge_publish, orchestrator role), or omit `draft` to publish on create " <>
+        "(no orchestrator role needed for publish-on-create)."
 
   # Note for the deduplicated (no-op) case. The article already existed and was
   # returned unchanged, so nothing was created OR published in this call —
-  # spelled out per existing status so the caller isn't misled by a
-  # "Created…"/"published…" message.
-  defp dedup_note(%{status: :published}),
+  # spelled out per existing status (and the caller's draft/publish intent) so
+  # the caller isn't misled by a "Created…"/"published…" message.
+  defp dedup_note(%{status: :published}, _draft?),
     do:
       "An identical published article already existed and was returned unchanged (already visible to agents)."
 
-  defp dedup_note(%{status: :draft}),
+  # Caller explicitly asked to stage a draft and an identical draft already
+  # exists — the intent is satisfied, nothing to do.
+  defp dedup_note(%{status: :draft}, true),
     do:
       "An identical draft already existed and was returned unchanged. It is a draft " <>
-        "(NOT visible to agents); publish it via POST /articles/:id/publish."
+        "(NOT visible to agents); publish it via POST /articles/:id/publish (MCP " <>
+        "knowledge_publish, orchestrator role)."
 
-  defp dedup_note(_existing),
+  # Caller asked to publish-on-create, but an identical article already exists as
+  # a draft someone staged earlier. Dedup never auto-publishes a staged draft, so
+  # the publish intent did not apply — say so honestly with the real remedy (an
+  # existing draft is published by orchestrator/user, not the agent).
+  defp dedup_note(%{status: :draft}, false),
+    do:
+      "An identical article already exists as a DRAFT that was staged earlier, so it " <>
+        "is NOT visible to agents and your publish-on-create did not change it (dedup " <>
+        "never auto-publishes a staged draft). To make it visible, an orchestrator/user " <>
+        "must publish it via POST /articles/:id/publish (MCP knowledge_publish), or " <>
+        "unpublish/edit it via PATCH /articles/:id."
+
+  defp dedup_note(_existing, _draft?),
     do: "An identical article already existed and was returned unchanged."
 
   defp maybe_merge_project_id(attrs, nil), do: attrs

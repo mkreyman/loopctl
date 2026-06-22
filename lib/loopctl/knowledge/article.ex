@@ -82,11 +82,14 @@ defmodule Loopctl.Knowledge.Article do
 
   NOTE: `:status` is castable here and is **trusted from `attrs`** — this
   changeset does NOT enforce who may create a `:published` (or
-  `:archived`/`:superseded`) article. Publish authorization is the caller's
-  responsibility: `LoopctlWeb.ArticleController.create/2` gates it at
-  orchestrator+ and sets the status server-side, and `Loopctl.Knowledge.OKF`
-  forces `:draft`. A future caller of `create_article/3` MUST likewise sanitize
-  `:status` (or gate the role) rather than pass an unvalidated caller value.
+  `:archived`/`:superseded`) article. Setting the create-time status is the
+  caller's responsibility: `LoopctlWeb.ArticleController.create/2` sets it
+  server-side (published by default, or draft when the caller opts in) and never
+  trusts a caller-supplied `:status` beyond the draft opt-in, and
+  `Loopctl.Knowledge.OKF` forces `:draft`. A future caller of `create_article/3`
+  MUST likewise sanitize `:status` (or gate the role) rather than pass an
+  unvalidated caller value. (Publishing is no longer gated on the create path;
+  publishing an EXISTING draft via the workflow endpoints remains role-gated.)
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(article \\ %__MODULE__{}, attrs) do
