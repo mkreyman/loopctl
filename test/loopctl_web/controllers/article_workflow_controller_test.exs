@@ -346,6 +346,41 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["error"]["message"] =~ "must not be empty"
     end
 
+    test "rejects a request above the 5000-id ceiling with 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      ids = Enum.map(1..5001, fn _ -> Ecto.UUID.generate() end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{"article_ids" => ids})
+
+      body = json_response(conn, 400)
+      assert body["error"]["message"] =~ "5000"
+    end
+
+    test "malformed (non-UUID) ids resolve to not_found, never a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-publish", %{
+          "article_ids" => [draft.id, "not-a-uuid", "also bad"]
+        })
+
+      body = json_response(conn, 200)
+      outcomes = Map.new(body["meta"]["results"], &{&1["id"], &1["outcome"]})
+      assert outcomes[draft.id] == "published"
+      assert outcomes["not-a-uuid"] == "not_found"
+      assert outcomes["also bad"] == "not_found"
+    end
+
     test "accepts more than 100 ids (auto-chunked server-side)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

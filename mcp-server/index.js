@@ -687,6 +687,21 @@ async function knowledgeBulkPublish({ article_ids }) {
     { article_ids },
     process.env.LOOPCTL_USER_KEY
   );
+
+  // Partial success returns 200 even when nothing published. Surface a warning
+  // so the agent doesn't treat not_found/errored ids as success.
+  const counts = result?.meta?.counts;
+  if (counts && (counts.not_found > 0 || counts.errored > 0)) {
+    const warning =
+      `WARNING: bulk-publish was partial — published ${counts.published}, ` +
+      `skipped ${counts.skipped}, not_found ${counts.not_found}, errored ${counts.errored} ` +
+      `(of ${counts.requested} requested). Inspect meta.results for per-id outcomes; ` +
+      `not_found/errored ids were NOT published.`;
+    return {
+      content: [{ type: "text", text: warning }, ...toContent(result).content],
+    };
+  }
+
   return toContent(result);
 }
 
