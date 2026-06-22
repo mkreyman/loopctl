@@ -652,39 +652,24 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
-async function knowledgeCreate({ title, body, category, tags, project_id, publish }) {
+async function knowledgeCreate({ title, body, category, tags, project_id, draft }) {
   const payload = { title, body };
   if (category) payload.category = category;
   if (tags) payload.tags = tags;
   if (project_id) payload.project_id = project_id;
 
-  // Publishing on create requires orchestrator role, so route through the
-  // orchestrator key (mirrors knowledge_publish). A plain draft create uses
-  // the agent key. The server returns 403 if publish is requested without the
-  // role, so this just routes the request rather than escalating privilege.
-  let key = process.env.LOOPCTL_AGENT_KEY;
-  if (publish) {
-    // Surface the orchestrator-role requirement up front rather than letting the
-    // request go out keyless and return a cryptic "No API key configured" error
-    // (an agent-only install has no LOOPCTL_ORCH_KEY).
-    if (!process.env.LOOPCTL_ORCH_KEY && !process.env.LOOPCTL_API_KEY) {
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Publishing on create requires orchestrator role: set LOOPCTL_ORCH_KEY, or omit " +
-              "publish to create a draft and have an orchestrator publish it via knowledge_publish.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    payload.publish = true;
-    key = process.env.LOOPCTL_ORCH_KEY;
-  }
+  // Articles publish on create by default for every role (including agent), so a
+  // plain create routes through the agent key and is immediately visible. Pass
+  // draft:true to stage it for later review instead — publish it afterwards with
+  // knowledge_publish.
+  if (draft) payload.draft = true;
 
-  const result = await apiCall("POST", "/api/v1/articles", payload, key);
+  const result = await apiCall(
+    "POST",
+    "/api/v1/articles",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
   return toContent(result);
 }
 
@@ -1942,11 +1927,10 @@ const TOOLS = [
     name: "knowledge_create",
     description:
       "Create a new knowledge article. Use to file findings, document patterns, or record decisions " +
-      "discovered during implementation. IMPORTANT: articles are created as a DRAFT and are NOT visible " +
-      "to agents (search/index/context) until published — the response `note` says so. Either publish " +
-      "later with knowledge_publish, or pass publish: true here to create-and-publish in one call " +
-      "(requires LOOPCTL_ORCH_KEY — orchestrator role; this tool routes a publish request through the " +
-      "orchestrator key, and the server returns 403 if that role is missing). " +
+      "discovered during implementation. Articles are PUBLISHED IMMEDIATELY by default and are visible " +
+      "to agents (search/index/context) right away — no separate publish step is needed. Pass " +
+      "draft: true to stage the article for later review instead; the response `note` says which " +
+      "outcome occurred, and a draft can be published afterwards with knowledge_publish. " +
       "Concurrency-safe: if a create races/retries against an " +
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
@@ -1976,11 +1960,11 @@ const TOOLS = [
           type: "string",
           description: "Optional: associate the article with a project UUID.",
         },
-        publish: {
+        draft: {
           type: "boolean",
           description:
-            "Optional: create AND publish in one call (default false → draft). Requires " +
-            "LOOPCTL_ORCH_KEY (orchestrator role); routed through the orchestrator key.",
+            "Optional: stage as a draft instead of publishing on create (default false → " +
+            "published immediately). Publish later with knowledge_publish.",
         },
       },
       required: ["title", "body"],

@@ -841,12 +841,14 @@
                 <span class="text-accent-400">POST</span> /api/v1/articles
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Create an article. Created as a
-                <span class="font-mono text-slate-300">draft</span>
-                (NOT visible in search/index/context) — the response
+                Create an article.
+                <span class="text-slate-300">Published immediately by default</span>
+                (visible in search/index/context) for every role — the response
                 <span class="font-mono text-slate-300">note</span>
-                says so. Pass <span class="font-mono text-slate-300">publish: true</span>
-                to create-and-publish in one call (requires orchestrator role).
+                says which outcome occurred. Pass
+                <span class="font-mono text-slate-300">draft: true</span>
+                (or <span class="font-mono text-slate-300">status: "draft"</span>)
+                to stage it for later review instead.
               </p>
             </div>
           </div>

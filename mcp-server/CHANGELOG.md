@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.8.0 — 2026-06-22 (knowledge_create publishes by default)
+
+### Changed
+
+- `knowledge_create` now **publishes on create by default** for every role
+  (including agent), making the article immediately visible in
+  search/index/context — no separate publish step or orchestrator key needed.
+  The previous `publish: true` flag is replaced by `draft: true`, which stages
+  the article for later review instead (publish it afterwards with
+  `knowledge_publish`). This eliminates the most common place harvested
+  knowledge silently rotted as an invisible draft. (loopctl #133)
+
 ## 2.7.0 — 2026-06-19 (knowledge_create publish-in-one-call)
 
 ### Added
