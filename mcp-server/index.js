@@ -1998,9 +1998,11 @@ const TOOLS = [
           type: "string",
           description:
             "Optional: stable per-article key for idempotent capture (max 255). Re-creating " +
-            "with the same key is a no-op that returns the existing article (deduplicated) " +
-            "instead of a partial duplicate — use a content hash or e.g. 'book:<id>:note:<n>'. " +
-            "Distinct from source_type/source_id (which mark a shared source).",
+            "with the same key is a no-op that returns a reference to the existing article " +
+            "(deduplicated; id only, not its body) instead of a partial duplicate. Use a " +
+            "HIGH-ENTROPY value (e.g. a content hash) — it is a per-tenant lookup key, not a " +
+            "secret, so a guessable key lets another agent in your tenant probe which keys " +
+            "exist. Distinct from source_type/source_id (which mark a shared source).",
         },
         source_type: {
           type: "string",

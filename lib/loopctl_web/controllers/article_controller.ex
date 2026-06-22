@@ -72,12 +72,14 @@ defmodule LoopctlWeb.ArticleController do
              nullable: true,
              description:
                "Optional stable per-article key for idempotent capture (max 255). " <>
-                 "Re-creating with the same key is a no-op that returns the existing " <>
-                 "article (200, `deduplicated: true`) — regardless of the body, and " <>
-                 "taking precedence over the title-conflict check; a changed title/body " <>
-                 "is NOT applied (PATCH /articles/:id to change it). Distinct from " <>
-                 "source_type/source_id, which identify a shared source. Set at create " <>
-                 "time only (ignored by PATCH); applies to tenant-scoped articles."
+                 "Re-creating with the same key is a no-op that returns a REFERENCE to " <>
+                 "the existing article (200, `deduplicated: true`, id only — not its " <>
+                 "body) — regardless of the body sent, and ahead of the title-conflict " <>
+                 "check; a changed title/body is NOT applied (PATCH /articles/:id to " <>
+                 "change it). Use a HIGH-ENTROPY value (e.g. a content hash): it is a " <>
+                 "per-tenant lookup key, not a secret. Distinct from source_type/" <>
+                 "source_id, which identify a shared source. Set at create time only " <>
+                 "(ignored by PATCH); applies to tenant-scoped articles."
            },
            metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
          }
@@ -221,26 +223,12 @@ defmodule LoopctlWeb.ArticleController do
         |> put_status(:created)
         |> json(create_response(article))
 
-      # Idempotent: a concurrent/retried create with an identical body. 200 (not
-      # 201), plus an explicit `deduplicated: true` flag in the body so clients
-      # that only see a 2xx (e.g. the MCP layer) can still tell a dedup from a
-      # real create.
+      # Idempotent dedup (no-op), 200 with `deduplicated: true` so clients that
+      # only see a 2xx (e.g. the MCP layer) can tell a dedup from a real create.
       {:ok, :deduplicated, existing} ->
-        # The article already existed (identical title+body) — dedup is a pure
-        # no-op (it never flips a draft to published), so the note must NOT claim
-        # it was "created" or "published" now. `draft?` is the caller's intent on
-        # THIS request, so a publish-intent create that lands on a pre-existing
-        # draft gets an accurate, agent-reachable explanation rather than a
-        # dead-end "publish it (orchestrator)" message.
-        response =
-          %{article: existing}
-          |> ArticleJSON.create()
-          |> Map.put(:deduplicated, true)
-          |> Map.put(:note, dedup_note_for(existing, attrs, draft?))
-
         conn
         |> put_status(:ok)
-        |> json(response)
+        |> json(dedup_response(existing, attrs, draft?))
 
       {:error, :duplicate_title, existing} ->
         conn
@@ -378,18 +366,35 @@ defmodule LoopctlWeb.ArticleController do
         "knowledge_publish, orchestrator role), or omit `draft` to publish on create " <>
         "(no orchestrator role needed for publish-on-create)."
 
-  # Pick the dedup note. An idempotency_key match is a DIFFERENT kind of dedup
-  # than the identical-title+body case: the caller may have sent new title/body
-  # that were deliberately NOT applied (the key is the identity), so it gets a
-  # note that says so rather than the misleading "an identical article already
-  # existed".
-  defp dedup_note_for(existing, attrs, draft?) do
+  # Build the dedup (no-op) response. Two cases differ deliberately:
+  #
+  #   * idempotency_key hit — the caller may NOT possess the existing content
+  #     (it matched only on the key, possibly with a different body), and the key
+  #     is client-chosen and may be low-entropy. So we return a REFERENCE only
+  #     (id/status, no body/title) — a guessable key must not become a way to
+  #     read an article the caller didn't author. This also matches #137's ask to
+  #     "return a clear already-captured (existing id)".
+  #   * identical title+body — the caller already supplied the identical body
+  #     (that's what made it a dedup), so echoing the existing row discloses
+  #     nothing new; return it in full as before.
+  defp dedup_response(existing, attrs, draft?) do
     key = attrs["idempotency_key"] || attrs[:idempotency_key]
 
     if is_binary(key) and existing.idempotency_key == key do
-      idempotency_dedup_note(existing)
+      %{
+        data: %{
+          id: existing.id,
+          status: to_string(existing.status),
+          idempotency_key: existing.idempotency_key
+        },
+        deduplicated: true,
+        note: idempotency_dedup_note(existing)
+      }
     else
-      dedup_note(existing, draft?)
+      %{article: existing}
+      |> ArticleJSON.create()
+      |> Map.put(:deduplicated, true)
+      |> Map.put(:note, dedup_note(existing, draft?))
     end
   end
 

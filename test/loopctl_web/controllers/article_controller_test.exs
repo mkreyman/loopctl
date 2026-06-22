@@ -379,11 +379,50 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       assert resp["deduplicated"] == true
       assert resp["data"]["id"] == first_id
-      assert resp["data"]["body"] == "first capture"
-      # The note must say the new title/body were NOT applied (not "identical
-      # article already existed"), since this is a key match with changed content.
+      # An idempotency_key hit returns a REFERENCE only — the existing body is NOT
+      # echoed back, so a (possibly guessable) key can't read another agent's
+      # content. The new body was not applied either.
+      refute resp["data"]["body"]
       assert resp["note"] =~ "idempotency_key"
       assert resp["note"] =~ "NOT applied"
+
+      # The original row is genuinely unchanged (verified via a direct read).
+      reread =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{first_id}")
+        |> json_response(200)
+
+      assert reread["data"]["body"] == "first capture"
+    end
+
+    test "a create that carries an idempotency_key but dedups on TITLE gets the title note", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      payload = %{
+        "title" => "Title Dedup",
+        "body" => "identical body",
+        "category" => "reference"
+      }
+
+      # First create has NO idempotency_key.
+      conn |> auth_conn(raw_key) |> post(~p"/api/v1/articles", payload) |> json_response(201)
+
+      # Second create has the SAME title+body but a key that matches nothing — it
+      # dedups on the title index, so it must get the title note (full body echoed,
+      # since the caller supplied the identical body), NOT the idempotency note.
+      resp =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", Map.put(payload, "idempotency_key", "unmatched-key"))
+        |> json_response(200)
+
+      assert resp["deduplicated"] == true
+      refute resp["note"] =~ "idempotency_key"
+      assert resp["data"]["body"] == "identical body"
     end
 
     test "different idempotency_keys create distinct articles", %{conn: conn} do

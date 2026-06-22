@@ -178,9 +178,11 @@ defmodule Loopctl.Knowledge do
   # cleanly. We accept that rather than re-running the whole create under a lock.
   defp resolve_create_conflict(tenant_id, attrs, changeset) do
     cond do
-      # Idempotency_key is the strongest identity and is checked first: a
-      # concurrent insert that raced past the pre-check fails this unique index;
-      # return the winner as a no-op dedup regardless of body.
+      # A single failed INSERT raises exactly one unique violation, so the
+      # changeset carries at most one of these constraint names — the cond order
+      # is not a tie-breaker, just which recovery to run. An idempotency_key
+      # violation (a create that raced past the pre-check) returns the winner as
+      # a no-op dedup regardless of body.
       idempotency_conflict?(changeset) ->
         case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs)) do
           %Article{} = existing -> {:ok, :deduplicated, existing}
