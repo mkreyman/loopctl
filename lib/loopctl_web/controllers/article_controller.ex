@@ -286,13 +286,13 @@ defmodule LoopctlWeb.ArticleController do
          :ok <- validate_enum(params["category"], @valid_categories, "category") do
       opts =
         []
-        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:project_id, string_param(params["project_id"]))
         |> maybe_add_opt(:category, params["category"])
         |> maybe_add_opt(:status, params["status"])
         |> maybe_add_opt(:tags, parse_tags(params["tags"]))
-        |> maybe_add_opt(:source_type, params["source_type"])
-        |> maybe_add_opt(:source_id, params["source_id"])
-        |> maybe_add_opt(:idempotency_key, params["idempotency_key"])
+        |> maybe_add_opt(:source_type, string_param(params["source_type"]))
+        |> maybe_add_opt(:source_id, string_param(params["source_id"]))
+        |> maybe_add_opt(:idempotency_key, string_param(params["idempotency_key"]))
         |> maybe_add_opt(:limit, parse_int(params["limit"]))
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
@@ -498,8 +498,11 @@ defmodule LoopctlWeb.ArticleController do
   defp maybe_add_opt(opts, _key, ""), do: opts
   defp maybe_add_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp parse_tags(nil), do: nil
-  defp parse_tags(""), do: nil
+  # Query params are usually strings, but a malformed query like `?project_id[]=x`
+  # decodes to a list/map. Treat any non-string value as absent rather than
+  # passing it into a where-clause where it would raise (a 500) on cast.
+  defp string_param(value) when is_binary(value), do: value
+  defp string_param(_), do: nil
 
   defp parse_tags(tags) when is_binary(tags) do
     tags
@@ -512,7 +515,8 @@ defmodule LoopctlWeb.ArticleController do
     end
   end
 
-  defp parse_int(nil), do: nil
+  # Absent, empty, or a malformed (non-string) `tags` param → no filter.
+  defp parse_tags(_), do: nil
 
   defp parse_int(val) when is_binary(val) do
     case Integer.parse(val) do
@@ -522,4 +526,6 @@ defmodule LoopctlWeb.ArticleController do
   end
 
   defp parse_int(val) when is_integer(val), do: val
+  # nil/absent or a malformed (list/map) limit/offset → no value.
+  defp parse_int(_), do: nil
 end

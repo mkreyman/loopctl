@@ -565,6 +565,21 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["meta"]["total_count"] == 1
     end
 
+    test "malformed list/map query params don't 500 (treated as no filter)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "X"})
+
+      # ?project_id[]=x&limit[]=1&tags[]=a decode to lists; must degrade to
+      # "no filter", never a FunctionClauseError / Ecto cast 500.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/articles?project_id[]=x&limit[]=1&source_id[]=y&tags[]=a")
+
+      assert json_response(conn, 200)["meta"]["total_count"] == 1
+    end
+
     test "a valid status filter still works", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
