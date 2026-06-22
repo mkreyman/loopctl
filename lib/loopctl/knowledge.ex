@@ -57,19 +57,24 @@ defmodule Loopctl.Knowledge do
 
   - `tenant_id` -- the tenant UUID
   - `attrs` -- map with title (required), body (required), category (required),
-    and optional: status, tags, source_type, source_id, metadata, project_id
+    and optional: status, tags, source_type, source_id, idempotency_key,
+    metadata, project_id
   - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
 
   ## Returns
 
   - `{:ok, %Article{}}` on a fresh create
-  - `{:ok, :deduplicated, %Article{}}` when a concurrent/retried create collided
-    on the active title and the incoming body is identical to the existing
-    article's after trimming leading/trailing whitespace — the existing row is
-    returned unchanged (this is a no-op: no second audit/webhook/embedding), so
-    callers can answer HTTP 200 rather than 201
+  - `{:ok, :deduplicated, %Article{}}` for an idempotent no-op (existing row
+    returned unchanged; no second audit/webhook/embedding; callers answer HTTP
+    200 not 201). Two triggers:
+      1. **idempotency_key** matches an existing article — returned **regardless
+         of body** (the key is the identity), taking precedence over the title
+         check; a changed title/body is NOT applied.
+      2. a concurrent/retried create collided on the **active title** AND the
+         incoming body is identical after trimming leading/trailing whitespace.
   - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
-    article with a DIFFERENT body (the caller should answer 409, not retry)
+    article with a DIFFERENT body and no idempotency_key matched (the caller
+    should answer 409, not retry)
   - `{:error, changeset}` on any other validation failure
   """
   @spec create_article(Ecto.UUID.t(), map(), keyword()) ::

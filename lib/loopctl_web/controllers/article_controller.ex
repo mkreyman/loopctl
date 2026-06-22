@@ -73,8 +73,11 @@ defmodule LoopctlWeb.ArticleController do
              description:
                "Optional stable per-article key for idempotent capture (max 255). " <>
                  "Re-creating with the same key is a no-op that returns the existing " <>
-                 "article (200, `deduplicated: true`) instead of a partial duplicate. " <>
-                 "Distinct from source_type/source_id, which identify a shared source."
+                 "article (200, `deduplicated: true`) — regardless of the body, and " <>
+                 "taking precedence over the title-conflict check; a changed title/body " <>
+                 "is NOT applied (PATCH /articles/:id to change it). Distinct from " <>
+                 "source_type/source_id, which identify a shared source. Set at create " <>
+                 "time only (ignored by PATCH); applies to tenant-scoped articles."
            },
            metadata: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
          }
@@ -87,9 +90,11 @@ defmodule LoopctlWeb.ArticleController do
         {"System scope requested without superadmin role", "application/json",
          Schemas.ErrorResponse},
       200 =>
-        {"Idempotent: an active article with the same title and an identical body " <>
-           "already exists; it is returned unchanged with `deduplicated: true`.",
-         "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+        {"Idempotent dedup, returned unchanged with `deduplicated: true`: either an " <>
+           "active article with the same title and an identical body exists, OR an " <>
+           "article with the same `idempotency_key` exists (in which case a changed " <>
+           "title/body is NOT applied). The `note` says which.", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       409 =>
         {"Title taken by an article with different content", "application/json",
          Schemas.ErrorResponse},
@@ -231,7 +236,7 @@ defmodule LoopctlWeb.ArticleController do
           %{article: existing}
           |> ArticleJSON.create()
           |> Map.put(:deduplicated, true)
-          |> Map.put(:note, dedup_note(existing, draft?))
+          |> Map.put(:note, dedup_note_for(existing, attrs, draft?))
 
         conn
         |> put_status(:ok)
@@ -372,6 +377,27 @@ defmodule LoopctlWeb.ArticleController do
         "search/index/context. Publish it via POST /articles/:id/publish (MCP " <>
         "knowledge_publish, orchestrator role), or omit `draft` to publish on create " <>
         "(no orchestrator role needed for publish-on-create)."
+
+  # Pick the dedup note. An idempotency_key match is a DIFFERENT kind of dedup
+  # than the identical-title+body case: the caller may have sent new title/body
+  # that were deliberately NOT applied (the key is the identity), so it gets a
+  # note that says so rather than the misleading "an identical article already
+  # existed".
+  defp dedup_note_for(existing, attrs, draft?) do
+    key = attrs["idempotency_key"] || attrs[:idempotency_key]
+
+    if is_binary(key) and existing.idempotency_key == key do
+      idempotency_dedup_note(existing)
+    else
+      dedup_note(existing, draft?)
+    end
+  end
+
+  defp idempotency_dedup_note(existing) do
+    "An article with this idempotency_key already exists (id #{existing.id}) and was " <>
+      "returned unchanged — your title/body were NOT applied (the idempotency_key is the " <>
+      "article's identity). To change the existing article, PATCH /articles/:id (role :user)."
+  end
 
   # Note for the deduplicated (no-op) case. The article already existed and was
   # returned unchanged, so nothing was created OR published in this call —

@@ -380,6 +380,10 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert resp["deduplicated"] == true
       assert resp["data"]["id"] == first_id
       assert resp["data"]["body"] == "first capture"
+      # The note must say the new title/body were NOT applied (not "identical
+      # article already existed"), since this is a key match with changed content.
+      assert resp["note"] =~ "idempotency_key"
+      assert resp["note"] =~ "NOT applied"
     end
 
     test "different idempotency_keys create distinct articles", %{conn: conn} do
