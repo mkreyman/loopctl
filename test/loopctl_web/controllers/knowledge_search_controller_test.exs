@@ -311,6 +311,43 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert length(body["data"]) <= 2
     end
 
+    test "rejects a relevance-mode limit above the relevance cap with 400, not a silent clamp (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Relevance modes (here keyword) cap well below the 1000 enumeration cap.
+      # A limit between the relevance cap and the enumeration cap must 400 —
+      # otherwise it would be silently clamped to the ranked-pool size and
+      # meta.limit would under-report what was requested.
+      over = Loopctl.Knowledge.max_relevance_page_size() + 1
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", mode: "keyword", limit: "#{over}"})
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "relevance-mode maximum"
+      assert resp["error"]["message"] =~ "exhaustive enumeration"
+    end
+
+    test "honors a within-cap relevance limit (combined/default mode) (#148 A1)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Default (combined) mode used to silently clamp to 50; now a within-cap
+      # limit is honored and reported faithfully.
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", limit: "90"})
+        |> json_response(200)
+
+      assert body["meta"]["limit"] == 90
+    end
+
     test "tenant isolation — tenant A cannot see tenant B's articles", %{conn: conn} do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
@@ -408,6 +445,51 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
 
       # List mode has no relevance ranking; score defaults to 0.0
       assert Enum.all?(body["data"], &(&1["score"] == 0.0))
+    end
+
+    test "honors a limit above the old 50 cap so list mode reaches every row (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # 60 > the previous silent controller clamp of 50.
+      total = 60
+
+      for i <- 1..total do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Listed #{i}",
+          body: "distinct prose #{i}",
+          category: :reference,
+          status: :published,
+          tags: ["listed148"]
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "listed148", limit: "60"})
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == total
+      assert body["meta"]["limit"] == 60
+      assert length(body["data"]) == total
+    end
+
+    test "rejects a limit above the maximum page size with 400 (no silent clamp) (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "anything", limit: "1001"})
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "maximum page size"
     end
 
     test "category filter without q enumerates the category", %{conn: conn} do

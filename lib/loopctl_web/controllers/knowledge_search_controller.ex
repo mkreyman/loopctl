@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Pagination
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -47,7 +48,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         "published articles, so the count is the size of that embedded set — not a " <>
         "match count, and <= the total published count), `merged_candidates` " <>
         "(combined mode: the deduped UNION of a keyword and a semantic sub-search, " <>
-        "each capped at 50, so up to ~100), or `filtered_set` " <>
+        "each capped at 100, so up to ~200), or `filtered_set` " <>
         "(list mode: the complete filtered set). Do NOT use a relevance-mode " <>
         "`total_count` to size the corpus — use list mode or `GET /knowledge/stats`. " <>
         "Role: agent+.",
@@ -86,7 +87,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       limit: [
         in: :query,
         type: :integer,
-        description: "Max results to return (default 10, max 50)",
+        description:
+          "Max results to return (default 10). The cap is mode-dependent and a limit " <>
+            "above it is rejected with 400 — never silently clamped. **List mode** (no " <>
+            "`q`, just `tags`/`category`) is exhaustive enumeration: max 1000, paginate " <>
+            "the complete filtered set via `offset`. **Relevance modes** (keyword / " <>
+            "semantic / combined) return a ranked top-N: max 100.",
         required: false
       ],
       offset: [
@@ -153,6 +159,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
     with {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
+         :ok <- validate_search_limit(params, query_spec),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.put(base_opts, :api_key_id, api_key_id)
 
@@ -264,17 +271,40 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     if tags == [], do: opts, else: [{:tags, tags} | opts]
   end
 
+  # List mode is exhaustive enumeration (cap: the shared max page size); the
+  # relevance modes return a ranked top-N (a much smaller cap). Validating the
+  # requested `limit` against the mode-appropriate cap — and 400-ing over it —
+  # keeps `meta.limit` honest in every mode (a relevance request for limit=200
+  # is rejected, never silently clamped to the ranked-pool size).
+  defp validate_search_limit(params, :list),
+    do: Pagination.validate_limit(params, Knowledge.max_page_size())
+
+  defp validate_search_limit(params, {:search, _q}) do
+    case Pagination.validate_limit(params, Knowledge.max_relevance_page_size()) do
+      :ok ->
+        :ok
+
+      {:error, :bad_request, _} ->
+        {:error, :bad_request,
+         "limit exceeds the relevance-mode maximum of #{Knowledge.max_relevance_page_size()}; " <>
+           "for exhaustive enumeration drop 'q' to use list mode (max #{Knowledge.max_page_size()})"}
+    end
+  end
+
+  # `limit` is honored up to the relevant cap; over-cap requests are rejected
+  # with 400 by `validate_search_limit/2` (in `search/2`) rather than silently
+  # clamped here. The `min/2` is a safety net for direct/list callers.
   defp maybe_add_limit(opts, nil), do: [{:limit, 10} | opts]
 
   defp maybe_add_limit(opts, value) when is_binary(value) do
     case Integer.parse(value) do
-      {int, ""} -> [{:limit, int |> max(1) |> min(50)} | opts]
+      {int, ""} -> [{:limit, int |> max(1) |> min(Knowledge.max_page_size())} | opts]
       _ -> [{:limit, 10} | opts]
     end
   end
 
   defp maybe_add_limit(opts, value) when is_integer(value) do
-    [{:limit, value |> max(1) |> min(50)} | opts]
+    [{:limit, value |> max(1) |> min(Knowledge.max_page_size())} | opts]
   end
 
   defp maybe_add_limit(opts, _), do: [{:limit, 10} | opts]

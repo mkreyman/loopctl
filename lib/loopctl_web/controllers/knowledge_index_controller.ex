@@ -18,6 +18,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Pagination
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -129,7 +130,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, fields} <- parse_fields(params["fields"]),
+    with :ok <- Pagination.validate_limit(params),
+         {:ok, fields} <- parse_fields(params["fields"]),
          {:ok, opts} <- build_opts(params) do
       {:ok, result} = Knowledge.list_index(tenant_id, opts)
       json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))

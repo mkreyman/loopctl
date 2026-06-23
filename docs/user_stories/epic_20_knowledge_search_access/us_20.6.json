@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-20.6.3",
-      "description": "Optional query parameters: `project_id` (UUID), `category` (string), `tags` (comma-separated string, split into list), `mode` (keyword|semantic|combined, default: combined), `limit` (integer, default 10, max 50), `offset` (integer, default 0).",
+      "description": "Optional query parameters: `project_id` (UUID), `category` (string), `tags` (comma-separated string, split into list), `mode` (keyword|semantic|combined, default: combined), `limit` (integer, default 10; mode-dependent max — relevance modes max 100, list mode (no `q`) max 1000; over-max returns 400, no silent clamp), `offset` (integer, default 0).",
       "status": "pending"
     },
     {

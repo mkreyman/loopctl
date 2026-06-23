@@ -44,7 +44,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                  }
                })
 
-      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      %{data: articles} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter", include_body: true)
+
       assert length(articles) == 1
       [article] = articles
       assert article.title == "Pattern from newsletter"

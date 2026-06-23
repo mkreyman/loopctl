@@ -45,6 +45,85 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
+  # Maximum page size for the article list endpoint (`list_articles/2`). Larger
+  # limits are HONORED up to this cap so callers can paginate to exhaustion at
+  # limit ∈ {100, 200, 500, 1000}; the controller rejects a requested limit above
+  # this with 400 rather than silently clamping (which truncated result sets and
+  # caused callers advancing `offset` by the requested limit to skip rows).
+  @max_page_size 1000
+
+  @doc """
+  The maximum page size (`limit`) honored by the **enumeration** paths
+  (`list_articles/2`, `list_filtered/2`, `list_drafts/2`, `list_index/2`).
+
+  Exposed so the controller can reject an over-large requested `limit` with a
+  400 instead of silently clamping it.
+  """
+  @spec max_page_size() :: pos_integer()
+  def max_page_size, do: @max_page_size
+
+  # Maximum result count for the **relevance** search modes (keyword / semantic /
+  # combined). These return a ranked top-N, not an exhaustive enumeration, so
+  # they are deliberately capped well below `@max_page_size`: a huge ranked page
+  # is both semantically pointless (callers want the best matches, not all of
+  # them) and expensive (per-row `ts_headline` snippet generation). The HTTP
+  # layer rejects a relevance-mode `limit` above this with 400 — it is NOT
+  # silently clamped — so `meta.limit` never under-reports what was requested.
+  @max_relevance_page_size 100
+
+  @doc """
+  The maximum result count for the relevance search modes (keyword / semantic /
+  combined). Distinct from `max_page_size/0`, which governs the exhaustive
+  enumeration paths.
+  """
+  @spec max_relevance_page_size() :: pos_integer()
+  def max_relevance_page_size, do: @max_relevance_page_size
+
+  # Byte budget for full-content (`include_body: true`) list reads. An article
+  # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
+  # agent-callable memory/DoS vector. Full-content pages therefore return as many
+  # rows as fit within this serialized-body budget (always ≥1 for progress), plus
+  # `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` to continue. Bounds
+  # the response regardless of the requested `limit` or per-row body size.
+  # Worst case per page is ~budget + one body: the always-take-≥1 rule can include
+  # one row beyond the budget, and `body` is byte-validated (≤500_000 bytes, see
+  # Article @max_body_bytes), so worst case is ≤ ~5.5 MB total here.
+  # Enumeration that doesn't need bodies should use the body-less summary
+  # (the default) or `GET /knowledge/index`.
+  @full_content_byte_budget 5_000_000
+
+  # Fields returned by the body-less article summary projection (everything on
+  # the article except the potentially-huge `body` and the never-loaded
+  # `embedding`). Loaded via `select: struct(a, @summary_fields)` so `body` is
+  # never transferred from Postgres for enumeration reads.
+  @summary_fields [
+    :id,
+    :tenant_id,
+    :project_id,
+    :title,
+    :category,
+    :status,
+    :scope,
+    :slug,
+    :tags,
+    :source_type,
+    :source_id,
+    :idempotency_key,
+    :metadata,
+    :inserted_at,
+    :updated_at
+  ]
+
+  @doc """
+  The full-content (`include_body: true`) serialized-body byte budget for list reads.
+
+  Reads `:full_content_byte_budget` from app config (so ops can tune it and tests
+  can exercise truncation cheaply), defaulting to #{@full_content_byte_budget} bytes.
+  """
+  @spec full_content_byte_budget() :: pos_integer()
+  def full_content_byte_budget,
+    do: Application.get_env(:loopctl, :full_content_byte_budget, @full_content_byte_budget)
+
   # --- Articles ---
 
   @doc """
@@ -378,41 +457,131 @@ defmodule Loopctl.Knowledge do
     - `:source_type` -- filter by source_type string (optional)
     - `:source_id` -- filter by source_id (optional; a malformed id matches nothing)
     - `:idempotency_key` -- filter by exact idempotency_key (optional)
-    - `:limit` -- max records to return (default 20, max 100)
+    - `:limit` -- max records to return (default 20, max #{@max_page_size}).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- records to skip for pagination (default 0)
+    - `:include_body` -- when false (default), each row is a body-less summary
+      (the `body` column is never transferred), so large enumeration pages are
+      cheap and safe. When true, full bodies are returned but the page is bounded
+      by a serialized-body byte budget (#{@full_content_byte_budget} bytes): it
+      returns the longest prefix that fits (always ≥1 row) and reports
+      `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` for continuation.
 
   ## Returns
 
-  - `%{data: [%Article{}], meta: %{total_count: integer, limit: integer, offset: integer}}`
+  - body-less: `%{data: [%Article{} (no body)], meta: %{total_count, limit, offset, include_body: false}}`
+  - full-content: `%{data: [%Article{}], meta: %{total_count, limit, offset, include_body: true,
+    returned, next_offset, has_more, byte_truncated, byte_budget}}`
   """
-  @spec list_articles(Ecto.UUID.t(), keyword()) :: %{
-          data: [Article.t()],
-          meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
-        }
+  @spec list_articles(Ecto.UUID.t(), keyword()) :: %{data: [Article.t()], meta: map()}
   def list_articles(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    include_body = Keyword.get(opts, :include_body, false)
 
     base =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
-        order_by: [desc: a.inserted_at]
+        # Total order (id tie-break) so offset pagination can't skip/duplicate
+        # rows that share an `inserted_at`.
+        order_by: [desc: a.inserted_at, asc: a.id]
       )
 
     base = apply_article_filters(base, opts)
-
     total_count = AdminRepo.aggregate(base, :count, :id)
 
+    if include_body do
+      paginate_with_body_budget(base, total_count, limit, offset)
+    else
+      paginate_summary(base, total_count, limit, offset)
+    end
+  end
+
+  # Body-less enumeration page: projects every field except the (potentially
+  # huge) `body`, so the response is bounded by metadata size and large pages
+  # (up to @max_page_size) are safe.
+  defp paginate_summary(base, total_count, limit, offset) do
     articles =
       base
       |> limit(^limit)
       |> offset(^offset)
+      |> select([a], struct(a, ^@summary_fields))
       |> AdminRepo.all()
 
     %{
       data: articles,
-      meta: %{total_count: total_count, limit: limit, offset: offset}
+      meta: %{total_count: total_count, limit: limit, offset: offset, include_body: false}
     }
+  end
+
+  # Full-content page: bounds the response by a serialized-body byte budget
+  # rather than a row count (bodies vary ~100x in size). First reads just the
+  # id + body byte-length for the requested window (no body transfer), takes the
+  # longest prefix that fits the budget (always ≥1 row), then loads the full rows
+  # for exactly those ids. Surfaces continuation via `meta`.
+  defp paginate_with_body_budget(base, total_count, limit, offset) do
+    budget = full_content_byte_budget()
+
+    # Run both queries in a read-only transaction for a consistent snapshot,
+    # since concurrent writes between the sized query and the fetch could
+    # let a page slightly exceed the budget or make returned/next_offset optimistic.
+    {:ok, {ids, byte_truncated, articles}} =
+      AdminRepo.transaction(fn ->
+        sized =
+          base
+          |> limit(^limit)
+          |> offset(^offset)
+          |> select([a], %{id: a.id, bytes: fragment("coalesce(octet_length(?), 0)", a.body)})
+          |> AdminRepo.all()
+
+        {ids, byte_truncated} = take_within_byte_budget(sized, budget)
+
+        articles =
+          base
+          |> where([a], a.id in ^ids)
+          |> AdminRepo.all()
+
+        {ids, byte_truncated, articles}
+      end)
+
+    returned = length(ids)
+    next_offset = offset + returned
+
+    %{
+      data: articles,
+      meta: %{
+        total_count: total_count,
+        limit: limit,
+        offset: offset,
+        include_body: true,
+        returned: returned,
+        next_offset: next_offset,
+        has_more: next_offset < total_count,
+        byte_truncated: byte_truncated,
+        byte_budget: budget
+      }
+    }
+  end
+
+  # Takes the longest prefix of the (already-ordered) sized rows whose cumulative
+  # body bytes stay within `budget`. Always takes at least one row so a page can
+  # make progress even if a single body is unusually large. Returns
+  # `{ids_in_order, truncated?}` where `truncated?` is true when the budget
+  # stopped us before consuming the whole window.
+  defp take_within_byte_budget(sized, budget) do
+    {rev_ids, _sum, truncated} =
+      Enum.reduce_while(sized, {[], 0, false}, fn %{id: id, bytes: bytes}, {acc, sum, _trunc} ->
+        new_sum = sum + bytes
+
+        cond do
+          acc == [] -> {:cont, {[id], bytes, false}}
+          new_sum > budget -> {:halt, {acc, sum, true}}
+          true -> {:cont, {[id | acc], new_sum, false}}
+        end
+      end)
+
+    {Enum.reverse(rev_ids), truncated}
   end
 
   @doc """
@@ -510,7 +679,7 @@ defmodule Loopctl.Knowledge do
            }}
   def list_index(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
-    limit = opts |> Keyword.get(:limit, 1000) |> max(1) |> min(1000)
+    limit = opts |> Keyword.get(:limit, @max_page_size) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =
@@ -893,7 +1062,12 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (default: `:published`)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
-    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:limit` -- max ranked results to return (default 20, max
+      #{@max_relevance_page_size}, min 1). Relevance search returns a ranked
+      top-N, not an exhaustive enumeration; clamped here as a safety net while the
+      HTTP layer rejects an over-large requested limit with 400 (no silent
+      truncation). For complete enumeration use `list_filtered/2` (max
+      #{@max_page_size}).
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -922,7 +1096,7 @@ defmodule Loopctl.Knowledge do
         {:error, :bad_request, "Query too long (max 500 characters)"}
 
       true ->
-        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_relevance_page_size)
         offset = opts |> Keyword.get(:offset, 0) |> max(0)
         status = Keyword.get(opts, :status, :published)
 
@@ -1008,7 +1182,9 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
     - `:status` -- filter by status atom (default: `:published`)
-    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:limit` -- max results to return (default 20, max #{@max_page_size}, min 1).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -1017,7 +1193,7 @@ defmodule Loopctl.Knowledge do
   """
   @spec list_filtered(Ecto.UUID.t(), keyword()) :: {:ok, %{results: [map()], meta: map()}}
   def list_filtered(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     status = Keyword.get(opts, :status, :published)
 
@@ -1405,42 +1581,38 @@ defmodule Loopctl.Knowledge do
   - `tenant_id` -- the tenant UUID
   - `opts` -- keyword list with:
     - `:project_id` -- filter by project UUID (optional)
-    - `:limit` -- max records to return (default 20, max 100)
+    - `:limit` -- max records to return (default 20, max #{@max_page_size}).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- records to skip for pagination (default 0)
 
   ## Returns
 
-  - `%{data: [%Article{}], meta: %{total_count: integer, limit: integer, offset: integer}}`
+  - `%{data: [%Article{}], meta: map()}` — drafts carry full bodies bounded by the
+    serialized-body byte budget, so `meta` includes `total_count`, `limit`,
+    `offset`, `include_body`, `returned`, `next_offset`, `has_more`,
+    `byte_truncated`, and `byte_budget`.
   """
-  @spec list_drafts(Ecto.UUID.t(), keyword()) :: %{
-          data: [Article.t()],
-          meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
-        }
+  @spec list_drafts(Ecto.UUID.t(), keyword()) :: %{data: [Article.t()], meta: map()}
   def list_drafts(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :draft,
-        order_by: [desc: a.inserted_at]
+        # Total order (id tie-break) for stable offset pagination.
+        order_by: [desc: a.inserted_at, asc: a.id]
       )
 
     base = maybe_filter_by_project_id(base, Keyword.get(opts, :project_id))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
-    articles =
-      base
-      |> limit(^limit)
-      |> offset(^offset)
-      |> AdminRepo.all()
-
-    %{
-      data: articles,
-      meta: %{total_count: total_count, limit: limit, offset: offset}
-    }
+    # The drafts review queue returns full bodies, so bound the response by the
+    # same serialized-body byte budget the article list uses for include_body.
+    paginate_with_body_budget(base, total_count, limit, offset)
   end
 
   # Shared transition logic for publish/unpublish/archive workflow
@@ -2575,7 +2747,9 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (default: `:published`)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
-    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:limit` -- max ranked results to return (default 10, max
+      #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
+      enumeration page size
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -2585,7 +2759,7 @@ defmodule Loopctl.Knowledge do
   @spec search_semantic(Ecto.UUID.t(), [float()], keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
   def search_semantic(tenant_id, query_embedding, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     status = Keyword.get(opts, :status, :published)
 
@@ -2659,7 +2833,9 @@ defmodule Loopctl.Knowledge do
     - `:keyword_weight` -- weight for keyword scores (default 0.5)
     - `:semantic_weight` -- weight for semantic scores (default 0.5)
     - `:project_id`, `:category`, `:status`, `:tags` -- standard filters
-    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:limit` -- max ranked results to return (default 10, max
+      #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
+      enumeration page size
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -2711,12 +2887,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_combined_search(tenant_id, query_string, keyword_weight, semantic_weight, opts) do
-    # Use wide limits for sub-searches to get comprehensive score pools.
-    # Suppress sub-search access recording so we only record once at the
-    # merged result (otherwise each article would be tracked twice).
+    # Use wide limits for sub-searches to get comprehensive score pools — at
+    # least the relevance cap, so the merged/paginated result can satisfy a
+    # request up to `max_relevance_page_size`. Suppress sub-search access
+    # recording so we only record once at the merged result (otherwise each
+    # article would be tracked twice).
     sub_opts =
       opts
-      |> Keyword.merge(limit: 50, offset: 0)
+      |> Keyword.merge(limit: @max_relevance_page_size, offset: 0)
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
@@ -2804,7 +2982,7 @@ defmodule Loopctl.Knowledge do
          offset: paginated.offset,
          search_mode: "combined",
          # Size of the deduplicated UNION of a keyword and a semantic sub-search
-         # (each capped at 50, so up to ~100 with no overlap), NOT a corpus total
+         # (each capped at 100, so up to ~200 with no overlap), NOT a corpus total
          # or full match count. Use list mode or knowledge_stats to size the corpus.
          total_count_scope: "merged_candidates"
        }
@@ -2827,7 +3005,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp paginate_results(results, opts) do
-    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     paginated =

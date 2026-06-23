@@ -104,7 +104,7 @@ defmodule Loopctl.Knowledge.Article do
     |> cast(attrs, @cast_fields)
     |> validate_required([:title, :body, :category])
     |> validate_length(:title, max: 500)
-    |> validate_length(:body, max: 100_000)
+    |> validate_body_byte_size()
     |> validate_length(:idempotency_key, max: @max_idempotency_key_length)
     |> validate_slug()
     |> validate_tags()
@@ -141,7 +141,7 @@ defmodule Loopctl.Knowledge.Article do
     article
     |> cast(attrs, [:title, :body, :category, :status, :tags, :slug, :metadata, :project_id])
     |> validate_length(:title, max: 500)
-    |> validate_length(:body, max: 100_000)
+    |> validate_body_byte_size()
     |> validate_slug()
     |> validate_tags()
     |> validate_metadata()
@@ -326,6 +326,30 @@ defmodule Loopctl.Knowledge.Article do
             expected: expected,
             actual: actual
           )
+        end
+
+      _ ->
+        changeset
+    end
+  end
+
+  # Body size enforced as byte_size to ensure a hard ceiling on memory/wire footprint.
+  # Worst-case UTF-8 encoding of 100k graphemes ≈ 400KB; we allow up to 500KB.
+  @max_body_bytes 500_000
+
+  defp validate_body_byte_size(changeset) do
+    case get_change(changeset, :body) do
+      nil ->
+        changeset
+
+      body when is_binary(body) ->
+        if byte_size(body) > @max_body_bytes do
+          add_error(changeset, :body, "exceeds maximum size of %{max} bytes (got %{actual})",
+            max: @max_body_bytes,
+            actual: byte_size(body)
+          )
+        else
+          changeset
         end
 
       _ ->

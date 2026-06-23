@@ -245,18 +245,32 @@ defmodule Loopctl.KnowledgeSearchTest do
       assert meta.offset == 0
     end
 
-    test "caps limit at 100" do
+    test "honors a within-cap relevance limit (#148 A1)" do
       %{tenant: tenant} = setup_tenant()
 
       create_published_article(tenant.id, %{
         title: "Limit Cap Test",
-        body: "Testing that limit is capped at 100."
+        body: "Testing that a within-cap limit is honored, not silently clamped."
       })
 
       assert {:ok, %{meta: meta}} =
-               Knowledge.search_keyword(tenant.id, "limit", limit: 200)
+               Knowledge.search_keyword(tenant.id, "limit", limit: 75)
 
-      assert meta.limit == 100
+      assert meta.limit == 75
+    end
+
+    test "clamps a relevance limit above the relevance cap as an internal safety net (#148 A1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Relevance modes are ranked top-N, capped well below the enumeration page
+      # size. The HTTP layer 400s an over-cap request; the context clamps as a
+      # safety net for direct callers.
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_keyword(tenant.id, "limit",
+                 limit: Knowledge.max_relevance_page_size() + 50
+               )
+
+      assert meta.limit == Knowledge.max_relevance_page_size()
     end
 
     test "floors limit at 1" do

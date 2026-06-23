@@ -87,6 +87,11 @@ config :loopctl, :content_extractor, Loopctl.MockContentExtractor
 # DI: Use mock WebAuthn adapter in tests
 config :loopctl, :webauthn_adapter, Loopctl.MockWebAuthn
 
+# Full-content (include_body) byte budget — small in tests so the byte-budget
+# truncation/continuation behavior can be exercised with a few small bodies
+# instead of ~5 MB of fixtures (production default is 5_000_000).
+config :loopctl, :full_content_byte_budget, 100_000
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",
