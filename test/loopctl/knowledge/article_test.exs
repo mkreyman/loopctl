@@ -76,8 +76,9 @@ defmodule Loopctl.Knowledge.ArticleTest do
       assert changeset.valid?
     end
 
-    test "rejects body exceeding 100_000 characters" do
-      long_body = String.duplicate("x", 100_001)
+    test "rejects body exceeding 500_000 bytes" do
+      # Create a body that exceeds 500KB (500,001 bytes)
+      long_body = String.duplicate("x", 500_001)
 
       changeset =
         Article.create_changeset(%Article{}, %{
@@ -88,6 +89,20 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
       refute changeset.valid?
       assert errors_on(changeset)[:body]
+    end
+
+    test "accepts body at 500_000 byte boundary" do
+      # Create a body at exactly 500KB (500,000 bytes)
+      body_at_limit = String.duplicate("x", 500_000)
+
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Valid title",
+          body: body_at_limit,
+          category: :pattern
+        })
+
+      assert changeset.valid?
     end
 
     test "rejects invalid category" do

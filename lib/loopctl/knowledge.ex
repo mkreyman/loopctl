@@ -85,6 +85,9 @@ defmodule Loopctl.Knowledge do
   # rows as fit within this serialized-body budget (always ≥1 for progress), plus
   # `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` to continue. Bounds
   # the response regardless of the requested `limit` or per-row body size.
+  # Worst case per page is ~budget + one body: the always-take-≥1 rule can include
+  # one row beyond the budget, and `body` is length-validated in graphemes
+  # (≤100_000), so a single body is ≤~400 KB of UTF-8 — i.e. ≤ ~5.4 MB total here.
   # Enumeration that doesn't need bodies should use the body-less summary
   # (the default) or `GET /knowledge/index`.
   @full_content_byte_budget 5_000_000
@@ -520,19 +523,27 @@ defmodule Loopctl.Knowledge do
   defp paginate_with_body_budget(base, total_count, limit, offset) do
     budget = full_content_byte_budget()
 
-    sized =
-      base
-      |> limit(^limit)
-      |> offset(^offset)
-      |> select([a], %{id: a.id, bytes: fragment("coalesce(octet_length(?), 0)", a.body)})
-      |> AdminRepo.all()
+    # Run both queries in a read-only transaction for a consistent snapshot,
+    # since concurrent writes between the sized query and the fetch could
+    # let a page slightly exceed the budget or make returned/next_offset optimistic.
+    {:ok, {ids, byte_truncated, articles}} =
+      AdminRepo.transaction(fn ->
+        sized =
+          base
+          |> limit(^limit)
+          |> offset(^offset)
+          |> select([a], %{id: a.id, bytes: fragment("coalesce(octet_length(?), 0)", a.body)})
+          |> AdminRepo.all()
 
-    {ids, byte_truncated} = take_within_byte_budget(sized, budget)
+        {ids, byte_truncated} = take_within_byte_budget(sized, budget)
 
-    articles =
-      base
-      |> where([a], a.id in ^ids)
-      |> AdminRepo.all()
+        articles =
+          base
+          |> where([a], a.id in ^ids)
+          |> AdminRepo.all()
+
+        {ids, byte_truncated, articles}
+      end)
 
     returned = length(ids)
     next_offset = offset + returned
