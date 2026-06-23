@@ -410,6 +410,51 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert Enum.all?(body["data"], &(&1["score"] == 0.0))
     end
 
+    test "honors a limit above the old 50 cap so list mode reaches every row (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # 60 > the previous silent controller clamp of 50.
+      total = 60
+
+      for i <- 1..total do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Listed #{i}",
+          body: "distinct prose #{i}",
+          category: :reference,
+          status: :published,
+          tags: ["listed148"]
+        })
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "listed148", limit: "60"})
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == total
+      assert body["meta"]["limit"] == 60
+      assert length(body["data"]) == total
+    end
+
+    test "rejects a limit above the maximum page size with 400 (no silent clamp) (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{tags: "anything", limit: "1001"})
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "maximum page size"
+    end
+
     test "category filter without q enumerates the category", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

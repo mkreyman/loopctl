@@ -45,6 +45,22 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
+  # Maximum page size for the article list endpoint (`list_articles/2`). Larger
+  # limits are HONORED up to this cap so callers can paginate to exhaustion at
+  # limit ∈ {100, 200, 500, 1000}; the controller rejects a requested limit above
+  # this with 400 rather than silently clamping (which truncated result sets and
+  # caused callers advancing `offset` by the requested limit to skip rows).
+  @max_page_size 1000
+
+  @doc """
+  The maximum page size (`limit`) honored by `list_articles/2`.
+
+  Exposed so the controller can reject an over-large requested `limit` with a
+  400 instead of silently clamping it.
+  """
+  @spec max_page_size() :: pos_integer()
+  def max_page_size, do: @max_page_size
+
   # --- Articles ---
 
   @doc """
@@ -378,7 +394,9 @@ defmodule Loopctl.Knowledge do
     - `:source_type` -- filter by source_type string (optional)
     - `:source_id` -- filter by source_id (optional; a malformed id matches nothing)
     - `:idempotency_key` -- filter by exact idempotency_key (optional)
-    - `:limit` -- max records to return (default 20, max 100)
+    - `:limit` -- max records to return (default 20, max #{@max_page_size}).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- records to skip for pagination (default 0)
 
   ## Returns
@@ -390,7 +408,7 @@ defmodule Loopctl.Knowledge do
           meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
         }
   def list_articles(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =
@@ -893,7 +911,9 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (default: `:published`)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
-    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:limit` -- max results to return (default 20, max #{@max_page_size}, min 1).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -922,7 +942,7 @@ defmodule Loopctl.Knowledge do
         {:error, :bad_request, "Query too long (max 500 characters)"}
 
       true ->
-        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
         offset = opts |> Keyword.get(:offset, 0) |> max(0)
         status = Keyword.get(opts, :status, :published)
 
@@ -1008,7 +1028,9 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
     - `:status` -- filter by status atom (default: `:published`)
-    - `:limit` -- max results to return (default 20, max 100, min 1)
+    - `:limit` -- max results to return (default 20, max #{@max_page_size}, min 1).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -1017,7 +1039,7 @@ defmodule Loopctl.Knowledge do
   """
   @spec list_filtered(Ecto.UUID.t(), keyword()) :: {:ok, %{results: [map()], meta: map()}}
   def list_filtered(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     status = Keyword.get(opts, :status, :published)
 
@@ -1405,7 +1427,9 @@ defmodule Loopctl.Knowledge do
   - `tenant_id` -- the tenant UUID
   - `opts` -- keyword list with:
     - `:project_id` -- filter by project UUID (optional)
-    - `:limit` -- max records to return (default 20, max 100)
+    - `:limit` -- max records to return (default 20, max #{@max_page_size}).
+      Limits above the max are clamped here as a safety net; the HTTP layer
+      rejects an over-large requested limit with 400 (no silent truncation).
     - `:offset` -- records to skip for pagination (default 0)
 
   ## Returns
@@ -1417,7 +1441,7 @@ defmodule Loopctl.Knowledge do
           meta: %{total_count: non_neg_integer(), limit: pos_integer(), offset: non_neg_integer()}
         }
   def list_drafts(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =

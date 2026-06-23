@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Pagination
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -86,7 +87,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       limit: [
         in: :query,
         type: :integer,
-        description: "Max results to return (default 10, max 50)",
+        description:
+          "Max results to return (default 10, max 1000). In list mode (no `q`) this " <>
+            "paginates the complete filtered set; a limit above the max is rejected " <>
+            "with 400 — not silently clamped. Relevance modes still return at most their " <>
+            "ranked candidate pool regardless of a higher limit.",
         required: false
       ],
       offset: [
@@ -151,7 +156,8 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
 
-    with {:ok, query_spec} <- resolve_query(params),
+    with :ok <- Pagination.validate_limit(params),
+         {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.put(base_opts, :api_key_id, api_key_id)
@@ -264,17 +270,20 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     if tags == [], do: opts, else: [{:tags, tags} | opts]
   end
 
+  # `limit` is honored up to the shared max page size so list-mode pagination
+  # reaches every matching article; over-large requests are rejected with 400 by
+  # `Pagination.validate_limit/1` (in `search/2`) rather than silently clamped here.
   defp maybe_add_limit(opts, nil), do: [{:limit, 10} | opts]
 
   defp maybe_add_limit(opts, value) when is_binary(value) do
     case Integer.parse(value) do
-      {int, ""} -> [{:limit, int |> max(1) |> min(50)} | opts]
+      {int, ""} -> [{:limit, int |> max(1) |> min(Knowledge.max_page_size())} | opts]
       _ -> [{:limit, 10} | opts]
     end
   end
 
   defp maybe_add_limit(opts, value) when is_integer(value) do
-    [{:limit, value |> max(1) |> min(50)} | opts]
+    [{:limit, value |> max(1) |> min(Knowledge.max_page_size())} | opts]
   end
 
   defp maybe_add_limit(opts, _), do: [{:limit, 10} | opts]

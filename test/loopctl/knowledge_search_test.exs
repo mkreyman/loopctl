@@ -245,18 +245,27 @@ defmodule Loopctl.KnowledgeSearchTest do
       assert meta.offset == 0
     end
 
-    test "caps limit at 100" do
+    test "honors a limit above 100 up to the max page size (#148 A1)" do
       %{tenant: tenant} = setup_tenant()
 
       create_published_article(tenant.id, %{
         title: "Limit Cap Test",
-        body: "Testing that limit is capped at 100."
+        body: "Testing that limit above 100 is honored, not silently clamped."
       })
 
       assert {:ok, %{meta: meta}} =
                Knowledge.search_keyword(tenant.id, "limit", limit: 200)
 
-      assert meta.limit == 100
+      assert meta.limit == 200
+    end
+
+    test "clamps a limit above the max page size to the max as an internal safety net (#148 A1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_keyword(tenant.id, "limit", limit: Knowledge.max_page_size() + 1)
+
+      assert meta.limit == Knowledge.max_page_size()
     end
 
     test "floors limit at 1" do

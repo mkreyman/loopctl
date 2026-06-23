@@ -704,6 +704,85 @@ defmodule LoopctlWeb.ArticleControllerTest do
     end
   end
 
+  describe "GET /api/v1/articles — pagination limit (#148 A1)" do
+    test "honors a limit > 100 and paginates a large tag to exhaustion without skipping rows",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # N > 200 so a limit=200 page proves the old `min(100)` clamp is gone and
+      # exhaustive offset pagination reaches every row (regression for the
+      # by-tag cleanup that scanned only 1902 of 3802 rows).
+      total = 205
+
+      for i <- 1..total do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Bulk Article #{i}",
+          category: :reference,
+          tags: ["bulk148"]
+        })
+      end
+
+      page1 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=bulk148&limit=200&offset=0")
+        |> json_response(200)
+
+      # Larger page sizes must return MORE data, not less: the applied limit is
+      # surfaced and honored (old code clamped to 100).
+      assert page1["meta"]["total_count"] == total
+      assert page1["meta"]["limit"] == 200
+      assert length(page1["data"]) == 200
+
+      page2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=bulk148&limit=200&offset=200")
+        |> json_response(200)
+
+      assert length(page2["data"]) == total - 200
+
+      ids =
+        (page1["data"] ++ page2["data"])
+        |> Enum.map(& &1["id"])
+        |> Enum.uniq()
+
+      assert length(ids) == total
+    end
+
+    test "rejects a limit above the maximum page size with 400 instead of silently clamping",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?limit=1001")
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "maximum page size"
+    end
+
+    test "honors the maximum limit exactly (1000) without clamping", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{tenant_id: tenant.id, title: "Edge", tags: ["edge148"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=edge148&limit=1000")
+        |> json_response(200)
+
+      assert body["meta"]["limit"] == 1000
+    end
+  end
+
   describe "GET /api/v1/projects/:project_id/articles" do
     test "lists project-scoped articles only", %{conn: conn} do
       tenant = fixture(:tenant)

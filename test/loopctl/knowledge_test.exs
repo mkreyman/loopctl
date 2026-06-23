@@ -770,11 +770,20 @@ defmodule Loopctl.KnowledgeTest do
       assert result.data == []
     end
 
-    test "caps limit at 100 when higher value requested" do
+    test "honors a limit above 100 up to the max page size (#148 A1)" do
       %{tenant: tenant} = setup_tenant()
 
+      # The old behavior silently clamped to 100, truncating result sets and
+      # causing callers advancing offset by the requested limit to skip rows.
       result = Knowledge.list_articles(tenant.id, limit: 500)
-      assert result.meta.limit == 100
+      assert result.meta.limit == 500
+    end
+
+    test "clamps a limit above the max page size to the max as an internal safety net (#148 A1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      result = Knowledge.list_articles(tenant.id, limit: Knowledge.max_page_size() + 1)
+      assert result.meta.limit == Knowledge.max_page_size()
     end
 
     test "respects custom limit and offset" do

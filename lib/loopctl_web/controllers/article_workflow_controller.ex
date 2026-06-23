@@ -17,6 +17,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   alias Loopctl.Knowledge
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.Pagination
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -179,7 +180,13 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "Includes source_type and source_id for review queue visibility. Role: orchestrator+.",
     parameters: [
       project_id: [in: :query, type: :string, description: "Filter by project UUID"],
-      limit: [in: :query, type: :integer, description: "Max results (default 20, max 100)"],
+      limit: [
+        in: :query,
+        type: :integer,
+        description:
+          "Max results per page (default 20, max 1000). A limit above the max is " <>
+            "rejected with 400 — not silently clamped."
+      ],
       offset: [in: :query, type: :integer, description: "Records to skip"]
     ],
     responses: %{
@@ -357,18 +364,20 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   def drafts(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:project_id, params["project_id"])
-      |> maybe_add_opt(:limit, parse_int(params["limit"]))
-      |> maybe_add_opt(:offset, parse_int(params["offset"]))
+    with :ok <- Pagination.validate_limit(params) do
+      opts =
+        []
+        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:limit, parse_int(params["limit"]))
+        |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
-    result = Knowledge.list_drafts(tenant_id, opts)
+      result = Knowledge.list_drafts(tenant_id, opts)
 
-    json(conn, %{
-      data: Enum.map(result.data, &ArticleJSON.article_data/1),
-      meta: result.meta
-    })
+      json(conn, %{
+        data: Enum.map(result.data, &ArticleJSON.article_data/1),
+        meta: result.meta
+      })
+    end
   end
 
   # --- Private helpers ---

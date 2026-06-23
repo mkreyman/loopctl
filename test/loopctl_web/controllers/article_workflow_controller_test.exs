@@ -697,6 +697,21 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert length(body["data"]) == 2
     end
 
+    test "rejects a limit above the maximum page size with 400 (no silent clamp) (#148 A1)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/drafts?limit=1001")
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "maximum page size"
+    end
+
     test "filters by project_id", %{conn: conn} do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
