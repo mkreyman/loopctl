@@ -53,13 +53,31 @@ defmodule Loopctl.Knowledge do
   @max_page_size 1000
 
   @doc """
-  The maximum page size (`limit`) honored by `list_articles/2`.
+  The maximum page size (`limit`) honored by the **enumeration** paths
+  (`list_articles/2`, `list_filtered/2`, `list_drafts/2`, `list_index/2`).
 
   Exposed so the controller can reject an over-large requested `limit` with a
   400 instead of silently clamping it.
   """
   @spec max_page_size() :: pos_integer()
   def max_page_size, do: @max_page_size
+
+  # Maximum result count for the **relevance** search modes (keyword / semantic /
+  # combined). These return a ranked top-N, not an exhaustive enumeration, so
+  # they are deliberately capped well below `@max_page_size`: a huge ranked page
+  # is both semantically pointless (callers want the best matches, not all of
+  # them) and expensive (per-row `ts_headline` snippet generation). The HTTP
+  # layer rejects a relevance-mode `limit` above this with 400 — it is NOT
+  # silently clamped — so `meta.limit` never under-reports what was requested.
+  @max_relevance_page_size 100
+
+  @doc """
+  The maximum result count for the relevance search modes (keyword / semantic /
+  combined). Distinct from `max_page_size/0`, which governs the exhaustive
+  enumeration paths.
+  """
+  @spec max_relevance_page_size() :: pos_integer()
+  def max_relevance_page_size, do: @max_relevance_page_size
 
   # --- Articles ---
 
@@ -528,7 +546,7 @@ defmodule Loopctl.Knowledge do
            }}
   def list_index(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
-    limit = opts |> Keyword.get(:limit, 1000) |> max(1) |> min(1000)
+    limit = opts |> Keyword.get(:limit, @max_page_size) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     base =
@@ -911,9 +929,12 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (default: `:published`)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
-    - `:limit` -- max results to return (default 20, max #{@max_page_size}, min 1).
-      Limits above the max are clamped here as a safety net; the HTTP layer
-      rejects an over-large requested limit with 400 (no silent truncation).
+    - `:limit` -- max ranked results to return (default 20, max
+      #{@max_relevance_page_size}, min 1). Relevance search returns a ranked
+      top-N, not an exhaustive enumeration; clamped here as a safety net while the
+      HTTP layer rejects an over-large requested limit with 400 (no silent
+      truncation). For complete enumeration use `list_filtered/2` (max
+      #{@max_page_size}).
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -942,7 +963,7 @@ defmodule Loopctl.Knowledge do
         {:error, :bad_request, "Query too long (max 500 characters)"}
 
       true ->
-        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
+        limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_relevance_page_size)
         offset = opts |> Keyword.get(:offset, 0) |> max(0)
         status = Keyword.get(opts, :status, :published)
 
@@ -2599,7 +2620,9 @@ defmodule Loopctl.Knowledge do
     - `:category` -- filter by category atom (optional)
     - `:status` -- filter by status atom (default: `:published`)
     - `:tags` -- filter by tag overlap, articles matching ANY tag (optional)
-    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:limit` -- max ranked results to return (default 10, max
+      #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
+      enumeration page size
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -2609,7 +2632,7 @@ defmodule Loopctl.Knowledge do
   @spec search_semantic(Ecto.UUID.t(), [float()], keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
   def search_semantic(tenant_id, query_embedding, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     status = Keyword.get(opts, :status, :published)
 
@@ -2683,7 +2706,9 @@ defmodule Loopctl.Knowledge do
     - `:keyword_weight` -- weight for keyword scores (default 0.5)
     - `:semantic_weight` -- weight for semantic scores (default 0.5)
     - `:project_id`, `:category`, `:status`, `:tags` -- standard filters
-    - `:limit` -- max results to return (default 10, max 50, min 1)
+    - `:limit` -- max ranked results to return (default 10, max
+      #{@max_relevance_page_size}, min 1); relevance top-N, capped well below the
+      enumeration page size
     - `:offset` -- results to skip for pagination (default 0)
 
   ## Returns
@@ -2735,12 +2760,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_combined_search(tenant_id, query_string, keyword_weight, semantic_weight, opts) do
-    # Use wide limits for sub-searches to get comprehensive score pools.
-    # Suppress sub-search access recording so we only record once at the
-    # merged result (otherwise each article would be tracked twice).
+    # Use wide limits for sub-searches to get comprehensive score pools — at
+    # least the relevance cap, so the merged/paginated result can satisfy a
+    # request up to `max_relevance_page_size`. Suppress sub-search access
+    # recording so we only record once at the merged result (otherwise each
+    # article would be tracked twice).
     sub_opts =
       opts
-      |> Keyword.merge(limit: 50, offset: 0)
+      |> Keyword.merge(limit: @max_relevance_page_size, offset: 0)
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
@@ -2851,7 +2878,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp paginate_results(results, opts) do
-    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     paginated =

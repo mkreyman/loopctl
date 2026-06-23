@@ -818,10 +818,10 @@ async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, c
 
 async function knowledgeDrafts({ limit, offset, project_id }) {
   const params = new URLSearchParams();
-  params.set(
-    "limit",
-    String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE))
-  );
+  // Pass `limit` through verbatim (like knowledge_list/index/search) so the
+  // server honors it up to its max page size and returns 400 above it — rather
+  // than silently clamping client-side, which would truncate draft enumeration.
+  if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
   if (project_id) params.set("project_id", project_id);
   const path = `/api/v1/knowledge/drafts?${params.toString()}`;
@@ -1931,7 +1931,10 @@ const TOOLS = [
         },
         limit: {
           type: "integer",
-          description: "Optional: max articles per page (default 20, max 100).",
+          description:
+            "Optional: max articles per page (default 20, max 1000). A limit above " +
+            "the max is rejected with 400 — not silently clamped — so paging by offset " +
+            "over meta.total_count enumerates the complete set without skipping rows.",
         },
       },
       required: [],
@@ -2293,16 +2296,20 @@ const TOOLS = [
     name: "knowledge_drafts",
     description:
       "List draft (unpublished) knowledge articles. Requires orchestrator role. " +
-      "Returns paginated drafts with total_count in meta. Max 20 per page.",
+      "Returns paginated drafts with total_count in meta. Paginate via offset/limit " +
+      "(limit honored up to 1000; a limit above the max is rejected with 400, not " +
+      "silently clamped).",
     inputSchema: {
       type: "object",
       properties: {
         limit: {
           type: "integer",
-          description: "Max drafts per page. Default 20, hard max 20.",
+          description:
+            "Max drafts per page (default 20, max 1000). A limit above the max is " +
+            "rejected with 400 — not silently clamped — so offset pagination stays complete.",
           default: 20,
           minimum: 1,
-          maximum: 20,
+          maximum: 1000,
         },
         offset: {
           type: "integer",

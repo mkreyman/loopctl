@@ -291,7 +291,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta2.offset == 2
     end
 
-    test "defaults to limit 10, caps at 50" do
+    test "defaults to limit 10, caps at the relevance page size (#148 A1)" do
       %{tenant: tenant} = setup_tenant()
 
       query_vector = make_embedding(:query)
@@ -302,10 +302,15 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta.limit == 10
       assert meta.offset == 0
 
-      assert {:ok, %{meta: capped_meta}} =
-               Knowledge.search_semantic(tenant.id, query_vector, limit: 100)
+      # Relevance modes cap at max_relevance_page_size (a ranked top-N), well below
+      # the enumeration page size. The context clamps as a safety net; the HTTP
+      # layer 400s an over-cap request.
+      cap = Knowledge.max_relevance_page_size()
 
-      assert capped_meta.limit == 50
+      assert {:ok, %{meta: capped_meta}} =
+               Knowledge.search_semantic(tenant.id, query_vector, limit: cap + 50)
+
+      assert capped_meta.limit == cap
     end
   end
 

@@ -5,6 +5,25 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.14.0 — 2026-06-23 (lag-free enumeration honors large pages)
+
+### Changed
+
+- `knowledge_drafts` now passes `limit` through to the server (like
+  `knowledge_list`/`knowledge_index`/`knowledge_search`) instead of silently
+  clamping it to 20 client-side. The server honors a page size up to 1000 and
+  returns **400** for a larger limit — never a silent clamp — so draft
+  enumeration via offset/limit reaches every row. Schema `maximum` raised
+  20 → 1000.
+- `knowledge_list` schema documents the raised max page size (100 → 1000) and the
+  honor-or-400 contract, matching the server change for #148 A1.
+
+### Fixed
+
+- Closes the MCP half of the #148 A1 silent-truncation bug: a draft enumeration
+  requesting `limit > 20` previously received only 20 rows while the caller, if
+  advancing `offset` by the requested limit, skipped the rest.
+
 ## 2.13.0 — 2026-06-22 (ingest publish opt-in)
 
 ### Added

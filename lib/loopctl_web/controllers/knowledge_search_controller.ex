@@ -88,10 +88,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         in: :query,
         type: :integer,
         description:
-          "Max results to return (default 10, max 1000). In list mode (no `q`) this " <>
-            "paginates the complete filtered set; a limit above the max is rejected " <>
-            "with 400 — not silently clamped. Relevance modes still return at most their " <>
-            "ranked candidate pool regardless of a higher limit.",
+          "Max results to return (default 10). The cap is mode-dependent and a limit " <>
+            "above it is rejected with 400 — never silently clamped. **List mode** (no " <>
+            "`q`, just `tags`/`category`) is exhaustive enumeration: max 1000, paginate " <>
+            "the complete filtered set via `offset`. **Relevance modes** (keyword / " <>
+            "semantic / combined) return a ranked top-N: max 100.",
         required: false
       ],
       offset: [
@@ -156,9 +157,9 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
 
-    with :ok <- Pagination.validate_limit(params),
-         {:ok, query_spec} <- resolve_query(params),
+    with {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
+         :ok <- validate_search_limit(params, query_spec),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.put(base_opts, :api_key_id, api_key_id)
 
@@ -270,9 +271,20 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     if tags == [], do: opts, else: [{:tags, tags} | opts]
   end
 
-  # `limit` is honored up to the shared max page size so list-mode pagination
-  # reaches every matching article; over-large requests are rejected with 400 by
-  # `Pagination.validate_limit/1` (in `search/2`) rather than silently clamped here.
+  # List mode is exhaustive enumeration (cap: the shared max page size); the
+  # relevance modes return a ranked top-N (a much smaller cap). Validating the
+  # requested `limit` against the mode-appropriate cap — and 400-ing over it —
+  # keeps `meta.limit` honest in every mode (a relevance request for limit=200
+  # is rejected, never silently clamped to the ranked-pool size).
+  defp validate_search_limit(params, :list),
+    do: Pagination.validate_limit(params, Knowledge.max_page_size())
+
+  defp validate_search_limit(params, {:search, _q}),
+    do: Pagination.validate_limit(params, Knowledge.max_relevance_page_size())
+
+  # `limit` is honored up to the relevant cap; over-cap requests are rejected
+  # with 400 by `validate_search_limit/2` (in `search/2`) rather than silently
+  # clamped here. The `min/2` is a safety net for direct/list callers.
   defp maybe_add_limit(opts, nil), do: [{:limit, 10} | opts]
 
   defp maybe_add_limit(opts, value) when is_binary(value) do
