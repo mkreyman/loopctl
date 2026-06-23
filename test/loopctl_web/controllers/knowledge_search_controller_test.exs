@@ -329,7 +329,8 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
         |> json_response(400)
 
       assert resp["error"]["status"] == 400
-      assert resp["error"]["message"] =~ "maximum page size"
+      assert resp["error"]["message"] =~ "relevance-mode maximum"
+      assert resp["error"]["message"] =~ "exhaustive enumeration"
     end
 
     test "honors a within-cap relevance limit (combined/default mode) (#148 A1)", %{conn: conn} do

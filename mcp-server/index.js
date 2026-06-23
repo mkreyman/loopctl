@@ -641,6 +641,7 @@ async function knowledgeList({
   idempotency_key,
   limit,
   offset,
+  include_body,
 }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
@@ -652,6 +653,9 @@ async function knowledgeList({
   if (idempotency_key) params.set("idempotency_key", idempotency_key);
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
+  // Body-less summary by default (safe to enumerate large pages); opt into full
+  // bodies (byte-budget bounded server-side) with include_body: true.
+  if (include_body === true) params.set("include_body", "true");
 
   const result = await apiCall(
     "GET",
@@ -1882,15 +1886,19 @@ const TOOLS = [
   {
     name: "knowledge_list",
     description:
-      "List articles with FULL fields (id, title, body, category, status, tags, source_type, " +
-      "source_id, idempotency_key, timestamps), filtered and paginated. Unlike knowledge_search " +
-      "(ranked, PUBLISHED-only, and lags writes while embeddings index) and knowledge_index " +
-      "(lightweight id/title/category only), this is the LAG-FREE, ALL-STATUS read of the DB of " +
-      "record — the right tool to enumerate, dedup, or repair. Returns articles in all statuses " +
-      "(draft, published, archived, superseded visible) — intended for dedup/repair tooling. Use " +
-      "for idempotency/existence checks: filter by `tags`, `source_type`+`source_id`, or " +
-      "`idempotency_key` and read `meta.total_count` (exact) to answer \"does an article for X " +
-      "already exist?\" reliably right after a write. Paginate via offset/limit.",
+      "List articles (id, title, category, status, tags, source_type, source_id, " +
+      "idempotency_key, timestamps), filtered and paginated. **Body-less summary by default** " +
+      "— the right tool to enumerate, dedup, or repair at scale (safe to page up to limit=1000). " +
+      "Pass `include_body: true` to also return the full `body`, in which case the server bounds " +
+      "the page by a ~5 MB serialized-body budget and returns meta.next_offset/has_more/" +
+      "byte_truncated for continuation (for a single full body use knowledge_get; for the relevant " +
+      "bodies use knowledge_context; for a bulk content dump use knowledge_export). Unlike " +
+      "knowledge_search (ranked, PUBLISHED-only, lags writes while embeddings index) and " +
+      "knowledge_index (id/title/category only), this is the LAG-FREE, ALL-STATUS read of the DB " +
+      "of record (draft, published, archived, superseded visible). Use for idempotency/existence " +
+      "checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read " +
+      "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
+      "right after a write. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1936,6 +1944,14 @@ const TOOLS = [
             "the max is rejected with 400 — not silently clamped — so paging by offset " +
             "over meta.total_count enumerates the complete set without skipping rows.",
         },
+        include_body: {
+          type: "boolean",
+          description:
+            "Optional (default false): when true, include the full article `body`. The page is " +
+            "then bounded by a ~5 MB serialized-body budget (it may return fewer than `limit` " +
+            "rows); continue via meta.next_offset while meta.has_more is true. Leave false to " +
+            "enumerate metadata cheaply at scale.",
+        },
       },
       required: [],
     },
@@ -1977,7 +1993,7 @@ const TOOLS = [
       "it counts: keyword_matches (stop-word-filtered tsquery matches; 'the' matches ~nothing), " +
       "ranked_corpus (semantic ranks all EMBEDDED published articles — that embedded set's size, " +
       "not a match count, and <= the published count), merged_candidates (combined: deduped UNION of " +
-      "a keyword and a semantic sub-search, each capped at 50, so up to ~100), or filtered_set " +
+      "a keyword and a semantic sub-search, each capped at 100, so up to ~200), or filtered_set " +
       "(list mode: the full set). Do NOT use a relevance-mode total_count to size the wiki — use " +
       "list mode or knowledge_stats. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly.",

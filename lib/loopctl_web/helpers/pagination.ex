@@ -45,8 +45,8 @@ defmodule LoopctlWeb.Helpers.Pagination do
 
   defp parse_int(val) when is_binary(val) do
     case Integer.parse(val) do
-      {n, _} -> n
-      :error -> nil
+      {n, ""} -> n
+      _ -> nil
     end
   end
 

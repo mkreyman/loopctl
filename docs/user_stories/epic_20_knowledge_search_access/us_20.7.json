@@ -26,7 +26,7 @@
     },
     {
       "id": "AC-20.7.3",
-      "description": "Optional query parameters: `project_id` (UUID), `limit` (integer, default 5, max 20), `recency_weight` (float, default 0.3, range 0.0-1.0).",
+      "description": "Optional query parameters: `project_id` (UUID), `limit` (integer, default 5, max 1000), `recency_weight` (float, default 0.3, range 0.0-1.0).",
       "status": "pending"
     },
     {

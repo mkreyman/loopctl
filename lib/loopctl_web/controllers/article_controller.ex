@@ -121,6 +121,10 @@ defmodule LoopctlWeb.ArticleController do
         "while embeddings index), this is the **lag-free, all-status** read of the DB of " <>
         "record — use it for dedup/idempotency/repair (\"does an article with this tag/" <>
         "source/idempotency_key exist?\"). `meta.total_count` is the exact filtered count. " <>
+        "**Returns a body-less summary by default** (safe to enumerate up to limit=1000); pass " <>
+        "`include_body=true` to also return `body`, which bounds the page by a ~5 MB " <>
+        "serialized-body budget and adds `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` " <>
+        "for continuation. For a single full body use GET /articles/:id. " <>
         "Role: agent+.",
     parameters: [
       category: [
@@ -152,7 +156,15 @@ defmodule LoopctlWeb.ArticleController do
           "Max results per page (default 20, max 1000). A limit above the max is " <>
             "rejected with 400 — not silently clamped — so offset pagination stays complete."
       ],
-      offset: [in: :query, type: :integer, description: "Records to skip"]
+      offset: [in: :query, type: :integer, description: "Records to skip"],
+      include_body: [
+        in: :query,
+        type: :boolean,
+        description:
+          "Include full article body (default false). When true the page is bounded by a " <>
+            "~5 MB serialized-body budget and may return fewer than `limit` rows; continue via " <>
+            "`meta.next_offset` while `meta.has_more` is true."
+      ]
     ],
     responses: %{
       200 =>
@@ -305,6 +317,9 @@ defmodule LoopctlWeb.ArticleController do
         |> maybe_add_opt(:idempotency_key, string_param(params["idempotency_key"]))
         |> maybe_add_opt(:limit, parse_int(params["limit"]))
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        # Body-less summary by default; opt into full bodies (byte-budget bounded)
+        # with ?include_body=true.
+        |> Keyword.put(:include_body, params["include_body"] == "true")
 
       result = Knowledge.list_articles(tenant_id, opts)
       json(conn, ArticleJSON.index(%{articles: result.data, meta: result.meta}))
@@ -532,10 +547,13 @@ defmodule LoopctlWeb.ArticleController do
   # Absent, empty, or a malformed (non-string) `tags` param → no filter.
   defp parse_tags(_), do: nil
 
+  # Strict parse: a trailing-garbage limit/offset (e.g. "100abc") is treated as
+  # absent → server default, matching LoopctlWeb.Helpers.Pagination.validate_limit
+  # so the *validated* limit and the *applied* limit can never disagree.
   defp parse_int(val) when is_binary(val) do
     case Integer.parse(val) do
-      {n, _} -> n
-      :error -> nil
+      {n, ""} -> n
+      _ -> nil
     end
   end
 

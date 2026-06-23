@@ -31,7 +31,7 @@
     },
     {
       "id": "AC-20.4.4",
-      "description": "Pagination via `opts[:limit]` (default 10, max 50) and `opts[:offset]` (default 0).",
+      "description": "Pagination via `opts[:limit]` (default 10, max 100) and `opts[:offset]` (default 0).",
       "status": "pending"
     },
     {

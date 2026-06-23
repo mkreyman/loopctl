@@ -48,7 +48,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         "published articles, so the count is the size of that embedded set — not a " <>
         "match count, and <= the total published count), `merged_candidates` " <>
         "(combined mode: the deduped UNION of a keyword and a semantic sub-search, " <>
-        "each capped at 50, so up to ~100), or `filtered_set` " <>
+        "each capped at 100, so up to ~200), or `filtered_set` " <>
         "(list mode: the complete filtered set). Do NOT use a relevance-mode " <>
         "`total_count` to size the corpus — use list mode or `GET /knowledge/stats`. " <>
         "Role: agent+.",
@@ -279,8 +279,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp validate_search_limit(params, :list),
     do: Pagination.validate_limit(params, Knowledge.max_page_size())
 
-  defp validate_search_limit(params, {:search, _q}),
-    do: Pagination.validate_limit(params, Knowledge.max_relevance_page_size())
+  defp validate_search_limit(params, {:search, _q}) do
+    case Pagination.validate_limit(params, Knowledge.max_relevance_page_size()) do
+      :ok ->
+        :ok
+
+      {:error, :bad_request, _} ->
+        {:error, :bad_request,
+         "limit exceeds the relevance-mode maximum of #{Knowledge.max_relevance_page_size()}; " <>
+           "for exhaustive enumeration drop 'q' to use list mode (max #{Knowledge.max_page_size()})"}
+    end
+  end
 
   # `limit` is honored up to the relevant cap; over-cap requests are rejected
   # with 400 by `validate_search_limit/2` (in `search/2`) rather than silently

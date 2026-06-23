@@ -783,6 +783,106 @@ defmodule LoopctlWeb.ArticleControllerTest do
     end
   end
 
+  describe "GET /api/v1/articles — include_body & byte budget (#148 A1)" do
+    test "returns a body-less summary by default (no body in list rows)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Summary Default",
+        body: "this body must not appear in the default list response",
+        tags: ["sum148"]
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=sum148")
+        |> json_response(200)
+
+      row = hd(body["data"])
+      assert row["title"] == "Summary Default"
+      assert row["tags"] == ["sum148"]
+      # Body-less summary: no body key, and meta says so.
+      refute Map.has_key?(row, "body")
+      assert body["meta"]["include_body"] == false
+    end
+
+    test "include_body=true returns full bodies with continuation meta", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "With Body",
+        body: "the full body content is returned here",
+        tags: ["wb148"]
+      })
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=wb148&include_body=true")
+        |> json_response(200)
+
+      row = hd(body["data"])
+      assert row["body"] == "the full body content is returned here"
+      assert body["meta"]["include_body"] == true
+      assert body["meta"]["returned"] == 1
+      assert body["meta"]["has_more"] == false
+      assert body["meta"]["byte_truncated"] == false
+      assert body["meta"]["next_offset"] == 1
+    end
+
+    test "include_body=true bounds a page by the byte budget and continues via next_offset",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Test byte budget is 100_000 (config/test.exs). Three 40 KB bodies (120 KB)
+      # exceed it, so the first page returns 2 (80 KB) and truncates; the 3rd is
+      # reachable by continuing at next_offset.
+      big = String.duplicate("x", 40_000)
+
+      for i <- 1..3 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Heavy #{i}",
+          body: big,
+          tags: ["heavy148"]
+        })
+      end
+
+      page1 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=heavy148&include_body=true&limit=1000")
+        |> json_response(200)
+
+      assert page1["meta"]["total_count"] == 3
+      assert page1["meta"]["returned"] == 2
+      assert length(page1["data"]) == 2
+      assert page1["meta"]["byte_truncated"] == true
+      assert page1["meta"]["has_more"] == true
+      assert page1["meta"]["next_offset"] == 2
+
+      page2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=heavy148&include_body=true&limit=1000&offset=2")
+        |> json_response(200)
+
+      assert page2["meta"]["returned"] == 1
+      assert page2["meta"]["has_more"] == false
+
+      all_ids =
+        (page1["data"] ++ page2["data"]) |> Enum.map(& &1["id"]) |> Enum.uniq()
+
+      assert length(all_ids) == 3
+    end
+  end
+
   describe "GET /api/v1/projects/:project_id/articles" do
     test "lists project-scoped articles only", %{conn: conn} do
       tenant = fixture(:tenant)

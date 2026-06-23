@@ -48,9 +48,9 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
                  }
                })
 
-      # Verify article was created
+      # Verify article was created (include_body to assert body content)
       %{data: articles} =
-        Knowledge.list_articles(tenant.id, source_type: "review_finding")
+        Knowledge.list_articles(tenant.id, source_type: "review_finding", include_body: true)
 
       assert length(articles) == 1
       [article] = articles

@@ -230,7 +230,7 @@
       ],
       "expected_results": [
         "Default call returns 20 articles (default limit)",
-        "limit: 200 call returns max 100 articles (max limit enforced)"
+        "limit: 200 call returns up to 200 articles (honored, not clamped)"
       ],
       "status": "pending"
     }

@@ -6,9 +6,18 @@ defmodule LoopctlWeb.ArticleJSON do
   across all article controller actions.
   """
 
-  @doc "Renders a list of articles with pagination meta."
+  @doc """
+  Renders a list of articles with pagination meta.
+
+  When `meta.include_body` is true the full `body` is included per row (the
+  response is byte-budget bounded server-side); otherwise each row is a body-less
+  summary so large enumeration pages stay small.
+  """
   def index(%{articles: articles, meta: meta}) do
-    %{data: Enum.map(articles, &article_data/1), meta: meta}
+    renderer =
+      if Map.get(meta, :include_body, false), do: &article_data/1, else: &article_summary/1
+
+    %{data: Enum.map(articles, renderer), meta: meta}
   end
 
   @doc "Renders a single article with preloaded links."
@@ -24,6 +33,25 @@ defmodule LoopctlWeb.ArticleJSON do
 
   @doc "Renders an archived article."
   def delete(%{article: article}), do: %{data: article_data(article)}
+
+  @doc "Serializes core article fields WITHOUT the body (body-less enumeration summary)."
+  def article_summary(article) do
+    %{
+      id: article.id,
+      tenant_id: article.tenant_id,
+      project_id: article.project_id,
+      title: article.title,
+      category: article.category,
+      status: article.status,
+      tags: article.tags,
+      source_type: article.source_type,
+      source_id: article.source_id,
+      idempotency_key: article.idempotency_key,
+      metadata: article.metadata,
+      inserted_at: article.inserted_at,
+      updated_at: article.updated_at
+    }
+  end
 
   @doc "Serializes core article fields (no links)."
   def article_data(article) do

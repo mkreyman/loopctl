@@ -51,7 +51,7 @@
     },
     {
       "id": "AC-20.1.8",
-      "description": "Results are paginated with limit/offset: `opts[:limit]` defaults to 20, max 100; `opts[:offset]` defaults to 0. Response meta includes `total_count`, `limit`, and `offset`.",
+      "description": "Results are paginated with limit/offset: `opts[:limit]` defaults to 20, max 1000; `opts[:offset]` defaults to 0. Response meta includes `total_count`, `limit`, and `offset`.",
       "status": "pending"
     },
     {

@@ -387,10 +387,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   defp parse_int(nil), do: nil
 
+  # Strict parse: trailing garbage (e.g. "100abc") → absent, matching
+  # LoopctlWeb.Helpers.Pagination.validate_limit so validated and applied limits agree.
   defp parse_int(val) when is_binary(val) do
     case Integer.parse(val) do
-      {n, _} -> n
-      :error -> nil
+      {n, ""} -> n
+      _ -> nil
     end
   end
 
