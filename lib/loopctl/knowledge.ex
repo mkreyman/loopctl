@@ -86,8 +86,8 @@ defmodule Loopctl.Knowledge do
   # `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` to continue. Bounds
   # the response regardless of the requested `limit` or per-row body size.
   # Worst case per page is ~budget + one body: the always-take-≥1 rule can include
-  # one row beyond the budget, and `body` is length-validated in graphemes
-  # (≤100_000), so a single body is ≤~400 KB of UTF-8 — i.e. ≤ ~5.4 MB total here.
+  # one row beyond the budget, and `body` is byte-validated (≤500_000 bytes, see
+  # Article @max_body_bytes), so worst case is ≤ ~5.5 MB total here.
   # Enumeration that doesn't need bodies should use the body-less summary
   # (the default) or `GET /knowledge/index`.
   @full_content_byte_budget 5_000_000
