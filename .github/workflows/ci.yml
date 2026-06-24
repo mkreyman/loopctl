@@ -238,9 +238,11 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # Include config/*.exs in the key and NO loose restore-keys — a partial-key
+          # restore would reuse a _build compiled under the old config, keeping a stale
+          # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
+          # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -322,9 +324,11 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # Include config/*.exs in the key and NO loose restore-keys — a partial-key
+          # restore would reuse a _build compiled under the old config, keeping a stale
+          # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
+          # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
