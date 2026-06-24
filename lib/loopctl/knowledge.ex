@@ -2880,51 +2880,72 @@ defmodule Loopctl.Knowledge do
   # Builds the suggested-links candidate query (returned, not executed) so a test can
   # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.
   #
-  # Ranks candidates by cosine similarity to the target. The target embedding (already
-  # fetched by the caller, `fetch_article_embedding`) is passed as a BOUND `^param`
-  # LIST of floats — exactly the form `search_semantic` ships in production. This is the
-  # HNSW-indexable shape `ORDER BY embedding <=> $const LIMIT k`
-  # (`articles_embedding_idx`, vector_cosine_ops), so the planner does an approximate-NN
-  # index scan instead of a per-row cosine + full sort over every published article.
+  # SHAPE IS LOAD-BEARING (verified with EXPLAIN against the ~76k-row prod corpus):
+  # pgvector's HNSW index (cosine) only accelerates a PURE `ORDER BY embedding <=> $const
+  # LIMIT k`. Adding the already-linked anti-join (a JOIN) OR a distance filter
+  # (`... <=> ... > threshold`) to that same query makes the planner abandon the index and
+  # Seq-Scan the entire corpus + Sort — the #172 / #170 production 500 (cost ~57k vs ~880).
   #
-  # Two regressions are deliberately avoided here:
-  #   * #168 — NEVER bind the *stored* `%Pgvector{}` struct as a param (that
-  #     re-interpolation was the original 500). We convert it to a plain list first
-  #     (`to_embedding_list/1`), the same value shape `search_semantic` binds.
-  #   * #172 — NEVER self-join `articles` to read the target vector as a *column*
-  #     (`a.embedding <=> t.embedding`). A column right-operand defeats the HNSW index
-  #     and forces a full-corpus scan + sort, which timed out at prod scale (~76k
-  #     published articles) → 500. The bound `^param` left-vs-const form is indexable.
+  # So this is split in two:
+  #   * INNER subquery — the pure top-`pool` nearest by cosine. Only index-safe filters
+  #     here (tenant, status, not-null, not-self, visibility — all verified to keep the
+  #     index). The target is a BOUND `^param` LIST of floats (`to_embedding_list/1`),
+  #     never the stored `%Pgvector{}` struct (that re-interpolation was the #168 500).
+  #   * OUTER query — applies the already-linked anti-join + the `similarity_score >
+  #     threshold` floor + the final `limit`, over just `pool` rows (cheap).
   #
-  # The caller has already confirmed the target exists / is published / is embedded /
-  # is visible. Bounded by `status`, `limit`, and a 15s timeout (matching the other
-  # vector paths, `nearest_prior_distance`/`distant_pairs`).
+  # `pool` over-fetches well beyond `limit` so the outer exclusions rarely starve the
+  # result; effective recall is additionally bounded by `hnsw.ef_search` (default 40),
+  # consistent with the `search_semantic` path. The caller has already confirmed the
+  # target exists / is published / is embedded / is visible.
   @doc false
   def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
     target = to_embedding_list(embedding)
+    pool = suggestion_candidate_pool(limit)
 
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id and a.status == :published,
-      where: not is_nil(a.embedding),
-      where: a.id != ^article_id,
+    candidates =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.status == :published,
+        where: not is_nil(a.embedding),
+        where: a.id != ^article_id,
+        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
+        limit: ^pool,
+        select: %{
+          id: a.id,
+          title: a.title,
+          category: a.category,
+          similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
+        }
+      )
+      |> maybe_filter_by_visibility(vis)
+
+    from(c in subquery(candidates),
       # Exclude any article already linked to the target (either direction, any type).
       left_join: l in ArticleLink,
       on:
         l.tenant_id == ^tenant_id and
-          ((l.source_article_id == ^article_id and l.target_article_id == a.id) or
-             (l.target_article_id == ^article_id and l.source_article_id == a.id)),
+          ((l.source_article_id == ^article_id and l.target_article_id == c.id) or
+             (l.target_article_id == ^article_id and l.source_article_id == c.id)),
       where: is_nil(l.id),
-      where: fragment("GREATEST(0, 1 - (? <=> ?)) > ?", a.embedding, ^target, ^threshold),
-      order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
+      where: c.similarity_score > ^threshold,
+      order_by: [desc: c.similarity_score],
       limit: ^limit,
       select: %{
-        id: a.id,
-        title: a.title,
-        category: a.category,
-        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
+        id: c.id,
+        title: c.title,
+        category: c.category,
+        similarity_score: c.similarity_score
       }
     )
-    |> maybe_filter_by_visibility(vis)
+  end
+
+  # Over-fetch factor for the inner ANN subquery: pull this many nearest candidates from
+  # the HNSW index before the outer query applies the anti-join + threshold and trims to
+  # `limit`. Scales with `limit` (headroom for exclusions), floored for the common small
+  # `limit`, and capped so the index scan stays cheap.
+  defp suggestion_candidate_pool(limit) do
+    max(limit * 5, 100)
+    |> min(Application.get_env(:loopctl, :max_suggestion_candidate_pool, 500))
   end
 
   # The HNSW-indexable cosine form binds the target as a plain `[float()]` list (the

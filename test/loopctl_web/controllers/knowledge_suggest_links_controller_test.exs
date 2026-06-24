@@ -79,16 +79,20 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
     end
 
     # The SQL-shape check above guards the self-join specifically; this guards the broader
-    # #172 regression CLASS — "the ORDER BY can use the HNSW index" — which a shape regex
-    # can't see. Disabling seq-scan AND sort forces the planner onto the only ordered path:
-    # if `ORDER BY embedding <=> $const` is index-matchable it satisfies it via
-    # `articles_embedding_idx` with NO Sort node; an index-INELIGIBLE rewrite (a self-join
-    # column operand like #170, a wrapped/computed order expr, or a dropped index) cannot,
-    # so the plan is forced to a (disabled-cost) Sort — failing this test. Catches a
-    # reintroduced full-corpus scan that every behavioral test (which seq-scans at test
-    # scale) would miss. Deterministic at any row count — asserts index ELIGIBILITY, not the
-    # planner's cost-based choice at scale.
-    test "EXPLAIN: the suggestion query is HNSW-index-eligible (no Sort / full-corpus scan)" do
+    # #172 regression CLASS — "the corpus is reached through the HNSW index, never a full
+    # Seq Scan + Sort" — which a shape regex can't see. This is THE bug that shipped twice
+    # (#170, then the first #172 attempt): both passed every behavioral test because at test
+    # scale the planner seq-scans 6 rows happily; only at prod scale (~76k rows) does the
+    # Seq Scan + Sort blow the statement timeout. Verified against the real prod corpus,
+    # the fix is a subquery: the inner ANN (`ORDER BY embedding <=> $const LIMIT pool`) uses
+    # `articles_embedding_idx`; the anti-join + threshold live in the OUTER query (each
+    # would defeat the index if pushed inside). With seq-scan disabled the planner must
+    # reach `articles` via that index — so the plan names the HNSW index and contains NO
+    # `Seq Scan on articles`. (An outer Sort over the small candidate pool is expected and
+    # fine — it is NOT a full-corpus sort.) An index-defeating rewrite (anti-join/threshold
+    # back inside, a self-join column operand, a dropped index) reintroduces `Seq Scan on
+    # articles`, failing this. Deterministic at any row count.
+    test "EXPLAIN: corpus reached via the HNSW index, never a full Seq Scan on articles" do
       {tenant, _key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0, 0.0])
       for i <- 1..5, do: embedded(tenant.id, "C#{i}", [1.0, 0.0])
@@ -100,18 +104,19 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
       {:ok, plan} =
         AdminRepo.transaction(fn ->
-          # Force the planner past cost-based choices so the assertion reflects index
-          # ELIGIBILITY, not whether HNSW happens to win at 6 rows.
+          # Disable seq-scan AND sort so the inner ANN must reach `articles` through the
+          # HNSW index — reflecting whether it CAN, not whether HNSW wins the cost model at
+          # 6 rows. (The outer sort over the small candidate pool is unaffected/expected.)
           AdminRepo.query!("SET LOCAL enable_seqscan = off")
           AdminRepo.query!("SET LOCAL enable_sort = off")
           %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
           Enum.map_join(rows, "\n", &Enum.join(&1, " "))
         end)
 
-      # Uses the HNSW index for the ordering...
+      # The corpus is read through the HNSW index...
       assert plan =~ "articles_embedding_idx"
-      # ...and therefore needs no Sort node (a full-corpus scan + sort would have one).
-      refute plan =~ ~r/\bSort\b/
+      # ...never a full-corpus Seq Scan (the #170/#172 production 500).
+      refute plan =~ ~r/Seq Scan on articles\b/i
     end
   end
 
