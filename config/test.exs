@@ -96,6 +96,11 @@ config :loopctl, :full_content_byte_budget, 100_000
 # be exercised with ~11 nodes instead of 100+ (production default is 100).
 config :loopctl, :max_graph_nodes, 10
 
+# Distant-pairs candidate cap — small in tests so the O(n²) self-join sampling
+# cap can be exercised with ~26 articles instead of 1000+ (production default is
+# 1000). Keep comfortably above the article count of any non-truncation test.
+config :loopctl, :max_pair_candidates, 25
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",

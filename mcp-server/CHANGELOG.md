@@ -5,6 +5,25 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.20.0 — 2026-06-23 (creativity primitives)
+
+### Added
+
+- **`knowledge_distant_pairs`** — distant-but-bridgeable article pairs in the
+  optimal-novelty embedding band (cosine distance min..max, default 0.3–0.7).
+  Optional `bridge_path` requires a ≤2-hop link-graph path. Paginated. The
+  remote-associates generator for computational-creativity ideation. (#152 A1)
+- **`knowledge_novelty`** — score ideas by novelty: each idea's text is embedded
+  and compared to the nearest prior proposal (default tag `proposal`), returning
+  `novelty_score` = cosine distance (0 = identical, higher = more novel up to 2.0;
+  `null` when the idea text is blank, no priors exist, or embedding fails — with
+  `meta.prior_count` (count of embedded priors actually compared against)). (#152 A2)
+- **`knowledge_random_walk`** — random walk through the link graph from a starting
+  article (no cycles), surfacing unexpected connections for incubation. (#152 A3)
+
+  Backed by `GET /api/v1/knowledge/pairs`, `POST /api/v1/knowledge/novelty`,
+  `GET /api/v1/knowledge/walk`.
+
 ## 2.19.0 — 2026-06-23 (agent-memory scoped context)
 
 ### Added

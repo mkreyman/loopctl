@@ -307,6 +307,11 @@ defmodule LoopctlWeb.Router do
     # Knowledge Graph (multi-hop traversal of the article-link graph)
     get "/knowledge/graph", KnowledgeGraphController, :graph
 
+    # Creativity primitives (distant pairs, novelty scoring, random walk)
+    get "/knowledge/pairs", KnowledgeCreativityController, :pairs
+    post "/knowledge/novelty", KnowledgeCreativityController, :novelty
+    get "/knowledge/walk", KnowledgeCreativityController, :walk
+
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 

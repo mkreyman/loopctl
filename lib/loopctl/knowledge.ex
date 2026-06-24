@@ -94,6 +94,24 @@ defmodule Loopctl.Knowledge do
   # per-node link cap to bound fan-out
   @max_graph_neighbors_per_node 10
 
+  # Creativity primitives (#152). The distant-pairs self-join is O(candidates²),
+  # so it samples at most @max_pair_candidates embedded articles (bounding the
+  # cross product); a random walk takes at most @max_walk_length steps. The
+  # candidate cap is operator-tunable via `config :loopctl, :max_pair_candidates`.
+  @max_pair_candidates 1000
+  @default_pair_limit 20
+  @max_pair_limit 100
+  @default_walk_length 4
+  @max_walk_length 25
+  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
+  # doesn't serialize 50 embedding round-trips.
+  @novelty_concurrency 5
+
+  # Maximum text length for a novelty idea to prevent unbounded embedding input.
+  # OpenAI's embedding API accepts up to ~8k tokens (~32k chars); we cap at 4MB
+  # to protect against DoS. Text beyond this is silently truncated before embedding.
+  @max_idea_text_bytes 4 * 1024 * 1024
+
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
   # agent-callable memory/DoS vector. Full-content pages therefore return as many
@@ -2969,6 +2987,337 @@ defmodule Loopctl.Knowledge do
       }
     )
     |> AdminRepo.all()
+  end
+
+  # --- Creativity primitives (#152) ---
+
+  @doc """
+  Finds **distant-but-bridgeable** article pairs in the optimal-novelty embedding
+  band (cosine distance ∈ [min, max], default 0.3–0.7) — the creative sweet spot
+  (neither banal nor nonsense).
+
+  Samples at most #{@max_pair_candidates} embedded published articles (bounding the
+  O(n²) self-join), returns distinct unordered pairs ordered deterministically for
+  pagination. With `bridge_path: true` only pairs that are also connected in the
+  link graph (directly, or via a shared neighbor — ≤2 hops) are returned.
+
+  ## Parameters
+
+  - `opts` -- `:min_distance` (default 0.3), `:max_distance` (default 0.7),
+    `:bridge_path` (default false), `:limit` (default #{@default_pair_limit},
+    max #{@max_pair_limit}), `:offset`.
+
+  ## Returns
+
+  - `{:ok, %{pairs: [...], total_count: integer, has_more: boolean}}`
+  - `{:error, :invalid_distance}` when the band is outside 0.0–2.0 or min > max
+  """
+  @spec distant_pairs(Ecto.UUID.t(), keyword()) ::
+          {:ok, %{pairs: [map()], total_count: integer(), has_more: boolean()}}
+          | {:error, :invalid_distance}
+  def distant_pairs(tenant_id, opts \\ []) do
+    min_d = Keyword.get(opts, :min_distance, 0.3)
+    max_d = Keyword.get(opts, :max_distance, 0.7)
+    limit = opts |> Keyword.get(:limit, @default_pair_limit) |> max(1) |> min(@max_pair_limit)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    bridge? = Keyword.get(opts, :bridge_path, false) == true
+
+    with :ok <- validate_distance_band(min_d, max_d) do
+      {:ok, do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?)}
+    end
+  end
+
+  defp validate_distance_band(min_d, max_d)
+       when is_number(min_d) and is_number(max_d) and min_d >= 0.0 and max_d <= 2.0 and
+              min_d <= max_d,
+       do: :ok
+
+  defp validate_distance_band(_, _), do: {:error, :invalid_distance}
+
+  # Operator-tunable cap on the sampled candidate set (bounds the O(n²) self-join).
+  defp max_pair_candidates do
+    Application.get_env(:loopctl, :max_pair_candidates, @max_pair_candidates)
+  end
+
+  defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?) do
+    candidates =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
+        order_by: a.id,
+        limit: ^max_pair_candidates(),
+        select: %{
+          id: a.id,
+          tenant_id: a.tenant_id,
+          title: a.title,
+          category: a.category,
+          embedding: a.embedding
+        }
+      )
+
+    # Build the base query for counting total pairs
+    count_query =
+      from(a in subquery(candidates),
+        join: b in subquery(candidates),
+        on: a.id < b.id,
+        where: fragment("(? <=> ?) BETWEEN ? AND ?", a.embedding, b.embedding, ^min_d, ^max_d),
+        select: count()
+      )
+
+    # Build the paginated query for fetching pairs
+    pairs_query =
+      from(a in subquery(candidates),
+        join: b in subquery(candidates),
+        on: a.id < b.id,
+        where: fragment("(? <=> ?) BETWEEN ? AND ?", a.embedding, b.embedding, ^min_d, ^max_d),
+        order_by: [asc: a.id, asc: b.id],
+        limit: ^(limit + 1),
+        offset: ^offset,
+        select: %{
+          a: %{id: a.id, title: a.title, category: a.category},
+          b: %{id: b.id, title: b.title, category: b.category},
+          distance: fragment("(? <=> ?)", a.embedding, b.embedding)
+        }
+      )
+
+    # Fetch count and paginated pairs
+    # Note: count may shift between queries, but avoiding transaction hold on the O(n²) self-join
+    # prevents AdminRepo pool starvation under concurrent agent load (3 agents, pool_size: 3).
+    total_count =
+      count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
+
+    pairs_with_lookahead =
+      pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
+
+    # Detect has_more by fetching limit+1; only return limit
+    has_more = length(pairs_with_lookahead) > limit
+    pairs = Enum.take(pairs_with_lookahead, limit)
+
+    %{pairs: pairs, total_count: total_count, has_more: has_more}
+  end
+
+  # Bridge filter: keep only pairs connected within ≤2 hops in the link graph —
+  # directly linked, or sharing a common neighbor (the #149 "bridgeable" notion).
+  # The shared neighbor must be a distinct *published* article, consistent with
+  # random_walk's published-only neighbors — a pair doesn't bridge through an
+  # archived/draft middle. All node/link references are tenant-scoped.
+  defp maybe_filter_bridge_path(query, false), do: query
+
+  defp maybe_filter_bridge_path(query, true) do
+    where(
+      query,
+      [a, b],
+      fragment(
+        "EXISTS (SELECT 1 FROM article_links l WHERE l.tenant_id = ? AND ((l.source_article_id = ? AND l.target_article_id = ?) OR (l.source_article_id = ? AND l.target_article_id = ?)))",
+        a.tenant_id,
+        a.id,
+        b.id,
+        b.id,
+        a.id
+      ) or
+        fragment(
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND m.id <> ? AND m.id <> ?)",
+          a.tenant_id,
+          a.id,
+          a.id,
+          a.tenant_id,
+          b.id,
+          b.id,
+          a.tenant_id,
+          a.id,
+          b.id
+        )
+    )
+  end
+
+  @doc """
+  Random walk through the link graph from a starting article (Boden's
+  random-exploration / incubation mechanism). Picks a random unvisited published
+  neighbor at each step, so the walk never revisits a node; stops at `length`
+  steps or when it reaches a dead end.
+
+  ## Parameters
+
+  - `start_id` -- the starting article UUID (must exist + be published)
+  - `opts` -- `:length` (steps, default #{@default_walk_length}, max #{@max_walk_length})
+
+  ## Returns
+
+  - `{:ok, [%{id, title, category}]}` — the walk in order, starting with `start_id`
+  - `{:error, :not_found}` when the start article doesn't exist / isn't published
+  """
+  @spec random_walk(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, [map()]} | {:error, :not_found}
+  def random_walk(tenant_id, start_id, opts \\ []) do
+    length = opts |> Keyword.get(:length, @default_walk_length) |> max(1) |> min(@max_walk_length)
+
+    case fetch_walk_node(tenant_id, start_id) do
+      nil -> {:error, :not_found}
+      node -> {:ok, do_random_walk(tenant_id, node, MapSet.new([node.id]), length, [node])}
+    end
+  end
+
+  defp do_random_walk(_tenant_id, _current, _visited, 0, acc), do: Enum.reverse(acc)
+
+  defp do_random_walk(tenant_id, current, visited, steps_left, acc) do
+    case random_unvisited_neighbor(tenant_id, current.id, visited) do
+      nil ->
+        Enum.reverse(acc)
+
+      next ->
+        do_random_walk(tenant_id, next, MapSet.put(visited, next.id), steps_left - 1, [next | acc])
+    end
+  end
+
+  defp fetch_walk_node(tenant_id, article_id) do
+    if valid_uuid?(article_id) do
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+        select: %{id: a.id, title: a.title, category: a.category}
+      )
+      |> AdminRepo.one()
+    end
+  end
+
+  defp random_unvisited_neighbor(tenant_id, current_id, visited) do
+    visited_ids = MapSet.to_list(visited)
+
+    from(l in ArticleLink,
+      where:
+        l.tenant_id == ^tenant_id and
+          (l.source_article_id == ^current_id or l.target_article_id == ^current_id),
+      join: n in Article,
+      on:
+        n.tenant_id == ^tenant_id and n.status == :published and
+          n.id ==
+            fragment(
+              "CASE WHEN ? = ? THEN ? ELSE ? END",
+              l.source_article_id,
+              type(^current_id, Ecto.UUID),
+              l.target_article_id,
+              l.source_article_id
+            ),
+      where: n.id not in type(^visited_ids, {:array, Ecto.UUID}),
+      order_by: fragment("random()"),
+      limit: 1,
+      select: %{id: n.id, title: n.title, category: n.category}
+    )
+    |> AdminRepo.one()
+  end
+
+  @doc """
+  Novelty scoring (#152 A2): for each idea, the **cosine distance** to its nearest
+  prior proposal — `0` = identical to existing work, higher = more novel (up to `2.0`
+  for an opposite embedding). Embeds each idea's text on the fly, concurrently (bounded
+  at #{@novelty_concurrency}). Priors default to published articles tagged `proposal`;
+  pass `:prior_tag` to use a different family.
+
+  ## Parameters
+
+  - `ideas` -- list of `%{...}` maps; the embed text is `idea[:text]` (or `"text"`),
+    else `title <> " " <> thesis`-style fields are joined.
+  - `opts` -- `:prior_tag` (default "proposal")
+
+  ## Returns
+
+  - `{:ok, [idea_with_novelty_score], prior_count}` — each idea gets `:novelty_score`
+    (float in `[0, 2]`, or `nil` when its text is blank, couldn't be embedded, or there
+    are no comparable priors). `prior_count` is the number of **embedded** prior
+    proposals actually available for comparison (when it is `0`, every score is `nil`
+    and no embedding work is done).
+  """
+  @spec novelty_scores(Ecto.UUID.t(), [map()], keyword()) :: {:ok, [map()], non_neg_integer()}
+  def novelty_scores(tenant_id, ideas, opts \\ []) when is_list(ideas) do
+    prior_tag = Keyword.get(opts, :prior_tag, "proposal")
+    prior_count = count_embedded_priors(tenant_id, prior_tag)
+
+    scored =
+      if prior_count == 0 do
+        # No comparable (embedded) priors — skip embedding entirely; nothing to score
+        # against, so no upstream calls are made and every idea scores nil.
+        Enum.map(ideas, &Map.put(&1, :novelty_score, nil))
+      else
+        ideas
+        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag),
+          max_concurrency: @novelty_concurrency,
+          timeout: :infinity,
+          ordered: true
+        )
+        |> Enum.zip(ideas)
+        |> Enum.map(fn
+          {{:ok, scored_idea}, _original_idea} ->
+            scored_idea
+
+          {{:exit, reason}, original_idea} ->
+            Logger.warning("novelty_scores: idea scoring task exited: #{inspect(reason)}")
+            Map.put(original_idea, :novelty_score, nil)
+        end)
+      end
+
+    {:ok, scored, prior_count}
+  end
+
+  # Count of embedded prior proposals — the set actually compared against (matches
+  # nearest_prior_distance's filter), so it's a truthful disambiguator for nil scores.
+  defp count_embedded_priors(tenant_id, prior_tag) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
+          fragment("? && ?", a.tags, ^[prior_tag])
+    )
+    |> AdminRepo.aggregate(:count, timeout: 15_000)
+  end
+
+  defp score_idea(tenant_id, idea, prior_tag) do
+    text = novelty_idea_text(idea)
+
+    if String.trim(text) == "" do
+      Map.put(idea, :novelty_score, nil)
+    else
+      score_embedding(tenant_id, idea, text, prior_tag)
+    end
+  end
+
+  defp score_embedding(tenant_id, idea, text, prior_tag) do
+    case generate_embedding(text) do
+      {:ok, embedding} ->
+        Map.put(idea, :novelty_score, nearest_prior_distance(tenant_id, embedding, prior_tag))
+
+      {:error, _} ->
+        Map.put(idea, :novelty_score, nil)
+    end
+  end
+
+  defp novelty_idea_text(idea) do
+    text =
+      case idea[:text] || idea["text"] do
+        text when is_binary(text) and text != "" ->
+          text
+
+        _ ->
+          [:title, :spark, :thesis]
+          |> Enum.map(fn k -> idea[k] || idea[to_string(k)] end)
+          |> Enum.filter(&is_binary/1)
+          |> Enum.join(" ")
+      end
+
+    # Truncate to max bytes to prevent unbounded embedding input DoS
+    if byte_size(text) > @max_idea_text_bytes do
+      String.slice(text, 0, @max_idea_text_bytes)
+    else
+      text
+    end
+  end
+
+  # Min cosine distance from the idea embedding to any prior proposal; nil when there
+  # are no embedded priors (distinguishable from a genuine high score).
+  defp nearest_prior_distance(tenant_id, embedding, prior_tag) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
+          fragment("? && ?", a.tags, ^[prior_tag]),
+      select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
+    )
+    |> AdminRepo.one(timeout: 15_000)
   end
 
   # --- Embeddings ---

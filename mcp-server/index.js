@@ -646,6 +646,39 @@ async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
   return toContent(result);
 }
 
+async function knowledgeDistantPairs({ min_distance, max_distance, bridge_path, limit, offset }) {
+  const params = new URLSearchParams();
+  if (min_distance != null) params.set("min_distance", String(min_distance));
+  if (max_distance != null) params.set("max_distance", String(max_distance));
+  if (bridge_path === true) params.set("bridge_path", "true");
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs ? `/api/v1/knowledge/pairs?${qs}` : "/api/v1/knowledge/pairs";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeNovelty({ ideas, prior_tag }) {
+  const body = { ideas };
+  if (prior_tag) body.prior_tag = prior_tag;
+  const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeRandomWalk({ start_id, length }) {
+  const params = new URLSearchParams();
+  params.set("start_id", start_id);
+  if (length != null) params.set("length", String(length));
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/walk?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeCount({
   project_id,
   category,
@@ -2231,6 +2264,70 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_distant_pairs",
+    description:
+      "Find distant-but-bridgeable article pairs in the optimal-novelty embedding band " +
+      "(cosine distance min..max, default 0.3–0.7) — the creative sweet spot (neither banal " +
+      "nor nonsense). Returns { data: [{a, b, distance}], meta:{count} }. With bridge_path:true, " +
+      "only pairs also connected in the link graph (≤2 hops) are returned. Samples up to 1000 " +
+      "embedded published articles; paginate via limit/offset. For computational-creativity " +
+      "ideation (remote-associates generator).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        min_distance: { type: "number", description: "Lower cosine-distance bound (default 0.3)." },
+        max_distance: { type: "number", description: "Upper cosine-distance bound (default 0.7)." },
+        bridge_path: { type: "boolean", description: "Require a ≤2-hop graph path (default false)." },
+        limit: { type: "integer", description: "Max pairs (default 20, max 100)." },
+        offset: { type: "integer", description: "Pairs to skip." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_novelty",
+    description:
+      "Score the NOVELTY of ideas: each idea's text is embedded and compared to the nearest " +
+      "prior proposal, returning novelty_score = cosine distance (0 = identical to existing " +
+      "work, higher = more novel, up to 2.0; null when the idea text is blank, no priors " +
+      "exist, or embedding fails). Priors default to published articles tagged 'proposal' " +
+      "(override with prior_tag). " +
+      "Returns { data: [{...idea, novelty_score}], meta: { prior_count } }. Use to rerank " +
+      "generated ideas by novelty × value and avoid repeating prior work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ideas: {
+          type: "array",
+          description:
+            "Ideas to score (≤50). Each is an object; its embed text is `text`, else " +
+            "title/spark/thesis are joined.",
+          items: { type: "object" },
+        },
+        prior_tag: {
+          type: "string",
+          description: "Tag identifying prior proposals to compare against (default 'proposal').",
+        },
+      },
+      required: ["ideas"],
+    },
+  },
+  {
+    name: "knowledge_random_walk",
+    description:
+      "Random walk through the link graph from a starting article (up to `length` published " +
+      "nodes, no cycles, stops at a dead end). Surfaces unexpected connections for creative " +
+      "incubation. Returns { data: [{id,title,category}], meta:{count} } in walk order.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        start_id: { type: "string", format: "uuid", description: "Starting article UUID (required)." },
+        length: { type: "integer", description: "Walk steps (default 4, max 25)." },
+      },
+      required: ["start_id"],
+    },
+  },
+  {
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. Ranked, and returns PUBLISHED " +
@@ -3183,6 +3280,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_suggest_links":
       return await knowledgeSuggestLinks(args);
+
+    case "knowledge_distant_pairs":
+      return await knowledgeDistantPairs(args);
+
+    case "knowledge_novelty":
+      return await knowledgeNovelty(args);
+
+    case "knowledge_random_walk":
+      return await knowledgeRandomWalk(args);
 
     case "knowledge_search":
       return await knowledgeSearch(args);
