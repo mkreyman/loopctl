@@ -44,7 +44,21 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Configure Elixir's Logger — structured JSON logging with tenant context.
 # Production uses JSON via LoggerJSON; dev/test override with human-readable format.
 config :logger, :default_handler,
-  formatter: {LoggerJSON.Formatters.Basic, metadata: [:request_id, :tenant_id, :remote_ip]}
+  formatter:
+    {LoggerJSON.Formatters.Basic,
+     metadata: [
+       :request_id,
+       :tenant_id,
+       :remote_ip,
+       # US-27.3: structured DB-error fields so a mapped DB error is emitted as
+       # first-class JSON fields in prod (AC-27.3.3), not just inline in the
+       # message. sqlstate/mapped_code make a 57014 timeout self-identifying.
+       :sqlstate,
+       :mapped_code,
+       :controller,
+       :action,
+       :pg_message
+     ]}
 
 # Configure esbuild (the version is required)
 config :esbuild,
@@ -70,11 +84,16 @@ config :tailwind,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
-# Override phoenix_ecto's Plug.Exception for CastError (default: 400 -> our: 404)
-# An invalid UUID in a URL path means the resource cannot exist, hence 404.
+# Override phoenix_ecto's Plug.Exception impls:
+# - CastError (default: 400 -> our: 404): an invalid UUID in a URL path means
+#   the resource cannot exist, hence 404 (see LoopctlWeb.Plugs.CastErrorHandler).
+# - Postgrex.Error (default: blanket 500): US-27.3 maps known SQLSTATE classes
+#   to pinned 504/503/500 instead (see LoopctlWeb.Plugs.DBErrorHandler). Excluded
+#   here so our single impl is authoritative and phoenix_ecto doesn't redefine it.
 config :phoenix_ecto, :exclude_ecto_exceptions_from_plug, [
   Ecto.CastError,
-  Ecto.Query.CastError
+  Ecto.Query.CastError,
+  Postgrex.Error
 ]
 
 # Hammer rate limiting (ETS backend)

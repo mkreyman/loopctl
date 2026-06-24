@@ -56,7 +56,14 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
          }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
       404 => {"Article not found", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"Database unavailable / serialization failure / deadlock — retryable; " <>
+           "see Retry-After header", "application/json", Schemas.ErrorResponse},
+      504 =>
+        {"Database statement timeout (code db_statement_timeout) — the vector " <>
+           "similarity scan exceeded the statement timeout", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -67,7 +74,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     with {:ok, threshold} <- parse_threshold(params["threshold"]),
          {:ok, limit} <- parse_limit(params["limit"]),
          {:ok, suggestions} <-
-           Knowledge.suggest_links(
+           suggest_links_guarded(
              tenant_id,
              article_id,
              [threshold: threshold, limit: limit] ++ Visibility.scope_opts(conn)
@@ -82,7 +89,37 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      # US-27.3: a DB exception (e.g. 57014 statement-timeout on the pgvector
+      # scan) is rescued into a tuple so the FallbackController maps it to a
+      # pinned status (504/503/500) and logs the SQLSTATE with the request_id,
+      # instead of escaping as a blanket 500 that erases the SQLSTATE.
+      {:error, %struct{} = db_error} when struct in [Postgrex.Error, DBConnection.ConnectionError] ->
+        {:error, db_error}
     end
+  end
+
+  # Run the (possibly slow) vector-similarity query, translating a raised DB
+  # exception into an `{:error, %Postgrex.Error{}}` / `{:error,
+  # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions are caught;
+  # anything else is re-raised (let-it-crash). The suggest_links query runs on
+  # AdminRepo — rescuing here does NOT change which tenant's data is touched.
+  #
+  # The executor is resolved via config-based DI (CLAUDE.md convention:
+  # behaviour + Application.get_env, mock wired in config/test.exs) so a test can
+  # deterministically inject a 57014 `Postgrex.Error` via Mox without seeding a
+  # corpus large enough to actually breach `statement_timeout` (which is
+  # inherently timing-dependent — the very reason the #170/#172 incident was
+  # hard to reproduce). Production resolves to `Loopctl.Knowledge` itself, which
+  # implements `Loopctl.Knowledge.SuggestLinksBehaviour`.
+  defp suggest_links_guarded(tenant_id, article_id, opts) do
+    knowledge().suggest_links(tenant_id, article_id, opts)
+  rescue
+    e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
+  end
+
+  defp knowledge do
+    Application.get_env(:loopctl, :knowledge_suggest_links, Knowledge)
   end
 
   # Absent → nil (context applies the default). A present value must parse to a

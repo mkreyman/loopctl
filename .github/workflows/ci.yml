@@ -29,9 +29,14 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # Key on config/*.exs too: deps like phoenix_ecto read parent-app
+          # config (e.g. :exclude_ecto_exceptions_from_plug) at THEIR compile
+          # time, but a config-only change does not mark the dep stale. Without
+          # this, a restored _build can keep a stale dep beam that collides with
+          # our own defimpl and fails `mix compile --warnings-as-errors`. No loose
+          # restore-keys for the same reason — a config change must not silently
+          # reuse a _build compiled under the old config.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -77,9 +82,10 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # See lint job: config/*.exs is part of the key so a config-only change
+          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
+          # config-sensitive deps instead of reusing a stale dep beam.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -142,9 +148,10 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # See lint job: config/*.exs is part of the key so a config-only change
+          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
+          # config-sensitive deps instead of reusing a stale dep beam.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -169,9 +176,10 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+          # See lint job: config/*.exs is part of the key so a config-only change
+          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
+          # config-sensitive deps instead of reusing a stale dep beam.
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Restore PLT cache
         uses: actions/cache@v4

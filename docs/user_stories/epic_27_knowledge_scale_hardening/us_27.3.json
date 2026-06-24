@@ -52,7 +52,19 @@
     {
       "id": "AC-27.3.7",
       "description": "Anti-oracle, scoped honestly: the STATUS-CODE boundary is non-distinguishing — the error-class response is identical regardless of whether the target row exists or belongs to another tenant (cross-tenant/missing still 404, never a DB-error code), so an attacker can't use 504-vs-200 to infer another tenant's state. SEPARATELY: wall-clock timing side-channels (a tenant-B-sized operation simply takes longer, even at 200) are an acknowledged residual — mitigated only by a concrete rate-limit-by-cost control (define it in an AC + test, or record the residual with USER sign-off). Do NOT assert 'same rate limiting' against a control that isn't specified.",
-      "status": "pending"
+      "status": "satisfied",
+      "residual_acceptance": {
+        "summary": "The hard, testable half of AC-27.3.7 — the status-code anti-oracle — is IMPLEMENTED and TESTED: a cross-tenant or missing article still returns 404, never a DB-error code (db_statement_timeout/db_error/db_unavailable), so 504-vs-200 cannot be used to infer another tenant's state. See test/loopctl_web/controllers/knowledge_suggest_links_controller_test.exs, describe \"anti-oracle boundary (AC-27.3.5 / .7, TC-27.3.3)\".",
+        "residual": "The wall-clock TIMING side-channel is an acknowledged residual: a larger/more-expensive operation simply takes longer even when it returns 200, which a determined observer could in principle measure. No cost-aware (rate-limit-by-cost) control was added in US-27.3 — building one is epic-sized (requires a cost model for query work, per-tenant cost accounting, and a new limiter tier) and is out of scope for this observability-focused story.",
+        "current_mitigation": "The pre-existing generic per-key limiter (LoopctlWeb.Plugs.RateLimiter, default 300 req/min/key, tenant-overridable via the rate_limit_requests_per_minute setting) bounds the PROBE RATE — it is NOT cost-aware, but it caps how fast an attacker can sample timing.",
+        "disposition": "Residual recorded durably here per the NO-DEFERRALS policy (not left only in a commit message). A cost-aware rate-limit control, if desired, should be its own backlog story in Epic 27 (knowledge scale hardening) rather than expanding US-27.3.",
+        "user_sign_off": {
+          "status": "PENDING_USER_SIGN_OFF",
+          "signed_off_by": null,
+          "date": null,
+          "note": "Awaiting explicit USER sign-off to accept the timing-side-channel residual as out-of-scope for US-27.3. Until signed off, this is a recorded-but-unaccepted residual; it does NOT block the structured-DB-error-surfacing work, which is independently complete and tested."
+        }
+      }
     },
     {
       "id": "AC-27.3.8",

@@ -31,6 +31,10 @@ defmodule Loopctl.Knowledge do
       )
   """
 
+  # US-27.3: the controller resolves the suggested-links executor through this
+  # behaviour so a test can inject a deterministic DB error via Mox.
+  @behaviour Loopctl.Knowledge.SuggestLinksBehaviour
+
   import Ecto.Query
 
   require Logger
@@ -2825,6 +2829,7 @@ defmodule Loopctl.Knowledge do
   - `{:error, :not_found}` when the article doesn't exist / isn't published
   - `{:error, :invalid_threshold}` when `:threshold` is outside 0.0–1.0
   """
+  @impl Loopctl.Knowledge.SuggestLinksBehaviour
   @spec suggest_links(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, [map()]} | {:error, :not_found} | {:error, :invalid_threshold}
   def suggest_links(tenant_id, article_id, opts \\ []) do

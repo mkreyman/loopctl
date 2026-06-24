@@ -155,6 +155,20 @@ defmodule Loopctl.DataCase do
     Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :not_found} end)
     Mox.stub(Loopctl.MockSecrets, :set, fn _name, _value -> :ok end)
     Mox.stub(Loopctl.MockSecrets, :delete, fn _name -> :ok end)
+
+    # US-27.3: by default the suggested-links executor delegates to the real
+    # context, so every existing suggest_links test exercises the genuine
+    # pgvector query. Only the DB-error-surfacing test overrides this stub with
+    # `Mox.expect/3` to inject a deterministic Postgrex.Error (a real
+    # statement-timeout is timing-dependent and not reproducible here).
+    Mox.stub(Loopctl.MockSuggestLinks, :suggest_links, fn tenant_id, article_id, opts ->
+      Loopctl.Knowledge.suggest_links(tenant_id, article_id, opts)
+    end)
+
+    # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
+    # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
+    # every request and only raises when an opt-in `x-test-raise-db-error` header
+    # is present — so there is NO global router mock to stub here.
   end
 
   @doc """

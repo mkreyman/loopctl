@@ -21,11 +21,15 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
+  - `{:error, %Postgrex.Error{}}` -> 504/503/500 by SQLSTATE class (US-27.3)
+  - `{:error, %DBConnection.ConnectionError{}}` -> 503 with Retry-After (US-27.3)
   """
 
   use LoopctlWeb, :controller
 
   alias Ecto.Changeset
+  alias LoopctlWeb.DBError
+  alias LoopctlWeb.DBErrorLogger
 
   def call(conn, {:error, :not_found}) do
     conn
@@ -253,6 +257,14 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-27.3: map a recognized DB exception (returned as a tuple by a controller
+  # that rescued it) to a pinned status + safe body + structured error log
+  # carrying the real SQLSTATE. NEVER leaks SQL/params/vectors/stack traces.
+  def call(conn, {:error, %Postgrex.Error{} = error}), do: render_db_error(conn, error)
+
+  def call(conn, {:error, %DBConnection.ConnectionError{} = error}),
+    do: render_db_error(conn, error)
+
   def call(conn, {:error, %Changeset{} = changeset}) do
     details = format_changeset_errors(changeset)
 
@@ -277,6 +289,35 @@ defmodule LoopctlWeb.FallbackController do
     conn
     |> put_status(:unprocessable_entity)
     |> json(%{error: %{status: 422, message: message}})
+  end
+
+  # US-27.3: shared DB-error rendering for both Postgrex.Error and
+  # DBConnection.ConnectionError. `DBError.map/1` returns the pinned status,
+  # safe client message, and the real SQLSTATE for the log. A non-DB error
+  # never reaches here (the call/2 clauses only match the two DB structs).
+  defp render_db_error(conn, error) do
+    case DBError.map(error) do
+      {:ok, mapping} ->
+        DBErrorLogger.log(conn, error, mapping)
+
+        conn
+        |> maybe_put_retry_after(mapping.retry_after)
+        |> put_status(mapping.status)
+        |> json(%{
+          error: %{status: mapping.status, code: mapping.code, message: mapping.message}
+        })
+
+      :unmapped ->
+        # Should be unreachable: call/2 only dispatches here for the two DB
+        # structs DBError knows. Re-raise rather than silently swallow.
+        raise error
+    end
+  end
+
+  defp maybe_put_retry_after(conn, nil), do: conn
+
+  defp maybe_put_retry_after(conn, seconds) when is_integer(seconds) do
+    put_resp_header(conn, "retry-after", Integer.to_string(seconds))
   end
 
   defp format_changeset_errors(changeset) do

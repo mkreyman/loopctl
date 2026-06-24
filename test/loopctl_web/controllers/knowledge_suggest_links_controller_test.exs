@@ -313,4 +313,216 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       |> json_response(404)
     end
   end
+
+  # US-27.3: a DB statement-timeout (57014) on the pgvector scan must surface as
+  # a pinned 504 (code "db_statement_timeout") with a SQLSTATE-bearing error log
+  # carrying the request_id — NOT a blanket 500 that erases the SQLSTATE. The
+  # incident origin (#170/#172) took 4 attempts to diagnose precisely because
+  # the SQLSTATE was lost.
+  describe "DB statement-timeout surfacing (AC-27.3.1 / .3 / .4, TC-27.3.1)" do
+    import ExUnit.CaptureLog, only: [with_log: 1]
+    import Mox
+
+    setup :verify_on_exit!
+
+    # A `Postgrex.Error` shaped exactly as Postgrex builds a real 57014 (the
+    # probe in scratchpad confirmed `code: :query_canceled, pg_code: "57014"`).
+    # `query:` carries SQL + a vector literal that WOULD leak if anything called
+    # Exception.message/1 — the no-leak assertions below prove we don't.
+    defp statement_timeout_error do
+      %Postgrex.Error{
+        postgres: %{
+          code: :query_canceled,
+          pg_code: "57014",
+          severity: "ERROR",
+          message: "canceling statement due to statement timeout"
+        },
+        query: "SELECT id FROM articles ORDER BY embedding <=> '[0.123,0.456]'::vector LIMIT 5"
+      }
+    end
+
+    # Inject the 57014 deterministically via the SuggestLinksBehaviour DI seam
+    # (config/test.exs + Mox). A REAL timeout depends on wall-clock vs. the
+    # statement_timeout and is not reproducible in the test harness — which is
+    # exactly why the #170/#172 prod incident took 4 attempts to diagnose. The
+    # mock raises the same %Postgrex.Error{} the real query would, so the full
+    # HTTP stack (controller rescue -> FallbackController -> 504 + log) is
+    # exercised end-to-end.
+    test "57014 -> 504 db_statement_timeout, safe body, sqlstate+request_id logged",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _tenant, _article, _opts ->
+        raise statement_timeout_error()
+      end)
+
+      {resp_conn, log} =
+        with_log(fn ->
+          conn
+          |> auth_conn(key)
+          |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+        end)
+
+      assert resp_conn.status == 504
+      body = json_response(resp_conn, 504)
+      assert body["error"]["status"] == 504
+      assert body["error"]["code"] == "db_statement_timeout"
+      assert is_binary(body["error"]["message"])
+
+      # Body never leaks SQL / vector / params / stack (AC-27.3.2 / .8).
+      raw = resp_conn.resp_body
+      refute raw =~ "SELECT"
+      refute raw =~ "embedding <=>"
+      refute raw =~ "::vector"
+      refute raw =~ "0.123"
+
+      # Structured log carries the real SQLSTATE and the mapped code (AC-27.3.3).
+      assert log =~ "sqlstate=57014"
+      assert log =~ "mapped_code=db_statement_timeout"
+
+      # request_id is a REAL captured value, not just the bare `request_id=` label
+      # (Plug.RequestId populates it on this path). Asserting against the actual
+      # response header proves the id is threaded — a regression that drops it
+      # would surface as `request_id=` (empty/nil) and fail this, where a bare
+      # `=~ "request_id="` substring check would not.
+      rid = resp_conn |> get_resp_header("x-request-id") |> List.first()
+      assert is_binary(rid) and rid != ""
+      assert log =~ "request_id=#{rid}"
+
+      # tenant_id is a required AC-27.3.3 correlation field — assert the seeded
+      # tenant id is present so a rename of the current_api_key assign (the source
+      # of db_error_tenant_id/1) can't silently drop tenant correlation.
+      assert log =~ "tenant_id=#{tenant.id}"
+
+      # And does NOT leak the vector literal / bound params (AC-27.3.8).
+      refute log =~ "::vector"
+      refute log =~ "embedding <=>"
+      refute log =~ "0.123"
+    end
+
+    # TC-27.3.2: an unmapped SQLSTATE Postgrex.Error surfaces as a generic 500
+    # with the real sqlstate logged (not erased), proving the catch-all path.
+    test "unmapped Postgrex.Error -> 500 db_error, real sqlstate logged (TC-27.3.2)",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+        raise %Postgrex.Error{
+          postgres: %{
+            code: :undefined_table,
+            pg_code: "42P01",
+            severity: "ERROR",
+            message: "relation does not exist"
+          }
+        }
+      end)
+
+      {resp_conn, log} =
+        with_log(fn ->
+          conn
+          |> auth_conn(key)
+          |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+        end)
+
+      assert resp_conn.status == 500
+      body = json_response(resp_conn, 500)
+      assert body["error"]["code"] == "db_error"
+      assert log =~ "sqlstate=42P01"
+      assert log =~ "mapped_code=db_error"
+    end
+
+    # Finding #2 (US-27.3): a serialization failure (40001) on the RESCUE path
+    # surfaces as a 503 with the PRECISE code db_serialization_failure (not the
+    # coarse db_unavailable). The escaped/backstop path now matches this via the
+    # SanitizedDBError mapped_code (see db_error_backstop_test.exs), so the 503
+    # `code` no longer diverges between the two paths.
+    test "40001 -> 503 db_serialization_failure (precise code, Retry-After), sqlstate logged",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+        raise %Postgrex.Error{
+          postgres: %{
+            code: :serialization_failure,
+            pg_code: "40001",
+            severity: "ERROR",
+            message: "could not serialize access due to concurrent update"
+          }
+        }
+      end)
+
+      {resp_conn, log} =
+        with_log(fn ->
+          conn
+          |> auth_conn(key)
+          |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+        end)
+
+      assert resp_conn.status == 503
+      body = json_response(resp_conn, 503)
+      assert body["error"]["code"] == "db_serialization_failure"
+      assert get_resp_header(resp_conn, "retry-after") != []
+      assert log =~ "sqlstate=40001"
+      assert log =~ "mapped_code=db_serialization_failure"
+    end
+
+    # A pool checkout / connection drop surfaces as a retryable 503 with
+    # Retry-After, distinct from a logic 500.
+    test "DBConnection.ConnectionError -> 503 db_unavailable with Retry-After",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+        raise %DBConnection.ConnectionError{message: "tcp closed"}
+      end)
+
+      resp_conn =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+
+      assert resp_conn.status == 503
+      body = json_response(resp_conn, 503)
+      assert body["error"]["code"] == "db_unavailable"
+      assert get_resp_header(resp_conn, "retry-after") != []
+    end
+  end
+
+  # TC-27.3.3 / AC-27.3.5 / .7: a missing or cross-tenant article still returns
+  # 404 — never a DB-error code. Error mapping does not become an existence
+  # oracle. (The happy-404 path is covered above; these reaffirm the boundary
+  # alongside the DB-error handling so the two don't collide.)
+  describe "anti-oracle boundary (AC-27.3.5 / .7, TC-27.3.3)" do
+    test "non-existent article's suggested_links -> 404, not a DB-error code", %{conn: conn} do
+      {_tenant, key} = setup_tenant_key()
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/articles/#{Ecto.UUID.generate()}/suggested_links")
+        |> json_response(404)
+
+      assert body["error"]["status"] == 404
+      refute body["error"]["code"] in ["db_statement_timeout", "db_error", "db_unavailable"]
+    end
+
+    test "cross-tenant article -> 404, not a DB-error code", %{conn: conn} do
+      {_tenant_a, key_a} = setup_tenant_key()
+      tenant_b = fixture(:tenant)
+      b = embedded(tenant_b.id, "B", [1.0])
+
+      body =
+        conn
+        |> auth_conn(key_a)
+        |> get(~p"/api/v1/knowledge/articles/#{b.id}/suggested_links")
+        |> json_response(404)
+
+      assert body["error"]["status"] == 404
+      refute body["error"]["code"] in ["db_statement_timeout", "db_error", "db_unavailable"]
+    end
+  end
 end

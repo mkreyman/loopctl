@@ -49,5 +49,12 @@ defmodule LoopctlWeb.Endpoint do
   plug Plug.MethodOverride
   plug Plug.Head
   plug Plug.Session, @session_options
-  plug LoopctlWeb.Router
+
+  # US-27.3: wraps the router so a DB exception that escapes a controller action
+  # uncaught (i.e. NOT via the FallbackController rescue path) still gets the same
+  # structured SQLSTATE log (AC-27.3.3) and can never leak raw SQL into the web
+  # server crash log (AC-27.3.8). The Plug.Exception backstop
+  # (LoopctlWeb.Plugs.DBErrorHandler) still maps the status; this plug adds the
+  # logging + sanitization the pure status hook cannot.
+  plug LoopctlWeb.Plugs.DBErrorBackstop
 end
