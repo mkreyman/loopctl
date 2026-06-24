@@ -299,7 +299,7 @@ defmodule Loopctl.Knowledge.Article do
   defp validate_agent_metadata(changeset) do
     case get_change(changeset, :metadata) do
       metadata when is_map(metadata) and not is_struct(metadata) ->
-        if metadata["agent_id"] || metadata[:agent_id] do
+        if Map.has_key?(metadata, "agent_id") or Map.has_key?(metadata, :agent_id) do
           changeset
           |> validate_metadata_agent_id(metadata)
           |> validate_metadata_member(metadata, "memory_type", :memory_type, @valid_memory_types)
