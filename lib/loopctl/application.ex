@@ -14,6 +14,7 @@ defmodule Loopctl.Application do
       Loopctl.Vault,
       Loopctl.Repo,
       Loopctl.AdminRepo,
+      Loopctl.HeavyReadRepo,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
       {Task.Supervisor, name: Loopctl.TaskSupervisor},

@@ -24,6 +24,15 @@ config :loopctl, Loopctl.AdminRepo,
   migration_foreign_key: [type: :binary_id],
   types: Loopctl.PostgrexTypes
 
+# HeavyReadRepo (US-27.11) — a dedicated pool for heavy BYPASSRLS vector/enumeration
+# reads, isolated from the small AdminRepo pool and carrying a pool-level
+# statement_timeout (set in runtime.exs). Same database as Repo/AdminRepo; never in
+# `ecto_repos` (it owns no migrations). See Loopctl.HeavyReadRepo / Loopctl.HeavyRead.
+config :loopctl, Loopctl.HeavyReadRepo,
+  migration_primary_key: [type: :binary_id],
+  migration_foreign_key: [type: :binary_id],
+  types: Loopctl.PostgrexTypes
+
 # Ecto migration defaults — binary UUIDs for all primary and foreign keys
 config :loopctl, Loopctl.Repo,
   migration_primary_key: [type: :binary_id],

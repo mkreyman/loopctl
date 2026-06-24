@@ -83,6 +83,34 @@ if config_env() == :prod do
     queue_target: 5_000,
     queue_interval: 10_000
 
+  # HeavyReadRepo (US-27.11) — dedicated BYPASSRLS pool for heavy vector/enumeration
+  # reads, isolated from the small AdminRepo pool so a slow read can't starve light
+  # admin ops (and vice-versa). Its `:parameters` carry a pool-level, server-side
+  # `statement_timeout` (a CORE GUC, settable via the startup packet) — the clean
+  # fast-fail lever US-27.4 builds on, with no per-request transaction. `ef_search`
+  # is NOT set here (pgvector custom GUC, rejected via :parameters on managed PG);
+  # see docs/runbooks/knowledge-scale.md for the ALTER ROLE mechanism if it must be
+  # raised. Sizing rationale (AC-27.11.1/.5), verified against the live fly mpg
+  # max_connections = 100 (see the runbook to re-verify post-deploy):
+  #
+  #   per-node pools: Repo 10 + AdminRepo 3 + HeavyReadRepo 8 = 21
+  #   2 app nodes: 42, + Oban notifier/console/migration headroom (~14) ≈ 56 < 100.
+  #
+  # K (HeavyReadRepo, default 8): supports ~6 concurrent sub-2s heavy vector reads
+  # while reserving ~2 connections for long-held streamed-export checkouts (US-27.16),
+  # which occupy a connection for minutes — a different profile than fast reads.
+  heavy_read_statement_timeout_ms =
+    System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000"
+
+  config :loopctl, Loopctl.HeavyReadRepo,
+    url: admin_database_url,
+    pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),
+    socket_options: maybe_ipv6,
+    connect_timeout: 15_000,
+    queue_target: 5_000,
+    queue_interval: 10_000,
+    parameters: [statement_timeout: heavy_read_statement_timeout_ms]
+
   # OpenAI embedding provider for semantic search (Knowledge Wiki)
   if openai_key = System.get_env("OPENAI_API_KEY") do
     config :loopctl, :embedding_provider, %{

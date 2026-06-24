@@ -26,6 +26,27 @@ config :loopctl, Loopctl.AdminRepo,
   # Allow the unboxed connection to be held long enough for the prod-floor seed.
   ownership_timeout: :timer.minutes(30)
 
+# HeavyReadRepo (US-27.11) — sandbox mode for tests, with a deliberately LOW
+# pool-level statement_timeout (250ms) so the mechanism tests (SHOW + fast-fire)
+# are fast and deterministic. Nothing in the default suite routes heavy DATA reads
+# here — `:heavy_read_repo` below points heavy reads at AdminRepo so they share the
+# sandbox connection fixtures insert through; only the dedicated HeavyReadRepo pool
+# tests touch this repo directly.
+config :loopctl, Loopctl.HeavyReadRepo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
+  pool: Ecto.Adapters.SQL.Sandbox,
+  pool_size: System.schedulers_online() * 2,
+  ownership_timeout: :timer.minutes(30),
+  parameters: [statement_timeout: "250ms"]
+
+# DI (US-27.11): route Loopctl.HeavyRead's heavy reads to AdminRepo in tests, so
+# they see the same sandbox transaction that fixtures write to. Prod/dev default to
+# the dedicated Loopctl.HeavyReadRepo pool.
+config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :loopctl, LoopctlWeb.Endpoint,

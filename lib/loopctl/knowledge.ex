@@ -43,6 +43,7 @@ defmodule Loopctl.Knowledge do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -2876,15 +2877,14 @@ defmodule Loopctl.Knowledge do
   end
 
   defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
-    # Bare AdminRepo.all (NO transaction) — deliberately mirrors `search_semantic` and
-    # `distant_pairs`, which avoid holding an AdminRepo connection. The prod admin pool is
-    # only 3 (`ADMIN_POOL_SIZE`), shared by every cross-tenant read, so wrapping this hot
-    # endpoint in a per-request transaction would risk pool starvation under concurrent
-    # agent load — the exact pattern the `distant_pairs` note (below in this module) was
-    # written to avoid. The HNSW-indexable query returns in single-digit ms; the 15s
-    # timeout is a backstop, matching `nearest_prior_distance`/`distant_pairs`.
-    suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
-    |> AdminRepo.all(timeout: 15_000)
+    # Routed through Loopctl.HeavyRead (US-27.11): the dedicated heavy-read pool,
+    # isolated from the small AdminRepo pool and carrying a pool-level
+    # statement_timeout — no per-request transaction (the constraint that shaped the
+    # #172 fix). The wrapper structurally requires a tenant_id-filtered query; the
+    # tenant predicate lives in this query's inner subquery. The 15s client timeout
+    # is a backstop above the server-side statement_timeout.
+    query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
+    HeavyRead.all(tenant_id, query, timeout: 15_000)
   end
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can
@@ -3263,14 +3263,20 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    # Fetch count and paginated pairs
-    # Note: count may shift between queries, but avoiding transaction hold on the O(n²) self-join
-    # prevents AdminRepo pool starvation under concurrent agent load (3 agents, pool_size: 3).
+    # Fetch count and paginated pairs through Loopctl.HeavyRead (US-27.11): the
+    # dedicated heavy-read pool with a pool-level statement_timeout, isolated from the
+    # small AdminRepo pool so this O(n²) self-join can't starve light admin ops. No
+    # transaction hold (count may shift between queries — acceptable, by design). Both
+    # queries filter `a.tenant_id`/`b.tenant_id`, satisfying the wrapper's guard.
     total_count =
-      count_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.one(timeout: 15_000)
+      count_query
+      |> maybe_filter_bridge_path(bridge?, vis)
+      |> then(&HeavyRead.one(tenant_id, &1, timeout: 15_000))
 
     pairs_with_lookahead =
-      pairs_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.all(timeout: 15_000)
+      pairs_query
+      |> maybe_filter_bridge_path(bridge?, vis)
+      |> then(&HeavyRead.all(tenant_id, &1, timeout: 15_000))
 
     # Detect has_more by fetching limit+1; only return limit
     has_more = length(pairs_with_lookahead) > limit
@@ -3563,7 +3569,8 @@ defmodule Loopctl.Knowledge do
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
     )
     |> maybe_filter_by_visibility(vis)
-    |> AdminRepo.one(timeout: 15_000)
+    # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
+    |> then(&HeavyRead.one(tenant_id, &1, timeout: 15_000))
   end
 
   # --- Embeddings ---
@@ -4038,14 +4045,17 @@ defmodule Loopctl.Knowledge do
 
     filtered_query = apply_search_filters(base_query, status, opts)
 
+    # Heavy vector reads via Loopctl.HeavyRead (US-27.11): dedicated pool, pool-level
+    # statement_timeout, isolated from the small AdminRepo pool. `filtered_query`
+    # filters `a.tenant_id`; the count's tenant predicate lives in its inner subquery.
     count_query = from(q in subquery(filtered_query), select: count())
-    total_count = AdminRepo.one(count_query)
+    total_count = HeavyRead.one(tenant_id, count_query)
 
     results =
       filtered_query
       |> limit(^limit)
       |> offset(^offset)
-      |> AdminRepo.all()
+      |> then(&HeavyRead.all(tenant_id, &1))
 
     maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
 
