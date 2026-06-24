@@ -104,7 +104,7 @@ defmodule Loopctl.Knowledge.ScaleSeedNightlyTest do
           """
           EXPLAIN (FORMAT TEXT)
           SELECT id FROM articles
-          WHERE tenant_id = $1
+          WHERE tenant_id = $1::uuid
           ORDER BY embedding <-> $2
           LIMIT 10
           """,
