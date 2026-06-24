@@ -17,6 +17,24 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   validates `memory_type`/`visibility`/`agent_id` conventions on write when an
   `agent_id` is present, and adds a GIN index on `metadata`. (#151)
 
+### ⚠️ Trust Model (v1 Conventions)
+
+- **Agent-memory `agent_id` is self-asserted**, not bound to the authenticated
+  API key. An agent can write memories tagged with another agent's identity.
+  Operators should assume agents can spoof authorship — do not use agent-memory
+  scoping for security-sensitive data. Future versions will bind `agent_id` to
+  the API key identity for verified attribution.
+
+- **`visibility` field** (`shared`/`private`/`owner`) is **stored but not
+  enforced** in v1. Any authenticated agent can retrieve any other agent's
+  memories via `agents=` filters, regardless of visibility. The field is an
+  advisory label for future RLS-based enforcement. Treat memory isolation as a
+  convenience filter, not a trust barrier.
+
+- Follow-on stories for write-path enforcement (binding `agent_id` to API key,
+  RLS-based `visibility` enforcement) are tracked separately with the operator's
+  explicit sign-off.
+
 ## 2.18.0 — 2026-06-23 (suggest typed links)
 
 ### Added

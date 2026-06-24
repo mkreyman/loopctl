@@ -21,8 +21,13 @@ defmodule LoopctlWeb.KnowledgeContextController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
 
   action_fallback LoopctlWeb.FallbackController
+
+  @max_csv_list_size 25
+  @max_csv_item_length 200
+  @max_conversation_id_length 200
 
   plug LoopctlWeb.Plugs.RequireRole, role: :agent
 
@@ -224,15 +229,33 @@ defmodule LoopctlWeb.KnowledgeContextController do
   defp maybe_add_recency_weight(opts, _), do: opts
 
   # Comma-separated value → list (OR semantics in the query). Absent/blank → no opt.
+  # Caps: max 25 items per list, max 200 chars per item. Excess items silently dropped,
+  # items exceeding length are truncated. For memory_types, only valid types are kept.
   defp maybe_add_csv(opts, _key, value) when value in [nil, ""], do: opts
 
   defp maybe_add_csv(opts, key, value) when is_binary(value) do
     case value
          |> String.split(",", trim: true)
          |> Enum.map(&String.trim/1)
-         |> Enum.reject(&(&1 == "")) do
-      [] -> opts
-      list -> [{key, list} | opts]
+         |> Enum.reject(&(&1 == ""))
+         |> Enum.take(@max_csv_list_size)
+         |> Enum.map(&String.slice(&1, 0, @max_csv_item_length)) do
+      [] ->
+        opts
+
+      list when key == :memory_types ->
+        # Only keep valid memory types; others are silently dropped
+        valid_types = Article.valid_memory_types()
+        filtered = Enum.filter(list, &(&1 in valid_types))
+
+        if Enum.empty?(filtered) do
+          opts
+        else
+          [{key, filtered} | opts]
+        end
+
+      list ->
+        [{key, list} | opts]
     end
   end
 
@@ -240,8 +263,10 @@ defmodule LoopctlWeb.KnowledgeContextController do
 
   defp maybe_add_conversation_id(opts, value) when value in [nil, ""], do: opts
 
-  defp maybe_add_conversation_id(opts, value) when is_binary(value),
-    do: [{:conversation_id, value} | opts]
+  defp maybe_add_conversation_id(opts, value) when is_binary(value) do
+    truncated = String.slice(value, 0, @max_conversation_id_length)
+    [{:conversation_id, truncated} | opts]
+  end
 
   defp maybe_add_conversation_id(opts, _), do: opts
 end
