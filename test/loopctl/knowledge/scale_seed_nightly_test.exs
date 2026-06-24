@@ -99,16 +99,18 @@ defmodule Loopctl.Knowledge.ScaleSeedNightlyTest do
       probe_embedding = ScaleSeed.embedding_for(0)
       probe_vector = Pgvector.new(probe_embedding)
 
+      tenant_id_binary = Ecto.UUID.dump!(tenant.id)
+
       %{rows: explain_rows} =
         AdminRepo.query!(
           """
           EXPLAIN (FORMAT TEXT)
           SELECT id FROM articles
-          WHERE tenant_id = $1::uuid
+          WHERE tenant_id = $1
           ORDER BY embedding <-> $2
           LIMIT 10
           """,
-          [tenant.id, probe_vector]
+          [tenant_id_binary, probe_vector]
         )
 
       plan_text = Enum.map_join(explain_rows, "\n", fn [line] -> line end)
