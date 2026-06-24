@@ -2806,9 +2806,12 @@ defmodule Loopctl.Knowledge do
   #{@default_suggestion_limit}), ordered most-similar first. Tenant-scoped.
 
   Ranking is approximate nearest-neighbor over the HNSW embedding index
-  (`articles_embedding_idx`, cosine), with pgvector iterative scan so the
-  already-linked exclusion can't starve the result below `:limit` when an
-  article's nearest neighbors are mostly already linked.
+  (`articles_embedding_idx`, cosine), bounded by the index search list
+  (`hnsw.ef_search`) exactly like the semantic-search path. In the rare case
+  that an article's nearest neighbors are almost all already linked, the result
+  may contain fewer than `:limit` suggestions — by design, consistent with
+  semantic search; deeper recall is intentionally not traded for holding an
+  AdminRepo connection on this hot, pool-constrained endpoint.
 
   ## Returns
 
@@ -2863,29 +2866,15 @@ defmodule Loopctl.Knowledge do
   end
 
   defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
-    query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
-
-    {:ok, rows} =
-      AdminRepo.transaction(
-        fn ->
-          # Iterative HNSW scan (pgvector ≥ 0.8): keep pulling index neighbors until `limit`
-          # candidates survive the anti-join (already-linked) + threshold post-filters,
-          # rather than stopping after a single `ef_search` (default 40) batch. Links are
-          # created BETWEEN similar articles, so a densely-linked hub's nearest neighbors are
-          # exactly the ones the anti-join removes — without iterative scan it could return
-          # fewer than `limit` suggestions even when qualifying ones exist just past the
-          # first batch. `strict_order` preserves the "most-similar first" ordering, and the
-          # scan stays bounded by pgvector's `max_scan_tuples`, so it never degrades to the
-          # #172 full-corpus scan. SET LOCAL is transaction-scoped (resets on commit), the
-          # same mechanism the RLS tenant GUC uses; pgvector reconciles it when the query's
-          # `<=>` ops load the extension.
-          AdminRepo.query!("SET LOCAL hnsw.iterative_scan = 'strict_order'")
-          AdminRepo.all(query, timeout: 15_000)
-        end,
-        timeout: 15_000
-      )
-
-    rows
+    # Bare AdminRepo.all (NO transaction) — deliberately mirrors `search_semantic` and
+    # `distant_pairs`, which avoid holding an AdminRepo connection. The prod admin pool is
+    # only 3 (`ADMIN_POOL_SIZE`), shared by every cross-tenant read, so wrapping this hot
+    # endpoint in a per-request transaction would risk pool starvation under concurrent
+    # agent load — the exact pattern the `distant_pairs` note (below in this module) was
+    # written to avoid. The HNSW-indexable query returns in single-digit ms; the 15s
+    # timeout is a backstop, matching `nearest_prior_distance`/`distant_pairs`.
+    suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
+    |> AdminRepo.all(timeout: 15_000)
   end
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can

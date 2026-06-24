@@ -52,8 +52,9 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
     #   * #168: that bound param is a plain LIST of floats, NEVER the stored `%Pgvector{}`
     #     struct (binding the struct was the original 500).
     #
-    # A literal 76k-row seed is infeasible in an async unit test, so the indexable
-    # SQL shape is the durable, non-flaky proxy for "does not full-scan at scale."
+    # A literal 76k-row seed is infeasible in an async unit test, so this fast SQL-shape
+    # check is the first guard; the EXPLAIN test below is the stronger one — it asserts the
+    # planner can actually use the HNSW index (the real "does not full-scan" property).
     test "binds the target as a list param (HNSW-indexable), with no full-corpus self-join" do
       {tenant, _key} = setup_tenant_key()
       target = embedded(tenant.id, "T", [1.0, 0.0])
@@ -75,6 +76,42 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       assert sql =~ "<=>"
       assert length(Regex.scan(~r/"articles"/, sql)) == 1
       assert sql =~ ~r/order by .*<=>/i
+    end
+
+    # The SQL-shape check above guards the self-join specifically; this guards the broader
+    # #172 regression CLASS — "the ORDER BY can use the HNSW index" — which a shape regex
+    # can't see. Disabling seq-scan AND sort forces the planner onto the only ordered path:
+    # if `ORDER BY embedding <=> $const` is index-matchable it satisfies it via
+    # `articles_embedding_idx` with NO Sort node; an index-INELIGIBLE rewrite (a self-join
+    # column operand like #170, a wrapped/computed order expr, or a dropped index) cannot,
+    # so the plan is forced to a (disabled-cost) Sort — failing this test. Catches a
+    # reintroduced full-corpus scan that every behavioral test (which seq-scans at test
+    # scale) would miss. Deterministic at any row count — asserts index ELIGIBILITY, not the
+    # planner's cost-based choice at scale.
+    test "EXPLAIN: the suggestion query is HNSW-index-eligible (no Sort / full-corpus scan)" do
+      {tenant, _key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+      for i <- 1..5, do: embedded(tenant.id, "C#{i}", [1.0, 0.0])
+
+      query =
+        Knowledge.suggestion_candidates_query(tenant.id, target.id, e([1.0, 0.0]), 0.5, 5, nil)
+
+      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
+
+      {:ok, plan} =
+        AdminRepo.transaction(fn ->
+          # Force the planner past cost-based choices so the assertion reflects index
+          # ELIGIBILITY, not whether HNSW happens to win at 6 rows.
+          AdminRepo.query!("SET LOCAL enable_seqscan = off")
+          AdminRepo.query!("SET LOCAL enable_sort = off")
+          %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
+          Enum.map_join(rows, "\n", &Enum.join(&1, " "))
+        end)
+
+      # Uses the HNSW index for the ordering...
+      assert plan =~ "articles_embedding_idx"
+      # ...and therefore needs no Sort node (a full-corpus scan + sort would have one).
+      refute plan =~ ~r/\bSort\b/
     end
   end
 
@@ -151,13 +188,11 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       assert free.id in ids(body)
     end
 
-    # #172 follow-up: the result must not under-fill below `limit` when the target's
-    # nearest neighbors are mostly already-linked. Links cluster among similar articles,
-    # so the anti-join removes exactly the closest candidates — pgvector iterative scan
-    # has to keep pulling neighbors until `limit` UNLINKED ones survive. (At test scale
-    # the planner seq-scans so this is exact regardless; the assertion guards the
-    # exclusion-under-limit contract that iterative scan preserves at prod scale.)
-    test "fills up to limit with unlinked candidates even when nearer ones are linked",
+    # Exclusion-under-limit contract: every already-linked near-neighbor is removed and
+    # none leaks through, and the result is filled from the remaining unlinked candidates
+    # rather than truncated by the anti-join. (Exact at test scale; the prod recall ceiling
+    # is documented on `suggest_links/3` — approximate-NN bounded by HNSW `ef_search`.)
+    test "excludes all already-linked near-neighbors and fills from the unlinked remainder",
          %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0])
