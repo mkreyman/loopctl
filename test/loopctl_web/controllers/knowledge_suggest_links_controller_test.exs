@@ -1,6 +1,7 @@
 defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
@@ -37,7 +38,61 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
 
+  describe "suggestion query shape (#168 RED→GREEN structural guard)" do
+    # The production 500 couldn't be reproduced in the test DB (the column is
+    # vector(1536) and PostgrexTypes is shared across envs, so the stored-vector
+    # re-interpolation encodes fine locally). This guard instead asserts the QUERY
+    # SHAPE that caused it is gone: the target vector must NOT be a bound parameter,
+    # and the cosine must be computed between two embedding COLUMNS. Both assertions
+    # FAIL on the pre-fix query (which bound `^embedding::vector`) and PASS on the fix.
+    test "does not re-interpolate the target vector as a query parameter" do
+      {tenant, _key} = setup_tenant_key()
+      target = embedded(tenant.id, "T", [1.0, 0.0])
+
+      query = Knowledge.suggestion_candidates_query(tenant.id, target.id, 0.5, 5, nil)
+      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
+
+      # No parameter is a vector/list — only ids, threshold, limit. The #168 bug
+      # bound the stored target vector here.
+      refute Enum.any?(params, fn p -> is_list(p) or match?(%Pgvector{}, p) end)
+
+      # The distance is computed between two `embedding` COLUMNS (the candidate's and
+      # the self-joined target's) — not a column vs a parameter.
+      assert sql =~ "<=>"
+      assert length(Regex.scan(~r/\."embedding"/, sql)) >= 2
+    end
+  end
+
   describe "GET /api/v1/knowledge/articles/:id/suggested_links (#150)" do
+    # #168 regression: the endpoint 500'd in production because the target's stored
+    # vector was round-tripped back in as a `^param::vector`. The query now does the
+    # cosine column-to-column via a self-join. This guards the end-to-end HTTP path
+    # (controller → query → JSON) returns 200 with the documented candidate shape.
+    test "returns 200 with ranked candidate shape (no 500) — #168", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target168", [1.0, 0.0])
+      c1 = embedded(tenant.id, "Cand1", [1.0, 0.0])
+      c2 = embedded(tenant.id, "Cand2", [0.9, 0.1])
+
+      conn =
+        conn |> auth_conn(key) |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+
+      # The key assertion: a clean 200, never a 500.
+      body = json_response(conn, 200)
+      returned = ids(body)
+      assert c1.id in returned
+      assert c2.id in returned
+      refute target.id in returned
+
+      for cand <- body["data"] do
+        assert is_binary(cand["id"])
+        assert is_binary(cand["title"])
+        assert cand["category"]
+        assert is_number(cand["similarity_score"])
+        assert cand["similarity_score"] >= 0.5
+      end
+    end
+
     test "returns candidates ranked by similarity, highest first, excluding below-threshold",
          %{conn: conn} do
       {tenant, key} = setup_tenant_key()
