@@ -2076,10 +2076,14 @@ const TOOLS = [
     name: "knowledge_facets",
     description:
       "Count articles grouped by each distinct tag, over the filtered set, WITHOUT returning " +
-      "rows. Returns { data: { tag: count }, meta: { distinct_count } }. Pass tag_prefix to " +
-      "restrict to a tag family (e.g. 'book-') so you get the DISTINCT count of that family " +
-      "(how many distinct books) plus per-member totals — without dragging tens of thousands " +
-      "of rows through context. Honors the same filters as knowledge_count (status, tags, match).",
+      "rows. Returns { data: { tag: count }, meta: { distinct_count, truncated } }. " +
+      "meta.distinct_count is the TRUE number of distinct tags (independent of limit); " +
+      "meta.truncated flags when limit capped the rows. Each `count` is the number of distinct " +
+      "articles carrying that tag. Pass tag_prefix to restrict to a tag family (e.g. 'book-') " +
+      "so you get the DISTINCT count of that family (how many distinct books) plus per-member " +
+      "totals — without dragging tens of thousands of rows through context. Honors the same " +
+      "filters as knowledge_count (status, tags, match). Cost: unnests tags over the whole " +
+      "filtered set; on large tenants narrow with tag_prefix/category/status/project_id.",
     inputSchema: {
       type: "object",
       properties: {

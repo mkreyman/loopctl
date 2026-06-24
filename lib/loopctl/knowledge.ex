@@ -889,13 +889,6 @@ defmodule Loopctl.Knowledge do
           from(t in subquery(unnested))
       end
 
-    # True distinct-tag cardinality over the filtered/prefixed set — independent
-    # of the row `:limit`, so a capped result still reports the real total.
-    distinct_count =
-      from(t in subquery(tag_rows), select: fragment("count(distinct ?)", t.tag))
-      |> AdminRepo.one()
-      |> Kernel.||(0)
-
     row_limit = facet_row_limit(Keyword.get(opts, :limit))
 
     facets =
@@ -907,7 +900,21 @@ defmodule Loopctl.Knowledge do
       )
       |> AdminRepo.all()
 
-    %{facets: facets, distinct_count: distinct_count, truncated: length(facets) < distinct_count}
+    returned = length(facets)
+
+    # The facet rows ARE the complete distinct-tag set unless we hit the row cap —
+    # only then is a second (count distinct) pass needed for the true total. This
+    # avoids the extra unnest/aggregate scan on the common (un-truncated) path.
+    distinct_count =
+      if returned < row_limit do
+        returned
+      else
+        from(t in subquery(tag_rows), select: fragment("count(distinct ?)", t.tag))
+        |> AdminRepo.one()
+        |> Kernel.||(0)
+      end
+
+    %{facets: facets, distinct_count: distinct_count, truncated: returned < distinct_count}
   end
 
   # An explicit positive `:limit` is honored up to @max_facet_rows; an omitted or

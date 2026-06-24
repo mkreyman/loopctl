@@ -150,5 +150,71 @@ defmodule LoopctlWeb.KnowledgeFacetsControllerTest do
       assert resp["error"]["status"] == 400
       assert resp["error"]["message"] =~ "group_by"
     end
+
+    test "counts distinct articles, not tag occurrences (duplicate tags in an array)", %{
+      conn: conn
+    } do
+      {tenant, raw_key} = setup_tenant_key()
+
+      # A single article whose array stores the same tag twice must count once.
+      fixture(:article, %{tenant_id: tenant.id, title: "dup", tags: ["dup", "dup"]})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/facets?group_by=tag&tag_prefix=dup")
+        |> json_response(200)
+
+      assert resp["data"]["dup"] == 1
+      assert resp["meta"]["distinct_count"] == 1
+    end
+
+    test "limit caps facet rows; distinct_count stays true and truncated flags it", %{conn: conn} do
+      {tenant, raw_key} = setup_tenant_key()
+
+      for t <- ["t-a", "t-b", "t-c"] do
+        fixture(:article, %{tenant_id: tenant.id, title: t, tags: [t]})
+      end
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/facets?group_by=tag&tag_prefix=t-&limit=2")
+        |> json_response(200)
+
+      # Only 2 facet rows returned, but distinct_count reflects the true 3, and
+      # truncated tells the caller the family was capped.
+      assert map_size(resp["data"]) == 2
+      assert resp["meta"]["distinct_count"] == 3
+      assert resp["meta"]["truncated"] == true
+    end
+
+    test "rejects a non-UUID project_id with 400 (not a 500)", %{conn: conn} do
+      {_tenant, raw_key} = setup_tenant_key()
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/facets?group_by=tag&project_id=not-a-uuid")
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "project_id"
+    end
+  end
+
+  describe "GET /api/v1/knowledge/count — project_id validation (#148)" do
+    test "rejects a non-UUID project_id with 400 (not a 500)", %{conn: conn} do
+      {_tenant, raw_key} = setup_tenant_key()
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/count?project_id=not-a-uuid")
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "project_id"
+    end
   end
 end

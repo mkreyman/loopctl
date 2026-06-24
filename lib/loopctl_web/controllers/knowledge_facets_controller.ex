@@ -69,6 +69,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
 
     with :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
+         :ok <- validate_project_id(params),
          {:ok, match} <- TagMatch.parse(params) do
       count = Knowledge.count_articles(tenant_id, build_opts(params, match))
       json(conn, %{count: count})
@@ -81,9 +82,13 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
       "Counts articles grouped by each distinct tag over the filtered set, so a " <>
         "caller gets a distinct-tag count and per-tag totals without paging rows. " <>
         "`tag_prefix` restricts to a tag family (e.g. `book-`) to count distinct " <>
-        "members of that family. Honors the same filters as `count` (including " <>
-        "`status` and `tags`/`match`). `group_by=tag` is the only mode today. " <>
-        "Role: agent+.",
+        "members of that family. `meta.distinct_count` is the TRUE number of distinct " <>
+        "tags (independent of `limit`); `meta.truncated` flags when `limit` returned " <>
+        "fewer rows. Per-tag `count` is the number of distinct articles carrying the " <>
+        "tag. Honors the same filters as `count` (including `status` and `tags`/`match`). " <>
+        "Cost: unnests tags over the whole filtered set (the GIN index doesn't help the " <>
+        "unnest/group); on large tenants narrow with `tag_prefix`/`category`/`status`/" <>
+        "`project_id`. `group_by=tag` is the only mode today. Role: agent+.",
     parameters: [
       group_by: [in: :query, type: :string, description: "Facet dimension (only `tag`)"],
       tag_prefix: [in: :query, type: :string, description: "Only tags starting with this prefix"],
@@ -110,7 +115,14 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
                type: :object,
                properties: %{
                  group_by: %OpenApiSpex.Schema{type: :string},
-                 distinct_count: %OpenApiSpex.Schema{type: :integer},
+                 distinct_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "True distinct-tag count, independent of limit"
+                 },
+                 truncated: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description: "True when limit returned fewer facet rows than distinct_count"
+                 },
                  tag_prefix: %OpenApiSpex.Schema{type: :string, nullable: true}
                }
              }
@@ -128,6 +140,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
     with :ok <- validate_group_by(params["group_by"]),
          :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
+         :ok <- validate_project_id(params),
          :ok <- Pagination.validate_limit(params),
          {:ok, match} <- TagMatch.parse(params) do
       opts =
@@ -136,7 +149,8 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
         |> maybe_put(:tag_prefix, string_param(params["tag_prefix"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
 
-      %{facets: facets, distinct_count: distinct_count} = Knowledge.tag_facets(tenant_id, opts)
+      %{facets: facets, distinct_count: distinct_count, truncated: truncated} =
+        Knowledge.tag_facets(tenant_id, opts)
 
       data = Map.new(facets, fn %{tag: tag, count: count} -> {tag, count} end)
 
@@ -145,6 +159,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
         meta: %{
           group_by: "tag",
           distinct_count: distinct_count,
+          truncated: truncated,
           tag_prefix: string_param(params["tag_prefix"])
         }
       })
@@ -163,6 +178,26 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
     |> maybe_put(:source_type, string_param(params["source_type"]))
     |> maybe_put(:source_id, string_param(params["source_id"]))
     |> maybe_put(:idempotency_key, string_param(params["idempotency_key"]))
+  end
+
+  # Reject a malformed project_id with 400 rather than letting a non-UUID reach
+  # the binary_id query and raise Ecto.Query.CastError (a 500). Requires the
+  # canonical 36-char dashed form so a 16-char junk segment can't coerce into a
+  # bogus-but-valid UUID (mirrors KnowledgeStatsController.project_opts/1).
+  defp validate_project_id(params) do
+    case params["project_id"] do
+      value when value in [nil, ""] ->
+        :ok
+
+      value when is_binary(value) and byte_size(value) == 36 ->
+        case Ecto.UUID.cast(value) do
+          {:ok, _} -> :ok
+          :error -> {:error, :bad_request, "Invalid project_id. Must be a UUID."}
+        end
+
+      _ ->
+        {:error, :bad_request, "Invalid project_id. Must be a UUID."}
+    end
   end
 
   defp validate_group_by(nil), do: :ok
