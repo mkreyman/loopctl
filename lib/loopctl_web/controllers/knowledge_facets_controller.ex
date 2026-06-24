@@ -6,9 +6,9 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
   - `GET /api/v1/knowledge/facets` -- count articles grouped by distinct tag (agent+)
 
   These remove large client-side enumerations: a caller can answer "how many
-  *published* articles tagged both X and Y" (`count` with `status`+`tags`+`match=all`)
-  or "how many distinct `book-*` books exist" (`facets?group_by=tag&tag_prefix=book-`)
-  without paging any article rows.
+  *published* articles tagged both X and Y (that I can see)" (`count` with `status`+`tags`+`match=all`)
+  or "how many distinct `book-*` books exist in my visible set" (`facets?group_by=tag&tag_prefix=book-`)
+  without paging any article rows. Agent callers see only their own articles and `shared` articles.
   """
 
   use LoopctlWeb, :controller
@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -32,11 +33,12 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
   operation(:count,
     summary: "Count articles (no rows)",
     description:
-      "Returns the count of articles matching the filters, without returning any " <>
-        "rows. Accepts the same filters as the article list (`category`, `status`, " <>
+      "Returns the count of articles matching the filters within the caller's visible set, " <>
+        "without returning any rows. Agent callers see only their own and `shared` articles. " <>
+        "Accepts the same filters as the article list (`category`, `status`, " <>
         "`tags`, `match`, `source_type`, `source_id`, `idempotency_key`, `project_id`). " <>
         "With `tags=a,b&match=all` it counts articles carrying BOTH tags; combine with " <>
-        "`status=published` for \"how many published articles tagged both\". Role: agent+.",
+        "`status=published` for \"how many published articles tagged both (that I can see)\". Role: agent+.",
     parameters: [
       category: [in: :query, type: :string, description: "Filter by category"],
       status: [in: :query, type: :string, description: "Filter by status"],
@@ -71,7 +73,12 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
          :ok <- validate_project_id(params),
          {:ok, match} <- TagMatch.parse(params) do
-      count = Knowledge.count_articles(tenant_id, build_opts(params, match))
+      count =
+        Knowledge.count_articles(
+          tenant_id,
+          build_opts(params, match) ++ Visibility.scope_opts(conn)
+        )
+
       json(conn, %{count: count})
     end
   end
@@ -79,14 +86,15 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
   operation(:facets,
     summary: "Tag facets (count by distinct tag)",
     description:
-      "Counts articles grouped by each distinct tag over the filtered set, so a " <>
-        "caller gets a distinct-tag count and per-tag totals without paging rows. " <>
+      "Counts articles grouped by each distinct tag over the caller's visible filtered set, so a " <>
+        "caller gets a distinct-tag count and per-tag totals without paging rows. Agent callers " <>
+        "see only their own and `shared` articles. " <>
         "`tag_prefix` restricts to a tag family (e.g. `book-`) to count distinct " <>
-        "members of that family. `meta.distinct_count` is the TRUE number of distinct " <>
-        "tags (independent of `limit`); `meta.truncated` flags when `limit` returned " <>
-        "fewer rows. Per-tag `count` is the number of distinct articles carrying the " <>
+        "members of that family. `meta.distinct_count` is the number of distinct " <>
+        "tags within the visible set (independent of `limit`); `meta.truncated` flags when `limit` returned " <>
+        "fewer rows. Per-tag `count` is the number of distinct visible articles carrying the " <>
         "tag. Honors the same filters as `count` (including `status` and `tags`/`match`). " <>
-        "Cost: unnests tags over the whole filtered set (the GIN index doesn't help the " <>
+        "Cost: unnests tags over the visible filtered set (the GIN index doesn't help the " <>
         "unnest/group); on large tenants narrow with `tag_prefix`/`category`/`status`/" <>
         "`project_id`. `group_by=tag` is the only mode today. Role: agent+.",
     parameters: [
@@ -148,6 +156,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
         |> build_opts(match)
         |> maybe_put(:tag_prefix, string_param(params["tag_prefix"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       %{facets: facets, distinct_count: distinct_count, truncated: truncated} =
         Knowledge.tag_facets(tenant_id, opts)

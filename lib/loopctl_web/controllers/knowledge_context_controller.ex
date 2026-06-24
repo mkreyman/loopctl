@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeContextController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -36,8 +37,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
   operation(:context,
     summary: "Deep-read knowledge context",
     description:
-      "Returns full article bodies ranked by combined relevance + recency scoring. " <>
-        "Each result includes one-hop linked article references (max 5 per result). " <>
+      "Returns full article bodies ranked by combined relevance + recency scoring within " <>
+        "the caller's visible set. Agent callers see only their own and `shared` articles. " <>
+        "Each result includes one-hop linked article references (max 5 per result) visible to the caller. " <>
         "Falls back to keyword-only search if embedding generation fails. " <>
         "Agent role is forced to published articles. Role: agent+.",
     parameters: [
@@ -131,7 +133,11 @@ defmodule LoopctlWeb.KnowledgeContextController do
     role = conn.assigns.current_api_key.role
 
     with {:ok, query} <- validate_query(params) do
-      opts = params |> build_opts(role) |> Keyword.put(:api_key_id, api_key_id)
+      opts =
+        params
+        |> build_opts(role)
+        |> Keyword.put(:api_key_id, api_key_id)
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       case Knowledge.get_context(tenant_id, query, opts) do
         {:ok, result} ->

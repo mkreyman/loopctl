@@ -808,20 +808,20 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `get_story_token_usage` | Token usage records for a story | orchestrator |
 | `get_cost_anomalies` | Cost anomaly alerts | orchestrator |
 | `set_token_budget` | Set token budget for a scope | orchestrator |
-| `knowledge_index` | Load knowledge wiki catalog (per-category, `fields` projection) | agent |
-| `knowledge_stats` | Aggregate article counts (total, by_category, by_status) | agent |
+| `knowledge_index` | Load knowledge wiki catalog (per-category, `fields` projection). Agent callers see only articles they own or marked `shared`. | agent |
+| `knowledge_stats` | Aggregate article counts (total, by_category, by_status) scoped to agent's visible articles. | agent |
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
-| `knowledge_context` | Get relevance-ranked articles for a task query | agent |
-| `knowledge_list` | List articles (full fields, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair | agent |
-| `knowledge_count` | Count articles matching filters without returning rows (same filters as `knowledge_list`) | agent |
-| `knowledge_facets` | Tag facet counts over a filtered article set (drives faceted browse) | agent |
-| `knowledge_graph` | Multi-hop link-graph traversal from a seed article (typed edges, depth/fan-out caps) | agent |
-| `knowledge_suggest_links` | Ranked typed-link candidates for an article by embedding similarity (read-only) | agent |
-| `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in the optimal-novelty embedding band (creativity) | agent |
-| `knowledge_novelty` | Score ideas by cosine distance to the nearest prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no priors/embed fails) | agent |
-| `knowledge_random_walk` | Random walk through the link graph from a start article (surfaces unexpected links) | agent |
-| `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture) | agent |
+| `knowledge_context` | Get relevance-ranked articles for a task query, scoped to agent's visible articles (with linked references). | agent |
+| `knowledge_list` | List articles (full fields, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair. Agent visibility filtering applies. | agent |
+| `knowledge_count` | Count articles matching filters within agent's visible set. | agent |
+| `knowledge_facets` | Tag facet counts over agent's visible filtered article set (drives faceted browse). | agent |
+| `knowledge_graph` | Multi-hop link-graph traversal from a seed article, bounded to agent's visible articles (typed edges, depth/fan-out caps). | agent |
+| `knowledge_suggest_links` | Ranked typed-link candidates for an article by embedding similarity among visible articles (read-only). | agent |
+| `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in optimal-novelty band, sampled from agent's visible published articles. | agent |
+| `knowledge_novelty` | Score ideas by distance to nearest visible prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no visible priors/embed fails). | agent |
+| `knowledge_random_walk` | Random walk through link graph from start article, traversing only agent's visible published articles. | agent |
+| `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture). Agent-authored articles are `visibility: owner` by default; use `metadata: {visibility: "shared"}` to make visible to other agents. | agent |
 | `knowledge_bulk_unpublish` | Bulk revert published articles to draft (archive), partial-success | user |
 | `knowledge_publish` | Publish an existing draft article | orchestrator |
 | `knowledge_bulk_publish` | Publish drafts, partial-success (per-id results, idempotent, no 100-cap) | user |

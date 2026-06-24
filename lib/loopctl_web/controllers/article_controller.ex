@@ -21,6 +21,7 @@ defmodule LoopctlWeb.ArticleController do
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -273,12 +274,66 @@ defmodule LoopctlWeb.ArticleController do
         |> maybe_merge_project_id(params["project_id"])
         |> put_create_status(draft?)
 
-      create_article(conn, tenant_id, attrs, audit_opts, draft?)
+      # Trust model (#163): an agent may only write a memory under its OWN verified
+      # key identity. For agent-role writers that carry agent-memory metadata, stamp
+      # metadata.agent_id from the key (overriding any spoofed value); an agent with
+      # no key identity can't attribute a memory → 403.
+      case bind_agent_identity(api_key, attrs) do
+        {:ok, bound_attrs} ->
+          create_article(conn, tenant_id, bound_attrs, audit_opts, draft?)
+
+        {:error, :no_agent_identity} ->
+          conn
+          |> put_status(:forbidden)
+          |> json(%{
+            error: %{
+              status: 403,
+              code: "agent_identity_required",
+              message:
+                "This API key has no agent identity; it cannot write an attributed agent memory"
+            }
+          })
+      end
     end
   end
 
+  # Stamp metadata.agent_id from the authenticated agent key (write-path binding,
+  # #163). Only agent-role writers carrying agent-memory metadata are bound; higher
+  # roles are trusted to attribute on behalf of others (orchestration/backfill).
+  defp bind_agent_identity(%{role: :agent} = api_key, attrs) do
+    metadata = attrs["metadata"] || attrs[:metadata] || %{}
+
+    if is_map(metadata) and agent_memory_metadata?(metadata) do
+      case api_key.agent_id do
+        nil ->
+          {:error, :no_agent_identity}
+
+        agent_id ->
+          {:ok, Map.put(attrs, "metadata", Map.put(metadata, "agent_id", to_string(agent_id)))}
+      end
+    else
+      {:ok, attrs}
+    end
+  end
+
+  defp bind_agent_identity(_api_key, attrs), do: {:ok, attrs}
+
+  # An article is an agent memory when its metadata carries any of the agent-memory
+  # markers (agent_id / memory_type / visibility). Request metadata is string-keyed
+  # JSON; we also accept the atom forms for non-HTTP callers.
+  @agent_memory_markers ["agent_id", "memory_type", "visibility"]
+  @agent_memory_marker_atoms [:agent_id, :memory_type, :visibility]
+  defp agent_memory_metadata?(metadata) do
+    Enum.any?(@agent_memory_markers, &Map.has_key?(metadata, &1)) or
+      Enum.any?(@agent_memory_marker_atoms, &Map.has_key?(metadata, &1))
+  end
+
   defp create_article(conn, tenant_id, attrs, audit_opts, draft?) do
-    case Knowledge.create_article(tenant_id, attrs, audit_opts) do
+    # Pass the caller's visibility scope so idempotency dedup can't echo a private
+    # memory the agent can't see (#163).
+    opts = audit_opts ++ Visibility.scope_opts(conn)
+
+    case Knowledge.create_article(tenant_id, attrs, opts) do
       {:ok, article} ->
         conn
         |> put_status(:created)
@@ -336,6 +391,7 @@ defmodule LoopctlWeb.ArticleController do
         # Body-less summary by default; opt into full bodies (byte-budget bounded)
         # with ?include_body=true.
         |> Keyword.put(:include_body, params["include_body"] == "true")
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       result = Knowledge.list_articles(tenant_id, opts)
       json(conn, ArticleJSON.index(%{articles: result.data, meta: result.meta}))
@@ -370,8 +426,9 @@ defmodule LoopctlWeb.ArticleController do
   def show(conn, %{"id" => article_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
+    opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
 
-    case Knowledge.get_article(tenant_id, article_id, api_key_id: api_key_id) do
+    case Knowledge.get_article(tenant_id, article_id, opts) do
       {:ok, article} ->
         json(conn, ArticleJSON.show(%{article: article}))
 

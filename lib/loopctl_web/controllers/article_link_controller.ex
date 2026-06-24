@@ -14,6 +14,7 @@ defmodule LoopctlWeb.ArticleLinkController do
   alias Loopctl.Knowledge
   alias LoopctlWeb.ArticleLinkJSON
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -89,9 +90,9 @@ defmodule LoopctlWeb.ArticleLinkController do
   @doc "POST /api/v1/article_links"
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    audit_opts = AuditContext.from_conn(conn)
+    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
 
-    case Knowledge.create_link(tenant_id, params, audit_opts) do
+    case Knowledge.create_link(tenant_id, params, opts) do
       {:ok, link} ->
         conn
         |> put_status(:created)
@@ -126,7 +127,7 @@ defmodule LoopctlWeb.ArticleLinkController do
   def index(conn, %{"article_id" => article_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    links = Knowledge.list_links_for_article(tenant_id, article_id)
+    links = Knowledge.list_links_for_article(tenant_id, article_id, Visibility.scope_opts(conn))
 
     json(conn, ArticleLinkJSON.index(%{links: links}))
   end

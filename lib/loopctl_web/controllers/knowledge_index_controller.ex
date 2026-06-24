@@ -2,12 +2,13 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   @moduledoc """
   Controller for the lightweight knowledge catalog endpoint.
 
-  - `GET /api/v1/knowledge/index` -- tenant-wide catalog of published articles (agent+)
+  - `GET /api/v1/knowledge/index` -- catalog of published articles (agent+)
   - `GET /api/v1/projects/:project_id/knowledge/index` -- project-scoped catalog (agent+)
 
-  Returns article metadata (no body) grouped by category. Honors `category`,
+  Returns article metadata (no body) grouped by category. Agent callers see only articles
+  they own, or marked as `shared`. Higher roles see all articles. Honors `category`,
   `tags`, `offset`, and `limit` query params with deterministic pagination over
-  the full filtered set (up to 1000 articles per page). A `fields` projection
+  the filtered set (up to 1000 articles per page). A `fields` projection
   (default `id,title,category`) keeps the payload small — request `tags`,
   `status`, or `updated_at` explicitly when needed.
   """
@@ -20,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -45,11 +47,13 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       "Returns a lightweight catalog of published articles grouped by category. " <>
         "Each article object includes only the projected fields (default " <>
         "id, title, category — see `fields`). " <>
+        "Agent callers see only articles they own (when `visibility` is `private` or `owner`) " <>
+        "or marked `shared`; higher roles see all articles. " <>
         "When called via GET /projects/:project_id/knowledge/index, includes both " <>
         "tenant-wide and project-specific articles. Honors category/tags filters and " <>
         "offset/limit pagination (default limit 1000, max 1000) with deterministic " <>
-        "ordering, so every article is reachable. `meta.categories` reports per-category " <>
-        "counts over the entire filtered set. Use `fields` to control the projection " <>
+        "ordering over the filtered set. `meta.categories` reports per-category " <>
+        "counts within the caller's visible articles. Use `fields` to control the projection " <>
         "(default id,title,category; request tags/status/updated_at explicitly) to keep " <>
         "the payload small. Role: agent+.",
     parameters: [
@@ -139,7 +143,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
 
     with :ok <- Pagination.validate_limit(params),
          {:ok, fields} <- parse_fields(params["fields"]),
-         {:ok, opts} <- build_opts(params) do
+         {:ok, base_opts} <- build_opts(params) do
+      opts = Keyword.merge(base_opts, Visibility.scope_opts(conn))
       {:ok, result} = Knowledge.list_index(tenant_id, opts)
       json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
     end

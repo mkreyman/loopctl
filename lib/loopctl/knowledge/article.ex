@@ -85,6 +85,10 @@ defmodule Loopctl.Knowledge.Article do
   # present — a curated reference article without an agent_id is unaffected).
   # `memory_type` is the agent-episodic kind (distinct from `category`, the
   # knowledge kind); `visibility` scopes sharing.
+  # `visibility` values:
+  #   - `shared` — visible to all roles in the tenant
+  #   - `private` — visible only to the agent who owns it (when agent_id is set)
+  #   - `owner` — equivalent to `private` (synonym, marking owner-only intent explicitly)
   @valid_memory_types ~w(observation finding summary decision question task)
   @valid_visibilities ~w(shared private owner)
   @max_agent_id_length 200
@@ -93,7 +97,13 @@ defmodule Loopctl.Knowledge.Article do
   @spec valid_memory_types() :: [String.t()]
   def valid_memory_types, do: @valid_memory_types
 
-  @doc "Allowed agent-memory `visibility` values."
+  @doc """
+  Allowed agent-memory `visibility` values.
+
+  - `shared` — visible to all roles
+  - `private` — visible only to the owning agent (read-only, scoped by agent_id)
+  - `owner` — equivalent to `private` (synonym marking owner-only intent)
+  """
   @spec valid_visibilities() :: [String.t()]
   def valid_visibilities, do: @valid_visibilities
 
@@ -319,6 +329,12 @@ defmodule Loopctl.Knowledge.Article do
     cond do
       not is_binary(agent_id) ->
         add_error(changeset, :metadata, "agent_id must be a string")
+
+      # A blank agent_id is rejected (#163): an identity-less agent key scopes reads
+      # to agent_id = "", so a stored "" owner would be readable by ANY such key —
+      # the empty string must never be a usable owner identity.
+      String.trim(agent_id) == "" ->
+        add_error(changeset, :metadata, "agent_id must not be blank")
 
       byte_size(agent_id) > @max_agent_id_length ->
         add_error(

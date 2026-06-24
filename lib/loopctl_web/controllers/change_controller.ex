@@ -15,6 +15,8 @@ defmodule LoopctlWeb.ChangeController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -79,13 +81,60 @@ defmodule LoopctlWeb.ChangeController do
 
       {:ok, result} = Audit.list_changes(tenant_id, since, opts)
 
+      # Visibility (#163): article change entries carry the memory's body + metadata
+      # in their snapshot. For an agent caller, drop entries for any article it can't
+      # currently see, so the change feed can't be used to read around the visibility
+      # barrier. Higher roles (scope_opts == []) see everything.
+      visible = filter_visible_changes(result.data, Visibility.scope_opts(conn), tenant_id)
+
       json(conn, %{
-        data: Enum.map(result.data, &change_json/1),
+        data: Enum.map(visible, &change_json/1),
         has_more: result.has_more,
         next_since: format_datetime(result.next_since)
       })
     end
   end
+
+  defp filter_visible_changes(entries, [], _tenant_id), do: entries
+
+  defp filter_visible_changes(entries, [visibility_agent_id: vis], tenant_id) do
+    # Collect every article id referenced by an article OR article_link entry, then
+    # resolve visibility in one lookup. Article entries drop unless the article is
+    # visible; article_link entries drop unless BOTH endpoints are visible (mirrors
+    # list_links_for_article) — a link can't leak a private memory's id/edge.
+    referenced_ids =
+      entries
+      |> Enum.flat_map(&change_article_ids/1)
+      |> Enum.uniq()
+
+    visible = Knowledge.visible_article_ids(tenant_id, referenced_ids, vis)
+
+    Enum.reject(entries, fn entry ->
+      case entry.entity_type do
+        "article" ->
+          not MapSet.member?(visible, entry.entity_id)
+
+        "article_link" ->
+          not Enum.all?(change_article_ids(entry), &MapSet.member?(visible, &1))
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  # Article ids referenced by a change entry: an article entry references itself; an
+  # article_link entry references both endpoints (from new_state or old_state).
+  defp change_article_ids(%{entity_type: "article", entity_id: id}), do: [id]
+
+  defp change_article_ids(%{entity_type: "article_link"} = entry) do
+    state = entry.new_state || entry.old_state || %{}
+
+    [state["source_article_id"], state["target_article_id"]]
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp change_article_ids(_entry), do: []
 
   defp parse_since(nil) do
     {:error, :bad_request, "The 'since' parameter is required"}

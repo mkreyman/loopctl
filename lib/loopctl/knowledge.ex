@@ -197,6 +197,7 @@ defmodule Loopctl.Knowledge do
   def create_article(tenant_id, attrs, opts \\ []) do
     scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     # System articles have no tenant — set tenant_id to nil
     effective_tenant_id = if scope in [:system, "system"], do: nil, else: tenant_id
@@ -204,9 +205,16 @@ defmodule Loopctl.Knowledge do
     with :ok <- validate_project_ownership(tenant_id, project_id),
          # Idempotent fast path: a prior capture with the same idempotency_key is
          # a clean no-op — return it unchanged regardless of body (the key IS the
-         # identity), so a re-run can't create a partial duplicate.
+         # identity), so a re-run can't create a partial duplicate. Visibility (#163):
+         # an agent only dedups against a match it can SEE — a key colliding with
+         # another agent's private memory falls through to insert, where the unique
+         # index rejects it without echoing the private article's id.
          nil <-
-           get_article_by_idempotency_key(effective_tenant_id, idempotency_key_from_attrs(attrs)) do
+           get_article_by_idempotency_key(
+             effective_tenant_id,
+             idempotency_key_from_attrs(attrs),
+             vis
+           ) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -255,7 +263,7 @@ defmodule Loopctl.Knowledge do
           {:ok, article}
 
         {:error, :article, changeset, _} ->
-          resolve_create_conflict(effective_tenant_id, attrs, changeset)
+          resolve_create_conflict(effective_tenant_id, attrs, changeset, vis)
       end
     else
       # validate_project_ownership/2 failure
@@ -288,7 +296,7 @@ defmodule Loopctl.Knowledge do
   # self-healing outcome — a 409 (body now differs), or the original 422 (row now
   # archived → SELECT returns nil) — which the client's next attempt resolves
   # cleanly. We accept that rather than re-running the whole create under a lock.
-  defp resolve_create_conflict(tenant_id, attrs, changeset) do
+  defp resolve_create_conflict(tenant_id, attrs, changeset, vis) do
     cond do
       # A single failed INSERT raises exactly one unique violation, so the
       # changeset carries at most one of these constraint names — the cond order
@@ -296,7 +304,7 @@ defmodule Loopctl.Knowledge do
       # violation (a create that raced past the pre-check) returns the winner as
       # a no-op dedup regardless of body.
       idempotency_conflict?(changeset) ->
-        case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs)) do
+        case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs), vis) do
           %Article{} = existing -> {:ok, :deduplicated, existing}
           _ -> {:error, changeset}
         end
@@ -336,20 +344,21 @@ defmodule Loopctl.Knowledge do
 
   # Look up by idempotency_key across ALL statuses, mirroring the partial unique
   # index (which has no status predicate) so the conflicting row is always found.
-  defp get_article_by_idempotency_key(_tenant_id, nil), do: nil
-  defp get_article_by_idempotency_key(nil, _key), do: nil
+  defp get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
+  defp get_article_by_idempotency_key(nil, _key, _vis), do: nil
 
-  defp get_article_by_idempotency_key(tenant_id, key) when is_binary(key) do
-    AdminRepo.one(
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  defp get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
   end
 
-  defp get_article_by_idempotency_key(_tenant_id, _key), do: nil
+  # Non-binary key (e.g. an integer) → no lookup.
+  defp get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
 
   # Only the active-title index — NOT the slug indexes, whose conflicts are on a
   # different field and must not be recovered via a title lookup.
@@ -420,24 +429,63 @@ defmodule Loopctl.Knowledge do
         {:error, :not_found}
 
       article ->
-        article =
-          AdminRepo.preload(article,
-            outgoing_links: :target_article,
-            incoming_links: :source_article
+        # Visibility enforcement (#163): a private/owner memory the caller doesn't
+        # own resolves to :not_found — no existence leak, no access recorded.
+        vis = Keyword.get(opts, :visibility_agent_id)
+
+        if visible_to_caller?(article, vis) do
+          article =
+            article
+            |> AdminRepo.preload(
+              outgoing_links: :target_article,
+              incoming_links: :source_article
+            )
+            |> filter_visible_links(vis)
+
+          Analytics.record_access(
+            tenant_id,
+            article.id,
+            Keyword.get(opts, :api_key_id),
+            "get",
+            Keyword.get(opts, :access_metadata, %{}),
+            attribution_context(opts)
           )
 
-        Analytics.record_access(
-          tenant_id,
-          article.id,
-          Keyword.get(opts, :api_key_id),
-          "get",
-          Keyword.get(opts, :access_metadata, %{}),
-          attribution_context(opts)
-        )
-
-        {:ok, article}
+          {:ok, article}
+        else
+          {:error, :not_found}
+        end
     end
   end
+
+  # In-memory mirror of `maybe_filter_by_visibility/2` for single-article fetches.
+  # `nil` agent_id (higher roles) sees everything; an agent sees shared articles
+  # and its own memories.
+  defp visible_to_caller?(_article, nil), do: true
+
+  defp visible_to_caller?(article, agent_id) when is_binary(agent_id) do
+    metadata = article.metadata || %{}
+    visibility = metadata["visibility"] || metadata[:visibility] || "shared"
+    owner = metadata["agent_id"] || metadata[:agent_id]
+    visibility not in ["private", "owner"] or owner == agent_id
+  end
+
+  # Drops preloaded links whose far-side article the caller can't see (#163), so a
+  # shared article never leaks a private memory's title via its links.
+  defp filter_visible_links(article, nil), do: article
+
+  defp filter_visible_links(article, vis) when is_binary(vis) do
+    %{
+      article
+      | outgoing_links:
+          Enum.filter(article.outgoing_links, &link_side_visible?(&1.target_article, vis)),
+        incoming_links:
+          Enum.filter(article.incoming_links, &link_side_visible?(&1.source_article, vis))
+    }
+  end
+
+  defp link_side_visible?(%Article{} = far_side, vis), do: visible_to_caller?(far_side, vis)
+  defp link_side_visible?(_not_loaded, _vis), do: false
 
   # Extracts the attribution context map from the caller's opts. Returns
   # an empty map when neither `:project_id` nor `:story_id` was provided.
@@ -732,6 +780,7 @@ defmodule Loopctl.Knowledge do
       base
       |> maybe_filter_by_category(Keyword.get(opts, :category))
       |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+      |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
@@ -825,6 +874,9 @@ defmodule Loopctl.Knowledge do
       else
         base
       end
+
+    # Visibility (#163): an agent's stats never count another agent's private memories.
+    base = maybe_filter_by_visibility(base, Keyword.get(opts, :visibility_agent_id))
 
     # Zero-fill every category/status so the maps are dense: a caller can read
     # `by_status["published"]` and get 0 (not nil) for a wiki with no published
@@ -1030,7 +1082,13 @@ defmodule Loopctl.Knowledge do
     # access_type="context" rather than duplicating as "search".
     search_opts =
       opts
-      |> Keyword.take([:project_id, :memory_types, :agents, :conversation_id])
+      |> Keyword.take([
+        :project_id,
+        :memory_types,
+        :agents,
+        :conversation_id,
+        :visibility_agent_id
+      ])
       |> Keyword.merge(
         limit: limit * 3,
         offset: 0,
@@ -1039,11 +1097,12 @@ defmodule Loopctl.Knowledge do
       )
 
     {search_result, fallback?} = run_context_search(tenant_id, query_string, search_opts)
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     case search_result do
       {:ok, search} ->
         {:ok, context} =
-          build_context_results(tenant_id, search, limit, recency_weight, fallback?)
+          build_context_results(tenant_id, search, limit, recency_weight, fallback?, vis)
 
         context_ids = Enum.map(context.results, & &1.id)
 
@@ -1077,7 +1136,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp build_context_results(tenant_id, search, limit, recency_weight, fallback?) do
+  defp build_context_results(tenant_id, search, limit, recency_weight, fallback?, vis) do
     article_ids =
       search.results
       |> Enum.map(& &1[:id])
@@ -1100,7 +1159,7 @@ defmodule Loopctl.Knowledge do
       now = DateTime.utc_now()
 
       article_ids_for_links = Enum.map(articles, & &1.id)
-      linked_map = batch_linked_refs(tenant_id, article_ids_for_links)
+      linked_map = batch_linked_refs(tenant_id, article_ids_for_links, vis)
 
       scored =
         articles
@@ -1163,9 +1222,9 @@ defmodule Loopctl.Knowledge do
 
   # Batch-fetches linked article refs for all given article IDs in a single query.
   # Returns a map of article_id => [%{id, title, category}], capped at 5 per article.
-  defp batch_linked_refs(_tenant_id, []), do: %{}
+  defp batch_linked_refs(_tenant_id, [], _vis), do: %{}
 
-  defp batch_linked_refs(tenant_id, article_ids) do
+  defp batch_linked_refs(tenant_id, article_ids, vis) do
     links =
       from(l in ArticleLink,
         where: l.tenant_id == ^tenant_id,
@@ -1187,6 +1246,8 @@ defmodule Loopctl.Knowledge do
           [link.source_article, link.target_article]
           |> Enum.reject(&(is_nil(&1) or &1.id == article_id))
         end)
+        # Visibility (#163): never surface a linked article the caller can't see.
+        |> Enum.filter(&visible_to_caller?(&1, vis))
         |> Enum.uniq_by(& &1.id)
         |> Enum.take(5)
         |> Enum.map(fn article ->
@@ -1397,6 +1458,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
     |> maybe_filter_by_agents(Keyword.get(opts, :agents))
     |> maybe_filter_by_conversation_id(Keyword.get(opts, :conversation_id))
+    |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
   end
 
   # Agent-memory scoping via JSONB containment (`metadata @> '{"key": val}'`),
@@ -2591,8 +2653,12 @@ defmodule Loopctl.Knowledge do
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]
     rel_type = attrs[:relationship_type] || attrs["relationship_type"]
+    vis = Keyword.get(opts, :visibility_agent_id)
 
-    with :ok <- validate_articles_exist(tenant_id, source_id, target_id) do
+    with :ok <- validate_articles_exist(tenant_id, source_id, target_id),
+         # Visibility (#163): an agent may not link to (and thereby probe/leak) an
+         # article it can't see — both endpoints must be visible to the caller.
+         :ok <- validate_link_visibility(tenant_id, source_id, target_id, vis) do
       changeset =
         %ArticleLink{tenant_id: tenant_id}
         |> ArticleLink.changeset(attrs)
@@ -2693,7 +2759,9 @@ defmodule Loopctl.Knowledge do
   - List of `%ArticleLink{}` structs with linked articles preloaded
   """
   @spec list_links_for_article(Ecto.UUID.t(), Ecto.UUID.t()) :: [ArticleLink.t()]
-  def list_links_for_article(tenant_id, article_id) do
+  def list_links_for_article(tenant_id, article_id, opts \\ []) do
+    vis = Keyword.get(opts, :visibility_agent_id)
+
     from(l in ArticleLink,
       where: l.tenant_id == ^tenant_id,
       where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
@@ -2702,6 +2770,18 @@ defmodule Loopctl.Knowledge do
       limit: 100
     )
     |> AdminRepo.all()
+    # Visibility (#163): drop links whose far-side article the caller can't see, so
+    # the link list can't leak another agent's private memory id/title.
+    |> filter_links_by_visibility(vis)
+  end
+
+  defp filter_links_by_visibility(links, nil), do: links
+
+  defp filter_links_by_visibility(links, vis) when is_binary(vis) do
+    Enum.filter(links, fn link ->
+      link_side_visible?(link.source_article, vis) and
+        link_side_visible?(link.target_article, vis)
+    end)
   end
 
   @default_suggestion_limit 5
@@ -2736,6 +2816,7 @@ defmodule Loopctl.Knowledge do
           {:ok, [map()]} | {:error, :not_found} | {:error, :invalid_threshold}
   def suggest_links(tenant_id, article_id, opts \\ []) do
     threshold = Keyword.get(opts, :threshold) || default_suggestion_threshold()
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     limit =
       opts
@@ -2744,7 +2825,7 @@ defmodule Loopctl.Knowledge do
       |> min(@max_relevance_page_size)
 
     with :ok <- validate_threshold(threshold) do
-      case fetch_article_embedding(tenant_id, article_id) do
+      case fetch_article_embedding(tenant_id, article_id, vis) do
         nil ->
           {:error, :not_found}
 
@@ -2752,7 +2833,7 @@ defmodule Loopctl.Knowledge do
           {:ok, []}
 
         %{embedding: embedding} ->
-          {:ok, suggestion_candidates(tenant_id, article_id, embedding, threshold, limit)}
+          {:ok, suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)}
       end
     end
   end
@@ -2765,17 +2846,18 @@ defmodule Loopctl.Knowledge do
 
   # Lightweight fetch — only the embedding (skips body/metadata). A non-UUID or a
   # missing/non-published article yields nil → {:error, :not_found}.
-  defp fetch_article_embedding(tenant_id, article_id) do
+  defp fetch_article_embedding(tenant_id, article_id, vis) do
     if valid_uuid?(article_id) do
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
         select: %{embedding: a.embedding}
       )
+      |> maybe_filter_by_visibility(vis)
       |> AdminRepo.one()
     end
   end
 
-  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit) do
+  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.status == :published,
       where: not is_nil(a.embedding),
@@ -2798,6 +2880,7 @@ defmodule Loopctl.Knowledge do
         similarity_score: fragment("GREATEST(0, 1 - (? <=> ?::vector))", a.embedding, ^embedding)
       }
     )
+    |> maybe_filter_by_visibility(vis)
     |> AdminRepo.all(timeout: 5_000)
   end
 
@@ -2831,10 +2914,11 @@ defmodule Loopctl.Knowledge do
           {:ok, map()} | {:error, :invalid_depth} | {:error, :not_found}
   def graph_traversal(tenant_id, article_id, opts \\ []) do
     depth = Keyword.get(opts, :depth, 1)
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     with :ok <- validate_graph_depth(depth),
-         true <- article_published?(tenant_id, article_id) do
-      {:ok, execute_graph_traversal(tenant_id, article_id, depth)}
+         true <- article_published?(tenant_id, article_id, vis) do
+      {:ok, execute_graph_traversal(tenant_id, article_id, depth, vis)}
     else
       false -> {:error, :not_found}
       {:error, _} = error -> error
@@ -2868,17 +2952,29 @@ defmodule Loopctl.Knowledge do
     do:
       Application.get_env(:loopctl, :max_graph_neighbors_per_node, @max_graph_neighbors_per_node)
 
-  defp article_published?(tenant_id, article_id) do
+  defp article_published?(tenant_id, article_id, vis) do
     valid_uuid?(article_id) and
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published
       )
+      |> maybe_filter_by_visibility(vis)
       |> AdminRepo.exists?()
   end
 
-  defp execute_graph_traversal(tenant_id, article_id, depth) do
+  defp execute_graph_traversal(tenant_id, article_id, depth, vis) do
     {:ok, tenant_bin} = Ecto.UUID.dump(tenant_id)
     {:ok, article_bin} = Ecto.UUID.dump(article_id)
+
+    # Visibility (#163): for agent callers, traversal only includes nodes the caller
+    # may see (shared/own). $6 binds the caller identity; the clause is a fixed literal
+    # (no user input concatenated), so it's injection-safe. Higher roles pass nil → no clause.
+    {vis_clause, params} =
+      if is_binary(vis) do
+        {" AND (COALESCE(a.metadata->>'visibility', 'shared') NOT IN ('private','owner') OR a.metadata->>'agent_id' = $6)",
+         [article_bin, tenant_bin, depth, max_graph_nodes(), max_graph_neighbors_per_node(), vis]}
+      else
+        {"", [article_bin, tenant_bin, depth, max_graph_nodes(), max_graph_neighbors_per_node()]}
+      end
 
     # Bidirectional recursive walk with a path-array cycle guard and per-node neighbor cap
     # to bound fan-out, capped at @max_graph_nodes. Raw SQL because Ecto has no native
@@ -2887,7 +2983,7 @@ defmodule Loopctl.Knowledge do
     WITH RECURSIVE graph AS (
       SELECT a.id AS node_id, ARRAY[a.id] AS path, 0 AS depth
       FROM articles a
-      WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'published'
+      WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'published'#{vis_clause}
 
       UNION ALL
 
@@ -2907,7 +3003,7 @@ defmodule Loopctl.Knowledge do
       ) l ON true
       JOIN articles a ON a.id = CASE WHEN l.source_article_id = g.node_id
                                      THEN l.target_article_id ELSE l.source_article_id END
-        AND a.tenant_id = $2 AND a.status = 'published'
+        AND a.tenant_id = $2 AND a.status = 'published'#{vis_clause}
       WHERE g.depth < $3
         AND NOT (CASE WHEN l.source_article_id = g.node_id
                       THEN l.target_article_id ELSE l.source_article_id END = ANY(g.path))
@@ -2919,17 +3015,14 @@ defmodule Loopctl.Knowledge do
     LIMIT $4
     """
 
-    node_cap = max_graph_nodes()
-    neighbor_cap = max_graph_neighbors_per_node()
-
     case SQL.query(
            AdminRepo,
            node_sql,
-           [article_bin, tenant_bin, depth, node_cap, neighbor_cap],
+           params,
            timeout: 5_000
          ) do
       {:ok, %{rows: node_rows}} ->
-        nodes_truncated = length(node_rows) >= node_cap
+        nodes_truncated = length(node_rows) >= max_graph_nodes()
 
         node_ids_with_depth =
           Enum.map(node_rows, fn [node_bin, d] ->
@@ -3027,9 +3120,10 @@ defmodule Loopctl.Knowledge do
     limit = opts |> Keyword.get(:limit, @default_pair_limit) |> max(1) |> min(@max_pair_limit)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     bridge? = Keyword.get(opts, :bridge_path, false) == true
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     with :ok <- validate_distance_band(min_d, max_d) do
-      {:ok, do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?)}
+      {:ok, do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?, vis)}
     end
   end
 
@@ -3045,7 +3139,7 @@ defmodule Loopctl.Knowledge do
     Application.get_env(:loopctl, :max_pair_candidates, @max_pair_candidates)
   end
 
-  defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?) do
+  defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?, vis) do
     candidates =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
@@ -3059,6 +3153,7 @@ defmodule Loopctl.Knowledge do
           embedding: a.embedding
         }
       )
+      |> maybe_filter_by_visibility(vis)
 
     # Build the base query for counting total pairs
     count_query =
@@ -3089,10 +3184,10 @@ defmodule Loopctl.Knowledge do
     # Note: count may shift between queries, but avoiding transaction hold on the O(n²) self-join
     # prevents AdminRepo pool starvation under concurrent agent load (3 agents, pool_size: 3).
     total_count =
-      count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
+      count_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.one(timeout: 15_000)
 
     pairs_with_lookahead =
-      pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
+      pairs_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.all(timeout: 15_000)
 
     # Detect has_more by fetching limit+1; only return limit
     has_more = length(pairs_with_lookahead) > limit
@@ -3106,9 +3201,10 @@ defmodule Loopctl.Knowledge do
   # The shared neighbor must be a distinct *published* article, consistent with
   # random_walk's published-only neighbors — a pair doesn't bridge through an
   # archived/draft middle. All node/link references are tenant-scoped.
-  defp maybe_filter_bridge_path(query, false), do: query
+  defp maybe_filter_bridge_path(query, false, _vis), do: query
 
-  defp maybe_filter_bridge_path(query, true) do
+  # Higher roles (vis nil): bridge through any published middle node.
+  defp maybe_filter_bridge_path(query, true, nil) do
     where(
       query,
       [a, b],
@@ -3135,6 +3231,36 @@ defmodule Loopctl.Knowledge do
     )
   end
 
+  # Agent callers (#163): the bridge middle node must ALSO be visible to the caller,
+  # so a pair can't be reported "bridgeable" through a private memory it can't see.
+  defp maybe_filter_bridge_path(query, true, vis) when is_binary(vis) do
+    where(
+      query,
+      [a, b],
+      fragment(
+        "EXISTS (SELECT 1 FROM article_links l WHERE l.tenant_id = ? AND ((l.source_article_id = ? AND l.target_article_id = ?) OR (l.source_article_id = ? AND l.target_article_id = ?)))",
+        a.tenant_id,
+        a.id,
+        b.id,
+        b.id,
+        a.id
+      ) or
+        fragment(
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND (COALESCE(m.metadata->>'visibility', 'shared') NOT IN ('private','owner') OR m.metadata->>'agent_id' = ?) AND m.id <> ? AND m.id <> ?)",
+          a.tenant_id,
+          a.id,
+          a.id,
+          a.tenant_id,
+          b.id,
+          b.id,
+          a.tenant_id,
+          ^vis,
+          a.id,
+          b.id
+        )
+    )
+  end
+
   @doc """
   Random walk through the link graph from a starting article (Boden's
   random-exploration / incubation mechanism). Picks a random unvisited published
@@ -3155,36 +3281,45 @@ defmodule Loopctl.Knowledge do
           {:ok, [map()]} | {:error, :not_found}
   def random_walk(tenant_id, start_id, opts \\ []) do
     length = opts |> Keyword.get(:length, @default_walk_length) |> max(1) |> min(@max_walk_length)
+    vis = Keyword.get(opts, :visibility_agent_id)
 
-    case fetch_walk_node(tenant_id, start_id) do
+    case fetch_walk_node(tenant_id, start_id, vis) do
       nil -> {:error, :not_found}
-      node -> {:ok, do_random_walk(tenant_id, node, MapSet.new([node.id]), length, [node])}
+      node -> {:ok, do_random_walk(tenant_id, node, MapSet.new([node.id]), length, [node], vis)}
     end
   end
 
-  defp do_random_walk(_tenant_id, _current, _visited, 0, acc), do: Enum.reverse(acc)
+  defp do_random_walk(_tenant_id, _current, _visited, 0, acc, _vis), do: Enum.reverse(acc)
 
-  defp do_random_walk(tenant_id, current, visited, steps_left, acc) do
-    case random_unvisited_neighbor(tenant_id, current.id, visited) do
+  defp do_random_walk(tenant_id, current, visited, steps_left, acc, vis) do
+    case random_unvisited_neighbor(tenant_id, current.id, visited, vis) do
       nil ->
         Enum.reverse(acc)
 
       next ->
-        do_random_walk(tenant_id, next, MapSet.put(visited, next.id), steps_left - 1, [next | acc])
+        do_random_walk(
+          tenant_id,
+          next,
+          MapSet.put(visited, next.id),
+          steps_left - 1,
+          [next | acc],
+          vis
+        )
     end
   end
 
-  defp fetch_walk_node(tenant_id, article_id) do
+  defp fetch_walk_node(tenant_id, article_id, vis) do
     if valid_uuid?(article_id) do
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
         select: %{id: a.id, title: a.title, category: a.category}
       )
+      |> maybe_filter_by_visibility(vis)
       |> AdminRepo.one()
     end
   end
 
-  defp random_unvisited_neighbor(tenant_id, current_id, visited) do
+  defp random_unvisited_neighbor(tenant_id, current_id, visited, vis) do
     visited_ids = MapSet.to_list(visited)
 
     from(l in ArticleLink,
@@ -3207,7 +3342,21 @@ defmodule Loopctl.Knowledge do
       limit: 1,
       select: %{id: n.id, title: n.title, category: n.category}
     )
+    |> maybe_filter_neighbor_visibility(vis)
     |> AdminRepo.one()
+  end
+
+  # Visibility on the *second* query binding (`n`, the neighbor Article) — the
+  # `[a]`-binding `maybe_filter_by_visibility/2` can't be reused here.
+  defp maybe_filter_neighbor_visibility(query, nil), do: query
+
+  defp maybe_filter_neighbor_visibility(query, vis) when is_binary(vis) do
+    where(
+      query,
+      [_l, n],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", n.metadata) or
+        fragment("?->>'agent_id' = ?", n.metadata, ^vis)
+    )
   end
 
   @doc """
@@ -3234,7 +3383,8 @@ defmodule Loopctl.Knowledge do
   @spec novelty_scores(Ecto.UUID.t(), [map()], keyword()) :: {:ok, [map()], non_neg_integer()}
   def novelty_scores(tenant_id, ideas, opts \\ []) when is_list(ideas) do
     prior_tag = Keyword.get(opts, :prior_tag, "proposal")
-    prior_count = count_embedded_priors(tenant_id, prior_tag)
+    vis = Keyword.get(opts, :visibility_agent_id)
+    prior_count = count_embedded_priors(tenant_id, prior_tag, vis)
 
     scored =
       if prior_count == 0 do
@@ -3243,7 +3393,7 @@ defmodule Loopctl.Knowledge do
         Enum.map(ideas, &Map.put(&1, :novelty_score, nil))
       else
         ideas
-        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag),
+        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag, vis),
           max_concurrency: @novelty_concurrency,
           timeout: :infinity,
           ordered: true
@@ -3262,31 +3412,37 @@ defmodule Loopctl.Knowledge do
     {:ok, scored, prior_count}
   end
 
-  # Count of embedded prior proposals — the set actually compared against (matches
-  # nearest_prior_distance's filter), so it's a truthful disambiguator for nil scores.
-  defp count_embedded_priors(tenant_id, prior_tag) do
+  # Count of embedded prior proposals visible to the caller — the set actually
+  # compared against (matches nearest_prior_distance's filter), so it's a truthful
+  # disambiguator for nil scores and never counts another agent's private priors.
+  defp count_embedded_priors(tenant_id, prior_tag, vis) do
     from(a in Article,
       where:
         a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
           fragment("? && ?", a.tags, ^[prior_tag])
     )
+    |> maybe_filter_by_visibility(vis)
     |> AdminRepo.aggregate(:count, timeout: 15_000)
   end
 
-  defp score_idea(tenant_id, idea, prior_tag) do
+  defp score_idea(tenant_id, idea, prior_tag, vis) do
     text = novelty_idea_text(idea)
 
     if String.trim(text) == "" do
       Map.put(idea, :novelty_score, nil)
     else
-      score_embedding(tenant_id, idea, text, prior_tag)
+      score_embedding(tenant_id, idea, text, prior_tag, vis)
     end
   end
 
-  defp score_embedding(tenant_id, idea, text, prior_tag) do
+  defp score_embedding(tenant_id, idea, text, prior_tag, vis) do
     case generate_embedding(text) do
       {:ok, embedding} ->
-        Map.put(idea, :novelty_score, nearest_prior_distance(tenant_id, embedding, prior_tag))
+        Map.put(
+          idea,
+          :novelty_score,
+          nearest_prior_distance(tenant_id, embedding, prior_tag, vis)
+        )
 
       {:error, _} ->
         Map.put(idea, :novelty_score, nil)
@@ -3316,13 +3472,14 @@ defmodule Loopctl.Knowledge do
 
   # Min cosine distance from the idea embedding to any prior proposal; nil when there
   # are no embedded priors (distinguishable from a genuine high score).
-  defp nearest_prior_distance(tenant_id, embedding, prior_tag) do
+  defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
     from(a in Article,
       where:
         a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
           fragment("? && ?", a.tags, ^[prior_tag]),
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
     )
+    |> maybe_filter_by_visibility(vis)
     |> AdminRepo.one(timeout: 15_000)
   end
 
@@ -3466,6 +3623,55 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
     |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
     |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
+    |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+  end
+
+  # Visibility enforcement (#163): when `:visibility_agent_id` is set (the caller is
+  # an agent), hide other agents' `private`/`owner` memories. An article is visible
+  # when its `metadata.visibility` is absent or `shared`, OR the caller owns it
+  # (`metadata.agent_id` matches the caller's verified key identity). Higher roles
+  # pass no `:visibility_agent_id` and see everything. An agent with no key
+  # identity (agent_id "") owns nothing, so it sees only shared articles.
+  #
+  # Perf: this adds a `metadata->>...` filter (not the GIN-indexed `@>` form). It is
+  # intentionally NOT given a dedicated index: the predicate is an OR whose first arm
+  # (shared / non-memory) matches the overwhelming majority of rows, so the planner
+  # must scan the tenant-scoped set regardless — a partial index on private/owner
+  # rows can't serve a query that also returns the shared majority. The added per-row
+  # JSONB extraction is cheap on the already-tenant-scoped scan; `distant_pairs`
+  # applies it to the ≤1000-row candidate subquery before the O(n²) join, so it
+  # doesn't compound the join cost.
+  @doc """
+  Returns the subset of `article_ids` that are visible to the caller (#163).
+
+  `visibility_agent_id` nil (higher roles) ⇒ all ids that exist; an agent ⇒ only
+  `shared`/non-memory articles plus its own. Used to filter indirect surfaces (the
+  change feed) that reference articles by id without re-querying each one. Returns
+  a `MapSet`. Ids that don't exist (hard-deleted) are excluded.
+  """
+  # No @spec: a `MapSet.t()` return annotation trips dialyzer's contract_with_opaque
+  # check against the concrete success typing (a known false positive for opaque
+  # built-ins). The behaviour is covered by tests instead.
+  def visible_article_ids(_tenant_id, [], _vis), do: MapSet.new()
+
+  def visible_article_ids(tenant_id, article_ids, vis) do
+    ids = Enum.filter(article_ids, &valid_uuid?/1)
+
+    from(a in Article, where: a.tenant_id == ^tenant_id and a.id in ^ids, select: a.id)
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  defp maybe_filter_by_visibility(query, nil), do: query
+
+  defp maybe_filter_by_visibility(query, agent_id) when is_binary(agent_id) do
+    where(
+      query,
+      [a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata) or
+        fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
+    )
   end
 
   defp maybe_filter_by_project_id(query, nil), do: query
@@ -3554,6 +3760,24 @@ defmodule Loopctl.Knowledge do
       true ->
         :ok
     end
+  end
+
+  # Agent callers may only link articles they can see; a hidden endpoint resolves
+  # to :target_not_found (the controller renders 404) — no existence leak. Higher
+  # roles (vis nil) skip the check.
+  defp validate_link_visibility(_tenant_id, _source_id, _target_id, nil), do: :ok
+
+  defp validate_link_visibility(tenant_id, source_id, target_id, vis) when is_binary(vis) do
+    # Distinct ids so a self-link (source == target) checks one article and still
+    # falls through to the changeset's self-link rejection (422) rather than 404.
+    ids = Enum.uniq([source_id, target_id])
+
+    visible_count =
+      from(a in Article, where: a.tenant_id == ^tenant_id and a.id in ^ids)
+      |> maybe_filter_by_visibility(vis)
+      |> AdminRepo.aggregate(:count, :id)
+
+    if visible_count == length(ids), do: :ok, else: {:error, :target_not_found}
   end
 
   defp maybe_supersede_target(multi, tenant_id, _target_id, rel_type)

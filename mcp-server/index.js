@@ -837,6 +837,7 @@ async function knowledgeCreate({
   source_type,
   source_id,
   idempotency_key,
+  metadata,
 }) {
   const payload = { title, body };
   if (category) payload.category = category;
@@ -845,6 +846,7 @@ async function knowledgeCreate({
   if (source_type) payload.source_type = source_type;
   if (source_id) payload.source_id = source_id;
   if (idempotency_key) payload.idempotency_key = idempotency_key;
+  if (metadata) payload.metadata = metadata;
 
   // Articles publish on create by default for every role (including agent), so a
   // plain create routes through the agent key and is immediately visible. Pass
@@ -2435,7 +2437,9 @@ const TOOLS = [
       "Get ranked full articles for a task query. Returns best knowledge with linked references. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly. For agent " +
       "memory, scope to a memory_type/agent/conversation via the memory_types/agents/" +
-      "conversation_id filters (articles whose metadata carries those keys).",
+      "conversation_id filters (articles whose metadata carries those keys). NOTE (#163): for " +
+      "an agent key, another agent's private/owner memories are never returned (results AND " +
+      "linked refs) regardless of the agents= filter — visibility is enforced, not advisory.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2533,6 +2537,19 @@ const TOOLS = [
             "HIGH-ENTROPY value (e.g. a content hash) — it is a per-tenant lookup key, not a " +
             "secret, so a guessable key lets another agent in your tenant probe which keys " +
             "exist. Distinct from source_type/source_id (which mark a shared source).",
+        },
+        metadata: {
+          type: "object",
+          description:
+            "Optional: extensible JSONB. Set the agent-memory keys to file this article as a " +
+            "scoped agent memory: `memory_type` (observation/finding/summary/decision/question/" +
+            "task) and `visibility` (shared | private | owner). TRUST MODEL (#163): for an " +
+            "agent key, `metadata.agent_id` is stamped server-side from your verified key " +
+            "identity — do NOT set it (any value you pass is overridden); `private`/`owner` " +
+            "memories are then readable only by you (other agents get 404/exclusion across all " +
+            "knowledge reads), while `shared` (the default) is visible tenant-wide. An agent " +
+            "key with no agent identity gets 403 agent_identity_required when writing memory " +
+            "metadata. Higher roles may attribute on behalf of others.",
         },
         source_type: {
           type: "string",

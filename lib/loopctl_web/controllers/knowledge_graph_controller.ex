@@ -5,8 +5,9 @@ defmodule LoopctlWeb.KnowledgeGraphController do
   - `GET /api/v1/knowledge/graph?article_id=&depth=` -- traverse the published
     article-link graph outward from an article (agent+).
 
-  Returns the reachable published articles and the links among them, bidirectional
-  and cycle-safe, bounded to 100 nodes / 500 edges (`truncated` flags a cap hit).
+  Returns reachable published articles visible to the caller and the links among them,
+  bidirectional and cycle-safe, bounded to 100 nodes / 500 edges (`truncated` flags a cap hit).
+  Agent callers see only their own articles and `shared` articles.
   """
 
   use LoopctlWeb, :controller
@@ -14,6 +15,7 @@ defmodule LoopctlWeb.KnowledgeGraphController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -25,12 +27,13 @@ defmodule LoopctlWeb.KnowledgeGraphController do
     summary: "Traverse the knowledge graph",
     description:
       "Walks the published article-link graph outward from `article_id` up to `depth` " <>
-        "hops (1–3, default 1). **Bidirectional** (links followed regardless of source/" <>
+        "hops (1–3, default 1), respecting visibility (agent callers see only their own and `shared` articles). " <>
+        "**Bidirectional** (links followed regardless of source/" <>
         "target direction) and **cycle-safe** (no node appears twice). Returns `nodes` " <>
         "(`id`, `title`, `category`, `depth`), `edges` (`source_article_id`, " <>
         "`target_article_id`, `relationship_type`), `truncated`, and `node_count`. " <>
         "Bounded to 100 nodes / 500 edges; `truncated: true` when a cap is hit. Only " <>
-        "published articles are traversed; tenant-scoped. Role: agent+.",
+        "published articles are traversed; bounded to visible articles. Role: agent+.",
     parameters: [
       article_id: [in: :query, type: :string, description: "Starting article UUID (required)"],
       depth: [in: :query, type: :integer, description: "Hops to traverse (1–3, default 1)"],
@@ -60,7 +63,12 @@ defmodule LoopctlWeb.KnowledgeGraphController do
 
     with {:ok, article_id} <- require_article_id(params["article_id"]),
          {:ok, depth} <- parse_depth(params["depth"]),
-         {:ok, result} <- Knowledge.graph_traversal(tenant_id, article_id, depth: depth) do
+         {:ok, result} <-
+           Knowledge.graph_traversal(
+             tenant_id,
+             article_id,
+             [depth: depth] ++ Visibility.scope_opts(conn)
+           ) do
       json(conn, result)
     else
       {:error, :invalid_depth} ->

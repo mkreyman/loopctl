@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -27,10 +28,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
       "Returns paginated pairs of articles whose embedding cosine distance is in the " <>
         "optimal-novelty band [`min_distance`, `max_distance`] (default 0.3–0.7) — the " <>
         "creative sweet spot. With `bridge_path=true`, only pairs also connected in the " <>
-        "link graph (≤2 hops) are returned. Each pair: `{a, b, distance}`. Samples up to " <>
-        "1000 embedded published articles (lowest-id slice; operator-tunable). " <>
+        "link graph (≤2 hops) are returned. Agent callers see only their own and `shared` " <>
+        "articles. Each pair: `{a, b, distance}`. Samples up to " <>
+        "1000 embedded published visible articles (lowest-id slice; operator-tunable). " <>
         "`meta` carries `count`/`total_count`/`has_more` for pagination — `total_count` is " <>
-        "over the sampled slice, so it can undercount on tenants with >1000 embedded " <>
+        "over the sampled visible slice, so it can undercount on tenants with >1000 embedded " <>
         "articles. Role: agent+.",
     parameters: [
       min_distance: [
@@ -89,12 +91,15 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     with {:ok, min_d} <- parse_float(params["min_distance"], 0.3),
          {:ok, max_d} <- parse_float(params["max_distance"], 0.7),
          {:ok, result} <-
-           Knowledge.distant_pairs(tenant_id,
-             min_distance: min_d,
-             max_distance: max_d,
-             bridge_path: params["bridge_path"] == "true",
-             limit: parse_int(params["limit"]) || 20,
-             offset: parse_int(params["offset"]) || 0
+           Knowledge.distant_pairs(
+             tenant_id,
+             [
+               min_distance: min_d,
+               max_distance: max_d,
+               bridge_path: params["bridge_path"] == "true",
+               limit: parse_int(params["limit"]) || 20,
+               offset: parse_int(params["offset"]) || 0
+             ] ++ Visibility.scope_opts(conn)
            ) do
       json(conn, %{
         data: result.pairs,
@@ -121,8 +126,9 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         "proposal (0 = identical to existing work, higher = more novel, up to 2.0 = " <>
         "opposite vectors; `null` when the idea text is blank, no priors exist, or " <>
         "embedding fails). Each idea's text is embedded on the fly. Priors default to " <>
-        "published articles tagged `proposal` (override with `prior_tag`). `meta.prior_count` " <>
-        "is the number of embedded priors actually compared against (0 ⇒ every score is " <>
+        "published articles tagged `proposal` visible to the caller (agent callers see only " <>
+        "their own and `shared` articles; override with `prior_tag`). `meta.prior_count` " <>
+        "is the number of embedded visible priors actually compared against (0 ⇒ every score is " <>
         "null). Body: `{ideas: [{text|title/spark/thesis...}], prior_tag?}`. Role: agent+.",
     request_body:
       {"Ideas to score", "application/json",
@@ -166,7 +172,8 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
     with {:ok, ideas} <- validate_ideas(params["ideas"]) do
-      opts = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
+      base = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
+      opts = base ++ Visibility.scope_opts(conn)
       {:ok, scored, prior_count} = Knowledge.novelty_scores(tenant_id, ideas, opts)
       json(conn, %{data: scored, meta: %{prior_count: prior_count}})
     end
@@ -175,9 +182,9 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
   operation(:walk,
     summary: "Random walk through the link graph",
     description:
-      "Returns a random walk of up to `length` published articles starting from " <>
-        "`start_id`, following random unvisited link-graph neighbors (no cycles; stops at " <>
-        "a dead end). Surfaces unexpected connections. Role: agent+.",
+      "Returns a random walk of up to `length` published articles visible to the caller " <>
+        "starting from `start_id`, following random unvisited link-graph neighbors (no cycles; stops at " <>
+        "a dead end). Agent callers see only their own and `shared` articles. Surfaces unexpected connections. Role: agent+.",
     parameters: [
       start_id: [in: :query, type: :string, description: "Starting article UUID (required)"],
       length: [in: :query, type: :integer, description: "Walk steps (default 4, max 25)"]
@@ -212,7 +219,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
     with {:ok, start_id} <- require_uuid(params["start_id"], "start_id"),
          {:ok, walk} <-
-           Knowledge.random_walk(tenant_id, start_id, length: parse_int(params["length"]) || 4) do
+           Knowledge.random_walk(
+             tenant_id,
+             start_id,
+             [length: parse_int(params["length"]) || 4] ++ Visibility.scope_opts(conn)
+           ) do
       json(conn, %{data: walk, meta: %{count: length(walk)}})
     else
       {:error, :not_found} -> {:error, :not_found}
