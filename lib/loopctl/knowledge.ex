@@ -107,6 +107,11 @@ defmodule Loopctl.Knowledge do
   # doesn't serialize 50 embedding round-trips.
   @novelty_concurrency 5
 
+  # Maximum text length for a novelty idea to prevent unbounded embedding input.
+  # OpenAI's embedding API accepts up to ~8k tokens (~32k chars); we cap at 4MB
+  # to protect against DoS. Text beyond this is silently truncated before embedding.
+  @max_idea_text_bytes 4 * 1024 * 1024
+
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
   # agent-callable memory/DoS vector. Full-content pages therefore return as many
@@ -3074,24 +3079,14 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    # Fetch count and paginated pairs with timeout
-    {total_count, pairs_with_lookahead} =
-      AdminRepo.transaction(
-        fn ->
-          count =
-            count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
+    # Fetch count and paginated pairs
+    # Note: count may shift between queries, but avoiding transaction hold on the O(n²) self-join
+    # prevents AdminRepo pool starvation under concurrent agent load (3 agents, pool_size: 3).
+    total_count =
+      count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
 
-          pairs =
-            pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
-
-          {count, pairs}
-        end,
-        timeout: 15_000
-      )
-      |> case do
-        {:ok, result} -> result
-        {:error, _} -> {0, []}
-      end
+    pairs_with_lookahead =
+      pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
 
     # Detect has_more by fetching limit+1; only return limit
     has_more = length(pairs_with_lookahead) > limit
@@ -3229,12 +3224,25 @@ defmodule Loopctl.Knowledge do
 
     scored =
       ideas
-      |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag),
+      |> Enum.with_index()
+      |> Task.async_stream(fn {idea, _idx} -> score_idea(tenant_id, idea, prior_tag) end,
         max_concurrency: @novelty_concurrency,
         timeout: :infinity,
         ordered: true
       )
-      |> Enum.map(fn {:ok, scored_idea} -> scored_idea end)
+      |> Enum.zip(ideas)
+      |> Enum.map(fn
+        {{:ok, scored_idea}, _original_idea} ->
+          scored_idea
+
+        {{:exit, reason}, original_idea} ->
+          Logger.warning("novelty_scores: idea scoring task exited: #{inspect(reason)}")
+          Map.put(original_idea, :novelty_score, nil)
+
+        {{other, _}, original_idea} ->
+          Logger.warning("novelty_scores: unexpected task result: #{inspect(other)}")
+          Map.put(original_idea, :novelty_score, nil)
+      end)
 
     {:ok, scored}
   end
@@ -3260,15 +3268,23 @@ defmodule Loopctl.Knowledge do
   end
 
   defp novelty_idea_text(idea) do
-    case idea[:text] || idea["text"] do
-      text when is_binary(text) and text != "" ->
-        text
+    text =
+      case idea[:text] || idea["text"] do
+        text when is_binary(text) and text != "" ->
+          text
 
-      _ ->
-        [:title, :spark, :thesis]
-        |> Enum.map(fn k -> idea[k] || idea[to_string(k)] end)
-        |> Enum.filter(&is_binary/1)
-        |> Enum.join(" ")
+        _ ->
+          [:title, :spark, :thesis]
+          |> Enum.map(fn k -> idea[k] || idea[to_string(k)] end)
+          |> Enum.filter(&is_binary/1)
+          |> Enum.join(" ")
+      end
+
+    # Truncate to max bytes to prevent unbounded embedding input DoS
+    if byte_size(text) > @max_idea_text_bytes do
+      String.slice(text, 0, @max_idea_text_bytes)
+    else
+      text
     end
   end
 

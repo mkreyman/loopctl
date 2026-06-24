@@ -28,7 +28,8 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
            json: %{input: text, model: model},
            headers: [{"authorization", "Bearer #{api_key}"}],
            retry: :transient,
-           max_retries: 2
+           max_retries: 2,
+           receive_timeout: 30_000
          ) do
       {:ok, %{status: 200, body: %{"data" => [%{"embedding" => embedding} | _]}}} ->
         {:ok, embedding}
