@@ -1,0 +1,128 @@
+{
+  "id": "US-27.3",
+  "title": "Structured DB-error surfacing: map SQLSTATE to safe, logged errors instead of a blanket 500",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "scale_observability",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1; incident: the 57014 statement_timeout hidden behind a generic 500 for the entire suggested_links saga",
+    "includes": "Throughout #168→#173 the real cause (Postgrex.Error 57014 query_canceled / statement timeout) was invisible to anyone hitting the API — it surfaced only as a generic 500. The diagnosis required fly logs access that the fixing session initially believed it lacked."
+  },
+  "priority_note": "Observability half of Theme 1. Without surfacing the real SQLSTATE, operators and future fixers debug blind — the documented reason the misses took four attempts.",
+  "story": {
+    "as_a": "loopctl operator (and the next engineer debugging a prod incident)",
+    "i_want_to": "database exceptions (statement timeout, serialization failure, etc.) to be mapped to a structured, logged error response that carries the real SQLSTATE and a safe message, instead of every DB failure collapsing into an opaque 500",
+    "so_that": "I can see WHY an endpoint failed (e.g. 57014 statement timeout on a vector scan) from logs/responses without shelling into the box to read raw stack traces"
+  },
+  "rationale": "A blanket 500 erases the single most useful diagnostic signal — the SQLSTATE — which is precisely why the suggested_links timeout took four attempts to pin down. Mapping known DB error classes to logged, structured responses turns 'it 500s sometimes' into 'it cancels with 57014 after the statement timeout', which is directly actionable and prevents future blind fixes. The mapping must not leak internal query text or stack traces to API clients.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.3.1",
+      "description": "A central handler (FallbackController clause and/or a plug) catches Postgrex.Error / DBConnection.ConnectionError and inspects the SQLSTATE, mapping to a SINGLE pinned status per class: 57014 (query_canceled / statement timeout) -> 504 with code \"db_statement_timeout\"; serialization/deadlock (40001/40P01) -> 503 retryable with a Retry-After header; others -> 500. ALL are logged with the SQLSTATE and code. Tests assert the EXACT status per class.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.2",
+      "description": "The client-facing JSON body never contains raw SQL, query parameters, vector literals, or an Elixir stack trace; it contains only {error: {status, code, message}} with a safe message.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.3",
+      "description": "Every mapped DB error is logged at error level with structured fields: sqlstate, mapped_code, endpoint/controller+action, tenant_id (if available), and request_id — so a log search can correlate the response to the real cause.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.4",
+      "description": "The 57014 timeout path returns a distinct, documented error code (e.g. \"db_statement_timeout\") so clients/monitoring can distinguish a timeout from a logic 500 and so the suggested_links class of failure is self-identifying in logs.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.5",
+      "description": "Tenant isolation/security: the error mapping does not change which tenant's data is touched and does not become an existence oracle (a cross-tenant or missing resource still returns 404, not a DB error).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.6",
+      "description": "Existing non-DB FallbackController behavior (:not_found→404, :invalid_threshold→400, changeset→422, etc.) is unchanged; only previously-unhandled DB exceptions gain structured handling.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.7",
+      "description": "Anti-oracle, scoped honestly: the STATUS-CODE boundary is non-distinguishing — the error-class response is identical regardless of whether the target row exists or belongs to another tenant (cross-tenant/missing still 404, never a DB-error code), so an attacker can't use 504-vs-200 to infer another tenant's state. SEPARATELY: wall-clock timing side-channels (a tenant-B-sized operation simply takes longer, even at 200) are an acknowledged residual — mitigated only by a concrete rate-limit-by-cost control (define it in an AC + test, or record the residual with USER sign-off). Do NOT assert 'same rate limiting' against a control that isn't specified.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.3.8",
+      "description": "Log sanitization: no structured log field contains a raw embedding/vector literal, an article body, or the full bound-parameter list; vectors are elided to dimensionality and params truncated. (Logs are reachable via fly logs — this is both noise and disclosure control.)",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.3.1",
+      "name": "Statement timeout maps to a logged structured timeout, not a bare 500",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "A controller/test seam that forces a Postgrex.Error with sqlstate 57014 (e.g. a stubbed repo or `SET LOCAL statement_timeout` + pg_sleep on a test route)"
+      ],
+      "steps": [
+        "Issue the request that triggers the 57014"
+      ],
+      "expected_results": [
+        "Response status is the mapped timeout code (e.g. 503/504), not 500",
+        "Response body is {error: {status, code: \"db_statement_timeout\", message: ...}} with no SQL/stack trace",
+        "An error log line exists with sqlstate=57014 and the request_id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.3.2",
+      "name": "Unknown DB error still maps to a logged 500 without leaking internals",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "A seam that raises a Postgrex.Error with an unmapped sqlstate"
+      ],
+      "steps": [
+        "Issue the request"
+      ],
+      "expected_results": [
+        "Status 500",
+        "Body contains a safe generic message, no SQL/stack trace",
+        "Log line carries the real sqlstate"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.3.3",
+      "name": "Existing error-atom handling is unchanged",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "Request a non-existent article's suggested_links"
+      ],
+      "expected_results": [
+        "404 (unchanged), not a DB-error code"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Hook point: LoopctlWeb.FallbackController (already maps error atoms/changesets) plus possibly an Endpoint-level rescue for exceptions raised outside the with-chain. Phoenix renders unhandled exceptions via the error view → ensure the SQLSTATE is logged before that.",
+    "Postgrex.Error exposes %Postgrex.Error{postgres: %{code: :query_canceled, ...}} — match on the atom/code; DBConnection.ConnectionError covers pool checkout/connection-drop timeouts.",
+    "Do NOT inadvertently catch-and-swallow errors that should crash; only translate known DB error classes to responses + logs.",
+    "Coordinate with US-27.4 (statement_timeout): the 57014 path is the expected fast-fail when a heavy endpoint exceeds its budget.",
+    "Logging: use Logger with structured metadata (Logger.metadata or a structured logger) — loopctl logs JSON to stdout (no Sentry); fly logs is the exception history, so the SQLSTATE MUST be in the log line.",
+    "Security: never echo query text/params to clients (information disclosure); the security-adversary review of this epic will check this."
+  ],
+  "dependencies": [],
+  "estimated_hours": 8
+}

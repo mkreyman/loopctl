@@ -1,0 +1,158 @@
+{
+  "id": "US-27.12",
+  "title": "Set-based bulk archive/delete/unpublish (by ids/tag/source) — bounded, atomic, FK-correct",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "pool_bulk",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 4; reviews: FK-restrict + blast-radius + atomicity findings",
+    "includes": "A KB cleanup issued ~4,000 individual DELETEs (no set-based bulk-by-tag). VERIFIED: article_links FKs to articles are on_delete: :restrict (NOT cascade) — so hard-deleting a linked article raises an FK violation unless its links are deleted first. Destructive ops are role: :user."
+  },
+  "priority_note": "Fixes the O(n)-round-trip anti-pattern, but must NOT swing to the opposite failure: an unbounded delete_all over a 76k tag on the 3-conn pool is a new outage. Bounded + atomic + FK-correct.",
+  "story": {
+    "as_a": "a user-role operator maintaining the knowledge base",
+    "i_want_to": "archive/delete/unpublish many articles in bounded set-based statements selected by ids, tag, or source — correctly handling the :restrict FK to article_links, atomically, with a blast-radius cap and a safe dry-run",
+    "so_that": "cleaning up a source/tag is a bounded, all-or-nothing operation that doesn't take thousands of round-trips, doesn't FK-abort, and doesn't starve the pool or surprise me with the blast radius"
+  },
+  "rationale": "Per-row mutation (~4,000 DELETEs) is slow and pool-hostile and scales linearly; set-based is the fix. But a single unbounded delete_all over tens of thousands of rows plus its link cleanup, holding one of three admin connections, is the same pool-starvation class on the write path. And because article_links FKs are :restrict, the delete order is load-bearing (links first, both directions, or the statement FK-aborts). The operation must be bounded, atomic, FK-correct, and previewable.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.12.1",
+      "description": "Bulk archive/delete/unpublish accept a selector — a list of ids, a tag (tags && ^[tag]), or a source id — and mutate via set-based update_all/delete_all (WHERE), never per-row.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.2",
+      "description": "FK-correct DELETE: the FK inventory to articles was AUDITED — only two references exist: article_links (×2, on_delete: :restrict) and article_access_events (on_delete: :delete_all). The DELETE variant MUST delete_all matching links FIRST — both directions (source_article_id IN ^ids OR target_article_id IN ^ids) AND carrying l.tenant_id == ^tenant_id — within the same transaction, or the :restrict FK aborts; article_access_events cascades automatically (no pre-delete needed). A schema-introspection guard test asserts no NEW :restrict FK to articles is added without updating the delete order. (Archive/unpublish leave links intact.)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.3",
+      "description": "ARCHIVE/UNPUBLISH semantics documented: links to now-archived articles are left intact but become INERT in graph/bridge traversal (graph_traversal/distant_pairs traverse published-only middles); this is the defined behavior, distinct from delete.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.4",
+      "description": "Atomicity: the mutation + its dependent-link handling + the single audit event are ONE transaction — all rows handled with the audit recorded, or none. A timed-out/interrupted op leaves a defined state (all-or-nothing per batch), no orphaned links, no partially-archived source a retry can't safely resume.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.5",
+      "description": "Blast-radius bound: a bulk op runs under an explicit statement_timeout and either caps affected rows per statement and iterates in bounded, individually-atomic batches, OR documents+tests the worst-case duration for the largest realistic selector (biggest prod source/tag) against the US-27.11 pool. The accounting INCLUDES cascaded `article_access_events` rows: that FK is on_delete: :delete_all, so a hard-delete also cascade-deletes potentially many access-event rows in the same statement (often the larger row count for a hot article) — part of the statement cost and connection-hold time. The cap and timeout are config-driven; this must NOT reintroduce pool starvation on the write path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.6",
+      "description": "Tenant isolation: every WHERE (articles AND the link cleanup) carries tenant_id; an ids selector ANDs with tenant_id so foreign ids are filtered out, never touched; a cross-tenant id/tag/source cannot affect another tenant's rows.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.7",
+      "description": "Authorization: bulk destructive ops require role: :user (anything that REMOVES data stays :user); agents/orchestrators get 403. Verified by a role test.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.8",
+      "description": "Affected-count return + idempotency: returns the affected count; re-running archive/delete on already-handled rows is a no-op (idempotent). The bulk emits ONE audit event (selector + count + actor), never per-row.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.12.9",
+      "description": "Safe preview (no TOCTOU surprise): a dry-run (e.g. ?dry_run=true) returns {would_affect: N} and mutates nothing; for the IRREVERSIBLE delete variant, either the op is archive-first with a documented restore path, OR the dry-run returns a frozen-set token and the real run requires it. The frozen-set token is INTEGRITY-PROTECTED (HMAC or server-minted, same trust model as the US-27.9a cursor — NEVER trusted from the client so a forged token can't target a different in-tenant id-set), single-use, TTL-bounded, and the stored id-set is SIZE-bounded (a selector exceeding the bound refuses the frozen-token path and uses re-confirm-on-drift instead). The dry-run COUNT is bounded (not an O(corpus) COUNT).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.12.1",
+      "name": "Bulk archive by tag is set-based and tenant-scoped",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a, tenant_b; {user_key,_} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})",
+        "Seed tagged articles in BOTH tenants with the same tag"
+      ],
+      "steps": [
+        "Bulk-archive by tag for tenant_a"
+      ],
+      "expected_results": [
+        "All tenant_a tagged articles archived; affected count returned; one update_all (assertable via query instrumentation)",
+        "tenant_b's same-tag articles untouched"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.12.2",
+      "name": "Hard delete of a LINKED article succeeds (links pre-deleted), not FK-abort",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {user_key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "An article with inbound AND outbound links"
+      ],
+      "steps": [
+        "Bulk-delete by ids including that article"
+      ],
+      "expected_results": [
+        "Links (both directions) deleted first; article deleted; NO FK violation; one audit event"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.12.3",
+      "name": "Agent/orchestrator cannot invoke bulk destructive ops",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {agent_key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "Attempt bulk-delete-by-tag with the agent key"
+      ],
+      "expected_results": [
+        "403 (role: :user required)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.12.4",
+      "name": "Atomic rollback on mid-op failure",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); a selector matching several articles+links; a seam to force a failure mid-transaction"
+      ],
+      "steps": [
+        "Run the bulk op so it fails partway"
+      ],
+      "expected_results": [
+        "Full rollback: no articles archived/deleted, no links removed, no audit event (all-or-nothing per batch)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.12.5",
+      "name": "Dry-run previews without mutating; frozen-set guards TOCTOU for delete",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {user_key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :user}); seed N tagged"
+      ],
+      "steps": [
+        "Dry-run bulk-delete by tag; then insert another matching article; then execute with the dry-run token"
+      ],
+      "expected_results": [
+        "Dry-run returns would_affect: N and mutates nothing; the real run operates on the frozen N (or re-confirms and refuses on drift), not N+1"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "VERIFIED: priv/repo/migrations/*create_article_links* — both article FKs are on_delete: :restrict. There is NO cascade to rely on; delete order (links-first, both directions, tenant-scoped) is load-bearing or the statement FK-aborts.",
+    "Use Ecto.Multi: link delete_all -> article delete_all/update_all -> single Audit insert, all in one transaction (atomicity AC-27.12.4). The audit event is O(1), not O(rows).",
+    "Blast-radius: prefer bounded batches (each batch its own atomic Multi) under a statement_timeout so one giant statement can't hold a connection on the 3-conn pool indefinitely (coordinate with US-27.11).",
+    "Extend prior bulk work (epic 13; #136/#144/#146) with by-tag + cascade-by-source selectors; reuse the body-less summary (#146).",
+    "Dry-run COUNT must be bounded (the COUNT-at-scale hazard flagged in US-27.10); a frozen id-set token avoids both an O(corpus) count and the TOCTOU window.",
+    "delete is irreversible — prefer archive-first with restore, or the frozen-token guard, for the delete variant."
+  ],
+  "dependencies": ["US-27.1", "US-27.11"],
+  "estimated_hours": 14
+}

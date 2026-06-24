@@ -1,0 +1,119 @@
+{
+  "id": "US-27.9a",
+  "title": "Keyset cursor mechanic + supporting index migration + cursor integrity (article list)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "pagination",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 3; split from original US-27.9; reviews: missing index + cursor-integrity findings",
+    "includes": "Offset drift observed live (a tag count swung 9,881 -> 4,981 mid-write). The articles table has NO (tenant_id, inserted_at, id) index today (only [:tenant_id], GIN tags, [:tenant_id, project_id, category]). inserted_at is utc_datetime_usec and bulk insert_all ties timestamps per batch, so the keyset MUST be the (inserted_at, id) tuple. The PK is a random UUID (binary_id) — there is NO monotonic bigint to fall back on."
+  },
+  "priority_note": "The cursor mechanic + its required index + its integrity are the critical path; rolling it onto other enumerations is US-27.9b.",
+  "story": {
+    "as_a": "an agent or external observer enumerating the knowledge base",
+    "i_want_to": "a keyset cursor for the article list that is stable under concurrent writes, backed by a real composite index, with the cursor's tenant scope derived from my auth principal (never trusted from the cursor) and the cursor integrity-protected",
+    "so_that": "I can iterate a large list to exhaustion with no offset drift, deep pages stay index-backed, and a forged/tampered cursor can neither cross tenants nor become an existence oracle"
+  },
+  "rationale": "Offset pagination drifts under the concurrent writes this KB sees — observed as a tag count swinging mid-enumeration — so an agent cannot reliably consume the KB. Keyset on a stable unique key fixes that, but only if (a) a supporting index actually exists (it does not today) and (b) the cursor is not a trust boundary: a Base64 blob is encoding, not integrity, so tenant scope must come from the authenticated principal and the cursor must be tamper-evident.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.9a.1",
+      "description": "The article list accepts a `cursor` param and returns `meta.next_cursor` (null when exhausted), ordered by the stable unique tuple (inserted_at, id); walking via next_cursor returns every row present for the whole walk exactly once under concurrent inserts/archives (no gaps, no duplicates, no offset drift).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9a.2",
+      "description": "A migration creates the composite index `(tenant_id, inserted_at, id)` on articles (CREATE INDEX CONCURRENTLY, outside a ddl transaction) supporting the keyset seek; AC's plan assertion (US-27.2) confirms deep pages are index-backed (no Seq Scan) at ≥prod scale. The keyset uses the (inserted_at, id) TUPLE (timestamps tie under batch inserts); there is NO monotonic-id fallback (PK is a random UUID).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9a.3",
+      "description": "Tenant scope is derived EXCLUSIVELY from the authenticated principal, NEVER from the cursor payload; the cursor encodes only an intra-tenant ordering position. A test forges a cursor carrying tenant B's key tuple and proves tenant A's request still returns only tenant A rows.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9a.4",
+      "description": "The cursor is integrity-protected (HMAC-signed or a server-minted opaque token mapped server-side); a tampered/garbage cursor returns 400 with a clear message — never a 500 and never a silent reset to page 1, and a forged cursor cannot become an existence oracle for another tenant's rows or out-of-range positions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9a.5",
+      "description": "limit is honored up to a documented max and never silently clamped down without signaling it (addresses the #148 silent-clamp regression); meta documents the effective limit.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.9a.1",
+      "name": "Cursor walk complete and gap-free under concurrent inserts",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); seed N articles"
+      ],
+      "steps": [
+        "Walk via cursor pages; between pages insert and archive additional articles; collect ids"
+      ],
+      "expected_results": [
+        "Every article present for the whole walk appears exactly once; final next_cursor null"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.9a.2",
+      "name": "Forged cursor cannot cross tenants",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a, tenant_b; a cursor crafted to embed tenant_b's (inserted_at,id)"
+      ],
+      "steps": [
+        "Request the list as tenant_a using the forged cursor"
+      ],
+      "expected_results": [
+        "Either 400 (HMAC rejects) or tenant_a-only rows (cursor key clamped); NEVER any tenant_b row"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.9a.3",
+      "name": "Tampered/garbage cursor -> 400, not 500 or page 1",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "Request with cursor=garbage and with a bit-flipped valid cursor"
+      ],
+      "expected_results": [
+        "400 clear error both times; not 500, not page 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.9a.4",
+      "name": "Deep pagination index-backed at scale",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)"
+      ],
+      "steps": [
+        "Build the keyset query for a late page; refute_full_scan/1"
+      ],
+      "expected_results": [
+        "Index-backed via (tenant_id, inserted_at, id); no Seq Scan for deep pages"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Keyset seek: WHERE tenant_id = ? AND (inserted_at, id) > (?, ?) ORDER BY inserted_at, id LIMIT n+1 (n+1 for has_more without a COUNT). No OFFSET on the cursor path.",
+    "Migration: CREATE INDEX CONCURRENTLY articles_tenant_inserted_id_idx ON articles (tenant_id, inserted_at, id); @disable_ddl_transaction true; on 76k rows confirm it's online.",
+    "Cursor integrity: HMAC the (inserted_at, id) tuple with an app secret, or mint a server-side opaque token; decode defensively -> 400. Tenant is ALWAYS from conn.assigns principal, never the cursor.",
+    "Reuse LoopctlWeb.Helpers.Pagination if present; keep body-less default (#166); include_body bounds in US-27.10.",
+    "inserted_at is utc_datetime_usec (ties under insert_all) -> the tuple key is necessary; drop any 'monotonic bigint id' idea (no such column)."
+  ],
+  "dependencies": ["US-27.1", "US-27.2"],
+  "estimated_hours": 12
+}

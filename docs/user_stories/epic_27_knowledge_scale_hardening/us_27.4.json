@@ -1,0 +1,115 @@
+{
+  "id": "US-27.4",
+  "title": "Per-endpoint statement_timeout fast-fail + slow-query logging",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "scale_observability",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1",
+    "includes": "The prior suggested_links query held a connection for ~30s before the DB cancelled it (57014). There was no bounded fast-fail and no slow-query signal, so a single pathological request degraded the whole endpoint silently."
+  },
+  "priority_note": "Pairs with US-27.3: the statement_timeout produces the 57014 that US-27.3 surfaces. Together they bound the blast radius of a slow query.",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "heavy read endpoints to run under an explicit, configurable statement_timeout so a pathological query fails fast instead of holding a connection for tens of seconds, and to have slow queries (over a threshold) logged with their duration",
+    "so_that": "one bad request can't exhaust the connection pool or hang clients, and recurring slow queries are visible before they become incidents"
+  },
+  "rationale": "Without a bounded statement timeout, a planner mistake (like the suggested_links full scan) consumes a connection for the full client/pool timeout, amplifying one slow query into endpoint-wide degradation against the small admin pool (Theme 4). An explicit per-endpoint statement_timeout turns that into a clean, logged fast-fail, and slow-query logging surfaces the trend before the cliff — both are prerequisites for operating vector endpoints at scale.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.4.1",
+      "description": "Heavy read endpoints (suggested_links, pairs, novelty, semantic search, enumeration) execute under an explicit SERVER-SIDE statement_timeout (default 10s, per-endpoint overridable in config, not hard-coded). NOTE there is no per-query server-side statement_timeout on a bare AdminRepo.all (Ecto's :timeout is the client-side DBConnection timeout — it cancels the checkout but the backend keeps running). The only real mechanisms are (a) `set_config('statement_timeout', ms, true)` inside a transaction (per-request transaction = pool-starvation risk on the 3-conn pool) or (b) a pool-level `statement_timeout` via the heavy-read pool's `:parameters` (US-27.11). Mechanism (b) is preferred; if (a) is chosen, US-27.11 MUST land first.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.4.2",
+      "description": "When the timeout fires, the request fails fast with the structured timeout error from US-27.3 (57014 → db_statement_timeout), and the connection is released promptly (not held to a longer client/pool timeout).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.4.3",
+      "description": "The statement_timeout mechanism does NOT reintroduce the connection-pool-starvation anti-pattern: if it requires a transaction (SET LOCAL), the trade-off is evaluated against the admin pool size (see Theme 4 / the distant_pairs pool-starvation note) and justified, or a non-transaction mechanism is used.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.4.4",
+      "description": "Queries exceeding a configurable slow-query threshold (e.g. 1s) are logged at warn with the endpoint, duration_ms, tenant_id, and request_id (query text optional and sanitized) — without logging every fast query.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.4.5",
+      "description": "Slow-query logging is implemented via a Repo telemetry handler (e.g. on [:loopctl, :repo, :query]) so it covers the repos uniformly rather than being sprinkled per call site.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.4.6",
+      "description": "Defaults are documented; the timeout and slow-query threshold are tunable via application config / env without a code change.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.4.1",
+      "name": "A query exceeding the endpoint statement_timeout fast-fails with the structured timeout",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "config sets a very low statement_timeout for the test endpoint and a test seam runs a deliberately slow query (pg_sleep)"
+      ],
+      "steps": [
+        "Issue the request"
+      ],
+      "expected_results": [
+        "Response is the db_statement_timeout structured error (US-27.3), not a 30s hang",
+        "Total request time is bounded near the configured timeout"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.4.2",
+      "name": "Slow query over threshold is logged with duration",
+      "type": "integration",
+      "preconditions": [
+        "Slow-query threshold configured low for the test",
+        "A test query that exceeds it"
+      ],
+      "steps": [
+        "Run the query and capture logs"
+      ],
+      "expected_results": [
+        "A warn log line with duration_ms and the endpoint/context",
+        "A fast query under threshold produces NO slow-query log line"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.4.3",
+      "name": "Timeout mechanism does not hold a pooled connection beyond the budget",
+      "type": "integration",
+      "preconditions": [
+        "Configured statement_timeout",
+        "A slow query"
+      ],
+      "steps": [
+        "Trigger the slow query and observe connection checkout duration"
+      ],
+      "expected_results": [
+        "Connection is returned to the pool promptly after the timeout fires"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "statement_timeout: `SELECT set_config('statement_timeout', '<ms>', true)` inside an AdminRepo.transaction is the SET LOCAL form, BUT a per-request transaction on the 3-connection admin pool risks starvation (the exact anti-pattern the round-1 #172 fix hit and the distant_pairs comment warns about). Prefer a non-transaction approach if possible, or sequence after Theme 4 pool sizing; document the decision.",
+    "Slow-query logging: attach a :telemetry handler to the Ecto repo query event ([:loopctl, :repo, :query]); read measurements.total_time / query_time; gate on a configurable threshold.",
+    "Config keys (config/runtime.exs): e.g. :knowledge_statement_timeout_ms, :slow_query_threshold_ms.",
+    "Coordinate the 57014 mapping with US-27.3 so the timeout produces the documented db_statement_timeout code.",
+    "Do not log raw vector literals or full SQL at info level (noise + disclosure); sanitize/truncate."
+  ],
+  "dependencies": ["US-27.3", "US-27.11"],
+  "estimated_hours": 8
+}

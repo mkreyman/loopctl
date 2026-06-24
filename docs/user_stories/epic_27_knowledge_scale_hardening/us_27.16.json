@@ -1,0 +1,161 @@
+{
+  "id": "US-27.16",
+  "title": "Bounded-memory knowledge export (no 5,000 cap) — keyset-streamed, fail-closed, pool-safe",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "streaming_export",
+  "background": {
+    "reference": "GitHub issue #176 (linked under Epic #175); export 413-caps at 5,000 articles",
+    "includes": "Both export endpoints 413 above 5,000 (knowledge_export_controller.ex / okf_controller.ex). VERIFIED: build_obsidian_zip (knowledge.ex:2523) and OKF.to_zip (okf.ex:128) both call :zip.create(_, [:memory]) — materializing every body. The 5,000 cap is a MEMORY guard, not a user limit. Project export's real WHERE is `tenant_id=? AND status=:published AND (project_id IS NULL OR project_id=?)` (export_base_query/2) — it already bundles tenant-wide (null-project) articles."
+  },
+  "priority_note": "Export's job is full-KB backup/migration and it is unusable above 5,000. Highest-risk NEW story: it streams over BYPASSRLS AdminRepo, can hold a scarce admin connection for minutes, and a chunked-response error can ship a partial bundle. Bounded memory + fail-closed + pool-safe are mandatory.",
+  "story": {
+    "as_a": "a user-role operator backing up or migrating a large knowledge base",
+    "i_want_to": "export the full KB (both OKF and Obsidian formats) with bounded server memory and no article-count cap, generated incrementally from short keyset reads, failing CLOSED on any mid-stream error",
+    "so_that": "I can back up a 76k+ article KB in one request without OOMing a node, starving the admin pool, or silently producing a truncated bundle that a restore would treat as complete"
+  },
+  "rationale": "A backup feature that fails on exactly the KBs large enough to need backups is broken. The 5,000 cap guards a materialize-everything implementation, so the fix bounds MEMORY — but naively (single long Repo.stream transaction over BYPASSRLS AdminRepo) it would hold one of three admin connections for the whole download and could ship a partial bundle on error. Incremental keyset reads + a fail-closed contract + a concurrency bound make the export safe at scale, consistent with the epic's stream-don't-materialize and pool-safety direction.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.16.1",
+      "description": "Both exports (OKF and Obsidian) produce the bundle with BOUNDED peak memory and no article-count cap. Default mechanism is INCREMENTAL keyset reads (the US-27.9a cursor) — short transaction-per-page reads that RELEASE the admin connection between pages — NOT a single long-lived Repo.stream transaction. :zip.create(_, [:memory]) is forbidden. The wire format is the implementer's choice among: (a) streamed `.tar.gz` via :erl_tar + send_chunked (with the importer/round-trip extended to tar), (b) a vetted streaming-zip dep added to mix.exs with a test proving per-entry flush (no central-directory buffering of all bodies), or (c) the async object-storage job (AC-27.16.6). The content-type/content-disposition match what is actually produced (don't advertise application/zip while emitting tar).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.16.2",
+      "description": "The 5,000 article-count hard cap (413) is REMOVED. Any remaining limit is a documented memory/time budget (max stream duration under the heavy-read statement_timeout, or chunk backpressure), NOT an article count; the 413 'narrow your scope' message is gone.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.16.3",
+      "description": "Memory is bounded as a RATIO, not an absolute: peak VM memory (:erlang.memory(:total)/:binary delta, measured across the real chunked HTTP transport — NOT Phoenix.ConnTest's inline conn) for a 50k export is within a small constant (e.g. <=2x) of a 500-article export (sub-linear in N), AND the producer never holds more than `chunk_size` articles in memory at once (proven by instrumenting max in-flight batch). The bound holds for the WORST-CASE single entry: a max-body article and a dense-hub article whose link preload fans out — the link preload is itself bounded/streamed, never materialized into one chunk. Reuse the existing @full_content_byte_budget precedent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.16.4",
+      "description": "Fail-closed on mid-stream error: send_chunked commits 200 before the body, so a Repo/timeout/connection error partway MUST NOT present as a complete export — the response is aborted/closed without a valid end-of-archive marker, OR a documented trailer/sentinel marks incompleteness, so an automated backup pipeline can DETECT truncation (no silent restore data-loss). The partial bytes never contain SQL, params, vector literals, or a stack trace (US-27.3 sanitization applies to the streaming path). A test injects a mid-stream failure and asserts the consumer detects incompleteness and sees no internal text.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.16.5",
+      "description": "Tenant/project scoping under BYPASSRLS: the streaming path runs on AdminRepo (BYPASSRLS — RLS does NOT enforce scope), so EVERY page query AND the link preload carry an explicit `tenant_id == ^principal_tenant` predicate, with tenant from conn.assigns (never a param). The streamed query's WHERE is byte-identical to the current export_base_query/2 (tenant_id + status + the `project_id IS NULL OR project_id=?` disjunction); a scale test asserts the streamed bundle's id-set equals the current fetch_published_for_export/2 id-set for the same (tenant, project). Visibility scoping and the existing export role are preserved (no auth downgrade).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.16.6",
+      "description": "Pool-safe, UNCONDITIONALLY (no 'offered' deferral): the export EITHER (a) uses incremental keyset reads that release the connection between pages AND enforces a hard cap on concurrent in-flight exports (per-tenant + global) with a bounded max stream duration under the heavy-read statement_timeout, OR (b) runs as an async Oban job building to object storage (returns {job_id, status} then a signed download URL), off the request path and off the shared admin pool. A test asserts N concurrent full-KB exports do not starve a light admin read (mirror TC-27.11.1 on the export path). US-27.11's concurrency budget explicitly accounts for these long-held export checkouts.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.16.1",
+      "name": "Export of a >5,000-article corpus succeeds; memory flat vs N",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); project = fixture(:project, tenant: tenant)",
+        "{user_key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})",
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: 50_000) under the project",
+        "Drive the REAL chunked transport (HTTP client against a test endpoint), not Phoenix.ConnTest inline conn"
+      ],
+      "steps": [
+        "Export OKF and Obsidian for 50k and (separately) 500 articles; record :erlang.memory(:total)/:binary delta and max in-flight batch"
+      ],
+      "expected_results": [
+        "200 chunked, not 413; valid bundle with all articles",
+        "50k peak memory within ~2x of 500; max in-flight batch <= chunk_size"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.16.2",
+      "name": "Worst-case single entry stays bounded",
+      "type": "integration",
+      "preconditions": [
+        "A corpus including one max-body article and one dense-hub article (many links)"
+      ],
+      "steps": [
+        "Export and observe per-chunk memory around those entries"
+      ],
+      "expected_results": [
+        "No memory spike scaling with the hub's link fan-out; link preload bounded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.16.3",
+      "name": "Mid-stream failure fails closed (no complete-looking partial, no leak)",
+      "type": "integration",
+      "preconditions": [
+        "A seam to force a Repo/timeout error after the first chunk"
+      ],
+      "steps": [
+        "Start an export that errors mid-stream; inspect the received bytes"
+      ],
+      "expected_results": [
+        "The bundle is detectably incomplete (no valid end-of-archive / explicit incomplete sentinel)",
+        "No SQL/params/vector/stack text in the bytes"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.16.4",
+      "name": "Streamed id-set == current export id-set (no contract drift) + tenant-scoped",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a project (with null-project tenant-wide articles too); tenant_b articles"
+      ],
+      "steps": [
+        "Export tenant_a's project; compare the bundle id-set to fetch_published_for_export/2"
+      ],
+      "expected_results": [
+        "Identical id-set (incl. the project_id IS NULL disjunction); zero tenant_b content"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.16.5",
+      "name": "Concurrent full-KB exports don't starve the admin pool",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: 50_000); pool per US-27.11"
+      ],
+      "steps": [
+        "Fire N concurrent full-KB exports + a light admin read"
+      ],
+      "expected_results": [
+        "The light read does not hit a checkout/queue timeout; concurrency cap enforced"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.16.6",
+      "name": "Auth unchanged",
+      "type": "integration",
+      "preconditions": [
+        "{key,_} = fixture(:api_key, %{role: <below export role>})"
+      ],
+      "steps": [
+        "Attempt the export"
+      ],
+      "expected_results": [
+        "Authorization unchanged from current behavior"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Controllers: knowledge_export_controller.ex (cap ~:77, content-type application/zip ~:63), okf_controller.ex (~:158). Context: build_obsidian_zip (knowledge.ex:2523), OKF.to_zip (okf.ex:128) — both :zip.create(_, [:memory]); remove the 5,000 gate.",
+    "NO stdlib streaming-zip exists; :zip.create materializes. Viable: :erl_tar streamed .tar.gz (changes format — extend importer/round-trip), a vetted streaming-zip dep (prove per-entry flush), or async-to-object-storage.",
+    "Repo.stream REQUIRES a transaction and would hold one of 3 AdminRepo (BYPASSRLS) connections for the whole client-paced download — the exact pool-starvation the knowledge.ex:2873-2883 comment warns about, and it pins xmin (blocks vacuum on a churning 76k table). Use the US-27.9a keyset cursor (page-sized reads, connection released between pages) as the default; reserve Repo.stream for the async Oban job on the US-27.11 heavy-read pool.",
+    "Memory test: measure :erlang.memory(:total)/:binary across the VM (article bodies are refc binaries off-process, so process_info(self()) misses them); compare 50k vs 500 (flat-vs-N), and drive the real chunked HTTP transport.",
+    "BYPASSRLS: explicit tenant_id on every page AND the outgoing/incoming link preload; tenant from conn.assigns.",
+    "object-storage async: fly has no built-in object store — needs S3/R2 config; the async path is only 'done' if that config exists.",
+    "Both formats reduce to 'iterate articles -> emit a file'; share a streaming core."
+  ],
+  "dependencies": ["US-27.1", "US-27.9a", "US-27.11"],
+  "estimated_hours": 16
+}

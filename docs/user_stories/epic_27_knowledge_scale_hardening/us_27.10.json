@@ -1,0 +1,110 @@
+{
+  "id": "US-27.10",
+  "title": "Document the cursor contract in meta + bounded opt-in include_body",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "pagination",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 3; #166 body-less default; ChunkedEncodingError on large full-body pages",
+    "includes": "Full-body list responses produced 100KB+ payloads and ChunkedEncodingError; #166 made body-less the default. The cursor contract must be self-describing so agents can consume it without out-of-band knowledge."
+  },
+  "priority_note": "Completes Theme 3's acceptance ('meta documents the cursor contract') and prevents the large-payload streaming failures from returning via an unbounded include_body.",
+  "story": {
+    "as_a": "an agent consuming knowledge enumeration responses",
+    "i_want_to": "the response meta to fully describe the pagination contract (next_cursor, has_more, effective limit) and to be able to opt into article bodies only within a bounded, safe page size",
+    "so_that": "I can drive pagination purely from the response (no guessing) and never trigger a 100KB+ streaming failure by accidentally requesting full bodies for a large page"
+  },
+  "rationale": "An opaque cursor is only usable if the response tells the consumer how to use it; self-describing meta is what makes agent-native iteration robust. Equally, include_body must be bounded so the body-less-default win from #166 can't be undone by a caller requesting bodies for thousands of rows and reproducing the ChunkedEncodingError — the limit and the contract together make enumeration both consumable and safe at scale.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.10.1",
+      "description": "Enumeration responses include a meta block documenting the cursor contract: next_cursor (string|null), has_more (bool), limit (effective), and (where meaningful) count for the current page; the field semantics are documented in the OpenAPI spec.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.10.2",
+      "description": "Body-less remains the default (per #166). include_body=true is opt-in and honored ONLY for limit <= 25 (a pinned constant @max_include_body_page); limit > 25 with include_body=true returns 400, never a silent 100KB+ chunked response. (Test: limit 25 + include_body passes, limit 26 + include_body returns 400.)",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.10.3",
+      "description": "With include_body=false (default) the response carries no article body fields, keeping payloads small and avoiding the ChunkedEncodingError class.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.10.4",
+      "description": "The OpenApiSpex schema for the enumeration endpoints reflects next_cursor/has_more/limit and the include_body bound, so the contract is discoverable via the API docs.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.10.5",
+      "description": "Tenant isolation and visibility scoping are unaffected; include_body never exposes a body the caller could not already read.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.10.1",
+      "name": "Meta fully describes the cursor contract",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "Seed enough articles for >1 page"
+      ],
+      "steps": [
+        "Request the first page"
+      ],
+      "expected_results": [
+        "meta has next_cursor (non-null), has_more=true, and an effective limit",
+        "Following next_cursor eventually yields next_cursor=null, has_more=false"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.10.2",
+      "name": "include_body is bounded",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})"
+      ],
+      "steps": [
+        "Request the list with include_body=true and limit beyond the include_body max"
+      ],
+      "expected_results": [
+        "400 (or explicit clamp signaled in meta); never a silent oversized chunked response"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.10.3",
+      "name": "Default response is body-less",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "Seed articles with bodies"
+      ],
+      "steps": [
+        "Request the list without include_body"
+      ],
+      "expected_results": [
+        "No body field in any item; payload is small"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Builds directly on US-27.9a (the cursor itself). This story is the contract/limits/docs layer.",
+    "Reuse the existing meta conventions (count/total_count/has_more already used by pairs); add next_cursor and the include_body bound.",
+    "include_body max should be a config constant (e.g. @max_include_body_page), well below the relevance page size.",
+    "Update the OpenApiSpex operation schemas for the enumeration endpoints.",
+    "Do not reintroduce total_count where it forces a full-corpus COUNT at scale (that itself can be slow) — prefer has_more derived from fetching limit+1."
+  ],
+  "dependencies": ["US-27.9a"],
+  "estimated_hours": 6
+}

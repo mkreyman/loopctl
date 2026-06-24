@@ -1,0 +1,124 @@
+{
+  "id": "US-27.8",
+  "title": "Per-endpoint index-usage + latency scale gates for ALL vector endpoints (incl. the auto-link worker)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 2 acceptance ('ALL vector endpoints <2s with a per-endpoint index-usage test')",
+    "includes": "Reviews: the worker was migrated (27.7a) but had no guard; a latency gate at 50k vs 76k+ prod, with ef_search unpinned and measured via EXPLAIN-not-HTTP, is theatre; and a guard on a re-built query is a stunt double."
+  },
+  "priority_note": "Turns Theme 2's acceptance into standing CI gates so a future regression fails CI, not prod. Depends on the scale fixture, the same-query plan helper, and the migrated endpoints.",
+  "story": {
+    "as_a": "loopctl engineer",
+    "i_want_to": "each vector endpoint AND the auto-link worker to carry a scale gate that asserts (a) the CONTROLLER'S ACTUAL query is index-backed (no full Seq Scan) at ≥prod scale, and (b) it returns under a latency budget — with ef_search pinned identical to prod and latency measured end-to-end",
+    "so_that": "any change that defeats the HNSW index or blows the budget fails CI on the real request path, calibrated at/above prod, not on a detached query at half-scale"
+  },
+  "rationale": "The four-attempt history proves index-correctness and latency at scale must be continuously enforced, not verified once — and that the verification must exercise the real request at real scale. A guard on a re-built query, at sub-prod scale, with divergent ef_search, measured via EXPLAIN, would repeat the exact false-confidence that shipped three broken fixes. This story makes the real invariant a permanent, honestly-calibrated CI property.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.8.1",
+      "description": "suggested_links, semantic search, distant_pairs, novelty, AND the auto-link worker each have a tagged scale test using the US-27.2 plan assertion that fails if the controller/worker's actual (unforced) query reaches articles via a full Seq Scan + Sort. The auto-link worker (a background path) is explicitly covered — a silently full-scanning worker is exactly the rot this epic targets.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.8.2",
+      "description": "The query under each plan assertion is the controller/worker's ACTUAL emitted query (per US-27.2 AC-27.2.4 — captured from the real path / asserted SQL+params-identical), not independently re-constructed args.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.8.3",
+      "description": "Scale calibration: the gate seeds ≥ PROD_ARTICLE_FLOOR (US-27.1 AC-27.1.6) and `hnsw.ef_search` is set identically (or explicitly left default) in the gate and prod runtime config — asserted by a test; a seed below floor or an ef_search mismatch FAILS the gate.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.8.4",
+      "description": "Latency: the PRIMARY signal is deterministic — the plan is index-backed and the index node returns <= pool rows with no full-corpus Sort. A wall-clock budget (default 2s) is measured END-TO-END through the HTTP endpoint (timed conn call, including checkout/serialize/render), not only via EXPLAIN ANALYZE; the wall-clock check is documented as advisory/secondary so it doesn't get skipped on a flake.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.8.5",
+      "description": "A reintroduction guard (Credo custom check or a test) flags any NEW cosine `ORDER BY embedding <=> ...` / distance computation outside the shared helper, with an explicit allowlist of the documented exceptions (do_distant_pairs, nearest_prior_distance from US-27.7b). CRITICAL: the allowlist exempts only the LINT, NOT the scale plan-gate — any cosine query, allowlisted or not, must still pass refute_full_scan at scale. A test asserts that an index-defeating change INSIDE an allowlisted function still fails the scale gate (the allowlist exempts the location from the lint, not a bad shape from the gate).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.8.6",
+      "description": "Latency budgets and the seed floor are configurable/documented so the gate is tuned as prod grows beyond the current floor; bumping the floor is a documented step, not a silent default.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.8.1",
+      "name": "Every vector path (incl. worker) index-backed at ≥prod scale on its real query",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "For each endpoint + the worker: capture its actual query and run refute_full_scan/1"
+      ],
+      "expected_results": [
+        "All pass (Index Scan, no Seq Scan on articles)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.8.2",
+      "name": "End-to-end latency budget at scale",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)"
+      ],
+      "steps": [
+        "Time HTTP requests (conn) for suggested_links / search / pairs / novelty for representative inputs"
+      ],
+      "expected_results": [
+        "Each completes under the configured budget end-to-end; plan signal deterministically index-backed"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.8.3",
+      "name": "ef_search / seed-floor mismatch fails the gate",
+      "type": "integration",
+      "preconditions": [
+        "Gate configured with ef_search differing from prod config, or seed < floor"
+      ],
+      "steps": [
+        "Run the gate"
+      ],
+      "expected_results": [
+        "Fails loudly with a clear calibration error"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.8.4",
+      "name": "A new hand-rolled cosine ORDER BY is flagged; known exceptions are not",
+      "type": "unit",
+      "preconditions": [
+        "A fixture introducing a cosine ORDER BY outside the helper"
+      ],
+      "steps": [
+        "Run the guard"
+      ],
+      "expected_results": [
+        "The new bypass is reported; do_distant_pairs/nearest_prior_distance (allowlisted) are not"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse Loopctl.PlanAssertions (US-27.2, same-query form) and Loopctl.Knowledge.ScaleSeed (US-27.1).",
+    "Capture the worker's query the same way as controllers (telemetry/explain seam) — the worker has no conn, so expose its query builder for assertion.",
+    "Lead with the deterministic plan signal; keep wall-clock advisory + generous (run on the scale gate, async: false) so it doesn't flake the default suite.",
+    "ef_search parity: assert the gate's and prod's :parameters/runtime ef_search match (or both default).",
+    "Allowlist mechanism for the reintroduction guard names do_distant_pairs + nearest_prior_distance (US-27.7b)."
+  ],
+  "dependencies": ["US-27.2", "US-27.7a", "US-27.7b", "US-27.5"],
+  "estimated_hours": 9
+}

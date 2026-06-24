@@ -1,0 +1,91 @@
+{
+  "id": "US-27.5",
+  "title": "Staging scale gate + runbook for retrieving the real prod error and verifying at scale",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "scale_observability",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1; incident: fixes shipped without prod verification; fly logs + prod EXPLAIN were the only things that caught the broken #173 fix",
+    "includes": "The only reason the four-attempt suggested_links bug was finally pinned was a session that ran `fly logs` and `fly ssh ... rpc` EXPLAIN ANALYZE against the live corpus. That capability was ad hoc, not a documented, repeatable gate. The wiki article bd4a26b6 captured the pattern; this story institutionalizes the process."
+  },
+  "priority_note": "Closes Theme 1's acceptance: 'a runbook exists for retrieving the real prod error' and 'representative-scale corpus available to CI/staging'. Makes honest verification repeatable rather than heroic.",
+  "story": {
+    "as_a": "loopctl engineer shipping a scale/perf fix",
+    "i_want_to": "a documented, repeatable procedure (and a staging gate) for (a) reproducing an endpoint's plan/timing against a representative corpus and (b) retrieving the real prod exception/plan before I close a scale issue",
+    "so_that": "no scale or perf fix is ever again closed on 'CI-green + merged' alone — the standard is 'verified against representative scale and confirmed on the live deployed build', as the epic's workflow requires"
+  },
+  "rationale": "Three of the four suggested_links fixes were closed as 'resolved end-to-end' while still broken in prod, because there was no required, documented verification step beyond green CI. Institutionalizing the reproduce-and-verify procedure (the scale gate + a runbook for fly logs / prod EXPLAIN) converts the lesson of #172 into a standing process, so the whole epic's 'verified at scale' acceptance criterion is enforceable rather than aspirational.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.5.1",
+      "description": "A runbook (docs/runbooks/knowledge_scale_verification.md) documents: how to run the US-27.1 scale fixture + US-27.2 plan assertions locally/in CI; how to read the real prod exception via `fly logs -a loopctl`; and how to run `AdminRepo.explain(:all, query, analyze: true)` against the live corpus via `fly ssh console -a loopctl -C \"/app/bin/loopctl rpc ...\"`.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.5.2",
+      "description": "The runbook states explicitly that loopctl uses NO Sentry — DB errors are in stdout via Logger, reachable through `fly logs` — so future sessions don't wrongly conclude they lack prod visibility.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.5.3",
+      "description": "A staging/CI 'scale gate' is defined (a tagged test run against the seeded large corpus) that exercises the vector + enumeration endpoints' plan assertions and per-endpoint timeouts; it is documented how to run it before merging a Theme 2/3/4 PR.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.5.4",
+      "description": "The runbook defines the closing checklist for a scale/perf issue: plan-assertion green at scale + EXPLAIN ANALYZE under the timeout on the live build + the live endpoint returns 200 on the reported repro ids — and states that an issue is not 'verified-in-prod' until these pass.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.5.5",
+      "description": "The runbook captures the index-name drift (articles_embedding_hnsw_idx vs articles_embedding_idx) and the canonical capability-based detection snippet (amname='hnsw' / indexdef ILIKE '%hnsw%'), and points to US-27.14 for the reconcile-vs-tolerate decision and the down-migration no-op hazard. It explicitly warns that `DROP INDEX IF EXISTS articles_embedding_idx` silently no-ops against the live `_hnsw_idx` name.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.5.1",
+      "name": "Runbook exists and references the concrete commands",
+      "type": "unit",
+      "preconditions": [
+        "Repo checkout"
+      ],
+      "steps": [
+        "Open docs/runbooks/knowledge_scale_verification.md"
+      ],
+      "expected_results": [
+        "It has the expected SECTIONS (assert on headings: 'Retrieving the prod error', 'Verifying at scale', 'Closing checklist', 'Index drift') rather than brittle exact-command strings, so a benign command edit doesn't break the test",
+        "Each section is non-empty"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.5.2",
+      "name": "Scale gate runs the plan assertions against the seeded corpus",
+      "type": "integration",
+      "preconditions": [
+        "Scale gate invoked (tagged run) with the US-27.1 fixture seeded"
+      ],
+      "steps": [
+        "Run the scale gate suite"
+      ],
+      "expected_results": [
+        "The vector-endpoint plan assertions (US-27.2) execute and pass at scale",
+        "The default unit suite is unaffected by the gate"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "This is primarily a documentation + CI-wiring story; the executable pieces (fixture, plan assertions, timeouts) come from US-27.1/27.2/27.4.",
+    "Reference the existing wiki article 'pgvector HNSW: filter-after-ANN' (knowledge id bd4a26b6) and the memory feedback-verify-against-prod-scale.",
+    "fly access is via the authenticated CLI (the operator's account); the rpc form is `/app/bin/loopctl rpc \"<Elixir>\"` (release bin is /app/bin/loopctl).",
+    "Keep the runbook honest about the residual limitation: even a 50–100k staging corpus is an approximation of the 76k+ prod corpus; the live-build confirmation step is still required.",
+    "If a true staging environment isn't available, document the minimum: the scale fixture in CI + the live prod EXPLAIN/logs confirmation as the gate."
+  ],
+  "dependencies": ["US-27.1", "US-27.2", "US-27.4"],
+  "estimated_hours": 5
+}

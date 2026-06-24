@@ -1,0 +1,85 @@
+{
+  "id": "US-27.14",
+  "title": "Reconcile the HNSW index-name drift between migration and prod (+ migration-safety)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "scale_observability",
+  "status": "pending",
+  "background": {
+    "reference": "GitHub Epic #175; BA C2, architect + adversarial F11",
+    "includes": "Migration 20260410022906 creates `articles_embedding_idx`; prod's live index is `articles_embedding_hnsw_idx` (created out-of-band). Three stories TOLERATE the drift via name-agnostic detection. Latent hazard: the migration's down-step `DROP INDEX IF EXISTS articles_embedding_idx` silently NO-OPS against prod's `_hnsw_idx` name — a rollback that wouldn't actually drop the live index."
+  },
+  "priority_note": "DECIDED (user sign-off 2026-06-24): RECONCILE — make prod and the migration agree on one canonical HNSW index name, then tighten the test tolerance. Prefer a metadata-only ALTER INDEX RENAME; if a same-definition index doesn't already exist under the canonical name, schedule a CONCURRENT recreate on ~76k rows. The down-migration no-op hazard is fixed regardless.",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "the deployed HNSW index name and the migration to agree on one canonical name (or the drift to be an explicitly-recorded, migration-safe decision), and the down-migration to handle whichever index name is actually present",
+    "so_that": "future migrations and rollbacks operate on the real index, the plan-assertion tolerance can be tightened, and no engineer wastes a session 'fixing' a drift that was meant to be permanent"
+  },
+  "rationale": "Permanently working around an environment drift in every test helper is tech-debt that can mask a real problem (e.g. the wrong index being live, or a down-migration that no-ops). Resolving the drift — or consciously recording it as permanent with migration-safety — removes a standing version-skew hazard. Because renaming/recreating an HNSW index on 76k rows has a real cost, the reconcile-vs-tolerate choice is a USER business decision, not a default.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.14.1",
+      "description": "RECONCILE (decided): inspect prod first (detect by amname='hnsw' on articles(embedding), not by name). If an HNSW index exists under a non-canonical name → `ALTER INDEX … RENAME TO` the canonical name (metadata-only, brief ACCESS EXCLUSIVE, no rewrite — a transactional migration). If NO usable HNSW index exists → a SEPARATE migration with `@disable_ddl_transaction true`/`@disable_migration_lock true` that `CREATE INDEX CONCURRENTLY` the canonical name then drops the old. These are TWO distinct migration shapes (RENAME wants the DDL transaction; CONCURRENT forbids it) — the impl picks one after inspecting prod; both are idempotent (no-op if already canonical) and verified on the live build.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.14.2",
+      "description": "Regardless of (a)/(b): the migration down-step is made safe — it drops/handles whichever HNSW index name is actually present (not a hard-coded name that silently no-ops against prod), so a rollback cannot leave an orphaned index or fail to drop the live one.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.14.3",
+      "description": "After the rename/recreate, the plan-assertion (US-27.2) and helpers are tightened from the `(_hnsw)?_idx` tolerance to the canonical name (still asserting amname='hnsw'); the change is verified on the live build (index present, queries still index-backed). Until this migration lands, US-27.1/27.2/27.5 keep the name-agnostic detection.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.14.4",
+      "description": "The canonical detection snippet (e.g. `SELECT indexname FROM pg_indexes WHERE tablename='articles' AND indexdef ILIKE '%hnsw%'`, or join on amname='hnsw') is documented so detection is robust regardless of the decision.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.14.1",
+      "name": "Down-migration drops the actually-present HNSW index",
+      "type": "integration",
+      "preconditions": [
+        "A DB where the HNSW index exists under a non-migration name"
+      ],
+      "steps": [
+        "Run the (fixed) down-migration"
+      ],
+      "expected_results": [
+        "The live HNSW index is dropped (not a silent no-op); up-migration recreates the canonical one"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.14.2",
+      "name": "Queries remain index-backed after reconciliation (canonical name, either migration path)",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)",
+        "Index reconciled to the canonical name"
+      ],
+      "steps": [
+        "refute_full_scan + assert_hnsw_index on the suggested_links query"
+      ],
+      "expected_results": [
+        "Still index-backed via the canonical amname='hnsw' index"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "DECIDED: reconcile (user sign-off 2026-06-24).",
+    "ALTER INDEX ... RENAME TO is metadata-only (fast) IF a same-definition index already exists under the other name; a true recreate (DROP+CREATE hnsw) on 76k rows is expensive and must be CONCURRENT/scheduled. Inspect prod first to choose the path.",
+    "The existing down-migration `DROP INDEX IF EXISTS articles_embedding_idx` is the latent bug — it no-ops against prod's `articles_embedding_hnsw_idx`; fix it to handle whichever name is present.",
+    "Verify on the live build (fly): SELECT indexname, indexdef FROM pg_indexes WHERE tablename='articles'."
+  ],
+  "dependencies": [],
+  "estimated_hours": 5
+}

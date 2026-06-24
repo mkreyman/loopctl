@@ -1,0 +1,83 @@
+{
+  "id": "US-27.9b",
+  "title": "Apply the keyset cursor to by-tag / by-source / change-feed enumerations",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "pagination",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 3; split from original US-27.9",
+    "includes": "The original offset-drift evidence was a by-TAG enumeration (9,881 -> 4,981). The cursor mechanic (US-27.9a) must reach the enumerations agents actually use to walk the KB: by-tag, by-source, and change-feed-style listing."
+  },
+  "priority_note": "Mechanical rollout of US-27.9a's proven cursor to the remaining enumeration surfaces; each must stay index-backed and tenant-safe.",
+  "story": {
+    "as_a": "an agent walking a tag, a source, or the change feed",
+    "i_want_to": "the same stable keyset cursor applied to the by-tag, by-source, and change-feed enumerations",
+    "so_that": "every way I enumerate the KB is drift-free and complete under concurrent writes, not just the bare article list"
+  },
+  "rationale": "The live offset-drift incident was on a by-tag walk, so applying the cursor only to the article list would leave the actual failure surface unfixed. Rolling the proven mechanic onto the tag/source/change-feed enumerations delivers the epic's Theme 3 acceptance ('enumerate a tag to exhaustion under concurrent writes ... stable, complete set').",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.9b.1",
+      "description": "by-tag, by-source, and change-feed enumerations accept `cursor` and return `meta.next_cursor`, using the US-27.9a keyset mechanic + integrity + auth-derived tenant scope (no re-implementation of the cursor trust model).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9b.2",
+      "description": "Each enumeration's keyset query is index-backed at ≥prod scale (US-27.2 plan assertion: no full-corpus Seq Scan). NOTE a GIN array index CANNOT provide ordered output and Postgres uses one index per scan node, so by-tag is NOT 'GIN-for-filter + index-for-order' simultaneously. The honest strategy: small tags GIN-match then Sort over the (bounded) matched set; LARGE tags keyset-seek the btree (tenant_id, inserted_at, id) and apply `tags && ^[tag]` as a recheck filter (turns the O(tag²)-per-walk re-sort into a bounded index range scan). The story picks/states which per tag size; deep-page cost is bounded for the historical 9,881-row tag, accepting a bounded Sort over the matched set only when small.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9b.3",
+      "description": "Walking a tag to exhaustion under concurrent writes returns a stable, complete set (the literal Theme 3 acceptance); verified by a concurrent-write test on the by-tag path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.9b.4",
+      "description": "Tenant isolation holds on every enumeration (cursor tenant from auth principal); a forged cursor cannot cross tenants on any of them.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.9b.1",
+      "name": "by-tag walk complete under concurrent writes (the original incident)",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); seed many articles with a shared tag"
+      ],
+      "steps": [
+        "Walk the tag via cursor; concurrently insert/archive tagged articles"
+      ],
+      "expected_results": [
+        "Stable, complete set; no drift; no duplicates/gaps for rows present throughout"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.9b.2",
+      "name": "by-source / change-feed deep pages index-backed at scale",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)"
+      ],
+      "steps": [
+        "refute_full_scan on a late by-source and change-feed page query"
+      ],
+      "expected_results": [
+        "Index-backed; no full Seq Scan"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse US-27.9a's cursor helper verbatim; do not re-implement encode/decode/tenant rules.",
+    "by-tag: GIN tags index filters; (inserted_at, id) orders. by-source: ensure a (tenant_id, source_id, inserted_at, id) index if needed for index-backed deep pages.",
+    "change-feed: already an enumeration (GET /changes?since=...) — align it onto the cursor contract or document why it keeps a since-token (which is itself a keyset).",
+    "All tenant-scoped from the principal."
+  ],
+  "dependencies": ["US-27.9a"],
+  "estimated_hours": 8
+}
