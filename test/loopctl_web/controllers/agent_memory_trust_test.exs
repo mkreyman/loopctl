@@ -537,6 +537,69 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
       assert priv in changed_ids.(ctx.raw_a)
     end
 
+    test "the change feed doesn't leak a private memory's id via an article_link entry", ctx do
+      # A link between two of agent A's private memories — agent B must not see the
+      # article_link change entry (it carries both private UUIDs).
+      p1 = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "LP1", [1.0, 0.0])
+      p2 = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "LP2", [1.0, 0.0])
+
+      fixture(:article_link, %{
+        tenant_id: ctx.tenant.id,
+        source_article_id: p1,
+        target_article_id: p2,
+        relationship_type: :relates_to
+      })
+
+      link_state_ids = fn raw ->
+        ctx.conn
+        |> auth(raw)
+        |> get(~p"/api/v1/changes?since=2020-01-01T00:00:00Z&entity_type=article_link")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.flat_map(fn e ->
+          [e["new_state"]["source_article_id"], e["new_state"]["target_article_id"]]
+        end)
+      end
+
+      b_ids = link_state_ids.(ctx.raw_b)
+      refute p1 in b_ids
+      refute p2 in b_ids
+    end
+
+    test "idempotency dedup doesn't reveal another agent's private memory id", ctx do
+      # Agent A creates a private memory with a known idempotency_key.
+      key = "shared-key-zorpt"
+
+      a_resp =
+        post_memory(ctx.conn, ctx.raw_a, %{
+          "title" => "IdemPriv",
+          "body" => "idem private body",
+          "category" => "finding",
+          "idempotency_key" => key,
+          "metadata" => %{"visibility" => "private"}
+        })
+        |> json_response(201)
+
+      a_id = a_resp["data"]["id"]
+
+      # Agent B replays the same key — must NOT get back A's private article id;
+      # the unique index rejects the write without echoing the private reference.
+      b_conn =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "BProbe",
+          "body" => "b body",
+          "category" => "finding",
+          "idempotency_key" => key
+        })
+
+      # B doesn't dedup against A's invisible memory → the unique index rejects the
+      # write (422), and A's private id never appears in the response.
+      b_body = json_response(b_conn, 422)
+      refute inspect(b_body) =~ a_id
+    end
+
     test "novelty priors exclude another agent's private proposals", ctx do
       # Agent A's private proposal; agent B scoring an idea sees no comparable prior.
       private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Proposal", [1.0, 0.0], ["proposal"])

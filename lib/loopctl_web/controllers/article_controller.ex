@@ -329,7 +329,11 @@ defmodule LoopctlWeb.ArticleController do
   end
 
   defp create_article(conn, tenant_id, attrs, audit_opts, draft?) do
-    case Knowledge.create_article(tenant_id, attrs, audit_opts) do
+    # Pass the caller's visibility scope so idempotency dedup can't echo a private
+    # memory the agent can't see (#163).
+    opts = audit_opts ++ Visibility.scope_opts(conn)
+
+    case Knowledge.create_article(tenant_id, attrs, opts) do
       {:ok, article} ->
         conn
         |> put_status(:created)

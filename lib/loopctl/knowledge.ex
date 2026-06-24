@@ -197,6 +197,7 @@ defmodule Loopctl.Knowledge do
   def create_article(tenant_id, attrs, opts \\ []) do
     scope = attrs[:scope] || attrs["scope"] || :tenant
     project_id = attrs[:project_id] || attrs["project_id"]
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     # System articles have no tenant — set tenant_id to nil
     effective_tenant_id = if scope in [:system, "system"], do: nil, else: tenant_id
@@ -204,9 +205,16 @@ defmodule Loopctl.Knowledge do
     with :ok <- validate_project_ownership(tenant_id, project_id),
          # Idempotent fast path: a prior capture with the same idempotency_key is
          # a clean no-op — return it unchanged regardless of body (the key IS the
-         # identity), so a re-run can't create a partial duplicate.
+         # identity), so a re-run can't create a partial duplicate. Visibility (#163):
+         # an agent only dedups against a match it can SEE — a key colliding with
+         # another agent's private memory falls through to insert, where the unique
+         # index rejects it without echoing the private article's id.
          nil <-
-           get_article_by_idempotency_key(effective_tenant_id, idempotency_key_from_attrs(attrs)) do
+           get_article_by_idempotency_key(
+             effective_tenant_id,
+             idempotency_key_from_attrs(attrs),
+             vis
+           ) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -255,7 +263,7 @@ defmodule Loopctl.Knowledge do
           {:ok, article}
 
         {:error, :article, changeset, _} ->
-          resolve_create_conflict(effective_tenant_id, attrs, changeset)
+          resolve_create_conflict(effective_tenant_id, attrs, changeset, vis)
       end
     else
       # validate_project_ownership/2 failure
@@ -288,7 +296,7 @@ defmodule Loopctl.Knowledge do
   # self-healing outcome — a 409 (body now differs), or the original 422 (row now
   # archived → SELECT returns nil) — which the client's next attempt resolves
   # cleanly. We accept that rather than re-running the whole create under a lock.
-  defp resolve_create_conflict(tenant_id, attrs, changeset) do
+  defp resolve_create_conflict(tenant_id, attrs, changeset, vis) do
     cond do
       # A single failed INSERT raises exactly one unique violation, so the
       # changeset carries at most one of these constraint names — the cond order
@@ -296,7 +304,7 @@ defmodule Loopctl.Knowledge do
       # violation (a create that raced past the pre-check) returns the winner as
       # a no-op dedup regardless of body.
       idempotency_conflict?(changeset) ->
-        case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs)) do
+        case get_article_by_idempotency_key(tenant_id, idempotency_key_from_attrs(attrs), vis) do
           %Article{} = existing -> {:ok, :deduplicated, existing}
           _ -> {:error, changeset}
         end
@@ -336,20 +344,21 @@ defmodule Loopctl.Knowledge do
 
   # Look up by idempotency_key across ALL statuses, mirroring the partial unique
   # index (which has no status predicate) so the conflicting row is always found.
-  defp get_article_by_idempotency_key(_tenant_id, nil), do: nil
-  defp get_article_by_idempotency_key(nil, _key), do: nil
+  defp get_article_by_idempotency_key(_tenant_id, nil, _vis), do: nil
+  defp get_article_by_idempotency_key(nil, _key, _vis), do: nil
 
-  defp get_article_by_idempotency_key(tenant_id, key) when is_binary(key) do
-    AdminRepo.one(
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
-        order_by: [asc: a.inserted_at],
-        limit: 1
-      )
+  defp get_article_by_idempotency_key(tenant_id, key, vis) when is_binary(key) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
+      order_by: [asc: a.inserted_at],
+      limit: 1
     )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.one()
   end
 
-  defp get_article_by_idempotency_key(_tenant_id, _key), do: nil
+  # Non-binary key (e.g. an integer) → no lookup.
+  defp get_article_by_idempotency_key(_tenant_id, _key, _vis), do: nil
 
   # Only the active-title index — NOT the slug indexes, whose conflicts are on a
   # different field and must not be recovered via a title lookup.
