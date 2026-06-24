@@ -20,7 +20,11 @@ config :loopctl, Loopctl.AdminRepo,
   hostname: "localhost",
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2
+  pool_size: System.schedulers_online() * 2,
+  # Scale tests seed ~80k rows under Sandbox.unboxed_run/2, which can exceed the
+  # default 60s ownership timeout (the seed takes >2 min) → "owner process crashed".
+  # Allow the unboxed connection to be held long enough for the prod-floor seed.
+  ownership_timeout: :timer.minutes(30)
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

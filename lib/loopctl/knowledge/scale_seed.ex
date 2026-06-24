@@ -124,28 +124,23 @@ defmodule Loopctl.Knowledge.ScaleSeed do
           {:ok, %{articles: non_neg_integer(), links: non_neg_integer()}}
           | {:error, term()}
   def seed(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    # Guard: refuse to run when the caller has explicitly opted into sandbox
-    # mode via the :scale_seed_allow_sandbox sentinel. This sentinel is set by
-    # callers that deliberately want to run inside a rolled-back transaction
-    # (not currently used — it exists so the guard can be bypassed in isolated
-    # test scenarios). Its absence means "production / unboxed path" which is
-    # the intended default.
-    #
-    # NOTE: AdminRepo.checked_out?() was previously used here but is a no-op
-    # for this purpose: checked_out?/1 reads Process.get(key(pool)) which is
-    # only populated while a query/transaction is in flight — not during the
-    # idle time between the sandbox checkout and the first DB call. The sentinel
-    # approach is reliable because it is set explicitly by the caller.
-    if Application.get_env(:loopctl, :scale_seed_allow_sandbox, false) == :raise_for_sandbox do
+    # Guard: refuse to run inside an open transaction. ScaleSeed must run UNBOXED
+    # (committed) — inside the DataCase async sandbox every insert_all + ANALYZE is
+    # rolled back, so ANALYZE sees n≈0 and the planner builds bogus stats. The seed
+    # opens no transaction of its own (insert_all per batch), so `in_transaction?/0`
+    # being true means we're inside the sandbox's wrapping transaction (or some other
+    # caller transaction) — exactly the misuse this guard exists to prevent. This is
+    # functional, unlike the prior checked_out?/sentinel approaches (both no-ops): the
+    # correct usage (`Ecto.Adapters.SQL.Sandbox.unboxed_run/2`) runs with no open
+    # transaction, so the guard passes there.
+    if AdminRepo.in_transaction?() do
       raise """
-      ScaleSeed.seed/2 was called with :scale_seed_allow_sandbox set to :raise_for_sandbox.
+      ScaleSeed.seed/2 was called inside an open transaction (e.g. the DataCase
+      async SQL sandbox). Rows inserted in a sandbox transaction are rolled back, so
+      ANALYZE sees n≈0 and verify_stats! produces confusing false-RED results.
 
-      This defeats the purpose of ScaleSeed — rows inserted inside a sandbox
-      transaction are rolled back, so ANALYZE sees n≈0 and verify_stats! will
-      produce confusing false-RED results.
-
-      Call ScaleSeed.seed/2 from a @tag :scale test that uses ExUnit.Case
-      directly (not DataCase) and wraps DB ops in Ecto.Adapters.SQL.Sandbox.unboxed_run/2.
+      Call ScaleSeed.seed/2 from a @tag :scale test that uses ExUnit.Case directly
+      (not DataCase) and wraps DB ops in Ecto.Adapters.SQL.Sandbox.unboxed_run/2.
       See the ScaleSeed moduledoc for the correct test setup.
       """
     end

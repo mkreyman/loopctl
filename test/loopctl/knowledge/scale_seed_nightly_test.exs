@@ -107,7 +107,7 @@ defmodule Loopctl.Knowledge.ScaleSeedNightlyTest do
           EXPLAIN (FORMAT TEXT)
           SELECT id FROM articles
           WHERE tenant_id = $1
-          ORDER BY embedding <-> $2
+          ORDER BY embedding <=> $2
           LIMIT 10
           """,
           [tenant_id_binary, probe_vector]
