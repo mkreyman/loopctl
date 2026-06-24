@@ -354,39 +354,23 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   defp seed_links(tenant_id, article_ids, link_density) do
     now = DateTime.utc_now()
     count = length(article_ids)
-    # Use :relates_to for all seeded links (simple bulk seed).
-    # Must be an atom — Ecto.Enum fields require atoms with schema module insert_all.
-    relationship_type = :relates_to
 
     # Convert article_ids list to tuple for O(1) random access.
     # Enum.at/2 on a list is O(n), making link seeding O(n^2 * density)
     # at prod-floor scale (80k * 5 ≈ 1.6e10 traversals).
     article_ids_tuple = List.to_tuple(article_ids)
 
-    # For each article, link to `link_density` nearest neighbours by index
-    # (wrapping around). This gives a deterministic nearest-neighbour graph
-    # that exercises the already-linked anti-join path.
+    # For each article, link to `link_density` nearest neighbours by index.
+    # See `build_link_row/7` for the no-wrap nearest-neighbor strategy that
+    # satisfies AC-27.1.3.
     link_rows =
       article_ids
       |> Enum.with_index()
       |> Enum.flat_map(fn {source_id, i} ->
-        for j <- 1..link_density do
-          target_idx = rem(i + j, count)
-          target_id = elem(article_ids_tuple, target_idx)
-
-          %{
-            id: Ecto.UUID.generate(),
-            tenant_id: tenant_id,
-            source_article_id: source_id,
-            target_article_id: target_id,
-            relationship_type: relationship_type,
-            metadata: %{},
-            inserted_at: now
-          }
-        end
+        build_link_rows(source_id, i, count, link_density, article_ids_tuple, tenant_id, now)
       end)
-      # Remove self-links (shouldn't happen with modular arithmetic when
-      # link_density < count, but guard defensively)
+      # Remove self-links defensively (the no-wrap formula never produces them
+      # for link_density < count, but guard against edge cases)
       |> Enum.reject(fn row -> row.source_article_id == row.target_article_id end)
 
     # Insert in batches to avoid statement size limits
@@ -402,6 +386,37 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       end)
 
     {:ok, inserted}
+  end
+
+  # Build the link rows for one source article to its `link_density` nearest
+  # neighbours.
+  #
+  # Strategy — no-wrap nearest-neighbor (AC-27.1.3):
+  # The embeddings use a sine wave of period 1_000. Articles at physical indices
+  # i and (i+j) have cosine similarity ≈ cos(2π·j/1_000), which is > 0.9 for
+  # any j <= 71. We must NOT use rem(i+j, count) for this: when count < period,
+  # the wrap maps index i=499 to index 0 — an angular distance of ~499 steps,
+  # yielding cosine ≈ -0.998 and violating AC-27.1.3.
+  #
+  # Instead: link forward (i+j) when room exists, link backward (i-j) otherwise.
+  # Maximum index distance is always <= link_density << 71, so cosine >> 0.9.
+  defp build_link_rows(source_id, i, count, link_density, article_ids_tuple, tenant_id, now) do
+    relationship_type = :relates_to
+
+    for j <- 1..link_density do
+      target_idx = if i + j < count, do: i + j, else: i - j
+      target_id = elem(article_ids_tuple, target_idx)
+
+      %{
+        id: Ecto.UUID.generate(),
+        tenant_id: tenant_id,
+        source_article_id: source_id,
+        target_article_id: target_id,
+        relationship_type: relationship_type,
+        metadata: %{},
+        inserted_at: now
+      }
+    end
   end
 
   defp analyze_and_verify(tenant_id, inserted_count) do

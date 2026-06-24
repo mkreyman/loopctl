@@ -10,13 +10,16 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 #   SCALE_TESTS=true mix test --only scale
 #
 # Plain `mix test` always excludes :scale.
-unless System.get_env("SCALE_TESTS") do
-  ExUnit.configure(exclude: [:scale])
-end
-
-# Nightly scale tests (TC-27.1.5) seed at PROD_ARTICLE_FLOOR and assert the
-# HNSW planner path. They are excluded unless SCALE_NIGHTLY=true is set,
-# even when SCALE_TESTS=true (they take several minutes).
-unless System.get_env("SCALE_NIGHTLY") do
-  ExUnit.configure(exclude: [:scale_nightly])
-end
+# ExUnit.configure(exclude: ...) REPLACES the exclude list — it does not merge.
+# Both exclusions must be specified in a single call so neither overwrites the other.
+#
+# To run scale tests:
+#   SCALE_TESTS=true mix test --only scale
+#
+# To run nightly scale tests:
+#   SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly
+#
+# Plain `mix test` always excludes both :scale and :scale_nightly.
+scale_excluded = if System.get_env("SCALE_TESTS"), do: [], else: [:scale]
+nightly_excluded = if System.get_env("SCALE_NIGHTLY"), do: [], else: [:scale_nightly]
+ExUnit.configure(exclude: scale_excluded ++ nightly_excluded)
