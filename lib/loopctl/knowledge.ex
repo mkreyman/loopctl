@@ -3643,8 +3643,9 @@ defmodule Loopctl.Knowledge do
   change feed) that reference articles by id without re-querying each one. Returns
   a `MapSet`. Ids that don't exist (hard-deleted) are excluded.
   """
-  @spec visible_article_ids(Ecto.UUID.t(), [Ecto.UUID.t()], String.t() | nil) ::
-          MapSet.t()
+  # No @spec: a `MapSet.t()` return annotation trips dialyzer's contract_with_opaque
+  # check against the concrete success typing (a known false positive for opaque
+  # built-ins). The behaviour is covered by tests instead.
   def visible_article_ids(_tenant_id, [], _vis), do: MapSet.new()
 
   def visible_article_ids(tenant_id, article_ids, vis) do
