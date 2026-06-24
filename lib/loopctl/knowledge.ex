@@ -2794,14 +2794,17 @@ defmodule Loopctl.Knowledge do
           node_count: length(nodes)
         }
 
-      {:error, _} ->
-        # Database error (timeout, connection, etc.) — return degraded response
-        %{
-          nodes: [],
-          edges: [],
-          truncated: true,
-          node_count: 0
-        }
+      {:error, reason} ->
+        # Database error (timeout, connection, etc.) — return a degraded but valid
+        # response (truncated: true) instead of crashing the request, and log so a
+        # repeated dense-hub traversal is visible to operators rather than an
+        # anonymous 500.
+        Logger.warning(
+          "knowledge graph traversal failed (depth=#{depth}, tenant=#{tenant_id}): " <>
+            "#{inspect(reason)} — returning degraded (truncated) result"
+        )
+
+        %{nodes: [], edges: [], truncated: true, node_count: 0}
     end
   end
 
