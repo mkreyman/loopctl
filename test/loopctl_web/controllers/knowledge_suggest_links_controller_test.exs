@@ -1,6 +1,7 @@
 defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
@@ -36,6 +37,31 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   end
 
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
+
+  describe "suggestion query shape (#168 RED→GREEN structural guard)" do
+    # The production 500 couldn't be reproduced in the test DB (the column is
+    # vector(1536) and PostgrexTypes is shared across envs, so the stored-vector
+    # re-interpolation encodes fine locally). This guard instead asserts the QUERY
+    # SHAPE that caused it is gone: the target vector must NOT be a bound parameter,
+    # and the cosine must be computed between two embedding COLUMNS. Both assertions
+    # FAIL on the pre-fix query (which bound `^embedding::vector`) and PASS on the fix.
+    test "does not re-interpolate the target vector as a query parameter" do
+      {tenant, _key} = setup_tenant_key()
+      target = embedded(tenant.id, "T", [1.0, 0.0])
+
+      query = Knowledge.suggestion_candidates_query(tenant.id, target.id, 0.5, 5, nil)
+      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
+
+      # No parameter is a vector/list — only ids, threshold, limit. The #168 bug
+      # bound the stored target vector here.
+      refute Enum.any?(params, fn p -> is_list(p) or match?(%Pgvector{}, p) end)
+
+      # The distance is computed between two `embedding` COLUMNS (the candidate's and
+      # the self-joined target's) — not a column vs a parameter.
+      assert sql =~ "<=>"
+      assert length(Regex.scan(~r/\."embedding"/, sql)) >= 2
+    end
+  end
 
   describe "GET /api/v1/knowledge/articles/:id/suggested_links (#150)" do
     # #168 regression: the endpoint 500'd in production because the target's stored

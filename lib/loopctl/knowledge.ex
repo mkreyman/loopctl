@@ -2857,13 +2857,29 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  # Ranks candidates by cosine similarity to the target article. The target's vector
-  # is referenced COLUMN-to-column via a self-join (`a.embedding <=> t.embedding`),
-  # never round-tripped back in as a `^param`/`::vector` cast — that re-interpolation
-  # of a stored `%Pgvector{}` was the #168 500. This mirrors `distant_pairs`, whose
-  # column-to-column cosine works in production. The caller has already confirmed the
-  # target exists / is published / is embedded / is visible (fetch_article_embedding).
   defp suggestion_candidates(tenant_id, article_id, threshold, limit, vis) do
+    suggestion_candidates_query(tenant_id, article_id, threshold, limit, vis)
+    |> AdminRepo.all(timeout: 5_000)
+  end
+
+  # Builds the suggested-links candidate query (returned, not executed) so a test can
+  # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.
+  #
+  # Ranks candidates by cosine similarity to the target. The target's vector is
+  # referenced COLUMN-to-column via a self-join (`a.embedding <=> t.embedding`), NEVER
+  # round-tripped back in as a `^param`/`::vector` cast — that re-interpolation of a
+  # stored `%Pgvector{}` was the #168 production 500. This mirrors `distant_pairs`,
+  # whose column-to-column cosine works in production. The caller has already confirmed
+  # the target exists / is published / is embedded / is visible (fetch_article_embedding).
+  #
+  # Perf tradeoff (#168): because the right operand is a COLUMN (`t.embedding`), the
+  # HNSW index (`articles_embedding_idx`, vector_cosine_ops) — which only accelerates
+  # `ORDER BY embedding <=> CONSTANT LIMIT k` — is intentionally not used; the query is
+  # a published-candidate scan + per-row cosine + sort, bounded by `status`, `limit`,
+  # and a 5s timeout. Negligible at current scale and consistent with the already-
+  # shipped `distant_pairs`; revisit if a tenant grows to tens of thousands of articles.
+  @doc false
+  def suggestion_candidates_query(tenant_id, article_id, threshold, limit, vis) do
     from(a in Article,
       join: t in Article,
       on: t.id == ^article_id and t.tenant_id == ^tenant_id,
@@ -2888,7 +2904,6 @@ defmodule Loopctl.Knowledge do
       }
     )
     |> maybe_filter_by_visibility(vis)
-    |> AdminRepo.all(timeout: 5_000)
   end
 
   @doc """
