@@ -39,9 +39,30 @@ convenience filter). No MCP tool signatures changed.
 Identity is the key's registry `agent_id` (a UUID). Memories written **before** this
 change with a self-asserted, non-UUID `agent_id` string won't match their owner's key
 identity, so the owning agent may no longer read its own pre-#163 private/owner
-memories (they remain visible to higher roles). Operators with such legacy memories
-should backfill `metadata.agent_id` to the owner's registry UUID, or treat the cutover
-as a clean break. Memories written after this change are always key-stamped.
+memories (they remain visible to higher roles).
+
+**Migration path for operators:**
+1. Identify affected articles (private/owner visibility with non-UUID agent_id):
+   ```sql
+   SELECT id, title, metadata->>'agent_id' as agent_id
+   FROM articles
+   WHERE status = 'published'
+     AND COALESCE(metadata->>'visibility', 'shared') IN ('private', 'owner')
+     AND metadata->>'agent_id' IS NOT NULL
+     AND metadata->>'agent_id' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+   ```
+2. For each affected article, determine the correct UUID for its owner (e.g., from agent registry or auth logs).
+3. Backfill via REST API (higher-role key required):
+   ```
+   PATCH /api/v1/knowledge/articles/:id {
+     "metadata": {
+       "agent_id": "<correct-uuid>"
+     }
+   }
+   ```
+   Or treat affected articles as a clean break (keep them archived/read-only to higher roles only).
+
+Memories written after this change are always key-stamped with the API key's UUID.
 
 ## 2.20.1 — 2026-06-24 (honest story pagination)
 

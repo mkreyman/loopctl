@@ -117,6 +117,22 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
       article = AdminRepo.get!(Article, body["data"]["id"])
       refute Map.has_key?(article.metadata, "agent_id")
     end
+
+    test "a higher role cannot store a blank agent_id (would be readable by identity-less agents)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_user, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        post_memory(
+          conn,
+          raw_user,
+          memory_attrs("Blank", %{"agent_id" => "", "visibility" => "private"})
+        )
+
+      # The changeset rejects a blank agent_id (422), so "" can never be a usable owner.
+      assert json_response(conn, 422)
+    end
   end
 
   describe "read-path: visibility enforcement (#163)" do
@@ -208,6 +224,18 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
              )
 
       assert ctx.priv_id in get_ids(ctx.conn, ctx.raw_a, ~p"/api/v1/articles")
+    end
+
+    test "the owning agent sees its own private memory in context", ctx do
+      ids =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> get(~p"/api/v1/knowledge/context?query=Zorpt")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.map(& &1["id"])
+
+      assert ctx.priv_id in ids
     end
 
     test "shared memory is visible to another agent", ctx do
@@ -418,7 +446,7 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
 
       refute p_id in Enum.map(walk_b["data"], & &1["id"])
 
-      # Agent A (owner) reaches it.
+      # Agent A (owner) reaches it via both walk and graph.
       walk_a =
         ctx.conn
         |> auth(ctx.raw_a)
@@ -426,6 +454,87 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
         |> json_response(200)
 
       assert p_id in Enum.map(walk_a["data"], & &1["id"])
+
+      graph_a =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> get(~p"/api/v1/knowledge/graph?article_id=#{s_id}&depth=2")
+        |> json_response(200)
+
+      assert p_id in Enum.map(graph_a["nodes"], & &1["id"])
+    end
+
+    test "the /links endpoint never leaks a private memory's title to another agent", ctx do
+      # Shared S links to agent A's private P; agent B lists S's links.
+      s_id =
+        post_memory(ctx.conn, ctx.raw_a, memory_attrs("LinkStart", %{"visibility" => "shared"}))
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      p_id = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "LinkHidden", [1.0, 0.0])
+
+      fixture(:article_link, %{
+        tenant_id: ctx.tenant.id,
+        source_article_id: s_id,
+        target_article_id: p_id,
+        relationship_type: :relates_to
+      })
+
+      far_ids = fn raw ->
+        ctx.conn
+        |> auth(raw)
+        |> get(~p"/api/v1/articles/#{s_id}/links")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.flat_map(fn l -> [l["source_article"]["id"], l["target_article"]["id"]] end)
+      end
+
+      refute p_id in far_ids.(ctx.raw_b)
+      assert p_id in far_ids.(ctx.raw_a)
+    end
+
+    test "an agent cannot create a link to an article it can't see", ctx do
+      # Agent A's private memory; agent B (with its own article) tries to link to it.
+      p_id = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Unseen", [1.0, 0.0])
+
+      b_article =
+        post_memory(ctx.conn, ctx.raw_b, memory_attrs("BOwn", %{"visibility" => "shared"}))
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      # 404 (no existence leak), not a successful link.
+      ctx.conn
+      |> auth(ctx.raw_b)
+      |> post(~p"/api/v1/article_links", %{
+        "source_article_id" => b_article,
+        "target_article_id" => p_id,
+        "relationship_type" => "relates_to"
+      })
+      |> json_response(404)
+    end
+
+    test "the change feed never leaks another agent's private memory body", ctx do
+      priv =
+        post_memory(ctx.conn, ctx.raw_a, %{
+          "title" => "ZorptChangeSecret",
+          "body" => "private body in the change feed",
+          "category" => "finding",
+          "metadata" => %{"visibility" => "private"}
+        })
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      changed_ids = fn raw ->
+        ctx.conn
+        |> auth(raw)
+        |> get(~p"/api/v1/changes?since=2020-01-01T00:00:00Z&entity_type=article")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.map(& &1["entity_id"])
+      end
+
+      refute priv in changed_ids.(ctx.raw_b)
+      assert priv in changed_ids.(ctx.raw_a)
     end
 
     test "novelty priors exclude another agent's private proposals", ctx do

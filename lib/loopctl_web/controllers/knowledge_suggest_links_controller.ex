@@ -25,10 +25,11 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   operation(:suggest,
     summary: "Suggest typed link candidates",
     description:
-      "Returns ranked link CANDIDATES for an article by embedding similarity, " <>
-        "**read-only — creates nothing**. Excludes the article itself and any " <>
+      "Returns ranked link CANDIDATES for an article by embedding similarity within the " <>
+        "caller's visible set, **read-only — creates nothing**. Agent callers see only " <>
+        "their own and `shared` articles. Excludes the article itself and any " <>
         "already-linked article (either direction, any relationship type); only " <>
-        "embedded, published articles are considered. Each candidate is " <>
+        "embedded, published, visible articles are considered. Each candidate is " <>
         "`{id, title, category, similarity_score}`, highest similarity first — POST " <>
         "the one you want as a **typed** link (relates_to/derived_from/contradicts/" <>
         "supersedes) via the article_links API. `threshold` (0–1, default 0.5) is the " <>

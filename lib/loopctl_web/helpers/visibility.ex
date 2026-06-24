@@ -23,10 +23,10 @@ defmodule LoopctlWeb.Helpers.Visibility do
   the opts passed to `Loopctl.Knowledge` read functions.
   """
   @spec scope_opts(Plug.Conn.t()) :: keyword()
-  def scope_opts(%Plug.Conn{assigns: %{current_api_key: key}}) do
-    case key.role do
-      :agent -> [visibility_agent_id: to_string(key.agent_id)]
-      _ -> []
-    end
+  def scope_opts(%Plug.Conn{assigns: %{current_api_key: %{role: :agent} = key}}) do
+    [visibility_agent_id: to_string(key.agent_id)]
   end
+
+  # Higher roles (or any request without an agent-role key) see everything.
+  def scope_opts(%Plug.Conn{}), do: []
 end

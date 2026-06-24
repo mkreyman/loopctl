@@ -15,6 +15,8 @@ defmodule LoopctlWeb.ChangeController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -79,12 +81,34 @@ defmodule LoopctlWeb.ChangeController do
 
       {:ok, result} = Audit.list_changes(tenant_id, since, opts)
 
+      # Visibility (#163): article change entries carry the memory's body + metadata
+      # in their snapshot. For an agent caller, drop entries for any article it can't
+      # currently see, so the change feed can't be used to read around the visibility
+      # barrier. Higher roles (scope_opts == []) see everything.
+      visible = filter_visible_changes(result.data, Visibility.scope_opts(conn), tenant_id)
+
       json(conn, %{
-        data: Enum.map(result.data, &change_json/1),
+        data: Enum.map(visible, &change_json/1),
         has_more: result.has_more,
         next_since: format_datetime(result.next_since)
       })
     end
+  end
+
+  defp filter_visible_changes(entries, [], _tenant_id), do: entries
+
+  defp filter_visible_changes(entries, [visibility_agent_id: vis], tenant_id) do
+    article_ids =
+      entries
+      |> Enum.filter(&(&1.entity_type == "article"))
+      |> Enum.map(& &1.entity_id)
+      |> Enum.uniq()
+
+    visible = Knowledge.visible_article_ids(tenant_id, article_ids, vis)
+
+    Enum.reject(entries, fn entry ->
+      entry.entity_type == "article" and not MapSet.member?(visible, entry.entity_id)
+    end)
   end
 
   defp parse_since(nil) do

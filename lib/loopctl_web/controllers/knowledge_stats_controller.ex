@@ -2,12 +2,13 @@ defmodule LoopctlWeb.KnowledgeStatsController do
   @moduledoc """
   Controller for the lightweight knowledge stats endpoint.
 
-  - `GET /api/v1/knowledge/stats` -- tenant-wide article counts (agent+)
+  - `GET /api/v1/knowledge/stats` -- article counts (agent+)
   - `GET /api/v1/projects/:project_id/knowledge/stats` -- project-scoped counts (agent+)
 
   Returns aggregate `COUNT(*)` totals (no article rows or metadata), so a caller
-  can answer "how many articles are here?" without paging the index. Counts
-  span all statuses; `by_status` makes the published/draft/etc. split explicit.
+  can answer "how many articles are visible to me?" without paging the index. Agent
+  callers see only articles they own or marked as `shared`; higher roles see all.
+  Counts span all statuses; `by_status` makes the published/draft/etc. split explicit.
   """
 
   use LoopctlWeb, :controller
@@ -26,12 +27,13 @@ defmodule LoopctlWeb.KnowledgeStatsController do
   operation(:stats,
     summary: "Knowledge stats",
     description:
-      "Returns aggregate article counts for the tenant — `total`, `by_category`, " <>
+      "Returns aggregate article counts — `total`, `by_category`, " <>
         "and `by_status` — computed with cheap COUNT(*) GROUP BY queries (no " <>
-        "article metadata is loaded). Counts span all statuses (draft, published, " <>
+        "article metadata is loaded). Agent callers see only their own articles and " <>
+        "`shared` articles; higher roles see all. Counts span all statuses (draft, published, " <>
         "archived, superseded); use `by_status` to see the split. When called via " <>
         "GET /projects/:project_id/knowledge/stats, counts both tenant-wide and " <>
-        "project-specific articles (same visibility as the index). Role: agent+.",
+        "project-specific articles within visibility. Role: agent+.",
     parameters: [
       project_id: [
         in: :path,

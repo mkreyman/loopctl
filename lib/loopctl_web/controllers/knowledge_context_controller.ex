@@ -37,8 +37,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
   operation(:context,
     summary: "Deep-read knowledge context",
     description:
-      "Returns full article bodies ranked by combined relevance + recency scoring. " <>
-        "Each result includes one-hop linked article references (max 5 per result). " <>
+      "Returns full article bodies ranked by combined relevance + recency scoring within " <>
+        "the caller's visible set. Agent callers see only their own and `shared` articles. " <>
+        "Each result includes one-hop linked article references (max 5 per result) visible to the caller. " <>
         "Falls back to keyword-only search if embedding generation fails. " <>
         "Agent role is forced to published articles. Role: agent+.",
     parameters: [

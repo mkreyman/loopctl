@@ -28,10 +28,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
       "Returns paginated pairs of articles whose embedding cosine distance is in the " <>
         "optimal-novelty band [`min_distance`, `max_distance`] (default 0.3–0.7) — the " <>
         "creative sweet spot. With `bridge_path=true`, only pairs also connected in the " <>
-        "link graph (≤2 hops) are returned. Each pair: `{a, b, distance}`. Samples up to " <>
-        "1000 embedded published articles (lowest-id slice; operator-tunable). " <>
+        "link graph (≤2 hops) are returned. Agent callers see only their own and `shared` " <>
+        "articles. Each pair: `{a, b, distance}`. Samples up to " <>
+        "1000 embedded published visible articles (lowest-id slice; operator-tunable). " <>
         "`meta` carries `count`/`total_count`/`has_more` for pagination — `total_count` is " <>
-        "over the sampled slice, so it can undercount on tenants with >1000 embedded " <>
+        "over the sampled visible slice, so it can undercount on tenants with >1000 embedded " <>
         "articles. Role: agent+.",
     parameters: [
       min_distance: [
@@ -125,8 +126,9 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         "proposal (0 = identical to existing work, higher = more novel, up to 2.0 = " <>
         "opposite vectors; `null` when the idea text is blank, no priors exist, or " <>
         "embedding fails). Each idea's text is embedded on the fly. Priors default to " <>
-        "published articles tagged `proposal` (override with `prior_tag`). `meta.prior_count` " <>
-        "is the number of embedded priors actually compared against (0 ⇒ every score is " <>
+        "published articles tagged `proposal` visible to the caller (agent callers see only " <>
+        "their own and `shared` articles; override with `prior_tag`). `meta.prior_count` " <>
+        "is the number of embedded visible priors actually compared against (0 ⇒ every score is " <>
         "null). Body: `{ideas: [{text|title/spark/thesis...}], prior_tag?}`. Role: agent+.",
     request_body:
       {"Ideas to score", "application/json",
@@ -180,9 +182,9 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
   operation(:walk,
     summary: "Random walk through the link graph",
     description:
-      "Returns a random walk of up to `length` published articles starting from " <>
-        "`start_id`, following random unvisited link-graph neighbors (no cycles; stops at " <>
-        "a dead end). Surfaces unexpected connections. Role: agent+.",
+      "Returns a random walk of up to `length` published articles visible to the caller " <>
+        "starting from `start_id`, following random unvisited link-graph neighbors (no cycles; stops at " <>
+        "a dead end). Agent callers see only their own and `shared` articles. Surfaces unexpected connections. Role: agent+.",
     parameters: [
       start_id: [in: :query, type: :string, description: "Starting article UUID (required)"],
       length: [in: :query, type: :integer, description: "Walk steps (default 4, max 25)"]

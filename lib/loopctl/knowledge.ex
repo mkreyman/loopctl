@@ -2638,8 +2638,12 @@ defmodule Loopctl.Knowledge do
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]
     rel_type = attrs[:relationship_type] || attrs["relationship_type"]
+    vis = Keyword.get(opts, :visibility_agent_id)
 
-    with :ok <- validate_articles_exist(tenant_id, source_id, target_id) do
+    with :ok <- validate_articles_exist(tenant_id, source_id, target_id),
+         # Visibility (#163): an agent may not link to (and thereby probe/leak) an
+         # article it can't see — both endpoints must be visible to the caller.
+         :ok <- validate_link_visibility(tenant_id, source_id, target_id, vis) do
       changeset =
         %ArticleLink{tenant_id: tenant_id}
         |> ArticleLink.changeset(attrs)
@@ -2740,7 +2744,9 @@ defmodule Loopctl.Knowledge do
   - List of `%ArticleLink{}` structs with linked articles preloaded
   """
   @spec list_links_for_article(Ecto.UUID.t(), Ecto.UUID.t()) :: [ArticleLink.t()]
-  def list_links_for_article(tenant_id, article_id) do
+  def list_links_for_article(tenant_id, article_id, opts \\ []) do
+    vis = Keyword.get(opts, :visibility_agent_id)
+
     from(l in ArticleLink,
       where: l.tenant_id == ^tenant_id,
       where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
@@ -2749,6 +2755,18 @@ defmodule Loopctl.Knowledge do
       limit: 100
     )
     |> AdminRepo.all()
+    # Visibility (#163): drop links whose far-side article the caller can't see, so
+    # the link list can't leak another agent's private memory id/title.
+    |> filter_links_by_visibility(vis)
+  end
+
+  defp filter_links_by_visibility(links, nil), do: links
+
+  defp filter_links_by_visibility(links, vis) when is_binary(vis) do
+    Enum.filter(links, fn link ->
+      link_side_visible?(link.source_article, vis) and
+        link_side_visible?(link.target_article, vis)
+    end)
   end
 
   @default_suggestion_limit 5
@@ -3151,10 +3169,10 @@ defmodule Loopctl.Knowledge do
     # Note: count may shift between queries, but avoiding transaction hold on the O(n²) self-join
     # prevents AdminRepo pool starvation under concurrent agent load (3 agents, pool_size: 3).
     total_count =
-      count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
+      count_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.one(timeout: 15_000)
 
     pairs_with_lookahead =
-      pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
+      pairs_query |> maybe_filter_bridge_path(bridge?, vis) |> AdminRepo.all(timeout: 15_000)
 
     # Detect has_more by fetching limit+1; only return limit
     has_more = length(pairs_with_lookahead) > limit
@@ -3168,9 +3186,10 @@ defmodule Loopctl.Knowledge do
   # The shared neighbor must be a distinct *published* article, consistent with
   # random_walk's published-only neighbors — a pair doesn't bridge through an
   # archived/draft middle. All node/link references are tenant-scoped.
-  defp maybe_filter_bridge_path(query, false), do: query
+  defp maybe_filter_bridge_path(query, false, _vis), do: query
 
-  defp maybe_filter_bridge_path(query, true) do
+  # Higher roles (vis nil): bridge through any published middle node.
+  defp maybe_filter_bridge_path(query, true, nil) do
     where(
       query,
       [a, b],
@@ -3191,6 +3210,36 @@ defmodule Loopctl.Knowledge do
           b.id,
           b.id,
           a.tenant_id,
+          a.id,
+          b.id
+        )
+    )
+  end
+
+  # Agent callers (#163): the bridge middle node must ALSO be visible to the caller,
+  # so a pair can't be reported "bridgeable" through a private memory it can't see.
+  defp maybe_filter_bridge_path(query, true, vis) when is_binary(vis) do
+    where(
+      query,
+      [a, b],
+      fragment(
+        "EXISTS (SELECT 1 FROM article_links l WHERE l.tenant_id = ? AND ((l.source_article_id = ? AND l.target_article_id = ?) OR (l.source_article_id = ? AND l.target_article_id = ?)))",
+        a.tenant_id,
+        a.id,
+        b.id,
+        b.id,
+        a.id
+      ) or
+        fragment(
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND (COALESCE(m.metadata->>'visibility', 'shared') NOT IN ('private','owner') OR m.metadata->>'agent_id' = ?) AND m.id <> ? AND m.id <> ?)",
+          a.tenant_id,
+          a.id,
+          a.id,
+          a.tenant_id,
+          b.id,
+          b.id,
+          a.tenant_id,
+          ^vis,
           a.id,
           b.id
         )
@@ -3568,6 +3617,36 @@ defmodule Loopctl.Knowledge do
   # (`metadata.agent_id` matches the caller's verified key identity). Higher roles
   # pass no `:visibility_agent_id` and see everything. An agent with no key
   # identity (agent_id "") owns nothing, so it sees only shared articles.
+  #
+  # Perf: this adds a `metadata->>...` filter (not the GIN-indexed `@>` form). It is
+  # intentionally NOT given a dedicated index: the predicate is an OR whose first arm
+  # (shared / non-memory) matches the overwhelming majority of rows, so the planner
+  # must scan the tenant-scoped set regardless — a partial index on private/owner
+  # rows can't serve a query that also returns the shared majority. The added per-row
+  # JSONB extraction is cheap on the already-tenant-scoped scan; `distant_pairs`
+  # applies it to the ≤1000-row candidate subquery before the O(n²) join, so it
+  # doesn't compound the join cost.
+  @doc """
+  Returns the subset of `article_ids` that are visible to the caller (#163).
+
+  `visibility_agent_id` nil (higher roles) ⇒ all ids that exist; an agent ⇒ only
+  `shared`/non-memory articles plus its own. Used to filter indirect surfaces (the
+  change feed) that reference articles by id without re-querying each one. Returns
+  a `MapSet`. Ids that don't exist (hard-deleted) are excluded.
+  """
+  @spec visible_article_ids(Ecto.UUID.t(), [Ecto.UUID.t()], String.t() | nil) ::
+          MapSet.t()
+  def visible_article_ids(_tenant_id, [], _vis), do: MapSet.new()
+
+  def visible_article_ids(tenant_id, article_ids, vis) do
+    ids = Enum.filter(article_ids, &valid_uuid?/1)
+
+    from(a in Article, where: a.tenant_id == ^tenant_id and a.id in ^ids, select: a.id)
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
   defp maybe_filter_by_visibility(query, nil), do: query
 
   defp maybe_filter_by_visibility(query, agent_id) when is_binary(agent_id) do
@@ -3665,6 +3744,24 @@ defmodule Loopctl.Knowledge do
       true ->
         :ok
     end
+  end
+
+  # Agent callers may only link articles they can see; a hidden endpoint resolves
+  # to :target_not_found (the controller renders 404) — no existence leak. Higher
+  # roles (vis nil) skip the check.
+  defp validate_link_visibility(_tenant_id, _source_id, _target_id, nil), do: :ok
+
+  defp validate_link_visibility(tenant_id, source_id, target_id, vis) when is_binary(vis) do
+    # Distinct ids so a self-link (source == target) checks one article and still
+    # falls through to the changeset's self-link rejection (422) rather than 404.
+    ids = Enum.uniq([source_id, target_id])
+
+    visible_count =
+      from(a in Article, where: a.tenant_id == ^tenant_id and a.id in ^ids)
+      |> maybe_filter_by_visibility(vis)
+      |> AdminRepo.aggregate(:count, :id)
+
+    if visible_count == length(ids), do: :ok, else: {:error, :target_not_found}
   end
 
   defp maybe_supersede_target(multi, tenant_id, _target_id, rel_type)
