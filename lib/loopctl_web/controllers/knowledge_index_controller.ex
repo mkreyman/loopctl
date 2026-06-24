@@ -20,6 +20,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -139,7 +140,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
 
     with :ok <- Pagination.validate_limit(params),
          {:ok, fields} <- parse_fields(params["fields"]),
-         {:ok, opts} <- build_opts(params) do
+         {:ok, base_opts} <- build_opts(params) do
+      opts = Keyword.merge(base_opts, Visibility.scope_opts(conn))
       {:ok, result} = Knowledge.list_index(tenant_id, opts)
       json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
     end

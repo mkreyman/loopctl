@@ -5,6 +5,30 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.21.0 — 2026-06-24 (agent-memory trust model enforced)
+
+### ⚠️ Behavior change (server-side)
+
+The agent-memory trust model that 2.19.0 shipped as **advisory-only** is now
+**enforced** by the server (#163). This changes what agent-role API keys can
+write and read:
+
+- **Write — `agent_id` is bound to the key.** When an **agent**-role key creates
+  an article carrying agent-memory metadata (`agent_id`/`memory_type`/`visibility`),
+  the server stamps `metadata.agent_id` from the key's verified agent identity,
+  overriding any value in the body. An agent can no longer write a memory under
+  another agent's identity. An agent key with no agent identity gets **403
+  `agent_identity_required`** for such a write. Higher roles (orchestrator/user)
+  may still attribute on behalf of others.
+- **Read — `visibility` is enforced.** For **agent**-role reads (`knowledge_get`,
+  `knowledge_list`/index, `knowledge_search`, `knowledge_context`), articles whose
+  `metadata.visibility` is `private` or `owner` are returned only to the owning
+  agent; others get `404`/exclusion with no existence leak. `shared` and
+  non-memory articles are unaffected. Higher roles continue to see everything.
+
+`visibility` scoping is now a real trust barrier for agent keys (not just a
+convenience filter). No MCP tool signatures changed.
+
 ## 2.20.1 — 2026-06-24 (honest story pagination)
 
 ### Fixed
@@ -60,8 +84,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   convenience filter, not a trust barrier.
 
 - Follow-on stories for write-path enforcement (binding `agent_id` to API key,
-  RLS-based `visibility` enforcement) are tracked separately with the operator's
-  explicit sign-off.
+  `visibility` enforcement) are tracked separately with the operator's explicit
+  sign-off. **Superseded by 2.21.0 — both are now enforced (#163).**
 
 ## 2.18.0 — 2026-06-23 (suggest typed links)
 

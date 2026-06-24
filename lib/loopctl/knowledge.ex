@@ -420,23 +420,41 @@ defmodule Loopctl.Knowledge do
         {:error, :not_found}
 
       article ->
-        article =
-          AdminRepo.preload(article,
-            outgoing_links: :target_article,
-            incoming_links: :source_article
+        # Visibility enforcement (#163): a private/owner memory the caller doesn't
+        # own resolves to :not_found — no existence leak, no access recorded.
+        if visible_to_caller?(article, Keyword.get(opts, :visibility_agent_id)) do
+          article =
+            AdminRepo.preload(article,
+              outgoing_links: :target_article,
+              incoming_links: :source_article
+            )
+
+          Analytics.record_access(
+            tenant_id,
+            article.id,
+            Keyword.get(opts, :api_key_id),
+            "get",
+            Keyword.get(opts, :access_metadata, %{}),
+            attribution_context(opts)
           )
 
-        Analytics.record_access(
-          tenant_id,
-          article.id,
-          Keyword.get(opts, :api_key_id),
-          "get",
-          Keyword.get(opts, :access_metadata, %{}),
-          attribution_context(opts)
-        )
-
-        {:ok, article}
+          {:ok, article}
+        else
+          {:error, :not_found}
+        end
     end
+  end
+
+  # In-memory mirror of `maybe_filter_by_visibility/2` for single-article fetches.
+  # `nil` agent_id (higher roles) sees everything; an agent sees shared articles
+  # and its own memories.
+  defp visible_to_caller?(_article, nil), do: true
+
+  defp visible_to_caller?(article, agent_id) when is_binary(agent_id) do
+    metadata = article.metadata || %{}
+    visibility = metadata["visibility"] || metadata[:visibility] || "shared"
+    owner = metadata["agent_id"] || metadata[:agent_id]
+    visibility not in ["private", "owner"] or owner == agent_id
   end
 
   # Extracts the attribution context map from the caller's opts. Returns
@@ -732,6 +750,7 @@ defmodule Loopctl.Knowledge do
       base
       |> maybe_filter_by_category(Keyword.get(opts, :category))
       |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+      |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
@@ -1030,7 +1049,13 @@ defmodule Loopctl.Knowledge do
     # access_type="context" rather than duplicating as "search".
     search_opts =
       opts
-      |> Keyword.take([:project_id, :memory_types, :agents, :conversation_id])
+      |> Keyword.take([
+        :project_id,
+        :memory_types,
+        :agents,
+        :conversation_id,
+        :visibility_agent_id
+      ])
       |> Keyword.merge(
         limit: limit * 3,
         offset: 0,
@@ -1397,6 +1422,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
     |> maybe_filter_by_agents(Keyword.get(opts, :agents))
     |> maybe_filter_by_conversation_id(Keyword.get(opts, :conversation_id))
+    |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
   end
 
   # Agent-memory scoping via JSONB containment (`metadata @> '{"key": val}'`),
@@ -3460,6 +3486,24 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
     |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
     |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
+    |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+  end
+
+  # Visibility enforcement (#163): when `:visibility_agent_id` is set (the caller is
+  # an agent), hide other agents' `private`/`owner` memories. An article is visible
+  # when its `metadata.visibility` is absent or `shared`, OR the caller owns it
+  # (`metadata.agent_id` matches the caller's verified key identity). Higher roles
+  # pass no `:visibility_agent_id` and see everything. An agent with no key
+  # identity (agent_id "") owns nothing, so it sees only shared articles.
+  defp maybe_filter_by_visibility(query, nil), do: query
+
+  defp maybe_filter_by_visibility(query, agent_id) when is_binary(agent_id) do
+    where(
+      query,
+      [a],
+      fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata) or
+        fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
+    )
   end
 
   defp maybe_filter_by_project_id(query, nil), do: query

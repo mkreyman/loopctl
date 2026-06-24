@@ -21,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -168,7 +169,10 @@ defmodule LoopctlWeb.KnowledgeSearchController do
          {:ok, mode} <- validate_mode(params),
          :ok <- validate_search_limit(params, query_spec),
          {:ok, base_opts} <- build_opts(params) do
-      opts = Keyword.put(base_opts, :api_key_id, api_key_id)
+      opts =
+        base_opts
+        |> Keyword.put(:api_key_id, api_key_id)
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       case execute_search(tenant_id, query_spec, mode, opts) do
         {:ok, result} ->

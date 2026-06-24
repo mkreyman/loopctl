@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeContextController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -131,7 +132,11 @@ defmodule LoopctlWeb.KnowledgeContextController do
     role = conn.assigns.current_api_key.role
 
     with {:ok, query} <- validate_query(params) do
-      opts = params |> build_opts(role) |> Keyword.put(:api_key_id, api_key_id)
+      opts =
+        params
+        |> build_opts(role)
+        |> Keyword.put(:api_key_id, api_key_id)
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       case Knowledge.get_context(tenant_id, query, opts) do
         {:ok, result} ->
