@@ -579,7 +579,7 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id, category, tags, offset, limit, fields }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields }) {
   if (project_id && !UUID_RE.test(project_id)) {
     return {
       content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
@@ -593,6 +593,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, offset, li
   if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
   if (tags) params.set("tags", tags);
+  if (match) params.set("match", match);
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
   if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
@@ -616,13 +617,66 @@ async function knowledgeStats({ project_id }) {
   return toContent(result);
 }
 
-async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, limit, offset }) {
+async function knowledgeCount({
+  project_id,
+  category,
+  status,
+  tags,
+  match,
+  source_type,
+  source_id,
+  idempotency_key,
+}) {
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  if (category) params.set("category", category);
+  if (status) params.set("status", status);
+  if (tags) params.set("tags", tags);
+  if (match) params.set("match", match);
+  if (source_type) params.set("source_type", source_type);
+  if (source_id) params.set("source_id", source_id);
+  if (idempotency_key) params.set("idempotency_key", idempotency_key);
+  const qs = params.toString();
+  const path = qs ? `/api/v1/knowledge/count?${qs}` : "/api/v1/knowledge/count";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+async function knowledgeFacets({
+  project_id,
+  category,
+  status,
+  tags,
+  match,
+  tag_prefix,
+  limit,
+}) {
+  const params = new URLSearchParams();
+  params.set("group_by", "tag");
+  if (project_id) params.set("project_id", project_id);
+  if (category) params.set("category", category);
+  if (status) params.set("status", status);
+  if (tags) params.set("tags", tags);
+  if (match) params.set("match", match);
+  if (tag_prefix) params.set("tag_prefix", tag_prefix);
+  if (limit != null) params.set("limit", String(limit));
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/facets?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function knowledgeSearch({ q, project_id, story_id, category, tags, match, mode, limit, offset }) {
   const params = new URLSearchParams();
   if (q != null && q !== "") params.set("q", q);
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
   if (tags) params.set("tags", tags);
+  if (match) params.set("match", match);
   if (mode) params.set("mode", mode);
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
@@ -636,6 +690,7 @@ async function knowledgeList({
   category,
   status,
   tags,
+  match,
   source_type,
   source_id,
   idempotency_key,
@@ -648,6 +703,7 @@ async function knowledgeList({
   if (category) params.set("category", category);
   if (status) params.set("status", status);
   if (tags) params.set("tags", tags);
+  if (match) params.set("match", match);
   if (source_type) params.set("source_type", source_type);
   if (source_id) params.set("source_id", source_id);
   if (idempotency_key) params.set("idempotency_key", idempotency_key);
@@ -1862,6 +1918,11 @@ const TOOLS = [
           type: "string",
           description: "Optional: comma-separated tags; matches articles carrying ANY of them.",
         },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Optional: tag match mode — 'any' (default, OR) or 'all' (AND, every tag).",
+        },
         offset: {
           type: "integer",
           description: "Optional: rows to skip for pagination (default 0).",
@@ -1918,6 +1979,11 @@ const TOOLS = [
         tags: {
           type: "string",
           description: "Optional: comma-separated tags; matches articles carrying ANY of them.",
+        },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Optional: tag match mode — 'any' (default, OR) or 'all' (AND, every tag).",
         },
         source_type: {
           type: "string",
@@ -1980,6 +2046,66 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_count",
+    description:
+      "Count articles matching filters WITHOUT returning any rows. Accepts the same filters " +
+      "as knowledge_list (category, status, tags, match, source_type, source_id, " +
+      "idempotency_key, project_id). With tags + match:'all' it counts articles carrying ALL " +
+      "the tags; add status:'published' to answer \"how many PUBLISHED articles tagged both X " +
+      "and Y\". Removes the need to paginate rows just to count. Returns { count }.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", format: "uuid", description: "Optional: scope to a project UUID." },
+        category: { type: "string", description: "Optional: filter by category." },
+        status: { type: "string", description: "Optional: filter by status." },
+        tags: { type: "string", description: "Optional: comma-separated tags." },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Tag match mode: 'any' (default, OR) or 'all' (AND — carries every tag).",
+        },
+        source_type: { type: "string", description: "Optional: filter by source_type." },
+        source_id: { type: "string", description: "Optional: filter by source_id." },
+        idempotency_key: { type: "string", description: "Optional: filter by idempotency_key." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_facets",
+    description:
+      "Count articles grouped by each distinct tag, over the filtered set, WITHOUT returning " +
+      "rows. Returns { data: { tag: count }, meta: { distinct_count, truncated } }. " +
+      "meta.distinct_count is the TRUE number of distinct tags (independent of limit); " +
+      "meta.truncated flags when limit capped the rows. Each `count` is the number of distinct " +
+      "articles carrying that tag. Pass tag_prefix to restrict to a tag family (e.g. 'book-') " +
+      "so you get the DISTINCT count of that family (how many distinct books) plus per-member " +
+      "totals — without dragging tens of thousands of rows through context. Honors the same " +
+      "filters as knowledge_count (status, tags, match). Cost: unnests tags over the whole " +
+      "filtered set; on large tenants narrow with tag_prefix/category/status/project_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", format: "uuid", description: "Optional: scope to a project UUID." },
+        category: { type: "string", description: "Optional: filter by category." },
+        status: { type: "string", description: "Optional: filter by status." },
+        tags: { type: "string", description: "Optional: comma-separated tags." },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Tag match mode: 'any' (default, OR) or 'all' (AND).",
+        },
+        tag_prefix: {
+          type: "string",
+          description: "Optional: only tags starting with this literal prefix (e.g. 'book-').",
+        },
+        limit: { type: "integer", description: "Optional: max distinct tags in the result (default all, max 1000; values above 1000 are rejected with 400)." },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. Ranked, and returns PUBLISHED " +
@@ -2022,6 +2148,11 @@ const TOOLS = [
         tags: {
           type: "string",
           description: "Optional: comma-separated tags to filter by.",
+        },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Optional: tag match mode — 'any' (default, OR) or 'all' (AND, every tag).",
         },
         mode: {
           type: "string",
@@ -2874,6 +3005,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_stats":
       return await knowledgeStats(args);
+
+    case "knowledge_count":
+      return await knowledgeCount(args);
+
+    case "knowledge_facets":
+      return await knowledgeFacets(args);
 
     case "knowledge_search":
       return await knowledgeSearch(args);

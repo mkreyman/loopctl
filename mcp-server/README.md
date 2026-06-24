@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 57 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 59 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (57)
+## Tools (59)
 
 ### Project Tools
 
@@ -145,6 +145,8 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 |---|---|
 | `knowledge_index` | Browse/paginate the knowledge wiki catalog grouped by category. Honors `category`, `tags`, `offset`, `limit` with deterministic ordering so every article is reachable (`meta.categories` reports per-category totals over the whole filtered set). Use `fields` (default `id,title,category`; request `tags`/`status`/`updated_at` explicitly; `id` and `category` are always included) to keep the payload small. Optional: `project_id`, `story_id`, `category`, `tags`, `offset`, `limit`, `fields`. |
 | `knowledge_stats` | Aggregate article counts (`total`, `by_category`, `by_status`) via cheap `COUNT(*) GROUP BY` — no article metadata loaded. The right tool for "how many articles are in this project?" (`knowledge_index` pages metadata; `knowledge_search`'s `total_count` is query-dependent). Counts span all statuses. Optional: `project_id`. |
+| `knowledge_count` | Count articles matching filters **without returning rows**. Same filters as `knowledge_list` (`category`, `status`, `tags`, `match`, `source_type`, `source_id`, `idempotency_key`, `project_id`). With `tags`+`match: all` (+`status`) → "how many published articles tagged both X and Y". Returns `{ count }`. |
+| `knowledge_facets` | Count articles grouped by **distinct tag**, no rows. `tag_prefix` (e.g. `book-`) gives the distinct count of a tag family plus per-member totals. Returns `{ data: { tag: count }, meta: { distinct_count } }`. Optional: `category`, `status`, `tags`, `match`, `project_id`, `limit`. |
 | `knowledge_search` | Search the knowledge wiki by topic (keyword, semantic, or combined). Returns snippets. **Ranked, published-only, and LAGS writes by minutes while embeddings index — do NOT use for existence/idempotency/dedup checks (a fresh write false-negatives); use `knowledge_list` for that.** `q` is optional when `tags`/`category` are supplied — that **list mode** returns the complete filtered set paginated via `offset`/`limit` over `meta.total_count`. `meta.total_count` is mode-dependent — read `meta.total_count_scope` (`keyword_matches`/`ranked_corpus`/`merged_candidates`/`filtered_set`) and don't use a relevance-mode count to size the wiki (use `knowledge_list` or `knowledge_stats`). Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_list` | List articles (`id`, `title`, `category`, `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, timestamps), filtered + paginated. **Body-less summary by default** (safe to page up to `limit=1000`); pass `include_body: true` to also return `body`, in which case the page is bounded by a ~5 MB byte budget — continue via `meta.next_offset` while `meta.has_more`. **Lag-free, all-status** read of the DB of record — unlike `knowledge_search` (ranked, published-only, lags writes) and `knowledge_index` (id/title/category only). The right tool to enumerate/dedup/repair and for idempotency/existence checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read `meta.total_count` (exact). Single full body → `knowledge_get`; relevant bodies → `knowledge_context`; bulk dump → `knowledge_export`. Optional: `project_id`, `category`, `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, `offset`, `limit`, `include_body`. |
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |

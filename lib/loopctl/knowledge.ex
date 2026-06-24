@@ -79,6 +79,12 @@ defmodule Loopctl.Knowledge do
   @spec max_relevance_page_size() :: pos_integer()
   def max_relevance_page_size, do: @max_relevance_page_size
 
+  # Default/maximum number of facet rows (distinct tags) returned by `tag_facets/2`.
+  # An omitted `:limit` is bounded by this (not "all"), so a tenant with tens of
+  # thousands of distinct tags can't force an unbounded response; `distinct_count`
+  # still reports the true cardinality and `truncated` flags when rows were capped.
+  @max_facet_rows 1000
+
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
   # agent-callable memory/DoS vector. Full-content pages therefore return as many
@@ -698,7 +704,7 @@ defmodule Loopctl.Knowledge do
     base =
       base
       |> maybe_filter_by_category(Keyword.get(opts, :category))
-      |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+      |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
@@ -806,6 +812,124 @@ defmodule Loopctl.Knowledge do
     total = by_status |> Map.values() |> Enum.sum()
 
     %{total: total, by_category: by_category, by_status: by_status}
+  end
+
+  @doc """
+  Counts articles matching the given filters **without** returning any rows.
+
+  Accepts the same filters as `list_articles/2` (`:project_id`, `:category`,
+  `:status`, `:tags` + `:match`, `:source_type`, `:source_id`,
+  `:idempotency_key`), so a single call answers "how many *published* articles
+  tagged both X and Y" (status + `tags` + `match: :all`) without enumerating rows.
+
+  ## Returns
+
+  - `non_neg_integer()`
+  """
+  @spec count_articles(Ecto.UUID.t(), keyword()) :: non_neg_integer()
+  def count_articles(tenant_id, opts \\ []) do
+    from(a in Article, where: a.tenant_id == ^tenant_id)
+    |> apply_article_filters(opts)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  @doc """
+  Counts articles grouped by each distinct tag (a tag facet).
+
+  Unnests `tags` over the filtered article set and counts articles per tag, so
+  callers can get a **distinct-tag count** and per-tag totals without paginating
+  rows. Honors the same filters as `count_articles/2` (including `:status` and
+  `:tags`/`:match`), plus an optional `:tag_prefix` to restrict to a tag family
+  (e.g. `"book-"` to count distinct books). Ordered by descending count.
+
+  ## Parameters
+
+  - `opts` -- `list_articles/2` filters, plus:
+    - `:tag_prefix` -- only tags starting with this literal prefix (LIKE-escaped)
+    - `:limit` -- cap the number of facet rows (distinct tags) returned. Defaults
+      to and is capped at #{@max_facet_rows} (never unbounded). `count` is the
+      number of distinct articles carrying the tag (robust to duplicate tags in an
+      article's array).
+
+  Cost note: this unnests `tags` over the **whole filtered article set** and
+  groups — the tags GIN index does not accelerate the unnest/group/sort. On large
+  tenants narrow the scan with `:tag_prefix`, `:category`, `:status`, or
+  `:project_id` rather than calling it unfiltered.
+
+  ## Returns
+
+  - `%{facets: [%{tag: String.t(), count: non_neg_integer()}],
+      distinct_count: non_neg_integer(), truncated: boolean()}` --
+    `distinct_count` is the TRUE number of distinct tags (independent of `:limit`);
+    `truncated` is true when the row `:limit` returned fewer facet rows than that.
+  """
+  @spec tag_facets(Ecto.UUID.t(), keyword()) :: %{
+          facets: [%{tag: String.t(), count: non_neg_integer()}],
+          distinct_count: non_neg_integer(),
+          truncated: boolean()
+        }
+  def tag_facets(tenant_id, opts \\ []) do
+    base =
+      from(a in Article, where: a.tenant_id == ^tenant_id)
+      |> apply_article_filters(opts)
+
+    unnested =
+      from(a in subquery(base), select: %{tag: fragment("unnest(?)", a.tags), article_id: a.id})
+
+    # The unnested (article_id, tag) rows after the optional tag-family prefix
+    # filter. Both the true distinct count and the per-tag facet derive from this,
+    # so the prefix is applied exactly once.
+    tag_rows =
+      case Keyword.get(opts, :tag_prefix) do
+        prefix when is_binary(prefix) and prefix != "" ->
+          pattern = like_escape(prefix) <> "%"
+          from(t in subquery(unnested), where: like(t.tag, ^pattern))
+
+        _ ->
+          from(t in subquery(unnested))
+      end
+
+    row_limit = facet_row_limit(Keyword.get(opts, :limit))
+
+    facets =
+      from(t in subquery(tag_rows),
+        group_by: t.tag,
+        select: %{tag: t.tag, count: fragment("count(distinct ?)", t.article_id)},
+        order_by: [desc: fragment("count(distinct ?)", t.article_id), asc: t.tag],
+        limit: ^row_limit
+      )
+      |> AdminRepo.all()
+
+    returned = length(facets)
+
+    # The facet rows ARE the complete distinct-tag set unless we hit the row cap —
+    # only then is a second (count distinct) pass needed for the true total. This
+    # avoids the extra unnest/aggregate scan on the common (un-truncated) path.
+    distinct_count =
+      if returned < row_limit do
+        returned
+      else
+        from(t in subquery(tag_rows), select: fragment("count(distinct ?)", t.tag))
+        |> AdminRepo.one()
+        |> Kernel.||(0)
+      end
+
+    %{facets: facets, distinct_count: distinct_count, truncated: returned < distinct_count}
+  end
+
+  # An explicit positive `:limit` is honored up to @max_facet_rows; an omitted or
+  # non-positive limit defaults to @max_facet_rows (never unbounded).
+  defp facet_row_limit(n) when is_integer(n) and n > 0, do: min(n, @max_facet_rows)
+  defp facet_row_limit(_), do: @max_facet_rows
+
+  # Escapes LIKE metacharacters (\\, %, _) in a literal prefix so a caller-supplied
+  # `tag_prefix` is matched literally (no wildcard injection). Postgres LIKE uses
+  # backslash as the default escape character.
+  defp like_escape(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   # COUNT(*) GROUP BY <field>, returning a dense %{string_value => count} map
@@ -1242,7 +1366,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_status(status)
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
-    |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
   end
 
   # Fire-and-forget recording of search access for the result list.
@@ -2521,7 +2645,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_status(Keyword.get(opts, :status))
-    |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
     |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
     |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
@@ -2545,10 +2669,16 @@ defmodule Loopctl.Knowledge do
     where(query, [a], a.status == ^status)
   end
 
-  defp maybe_filter_by_tags(query, nil), do: query
-  defp maybe_filter_by_tags(query, []), do: query
+  # `match` is `:any` (array overlap `&&`, the back-compat OR semantics) or
+  # `:all` (array contains `@>` — articles carrying EVERY listed tag).
+  defp maybe_filter_by_tags(query, nil, _match), do: query
+  defp maybe_filter_by_tags(query, [], _match), do: query
 
-  defp maybe_filter_by_tags(query, tags) when is_list(tags) do
+  defp maybe_filter_by_tags(query, tags, :all) when is_list(tags) do
+    where(query, [a], fragment("? @> ?", a.tags, ^tags))
+  end
+
+  defp maybe_filter_by_tags(query, tags, _any) when is_list(tags) do
     where(query, [a], fragment("? && ?", a.tags, ^tags))
   end
 

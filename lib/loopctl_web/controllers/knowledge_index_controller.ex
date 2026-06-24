@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.TagMatch
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -69,7 +70,13 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       tags: [
         in: :query,
         type: :string,
-        description: "Comma-separated tags; matches articles carrying ANY of them",
+        description: "Comma-separated tags (match mode set by `match`, default ANY)",
+        required: false
+      ],
+      match: [
+        in: :query,
+        type: :string,
+        description: "Tag match mode: any (default, OR) or all (AND — carries every listed tag)",
         required: false
       ],
       limit: [
@@ -170,12 +177,14 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   defp parse_fields(_), do: {:error, :bad_request, "fields must be a comma-separated string"}
 
   defp build_opts(params) do
-    with {:ok, category} <- validate_category(params["category"]) do
+    with {:ok, category} <- validate_category(params["category"]),
+         {:ok, match} <- TagMatch.parse(params) do
       opts =
         []
         |> maybe_put(:project_id, parse_project_id(params["project_id"]))
         |> maybe_put(:category, category)
         |> maybe_put(:tags, parse_tags(params["tags"]))
+        |> Keyword.put(:match, match)
         |> maybe_put(:limit, parse_int(params["limit"]))
         |> maybe_put(:offset, parse_int(params["offset"]))
 

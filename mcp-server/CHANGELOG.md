@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.15.0 — 2026-06-23 (AND-tag filtering + count/facets)
+
+### Added
+
+- **`knowledge_count`** — count articles matching filters (category, status, tags,
+  `match`, source/idempotency, project) **without returning rows**. With
+  `tags` + `match: "all"` (+ `status`) it answers "how many published articles
+  tagged both X and Y" in one call. (#148 A2/A4)
+- **`knowledge_facets`** — count articles grouped by distinct tag, with an
+  optional `tag_prefix` to get the **distinct count of a tag family** (e.g. how
+  many distinct `book-*` books) plus per-member totals, no row enumeration. (#148 A3)
+- **`match` param** on `knowledge_list`, `knowledge_index`, and `knowledge_search`:
+  `any` (default, OR — back-compat) or `all` (AND — articles carrying every listed
+  tag). Lets agents ask for "book hubs" (`tags: "book,hub", match: "all"`) instead
+  of the union. (#148 A2 / M1)
+
 ## 2.14.0 — 2026-06-23 (lag-free enumeration honors large pages)
 
 ### ⚠️ Breaking Change

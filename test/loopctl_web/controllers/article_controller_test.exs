@@ -702,6 +702,48 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body_tags["meta"]["total_count"] == 1
       assert hd(body_tags["data"])["title"] == "Pattern A"
     end
+
+    test "match=all ANDs tags; default ORs them (#148 A2)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{tenant_id: tenant.id, title: "Book Hub", tags: ["book", "hub"]})
+      fixture(:article, %{tenant_id: tenant.id, title: "Book Only", tags: ["book"]})
+      fixture(:article, %{tenant_id: tenant.id, title: "Hub Only", tags: ["hub"]})
+
+      # AND: only the article carrying BOTH tags
+      and_body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=book,hub&match=all")
+        |> json_response(200)
+
+      assert and_body["meta"]["total_count"] == 1
+      assert hd(and_body["data"])["title"] == "Book Hub"
+
+      # OR (default): the union of all three
+      or_body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=book,hub")
+        |> json_response(200)
+
+      assert or_body["meta"]["total_count"] == 3
+    end
+
+    test "rejects an invalid match with 400 (#148 A2)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles?tags=book&match=nonsense")
+        |> json_response(400)
+
+      assert resp["error"]["status"] == 400
+      assert resp["error"]["message"] =~ "match"
+    end
   end
 
   describe "GET /api/v1/articles — pagination limit (#148 A1)" do

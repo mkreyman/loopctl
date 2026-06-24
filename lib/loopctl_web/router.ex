@@ -299,6 +299,10 @@ defmodule LoopctlWeb.Router do
     # Knowledge Stats (aggregate counts by category/status)
     get "/knowledge/stats", KnowledgeStatsController, :stats
 
+    # Knowledge Count + Facets (filtered counts and count-by-tag, no rows)
+    get "/knowledge/count", KnowledgeFacetsController, :count
+    get "/knowledge/facets", KnowledgeFacetsController, :facets
+
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 
