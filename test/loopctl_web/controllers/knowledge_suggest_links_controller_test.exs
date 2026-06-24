@@ -38,28 +38,43 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
 
-  describe "suggestion query shape (#168 RED→GREEN structural guard)" do
-    # The production 500 couldn't be reproduced in the test DB (the column is
-    # vector(1536) and PostgrexTypes is shared across envs, so the stored-vector
-    # re-interpolation encodes fine locally). This guard instead asserts the QUERY
-    # SHAPE that caused it is gone: the target vector must NOT be a bound parameter,
-    # and the cosine must be computed between two embedding COLUMNS. Both assertions
-    # FAIL on the pre-fix query (which bound `^embedding::vector`) and PASS on the fix.
-    test "does not re-interpolate the target vector as a query parameter" do
+  describe "suggestion query shape (#168 + #172 RED→GREEN structural guard)" do
+    # Neither production 500 reproduces in the test DB: #168 (re-interpolating a stored
+    # %Pgvector{}) encodes fine locally, and #172 (a full-corpus scan + sort) only times
+    # out at prod scale (~76k published articles) — a handful of test rows never exhibit
+    # it. This guard asserts the QUERY SHAPE instead, catching BOTH regressions:
+    #
+    #   * #172: the target embedding is a BOUND list parameter and the `articles` table
+    #     appears EXACTLY ONCE — there is no self-join to read the target vector as a
+    #     column. The bound-`^param` left-vs-const form is what the HNSW index
+    #     (`articles_embedding_idx`, vector_cosine_ops) accelerates; the old self-join
+    #     forced a per-row cosine + full sort over the whole corpus.
+    #   * #168: that bound param is a plain LIST of floats, NEVER the stored `%Pgvector{}`
+    #     struct (binding the struct was the original 500).
+    #
+    # A literal 76k-row seed is infeasible in an async unit test, so the indexable
+    # SQL shape is the durable, non-flaky proxy for "does not full-scan at scale."
+    test "binds the target as a list param (HNSW-indexable), with no full-corpus self-join" do
       {tenant, _key} = setup_tenant_key()
       target = embedded(tenant.id, "T", [1.0, 0.0])
 
-      query = Knowledge.suggestion_candidates_query(tenant.id, target.id, 0.5, 5, nil)
+      query =
+        Knowledge.suggestion_candidates_query(tenant.id, target.id, e([1.0, 0.0]), 0.5, 5, nil)
+
       {sql, params} = SQL.to_sql(:all, AdminRepo, query)
 
-      # No parameter is a vector/list — only ids, threshold, limit. The #168 bug
-      # bound the stored target vector here.
-      refute Enum.any?(params, fn p -> is_list(p) or match?(%Pgvector{}, p) end)
+      # #172: the target vector is a BOUND parameter (a list), enabling the indexable
+      # `ORDER BY embedding <=> $const LIMIT k` form.
+      assert Enum.any?(params, &is_list/1)
 
-      # The distance is computed between two `embedding` COLUMNS (the candidate's and
-      # the self-joined target's) — not a column vs a parameter.
+      # #168: that param is a plain list, NEVER the stored %Pgvector{} struct.
+      refute Enum.any?(params, &match?(%Pgvector{}, &1))
+
+      # #172: exactly one `articles` table reference — no self-join driving a
+      # full-corpus scan. (The only other table is the `article_links` exclusion join.)
       assert sql =~ "<=>"
-      assert length(Regex.scan(~r/\."embedding"/, sql)) >= 2
+      assert length(Regex.scan(~r/"articles"/, sql)) == 1
+      assert sql =~ ~r/order by .*<=>/i
     end
   end
 
