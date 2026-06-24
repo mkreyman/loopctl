@@ -2096,7 +2096,7 @@ const TOOLS = [
           type: "string",
           description: "Optional: only tags starting with this literal prefix (e.g. 'book-').",
         },
-        limit: { type: "integer", description: "Optional: max facet rows (default all, max 1000)." },
+        limit: { type: "integer", description: "Optional: max distinct tags in the result (default all, max 1000; values above 1000 are rejected with 400)." },
       },
       required: [],
     },

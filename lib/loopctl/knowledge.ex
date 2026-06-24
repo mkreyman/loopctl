@@ -79,6 +79,12 @@ defmodule Loopctl.Knowledge do
   @spec max_relevance_page_size() :: pos_integer()
   def max_relevance_page_size, do: @max_relevance_page_size
 
+  # Default/maximum number of facet rows (distinct tags) returned by `tag_facets/2`.
+  # An omitted `:limit` is bounded by this (not "all"), so a tenant with tens of
+  # thousands of distinct tags can't force an unbounded response; `distinct_count`
+  # still reports the true cardinality and `truncated` flags when rows were capped.
+  @max_facet_rows 1000
+
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
   # agent-callable memory/DoS vector. Full-content pages therefore return as many
@@ -840,49 +846,74 @@ defmodule Loopctl.Knowledge do
 
   - `opts` -- `list_articles/2` filters, plus:
     - `:tag_prefix` -- only tags starting with this literal prefix (LIKE-escaped)
-    - `:limit` -- cap the number of facet rows returned (default all)
+    - `:limit` -- cap the number of facet rows (distinct tags) returned. Defaults
+      to and is capped at #{@max_facet_rows} (never unbounded). `count` is the
+      number of distinct articles carrying the tag (robust to duplicate tags in an
+      article's array).
+
+  Cost note: this unnests `tags` over the **whole filtered article set** and
+  groups — the tags GIN index does not accelerate the unnest/group/sort. On large
+  tenants narrow the scan with `:tag_prefix`, `:category`, `:status`, or
+  `:project_id` rather than calling it unfiltered.
 
   ## Returns
 
-  - `%{facets: [%{tag: String.t(), count: pos_integer()}], distinct_count: non_neg_integer()}`
+  - `%{facets: [%{tag: String.t(), count: non_neg_integer()}],
+      distinct_count: non_neg_integer(), truncated: boolean()}` --
+    `distinct_count` is the TRUE number of distinct tags (independent of `:limit`);
+    `truncated` is true when the row `:limit` returned fewer facet rows than that.
   """
   @spec tag_facets(Ecto.UUID.t(), keyword()) :: %{
           facets: [%{tag: String.t(), count: non_neg_integer()}],
-          distinct_count: non_neg_integer()
+          distinct_count: non_neg_integer(),
+          truncated: boolean()
         }
   def tag_facets(tenant_id, opts \\ []) do
     base =
       from(a in Article, where: a.tenant_id == ^tenant_id)
       |> apply_article_filters(opts)
 
-    unnested = from(a in subquery(base), select: %{tag: fragment("unnest(?)", a.tags)})
+    unnested =
+      from(a in subquery(base), select: %{tag: fragment("unnest(?)", a.tags), article_id: a.id})
 
-    facet_query =
-      from(t in subquery(unnested),
-        group_by: t.tag,
-        select: %{tag: t.tag, count: count(t.tag)},
-        order_by: [desc: count(t.tag), asc: t.tag]
-      )
-
-    facet_query =
+    # The unnested (article_id, tag) rows after the optional tag-family prefix
+    # filter. Both the true distinct count and the per-tag facet derive from this,
+    # so the prefix is applied exactly once.
+    tag_rows =
       case Keyword.get(opts, :tag_prefix) do
         prefix when is_binary(prefix) and prefix != "" ->
           pattern = like_escape(prefix) <> "%"
-          where(facet_query, [t], like(t.tag, ^pattern))
+          from(t in subquery(unnested), where: like(t.tag, ^pattern))
 
         _ ->
-          facet_query
+          from(t in subquery(unnested))
       end
 
-    facet_query =
-      case Keyword.get(opts, :limit) do
-        n when is_integer(n) and n > 0 -> limit(facet_query, ^n)
-        _ -> facet_query
-      end
+    # True distinct-tag cardinality over the filtered/prefixed set — independent
+    # of the row `:limit`, so a capped result still reports the real total.
+    distinct_count =
+      from(t in subquery(tag_rows), select: fragment("count(distinct ?)", t.tag))
+      |> AdminRepo.one()
+      |> Kernel.||(0)
 
-    facets = AdminRepo.all(facet_query)
-    %{facets: facets, distinct_count: length(facets)}
+    row_limit = facet_row_limit(Keyword.get(opts, :limit))
+
+    facets =
+      from(t in subquery(tag_rows),
+        group_by: t.tag,
+        select: %{tag: t.tag, count: fragment("count(distinct ?)", t.article_id)},
+        order_by: [desc: fragment("count(distinct ?)", t.article_id), asc: t.tag],
+        limit: ^row_limit
+      )
+      |> AdminRepo.all()
+
+    %{facets: facets, distinct_count: distinct_count, truncated: length(facets) < distinct_count}
   end
+
+  # An explicit positive `:limit` is honored up to @max_facet_rows; an omitted or
+  # non-positive limit defaults to @max_facet_rows (never unbounded).
+  defp facet_row_limit(n) when is_integer(n) and n > 0, do: min(n, @max_facet_rows)
+  defp facet_row_limit(_), do: @max_facet_rows
 
   # Escapes LIKE metacharacters (\\, %, _) in a literal prefix so a caller-supplied
   # `tag_prefix` is matched literally (no wildcard injection). Postgres LIKE uses

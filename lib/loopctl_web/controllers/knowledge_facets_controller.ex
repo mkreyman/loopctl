@@ -92,7 +92,12 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
       tags: [in: :query, type: :string, description: "Filter by tags (comma-separated)"],
       match: [in: :query, type: :string, description: "Tag match mode: any (default) or all"],
       project_id: [in: :query, type: :string, description: "Filter by project UUID"],
-      limit: [in: :query, type: :integer, description: "Max facet rows (default all, max 1000)"]
+      limit: [
+        in: :query,
+        type: :integer,
+        description:
+          "Max distinct tags in the facet result (default all, max 1000; values above 1000 rejected with 400)"
+      ]
     ],
     responses: %{
       200 =>
