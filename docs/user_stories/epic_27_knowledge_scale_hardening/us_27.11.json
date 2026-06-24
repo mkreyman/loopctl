@@ -1,0 +1,110 @@
+{
+  "id": "US-27.11",
+  "title": "Connection-pool sizing / dedicated heavy-read pool (with tenant-isolation + pool-level params)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "pool_bulk",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 4; reviews: 27.4/27.6 are shaped around this story's absence",
+    "includes": "ADMIN_POOL_SIZE defaults to 3; the transaction-based first #172 fix caused pool starvation on it (caught in adversarial review). Heavy analytical/vector reads run on AdminRepo (BYPASSRLS). A pool-level `statement_timeout`/`hnsw.ef_search` parameter is the clean lever US-27.4 and US-27.6b need."
+  },
+  "priority_note": "Bumped to HIGH (was medium): two high-priority stories (US-27.4 timeout mechanism, US-27.6a's no-per-request-transaction constraint) are shaped around the 3-conn pool. Sizing it removes that constraint and unblocks them.",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "the admin/BYPASSRLS read workload sized appropriately (or a dedicated heavy-read pool added with pool-level statement_timeout/ef_search parameters), without breaking tenant isolation or exhausting the DB",
+    "so_that": "concurrent heavy vector/enumeration reads don't starve each other or other admin ops, and US-27.4/27.6b get a safe place to set server-side timeouts and ef_search without a per-request transaction"
+  },
+  "rationale": "A 3-connection admin pool lets three concurrent heavy reads monopolize all admin DB capacity (it already distorted the #172 fix). Right-sizing it — or isolating heavy reads on a dedicated pool whose `:parameters` carry the server-side statement_timeout and ef_search — removes that hidden coupling and is the clean mechanism for the timeout (US-27.4) and recall (US-27.6b) levers. A second BYPASSRLS pool is itself a tenant-isolation surface, so isolation must be re-proven on it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.11.1",
+      "description": "The admin/heavy-read pool is sized to a TESTABLE target: it supports K concurrent heavy reads (K = documented expected concurrency) plus light admin ops without DBConnection checkout/queue timeouts (verified in TC-27.11.1); the chosen size and the K it supports are documented (no vague 'justified value'). The K budget EXPLICITLY accounts for long-held streamed-export checkouts (US-27.16) — which occupy a connection for minutes, a different profile than sub-2s reads — not only fast vector reads.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.11.2",
+      "description": "Pool size stays env-configurable (ADMIN_POOL_SIZE / a new heavy-read pool size) with the new default + rationale documented in config and the US-27.5 runbook.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.11.3",
+      "description": "Server-side defaults are set by the CORRECT mechanism per GUC type: `statement_timeout` is a CORE GUC and IS settable via the repo `:parameters` (startup packet) — verified. `hnsw.ef_search` is a pgvector CUSTOM GUC that does NOT exist until the extension loads per-session, so a Postgrex `:parameters` startup entry is commonly REJECTED on managed PG (fly mpg/RDS: 'unrecognized configuration parameter'). If ef_search must be raised, use `ALTER ROLE <heavy_read_role> SET hnsw.ef_search = N` (or ALTER DATABASE), applied per-session after extension load — NOT `:parameters`. A test connects through the pool and asserts `SHOW hnsw.ef_search` returns N; the working mechanism is recorded in the US-27.5 runbook. If NO mechanism reliably applies on fly mpg, ef_search stays at the default (40) and recall is handled by over-fetch + the US-27.6b under-fill signal (do not over-promise a lever that doesn't work).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.11.4",
+      "description": "Tenant isolation on the new surface is STRUCTURAL, not just per-query-tested: a dedicated heavy-read repo is fronted by a wrapper/context that REQUIRES a tenant_id argument and injects the predicate (or a Credo/test guard flags any direct HeavyReadRepo.all/one/stream whose query lacks a tenant_id filter), so a new heavy read (incl. the 27.16 export stream and 27.12 bulk paths if they route through it) cannot forget tenant scoping by construction. Plus a tenant-isolation test proving tenant A cannot read tenant B's rows through the new pool.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.11.5",
+      "description": "The sum of all configured pools fits within the LIVE managed-Postgres max_connections with headroom for migrations/console — verified against the actual DB setting (or a runbook step to re-verify post-deploy), not only a documented constant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.11.6",
+      "description": "After sizing, US-27.4's timeout mechanism is (re-)verified against the new pool (so 27.4 isn't validated under the old 3-conn assumption and then changed underneath).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.11.1",
+      "name": "K concurrent heavy reads don't starve other admin ops",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)",
+        "Pool sized per this story; K defined"
+      ],
+      "steps": [
+        "Issue K concurrent heavy vector reads while issuing a light admin read"
+      ],
+      "expected_results": [
+        "The light admin read does not fail with a checkout/queue timeout; no cascade of 500s"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.11.2",
+      "name": "Heavy-read pool is tenant-isolated",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a, tenant_b with embedded articles; heavy-read repo configured"
+      ],
+      "steps": [
+        "Run a heavy read for tenant_a through the new pool"
+      ],
+      "expected_results": [
+        "No tenant_b rows returned; explicit tenant_id predicate enforced"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.11.3",
+      "name": "Configured pools fit within LIVE max_connections",
+      "type": "integration",
+      "preconditions": [
+        "Config loaded; live DB reachable (or runbook step)"
+      ],
+      "steps": [
+        "Sum configured pool sizes; compare to the live SHOW max_connections"
+      ],
+      "expected_results": [
+        "Total + headroom <= live max_connections"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Config: config/runtime.exs ADMIN_POOL_SIZE (default 3) + main Repo (10). AdminRepo is BYPASSRLS.",
+    "Option A: raise ADMIN_POOL_SIZE. Option B: Loopctl.HeavyReadRepo with its own pool + `:parameters` (statement_timeout, hnsw.ef_search). B isolates better AND gives 27.4/27.6b their clean lever; document the trade-off.",
+    "fly mpg max_connections is finite and can change out-of-band — AC-27.11.5 must check the LIVE value, not a constant; TC-27.11.3 should query SHOW max_connections.",
+    "A new BYPASSRLS repo MUST keep explicit tenant_id on every query (CLAUDE.md: every context fn takes tenant_id; every test has a tenant-isolation case).",
+    "This removes the constraint that forced the #172 fix to avoid a per-request transaction; US-27.4/27.6b depend on the outcome."
+  ],
+  "dependencies": ["US-27.1"],
+  "estimated_hours": 8
+}

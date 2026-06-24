@@ -1,0 +1,98 @@
+{
+  "id": "US-27.7b",
+  "title": "Make distant_pairs & novelty index-correct on their own shapes (NOT nearest/4) + document them as the lint exceptions",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 2; architect review (category-error finding)",
+    "includes": "distant_pairs (do_distant_pairs) is a column-to-column self-join `a.embedding <=> b.embedding` over a bounded sampled subquery — there is NO $const target, so HNSW cannot apply. nearest_prior_distance is `MIN(embedding <=> $const)` — an aggregate, not a top-k ORDER BY, also not HNSW-accelerable. Neither fits VectorSearch.nearest/4."
+  },
+  "priority_note": "Prevents a category error: forcing these onto nearest/4 would change their semantics. They share helpers where sensible and are the NAMED documented exceptions for the 'no hand-rolled cosine' lint.",
+  "story": {
+    "as_a": "loopctl engineer",
+    "i_want_to": "keep distant_pairs and novelty (nearest_prior_distance) on their correct, bounded shapes — reusing the helper's to_embedding_list and candidate-sampling where applicable — and register them explicitly as the documented exceptions to the 'no hand-rolled cosine ORDER BY outside the helper' guard",
+    "so_that": "their behavior and bounds are preserved (not regressed by a forced migration), and the lint (US-27.8) doesn't false-positive on two legitimately-different shapes"
+  },
+  "rationale": "distant_pairs is column-to-column and novelty is a MIN aggregate; neither is a top-k-against-a-constant, so neither can or should consume nearest/4 — routing them through it would change recall semantics. The honest design keeps their shapes, shares only the safe bits (vector list conversion, bounded candidate sampling), and names them up front as the guard's exceptions so the reintroduction-lint stays meaningful.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.7b.1",
+      "description": "distant_pairs and nearest_prior_distance are NOT migrated to VectorSearch.nearest/4; the change is limited to sharing to_embedding_list/1 and (for pairs) the bounded candidate-sampling subquery. Their distance computation and outputs are unchanged (behavior-preserving).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7b.2",
+      "description": "Their existing bounds are preserved and verified: distant_pairs keeps max_pair_candidates() sampling + its timeout; novelty keeps its prior-set scoping + timeout. Outputs (pairs list/meta, novelty_scores) are identical to pre-change.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7b.3",
+      "description": "Both are registered as the NAMED, documented exceptions to the US-27.8 'no hand-rolled cosine ORDER BY/distance outside the helper' guard, with a one-line rationale each (column-to-column self-join; MIN aggregate) — so the guard does not false-positive and the exceptions are auditable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7b.4",
+      "description": "Each remains tenant-scoped and within its documented latency at scale (US-27.8 covers them too); if either is found to full-scan at scale, it is corrected on its own shape (e.g. the pairs sampling bound) until the gate passes.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.7b.1",
+      "name": "distant_pairs output unchanged after sharing helpers",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); embedded articles at known distances"
+      ],
+      "steps": [
+        "Call distant_pairs before/after the change with the same inputs"
+      ],
+      "expected_results": [
+        "Identical pairs and meta; bounds (max_pair_candidates) preserved"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.7b.2",
+      "name": "novelty scores unchanged",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); priors tagged; an idea"
+      ],
+      "steps": [
+        "Call novelty_scores before/after"
+      ],
+      "expected_results": [
+        "Identical novelty_score values and prior_count"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.7b.3",
+      "name": "Lint treats them as known exceptions, not violations",
+      "type": "unit",
+      "preconditions": [
+        "The US-27.8 reintroduction guard"
+      ],
+      "steps": [
+        "Run the guard over the module"
+      ],
+      "expected_results": [
+        "do_distant_pairs and nearest_prior_distance are recognized as registered exceptions; no false-positive failure"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "do_distant_pairs (knowledge.ex ~3220) — column-to-column BETWEEN over a LIMIT max_pair_candidates() sampled subquery; not HNSW-eligible by nature.",
+    "nearest_prior_distance (knowledge.ex ~3553) — MIN(embedding <=> $const::vector) aggregate; routing through a top-k helper would change recall semantics (top-k then min != true min over the set).",
+    "Share to_embedding_list/1 for the [float()] conversion; do NOT force the nearest/4 shape.",
+    "Register both in whatever mechanism US-27.8 uses for the 'no hand-rolled cosine' guard (an allowlist with rationale)."
+  ],
+  "dependencies": ["US-27.6a"],
+  "estimated_hours": 6
+}

@@ -1,0 +1,84 @@
+{
+  "id": "US-27.15",
+  "title": "Telemetry metrics + alerting for vector latency, db_statement_timeout, and recall under-fill",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "medium",
+  "phase": "scale_observability",
+  "status": "pending",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1 observability; BA L2, adversarial F8",
+    "includes": "US-27.3/27.4 produce structured LOGS (sqlstate, slow-query duration); US-27.6b emits an under-fill telemetry event. But 'recurring slow queries are visible before they become incidents' is hard to satisfy with grep-the-logs alone — there is no metric/dashboard/alert. loopctl has no Sentry; logs go to stdout (fly logs)."
+  },
+  "priority_note": "Turns the logs/events from 27.3/27.4/27.6b into watchable metrics + alerts. Mildly beyond the epic's literal 'logged structured errors' acceptance — confirm scope (could be a fast-follow) — but directly serves the 'visible before incidents' promise.",
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "the structured signals this epic emits (db_statement_timeout, slow-query duration, vector-query latency, recall under-fill) exposed as :telemetry metrics with at least a threshold-based alert path",
+    "so_that": "I can SEE a degradation trend (rising timeouts, creeping latency, frequent under-fill) before it becomes an incident, instead of discovering it by grepping logs after users complain"
+  },
+  "rationale": "The whole epic exists because a real degradation was invisible until users hit it. Logs make the cause discoverable AFTER you know to look; metrics + alerts make the trend visible BEFORE the cliff. Aggregating the already-emitted telemetry into counters/histograms with an alert threshold is the difference between 'observable in hindsight' and 'caught early', which is the operational intent behind Theme 1.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.15.1",
+      "description": "A telemetry/metrics layer aggregates: a counter of db_statement_timeout (57014) by endpoint; a histogram of vector-query and enumeration latency by endpoint; a counter of recall under-fill (from US-27.6b) by endpoint — emitted as :telemetry metrics (Telemetry.Metrics) consumable by a reporter.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.15.2",
+      "description": "At least one alert path exists (e.g. a log-based alert rule, or a metrics reporter threshold) that fires when timeout rate, p95 latency, or under-fill rate crosses a configurable threshold over a window — documented in the runbook (US-27.5).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.15.3",
+      "description": "Metrics carry safe dimensions only (endpoint, status/sqlstate) — NO vector literals, bodies, or params. Cardinality is CONCRETELY bounded: tenant_id is a label ONLY when total tenants <= a documented cap (e.g. 1000) and even then only on counters, NOT histograms (endpoint × tenant × buckets blows up in a multi-tenant SaaS); above the cap, tenant_id is dropped from labels (per-tenant attribution falls back to logs). A test asserts the label set cannot grow unboundedly (no per-article-id label; tenant label gated by the cap).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.15.4",
+      "description": "Scope is confirmed with the USER: if a full dashboard/alerting stack is out of scope for this epic, the minimum (telemetry metric emission + a documented threshold) ships here and the dashboard is recorded as a backlog item with sign-off — not silently dropped (the story narrative promises 'visible before incidents').",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.15.1",
+      "name": "Timeout and under-fill increment their counters",
+      "type": "integration",
+      "preconditions": [
+        "Telemetry metrics attached; seams to force a 57014 and an under-fill"
+      ],
+      "steps": [
+        "Trigger one statement timeout and one under-fill"
+      ],
+      "expected_results": [
+        "db_statement_timeout counter += 1 (labeled by endpoint); under_fill counter += 1"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.15.2",
+      "name": "Metrics carry no sensitive content and bounded cardinality",
+      "type": "unit",
+      "preconditions": [
+        "Metric definitions"
+      ],
+      "steps": [
+        "Inspect the metric tags"
+      ],
+      "expected_results": [
+        "Tags are endpoint/tenant_id/status only; no vectors/bodies/params; no per-article-id label"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Hook: the US-27.4 repo :telemetry handler + the US-27.6b under-fill event + the US-27.3 timeout mapping all already emit events — this story aggregates them via Telemetry.Metrics.",
+    "Reporter: whatever loopctl already uses (or a simple LoggerMetrics reporter) — full Prometheus/Grafana may be out of scope; ship metric emission + a threshold at minimum.",
+    "Bounded cardinality: never label by article_id or raw vector; tenant_id is acceptable if tenant count is bounded.",
+    "Confirm scope with USER (AC-27.15.4) — this may be a fast-follow rather than in-epic; record the decision."
+  ],
+  "dependencies": ["US-27.3", "US-27.4", "US-27.6b"],
+  "estimated_hours": 6
+}

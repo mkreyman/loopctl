@@ -1,0 +1,88 @@
+{
+  "id": "US-27.13",
+  "title": "Remediate every vector/enumeration endpoint the scale gate proves broken",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175; BA review C1 (the detect→fix seam)",
+    "includes": "US-27.1/27.2/27.8 build the apparatus to DETECT a full-scan/over-budget endpoint at scale; US-27.6a/27.7a re-route the fitting endpoints. But once the harness exists and is run at ≥prod scale, some endpoint (e.g. a path not covered by the helper, or one only 'proven' on search_semantic) may go RED — and no other story OWNS fixing it. That is the green-but-broken trap one level up."
+  },
+  "priority_note": "Without this, the epic can pass its own gates and still ship a broken endpoint with no owner. This is the epic's whole reason for existing.",
+  "story": {
+    "as_a": "loopctl engineer",
+    "i_want_to": "a contracted remediation pass that takes every endpoint the new scale gate (US-27.8) proves full-scanning or over-budget at ≥prod scale and fixes it (via the kNN helper or its own correct shape) until the gate and the live-build confirmation pass",
+    "so_that": "the alarm built by Theme 1/2 is actually acted on — the epic delivers WORKING endpoints at scale, not just a red light next to broken ones"
+  },
+  "rationale": "Building an excellent alarm and an excellent replacement part is worthless if nothing is contracted to act when the alarm fires on an endpoint the replacement part didn't fully fix. This story closes the detect→fix seam: it enumerates the gate's RED endpoints and owns their correction, each verified at scale AND on the live deployed build per the US-27.5 checklist.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.13.1",
+      "description": "Run the US-27.8 scale gate against the ≥prod corpus across ALL vector + enumeration endpoints and record the full pass/fail matrix (plan + latency) as the remediation work-list.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.13.2",
+      "description": "For every endpoint that fails the plan assertion (full Seq Scan) or the latency budget, the query is corrected (via US-27.6a helper or its own index-correct shape) until the gate passes; the fix is behavior/contract-preserving.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.13.3",
+      "description": "Each remediated endpoint gets the US-27.5 live-build confirmation: EXPLAIN ANALYZE under the timeout on the deployed build + the live endpoint returns 200 (and correct results) on representative inputs — not 'verified' on CI alone.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.13.4",
+      "description": "If the gate matrix is all-green from the outset, that is a valid outcome — BUT only when (a) the matrix records its calibration provenance (seed count >= PROD_ARTICLE_FLOOR and the effective ef_search), rejecting any matrix that can't confirm calibration as INVALID rather than 'all-green' (so a mis-calibrated CI run can't rubber-stamp); AND (b) the US-27.5 live-build confirmation is still run on at least the historically-broken endpoint (suggested_links) — an empty work-list is proven against prod, not just against the same author's CI gate.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.13.5",
+      "description": "Tenant isolation and external contracts are preserved for every remediated endpoint.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.13.1",
+      "name": "Scale gate matrix recorded and all endpoints green",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "Run the US-27.8 plan+latency assertions for every vector/enumeration endpoint"
+      ],
+      "expected_results": [
+        "Every endpoint passes (or each failure has a recorded fix that then passes)"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.13.2",
+      "name": "A remediated endpoint is confirmed on the live build",
+      "type": "integration",
+      "preconditions": [
+        "A previously-RED endpoint, fixed and deployed"
+      ],
+      "steps": [
+        "Per US-27.5 runbook: prod EXPLAIN ANALYZE + hit the live endpoint"
+      ],
+      "expected_results": [
+        "Index-backed + under timeout on prod; live endpoint returns 200 with correct results"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "This story is gated by the harness (US-27.8) and the helper (US-27.6a/27.7a/27.7b) existing; it is the 'act on the alarm' step.",
+    "Likely candidates to go RED at scale: any endpoint not routed through the helper, the auto-link worker, or an enumeration without the keyset index — but the matrix (AC-27.13.1) is the source of truth, not speculation.",
+    "Use the US-27.5 closing checklist as the definition of done per endpoint.",
+    "No-deferrals: a RED endpoint is fixed here, not filed for later."
+  ],
+  "dependencies": ["US-27.8", "US-27.6a", "US-27.7a", "US-27.7b", "US-27.5"],
+  "estimated_hours": 12
+}

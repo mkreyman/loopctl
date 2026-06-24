@@ -1,0 +1,144 @@
+{
+  "id": "US-27.1",
+  "title": "Large-corpus scale fixture (committed, ANALYZEd, ≥ prod size) for representative testing",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "scale_observability",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1; incident: suggested_links #168→#170→#172→#173 (4 attempts)",
+    "includes": "The prod KB has ~76k published articles with vector(1536) embeddings + an HNSW cosine index. The test DB holds a handful of rows, so the planner never makes the cost-based choices (HNSW index vs Seq Scan) that only appear at scale. Three CI-green, enhanced-reviewed fixes shipped broken because of this gap."
+  },
+  "priority_note": "Theme 1 first: without reproduce-at-scale, every later perf story is a blind guess. Unblocks US-27.2 and the Theme 2 index guards.",
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "seed a representative large corpus (default ≥ current prod published-article count, with embeddings and inter-article links) as a COMMITTED dataset (not inside the rolled-back async sandbox), with ANALYZE run so the planner has real statistics",
+    "so_that": "vector and enumeration endpoints can be exercised on data large enough — and statistically fresh enough — that the query planner behaves as it does in production, instead of passing on a 6-row sandbox table that can never reproduce a full-scan timeout"
+  },
+  "rationale": "The root cause of the four-attempt suggested_links saga was a non-representative test environment: a fix is proven on a toy DB, ships 'green', and the real prod planner behavior is invisible until the live endpoint is hit. A reusable, committed, ANALYZEd large-corpus fixture makes scale-dependent regressions reproducible in an automated gate, which is the precondition for honestly verifying every other story in this epic.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.1.1",
+      "description": "A seeding helper (Loopctl.Knowledge.ScaleSeed.seed/2 and/or a `mix loopctl.seed_scale` task) inserts a configurable N published articles for a tenant_id, each with a non-null vector(1536) embedding, using AdminRepo.insert_all in batches (e.g. 1_000/batch) so seeding the default N completes within a documented budget (target < 3 min on CI hardware).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.2",
+      "description": "Seeded embeddings are deterministic from the row index (e.g. a phash2-seeded float list, L2-normalized) so runs are reproducible without Math.random/Date.now, AND spread across the vector space so cosine ordering is meaningful (vector for index i differs from i+1).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.3",
+      "description": "The helper seeds inter-article links (article_links) at a configurable density (default ~5 links/article among nearest neighbors) so the already-linked anti-join path and 'densely-linked hub' recall behavior are exercised at scale.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.4",
+      "description": "Seeding COMMITS its rows (it does NOT run inside the DataCase async sandbox transaction, which would roll back and leave the planner seeing 0 rows). The scale-seed path runs against a dedicated DB with async: false; an explicit guard/comment prevents accidental use inside the sandbox.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.5",
+      "description": "After bulk insert, the helper runs `ANALYZE articles` (and article_links) and BLOCKS until complete, then verifies pg_stat_user_tables.n_live_tup/last_analyze for articles reflects the seeded corpus — so no plan assertion ever runs against stale (n≈0) statistics (a false RED/GREEN source).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.6",
+      "description": "The default seed count for the scale gate is pinned to ≥ the current prod published-article count (recorded as a dated constant, e.g. PROD_ARTICLE_FLOOR with the date/source), and the gate fails loudly if asked to assert at a seed count below that floor. A documented step bumps the floor as prod grows.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.7",
+      "description": "The HNSW index is detected by capability (querying pg_indexes for an HNSW index on articles.embedding, e.g. via amname='hnsw'), NOT by a hard-coded name — tolerating the prod/migration name drift (articles_embedding_hnsw_idx vs articles_embedding_idx). Seeding asserts an HNSW index is present before scale assertions are meaningful.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.8",
+      "description": "Scale seeding is OPT-IN and tagged (e.g. @tag :scale / SCALE_TESTS env) so the default async unit suite is untouched; the large corpus is never created in a normal `mix test` run. Teardown is documented.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.1.9",
+      "description": "Tenant isolation: the seed inserts only under the given tenant_id, sets tenant_id programmatically (never via cast), and a second tenant seeded in the same DB remains isolated (tenant A's corpus is invisible to tenant B).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.1.1",
+      "name": "Seeds the requested number of embedded published articles, committed and analyzed",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: 1_000) on the dedicated (non-sandbox) DB"
+      ],
+      "expected_results": [
+        "AdminRepo count of published embedded articles for tenant.id == 1_000",
+        "All embeddings dimension 1536",
+        "pg_stat_user_tables shows articles analyzed with n_live_tup reflecting the rows"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.1.2",
+      "name": "Seeded links connect near-neighbors at the configured density",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: 500, link_density: 3)"
+      ],
+      "steps": [
+        "Aggregate count of article_links for tenant.id"
+      ],
+      "expected_results": [
+        "~500*3 links (within tolerance); every link's source and target belong to tenant.id"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.1.3",
+      "name": "Asserting below the prod floor fails loudly",
+      "type": "integration",
+      "preconditions": [
+        "PROD_ARTICLE_FLOOR pinned (e.g. 80_000)"
+      ],
+      "steps": [
+        "Invoke the scale gate configured to seed fewer than the floor"
+      ],
+      "expected_results": [
+        "It raises/fails with a clear 'seed below prod floor' error rather than silently asserting on an under-scale corpus"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.1.4",
+      "name": "Scale seed is tenant-isolated and deterministic",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a, tenant_b; seed tenant_a count: 200"
+      ],
+      "steps": [
+        "Count tenant_b embedded articles; regenerate the vector for index 5 twice"
+      ],
+      "expected_results": [
+        "tenant_b has 0; tenant_a has 200; index-5 vector identical across calls; differs from index-6"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Helper: Loopctl.Knowledge.ScaleSeed (test/support) + optional `mix loopctl.seed_scale`.",
+    "CRITICAL FOOT-GUN: ANALYZE needs committed rows. DataCase (async: true) wraps each test in a rolled-back transaction, so insert_all + ANALYZE there is defeated. Scale seed must run async: false against a dedicated DB and COMMIT.",
+    "Bulk insert via AdminRepo.insert_all in batches; never per-row. inserted_at is utc_datetime_usec and a batch shares one timestamp — relevant to US-27.9's (inserted_at, id) keyset.",
+    "Deterministic vectors from row index (phash2 → float list → L2-normalize); no Math.random/Date.now.",
+    "Index detection by capability: SELECT indexname FROM pg_indexes ... or join pg_am amname='hnsw'; do NOT hard-code a name (prod drift).",
+    "PROD_ARTICLE_FLOOR: a dated constant (~80k as of 2026-06); raise as prod grows. Tie to US-27.8 AC for gate calibration.",
+    "tenant_id set programmatically on every row, never cast."
+  ],
+  "dependencies": [],
+  "estimated_hours": 14
+}

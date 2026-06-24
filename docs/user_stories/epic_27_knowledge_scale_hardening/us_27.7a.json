@@ -1,0 +1,109 @@
+{
+  "id": "US-27.7a",
+  "title": "Route the single-target top-k endpoints through the kNN helper",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 2; split from original US-27.7 per review (distant_pairs/novelty are a different shape — US-27.7b)",
+    "includes": "True single-target top-k consumers: semantic search, suggested_links, and the auto-link worker (find the nearest articles to link). These map cleanly onto VectorSearch.nearest/4."
+  },
+  "priority_note": "Realizes US-27.6a's value on the endpoints that actually fit the nearest/k shape. distant_pairs/nearest_prior_distance are handled separately (27.7b) because they are NOT top-k-against-a-constant.",
+  "story": {
+    "as_a": "loopctl engineer",
+    "i_want_to": "migrate semantic search, suggested_links, and the auto-link worker to use the shared kNN helper (US-27.6a) instead of their bespoke cosine queries",
+    "so_that": "the true top-k vector endpoints share one proven, index-correct, scale-tested path, and a future endpoint can't reintroduce a full scan there"
+  },
+  "rationale": "A shared helper only removes the failure class if the fitting endpoints adopt it. Migrating the three genuine single-target top-k consumers collapses duplicated cosine/over-fetch logic into one place and gives each the same scale guard for free, while leaving the genuinely-different shapes (pairs, novelty aggregate) to a separate, honest story.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.7a.1",
+      "description": "suggested_links uses VectorSearch.nearest/candidate_query (its verified subquery shape becomes the helper's default path); behavior (excludes self/linked, threshold, limit, ordering) is preserved and its existing tests still pass.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7a.2",
+      "description": "search_semantic is expressed via the helper (or the helper derived from it) without regressing its proven prod behavior, latency, or result shape (id/title/category/similarity_score + meta).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7a.3",
+      "description": "The auto-link worker's similarity lookup uses the helper so background linking cannot full-scan either.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7a.4",
+      "description": "Behavior/contract preserving: each migrated endpoint's external JSON contract is identical (controllers unchanged); changes are limited to internal query construction; existing controller/context tests pass.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7a.5",
+      "description": "Tenant isolation and visibility scoping preserved for each; tenant-isolation tests remain green.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.7a.6",
+      "description": "Contract-preserving means CONTRACT-preserving, not SLOW-preserving: if routing an endpoint through the helper does not by itself bring it under the US-27.8 budget at scale, the endpoint is corrected within this story (via the helper) until the scale gate passes — a migrated-but-still-slow endpoint is NOT done.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.7a.1",
+      "name": "suggested_links behavior preserved through the helper",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "target + neighbors + one pre-linked neighbor"
+      ],
+      "steps": [
+        "GET /api/v1/knowledge/articles/:id/suggested_links"
+      ],
+      "expected_results": [
+        "200; excludes self and linked; honors threshold/limit; ranked; identical observable behavior to pre-migration"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.7a.2",
+      "name": "semantic search results unchanged after migration",
+      "type": "integration",
+      "preconditions": [
+        "embedded articles with known relative distances"
+      ],
+      "steps": [
+        "Call semantic search with a query embedding"
+      ],
+      "expected_results": [
+        "Same ranked ids and meta shape; no ordering/score regression"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.7a.3",
+      "name": "Each migrated endpoint index-backed + under budget at scale",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "Run the US-27.8 plan + latency assertions for search, suggested_links, and the worker lookup"
+      ],
+      "expected_results": [
+        "All index-backed (no Seq Scan) and under budget"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Touch points: suggest_links/3 + suggestion_candidates_query/6, search_semantic/3, the auto-link Oban worker.",
+    "Land as one coherent PR; keep external JSON contracts identical.",
+    "The auto-link worker is a background path — its lookup must also be index-correct (a silently full-scanning worker is exactly the kind of rot this epic targets); guarded by US-27.8.",
+    "Preserve existing timeouts; run each endpoint's existing test file plus the US-27.2 scale plan-assertion."
+  ],
+  "dependencies": ["US-27.6a"],
+  "estimated_hours": 10
+}

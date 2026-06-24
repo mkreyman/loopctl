@@ -1,0 +1,89 @@
+{
+  "id": "US-27.17",
+  "title": "Terminal epic verification: execute the full scale gate + prod live-build checks (deferred verification, run last)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "terminal_verification",
+  "background": {
+    "reference": "GitHub Epic #175; consolidation of the scale + prod-verification gates that the autonomous build loop (mix precommit + enhanced review + CI) cannot run mid-stream",
+    "includes": "The @tag :scale tests are excluded from `mix precommit` (they need a committed ~80k-row corpus + a non-sandbox DB), and the prod live-build verification needs the deployed build (fly). So per-story merges happen on code+unit+review+CI; the scale/prod execution is DEFERRED here, deliberately, so the whole epic builds autonomously with no manual gate mid-stream and verification is one consolidated terminal pass."
+  },
+  "priority_note": "This is the single end-of-epic verification story. It runs DEAD LAST (depends on every leaf story) and executes every scale/live-build AC the implementation stories wrote-but-deferred. Itself automatable: the scale suite runs as the agent's work; the prod checks run via the authenticated fly CLI.",
+  "story": {
+    "as_a": "the autonomous build loop (and the operator reviewing the final result)",
+    "i_want_to": "run the complete scale gate (seeded ~80k corpus) across every vector/enumeration/export/bulk endpoint AND the prod live-build verification once, at the very end, remediating any failures, and produce a single verification report",
+    "so_that": "the epic is implemented with ZERO manual intervention mid-stream, every quality gate is still honored, and the scale + prod verification (the gates that caught #172) happen once at the end instead of per-story"
+  },
+  "rationale": "Deferring scale/prod verification to the very end lets the whole epic build autonomously (each story on its automatable gates) without a human in the loop, while still honoring those gates — they are executed here, comprehensively, rather than skipped. Consolidating them into one terminal pass is the accepted trade for full autonomy; the enhanced review per story still catches logic/structural defects en route, and this story catches the scale-only and prod-only failures at the end.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.17.1",
+      "description": "Seed the ~80k (>= PROD_ARTICLE_FLOOR) committed corpus (US-27.1) and run the ENTIRE @tag :scale suite — every per-endpoint plan assertion (US-27.2/27.8), the keyset deep-page assertions (US-27.9a/9b), the bulk blast-radius (US-27.12), and the export memory bound (US-27.16) — recording the full pass/fail matrix with calibration provenance (seed count, ef_search).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.17.2",
+      "description": "Remediate every scale failure in this pass (the US-27.13 detect→fix loop applied epic-wide, not just vector endpoints): any endpoint that full-scans or blows its budget at scale is corrected via the shared helper / its own bounded shape until the scale gate is all-green. No deferrals.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.17.3",
+      "description": "After the final merge deploys, run the PROD live-build verification (US-27.5 runbook) AUTONOMOUSLY via the authenticated fly CLI: prod EXPLAIN ANALYZE under the statement_timeout for each heavy endpoint (index-backed, no Seq Scan), the repro-id 200 checks (incl. the original suggested_links ids), and a fly-logs scan for new 57014/timeouts. No user action required — the operator only reviews the produced report.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.17.4",
+      "description": "Produce a single terminal verification report: the scale matrix (all-green, with provenance) + the prod EXPLAIN/repro/log evidence per endpoint, mapping each deferred scale/live-build AC across the epic to its execution result here. The epic is 'verified' only when this report is all-green on both the scale gate and prod.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.17.5",
+      "description": "If the prod environment is unreachable from the run context, the scale-gate portion (AC-27.17.1/2/4) still completes autonomously and the report explicitly flags the prod portion (AC-27.17.3) as the single remaining check — so the only possible manual touch is a 5-minute operator confirmation, never mid-stream work.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.17.1",
+      "name": "Full scale suite green at >= prod floor with provenance",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "Run the entire @tag :scale suite across all endpoints"
+      ],
+      "expected_results": [
+        "All green; matrix records seed >= floor and the ef_search used; any failure triggers remediation (AC-27.17.2) then re-runs to green"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.17.2",
+      "name": "Prod live-build verification runs via fly and reports",
+      "type": "integration",
+      "preconditions": [
+        "Epic fully merged + deployed"
+      ],
+      "steps": [
+        "Via fly ssh rpc: AdminRepo.explain(:all, q, analyze: true) for each heavy endpoint; hit repro ids; scan fly logs"
+      ],
+      "expected_results": [
+        "Each heavy endpoint index-backed + under timeout on prod; repro ids return 200; no new 57014; report produced"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "RUN LAST: depends on every leaf story so the loop schedules it after the whole epic is implemented + deployed.",
+    "Scale execution is the agent's WORK (seed + `SCALE_TESTS=1 mix test --only scale`), NOT the per-story merge gate (which stays `mix precommit`). Remediations are code that passes precommit + enhanced review + CI like any story.",
+    "Prod verification reuses the proven #172 method: `fly ssh console -a loopctl -C \"/app/bin/loopctl rpc '<Elixir>'\"` for EXPLAIN ANALYZE, `fly logs` for the SQLSTATE. fly is authenticated in the run context.",
+    "This story makes the per-story 'verified at scale / live build' ACs (27.5/27.8/27.13/27.16 etc.) honest: they are EXECUTED here, once, comprehensively — not skipped, not per-story-manual.",
+    "If you instead want per-PR scale enforcement (no end-consolidation), wire the scale suite into CI as a job and run the epic with `--gate \"mix precommit && SCALE_TESTS=1 mix test --only scale\"` — at the cost of an ~80k seed per PR. The terminal-story model here is the lighter, autonomy-first choice."
+  ],
+  "dependencies": ["US-27.13", "US-27.15", "US-27.10", "US-27.12", "US-27.16", "US-27.9b", "US-27.14"],
+  "estimated_hours": 10
+}

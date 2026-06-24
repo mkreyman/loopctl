@@ -1,0 +1,123 @@
+{
+  "id": "US-27.2",
+  "title": "Plan-assertion helper on the CONTROLLER'S actual query — fails on full-corpus Seq Scan, no forced planner",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "scale_observability",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 1; incident: the EXPLAIN enable_seqscan=off guard added in #172/#173 proved index ELIGIBILITY on a join-free shape, not that the real query uses the index",
+    "includes": "The #172 guard forced enable_seqscan/sort=off, which hides the real cost-based decision. Equally dangerous: a guard that asserts on a re-built query object rather than the query the controller actually runs. Wiki bd4a26b6 captures the pattern."
+  },
+  "priority_note": "Directly addresses the test that gave false confidence three times. Depends on US-27.1 (needs a committed, analyzed, ≥prod corpus for prod-like planner choices).",
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "a reusable assertion that runs EXPLAIN on the SAME query the controller/worker actually executes (joins, filters, derived limit/threshold/pool, visibility — all included), WITHOUT forcing the planner, against the large corpus, and fails if articles is reached by a full Seq Scan",
+    "so_that": "a regression that re-introduces a full-corpus scan fails CI on the real request path — not on a detached stunt-double query, and not hidden behind enable_seqscan=off"
+  },
+  "rationale": "Two distinct false-confidence traps shipped or nearly shipped: (a) forcing the planner (enable_seqscan=off) proves eligibility, not usage; (b) asserting on an independently re-constructed query proves the query builder, not the request path. A future filter added in suggest_links/3 (not the query builder) would sail past a stunt-double guard. Asserting the unforced plan of the controller's exact emitted SQL+params on a representative corpus is the only guard that would have caught all three prior misses.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.2.1",
+      "description": "A helper (Loopctl.PlanAssertions.refute_full_scan/1, assert_hnsw_index/1) runs `EXPLAIN` WITHOUT setting enable_seqscan/enable_sort — the planner's natural choice on the current (analyzed) data.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.2",
+      "description": "The PRIMARY failure signal is the literal `Seq Scan on articles` node (case-insensitive). A `Sort` node is NOT itself a failure (the verified suggested_links shape legitimately sorts the small post-ANN pool); Sort is advisory-only, flagged only if its input row estimate ≈ the seeded corpus size.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.3",
+      "description": "The success signal requires an `Index Scan using <hnsw index>` reaching articles, AND the matched index is verified to be an HNSW index (amname='hnsw'), not merely a name match — so a btree that happens to match the name regex can't pass.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.4",
+      "description": "The query under test is obtained from the SAME code path the controller/worker invokes (e.g. a `*_query/n` function the action itself calls, or by capturing emitted SQL+params via a Repo telemetry/explain seam on a real `conn` request) — NOT by independently re-constructing args. A test asserts the controller's effective SQL+params equals the asserted query's SQL+params (byte-identical).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.5",
+      "description": "Before asserting, the helper requires fresh statistics (the US-27.1 ANALYZE guard) — a plan assertion against an unanalyzed `articles` aborts with a clear error rather than producing a misleading pass/fail.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.6",
+      "description": "On failure the helper reports the offending plan text (truncated, vector literals elided) so a red CI run shows the Seq Scan node, not just a boolean.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.7",
+      "description": "An accompanying scale test exercises the production suggested_links query shape (anti-join + threshold) through the helper at ≥prod scale and proves it is index-backed — the exact #172 regression class guarded on the real shape.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.2.8",
+      "description": "The scale plan-assertions are tagged/opt-in (scale gate, not the default async suite) and documented as the canonical way to guard a vector endpoint.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.2.1",
+      "name": "Helper fails on an index-defeating shape at scale",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR)"
+      ],
+      "steps": [
+        "Build a deliberately index-defeating query (e.g. anti-join inside the ORDER BY, the #170 shape)",
+        "Loopctl.PlanAssertions.refute_full_scan(query)"
+      ],
+      "expected_results": [
+        "Raises; message includes the `Seq Scan on articles` node"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.2.2",
+      "name": "Controller's effective query == asserted query (no stunt double)",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {key,_} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})",
+        "An embedded target article"
+      ],
+      "steps": [
+        "Capture the SQL+params the controller emits for GET suggested_links (telemetry seam)",
+        "Compare to the query the scale assertion runs"
+      ],
+      "expected_results": [
+        "SQL strings and param lists are identical"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.2.3",
+      "name": "Production suggested_links shape is index-backed at scale (HNSW, not name-only)",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "Run refute_full_scan + assert_hnsw_index on the real suggested_links query"
+      ],
+      "expected_results": [
+        "No Seq Scan on articles; reached via an amname='hnsw' index"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Helper: Loopctl.PlanAssertions (test/support). Use Repo.explain(:all, query) (preserves real param binding). EXPLAIN (not ANALYZE) suffices for shape; ANALYZE optional for runtime.",
+    "CRITICAL: do NOT SET enable_seqscan=off/enable_sort=off here — forcing the planner is exactly what produced false confidence in #172.",
+    "Same-query guarantee: the strongest form captures SQL via a :telemetry handler on a real ConnCase request and feeds THAT to EXPLAIN, so a filter added in the controller (not the builder) is included.",
+    "amname check: join pg_class/pg_am or `SELECT am.amname FROM pg_index ... ` for the index used; assert 'hnsw'.",
+    "Sort cardinality parsing from EXPLAIN text is flaky — keep `Seq Scan on articles` as the deterministic primary signal; Sort is advisory.",
+    "Meaningful only at scale (6 rows seq-scans happily) — hence the US-27.1 dependency. Tie into US-27.8 per-endpoint guards."
+  ],
+  "dependencies": ["US-27.1"],
+  "estimated_hours": 10
+}

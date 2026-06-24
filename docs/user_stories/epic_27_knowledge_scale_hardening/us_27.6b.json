@@ -1,0 +1,115 @@
+{
+  "id": "US-27.6b",
+  "title": "kNN over-fetch/recall tuning + observable (non-silent) under-fill",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 2; split from original US-27.6; adversarial review F8",
+    "includes": "hnsw.ef_search is never SET (pgvector default ~40); post-filtering an over-fetched pool means a densely-linked hub can have its whole pool filtered out -> suggested_links returns [] while near neighbors exist. The epic exists because a real failure (timeout) was SILENT; a fast, index-backed query returning silently-incomplete results is the same failure class."
+  },
+  "priority_note": "Closes the 'fast-green-but-wrong' gap the adversarial review called the next likely incident. Depends on US-27.6a.",
+  "story": {
+    "as_a": "loopctl operator and agent consumer",
+    "i_want_to": "the kNN helper's over-fetch pool sized for good recall, the ef_search recall ceiling documented and consistent across envs, AND a structured signal emitted whenever the result under-fills (returns fewer than requested because the pool was exhausted by filters)",
+    "so_that": "silent recall incompleteness is observable and alertable — not a quiet wrong answer indistinguishable from 'no neighbors exist'"
+  },
+  "rationale": "Documenting a recall ceiling does not handle it — the whole epic exists because a silent failure shipped. A densely-linked hub returning empty suggestions while neighbors exist is exactly a fast-green-but-wrong result the latency/plan gates can't catch. Making under-fill emit a signal (and keeping ef_search consistent test-vs-prod) converts a silent quality regression into an observable, alertable event.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.6b.1",
+      "description": "Over-fetch: the inner pool = max(k * factor, floor) capped by a config max, and ALWAYS floored at k (a misconfigured cap can never drop the pool below the requested k). The factor/floor/cap are config constants with documented defaults.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.2",
+      "description": "When post-filters exhaust the pool such that fewer than k candidates are returned despite the pool being filled to the cap, the helper emits a structured signal (a :telemetry event + optional warn log) carrying tenant_id, endpoint, requested k, pool size, returned count, and exclusion counts — so under-fill is observable, not silent. A scale test asserts the signal fires on a dense-hub target.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.3",
+      "description": "The recall ceiling is documented on VectorSearch AND its consumers: recall is bounded by hnsw.ef_search (default ~40) and the pool; under-fill is expected for densely-linked hubs. The doc states raising ef_search per-request requires a transaction (pool-starvation on the 3-conn pool) AND that ef_search is a custom GUC that CANNOT be set via a Postgrex startup `:parameters` entry (rejected before pgvector loads); the only safe non-transaction lever is `ALTER ROLE … SET hnsw.ef_search` (US-27.11), and only if verified to apply on fly mpg — otherwise recall stays at the default and is handled by over-fetch + the under-fill signal.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.4",
+      "description": "ef_search parity: whatever ef_search value is effective (default, or an ALTER ROLE override from US-27.11) is identical in the scale gate and prod — asserted by `SHOW hnsw.ef_search` on the gate connection vs the prod-shaped connection (NOT comparing :parameters config blobs), so latency/recall don't diverge silently between gate and prod (ties to US-27.8).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.6",
+      "description": "Consumer-facing signal (not just operator telemetry): when under-fill occurs, the endpoint response `meta` carries a flag (e.g. `recall_truncated: true` / `pool_exhausted: true`) so the AGENT consumer can distinguish an incomplete result from a genuinely-empty one — converting the documented ceiling into a contract signal.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.7",
+      "description": "After this story's pool-sizing cap (AC-27.6b.1) lands, US-27.6a's worst-case caller-cost bound (TC-27.6a.4) is RE-VERIFIED against the final cap (mirrors US-27.11 AC-27.11.6) — so 27.6a's cost proof isn't invalidated by 6b changing the cap underneath.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6b.5",
+      "description": "The under-fill signal does not leak data (no vector literals/bodies; tenant_id is an id, not content) and does not itself become a per-row cost (one event per request, not per filtered candidate).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.6b.1",
+      "name": "Pool floor never below k",
+      "type": "unit",
+      "preconditions": [
+        "Config sets max_pool below k for the test"
+      ],
+      "steps": [
+        "Compute the pool for k=50 with a misconfigured cap of 10"
+      ],
+      "expected_results": [
+        "Pool >= 50 (floored at k), not 10"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6b.2",
+      "name": "Under-fill emits a telemetry signal",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "A target whose nearest pool neighbors are all already-linked (dense hub)"
+      ],
+      "steps": [
+        "Attach a telemetry handler; call VectorSearch.nearest with exclude_linked, k=5"
+      ],
+      "expected_results": [
+        "Fewer than 5 returned; a [:loopctl, :knowledge, :vector_search, :under_fill] event fired with requested=5, returned<5, pool, exclusion counts"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6b.3",
+      "name": "Full result emits NO under-fill signal",
+      "type": "integration",
+      "preconditions": [
+        "A target with plenty of unlinked above-threshold neighbors"
+      ],
+      "steps": [
+        "Call with k=5"
+      ],
+      "expected_results": [
+        "5 returned; no under_fill event"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Pool: pool = k*factor |> max(floor) |> min(cap) |> max(k). Config: :vector_pool_factor, :vector_pool_floor, :max_vector_pool.",
+    "Under-fill detection: emit when length(results) < k AND the pool was filled to cap (i.e. the index returned >= pool candidates and filters cut below k) — distinguish from 'corpus simply has < k embedded articles'.",
+    "Telemetry event name + payload documented; pairs with US-27.15 (metrics/alerting) which aggregates it.",
+    "ef_search is currently never SET (default 40) — parity holds today; pin it so a future prod ef_search change can't silently diverge from the gate (US-27.8 AC).",
+    "Pool-level ef_search via a dedicated heavy-read pool's :parameters (US-27.11 Option B) is the safe way to raise recall without a per-request transaction."
+  ],
+  "dependencies": ["US-27.6a"],
+  "estimated_hours": 7
+}

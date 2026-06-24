@@ -1,0 +1,141 @@
+{
+  "id": "US-27.6a",
+  "title": "Index-correct pure-ANN kNN helper (correct-by-construction, caller-cost-bounded)",
+  "epic": {
+    "id": "epic_27",
+    "name": "Knowledge Subsystem Performance & Scale Hardening"
+  },
+  "priority": "high",
+  "phase": "vector_layer",
+  "background": {
+    "reference": "GitHub Epic #175, Theme 2; wiki 'pgvector HNSW: filter-after-ANN' (bd4a26b6)",
+    "includes": "Each embedding endpoint hand-rolls its cosine query; search_semantic is the proven index shape; suggested_links had to be rewritten to 'pure ANN subquery + app-side filter'. No correct-by-construction path exists, so a new endpoint can reinvent the index-defeating mistake. Split from the original US-27.6 (16h) per review: this is the critical-path core helper; recall/over-fetch tuning is US-27.6b."
+  },
+  "priority_note": "Highest-leverage perf story — fixes the whole vector-query CLASS. Depends on US-27.1/27.2 so correctness is provable at scale. Unblocks US-27.7a.",
+  "story": {
+    "as_a": "loopctl engineer building or maintaining an embedding-backed endpoint",
+    "i_want_to": "a single shared kNN helper that performs an index-backed `ORDER BY embedding <=> $vec LIMIT k` over published-embedded articles with NO joins or distance-WHERE in the index-ordered query, applying post-filters (self/linked/tag/threshold/visibility) after the index fetch",
+    "so_that": "no endpoint can accidentally defeat the HNSW index, and every embedding endpoint shares one proven, scale-tested ANN path"
+  },
+  "rationale": "The repeated production failures share one root cause — a join or distance filter inside the index-ordered query defeats the HNSW index and forces a full-corpus scan. Encoding the correct shape once and routing every vector endpoint through it makes the failure mode structurally unreachable, far stronger than fixing endpoints one incident at a time.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-27.6a.1",
+      "description": "Loopctl.Knowledge.VectorSearch.nearest/4 (and a `candidate_query/n` returning the queryable for plan tests) accepts tenant_id, a target embedding as a plain [float()] list (never a %Pgvector{} struct — reuse to_embedding_list/1), a k/limit, and opts; builds the pure index-eligible `ORDER BY embedding <=> $vec LIMIT pool` over published non-null-embedding articles, tenant-scoped; returns candidates with similarity_score = GREATEST(0, 1 - distance).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6a.2",
+      "description": "The helper NEVER places a JOIN or a distance-based WHERE inside the index-ordered query. Exclusions (self, already-linked either-direction, tag, threshold) and the visibility scope are applied either as index-safe residual filters (equality/membership/metadata, verified not to defeat the index) on the inner query OR in an outer query over the over-fetched pool — matching the verified suggested_links shape.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6a.3",
+      "description": "The emitted query is index-backed at ≥prod scale: a US-27.2 plan assertion (refute_full_scan + assert_hnsw_index) on the helper's query — WITH the anti-join and threshold post-filters applied — passes (no Seq Scan on articles).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6a.4",
+      "description": "Caller-cost bound (OWASP A06 / insecure design): every caller-tunable parameter that affects query cost (k/limit, threshold, pool override, tag/category) has a documented, enforced upper bound; the helper's worst-case cost for the MAXIMUM permitted parameters (e.g. threshold=0, k=max, dense target) is measured at scale and completes under the heavy-read statement_timeout. The statement_timeout is a DESIGNED backstop, not the primary bound.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6a.5",
+      "description": "Tenant isolation: tenant_id is enforced on every relation (candidate scan AND any anti-join); runs on AdminRepo (BYPASSRLS) with explicit tenant predicates; a tenant-isolation test proves tenant A never receives tenant B candidates.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-27.6a.6",
+      "description": "The helper does NOT wrap its query in a per-request transaction (the #172 round-1 pool-starvation anti-pattern on the 3-conn admin pool); it is a bare AdminRepo.all, matching search_semantic/distant_pairs.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-27.6a.1",
+      "name": "Returns nearest published candidates ranked by similarity, self excluded",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); target + neighbors at varying distances"
+      ],
+      "steps": [
+        "VectorSearch.nearest(tenant.id, target_embedding, 5, exclude_id: target.id)"
+      ],
+      "expected_results": [
+        "≤5 candidates, highest similarity first; target excluded; numeric similarity_score each"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6a.2",
+      "name": "Post-filters applied over the pool, not inside the index query",
+      "type": "integration",
+      "preconditions": [
+        "target + 6 near-identical neighbors; 4 pre-linked to target"
+      ],
+      "steps": [
+        "VectorSearch.nearest(tenant.id, target_embedding, 2, exclude_id: target.id, exclude_linked: true, threshold: 0.5)"
+      ],
+      "expected_results": [
+        "Exactly the 2 unlinked above-threshold neighbors; none of the 4 linked appear"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6a.3",
+      "name": "Index-backed at scale incl. post-filters",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 5)"
+      ],
+      "steps": [
+        "PlanAssertions.refute_full_scan(VectorSearch.candidate_query(tenant.id, vec, 5, exclude_linked: true, threshold: 0.5))"
+      ],
+      "expected_results": [
+        "No Seq Scan on articles; amname='hnsw' index used"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6a.4",
+      "name": "Worst-case caller params complete under the statement timeout at scale",
+      "type": "integration",
+      "preconditions": [
+        "Loopctl.Knowledge.ScaleSeed.seed(tenant.id, count: PROD_FLOOR, link_density: 10)",
+        "A dense-hub target"
+      ],
+      "steps": [
+        "Call with threshold=0.0, k=max permitted"
+      ],
+      "expected_results": [
+        "Completes under the configured heavy-read statement_timeout"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-27.6a.5",
+      "name": "Tenant isolation",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a, tenant_b; embedded articles in both"
+      ],
+      "steps": [
+        "VectorSearch.nearest(tenant_a.id, vec, 10)"
+      ],
+      "expected_results": [
+        "No tenant_b article appears"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Module: Loopctl.Knowledge.VectorSearch (new). Generalize the verified suggested_links subquery shape: inner pure-ANN (index-safe filters only) -> outer anti-join/threshold/limit over the pool.",
+    "Target = plain [float()] list via to_embedding_list/1 (%Pgvector{} -> Pgvector.to_list/1). Binding the struct was the #168 500.",
+    "AdminRepo (BYPASSRLS) + explicit tenant_id everywhere; NO per-request transaction (pool starvation, Theme 4).",
+    "Composable opts: exclude_id, exclude_linked (bidirectional), threshold, tags, category, visibility scope, k, pool override — each cost-bounded (AC-27.6a.4).",
+    "Over-fetch sizing + recall semantics + under-fill monitoring are split into US-27.6b. This story is the index-correct core + cost bounds + tenant isolation.",
+    "distant_pairs (column-to-column) and nearest_prior_distance (MIN aggregate) do NOT fit nearest/4 — handled in US-27.7b, not here."
+  ],
+  "dependencies": ["US-27.1", "US-27.2"],
+  "estimated_hours": 10
+}
