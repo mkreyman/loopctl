@@ -129,14 +129,25 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         "published articles tagged `proposal` visible to the caller (agent callers see only " <>
         "their own and `shared` articles; override with `prior_tag`). `meta.prior_count` " <>
         "is the number of embedded visible priors actually compared against (0 ⇒ every score is " <>
-        "null). Body: `{ideas: [{text|title/spark/thesis...}], prior_tag?}`. Role: agent+.",
+        "null). Body: provide the ideas as EITHER `texts: [\"...\", ...]` (strings) OR " <>
+        "`ideas: [...]` where each element is a string or an object " <>
+        "`{text|title/spark/thesis,...}`; all forms are coerced to ideas. Optional " <>
+        "`prior_tag` (default `proposal`) selects the prior corpus. Returns " <>
+        "`{data: [{...idea, novelty_score}], meta: {prior_count}}`. Role: agent+.",
     request_body:
-      {"Ideas to score", "application/json",
+      {"Ideas to score (texts:[string] or ideas:[string|object])", "application/json",
        %OpenApiSpex.Schema{
          type: :object,
-         required: [:ideas],
          properties: %{
-           ideas: %OpenApiSpex.Schema{type: :array},
+           ideas: %OpenApiSpex.Schema{
+             type: :array,
+             description: "Strings or objects ({text|title/spark/thesis,...})"
+           },
+           texts: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string},
+             description: "Alternative to `ideas`: a list of idea strings (#152 AC shape)"
+           },
            prior_tag: %OpenApiSpex.Schema{type: :string}
          }
        }},
@@ -171,7 +182,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
   def novelty(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, ideas} <- validate_ideas(params["ideas"]) do
+    with {:ok, ideas} <- normalize_ideas(params) do
       base = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
       opts = base ++ Visibility.scope_opts(conn)
       {:ok, scored, prior_count} = Knowledge.novelty_scores(tenant_id, ideas, opts)
@@ -265,18 +276,49 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
   defp require_uuid(_, field), do: {:error, :bad_request, "#{field} must be a UUID"}
 
-  defp validate_ideas(ideas) when is_list(ideas) and ideas != [] do
+  # Accept either shape (#169): the #152 AC / CREATIVITY.md `texts: [string]`, the
+  # richer `ideas: [{text|title/spark/thesis,...}]`, or a bare `ideas: [string]`.
+  # All are coerced to idea objects so the documented contract and the
+  # idea-synthesizer consumer agree.
+  defp normalize_ideas(params) do
+    raw = resolve_ideas_param(params)
+
     cond do
-      length(ideas) > @max_novelty_ideas ->
+      not is_list(raw) or raw == [] ->
+        {:error, :bad_request,
+         "provide a non-empty `ideas` (objects or strings) or `texts` (strings) array"}
+
+      length(raw) > @max_novelty_ideas ->
         {:error, :bad_request, "ideas must not exceed #{@max_novelty_ideas} per request"}
 
-      not Enum.all?(ideas, &is_map/1) ->
-        {:error, :bad_request, "each idea must be an object"}
-
       true ->
-        {:ok, ideas}
+        coerced = Enum.map(raw, &coerce_idea/1)
+
+        if Enum.any?(coerced, &(&1 == :invalid)) do
+          {:error, :bad_request, "each idea must be a string or an object with a `text` field"}
+        else
+          {:ok, coerced}
+        end
     end
   end
 
-  defp validate_ideas(_), do: {:error, :bad_request, "ideas must be a non-empty array"}
+  # Prefer whichever of `ideas`/`texts` is a non-empty list, so an empty `ideas: []`
+  # doesn't shadow a valid `texts` (an empty list is truthy in Elixir, so a plain `||`
+  # would short-circuit on it). Falls through to the validation error otherwise.
+  defp resolve_ideas_param(params) do
+    ideas = params["ideas"]
+    texts = params["texts"]
+
+    cond do
+      is_list(ideas) and ideas != [] -> ideas
+      is_list(texts) and texts != [] -> texts
+      true -> ideas || texts
+    end
+  end
+
+  # A bare string becomes `%{"text" => string}`; an object passes through (its text
+  # is resolved server-side from text/title/spark/thesis).
+  defp coerce_idea(idea) when is_binary(idea), do: %{"text" => idea}
+  defp coerce_idea(idea) when is_map(idea), do: idea
+  defp coerce_idea(_), do: :invalid
 end
