@@ -47,8 +47,8 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
     #   * #172: the target embedding is a BOUND list parameter and the `articles` table
     #     appears EXACTLY ONCE — there is no self-join to read the target vector as a
     #     column. The bound-`^param` left-vs-const form is what the HNSW index
-    #     (`articles_embedding_idx`, vector_cosine_ops) accelerates; the old self-join
-    #     forced a per-row cosine + full sort over the whole corpus.
+    #     (`articles_embedding_hnsw_idx`, vector_cosine_ops) accelerates; the old
+    #     self-join forced a per-row cosine + full sort over the whole corpus.
     #   * #168: that bound param is a plain LIST of floats, NEVER the stored `%Pgvector{}`
     #     struct (binding the struct was the original 500).
     #
@@ -85,7 +85,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
     # scale the planner seq-scans 6 rows happily; only at prod scale (~76k rows) does the
     # Seq Scan + Sort blow the statement timeout. Verified against the real prod corpus,
     # the fix is a subquery: the inner ANN (`ORDER BY embedding <=> $const LIMIT pool`) uses
-    # `articles_embedding_idx`; the anti-join + threshold live in the OUTER query (each
+    # `articles_embedding_hnsw_idx`; the anti-join + threshold live in the OUTER query (each
     # would defeat the index if pushed inside). With seq-scan disabled the planner must
     # reach `articles` via that index — so the plan names the HNSW index and contains NO
     # `Seq Scan on articles`. (An outer Sort over the small candidate pool is expected and
@@ -114,10 +114,10 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
         end)
 
       # The corpus is read through the HNSW index as an INDEX SCAN for the ordering
-      # (not merely the index name appearing somewhere). Tolerates the index-name drift
-      # between envs (`articles_embedding_idx` in test, `articles_embedding_hnsw_idx` in
-      # prod) — both are the HNSW cosine index.
-      assert plan =~ ~r/Index Scan using articles_embedding(_hnsw)?_idx/
+      # (not merely the index name appearing somewhere). US-27.14 reconciled the
+      # index name to the single canonical `articles_embedding_hnsw_idx` in every env
+      # (test + prod), so this assertion is now exact rather than name-agnostic.
+      assert plan =~ ~r/Index Scan using articles_embedding_hnsw_idx/
       # ...never a full-corpus Seq Scan (the #170/#172 production 500).
       refute plan =~ ~r/Seq Scan on articles\b/i
     end
