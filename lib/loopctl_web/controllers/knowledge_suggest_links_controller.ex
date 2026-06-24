@@ -33,7 +33,11 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
         "`{id, title, category, similarity_score}`, highest similarity first — POST " <>
         "the one you want as a **typed** link (relates_to/derived_from/contradicts/" <>
         "supersedes) via the article_links API. `threshold` (0–1, default 0.5) is the " <>
-        "cosine floor; `limit` (default 5) caps results. Role: agent+.",
+        "cosine floor; `limit` (default 5) caps results. Suggestions are approximate-NN " <>
+        "over the embedding index: exclusions (already-linked / below-threshold) are " <>
+        "applied to the nearest candidate pool, so a densely-linked article may return " <>
+        "fewer than `limit` (or none) even if more-distant unlinked articles exist. " <>
+        "Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Article UUID"],
       limit: [in: :query, type: :integer, description: "Max candidates (default 5)"],
