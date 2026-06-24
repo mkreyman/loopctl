@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 62 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 65 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (62)
+## Tools (65)
 
 ### Project Tools
 
@@ -153,6 +153,9 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. **Agent-memory scoping**: `memory_types` (comma-separated, OR — observation/finding/summary/decision/question/task), `agents` (comma-separated agent_ids, OR), `conversation_id` (exact) filter on article `metadata` (JSONB `@>`). Optional: `project_id`, `story_id` for attribution, `limit`, `recency_weight`. |
 | `knowledge_graph` | Multi-hop traversal of the published article-link graph from `article_id` (depth 1–3, default 1). Bidirectional, cycle-safe, bounded to 100 nodes / 500 edges (`truncated` flags a cap). Returns `nodes` (`id`/`title`/`category`/`depth`) + `edges` (`source_article_id`/`target_article_id`/`relationship_type`). Explore typed connections beyond `knowledge_context`'s 1-hop links. Required: `article_id`. Optional: `depth`, `project_id`. |
 | `knowledge_suggest_links` | Ranked typed-link **candidates** for an article by embedding similarity — **read-only** (creates nothing). Excludes the article itself + any already-linked article (either direction, any type); only embedded published. Returns `{id, title, category, similarity_score}` highest-first, to create as a **typed** link (relates_to/derived_from/contradicts/supersedes). Required: `article_id`. Optional: `threshold` (cosine floor 0–1, default 0.5), `limit` (default 5). |
+| `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in the optimal-novelty embedding band (cosine distance, default 0.3–0.7) — the creative sweet spot. `bridge_path: true` requires a ≤2-hop link path. Returns `{a, b, distance}` pairs, paginated. Optional: `min_distance`, `max_distance`, `bridge_path`, `limit` (default 20, max 100), `offset`. |
+| `knowledge_novelty` | Score ideas by novelty: embeds each idea's text, returns `novelty_score` = cosine distance to the nearest prior proposal (0 = identical, 1 = novel). Priors default to articles tagged `proposal`. Required: `ideas` (array, ≤50). Optional: `prior_tag`. |
+| `knowledge_random_walk` | Random walk through the link graph from `start_id` (no cycles, up to `length` nodes), surfacing unexpected connections. Returns `{id, title, category}` in walk order. Required: `start_id`. Optional: `length` (default 4, max 25). |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. **Published immediately by default** (visible to agents in search/index/context) for every role — the response `note` says which outcome occurred. Pass `draft: true` to stage it for later review instead (publish afterwards with `knowledge_publish`). Pass `idempotency_key` for idempotent capture (re-creating with the same key is a no-op returning the existing article — no partial duplicates). Optional: `category`, `tags`, `project_id`, `draft`, `idempotency_key`, `source_type`, `source_id`. |
 | `knowledge_okf_export` | **Requires `LOOPCTL_USER_KEY`.** Export the wiki as a portable OKF (Open Knowledge Format) v0.1 bundle of markdown files. Writes to `out_dir`, or returns `{files, meta}` inline. |
 | `knowledge_okf_import` | **Requires `LOOPCTL_USER_KEY`.** Import an OKF v0.1 bundle from a local directory. Creates or (with `merge`) updates articles; tolerates and preserves unknown frontmatter. |

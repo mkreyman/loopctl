@@ -775,7 +775,7 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (62)
+### Available Tools (65)
 
 Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summary:
 
@@ -814,7 +814,15 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query | agent |
 | `knowledge_list` | List articles (full fields, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair | agent |
+| `knowledge_count` | Count articles matching filters without returning rows (same filters as `knowledge_list`) | agent |
+| `knowledge_facets` | Tag facet counts over a filtered article set (drives faceted browse) | agent |
+| `knowledge_graph` | Multi-hop link-graph traversal from a seed article (typed edges, depth/fan-out caps) | agent |
+| `knowledge_suggest_links` | Ranked typed-link candidates for an article by embedding similarity (read-only) | agent |
+| `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in the optimal-novelty embedding band (creativity) | agent |
+| `knowledge_novelty` | Score ideas by distance to the nearest prior proposal (0 = identical, 1 = novel) | agent |
+| `knowledge_random_walk` | Random walk through the link graph from a start article (surfaces unexpected links) | agent |
 | `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture) | agent |
+| `knowledge_bulk_unpublish` | Bulk revert published articles to draft (archive), partial-success | user |
 | `knowledge_publish` | Publish an existing draft article | orchestrator |
 | `knowledge_bulk_publish` | Publish drafts, partial-success (per-id results, idempotent, no 100-cap) | user |
 | `knowledge_unpublish` | Revert a published article back to draft | user |
