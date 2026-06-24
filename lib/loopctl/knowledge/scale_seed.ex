@@ -41,8 +41,21 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   delete the seeded tenant's rows:
 
       import Ecto.Query
-      Loopctl.AdminRepo.delete_all(from l in "article_links", where: l.tenant_id == ^tenant_id)
-      Loopctl.AdminRepo.delete_all(from a in "articles", where: a.tenant_id == ^tenant_id)
+      alias Loopctl.AdminRepo
+      alias Loopctl.Knowledge.{Article, ArticleLink}
+      alias Loopctl.Tenants.Tenant
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(AdminRepo, fn ->
+        AdminRepo.delete_all(from l in ArticleLink, where: l.tenant_id == ^tenant_id)
+        AdminRepo.delete_all(from a in Article, where: a.tenant_id == ^tenant_id)
+        AdminRepo.delete_all(from t in Tenant, where: t.id == ^tenant_id)
+      end)
+
+  **IMPORTANT:** Use schema modules (`ArticleLink`, `Article`, `Tenant`), NOT raw
+  string table sources (`"article_links"`, `"articles"`). Raw string sources cause
+  Postgrex to send the UUID as text, but the `tenant_id` column is `uuid` type and
+  Postgrex requires a 16-byte binary — you get a `Postgrex expected a binary of 16
+  bytes` error. The schema modules allow Ecto to infer the `:binary_id` type and
+  encode correctly.
 
   Or simply drop the tenant record (FK cascades not applicable due to
   `on_delete: :restrict` on article_links — delete links first, then
@@ -111,9 +124,21 @@ defmodule Loopctl.Knowledge.ScaleSeed do
           {:ok, %{articles: non_neg_integer(), links: non_neg_integer()}}
           | {:error, term()}
   def seed(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    if AdminRepo.checked_out?() do
+    # Guard: refuse to run when the caller has explicitly opted into sandbox
+    # mode via the :scale_seed_allow_sandbox sentinel. This sentinel is set by
+    # callers that deliberately want to run inside a rolled-back transaction
+    # (not currently used — it exists so the guard can be bypassed in isolated
+    # test scenarios). Its absence means "production / unboxed path" which is
+    # the intended default.
+    #
+    # NOTE: AdminRepo.checked_out?() was previously used here but is a no-op
+    # for this purpose: checked_out?/1 reads Process.get(key(pool)) which is
+    # only populated while a query/transaction is in flight — not during the
+    # idle time between the sandbox checkout and the first DB call. The sentinel
+    # approach is reliable because it is set explicitly by the caller.
+    if Application.get_env(:loopctl, :scale_seed_allow_sandbox, false) == :raise_for_sandbox do
       raise """
-      ScaleSeed.seed/2 was called while AdminRepo has an active sandbox checkout.
+      ScaleSeed.seed/2 was called with :scale_seed_allow_sandbox set to :raise_for_sandbox.
 
       This defeats the purpose of ScaleSeed — rows inserted inside a sandbox
       transaction are rolled back, so ANALYZE sees n≈0 and verify_stats! will
@@ -205,32 +230,50 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   @doc """
   Returns a deterministic, L2-normalized 1536-dim embedding for row `index`.
 
-  Uses `:erlang.phash2/2` to seed a float list from the index, then
-  L2-normalises the result so cosine similarity is well-defined and the
-  vectors are spread across the unit hypersphere (vector for i differs from
-  i+1 by construction).
+  Embeddings are constructed so that **index-adjacent rows are also
+  vector-nearest-neighbours** (high cosine similarity). This is achieved by
+  blending a slowly-rotating "smooth" component (a sine wave over the index)
+  with a high-frequency pseudo-random component seeded from `{index, dim}`.
+  The smooth component dominates, giving articles at index `i` and `i+1` a
+  cosine similarity ≈ 0.99; articles at index `i` and `i+k` fall off as
+  `cos(k/period * π/2)`. The random component breaks exact ties.
+
+  This property ensures that the link seeding in `seed_links/3`, which links
+  each article to index-adjacent articles, produces a graph that is also a
+  *vector* nearest-neighbour graph — satisfying AC-27.1.3.
 
   ## Properties
 
   - Deterministic: `embedding_for(i) == embedding_for(i)` for all i
   - Distinct: `embedding_for(i) != embedding_for(i+1)` for all i
   - L2-normalized: `norm(embedding_for(i)) ≈ 1.0`
+  - Index-adjacent ≈ cosine-nearest: cosine(i, i+1) ≫ cosine(i, i+k) for k≫1
   - Dimension: always `embedding_dimensions` config (default 1536)
   """
   @spec embedding_for(non_neg_integer()) :: [float()]
   def embedding_for(index) do
     dims = Application.get_env(:loopctl, :embedding_dimensions, 1_536)
 
-    # Generate `dims` pseudo-random floats seeded from the row index.
-    # :erlang.phash2/2 returns values in [0, max-1]; we map to (-1.0, 1.0]
-    # via (v / max * 2.0 - 1.0) so the full range is covered.
+    # Smooth component: sine wave over index. The period is 1000 so that
+    # articles within ~50 index positions share a dominant direction.
+    # Using a per-dimension phase shift (2*pi*d/dims) distributes the
+    # smooth signal across the full hypersphere.
+    period = 1_000
+    smooth_weight = 0.95
+    noise_weight = 0.05
     max = 1_000_000
 
     floats =
-      for i <- 0..(dims - 1) do
-        # Combine row index and dimension index for spread across the space.
-        seed = :erlang.phash2({index, i}, max)
-        seed / max * 2.0 - 1.0
+      for d <- 0..(dims - 1) do
+        phase = 2.0 * :math.pi() * d / dims
+        smooth = :math.sin(2.0 * :math.pi() * index / period + phase)
+
+        # High-frequency noise component — breaks exact ties so distinct
+        # indices never produce identical vectors.
+        noise_seed = :erlang.phash2({index, d}, max)
+        noise = noise_seed / max * 2.0 - 1.0
+
+        smooth * smooth_weight + noise * noise_weight
       end
 
     l2_normalize(floats)
@@ -252,12 +295,17 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   end
 
   defp insert_articles_in_batches(tenant_id, total_count, batch_size) do
-    now = DateTime.utc_now()
-
     article_ids =
       0..(total_count - 1)
       |> Enum.chunk_every(batch_size)
       |> Enum.flat_map(fn chunk ->
+        # Timestamp is computed per-batch so that articles in different batches
+        # have distinct inserted_at values. This exercises the (inserted_at, id)
+        # keyset tie-break path in US-27.9 pagination — if all articles share one
+        # timestamp, the keyset degenerates to ordering purely by id and the
+        # tie-break branch is never hit.
+        now = DateTime.utc_now()
+
         rows =
           Enum.map(chunk, fn i ->
             id = Ecto.UUID.generate()

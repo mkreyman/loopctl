@@ -13,3 +13,10 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 unless System.get_env("SCALE_TESTS") do
   ExUnit.configure(exclude: [:scale])
 end
+
+# Nightly scale tests (TC-27.1.5) seed at PROD_ARTICLE_FLOOR and assert the
+# HNSW planner path. They are excluded unless SCALE_NIGHTLY=true is set,
+# even when SCALE_TESTS=true (they take several minutes).
+unless System.get_env("SCALE_NIGHTLY") do
+  ExUnit.configure(exclude: [:scale_nightly])
+end

@@ -33,3 +33,4 @@ mcp-server/node_modules/
 
 # Design reference templates (not application code)
 /docs/tailwind/
+.claude/implement-plan.run.json

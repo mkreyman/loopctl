@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  schedule:
+    # Nightly at 02:00 UTC — runs scale-nightly job (TC-27.1.5, prod-floor HNSW plan check)
+    - cron: "0 2 * * *"
 
 env:
   MIX_ENV: test
@@ -194,6 +197,179 @@ jobs:
 
       - name: Run Dialyzer
         run: mix dialyzer
+
+  scale-test:
+    name: Scale Tests (US-27.1)
+    # Run on push to master and PRs touching scale-related paths, plus nightly
+    # schedule. This ensures the scale suite (which commits real rows and runs
+    # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
+    # other regressions are caught before they reach production.
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: loopctl_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Create RLS roles
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
+              END IF;
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
+              END IF;
+            END \$\$;
+          "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+            GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
+          "
+
+      - name: Setup database
+        run: mix ecto.create && mix ecto.migrate
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+
+      - name: Grant RLS roles access to tables
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+          "
+
+      - name: Run scale tests (TC-27.1.1 through TC-27.1.4, AC-27.1.7)
+        run: SCALE_TESTS=true mix test --only scale test/loopctl/knowledge/scale_seed_test.exs
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+
+  scale-nightly:
+    name: Scale Nightly (TC-27.1.5 — prod-floor + HNSW plan)
+    # Runs nightly to assert the HNSW planner path is chosen at PROD_ARTICLE_FLOOR.
+    # This is the core deliverable of US-27.1 — reproducing the cost-based planner
+    # choices that only appear at production scale (~80k articles).
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: loopctl_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Create RLS roles
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
+              END IF;
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
+              END IF;
+            END \$\$;
+          "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+            GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
+          "
+
+      - name: Setup database
+        run: mix ecto.create && mix ecto.migrate
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+
+      - name: Grant RLS roles access to tables
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+          "
+
+      - name: Run nightly prod-floor scale test (TC-27.1.5)
+        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly test/loopctl/knowledge/scale_seed_nightly_test.exs
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+        timeout-minutes: 30
 
   deploy:
     name: Deploy

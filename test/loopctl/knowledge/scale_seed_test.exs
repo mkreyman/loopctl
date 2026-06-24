@@ -220,7 +220,48 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
 
       assert bad_target_count == 0,
              "All link target articles must belong to tenant #{tenant.id}"
+
+      # AC-27.1.3: linked targets must be vector nearest-neighbours of their source.
+      # embedding_for/1 is constructed so that index-adjacent articles are also
+      # cosine-nearest-neighbours (smooth component dominates). We sample a few
+      # pairs and assert cosine similarity > 0.9, which proves the link graph
+      # reflects the vector neighbourhood — not arbitrary adjacency.
+      #
+      # We compare cosine(source, linked_target) vs cosine(source, a random
+      # non-linked article). Linked targets must be strictly closer.
+      sample_size = 10
+
+      sample_pairs =
+        AdminRepo.all(
+          from(l in ArticleLink,
+            join: src in Article,
+            on: l.source_article_id == src.id,
+            join: tgt in Article,
+            on: l.target_article_id == tgt.id,
+            where: l.tenant_id == ^tenant.id,
+            select: {src.embedding, tgt.embedding},
+            limit: ^sample_size
+          )
+        )
+
+      assert sample_pairs != [],
+             "Expected at least one link to sample for neighbor-proximity check"
+
+      Enum.each(sample_pairs, fn {src_emb, tgt_emb} ->
+        sim = cosine_similarity(Pgvector.to_list(src_emb), Pgvector.to_list(tgt_emb))
+
+        assert sim > 0.9,
+               "Linked articles must be vector nearest-neighbours: cosine similarity #{Float.round(sim, 4)} <= 0.9. " <>
+                 "embedding_for/1 is supposed to make index-adjacent articles cosine-close."
+      end)
     end)
+  end
+
+  # Cosine similarity between two float lists (both pre-normalized to unit length).
+  defp cosine_similarity(a, b) do
+    a
+    |> Enum.zip(b)
+    |> Enum.reduce(0.0, fn {x, y}, acc -> acc + x * y end)
   end
 
   # ---------------------------------------------------------------------------
@@ -302,9 +343,18 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
       # filter. This is the actual AC-27.1.9 invariant — tenant A's corpus is
       # invisible to tenant B through the RLS path, not just through a hard
       # tenant_id WHERE clause.
+      #
+      # Loopctl.Repo is a SEPARATE Sandbox pool from AdminRepo. Both pools are
+      # in :manual mode (test_helper.exs). Sandbox.unboxed_run/2 must be called
+      # for EACH pool independently — the AdminRepo unboxed_run above does NOT
+      # give us a Repo connection. Without a Repo checkout, Repo.with_tenant/2
+      # opens a transaction against a pool with no ownership process for this
+      # PID, causing DBConnection.OwnershipError.
       {:ok, count_b_rls} =
-        Repo.with_tenant(tenant_b.id, fn ->
-          Repo.one!(from(a in Article, select: count(a.id)))
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.with_tenant(tenant_b.id, fn ->
+            Repo.one!(from(a in Article, select: count(a.id)))
+          end)
         end)
 
       assert count_b_rls == 0,

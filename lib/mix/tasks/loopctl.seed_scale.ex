@@ -24,6 +24,9 @@ defmodule Mix.Tasks.Loopctl.SeedScale do
       --batch-size    Rows per insert_all batch (default: 1_000).
       --check-floor   When set, raises if count < PROD_ARTICLE_FLOOR (80_000 as of 2026-06-24).
                       Use this for CI scale-gate runs.
+      --allow-prod    Bypass the environment guard that prevents running in non-test/dev
+                      environments. Use with extreme caution — this task seeds via AdminRepo
+                      (BYPASSRLS) and will write synthetic data to whatever DB is configured.
 
   ## Examples
 
@@ -42,8 +45,19 @@ defmodule Mix.Tasks.Loopctl.SeedScale do
 
       # In iex -S mix:
       import Ecto.Query
-      Loopctl.AdminRepo.delete_all(from l in "article_links", where: l.tenant_id == ^tenant_id)
-      Loopctl.AdminRepo.delete_all(from a in "articles", where: a.tenant_id == ^tenant_id)
+      alias Loopctl.AdminRepo
+      alias Loopctl.Knowledge.{Article, ArticleLink}
+      alias Loopctl.Tenants.Tenant
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(AdminRepo, fn ->
+        AdminRepo.delete_all(from l in ArticleLink, where: l.tenant_id == ^tenant_id)
+        AdminRepo.delete_all(from a in Article, where: a.tenant_id == ^tenant_id)
+        AdminRepo.delete_all(from t in Tenant, where: t.id == ^tenant_id)
+      end)
+
+  **IMPORTANT:** Use schema modules (`ArticleLink`, `Article`, `Tenant`), NOT raw
+  string table sources (`"article_links"`, `"articles"`). Raw string sources cause
+  Postgrex to send the UUID as text — you get a `Postgrex expected a binary of 16
+  bytes` error. Schema modules allow Ecto to infer the `:binary_id` type.
 
   ## Performance budget
 
@@ -57,9 +71,14 @@ defmodule Mix.Tasks.Loopctl.SeedScale do
 
   @impl Mix.Task
   def run(args) do
-    Mix.Task.run("app.start")
-
-    alias Loopctl.Knowledge.ScaleSeed
+    # Safety guard: refuse to run against a production database unless the
+    # caller explicitly acknowledges the risk via --allow-prod.
+    # Without this check, an operator with the wrong DATABASE_URL would
+    # commit ~80k synthetic published articles into a live tenant's KB via
+    # the RLS-bypassing AdminRepo (BYPASSRLS).
+    #
+    # Allowed environments: :test, :dev, or any env with --allow-prod flag.
+    env = Mix.env()
 
     {opts, _rest, _invalid} =
       OptionParser.parse(args,
@@ -68,9 +87,32 @@ defmodule Mix.Tasks.Loopctl.SeedScale do
           count: :integer,
           link_density: :integer,
           batch_size: :integer,
-          check_floor: :boolean
+          check_floor: :boolean,
+          allow_prod: :boolean
         ]
       )
+
+    allow_prod = Keyword.get(opts, :allow_prod, false)
+
+    unless env in [:test, :dev] or allow_prod do
+      Mix.raise("""
+      mix loopctl.seed_scale refuses to run in environment #{inspect(env)}.
+
+      This task seeds synthetic data directly via AdminRepo (BYPASSRLS), bypassing RLS.
+      Running against a production database risks committing 80k+ synthetic articles
+      to a real tenant's knowledge base.
+
+      To proceed in a non-test/dev environment, pass --allow-prod to confirm intent:
+
+          mix loopctl.seed_scale --allow-prod --tenant-id UUID --count 1000
+
+      Recommended: run against a dedicated test/CI database only.
+      """)
+    end
+
+    Mix.Task.run("app.start")
+
+    alias Loopctl.Knowledge.ScaleSeed
 
     tenant_id = Keyword.get(opts, :tenant_id)
 
