@@ -289,7 +289,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
     with {:ok, result} <- Knowledge.bulk_publish(tenant_id, article_ids, audit_opts) do
       json(conn, %{
-        data: Enum.map(result.published, &ArticleJSON.article_data/1),
+        # Body-less summaries: the affected set as confirmation; the actionable
+        # per-id detail is in meta.results (consistent with bulk-unpublish, #158).
+        data: Enum.map(result.published, &ArticleJSON.article_summary/1),
         meta: %{
           # `count` kept for backward compatibility = number actually published.
           count: result.counts.published,
@@ -331,7 +333,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     with {:ok, ids} <- resolve_bulk_delete_ids(tenant_id, params),
          {:ok, result} <- Knowledge.bulk_archive(tenant_id, ids, audit_opts) do
       json(conn, %{
-        data: Enum.map(result.archived, &ArticleJSON.article_data/1),
+        # Body-less summaries (consistent with bulk-unpublish, #158); per-id detail
+        # is in meta.results.
+        data: Enum.map(result.archived, &ArticleJSON.article_summary/1),
         meta: %{
           # `count` = number actually archived.
           count: result.counts.archived,

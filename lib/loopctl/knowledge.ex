@@ -1998,7 +1998,9 @@ defmodule Loopctl.Knowledge do
 
   defp do_bulk_publish(tenant_id, article_ids, opts) do
     # Load every requested article once, keyed by id (lag-free, DB-of-record).
-    existing = load_existing_by_ids(tenant_id, article_ids)
+    # Body-less: the publish transition + audit only need id/status, and the
+    # response is body-less summaries — never materialize up to 5000 bodies (#158).
+    existing = load_existing_by_ids(tenant_id, article_ids, false)
 
     drafts =
       for id <- article_ids,
@@ -2267,7 +2269,9 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_bulk_archive(tenant_id, article_ids, opts) do
-    existing = load_existing_by_ids(tenant_id, article_ids)
+    # Body-less load: the archive transition + audit need only id/status, and the
+    # response is body-less summaries — never materialize up to 5000 bodies (#158).
+    existing = load_existing_by_ids(tenant_id, article_ids, false)
 
     archivable =
       for id <- article_ids,
@@ -2331,10 +2335,12 @@ defmodule Loopctl.Knowledge do
   # kept out of the `id in ^ids` query (which would raise on cast) so they
   # resolve to a clean "not_found" via the absent map entry.
   # `include_body: false` projects every field except the (potentially large)
-  # `body`, so a bulk op that never echoes the body (e.g. bulk-unpublish, which
-  # renders body-less summaries) doesn't pull up to 5000 full bodies into memory
-  # just to flip a status. The status transition and audit only need id/status.
-  defp load_existing_by_ids(tenant_id, article_ids, include_body \\ true) do
+  # `body`, so a bulk op that never echoes the body (all of bulk publish/unpublish/
+  # archive render body-less summaries) doesn't pull up to 5000 full bodies into
+  # memory just to flip a status. The status transition and audit only need
+  # id/status. Callers pass `include_body` explicitly (no default — every current
+  # caller is body-less; pass `true` if a future caller needs full bodies).
+  defp load_existing_by_ids(tenant_id, article_ids, include_body) do
     queryable_ids = Enum.filter(article_ids, &valid_uuid?/1)
 
     base =

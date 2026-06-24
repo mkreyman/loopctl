@@ -219,6 +219,10 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["meta"]["count"] == 3
       assert length(body["data"]) == 3
 
+      # data carries body-less summaries — never the full bodies (#158).
+      assert Enum.all?(body["data"], &(not Map.has_key?(&1, "body")))
+      assert Enum.all?(body["data"], &Map.has_key?(&1, "id"))
+
       # Verify all published in DB
       for id <- [a1.id, a2.id, a3.id] do
         article = AdminRepo.get!(Article, id)
@@ -555,6 +559,10 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, draft.id).status == :archived
       assert AdminRepo.get!(Article, published.id).status == :archived
       assert AdminRepo.get!(Article, superseded.id).status == :superseded
+
+      # data carries body-less summaries — never the full bodies (#158).
+      assert Enum.all?(body["data"], &(not Map.has_key?(&1, "body")))
+      assert Enum.all?(body["data"], &Map.has_key?(&1, "id"))
     end
 
     test "supplying more than one selector is rejected (no silent confirm bypass)", %{conn: conn} do
