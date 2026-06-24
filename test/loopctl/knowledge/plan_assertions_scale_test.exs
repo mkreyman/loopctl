@@ -80,24 +80,36 @@ defmodule Loopctl.Knowledge.PlanAssertionsScaleTest do
       built =
         Knowledge.suggestion_candidates_query(tenant.id, target.id, target.embedding, 0.5, 5, nil)
 
-      {built_sql, _} = SQL.to_sql(:all, AdminRepo, built)
+      {built_sql, built_params} = SQL.to_sql(:all, AdminRepo, built)
 
-      # AC-27.2.4: the query we assert on is byte-identical to the one the request path
-      # actually emits (no independently re-constructed stunt double).
+      # AC-27.2.4: capture the SQL+PARAMS the request path actually emits.
       captured =
         PlanAssertions.capture_repo_queries(fn ->
           Knowledge.suggest_links(tenant.id, target.id, threshold: 0.5, limit: 5)
         end)
 
-      {emitted_sql, _} =
+      {emitted_sql, emitted_params} =
         PlanAssertions.only_query_matching(captured, ~r/<=>.*article_links|article_links.*<=>/s)
 
+      # Byte-identical SQL *and* params — the planner's choice for a `LIMIT $n` / `<=> $vec`
+      # query can depend on param values, so SQL parity alone is not enough.
       assert emitted_sql == built_sql,
              "Plan-assertion query and request-path query must be byte-identical (AC-27.2.4)."
 
-      # AC-27.2.7: planner's NATURAL choice (no enable_seqscan/sort=off) at 80k must reach
-      # articles via the HNSW index — not a full Seq Scan + Sort (the #172 prod 500).
-      assert :ok = PlanAssertions.assert_hnsw_index(built)
+      assert emitted_params == built_params,
+             "Request-path params must match the asserted params (AC-27.2.4)."
+
+      # AC-27.2.7: assert on the CAPTURED request-path {sql, params} (not a re-built stunt
+      # double). Planner's NATURAL choice (no enable_seqscan/sort=off) at 80k must reach
+      # `articles` via exactly one HNSW Index Scan — never a Seq/Bitmap full-corpus read.
+      #
+      # NOTE (optimistic case): this seeds ONE tenant owning the whole corpus, so the
+      # tenant predicate is non-selective and HNSW is the obvious win. A *small* tenant
+      # within a large multi-tenant corpus is more adversarial (HNSW can't pre-filter by
+      # tenant), and the planner may correctly prefer a tenant-btree + sort there — which
+      # is fine for a small tenant. Prod's hot path (second-brain) IS the single large
+      # tenant, which this models.
+      assert :ok = PlanAssertions.assert_hnsw_index({emitted_sql, emitted_params})
     end)
   end
 end
