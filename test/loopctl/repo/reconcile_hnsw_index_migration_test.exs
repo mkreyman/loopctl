@@ -18,8 +18,19 @@ defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
   canonical index intact for every other test (the index DDL here is
   non-concurrent, so it runs happily inside a transaction). It does NOT touch
   `schema_migrations`; it invokes the migration modules' `up/0` / `down/0`
-  directly via `Ecto.Migration.Runner`, which is exactly the code path
-  `Ecto.Migrator` uses.
+  directly via `Ecto.Migration.Runner.run/8`.
+
+  Scope of what this exercises: `Runner.run/8` starts the runner Agent and
+  calls `perform_operation/3` — it executes the migrations' SQL and detection
+  logic, which is what this test validates. It does NOT manage transactions or
+  consult `@disable_ddl_transaction` / `@disable_migration_lock`; that logic
+  lives one layer up in `Ecto.Migrator.run_maybe_in_transaction/4`, which this
+  test deliberately bypasses. Consequently the old `AddEmbeddingHnswIndex`
+  migration's `@disable_ddl_transaction true` is NOT honored here: its DDL runs
+  on the sandbox connection INSIDE the test transaction (which is exactly what
+  makes the test safe and self-cleaning), rather than outside a transaction as
+  it would under the real migrator. This test therefore proves the SQL /
+  detection behavior, not the disable-ddl-transaction behavior.
 
   `async: false` because it mutates a shared, table-level index whose name
   other (async) tests assert on — the sandbox isolates the data, but the
@@ -94,6 +105,35 @@ defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
 
     run_migration(ReconcileHnswIndexName, :up)
     assert hnsw_index_names() == [@canonical]
+  end
+
+  test "old up-step does not create a duplicate hnsw index from the prod drift state (AC-27.14.2)" do
+    # Reproduce prod's drift: the single hnsw index lives under the out-of-band
+    # name `articles_embedding_hnsw_idx`, NOT the migration's `articles_embedding_idx`.
+    assert hnsw_index_names() == [@canonical]
+
+    # The amname-aware up-guard must see the existing hnsw index and SKIP, so
+    # no second redundant hnsw index is created. (The old name-based guard
+    # `indexname = 'articles_embedding_idx'` would have created a duplicate.)
+    run_migration(AddEmbeddingHnswIndex, :up)
+
+    assert hnsw_index_names() == [@canonical],
+           "up-step must not create a duplicate hnsw index when one already exists under a different name"
+  end
+
+  test "down-step drops ALL hnsw indexes, leaving none orphaned (AC-27.14.2)" do
+    # Force the (normally unreachable) two-index state to prove the down-step
+    # iterates over every hnsw index rather than dropping only one (LIMIT 1).
+    AdminRepo.query!(
+      "CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops)"
+    )
+
+    assert Enum.sort(hnsw_index_names()) == Enum.sort([@canonical, @noncanonical])
+
+    run_migration(AddEmbeddingHnswIndex, :down)
+
+    assert hnsw_index_names() == [],
+           "down-step must drop every hnsw index, leaving none orphaned"
   end
 
   test "reconcile migration renames a non-canonical hnsw index to the canonical name" do

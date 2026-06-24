@@ -65,13 +65,15 @@ defmodule Loopctl.Repo.Migrations.ReconcileHnswIndexName do
       FROM pg_indexes
       WHERE tablename = 'articles' AND indexdef ILIKE '%hnsw%';
 
-      -- Or by access method (what this migration uses), exact:
+      -- Or by access method (what this migration uses), exact and
+      -- schema-qualified to the public `articles`:
       SELECT i.relname
       FROM pg_index x
       JOIN pg_class i ON i.oid = x.indexrelid
       JOIN pg_class t ON t.oid = x.indrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
       JOIN pg_am    am ON am.oid = i.relam
-      WHERE t.relname = 'articles' AND am.amname = 'hnsw';
+      WHERE t.relname = 'articles' AND n.nspname = 'public' AND am.amname = 'hnsw';
   """
 
   def up do
@@ -84,16 +86,25 @@ defmodule Loopctl.Repo.Migrations.ReconcileHnswIndexName do
       -- hnsw index on `articles` already present — rather than a bare
       -- relname match. A bare `pg_class.relname` check is unqualified by
       -- relkind/access-method/namespace, so an unrelated object squatting
-      -- the name (table, view, sequence, or an index of another AM, in ANY
+      -- the name (table, view, sequence, or an index of another AM, in any
       -- schema) would RETURN early and silently skip reconciliation, leaving
-      -- the very drift this migration exists to fix.
+      -- the very drift this migration exists to fix. The `n.nspname = 'public'`
+      -- join below makes that namespace-safety claim TRUE: in a hypothetical
+      -- multi-schema (schema-per-tenant) deployment with more than one
+      -- `articles` relation, this predicate matches only the one in `public`,
+      -- so neither the guard nor the RENAME below can touch a same-named
+      -- relation in another schema. (loopctl is single-schema RLS today, so in
+      -- practice exactly one `articles` exists — but the predicate is correct
+      -- ahead of any future schema-per-tenant move.)
       IF EXISTS (
         SELECT 1
         FROM pg_index x
         JOIN pg_class i ON i.oid = x.indexrelid
         JOIN pg_class t ON t.oid = x.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
         JOIN pg_am    am ON am.oid = i.relam
         WHERE t.relname = 'articles'
+          AND n.nspname = 'public'
           AND am.amname = 'hnsw'
           AND i.relname = 'articles_embedding_hnsw_idx'
       ) THEN
@@ -102,13 +113,15 @@ defmodule Loopctl.Repo.Migrations.ReconcileHnswIndexName do
 
       -- Find whichever hnsw index on articles is present, by access method
       -- (not by name) so we catch the test-DB `articles_embedding_idx` and
-      -- any other out-of-band name.
+      -- any other out-of-band name. Same `public`-schema qualification as the
+      -- guard above, so the RENAME target is always the public `articles`.
       SELECT i.relname INTO idx
       FROM pg_index x
       JOIN pg_class i ON i.oid = x.indexrelid
       JOIN pg_class t ON t.oid = x.indrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
       JOIN pg_am    am ON am.oid = i.relam
-      WHERE t.relname = 'articles' AND am.amname = 'hnsw'
+      WHERE t.relname = 'articles' AND n.nspname = 'public' AND am.amname = 'hnsw'
       LIMIT 1;
 
       IF idx IS NOT NULL THEN
