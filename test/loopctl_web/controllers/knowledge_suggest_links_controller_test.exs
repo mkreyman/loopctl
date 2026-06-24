@@ -79,10 +79,12 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   end
 
   describe "GET /api/v1/knowledge/articles/:id/suggested_links (#150)" do
-    # #168 regression: the endpoint 500'd in production because the target's stored
-    # vector was round-tripped back in as a `^param::vector`. The query now does the
-    # cosine column-to-column via a self-join. This guards the end-to-end HTTP path
-    # (controller → query → JSON) returns 200 with the documented candidate shape.
+    # #168/#172 regression: the endpoint 500'd in production. #168 was re-interpolating
+    # the stored `%Pgvector{}` as a `^param::vector`; #172 was the self-join that read the
+    # target vector as a column, forcing a full-corpus scan. The query now binds the target
+    # as a plain list param (HNSW-indexable `ORDER BY embedding <=> $const LIMIT k`). This
+    # guards the end-to-end HTTP path (controller → query → JSON) returns 200 with the
+    # documented candidate shape.
     test "returns 200 with ranked candidate shape (no 500) — #168", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target168", [1.0, 0.0])
@@ -147,6 +149,38 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       assert target.id not in ids(body)
       assert linked.id not in ids(body)
       assert free.id in ids(body)
+    end
+
+    # #172 follow-up: the result must not under-fill below `limit` when the target's
+    # nearest neighbors are mostly already-linked. Links cluster among similar articles,
+    # so the anti-join removes exactly the closest candidates — pgvector iterative scan
+    # has to keep pulling neighbors until `limit` UNLINKED ones survive. (At test scale
+    # the planner seq-scans so this is exact regardless; the assertion guards the
+    # exclusion-under-limit contract that iterative scan preserves at prod scale.)
+    test "fills up to limit with unlinked candidates even when nearer ones are linked",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0])
+      # Six equally-similar candidates; pre-link four so only two remain unlinked.
+      linked = for i <- 1..4, do: embedded(tenant.id, "Linked#{i}", [1.0])
+      free1 = embedded(tenant.id, "Free1", [1.0])
+      free2 = embedded(tenant.id, "Free2", [1.0])
+
+      for l <- linked do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: target.id,
+          target_article_id: l.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      returned = ids(suggest(conn, key, target.id, %{limit: 2}))
+
+      # Exactly the two unlinked candidates — none of the four linked ones leak through,
+      # and the result is not starved below the requested limit.
+      assert Enum.sort(returned) == Enum.sort([free1.id, free2.id])
+      for l <- linked, do: assert(l.id not in returned)
     end
 
     test "is read-only — creates no links", %{conn: conn} do
