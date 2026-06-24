@@ -668,8 +668,11 @@ async function knowledgeDistantPairs({ min_distance, max_distance, bridge_path, 
   return toContent(result);
 }
 
-async function knowledgeNovelty({ ideas, prior_tag }) {
-  const body = { ideas };
+async function knowledgeNovelty({ ideas, texts, prior_tag }) {
+  // Accept either shape (#169): `ideas` (strings or objects) or `texts` (strings).
+  const body = {};
+  if (ideas !== undefined) body.ideas = ideas;
+  if (texts !== undefined) body.texts = texts;
   if (prior_tag) body.prior_tag = prior_tag;
   const result = await apiCall("POST", "/api/v1/knowledge/novelty", body, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
@@ -2302,7 +2305,9 @@ const TOOLS = [
       "prior proposal, returning novelty_score = cosine distance (0 = identical to existing " +
       "work, higher = more novel, up to 2.0; null when the idea text is blank, no priors " +
       "exist, or embedding fails). Priors default to published articles tagged 'proposal' " +
-      "(override with prior_tag). " +
+      "(override with prior_tag). Provide the ideas as EITHER `texts` (a list of strings) " +
+      "OR `ideas` (a list of strings or objects {text|title/spark/thesis,...}); all forms " +
+      "are accepted. " +
       "Returns { data: [{...idea, novelty_score}], meta: { prior_count } }. Use to rerank " +
       "generated ideas by novelty × value and avoid repeating prior work.",
     inputSchema: {
@@ -2311,16 +2316,21 @@ const TOOLS = [
         ideas: {
           type: "array",
           description:
-            "Ideas to score (≤50). Each is an object; its embed text is `text`, else " +
-            "title/spark/thesis are joined.",
-          items: { type: "object" },
+            "Ideas to score (≤50). Each is a string, or an object whose embed text is " +
+            "`text` (else title/spark/thesis are joined).",
+          items: { type: ["string", "object"] },
+        },
+        texts: {
+          type: "array",
+          description: "Alternative to `ideas`: a list of idea strings (the #152 AC shape).",
+          items: { type: "string" },
         },
         prior_tag: {
           type: "string",
           description: "Tag identifying prior proposals to compare against (default 'proposal').",
         },
       },
-      required: ["ideas"],
+      required: [],
     },
   },
   {

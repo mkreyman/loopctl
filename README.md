@@ -819,7 +819,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_graph` | Multi-hop link-graph traversal from a seed article, bounded to agent's visible articles (typed edges, depth/fan-out caps). | agent |
 | `knowledge_suggest_links` | Ranked typed-link candidates for an article by embedding similarity among visible articles (read-only). | agent |
 | `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in optimal-novelty band, sampled from agent's visible published articles. | agent |
-| `knowledge_novelty` | Score ideas by distance to nearest visible prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no visible priors/embed fails). | agent |
+| `knowledge_novelty` | Score ideas (`texts:[string]` or `ideas:[string\|object]`) by cosine distance to the nearest visible prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no visible priors/embed fails). `meta.prior_count` = embedded visible priors compared against. | agent |
 | `knowledge_random_walk` | Random walk through link graph from start article, traversing only agent's visible published articles. | agent |
 | `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture). Agent-authored articles are `visibility: owner` by default; use `metadata: {visibility: "shared"}` to make visible to other agents. | agent |
 | `knowledge_bulk_unpublish` | Bulk revert published articles to draft (archive), partial-success | user |

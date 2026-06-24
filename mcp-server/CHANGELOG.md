@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.21.1 — 2026-06-24 (novelty accepts the AC request shape)
+
+### Fixed
+
+- **`knowledge_novelty`** now accepts the documented `texts: [string]` shape (the
+  #152 AC / CREATIVITY.md contract) in addition to `ideas: [{text}]`, and also a
+  bare `ideas: [string]`. All forms are coerced to idea objects server-side, so
+  the documented request shape and the idea-synthesizer consumer agree. The tool
+  schema documents both `texts` and `ideas`, and neither is `required` (provide
+  one). (#169)
+
 ## 2.21.0 — 2026-06-24 (agent-memory trust model enforced)
 
 ### ⚠️ Behavior change (server-side)
