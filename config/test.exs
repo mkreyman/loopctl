@@ -132,6 +132,13 @@ config :loopctl, :secrets_adapter, Loopctl.MockSecrets
 # overrides it with Mox.expect/3 to inject a deterministic Postgrex.Error.
 config :loopctl, :knowledge_suggest_links, Loopctl.MockSuggestLinks
 
+# DI (US-27.3): the router wrapped by LoopctlWeb.Plugs.DBErrorBackstop. The
+# default stub (DataCase.stub_all_defaults/0) delegates to the real
+# LoopctlWeb.Router so all requests flow normally; the DBErrorBackstop test
+# overrides it to raise a DB exception uncaught and assert the structured log +
+# sanitized re-raise.
+config :loopctl, :db_error_backstop_router, Loopctl.MockBackstopRouter
+
 # Witness header enforcement disabled in tests — dedicated tests verify
 # the plug directly. Other tests don't send the header on secondary conns.
 config :loopctl, :enforce_witness_header, false

@@ -6,16 +6,22 @@ defmodule LoopctlWeb.Plugs.DBErrorHandler do
   rescues and returns as `{:error, %Postgrex.Error{}}` — that path also does
   the structured SQLSTATE logging with request_id (AC-27.3.3).
 
-  This module is the backstop for any DB exception that escapes an action
-  uncaught and reaches Phoenix's `render_errors` path. `Plug.Exception.status/1`
-  is consulted for the HTTP status of any raised exception, so we map the same
-  SQLSTATE classes to the same pinned statuses here (504/503/500) instead of a
-  blanket 500. The body is rendered by `LoopctlWeb.ErrorJSON` from the status's
-  reason phrase — a safe, generic message with no SQL/params/stack trace.
+  This module supplies the HTTP STATUS for any DB exception that escapes an
+  action uncaught and reaches Phoenix's `render_errors` path.
+  `Plug.Exception.status/1` is consulted for the status of any raised exception,
+  so we map the same SQLSTATE classes to the same pinned statuses here
+  (504/503/500) instead of a blanket 500. The body is rendered by
+  `LoopctlWeb.ErrorJSON` — a safe, generic message with no SQL/params/stack trace.
 
-  `status/1` is pure (no logging hook); deterministic structured logging is the
-  rescue→tuple→FallbackController path. Phoenix still emits its own crash log for
-  raised errors, which carries the SQLSTATE for diagnosis as a backstop.
+  `status/1` is pure (no logging hook). The STRUCTURED logging and SQL-leak
+  sanitization for the uncaught path are handled separately by
+  `LoopctlWeb.Plugs.DBErrorBackstop` (an endpoint-level wrapping plug): it catches
+  the escaped DB exception, emits the same sanitized structured SQLSTATE line as
+  the FallbackController rescue path (via `LoopctlWeb.DBErrorLogger`), and
+  re-raises a `LoopctlWeb.SanitizedDBError` so the web-server crash log can never
+  echo the raw query. Together, AC-27.3.3 (structured fields) and AC-27.3.8
+  (no raw SQL/vector leakage) hold for EVERY controller, not just suggested_links
+  — while THIS module keeps owning the status mapping.
 
   Mirrors `LoopctlWeb.Plugs.CastErrorHandler`: auto-compiled `defimpl`, no
   router/endpoint registration needed. phoenix_ecto's own `Postgrex.Error` impl

@@ -164,6 +164,16 @@ defmodule Loopctl.DataCase do
     Mox.stub(Loopctl.MockSuggestLinks, :suggest_links, fn tenant_id, article_id, opts ->
       Loopctl.Knowledge.suggest_links(tenant_id, article_id, opts)
     end)
+
+    # US-27.3: by default the backstop router delegates to the real
+    # LoopctlWeb.Router so every request dispatches normally. Only the
+    # DBErrorBackstop test overrides these with `Mox.expect/3` to inject a router
+    # that raises a DB exception uncaught, exercising the catch/log/sanitize path.
+    Mox.stub(Loopctl.MockBackstopRouter, :init, fn opts -> LoopctlWeb.Router.init(opts) end)
+
+    Mox.stub(Loopctl.MockBackstopRouter, :call, fn conn, opts ->
+      LoopctlWeb.Router.call(conn, opts)
+    end)
   end
 
   @doc """

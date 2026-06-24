@@ -9,3 +9,10 @@ Mox.defmock(Loopctl.MockContentExtractor, for: Loopctl.Knowledge.ContentExtracto
 Mox.defmock(Loopctl.MockWebAuthn, for: Loopctl.WebAuthn.Behaviour)
 Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
+
+# US-27.3: a Plug-shaped mock standing in for LoopctlWeb.Router so the
+# DBErrorBackstop's catch/log/sanitize path can be exercised by injecting a
+# router that raises a DB exception uncaught — without mounting a test-only route
+# on the production router. The default stub (DataCase.stub_all_defaults/0)
+# delegates to the real router so every other request flows normally.
+Mox.defmock(Loopctl.MockBackstopRouter, for: Plug)
