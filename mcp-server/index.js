@@ -761,12 +761,25 @@ async function knowledgeGet({ article_id, project_id, story_id }) {
   return toContent(result);
 }
 
-async function knowledgeContext({ query, project_id, story_id, limit, recency_weight }) {
+async function knowledgeContext({
+  query,
+  project_id,
+  story_id,
+  limit,
+  recency_weight,
+  memory_types,
+  agents,
+  conversation_id,
+}) {
   const params = new URLSearchParams({ query });
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (limit != null) params.set("limit", String(limit));
   if (recency_weight != null) params.set("recency_weight", String(recency_weight));
+  // Agent-memory scoping (comma-separated lists are OR'd; conversation_id is exact).
+  if (memory_types) params.set("memory_types", Array.isArray(memory_types) ? memory_types.join(",") : memory_types);
+  if (agents) params.set("agents", Array.isArray(agents) ? agents.join(",") : agents);
+  if (conversation_id) params.set("conversation_id", conversation_id);
 
   const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
@@ -2314,7 +2327,9 @@ const TOOLS = [
     name: "knowledge_context",
     description:
       "Get ranked full articles for a task query. Returns best knowledge with linked references. " +
-      "Pass story_id when working on a loopctl story so reads attribute correctly.",
+      "Pass story_id when working on a loopctl story so reads attribute correctly. For agent " +
+      "memory, scope to a memory_type/agent/conversation via the memory_types/agents/" +
+      "conversation_id filters (articles whose metadata carries those keys).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2341,6 +2356,20 @@ const TOOLS = [
           description: "Optional: weight for recency scoring (0.0-1.0).",
           minimum: 0,
           maximum: 1,
+        },
+        memory_types: {
+          type: "string",
+          description:
+            "Optional agent-memory scope: comma-separated memory_types (OR) — " +
+            "observation|finding|summary|decision|question|task.",
+        },
+        agents: {
+          type: "string",
+          description: "Optional agent-memory scope: comma-separated agent_ids (OR).",
+        },
+        conversation_id: {
+          type: "string",
+          description: "Optional agent-memory scope: exact conversation_id.",
         },
       },
       required: ["query"],

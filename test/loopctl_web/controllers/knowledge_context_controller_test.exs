@@ -491,4 +491,82 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
       end
     end
   end
+
+  describe "GET /api/v1/knowledge/context — agent-memory scoping (#151)" do
+    setup do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      finding =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Mem Finding",
+          body: "memoryword zeta finding observation content",
+          category: :finding,
+          status: :published,
+          metadata: %{
+            "agent_id" => "agent-1",
+            "memory_type" => "finding",
+            "conversation_id" => "conv-1"
+          }
+        })
+
+      decision =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Mem Decision",
+          body: "memoryword zeta decision content",
+          category: :decision,
+          status: :published,
+          metadata: %{
+            "agent_id" => "agent-2",
+            "memory_type" => "decision",
+            "conversation_id" => "conv-2"
+          }
+        })
+
+      %{key: raw_key, finding: finding, decision: decision}
+    end
+
+    defp ctx_ids(conn, key, query) do
+      conn
+      |> auth_conn(key)
+      |> get(~p"/api/v1/knowledge/context", query)
+      |> json_response(200)
+      |> Map.fetch!("data")
+      |> Enum.map(& &1["id"])
+    end
+
+    test "memory_types scopes results by memory_type (OR via metadata @>)",
+         %{conn: conn, key: key, finding: finding, decision: decision} do
+      ids = ctx_ids(conn, key, %{query: "memoryword", memory_types: "finding"})
+      assert finding.id in ids
+      refute decision.id in ids
+
+      both = ctx_ids(conn, key, %{query: "memoryword", memory_types: "finding,decision"})
+      assert finding.id in both
+      assert decision.id in both
+    end
+
+    test "agents scopes results by agent_id",
+         %{conn: conn, key: key, finding: finding, decision: decision} do
+      ids = ctx_ids(conn, key, %{query: "memoryword", agents: "agent-2"})
+      assert decision.id in ids
+      refute finding.id in ids
+    end
+
+    test "conversation_id scopes results exactly",
+         %{conn: conn, key: key, finding: finding, decision: decision} do
+      ids = ctx_ids(conn, key, %{query: "memoryword", conversation_id: "conv-1"})
+      assert finding.id in ids
+      refute decision.id in ids
+    end
+
+    test "no memory scope returns all matching articles",
+         %{conn: conn, key: key, finding: finding, decision: decision} do
+      ids = ctx_ids(conn, key, %{query: "memoryword"})
+      assert finding.id in ids
+      assert decision.id in ids
+    end
+  end
 end

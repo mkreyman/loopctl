@@ -5,6 +5,69 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
   alias Loopctl.Knowledge.Article
 
+  describe "agent-memory metadata conventions (#151)" do
+    defp memory_changeset(metadata) do
+      Article.create_changeset(%Article{}, %{
+        title: "Mem #{System.unique_integer([:positive])}",
+        body: "agent memory body",
+        category: :finding,
+        metadata: metadata
+      })
+    end
+
+    test "valid memory_type and visibility pass when agent_id is present" do
+      cs =
+        memory_changeset(%{
+          "agent_id" => "agent-1",
+          "memory_type" => "finding",
+          "visibility" => "shared",
+          "conversation_id" => "conv-1"
+        })
+
+      assert cs.valid?
+    end
+
+    test "rejects an invalid memory_type when agent_id is present" do
+      cs = memory_changeset(%{"agent_id" => "agent-1", "memory_type" => "bogus"})
+
+      refute cs.valid?
+      assert "invalid memory_type 'bogus'; must be one of: " <> _ = error_on(cs, :metadata)
+    end
+
+    test "rejects an invalid visibility when agent_id is present" do
+      cs = memory_changeset(%{"agent_id" => "agent-1", "visibility" => "nope"})
+
+      refute cs.valid?
+      assert error_on(cs, :metadata) =~ "invalid visibility"
+    end
+
+    test "rejects a non-string / over-long agent_id" do
+      assert error_on(memory_changeset(%{"agent_id" => 123}), :metadata) =~
+               "agent_id must be a string"
+
+      long = String.duplicate("x", 201)
+      assert error_on(memory_changeset(%{"agent_id" => long}), :metadata) =~ "agent_id too long"
+    end
+
+    test "without an agent_id, memory_type/visibility are NOT validated (free-form metadata)" do
+      cs = memory_changeset(%{"memory_type" => "bogus", "visibility" => "nope", "any" => "thing"})
+
+      assert cs.valid?
+    end
+
+    test "exposes the allowed value lists" do
+      assert "finding" in Article.valid_memory_types()
+      assert "shared" in Article.valid_visibilities()
+    end
+
+    defp error_on(changeset, field) do
+      changeset.errors
+      |> Keyword.get_values(field)
+      |> Enum.map(fn {msg, _opts} -> msg end)
+      |> List.first()
+    end
+  end
+
   describe "create_changeset/2" do
     test "valid changeset with all required fields" do
       changeset =

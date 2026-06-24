@@ -1012,7 +1012,7 @@ defmodule Loopctl.Knowledge do
     # access_type="context" rather than duplicating as "search".
     search_opts =
       opts
-      |> Keyword.take([:project_id])
+      |> Keyword.take([:project_id, :memory_types, :agents, :conversation_id])
       |> Keyword.merge(
         limit: limit * 3,
         offset: 0,
@@ -1376,6 +1376,42 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+    |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
+    |> maybe_filter_by_agents(Keyword.get(opts, :agents))
+    |> maybe_filter_by_conversation_id(Keyword.get(opts, :conversation_id))
+  end
+
+  # Agent-memory scoping via JSONB containment (`metadata @> '{"key": val}'`),
+  # matching the conventions validated on the Article changeset. Lists are OR'd.
+  defp maybe_filter_by_memory_types(query, nil), do: query
+  defp maybe_filter_by_memory_types(query, []), do: query
+
+  defp maybe_filter_by_memory_types(query, types) when is_list(types) do
+    conditions =
+      Enum.reduce(types, dynamic(false), fn type, acc ->
+        dynamic([a], ^acc or fragment("? @> ?", a.metadata, ^%{"memory_type" => type}))
+      end)
+
+    where(query, ^conditions)
+  end
+
+  defp maybe_filter_by_agents(query, nil), do: query
+  defp maybe_filter_by_agents(query, []), do: query
+
+  defp maybe_filter_by_agents(query, agents) when is_list(agents) do
+    conditions =
+      Enum.reduce(agents, dynamic(false), fn agent, acc ->
+        dynamic([a], ^acc or fragment("? @> ?", a.metadata, ^%{"agent_id" => agent}))
+      end)
+
+    where(query, ^conditions)
+  end
+
+  defp maybe_filter_by_conversation_id(query, nil), do: query
+  defp maybe_filter_by_conversation_id(query, ""), do: query
+
+  defp maybe_filter_by_conversation_id(query, conv_id) when is_binary(conv_id) do
+    where(query, [a], fragment("? @> ?", a.metadata, ^%{"conversation_id" => conv_id}))
   end
 
   # Fire-and-forget recording of search access for the result list.

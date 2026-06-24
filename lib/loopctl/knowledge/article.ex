@@ -81,6 +81,22 @@ defmodule Loopctl.Knowledge.Article do
 
   @max_idempotency_key_length 255
 
+  # Agent-memory conventions in `metadata` (validated only when `agent_id` is
+  # present — a curated reference article without an agent_id is unaffected).
+  # `memory_type` is the agent-episodic kind (distinct from `category`, the
+  # knowledge kind); `visibility` scopes sharing.
+  @valid_memory_types ~w(observation finding summary decision question task)
+  @valid_visibilities ~w(shared private owner)
+  @max_agent_id_length 200
+
+  @doc "Allowed agent-memory `memory_type` values."
+  @spec valid_memory_types() :: [String.t()]
+  def valid_memory_types, do: @valid_memory_types
+
+  @doc "Allowed agent-memory `visibility` values."
+  @spec valid_visibilities() :: [String.t()]
+  def valid_visibilities, do: @valid_visibilities
+
   @doc """
   Changeset for creating a new article.
 
@@ -110,6 +126,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_tags()
     |> validate_source_type()
     |> validate_metadata()
+    |> validate_agent_metadata()
     |> maybe_generate_slug()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
@@ -145,6 +162,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_slug()
     |> validate_tags()
     |> validate_metadata()
+    |> validate_agent_metadata()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
@@ -273,6 +291,67 @@ defmodule Loopctl.Knowledge.Article do
         [metadata: "must be a map"]
       end
     end)
+  end
+
+  # When `metadata.agent_id` is present, the article is an agent memory: validate
+  # the `agent_id`, `memory_type`, and `visibility` conventions. Without an
+  # `agent_id`, no agent-memory validation applies (curated references are free-form).
+  defp validate_agent_metadata(changeset) do
+    case get_change(changeset, :metadata) do
+      metadata when is_map(metadata) and not is_struct(metadata) ->
+        if Map.has_key?(metadata, "agent_id") or Map.has_key?(metadata, :agent_id) do
+          changeset
+          |> validate_metadata_agent_id(metadata)
+          |> validate_metadata_member(metadata, "memory_type", :memory_type, @valid_memory_types)
+          |> validate_metadata_member(metadata, "visibility", :visibility, @valid_visibilities)
+        else
+          changeset
+        end
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp validate_metadata_agent_id(changeset, metadata) do
+    agent_id = metadata["agent_id"] || metadata[:agent_id]
+
+    cond do
+      not is_binary(agent_id) ->
+        add_error(changeset, :metadata, "agent_id must be a string")
+
+      byte_size(agent_id) > @max_agent_id_length ->
+        add_error(
+          changeset,
+          :metadata,
+          "agent_id too long (max #{@max_agent_id_length} characters)"
+        )
+
+      true ->
+        changeset
+    end
+  end
+
+  defp validate_metadata_member(changeset, metadata, str_key, atom_key, allowed) do
+    value = metadata[str_key] || metadata[atom_key]
+
+    cond do
+      is_nil(value) ->
+        changeset
+
+      not is_binary(value) ->
+        add_error(changeset, :metadata, "#{str_key} must be a string")
+
+      value in allowed ->
+        changeset
+
+      true ->
+        add_error(
+          changeset,
+          :metadata,
+          "invalid #{str_key} '#{String.slice(value, 0, 50)}'; must be one of: #{Enum.join(allowed, ", ")}"
+        )
+    end
   end
 
   defp validate_source_type(changeset) do

@@ -21,8 +21,13 @@ defmodule LoopctlWeb.KnowledgeContextController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
 
   action_fallback LoopctlWeb.FallbackController
+
+  @max_csv_list_size 25
+  @max_csv_item_length 200
+  @max_conversation_id_length 200
 
   plug LoopctlWeb.Plugs.RequireRole, role: :agent
 
@@ -69,6 +74,27 @@ defmodule LoopctlWeb.KnowledgeContextController do
           "Article status filter (published, draft, archived). " <>
             "Only effective for user/superadmin roles. " <>
             "Agent/orchestrator roles are forced to published.",
+        required: false
+      ],
+      memory_types: [
+        in: :query,
+        type: :string,
+        description:
+          "Agent-memory scope: comma-separated memory_types (OR) — " <>
+            "observation|finding|summary|decision|question|task. Filters via metadata @>.",
+        required: false
+      ],
+      agents: [
+        in: :query,
+        type: :string,
+        description:
+          "Agent-memory scope: comma-separated agent_ids (OR). Filters via metadata @>.",
+        required: false
+      ],
+      conversation_id: [
+        in: :query,
+        type: :string,
+        description: "Agent-memory scope: exact conversation_id. Filters via metadata @>.",
         required: false
       ]
     ],
@@ -142,6 +168,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
       |> maybe_add_project_id(params["project_id"])
       |> maybe_add_limit(params["limit"])
       |> maybe_add_recency_weight(params["recency_weight"])
+      |> maybe_add_csv(:memory_types, params["memory_types"])
+      |> maybe_add_csv(:agents, params["agents"])
+      |> maybe_add_conversation_id(params["conversation_id"])
 
     # Agent role forced to published; user role can override via ?status= param
     role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
@@ -198,4 +227,46 @@ defmodule LoopctlWeb.KnowledgeContextController do
   end
 
   defp maybe_add_recency_weight(opts, _), do: opts
+
+  # Comma-separated value → list (OR semantics in the query). Absent/blank → no opt.
+  # Caps: max 25 items per list, max 200 chars per item. Excess items silently dropped,
+  # items exceeding length are truncated. For memory_types, only valid types are kept.
+  defp maybe_add_csv(opts, _key, value) when value in [nil, ""], do: opts
+
+  defp maybe_add_csv(opts, key, value) when is_binary(value) do
+    case value
+         |> String.split(",", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == ""))
+         |> Enum.take(@max_csv_list_size)
+         |> Enum.map(&String.slice(&1, 0, @max_csv_item_length)) do
+      [] ->
+        opts
+
+      list when key == :memory_types ->
+        # Only keep valid memory types; others are silently dropped
+        valid_types = Article.valid_memory_types()
+        filtered = Enum.filter(list, &(&1 in valid_types))
+
+        if Enum.empty?(filtered) do
+          opts
+        else
+          [{key, filtered} | opts]
+        end
+
+      list ->
+        [{key, list} | opts]
+    end
+  end
+
+  defp maybe_add_csv(opts, _key, _), do: opts
+
+  defp maybe_add_conversation_id(opts, value) when value in [nil, ""], do: opts
+
+  defp maybe_add_conversation_id(opts, value) when is_binary(value) do
+    truncated = String.slice(value, 0, @max_conversation_id_length)
+    [{:conversation_id, truncated} | opts]
+  end
+
+  defp maybe_add_conversation_id(opts, _), do: opts
 end
