@@ -10,9 +10,13 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
   use LoopctlWeb.ConnCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
 
   setup :verify_on_exit!
+
+  # 1536-dim vector from a sparse prefix (rest zero-filled), for embedding fixtures.
+  defp e(prefix), do: prefix ++ List.duplicate(0.0, 1536 - length(prefix))
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
@@ -222,6 +226,230 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
              )
 
       assert ctx.priv_id in get_ids(ctx.conn, ctx.raw_user, ~p"/api/v1/articles")
+    end
+
+    test "the owning agent reads its own OWNER-visibility memory; another agent can't", ctx do
+      owner_id =
+        post_memory(ctx.conn, ctx.raw_a, memory_attrs("ZorptOwner", %{"visibility" => "owner"}))
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      assert json_response(
+               ctx.conn |> auth(ctx.raw_a) |> get(~p"/api/v1/articles/#{owner_id}"),
+               200
+             )
+
+      assert json_response(
+               ctx.conn |> auth(ctx.raw_b) |> get(~p"/api/v1/articles/#{owner_id}"),
+               404
+             )
+    end
+
+    test "an identity-less agent sees only shared memories", ctx do
+      {raw_noid, _} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :agent, agent_id: nil})
+      ids = get_ids(ctx.conn, raw_noid, ~p"/api/v1/articles")
+      assert ctx.shared_id in ids
+      refute ctx.priv_id in ids
+    end
+  end
+
+  # The trust barrier is only as strong as its weakest read path — assert agent A's
+  # PRIVATE memory never leaks to agent B through ANY agent-reachable knowledge read.
+  describe "cross-endpoint visibility isolation (#163)" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_a, _key_a} = agent_key(tenant.id)
+      {raw_b, _key_b} = agent_key(tenant.id)
+      %{conn: conn, tenant: tenant, raw_a: raw_a, raw_b: raw_b}
+    end
+
+    # tags is a TOP-LEVEL article field (not metadata); visibility lives in metadata.
+    defp private_embedded(conn, raw_key, tenant_id, title, vector, tags \\ []) do
+      attrs = %{
+        "title" => title,
+        "body" => "#{title} body text",
+        "category" => "finding",
+        "tags" => tags,
+        "metadata" => %{"visibility" => "private"}
+      }
+
+      id = post_memory(conn, raw_key, attrs) |> json_response(201) |> get_in(["data", "id"])
+
+      {:ok, _} = Knowledge.update_embedding(tenant_id, id, e(vector))
+      id
+    end
+
+    test "count / stats / facets never include another agent's private memory", ctx do
+      # Tenant has exactly one article: agent A's private memory tagged `zsecret`.
+      _id =
+        post_memory(ctx.conn, ctx.raw_a, %{
+          "title" => "Secret",
+          "body" => "secret body",
+          "category" => "finding",
+          "tags" => ["zsecret"],
+          "metadata" => %{"visibility" => "private"}
+        })
+        |> json_response(201)
+
+      # count
+      assert ctx.conn
+             |> auth(ctx.raw_b)
+             |> get(~p"/api/v1/knowledge/count")
+             |> json_response(200)
+             |> Map.get("count") == 0
+
+      assert ctx.conn
+             |> auth(ctx.raw_a)
+             |> get(~p"/api/v1/knowledge/count")
+             |> json_response(200)
+             |> Map.get("count") == 1
+
+      # stats (tenant-wide totals)
+      assert ctx.conn
+             |> auth(ctx.raw_b)
+             |> get(~p"/api/v1/knowledge/stats")
+             |> json_response(200)
+             |> Map.get("total") == 0
+
+      assert ctx.conn
+             |> auth(ctx.raw_a)
+             |> get(~p"/api/v1/knowledge/stats")
+             |> json_response(200)
+             |> Map.get("total") == 1
+
+      # facets
+      b_facets =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> get(~p"/api/v1/knowledge/facets")
+        |> json_response(200)
+        |> Map.get("data")
+
+      a_facets =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> get(~p"/api/v1/knowledge/facets")
+        |> json_response(200)
+        |> Map.get("data")
+
+      refute Map.has_key?(b_facets, "zsecret")
+      assert Map.get(a_facets, "zsecret") == 1
+    end
+
+    test "distant_pairs never pairs another agent's private memory", ctx do
+      # Two of agent A's private memories, in the default 0.3–0.7 band (distance 0.5).
+      private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "P1", [1.0, 0.0])
+      private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "P2", [0.5, 0.866])
+
+      assert ctx.conn
+             |> auth(ctx.raw_b)
+             |> get(~p"/api/v1/knowledge/pairs")
+             |> json_response(200)
+             |> Map.get("data") == []
+
+      assert length(
+               ctx.conn
+               |> auth(ctx.raw_a)
+               |> get(~p"/api/v1/knowledge/pairs")
+               |> json_response(200)
+               |> Map.get("data")
+             ) == 1
+    end
+
+    test "suggest_links never suggests another agent's private memory", ctx do
+      # A SHARED, embedded target both agents can query; a PRIVATE candidate owned by A.
+      target_id =
+        post_memory(ctx.conn, ctx.raw_a, memory_attrs("Target", %{"visibility" => "shared"}))
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      {:ok, _} = Knowledge.update_embedding(ctx.tenant.id, target_id, e([1.0, 0.0]))
+      priv_cand = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Cand", [1.0, 0.0])
+
+      b_ids =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> get(~p"/api/v1/knowledge/articles/#{target_id}/suggested_links")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.map(& &1["id"])
+
+      a_ids =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> get(~p"/api/v1/knowledge/articles/#{target_id}/suggested_links")
+        |> json_response(200)
+        |> Map.get("data")
+        |> Enum.map(& &1["id"])
+
+      refute priv_cand in b_ids
+      assert priv_cand in a_ids
+    end
+
+    test "graph / walk never traverse to another agent's private memory", ctx do
+      # Shared start S linked to agent A's private memory P.
+      s_id =
+        post_memory(ctx.conn, ctx.raw_a, memory_attrs("Start", %{"visibility" => "shared"}))
+        |> json_response(201)
+        |> get_in(["data", "id"])
+
+      p_id = private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Hidden", [1.0, 0.0])
+
+      fixture(:article_link, %{
+        tenant_id: ctx.tenant.id,
+        source_article_id: s_id,
+        target_article_id: p_id,
+        relationship_type: :relates_to
+      })
+
+      graph_b =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> get(~p"/api/v1/knowledge/graph?article_id=#{s_id}&depth=2")
+        |> json_response(200)
+
+      refute p_id in Enum.map(graph_b["nodes"], & &1["id"])
+
+      walk_b =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> get(~p"/api/v1/knowledge/walk?start_id=#{s_id}&length=4")
+        |> json_response(200)
+
+      refute p_id in Enum.map(walk_b["data"], & &1["id"])
+
+      # Agent A (owner) reaches it.
+      walk_a =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> get(~p"/api/v1/knowledge/walk?start_id=#{s_id}&length=4")
+        |> json_response(200)
+
+      assert p_id in Enum.map(walk_a["data"], & &1["id"])
+    end
+
+    test "novelty priors exclude another agent's private proposals", ctx do
+      # Agent A's private proposal; agent B scoring an idea sees no comparable prior.
+      private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Proposal", [1.0, 0.0], ["proposal"])
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _ -> {:ok, e([1.0, 0.0])} end)
+
+      b_meta =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> post(~p"/api/v1/knowledge/novelty", %{ideas: [%{text: "x"}]})
+        |> json_response(200)
+        |> Map.get("meta")
+
+      a_meta =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> post(~p"/api/v1/knowledge/novelty", %{ideas: [%{text: "x"}]})
+        |> json_response(200)
+        |> Map.get("meta")
+
+      assert b_meta["prior_count"] == 0
+      assert a_meta["prior_count"] == 1
     end
   end
 end

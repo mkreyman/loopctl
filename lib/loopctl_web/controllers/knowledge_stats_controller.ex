@@ -15,6 +15,7 @@ defmodule LoopctlWeb.KnowledgeStatsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -64,7 +65,12 @@ defmodule LoopctlWeb.KnowledgeStatsController do
   def stats(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    result = Knowledge.stats(tenant_id, project_opts(params["project_id"]))
+    result =
+      Knowledge.stats(
+        tenant_id,
+        project_opts(params["project_id"]) ++ Visibility.scope_opts(conn)
+      )
+
     json(conn, LoopctlWeb.KnowledgeStatsJSON.stats(result))
   end
 

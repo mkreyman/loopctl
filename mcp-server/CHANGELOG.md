@@ -20,14 +20,28 @@ write and read:
   another agent's identity. An agent key with no agent identity gets **403
   `agent_identity_required`** for such a write. Higher roles (orchestrator/user)
   may still attribute on behalf of others.
-- **Read — `visibility` is enforced.** For **agent**-role reads (`knowledge_get`,
-  `knowledge_list`/index, `knowledge_search`, `knowledge_context`), articles whose
-  `metadata.visibility` is `private` or `owner` are returned only to the owning
-  agent; others get `404`/exclusion with no existence leak. `shared` and
-  non-memory articles are unaffected. Higher roles continue to see everything.
+- **Read — `visibility` is enforced on EVERY agent-reachable read.** For
+  **agent**-role reads, articles whose `metadata.visibility` is `private` or `owner`
+  are returned only to the owning agent; others get `404`/exclusion with no existence
+  leak. `shared` and non-memory articles are unaffected; higher roles continue to see
+  everything. Covered surfaces: `knowledge_get` (incl. its linked-article refs),
+  `knowledge_list`/index, `knowledge_search`, `knowledge_context` (incl. linked refs),
+  `knowledge_stats`, `knowledge_count`, `knowledge_facets`, `knowledge_graph`,
+  `knowledge_suggest_links`, `knowledge_distant_pairs`, `knowledge_random_walk`, and
+  `knowledge_novelty` (private priors are excluded from the comparison set). `owner`
+  and `private` are enforced identically (owner-only) in this version.
 
 `visibility` scoping is now a real trust barrier for agent keys (not just a
 convenience filter). No MCP tool signatures changed.
+
+### Migration note
+
+Identity is the key's registry `agent_id` (a UUID). Memories written **before** this
+change with a self-asserted, non-UUID `agent_id` string won't match their owner's key
+identity, so the owning agent may no longer read its own pre-#163 private/owner
+memories (they remain visible to higher roles). Operators with such legacy memories
+should backfill `metadata.agent_id` to the owner's registry UUID, or treat the cutover
+as a clean break. Memories written after this change are always key-stamped.
 
 ## 2.20.1 — 2026-06-24 (honest story pagination)
 

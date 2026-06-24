@@ -14,6 +14,7 @@ defmodule LoopctlWeb.KnowledgeGraphController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -60,7 +61,12 @@ defmodule LoopctlWeb.KnowledgeGraphController do
 
     with {:ok, article_id} <- require_article_id(params["article_id"]),
          {:ok, depth} <- parse_depth(params["depth"]),
-         {:ok, result} <- Knowledge.graph_traversal(tenant_id, article_id, depth: depth) do
+         {:ok, result} <-
+           Knowledge.graph_traversal(
+             tenant_id,
+             article_id,
+             [depth: depth] ++ Visibility.scope_opts(conn)
+           ) do
       json(conn, result)
     else
       {:error, :invalid_depth} ->

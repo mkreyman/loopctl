@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -71,7 +72,12 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
          :ok <- validate_project_id(params),
          {:ok, match} <- TagMatch.parse(params) do
-      count = Knowledge.count_articles(tenant_id, build_opts(params, match))
+      count =
+        Knowledge.count_articles(
+          tenant_id,
+          build_opts(params, match) ++ Visibility.scope_opts(conn)
+        )
+
       json(conn, %{count: count})
     end
   end
@@ -148,6 +154,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
         |> build_opts(match)
         |> maybe_put(:tag_prefix, string_param(params["tag_prefix"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       %{facets: facets, distinct_count: distinct_count, truncated: truncated} =
         Knowledge.tag_facets(tenant_id, opts)

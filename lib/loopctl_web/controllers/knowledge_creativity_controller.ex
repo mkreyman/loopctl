@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -89,12 +90,15 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     with {:ok, min_d} <- parse_float(params["min_distance"], 0.3),
          {:ok, max_d} <- parse_float(params["max_distance"], 0.7),
          {:ok, result} <-
-           Knowledge.distant_pairs(tenant_id,
-             min_distance: min_d,
-             max_distance: max_d,
-             bridge_path: params["bridge_path"] == "true",
-             limit: parse_int(params["limit"]) || 20,
-             offset: parse_int(params["offset"]) || 0
+           Knowledge.distant_pairs(
+             tenant_id,
+             [
+               min_distance: min_d,
+               max_distance: max_d,
+               bridge_path: params["bridge_path"] == "true",
+               limit: parse_int(params["limit"]) || 20,
+               offset: parse_int(params["offset"]) || 0
+             ] ++ Visibility.scope_opts(conn)
            ) do
       json(conn, %{
         data: result.pairs,
@@ -166,7 +170,8 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
     with {:ok, ideas} <- validate_ideas(params["ideas"]) do
-      opts = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
+      base = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
+      opts = base ++ Visibility.scope_opts(conn)
       {:ok, scored, prior_count} = Knowledge.novelty_scores(tenant_id, ideas, opts)
       json(conn, %{data: scored, meta: %{prior_count: prior_count}})
     end
@@ -212,7 +217,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
     with {:ok, start_id} <- require_uuid(params["start_id"], "start_id"),
          {:ok, walk} <-
-           Knowledge.random_walk(tenant_id, start_id, length: parse_int(params["length"]) || 4) do
+           Knowledge.random_walk(
+             tenant_id,
+             start_id,
+             [length: parse_int(params["length"]) || 4] ++ Visibility.scope_opts(conn)
+           ) do
       json(conn, %{data: walk, meta: %{count: length(walk)}})
     else
       {:error, :not_found} -> {:error, :not_found}

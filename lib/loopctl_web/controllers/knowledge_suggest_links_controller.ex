@@ -14,6 +14,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -61,9 +62,10 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
     with {:ok, threshold} <- parse_threshold(params["threshold"]),
          {:ok, limit} <- parse_limit(params["limit"]),
          {:ok, suggestions} <-
-           Knowledge.suggest_links(tenant_id, article_id,
-             threshold: threshold,
-             limit: limit
+           Knowledge.suggest_links(
+             tenant_id,
+             article_id,
+             [threshold: threshold, limit: limit] ++ Visibility.scope_opts(conn)
            ) do
       json(conn, %{data: suggestions})
     else
