@@ -1743,7 +1743,9 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_bulk_unpublish(tenant_id, article_ids, opts) do
-    existing = load_existing_by_ids(tenant_id, article_ids)
+    # Body-less load: bulk-unpublish renders summaries and only flips status, so
+    # it never needs the article bodies (bounds memory for a 5000-id batch).
+    existing = load_existing_by_ids(tenant_id, article_ids, false)
 
     published =
       for id <- article_ids,
@@ -2265,13 +2267,22 @@ defmodule Loopctl.Knowledge do
   # Load the requested articles once, keyed by id. Malformed (non-UUID) ids are
   # kept out of the `id in ^ids` query (which would raise on cast) so they
   # resolve to a clean "not_found" via the absent map entry.
-  defp load_existing_by_ids(tenant_id, article_ids) do
+  # `include_body: false` projects every field except the (potentially large)
+  # `body`, so a bulk op that never echoes the body (e.g. bulk-unpublish, which
+  # renders body-less summaries) doesn't pull up to 5000 full bodies into memory
+  # just to flip a status. The status transition and audit only need id/status.
+  defp load_existing_by_ids(tenant_id, article_ids, include_body \\ true) do
     queryable_ids = Enum.filter(article_ids, &valid_uuid?/1)
 
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id,
-      where: a.id in ^queryable_ids
-    )
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.id in ^queryable_ids
+      )
+
+    query = if include_body, do: base, else: from(a in base, select: struct(a, ^@summary_fields))
+
+    query
     |> AdminRepo.all()
     |> Map.new(&{&1.id, &1})
   end

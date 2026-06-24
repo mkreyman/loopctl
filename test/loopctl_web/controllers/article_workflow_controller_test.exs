@@ -499,6 +499,24 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
 
       assert json_response(conn, 400)
     end
+
+    test "tenant isolation: cannot unpublish another tenant's article", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      {key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+      tenant_b = fixture(:tenant)
+      b_article = fixture(:article, %{tenant_id: tenant_b.id, status: :published})
+
+      body =
+        conn
+        |> auth_conn(key_a)
+        |> post(~p"/api/v1/knowledge/bulk-unpublish", %{"article_ids" => [b_article.id]})
+        |> json_response(200)
+
+      # B's id is invisible to tenant A → resolves to not_found, stays published.
+      assert body["meta"]["counts"]["not_found"] == 1
+      assert body["meta"]["counts"]["unpublished"] == 0
+      assert AdminRepo.get!(Article, b_article.id).status == :published
+    end
   end
 
   describe "POST /api/v1/knowledge/bulk-delete" do
