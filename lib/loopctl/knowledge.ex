@@ -2646,6 +2646,10 @@ defmodule Loopctl.Knowledge do
 
   @default_suggestion_limit 5
 
+  @doc "Default number of link suggestions when `:limit` is omitted."
+  @spec default_suggestion_limit() :: pos_integer()
+  def default_suggestion_limit, do: @default_suggestion_limit
+
   @doc """
   Suggests **typed link candidates** for an article by embedding similarity —
   **read-only**, creates nothing.

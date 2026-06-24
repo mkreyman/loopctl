@@ -91,8 +91,8 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
   defp parse_threshold(_), do: {:error, :invalid_threshold}
 
-  # Absent → use the context default (5). A present value must be a positive integer.
-  defp parse_limit(value) when value in [nil, ""], do: {:ok, 5}
+  # Absent → the context default. A present value must be a positive integer.
+  defp parse_limit(value) when value in [nil, ""], do: {:ok, Knowledge.default_suggestion_limit()}
 
   defp parse_limit(value) when is_binary(value) do
     case Integer.parse(value) do
