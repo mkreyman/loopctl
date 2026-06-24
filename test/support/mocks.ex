@@ -10,9 +10,7 @@ Mox.defmock(Loopctl.MockWebAuthn, for: Loopctl.WebAuthn.Behaviour)
 Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
 
-# US-27.3: a Plug-shaped mock standing in for LoopctlWeb.Router so the
-# DBErrorBackstop's catch/log/sanitize path can be exercised by injecting a
-# router that raises a DB exception uncaught — without mounting a test-only route
-# on the production router. The default stub (DataCase.stub_all_defaults/0)
-# delegates to the real router so every other request flows normally.
-Mox.defmock(Loopctl.MockBackstopRouter, for: Plug)
+# US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
+# wired via config/test.exs), NOT a Mox mock — so the production router stays on
+# the hot path for every request and the catch/log/sanitize path is exercised by
+# an opt-in `x-test-raise-db-error` request header rather than a global mock.

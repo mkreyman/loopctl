@@ -27,15 +27,18 @@ defmodule LoopctlWeb.Plugs.DBErrorHandler do
   router/endpoint registration needed. phoenix_ecto's own `Postgrex.Error` impl
   is disabled via `config :phoenix_ecto, :exclude_ecto_exceptions_from_plug` so
   this is the single authoritative mapping. We preserve phoenix_ecto's
-  `:character_not_in_repertoire -> 400` so pre-US-27.3 behavior is unchanged.
+  `:character_not_in_repertoire -> 400` (now encoded in `LoopctlWeb.DBError.map/1`
+  so the uncaught and rescue paths agree) so pre-US-27.3 behavior is unchanged.
   """
 end
 
 defimpl Plug.Exception, for: Postgrex.Error do
-  # Preserve phoenix_ecto's prior special case (invalid UTF-8 in input -> 400)
-  # so US-27.3 only adds structured handling for previously-blanket-500 classes.
-  def status(%{postgres: %{code: :character_not_in_repertoire}}), do: 400
-
+  # Single source of truth: LoopctlWeb.DBError.map/1 owns every SQLSTATE→status
+  # decision, INCLUDING phoenix_ecto's prior special case
+  # (:character_not_in_repertoire / invalid UTF-8 in input -> 400). Keeping the
+  # 400 mapping in map/1 (rather than a special-case clause here) guarantees the
+  # uncaught Plug.Exception path and the FallbackController rescue path agree on
+  # the same status for the same SQLSTATE.
   def status(error) do
     case LoopctlWeb.DBError.map(error) do
       {:ok, %{status: status}} -> status

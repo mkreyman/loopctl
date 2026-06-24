@@ -172,8 +172,17 @@ defmodule LoopctlWeb.FallbackControllerTest do
 
   describe "ErrorJSON" do
     test "renders 500 without leaking internal details" do
+      # Finding #1 (US-27.3): the 500 clause now carries a `code` (generic
+      # internal_server_error with no DB reason) — still a safe, generic body.
       body = LoopctlWeb.ErrorJSON.render("500.json", %{})
-      assert body == %{error: %{status: 500, message: "Internal server error"}}
+
+      assert body == %{
+               error: %{
+                 status: 500,
+                 code: "internal_server_error",
+                 message: "Internal server error"
+               }
+             }
     end
 
     test "renders 404 with consistent format" do
@@ -210,6 +219,16 @@ defmodule LoopctlWeb.FallbackControllerTest do
       },
       query:
         "SELECT id FROM articles ORDER BY embedding <=> '[0.123,0.456,0.789]'::vector LIMIT 5"
+    }
+  end
+
+  # A Postgrex.Error whose postgres.message carries a specific value — used by
+  # the Finding #3 pg_message-allowlist tests to prove a constraint value is only
+  # logged for the value-free allowlisted classes and omitted for the catch-all.
+  defp constraint_error(code, pg_code, message) do
+    %Postgrex.Error{
+      postgres: %{code: code, pg_code: pg_code, severity: "ERROR", message: message},
+      query: "SELECT id FROM articles ORDER BY embedding <=> '[0.1]'::vector LIMIT 5"
     }
   end
 
@@ -253,6 +272,20 @@ defmodule LoopctlWeb.FallbackControllerTest do
       body = Jason.decode!(conn.resp_body)
       assert body["error"]["status"] == 500
       assert body["error"]["code"] == "db_error"
+    end
+
+    # Finding #2 (US-27.3): 22021 character_not_in_repertoire (invalid UTF-8 in
+    # input) maps to 400 on the rescue path too — matching the uncaught
+    # Plug.Exception path — instead of falling into the generic 500 catch-all.
+    test "22021 character_not_in_repertoire -> 400 db_invalid_input", %{conn: conn} do
+      conn = call_fallback(conn, {:error, pg_error(:character_not_in_repertoire, "22021")})
+
+      assert conn.status == 400
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 400
+      assert body["error"]["code"] == "db_invalid_input"
+      # No Retry-After on a client input error (400).
+      assert Plug.Conn.get_resp_header(conn, "retry-after") == []
     end
 
     test "DBConnection.ConnectionError -> 503 db_unavailable with Retry-After", %{conn: conn} do
@@ -305,6 +338,57 @@ defmodule LoopctlWeb.FallbackControllerTest do
       refute log =~ "0.123"
       refute log =~ "::vector"
     end
+
+    # Finding #3 (US-27.3, AC-27.3.8 disclosure control): for the allowlisted
+    # timeout/serialization/deadlock classes the bare PG message is value-free
+    # and IS logged.
+    test "pg_message IS logged for the allowlisted serialization class", %{conn: conn} do
+      error = constraint_error(:serialization_failure, "40001", "could not serialize access")
+
+      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+
+      assert log =~ "sqlstate=40001"
+      assert log =~ "could not serialize access"
+    end
+
+    # Finding #3: the catch-all db_error class also matches constraint-violation
+    # errors whose postgres.message embeds a user/row value — that value must NOT
+    # land in the structured pg_message log field, while sqlstate/mapped_code are
+    # still logged for diagnosability.
+    test "pg_message is OMITTED for the catch-all db_error class (no constraint value leak)", %{
+      conn: conn
+    } do
+      error =
+        constraint_error(
+          :unique_violation,
+          "23505",
+          "Key (slug)=(secret-tenant-slug) already exists"
+        )
+
+      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+
+      # Diagnostics still present.
+      assert log =~ "sqlstate=23505"
+      assert log =~ "mapped_code=db_error"
+      # The embedded constraint value must NOT appear in any log field.
+      refute log =~ "secret-tenant-slug"
+      refute log =~ "already exists"
+    end
+
+    test "pg_message is OMITTED for db_invalid_input (22021) class", %{conn: conn} do
+      error =
+        constraint_error(
+          :character_not_in_repertoire,
+          "22021",
+          "invalid byte sequence 0xDEADBEEF"
+        )
+
+      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+
+      assert log =~ "sqlstate=22021"
+      assert log =~ "mapped_code=db_invalid_input"
+      refute log =~ "0xDEADBEEF"
+    end
   end
 
   describe "Plug.Exception safety net for raised DB errors (AC-27.3.1)" do
@@ -318,6 +402,19 @@ defmodule LoopctlWeb.FallbackControllerTest do
 
     test "unmapped Postgrex.Error maps to 500 via Plug.Exception" do
       assert Plug.Exception.status(pg_error(:undefined_table, "42P01")) == 500
+    end
+
+    # Finding #2 (US-27.3): the uncaught Plug.Exception path and the rescue path
+    # AGREE on 400 for 22021 (invalid UTF-8 in input), preserving phoenix_ecto's
+    # prior special case rather than diverging (uncaught 400 vs rescued 500).
+    test "Postgrex.Error 22021 character_not_in_repertoire maps to 400 via Plug.Exception" do
+      assert Plug.Exception.status(pg_error(:character_not_in_repertoire, "22021")) == 400
+    end
+
+    test "rescue path and Plug.Exception path agree on status for 22021", %{conn: conn} do
+      error = pg_error(:character_not_in_repertoire, "22021")
+      rescued = call_fallback(conn, {:error, error})
+      assert rescued.status == Plug.Exception.status(error)
     end
 
     test "DBConnection.ConnectionError maps to 503 via Plug.Exception" do

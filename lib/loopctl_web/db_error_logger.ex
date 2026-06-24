@@ -24,6 +24,14 @@ defmodule LoopctlWeb.DBErrorLogger do
   keeps the fields visible under any formatter/metadata configuration. We log
   only the bare PG message (`postgres.message`), NEVER `Exception.message/1`
   (which interpolates `e.query` — the raw SQL + vector literal).
+
+  The bare PG message is logged ONLY for the value-free timeout/serialization/
+  deadlock classes (`db_statement_timeout` / `db_serialization_failure` /
+  `db_deadlock`). For the catch-all `db_error` (and `db_invalid_input`) classes —
+  which also match constraint-violation errors whose `postgres.message` embeds a
+  user/row value such as `Key (slug)=(foo) already exists` — `pg_message` is
+  omitted (AC-27.3.8 disclosure control). `sqlstate` + `mapped_code` are logged
+  for every class regardless, so diagnosability is preserved.
   """
 
   require Logger
@@ -58,9 +66,26 @@ defmodule LoopctlWeb.DBErrorLogger do
       action: action,
       tenant_id: tenant_id,
       request_id: request_id,
-      pg_message: safe_pg_message(error)
+      pg_message: safe_pg_message(error, mapping.mapped_code)
     )
   end
+
+  # AC-27.3.8 (disclosure control): the bare PG message is value-free for the
+  # three timeout/serialization/deadlock classes this story targets, but the
+  # catch-all `db_error` (and the new `db_invalid_input`) class also matches
+  # constraint-violation errors whose `postgres.message` embeds a user/row value
+  # (e.g. "Key (slug)=(foo) already exists"). Restrict pg_message logging to the
+  # value-free allowlist so a catch-all DB error reaching the backstop/rescue can
+  # never spill a constraint value into the structured log. sqlstate + mapped_code
+  # are still logged for every class, so diagnosability for the catch-all is
+  # unchanged.
+  @pg_message_allowlist ~w(db_statement_timeout db_serialization_failure db_deadlock)
+
+  defp safe_pg_message(error, mapped_code) when mapped_code in @pg_message_allowlist do
+    safe_pg_message(error)
+  end
+
+  defp safe_pg_message(_error, _mapped_code), do: nil
 
   defp phoenix_private(conn, key) do
     case conn.private do

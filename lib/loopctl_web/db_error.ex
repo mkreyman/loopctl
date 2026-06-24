@@ -15,8 +15,16 @@ defmodule LoopctlWeb.DBError do
   | 57014 statement timeout   | `:query_canceled`       | 504    | `db_statement_timeout`  | —            |
   | 40001 serialization       | `:serialization_failure`| 503    | `db_serialization_failure` | Retry-After |
   | 40P01 deadlock            | `:deadlock_detected`    | 503    | `db_deadlock`           | Retry-After  |
+  | 22021 invalid byte seq    | `:character_not_in_repertoire` | 400 | `db_invalid_input` | —          |
   | any other `Postgrex.Error`| *                       | 500    | `db_error`              | log sqlstate |
   | `DBConnection.ConnectionError` | —                  | 503    | `db_unavailable`        | Retry-After  |
+
+  The `22021` (character_not_in_repertoire — invalid UTF-8 in input) → 400
+  mapping mirrors the `Plug.Exception` impl in `LoopctlWeb.Plugs.DBErrorHandler`,
+  which preserves phoenix_ecto's prior special case. Keeping it here too means the
+  FallbackController rescue path and the uncaught Plug.Exception path AGREE on 400
+  for the same SQLSTATE (a rescued invalid-UTF-8 byte is a client input error, not
+  a server 500).
 
   Only `db_statement_timeout` (504) is pinned by the acceptance criteria; the
   other codes are descriptive and asserted in tests.
@@ -97,6 +105,18 @@ defmodule LoopctlWeb.DBError do
        message: "The database detected a deadlock. Please retry.",
        sqlstate: sqlstate(e),
        retry_after: @retry_after_seconds
+     }}
+  end
+
+  def map(%Postgrex.Error{postgres: %{code: :character_not_in_repertoire}} = e) do
+    {:ok,
+     %{
+       status: 400,
+       code: "db_invalid_input",
+       mapped_code: "db_invalid_input",
+       message: "The request contained invalid input that the database rejected.",
+       sqlstate: sqlstate(e),
+       retry_after: nil
      }}
   end
 

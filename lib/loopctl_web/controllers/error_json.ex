@@ -22,8 +22,23 @@ defmodule LoopctlWeb.ErrorJSON do
     %{error: %{status: 403, message: "Forbidden"}}
   end
 
-  def render("500.json", _assigns) do
-    %{error: %{status: 500, message: "Internal server error"}}
+  # US-27.3: a DB exception in the catch-all class (DBError.map/1 → status 500,
+  # mapped_code "db_error") that escapes an action uncaught is re-raised as a
+  # LoopctlWeb.SanitizedDBError{status: 500, mapped_code: "db_error"} by
+  # LoopctlWeb.Plugs.DBErrorBackstop, and Phoenix renders it here. Like the
+  # 504/503 clauses, surface `code` (db_error for the mapped DB case; falls back
+  # to the generic 500 for a plain logic crash with no SanitizedDBError reason)
+  # so the escaped-error body carries the same self-identifying class the
+  # FallbackController rescue path emits (mapping.code). Body stays safe and
+  # generic — no SQL/params/vectors/stack trace.
+  def render("500.json", assigns) do
+    %{
+      error: %{
+        status: 500,
+        code: db_code(assigns, "internal_server_error"),
+        message: "Internal server error"
+      }
+    }
   end
 
   # US-27.3: raised DB exceptions that escape an action are mapped to these
