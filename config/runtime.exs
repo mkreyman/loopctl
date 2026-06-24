@@ -87,18 +87,19 @@ if config_env() == :prod do
   # reads, isolated from the small AdminRepo pool so a slow read can't starve light
   # admin ops (and vice-versa). Its `:parameters` carry a pool-level, server-side
   # `statement_timeout` (a CORE GUC, settable via the startup packet) — the clean
-  # fast-fail lever US-27.4 builds on, with no per-request transaction. `ef_search`
-  # is NOT set here (pgvector custom GUC, rejected via :parameters on managed PG);
-  # see docs/runbooks/knowledge-scale.md for the ALTER ROLE mechanism if it must be
-  # raised. Sizing rationale (AC-27.11.1/.5), verified against the live fly mpg
-  # max_connections = 100 (see the runbook to re-verify post-deploy):
+  # fast-fail lever US-27.4 builds on, with no per-request transaction. A long-held
+  # US-27.16 export overrides it per-transaction via SET LOCAL (see Loopctl.HeavyRead
+  # `transaction/2` `:statement_timeout`). `ef_search` is NOT set here (pgvector custom
+  # GUC, rejected via :parameters on managed PG); see docs/runbooks/knowledge-scale.md
+  # for the ALTER ROLE mechanism if it must be raised.
   #
-  #   per-node pools: Repo 10 + AdminRepo 3 + HeavyReadRepo 8 = 21
-  #   2 app nodes: 42, + Oban notifier/console/migration headroom (~14) ≈ 56 < 100.
-  #
-  # K (HeavyReadRepo, default 8): supports ~6 concurrent sub-2s heavy vector reads
-  # while reserving ~2 connections for long-held streamed-export checkouts (US-27.16),
-  # which occupy a connection for minutes — a different profile than fast reads.
+  # Pool sizes here MUST stay in lockstep with `Loopctl.DbCapacity` (which models the
+  # connection budget and is asserted in db_capacity_test.exs). Sizing (AC-27.11.1/.5),
+  # vs the live fly mpg max_connections = 100 (runbook re-verifies post-deploy):
+  #   per-node: Repo 10 + AdminRepo 3 + HeavyReadRepo 8 = 21; peak during a rolling
+  #   deploy at 2 nodes = 42 + 21 (overlap node) + 4 ops = 67 < 100 (max ~3 nodes).
+  # K (HeavyReadRepo, default 8): ~6 concurrent sub-2s heavy vector reads + ~2 reserved
+  # for long-held streamed-export checkouts (US-27.16), a different profile than fast reads.
   heavy_read_statement_timeout_ms =
     System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000"
 

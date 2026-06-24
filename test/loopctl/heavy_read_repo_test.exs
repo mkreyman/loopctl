@@ -11,6 +11,9 @@ defmodule Loopctl.HeavyReadRepoTest do
   use Loopctl.DataCase, async: true
 
   alias Loopctl.HeavyReadRepo
+  alias Loopctl.Knowledge.Article
+
+  import Ecto.Query
 
   describe "pool-level statement_timeout via :parameters" do
     test "SHOW statement_timeout reflects the configured pool parameter (AC-27.11.3)" do
@@ -23,6 +26,31 @@ defmodule Loopctl.HeavyReadRepoTest do
       # pool-level mechanism US-27.4 relies on actually fires and releases the conn.
       assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
                HeavyReadRepo.query("SELECT pg_sleep(1)")
+    end
+
+    test "the pool statement_timeout cancels a real Ecto query, not just raw SQL" do
+      # Closes the DI-seam gap: routed reads run on AdminRepo in test, so prove the
+      # dedicated pool's timeout applies to an actual Ecto.Query (built → SQL → run),
+      # not only a raw HeavyReadRepo.query/1.
+      _ = Article
+      slow = from(s in fragment("generate_series(1, 100000000)"), select: count())
+      err = assert_raise Postgrex.Error, fn -> HeavyReadRepo.all(slow) end
+      assert err.postgres.code == :query_canceled
+    end
+
+    test "SET LOCAL statement_timeout lifts the pool default within a transaction (export lever)" do
+      # US-27.16 streamed exports hold a connection for minutes — longer than the fast-
+      # read pool default. SET LOCAL inside the export's transaction scopes the override
+      # to that transaction only. A 400ms query (> 250ms pool default) survives under a
+      # 5s local override.
+      result =
+        HeavyReadRepo.transaction(fn ->
+          HeavyReadRepo.query!("SET LOCAL statement_timeout = 5000")
+          HeavyReadRepo.query!("SELECT pg_sleep(0.4)")
+          :ok
+        end)
+
+      assert result == {:ok, :ok}
     end
   end
 

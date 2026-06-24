@@ -29,9 +29,13 @@ re-checking the connection budget below.
 
 ### Connection budget vs. `max_connections` (AC-27.11.5)
 
-Per node: `10 + 3 + 8 = 21`. At 2 app nodes: `42`, plus ~14 headroom
-(migrations, `fly ssh console`, Oban Postgres notifier, rolling-deploy overlap)
-≈ **56**. Encoded in `Loopctl.DbCapacity`; asserted by `db_capacity_test.exs`.
+Per node: `10 + 3 + 8 = 21`. **Peak** during a rolling deploy (fly replaces one
+machine at a time, so old + new briefly overlap) at 2 app nodes:
+`42 (steady) + 21 (overlap node) + 4 (ops: migration + Oban notifier + console)` =
+**67** < 100. Ceiling: **3 app nodes** (`max_supported_nodes`). Encoded in
+`Loopctl.DbCapacity`; asserted by `db_capacity_test.exs`. **If you scale past 3
+nodes or raise any pool size, the budget no longer fits — re-derive it and resize
+the DB plan first.**
 
 **Live value (re-verify post-deploy and after any DB-plan resize):**
 
