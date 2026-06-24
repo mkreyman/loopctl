@@ -91,6 +91,8 @@ defmodule Loopctl.Knowledge do
   # Runtime-configurable (so tests can exercise truncation cheaply); defaults below.
   @max_graph_nodes 100
   @max_graph_edges 500
+  # per-node link cap to bound fan-out
+  @max_graph_neighbors_per_node 10
 
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
@@ -2685,8 +2687,29 @@ defmodule Loopctl.Knowledge do
   defp validate_graph_depth(depth) when is_integer(depth) and depth >= 1 and depth <= 3, do: :ok
   defp validate_graph_depth(_), do: {:error, :invalid_depth}
 
-  defp max_graph_nodes, do: Application.get_env(:loopctl, :max_graph_nodes, @max_graph_nodes)
-  defp max_graph_edges, do: Application.get_env(:loopctl, :max_graph_edges, @max_graph_edges)
+  @doc """
+  Maximum number of reachable nodes in a graph traversal result.
+  Configurable via `:max_graph_nodes` in application config; defaults to #{@max_graph_nodes}.
+  """
+  @spec max_graph_nodes() :: pos_integer()
+  def max_graph_nodes, do: Application.get_env(:loopctl, :max_graph_nodes, @max_graph_nodes)
+
+  @doc """
+  Maximum number of edges in a graph traversal result.
+  Configurable via `:max_graph_edges` in application config; defaults to #{@max_graph_edges}.
+  """
+  @spec max_graph_edges() :: pos_integer()
+  def max_graph_edges, do: Application.get_env(:loopctl, :max_graph_edges, @max_graph_edges)
+
+  @doc """
+  Maximum number of links followed per node in recursive graph traversal.
+  Bounds fan-out to prevent unbounded explosion on high-degree hubs.
+  Configurable via `:max_graph_neighbors_per_node` in application config; defaults to #{@max_graph_neighbors_per_node}.
+  """
+  @spec max_graph_neighbors_per_node() :: pos_integer()
+  def max_graph_neighbors_per_node,
+    do:
+      Application.get_env(:loopctl, :max_graph_neighbors_per_node, @max_graph_neighbors_per_node)
 
   defp article_published?(tenant_id, article_id) do
     valid_uuid?(article_id) and
@@ -2700,8 +2723,9 @@ defmodule Loopctl.Knowledge do
     {:ok, tenant_bin} = Ecto.UUID.dump(tenant_id)
     {:ok, article_bin} = Ecto.UUID.dump(article_id)
 
-    # Bidirectional recursive walk with a path-array cycle guard, capped at
-    # @max_graph_nodes. Raw SQL because Ecto has no native recursive-CTE builder.
+    # Bidirectional recursive walk with a path-array cycle guard and per-node neighbor cap
+    # to bound fan-out, capped at @max_graph_nodes. Raw SQL because Ecto has no native
+    # recursive-CTE builder. LATERAL limits neighbors per node to prevent unbounded explosion.
     node_sql = """
     WITH RECURSIVE graph AS (
       SELECT a.id AS node_id, ARRAY[a.id] AS path, 0 AS depth
@@ -2717,8 +2741,13 @@ defmodule Loopctl.Knowledge do
                        ELSE l.source_article_id END,
         g.depth + 1
       FROM graph g
-      JOIN article_links l ON l.tenant_id = $2
-        AND (l.source_article_id = g.node_id OR l.target_article_id = g.node_id)
+      JOIN LATERAL (
+        SELECT source_article_id, target_article_id, relationship_type
+        FROM article_links
+        WHERE tenant_id = $2
+          AND (source_article_id = g.node_id OR target_article_id = g.node_id)
+        LIMIT $5
+      ) l ON true
       JOIN articles a ON a.id = CASE WHEN l.source_article_id = g.node_id
                                      THEN l.target_article_id ELSE l.source_article_id END
         AND a.tenant_id = $2 AND a.status = 'published'
@@ -2734,35 +2763,46 @@ defmodule Loopctl.Knowledge do
     """
 
     node_cap = max_graph_nodes()
+    neighbor_cap = max_graph_neighbors_per_node()
 
-    {:ok, %{rows: node_rows}} =
-      SQL.query(
-        AdminRepo,
-        node_sql,
-        [article_bin, tenant_bin, depth, node_cap],
-        timeout: 5_000
-      )
+    case SQL.query(
+           AdminRepo,
+           node_sql,
+           [article_bin, tenant_bin, depth, node_cap, neighbor_cap],
+           timeout: 5_000
+         ) do
+      {:ok, %{rows: node_rows}} ->
+        nodes_truncated = length(node_rows) >= node_cap
 
-    nodes_truncated = length(node_rows) >= node_cap
+        node_ids_with_depth =
+          Enum.map(node_rows, fn [node_bin, d] ->
+            {:ok, uuid} = Ecto.UUID.load(node_bin)
+            {uuid, d}
+          end)
 
-    node_ids_with_depth =
-      Enum.map(node_rows, fn [node_bin, d] ->
-        {:ok, uuid} = Ecto.UUID.load(node_bin)
-        {uuid, d}
-      end)
+        node_ids = Enum.map(node_ids_with_depth, &elem(&1, 0))
+        depth_map = Map.new(node_ids_with_depth)
 
-    node_ids = Enum.map(node_ids_with_depth, &elem(&1, 0))
-    depth_map = Map.new(node_ids_with_depth)
+        nodes = fetch_graph_nodes(tenant_id, node_ids, depth_map)
+        fetched_node_ids = Enum.map(nodes, & &1.id)
+        edges = fetch_graph_edges(tenant_id, fetched_node_ids)
 
-    nodes = fetch_graph_nodes(tenant_id, node_ids, depth_map)
-    edges = fetch_graph_edges(tenant_id, node_ids)
+        %{
+          nodes: nodes,
+          edges: edges,
+          truncated: nodes_truncated or length(edges) >= max_graph_edges(),
+          node_count: length(nodes)
+        }
 
-    %{
-      nodes: nodes,
-      edges: edges,
-      truncated: nodes_truncated or length(edges) >= max_graph_edges(),
-      node_count: length(nodes)
-    }
+      {:error, _} ->
+        # Database error (timeout, connection, etc.) — return degraded response
+        %{
+          nodes: [],
+          edges: [],
+          truncated: true,
+          node_count: 0
+        }
+    end
   end
 
   defp fetch_graph_nodes(_tenant_id, [], _depth_map), do: []
@@ -2784,7 +2824,7 @@ defmodule Loopctl.Knowledge do
       where:
         l.tenant_id == ^tenant_id and
           l.source_article_id in ^node_ids and l.target_article_id in ^node_ids,
-      order_by: [asc: l.inserted_at],
+      order_by: [asc: l.inserted_at, asc: l.id],
       limit: ^max_graph_edges(),
       select: %{
         source_article_id: l.source_article_id,
