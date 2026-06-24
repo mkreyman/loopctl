@@ -171,11 +171,15 @@ defmodule Loopctl.KnowledgeEmbeddingTest do
   end
 
   # TC-20.2.7: HNSW index exists
+  # US-27.14: reconciled to the single canonical name `articles_embedding_hnsw_idx`
+  # (matches prod). The reconcile migration renames the old migration's
+  # `articles_embedding_idx` to this name in every env, so the assertion is now
+  # exact rather than name-agnostic (still asserting the hnsw access method).
   describe "HNSW index" do
-    test "articles_embedding_idx exists on articles table" do
+    test "articles_embedding_hnsw_idx exists on articles table" do
       result =
         Loopctl.AdminRepo.query!(
-          "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_idx'"
+          "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'articles' AND indexname = 'articles_embedding_hnsw_idx'"
         )
 
       assert length(result.rows) == 1
