@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.18.0 — 2026-06-23 (suggest typed links)
+
+### Added
+
+- **`knowledge_suggest_links`** — ranked typed-link *candidates* for an article by
+  embedding similarity, **read-only** (creates nothing). Excludes the article itself
+  and any already-linked article (either direction, any type); only embedded
+  published articles. Returns `{id, title, category, similarity_score}` highest-first
+  so the caller can create a *typed* link (relates_to/derived_from/contradicts/
+  supersedes) — unlike the auto-linker's ambient `relates_to`. Optional `threshold`
+  (cosine floor, default 0.5) and `limit` (default 5). Backed by
+  `GET /api/v1/knowledge/articles/:id/suggested_links`. (#150)
+
 ## 2.17.0 — 2026-06-23 (knowledge graph traversal)
 
 ### Added

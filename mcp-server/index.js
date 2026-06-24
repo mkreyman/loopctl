@@ -631,6 +631,21 @@ async function knowledgeGraph({ article_id, depth, project_id }) {
   return toContent(result);
 }
 
+async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (threshold != null) params.set("threshold", String(threshold));
+  const qs = params.toString();
+  const base = `/api/v1/knowledge/articles/${article_id}/suggested_links`;
+  const result = await apiCall(
+    "GET",
+    qs ? `${base}?${qs}` : base,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeCount({
   project_id,
   category,
@@ -2174,6 +2189,35 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_suggest_links",
+    description:
+      "Suggest ranked typed-link CANDIDATES for an article by embedding similarity — " +
+      "READ-ONLY, creates nothing. Excludes the article itself and any already-linked " +
+      "article (either direction, any relationship type); only embedded published articles. " +
+      "Returns { data: [{id, title, category, similarity_score}] } highest-similarity first. " +
+      "Review them and create the one you want as a TYPED link (relates_to/derived_from/" +
+      "contradicts/supersedes) — unlike the auto-linker which only makes ambient relates_to. " +
+      "Optional: threshold (cosine floor 0–1, default 0.5), limit (default 5).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          format: "uuid",
+          description: "The article to suggest links for (required).",
+        },
+        limit: { type: "integer", description: "Max candidates (default 5)." },
+        threshold: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description: "Cosine similarity floor (default 0.5).",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. Ranked, and returns PUBLISHED " +
@@ -3107,6 +3151,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_graph":
       return await knowledgeGraph(args);
+
+    case "knowledge_suggest_links":
+      return await knowledgeSuggestLinks(args);
 
     case "knowledge_search":
       return await knowledgeSearch(args);

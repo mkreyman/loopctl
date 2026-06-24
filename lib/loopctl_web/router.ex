@@ -364,6 +364,11 @@ defmodule LoopctlWeb.Router do
     # ArticleLink management
     resources "/article_links", ArticleLinkController, only: [:create, :delete]
     get "/articles/:article_id/links", ArticleLinkController, :index
+
+    # Suggested typed-link candidates (read-only; embedding similarity)
+    get "/knowledge/articles/:id/suggested_links",
+        KnowledgeSuggestLinksController,
+        :suggest
   end
 
   # Superadmin endpoints (Epic 11)

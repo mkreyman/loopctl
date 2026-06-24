@@ -2644,6 +2644,103 @@ defmodule Loopctl.Knowledge do
     |> AdminRepo.all()
   end
 
+  @default_suggestion_limit 5
+
+  @doc "Default number of link suggestions when `:limit` is omitted."
+  @spec default_suggestion_limit() :: pos_integer()
+  def default_suggestion_limit, do: @default_suggestion_limit
+
+  @doc """
+  Suggests **typed link candidates** for an article by embedding similarity —
+  **read-only**, creates nothing.
+
+  Returns published articles most similar to `article_id` (cosine over the
+  embedding) that are not already linked to it, so a caller can review them and
+  POST a *typed* link (`relates_to`/`derived_from`/`contradicts`/`supersedes`) —
+  unlike the auto-linker, which only ever creates ambient `relates_to`.
+
+  Excludes the article itself and **any already-linked article** (either
+  direction, any relationship type). Only embedded, `published` articles are
+  considered. Honors `:threshold` (cosine similarity floor, default from
+  `:suggestion_similarity_threshold` config or 0.5) and `:limit` (default
+  #{@default_suggestion_limit}), ordered most-similar first. Tenant-scoped.
+
+  ## Returns
+
+  - `{:ok, [%{id, title, category, similarity_score}]}` (highest similarity first)
+  - `{:ok, []}` when the article has no embedding yet
+  - `{:error, :not_found}` when the article doesn't exist / isn't published
+  - `{:error, :invalid_threshold}` when `:threshold` is outside 0.0–1.0
+  """
+  @spec suggest_links(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, [map()]} | {:error, :not_found} | {:error, :invalid_threshold}
+  def suggest_links(tenant_id, article_id, opts \\ []) do
+    threshold = Keyword.get(opts, :threshold) || default_suggestion_threshold()
+
+    limit =
+      opts
+      |> Keyword.get(:limit, @default_suggestion_limit)
+      |> max(1)
+      |> min(@max_relevance_page_size)
+
+    with :ok <- validate_threshold(threshold) do
+      case fetch_article_embedding(tenant_id, article_id) do
+        nil ->
+          {:error, :not_found}
+
+        %{embedding: nil} ->
+          {:ok, []}
+
+        %{embedding: embedding} ->
+          {:ok, suggestion_candidates(tenant_id, article_id, embedding, threshold, limit)}
+      end
+    end
+  end
+
+  defp default_suggestion_threshold,
+    do: Application.get_env(:loopctl, :suggestion_similarity_threshold, 0.5)
+
+  defp validate_threshold(t) when is_number(t) and t >= 0.0 and t <= 1.0, do: :ok
+  defp validate_threshold(_), do: {:error, :invalid_threshold}
+
+  # Lightweight fetch — only the embedding (skips body/metadata). A non-UUID or a
+  # missing/non-published article yields nil → {:error, :not_found}.
+  defp fetch_article_embedding(tenant_id, article_id) do
+    if valid_uuid?(article_id) do
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+        select: %{embedding: a.embedding}
+      )
+      |> AdminRepo.one()
+    end
+  end
+
+  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.status == :published,
+      where: not is_nil(a.embedding),
+      where: a.id != ^article_id,
+      # Exclude any article already linked to the target (either direction, any type).
+      left_join: l in ArticleLink,
+      on:
+        l.tenant_id == ^tenant_id and
+          ((l.source_article_id == ^article_id and l.target_article_id == a.id) or
+             (l.target_article_id == ^article_id and l.source_article_id == a.id)),
+      where: is_nil(l.id),
+      where:
+        fragment("GREATEST(0, 1 - (? <=> ?::vector)) > ?", a.embedding, ^embedding, ^threshold),
+      order_by: [asc: fragment("? <=> ?::vector", a.embedding, ^embedding)],
+      limit: ^limit,
+      select: %{
+        id: a.id,
+        title: a.title,
+        category: a.category,
+        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?::vector))", a.embedding, ^embedding)
+      }
+    )
+    |> AdminRepo.all(timeout: 5_000)
+  end
+
   @doc """
   Multi-hop traversal of the published article-link graph from a starting article.
 
