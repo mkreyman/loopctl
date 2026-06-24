@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 59 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 60 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (59)
+## Tools (60)
 
 ### Project Tools
 
@@ -162,6 +162,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_publish` | **Requires `LOOPCTL_ORCH_KEY` (orchestrator role).** Publish an existing draft article, making it visible to all agents. (Note: `knowledge_create` publishes on create by default with no orchestrator key needed — this tool is for publishing a draft staged earlier.) Required: `article_id`. |
 | `knowledge_bulk_publish` | **Requires `LOOPCTL_USER_KEY`.** Publish drafts, partial-success style: every valid draft publishes; others are reported per-id as `skipped` (already published — idempotent — or archived/superseded), `not_found`, or `errored`. No 100-id cap (auto-chunked); duplicates ignored; safe to retry. `meta.count` = published; `meta.counts`/`meta.results` give the breakdown. Required: `article_ids` (array). |
 | `knowledge_unpublish` | **Requires `LOOPCTL_USER_KEY`.** Revert a published article back to draft (hidden from search/context, not deleted). Required: `article_id`. |
+| `knowledge_bulk_unpublish` | **Requires `LOOPCTL_USER_KEY`.** Revert published articles to draft in bulk, partial-success style (mirror of `knowledge_bulk_publish`): per-id `unpublished`/`skipped` (already draft, or archived/superseded)/`not_found`/`errored`. No 100-id cap (auto-chunked, ≤5000); duplicates ignored; safe to retry. Not deleted (re-publish to restore; `knowledge_bulk_delete` to archive). `meta.count`/`meta.counts`/`meta.results` give the breakdown. Required: `article_ids` (array). |
 | `knowledge_archive` | **Requires `LOOPCTL_USER_KEY`.** Soft-delete an article (draft or published). Row retained for audit; hidden from all reads. Required: `article_id`. |
 | `knowledge_delete` | **Requires `LOOPCTL_USER_KEY`.** Alias for `knowledge_archive` — DELETE verb on the REST API archives under the hood. Required: `article_id`. |
 | `knowledge_bulk_delete` | **Requires `LOOPCTL_USER_KEY`.** Bulk soft-delete (archive), partial-success. Provide exactly one selector: `article_ids` (list), `source_type`+`source_id` (every active article from a source — dedup cleanup), or `tag`+`confirm:true` (every active article with the tag — high blast radius). Per-id outcomes (archived/skipped/not_found/errored) in `meta.results`; `meta.count`=archived; idempotent (already-archived skipped); no 100-cap (auto-chunked, ≤5000). |

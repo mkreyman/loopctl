@@ -207,7 +207,13 @@ defmodule LoopctlWeb.ArticleController do
 
   operation(:update,
     summary: "Update article",
-    description: "Updates article fields. Role: user+.",
+    description:
+      "**PATCH /api/v1/articles/:id** — updates an existing article in place. Send only " <>
+        "the fields to change; supported keys are `title`, `body`, `tags` (replaces the " <>
+        "whole array), `category`, `status`, `metadata`, and `project_id`. Partial updates " <>
+        "are supported (e.g. body-only to tidy a hub, or tags-only). `tenant_id` is never " <>
+        "accepted from the body. Returns the full updated article. A changed `body`/`tags` " <>
+        "re-triggers embedding/linking. Role: user+ (distinct from create, which is agent+).",
     parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
     request_body:
       {"Update params", "application/json",

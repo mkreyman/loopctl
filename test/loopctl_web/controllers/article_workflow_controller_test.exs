@@ -404,6 +404,103 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
     end
   end
 
+  describe "POST /api/v1/knowledge/bulk-unpublish (#148 M3)" do
+    test "unpublishes published articles and reports per-id outcomes for the rest", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      already_draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      archived = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      missing = Ecto.UUID.generate()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-unpublish", %{
+          "article_ids" => [published.id, already_draft.id, archived.id, missing]
+        })
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["count"] == 1
+      assert body["meta"]["counts"]["unpublished"] == 1
+      assert body["meta"]["counts"]["skipped"] == 2
+      assert body["meta"]["counts"]["not_found"] == 1
+      assert body["meta"]["counts"]["requested"] == 4
+
+      outcomes = Map.new(body["meta"]["results"], &{&1["id"], &1["outcome"]})
+      assert outcomes[published.id] == "unpublished"
+      assert outcomes[already_draft.id] == "skipped"
+      assert outcomes[archived.id] == "skipped"
+      assert outcomes[missing] == "not_found"
+
+      # The published article is now a draft; the rest are untouched.
+      assert AdminRepo.get!(Article, published.id).status == :draft
+      assert AdminRepo.get!(Article, already_draft.id).status == :draft
+      assert AdminRepo.get!(Article, archived.id).status == :archived
+
+      # data carries body-less summaries of the affected set.
+      [summary] = body["data"]
+      assert summary["id"] == published.id
+      refute Map.has_key?(summary, "body")
+
+      # Audit event recorded.
+      audit_count =
+        AuditLog
+        |> where([a], a.tenant_id == ^tenant.id and a.action == "article.unpublished")
+        |> AdminRepo.aggregate(:count, :id)
+
+      assert audit_count == 1
+    end
+
+    test "already-draft ids are an idempotent no-op (skipped)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-unpublish", %{"article_ids" => [draft.id]})
+        |> json_response(200)
+
+      assert body["meta"]["count"] == 0
+      assert body["meta"]["counts"]["skipped"] == 1
+      [result] = body["meta"]["results"]
+      assert result["outcome"] == "skipped"
+      assert result["reason"] == "already_draft"
+    end
+
+    test "requires user role (agent forbidden)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(agent_key)
+        |> post(~p"/api/v1/knowledge/bulk-unpublish", %{"article_ids" => [published.id]})
+
+      assert json_response(conn, 403)
+      # Unchanged.
+      assert AdminRepo.get!(Article, published.id).status == :published
+    end
+
+    test "empty article_ids returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-unpublish", %{"article_ids" => []})
+
+      assert json_response(conn, 400)
+    end
+  end
+
   describe "POST /api/v1/knowledge/bulk-delete" do
     test "archives valid ids and reports per-id outcomes for the rest", %{conn: conn} do
       tenant = fixture(:tenant)

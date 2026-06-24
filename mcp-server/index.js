@@ -809,6 +809,31 @@ async function knowledgeBulkPublish({ article_ids }) {
   return toContent(result);
 }
 
+async function knowledgeBulkUnpublish({ article_ids }) {
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/bulk-unpublish",
+    { article_ids },
+    process.env.LOOPCTL_USER_KEY
+  );
+
+  // Partial success returns 200 even when nothing unpublished. Surface a warning
+  // so the agent doesn't treat not_found/errored ids as success.
+  const counts = result?.meta?.counts;
+  if (counts && (counts.not_found > 0 || counts.errored > 0)) {
+    const warning =
+      `WARNING: bulk-unpublish was partial — unpublished ${counts.unpublished}, ` +
+      `skipped ${counts.skipped}, not_found ${counts.not_found}, errored ${counts.errored} ` +
+      `(of ${counts.requested} requested). Inspect meta.results for per-id outcomes; ` +
+      `not_found/errored ids were NOT unpublished.`;
+    return {
+      content: [{ type: "text", text: warning }, ...toContent(result).content],
+    };
+  }
+
+  return toContent(result);
+}
+
 async function knowledgeUnpublish({ article_id }) {
   const result = await apiCall(
     "POST",
@@ -2346,6 +2371,31 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_bulk_unpublish",
+    description:
+      "Unpublish (published → draft) articles in bulk, partial-success style — the mirror " +
+      "of knowledge_bulk_publish, for cleanup passes. REQUIRES LOOPCTL_USER_KEY (user role). " +
+      "Every currently-published id is reverted to draft; each other id gets a per-id outcome: " +
+      "unpublished, skipped (already draft — idempotent — or archived/superseded), not_found, " +
+      "or errored. Duplicate ids de-duplicated; no 100-id cap (auto-chunked server-side, " +
+      "bounded to 5000/call). meta.count = number actually unpublished; meta.counts has the " +
+      "full breakdown; meta.results is the per-id list in request order. Safe to retry — " +
+      "already-draft ids are skipped, not errored. Articles are NOT deleted (re-publish with " +
+      "knowledge_bulk_publish); to archive/soft-delete use knowledge_bulk_delete.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_ids: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Article UUIDs to unpublish. Any length (auto-chunked); duplicates ignored.",
+        },
+      },
+      required: ["article_ids"],
+    },
+  },
+  {
     name: "knowledge_unpublish",
     description:
       "Revert a published article back to draft state. The article stops being visible " +
@@ -3033,6 +3083,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_bulk_publish":
       return await knowledgeBulkPublish(args);
+
+    case "knowledge_bulk_unpublish":
+      return await knowledgeBulkUnpublish(args);
 
     case "knowledge_unpublish":
       return await knowledgeUnpublish(args);
