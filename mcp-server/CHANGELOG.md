@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.20.1 — 2026-06-24 (honest story pagination)
+
+### Fixed
+
+- **`list_stories` / `list_ready_stories`** no longer silently clamp `limit` to 20.
+  They default to 20 but now honor an explicit `limit` up to the server's max (500),
+  so paging by advancing `offset` no longer skips stories. Tool schemas document the
+  `default 20, max 500` contract. (#155)
+
 ## 2.20.0 — 2026-06-23 (creativity primitives)
 
 ### Added

@@ -139,9 +139,12 @@ function toContent(result) {
 /**
  * Compact variant for list endpoints — strips acceptance_criteria and
  * description (use get_story for full details). Keeps all other fields.
- * Enforces a max page size to prevent MCP response token overflow.
+ * A modest DEFAULT page size keeps unprompted responses small, but an explicit
+ * `limit` is honored up to the server's max (500) so story enumeration paginates
+ * honestly instead of silently capping at 20 and skipping rows on offset advance.
  */
-const MAX_PAGE_SIZE = 20;
+const DEFAULT_STORY_PAGE_SIZE = 20;
+const SERVER_MAX_STORY_PAGE_SIZE = 500;
 
 function toContentCompact(result) {
   if (result && result.error === true) return toContent(result);
@@ -367,7 +370,10 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
   if (agent_status) params.set("agent_status", agent_status);
   if (verified_status) params.set("verified_status", verified_status);
   if (epic_id) params.set("epic_id", epic_id);
-  params.set("limit", String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE)));
+  params.set(
+    "limit",
+    String(Math.min(limit ?? DEFAULT_STORY_PAGE_SIZE, SERVER_MAX_STORY_PAGE_SIZE)),
+  );
   if (offset != null) params.set("offset", String(offset));
   if (include_token_totals) params.set("include_token_totals", "true");
 
@@ -377,7 +383,10 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
 
 async function listReadyStories({ project_id, limit }) {
   const params = new URLSearchParams({ project_id });
-  params.set("limit", String(Math.min(limit ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE)));
+  params.set(
+    "limit",
+    String(Math.min(limit ?? DEFAULT_STORY_PAGE_SIZE, SERVER_MAX_STORY_PAGE_SIZE)),
+  );
 
   const result = await apiCall("GET", `/api/v1/stories/ready?${params}`);
   return toContentCompact(result);
@@ -1526,8 +1535,8 @@ const TOOLS = [
     description:
       "List stories for a project, optionally filtered by agent_status, verified_status, or epic_id. " +
       "Returns compact results (no acceptance_criteria/description) — use get_story for full details. " +
-      "Max 20 per page. Use offset to paginate (response includes total_count). " +
-      "Filter by epic_id or agent_status to reduce result size.",
+      "Defaults to 20 per page; pass `limit` up to 500 to page larger. Use offset to paginate " +
+      "(response includes total_count). Filter by epic_id or agent_status to reduce result size.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1550,7 +1559,7 @@ const TOOLS = [
         },
         limit: {
           type: "integer",
-          description: "Maximum number of stories to return.",
+          description: "Maximum number of stories to return (default 20, max 500).",
         },
         offset: {
           type: "integer",
@@ -1569,7 +1578,7 @@ const TOOLS = [
     description:
       "List stories that are ready to be worked on (contracted, dependencies met). " +
       "Returns compact results — use get_story for full details. " +
-      "Max 20 per page. Response includes total_count for pagination.",
+      "Defaults to 20 per page; pass `limit` up to 500 to page larger. Response includes total_count.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1579,7 +1588,7 @@ const TOOLS = [
         },
         limit: {
           type: "integer",
-          description: "Maximum number of stories to return.",
+          description: "Maximum number of stories to return (default 20, max 500).",
         },
       },
       required: ["project_id"],
