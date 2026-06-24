@@ -281,7 +281,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
   # All are coerced to idea objects so the documented contract and the
   # idea-synthesizer consumer agree.
   defp normalize_ideas(params) do
-    raw = params["ideas"] || params["texts"]
+    raw = resolve_ideas_param(params)
 
     cond do
       not is_list(raw) or raw == [] ->
@@ -299,6 +299,20 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         else
           {:ok, coerced}
         end
+    end
+  end
+
+  # Prefer whichever of `ideas`/`texts` is a non-empty list, so an empty `ideas: []`
+  # doesn't shadow a valid `texts` (an empty list is truthy in Elixir, so a plain `||`
+  # would short-circuit on it). Falls through to the validation error otherwise.
+  defp resolve_ideas_param(params) do
+    ideas = params["ideas"]
+    texts = params["texts"]
+
+    cond do
+      is_list(ideas) and ideas != [] -> ideas
+      is_list(texts) and texts != [] -> texts
+      true -> ideas || texts
     end
   end
 

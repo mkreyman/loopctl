@@ -250,6 +250,21 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       assert body["meta"]["prior_count"] == 1
     end
 
+    test "an empty ideas:[] does not shadow a valid texts list", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
+      stub_idea_embeddings(%{"identical" => [1.0, 0.0]})
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> post(~p"/api/v1/knowledge/novelty", %{ideas: [], texts: ["identical"]})
+        |> json_response(200)
+
+      assert [%{"novelty_score" => score}] = body["data"]
+      assert_in_delta score, 0.0, 1.0e-4
+    end
+
     test "accepts a bare ideas:[string] list", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
