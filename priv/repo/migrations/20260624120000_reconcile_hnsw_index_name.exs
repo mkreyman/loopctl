@@ -5,6 +5,18 @@ defmodule Loopctl.Repo.Migrations.ReconcileHnswIndexName do
   # (a brief ACCESS EXCLUSIVE lock, no table rewrite), so it WANTS the DDL
   # transaction. The rename + the idempotency guard run atomically.
   #
+  # NO @disable_migration_lock either — and that is deliberate, not an
+  # oversight. This migration runs inside Ecto's default
+  # `pg_advisory_xact_lock` migration lock, which is acceptable here because:
+  #
+  #   1. On PROD the canonical `articles_embedding_hnsw_idx` already exists,
+  #      so the up-step RETURNs at the idempotency guard BEFORE any DDL — no
+  #      lock is ever held against the live ~76k-row index.
+  #   2. Where it DOES fire (e.g. the test DB renaming `articles_embedding_idx`),
+  #      `ALTER INDEX ... RENAME` is metadata-only: a brief ACCESS EXCLUSIVE
+  #      lock with no rewrite, so holding the migration lock for its duration
+  #      is cheap and safe.
+  #
   # (Contrast: the CONCURRENT-recreate path — only needed if NO hnsw index
   # exists — would FORBID the transaction and require
   # `@disable_ddl_transaction true` / `@disable_migration_lock true`. Prod
@@ -68,7 +80,23 @@ defmodule Loopctl.Repo.Migrations.ReconcileHnswIndexName do
     DECLARE idx text;
     BEGIN
       -- Already canonical (prod, or this migration already ran): no-op.
-      IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'articles_embedding_hnsw_idx') THEN
+      -- Use the SAME predicate as the detection query below — the canonical
+      -- hnsw index on `articles` already present — rather than a bare
+      -- relname match. A bare `pg_class.relname` check is unqualified by
+      -- relkind/access-method/namespace, so an unrelated object squatting
+      -- the name (table, view, sequence, or an index of another AM, in ANY
+      -- schema) would RETURN early and silently skip reconciliation, leaving
+      -- the very drift this migration exists to fix.
+      IF EXISTS (
+        SELECT 1
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_class t ON t.oid = x.indrelid
+        JOIN pg_am    am ON am.oid = i.relam
+        WHERE t.relname = 'articles'
+          AND am.amname = 'hnsw'
+          AND i.relname = 'articles_embedding_hnsw_idx'
+      ) THEN
         RETURN;
       END IF;
 

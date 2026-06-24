@@ -116,4 +116,30 @@ defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
     run_migration(ReconcileHnswIndexName, :up)
     assert hnsw_index_names() == [@canonical]
   end
+
+  test "guard does not treat a non-hnsw object squatting the canonical name as 'already reconciled'" do
+    # Failure mode the tightened idempotency guard fixes: a bare
+    # `pg_class.relname = 'articles_embedding_hnsw_idx'` check matches ANY
+    # relation of that name (table, view, sequence, or an index of another AM)
+    # and RETURNs early, silently reporting success while the real hnsw index
+    # still sits under a non-canonical name — leaving the very drift this
+    # migration exists to remove.
+    #
+    # Set up exactly that: the real hnsw index lives under the non-canonical
+    # name, and an UNRELATED table squats the canonical name. Postgres puts
+    # tables and indexes in the same relation namespace, so reconciliation
+    # legitimately cannot complete (the RENAME target is occupied). The CORRECT
+    # behavior is to surface that conflict by raising — NOT to short-circuit at
+    # the guard and report a false success. The old bare-relname guard would
+    # have hidden the drift by returning early; the amname='hnsw' guard does
+    # not, so the migration proceeds to the RENAME and raises on the collision.
+    AdminRepo.query!("ALTER INDEX #{@canonical} RENAME TO #{@noncanonical}")
+    AdminRepo.query!("CREATE TABLE #{@canonical} (id int)")
+
+    assert hnsw_index_names() == [@noncanonical]
+
+    assert_raise Postgrex.Error, fn ->
+      run_migration(ReconcileHnswIndexName, :up)
+    end
+  end
 end
