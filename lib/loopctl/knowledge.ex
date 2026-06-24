@@ -35,6 +35,7 @@ defmodule Loopctl.Knowledge do
 
   require Logger
 
+  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -84,6 +85,12 @@ defmodule Loopctl.Knowledge do
   # thousands of distinct tags can't force an unbounded response; `distinct_count`
   # still reports the true cardinality and `truncated` flags when rows were capped.
   @max_facet_rows 1000
+
+  # Multi-hop graph traversal caps: bound a single traversal so a dense graph
+  # can't return an unbounded node/edge set. `truncated` flags when either is hit.
+  # Runtime-configurable (so tests can exercise truncation cheaply); defaults below.
+  @max_graph_nodes 100
+  @max_graph_edges 500
 
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
@@ -2631,6 +2638,159 @@ defmodule Loopctl.Knowledge do
       preload: [:source_article, :target_article],
       order_by: [desc: l.inserted_at],
       limit: 100
+    )
+    |> AdminRepo.all()
+  end
+
+  @doc """
+  Multi-hop traversal of the published article-link graph from a starting article.
+
+  Walks `article_links` outward from `article_id` up to `depth` hops
+  (**bidirectional** — a link is followed regardless of source/target direction),
+  returning the reachable published articles and the links among them. Cycle-safe:
+  a recursive-CTE path array prevents revisiting a node, so a cyclic graph
+  terminates and no node appears twice. Bounded to #{@max_graph_nodes} nodes and
+  #{@max_graph_edges} edges; `truncated` is true when either cap is hit.
+
+  Only `published` articles are traversed (the agent-visible set), and everything
+  is tenant-scoped.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the starting article UUID
+  - `opts` -- `:depth` (1–3, default 1)
+
+  ## Returns
+
+  - `{:ok, %{nodes: [%{id, title, category, depth}], edges: [%{source_article_id,
+    target_article_id, relationship_type}], truncated: boolean, node_count: integer}}`
+  - `{:error, :invalid_depth}` when depth is outside 1–3
+  - `{:error, :not_found}` when the starting article doesn't exist / isn't published
+  """
+  @spec graph_traversal(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, map()} | {:error, :invalid_depth} | {:error, :not_found}
+  def graph_traversal(tenant_id, article_id, opts \\ []) do
+    depth = Keyword.get(opts, :depth, 1)
+
+    with :ok <- validate_graph_depth(depth),
+         true <- article_published?(tenant_id, article_id) do
+      {:ok, execute_graph_traversal(tenant_id, article_id, depth)}
+    else
+      false -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp validate_graph_depth(depth) when is_integer(depth) and depth >= 1 and depth <= 3, do: :ok
+  defp validate_graph_depth(_), do: {:error, :invalid_depth}
+
+  defp max_graph_nodes, do: Application.get_env(:loopctl, :max_graph_nodes, @max_graph_nodes)
+  defp max_graph_edges, do: Application.get_env(:loopctl, :max_graph_edges, @max_graph_edges)
+
+  defp article_published?(tenant_id, article_id) do
+    valid_uuid?(article_id) and
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published
+      )
+      |> AdminRepo.exists?()
+  end
+
+  defp execute_graph_traversal(tenant_id, article_id, depth) do
+    {:ok, tenant_bin} = Ecto.UUID.dump(tenant_id)
+    {:ok, article_bin} = Ecto.UUID.dump(article_id)
+
+    # Bidirectional recursive walk with a path-array cycle guard, capped at
+    # @max_graph_nodes. Raw SQL because Ecto has no native recursive-CTE builder.
+    node_sql = """
+    WITH RECURSIVE graph AS (
+      SELECT a.id AS node_id, ARRAY[a.id] AS path, 0 AS depth
+      FROM articles a
+      WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'published'
+
+      UNION ALL
+
+      SELECT
+        CASE WHEN l.source_article_id = g.node_id THEN l.target_article_id
+             ELSE l.source_article_id END AS node_id,
+        g.path || CASE WHEN l.source_article_id = g.node_id THEN l.target_article_id
+                       ELSE l.source_article_id END,
+        g.depth + 1
+      FROM graph g
+      JOIN article_links l ON l.tenant_id = $2
+        AND (l.source_article_id = g.node_id OR l.target_article_id = g.node_id)
+      JOIN articles a ON a.id = CASE WHEN l.source_article_id = g.node_id
+                                     THEN l.target_article_id ELSE l.source_article_id END
+        AND a.tenant_id = $2 AND a.status = 'published'
+      WHERE g.depth < $3
+        AND NOT (CASE WHEN l.source_article_id = g.node_id
+                      THEN l.target_article_id ELSE l.source_article_id END = ANY(g.path))
+    )
+    SELECT node_id, depth FROM (
+      SELECT DISTINCT ON (node_id) node_id, depth FROM graph ORDER BY node_id, depth ASC
+    ) sub
+    ORDER BY depth ASC, node_id
+    LIMIT $4
+    """
+
+    node_cap = max_graph_nodes()
+
+    {:ok, %{rows: node_rows}} =
+      SQL.query(
+        AdminRepo,
+        node_sql,
+        [article_bin, tenant_bin, depth, node_cap],
+        timeout: 5_000
+      )
+
+    nodes_truncated = length(node_rows) >= node_cap
+
+    node_ids_with_depth =
+      Enum.map(node_rows, fn [node_bin, d] ->
+        {:ok, uuid} = Ecto.UUID.load(node_bin)
+        {uuid, d}
+      end)
+
+    node_ids = Enum.map(node_ids_with_depth, &elem(&1, 0))
+    depth_map = Map.new(node_ids_with_depth)
+
+    nodes = fetch_graph_nodes(tenant_id, node_ids, depth_map)
+    edges = fetch_graph_edges(tenant_id, node_ids)
+
+    %{
+      nodes: nodes,
+      edges: edges,
+      truncated: nodes_truncated or length(edges) >= max_graph_edges(),
+      node_count: length(nodes)
+    }
+  end
+
+  defp fetch_graph_nodes(_tenant_id, [], _depth_map), do: []
+
+  defp fetch_graph_nodes(tenant_id, node_ids, depth_map) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.id in ^node_ids and a.status == :published,
+      select: %{id: a.id, title: a.title, category: a.category}
+    )
+    |> AdminRepo.all()
+    |> Enum.map(&Map.put(&1, :depth, Map.get(depth_map, &1.id)))
+    |> Enum.sort_by(& &1.depth)
+  end
+
+  defp fetch_graph_edges(_tenant_id, []), do: []
+
+  defp fetch_graph_edges(tenant_id, node_ids) do
+    from(l in ArticleLink,
+      where:
+        l.tenant_id == ^tenant_id and
+          l.source_article_id in ^node_ids and l.target_article_id in ^node_ids,
+      order_by: [asc: l.inserted_at],
+      limit: ^max_graph_edges(),
+      select: %{
+        source_article_id: l.source_article_id,
+        target_article_id: l.target_article_id,
+        relationship_type: l.relationship_type
+      }
     )
     |> AdminRepo.all()
   end

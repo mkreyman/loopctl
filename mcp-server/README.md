@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 60 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 61 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -66,7 +66,7 @@ Or if installed locally:
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
-## Tools (60)
+## Tools (61)
 
 ### Project Tools
 
@@ -151,6 +151,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_list` | List articles (`id`, `title`, `category`, `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, timestamps), filtered + paginated. **Body-less summary by default** (safe to page up to `limit=1000`); pass `include_body: true` to also return `body`, in which case the page is bounded by a ~5 MB byte budget — continue via `meta.next_offset` while `meta.has_more`. **Lag-free, all-status** read of the DB of record — unlike `knowledge_search` (ranked, published-only, lags writes) and `knowledge_index` (id/title/category only). The right tool to enumerate/dedup/repair and for idempotency/existence checks: filter by `tags`, `source_type`+`source_id`, or `idempotency_key` and read `meta.total_count` (exact). Single full body → `knowledge_get`; relevant bodies → `knowledge_context`; bulk dump → `knowledge_export`. Optional: `project_id`, `category`, `status`, `tags`, `source_type`, `source_id`, `idempotency_key`, `offset`, `limit`, `include_body`. |
 | `knowledge_get` | Get full article content by ID. Use after search to read an article in detail. Optional: `project_id`, `story_id` for attribution. |
 | `knowledge_context` | Get relevance-and-recency-ranked full articles for a task query. Best knowledge for your current context. Optional: `project_id`, `story_id` for attribution. |
+| `knowledge_graph` | Multi-hop traversal of the published article-link graph from `article_id` (depth 1–3, default 1). Bidirectional, cycle-safe, bounded to 100 nodes / 500 edges (`truncated` flags a cap). Returns `nodes` (`id`/`title`/`category`/`depth`) + `edges` (`source_article_id`/`target_article_id`/`relationship_type`). Explore typed connections beyond `knowledge_context`'s 1-hop links. Required: `article_id`. Optional: `depth`, `project_id`. |
 | `knowledge_create` | Create a new knowledge article. File findings, document patterns, or record decisions. **Published immediately by default** (visible to agents in search/index/context) for every role — the response `note` says which outcome occurred. Pass `draft: true` to stage it for later review instead (publish afterwards with `knowledge_publish`). Pass `idempotency_key` for idempotent capture (re-creating with the same key is a no-op returning the existing article — no partial duplicates). Optional: `category`, `tags`, `project_id`, `draft`, `idempotency_key`, `source_type`, `source_id`. |
 | `knowledge_okf_export` | **Requires `LOOPCTL_USER_KEY`.** Export the wiki as a portable OKF (Open Knowledge Format) v0.1 bundle of markdown files. Writes to `out_dir`, or returns `{files, meta}` inline. |
 | `knowledge_okf_import` | **Requires `LOOPCTL_USER_KEY`.** Import an OKF v0.1 bundle from a local directory. Creates or (with `merge`) updates articles; tolerates and preserves unknown frontmatter. |

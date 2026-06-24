@@ -92,6 +92,10 @@ config :loopctl, :webauthn_adapter, Loopctl.MockWebAuthn
 # instead of ~5 MB of fixtures (production default is 5_000_000).
 config :loopctl, :full_content_byte_budget, 100_000
 
+# Graph-traversal node cap — small in tests so the `truncated` cap behavior can
+# be exercised with ~11 nodes instead of 100+ (production default is 100).
+config :loopctl, :max_graph_nodes, 10
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",

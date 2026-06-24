@@ -617,6 +617,20 @@ async function knowledgeStats({ project_id }) {
   return toContent(result);
 }
 
+async function knowledgeGraph({ article_id, depth, project_id }) {
+  const params = new URLSearchParams();
+  params.set("article_id", article_id);
+  if (depth != null) params.set("depth", String(depth));
+  if (project_id) params.set("project_id", project_id);
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/graph?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeCount({
   project_id,
   category,
@@ -2131,6 +2145,35 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_graph",
+    description:
+      "Traverse the published article-link graph outward from an article, up to `depth` hops " +
+      "(1–3, default 1). BIDIRECTIONAL (follows links regardless of source/target direction) and " +
+      "cycle-safe (no node twice). Returns { nodes: [{id,title,category,depth}], edges: " +
+      "[{source_article_id,target_article_id,relationship_type}], truncated, node_count }. Bounded " +
+      "to 100 nodes / 500 edges (truncated:true when hit). Use to explore how a piece of knowledge " +
+      "connects (relates_to/derived_from/contradicts/supersedes) beyond the 1-hop links in " +
+      "knowledge_context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          format: "uuid",
+          description: "Starting article UUID (required).",
+        },
+        depth: {
+          type: "integer",
+          minimum: 1,
+          maximum: 3,
+          description: "Hops to traverse (1–3, default 1). Out of range → 400.",
+        },
+        project_id: { type: "string", format: "uuid", description: "Optional: project UUID." },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_search",
     description:
       "Search the knowledge wiki by topic. Returns snippets. Ranked, and returns PUBLISHED " +
@@ -3061,6 +3104,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_facets":
       return await knowledgeFacets(args);
+
+    case "knowledge_graph":
+      return await knowledgeGraph(args);
 
     case "knowledge_search":
       return await knowledgeSearch(args);

@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.17.0 — 2026-06-23 (knowledge graph traversal)
+
+### Added
+
+- **`knowledge_graph`** — multi-hop traversal of the published article-link graph
+  from a starting article (depth 1–3). Bidirectional, cycle-safe, bounded to 100
+  nodes / 500 edges (`truncated` flags a cap hit). Returns `nodes`
+  (id/title/category/depth) + `edges` (source/target/relationship_type) so agents
+  can explore typed connections beyond the 1-hop links in `knowledge_context`.
+  Backed by `GET /api/v1/knowledge/graph`. (#149)
+
 ## 2.16.0 — 2026-06-23 (bulk unpublish)
 
 ### Added
