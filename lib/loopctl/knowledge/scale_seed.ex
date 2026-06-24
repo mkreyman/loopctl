@@ -63,6 +63,8 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   floor (AC-27.1.6).
   """
 
+  import Ecto.Query, only: [from: 2]
+
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -93,19 +95,36 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   - `:link_density` — average links per article (default: 5)
   - `:batch_size` — rows per `insert_all` batch (default: 1_000)
 
-  Returns `{:ok, %{articles: integer(), links: integer()}}` on success.
+  Returns `{:ok, %{articles: integer(), links: integer()}}` on success,
+  where `:articles` is the number of rows **actually committed** (not the
+  requested count). A re-seed of the same tenant will return `articles: 0`
+  due to `on_conflict: :nothing`.
 
   ## GUARD: sandbox usage
 
-  This function raises if called inside an Ecto sandbox transaction — doing
-  so would defeat the purpose (ANALYZE would see 0 rows post-rollback).
-  Always call from a `@tag :scale` test that has NOT started a sandbox
-  checkout for the inserted tenant's data.
+  This function raises `RuntimeError` if called while AdminRepo has an active
+  sandbox checkout — doing so would defeat the purpose (ANALYZE would see 0
+  rows post-rollback). Always call from a `@tag :scale` test that has NOT
+  started a sandbox checkout for the inserted tenant's data.
   """
   @spec seed(binary(), keyword()) ::
           {:ok, %{articles: non_neg_integer(), links: non_neg_integer()}}
           | {:error, term()}
   def seed(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    if AdminRepo.checked_out?() do
+      raise """
+      ScaleSeed.seed/2 was called while AdminRepo has an active sandbox checkout.
+
+      This defeats the purpose of ScaleSeed — rows inserted inside a sandbox
+      transaction are rolled back, so ANALYZE sees n≈0 and verify_stats! will
+      produce confusing false-RED results.
+
+      Call ScaleSeed.seed/2 from a @tag :scale test that uses ExUnit.Case
+      directly (not DataCase) and wraps DB ops in Ecto.Adapters.SQL.Sandbox.unboxed_run/2.
+      See the ScaleSeed moduledoc for the correct test setup.
+      """
+    end
+
     count = Keyword.get(opts, :count, 1_000)
     link_density = Keyword.get(opts, :link_density, 5)
     batch_size = Keyword.get(opts, :batch_size, 1_000)
@@ -113,8 +132,8 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     with :ok <- assert_hnsw_index_present!(),
          {:ok, article_ids} <- insert_articles_in_batches(tenant_id, count, batch_size),
          {:ok, link_count} <- seed_links(tenant_id, article_ids, link_density),
-         :ok <- analyze_and_verify(tenant_id, count) do
-      {:ok, %{articles: count, links: link_count}}
+         :ok <- analyze_and_verify(tenant_id, length(article_ids)) do
+      {:ok, %{articles: length(article_ids), links: link_count}}
     end
   end
 
@@ -291,6 +310,11 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     # Must be an atom — Ecto.Enum fields require atoms with schema module insert_all.
     relationship_type = :relates_to
 
+    # Convert article_ids list to tuple for O(1) random access.
+    # Enum.at/2 on a list is O(n), making link seeding O(n^2 * density)
+    # at prod-floor scale (80k * 5 ≈ 1.6e10 traversals).
+    article_ids_tuple = List.to_tuple(article_ids)
+
     # For each article, link to `link_density` nearest neighbours by index
     # (wrapping around). This gives a deterministic nearest-neighbour graph
     # that exercises the already-linked anti-join path.
@@ -300,7 +324,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       |> Enum.flat_map(fn {source_id, i} ->
         for j <- 1..link_density do
           target_idx = rem(i + j, count)
-          target_id = Enum.at(article_ids, target_idx)
+          target_id = elem(article_ids_tuple, target_idx)
 
           %{
             id: Ecto.UUID.generate(),
@@ -332,17 +356,70 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     {:ok, inserted}
   end
 
-  defp analyze_and_verify(tenant_id, expected_count) do
+  defp analyze_and_verify(tenant_id, inserted_count) do
+    # Capture last_analyze BEFORE running ANALYZE so we can assert it advanced.
+    pre_analyze_ts = fetch_last_analyze()
+
     # Run ANALYZE on both tables so the planner has fresh statistics.
     # ANALYZE is non-transactional and sees only committed rows.
     AdminRepo.query!("ANALYZE articles")
     AdminRepo.query!("ANALYZE article_links")
 
     # Verify pg_stat_user_tables reflects the seeded corpus (AC-27.1.5).
-    verify_stats!(tenant_id, expected_count)
+    verify_stats!(tenant_id, inserted_count, pre_analyze_ts)
   end
 
-  defp verify_stats!(tenant_id, expected_count) do
+  # Fetch last_analyze from pg_stat_user_tables for the articles table.
+  # Returns nil when the table has never been analyzed.
+  defp fetch_last_analyze do
+    %{rows: rows} =
+      AdminRepo.query!("""
+      SELECT last_analyze
+      FROM pg_stat_user_tables
+      WHERE relname = 'articles'
+      """)
+
+    case rows do
+      [[ts]] -> ts
+      _ -> nil
+    end
+  end
+
+  defp verify_stats!(tenant_id, inserted_count, pre_analyze_ts) do
+    # pg_stat_user_tables is refreshed by the stats collector asynchronously.
+    # Poll with a short bounded retry to tolerate the propagation lag on idle
+    # or freshly started stats collectors.
+    poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, _attempts = 5, _delay_ms = 200)
+  end
+
+  defp poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, 0, _delay_ms) do
+    # Final attempt — run the check and propagate whatever result we get.
+    do_verify_stats(tenant_id, inserted_count, pre_analyze_ts)
+  end
+
+  defp poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, attempts, delay_ms) do
+    case do_verify_stats(tenant_id, inserted_count, pre_analyze_ts) do
+      :ok ->
+        :ok
+
+      {:error, _reason} ->
+        # Stats subsystem may not have flushed yet — wait and retry.
+        Process.sleep(delay_ms)
+        poll_verify_stats(tenant_id, inserted_count, pre_analyze_ts, attempts - 1, delay_ms * 2)
+    end
+  end
+
+  defp do_verify_stats(tenant_id, inserted_count, pre_analyze_ts) do
+    # Tenant-scoped committed row count gives an exact assertion that THIS
+    # seed's rows reached the planner — table-wide n_live_tup can pass
+    # spuriously on shared/re-used DBs where other tenants have rows.
+    actual_count =
+      AdminRepo.one!(
+        from a in Article,
+          where: a.tenant_id == ^tenant_id and a.status == :published,
+          select: count(a.id)
+      )
+
     %{rows: rows} =
       AdminRepo.query!("""
       SELECT n_live_tup, last_analyze
@@ -352,38 +429,96 @@ defmodule Loopctl.Knowledge.ScaleSeed do
 
     case rows do
       [[n_live_tup, last_analyze]] ->
-        check_stat_values(tenant_id, expected_count, n_live_tup, last_analyze)
+        check_stat_values(
+          tenant_id,
+          inserted_count,
+          actual_count,
+          n_live_tup,
+          last_analyze,
+          pre_analyze_ts
+        )
 
       _ ->
         {:error, "pg_stat_user_tables query returned unexpected shape: #{inspect(rows)}"}
     end
   end
 
-  defp check_stat_values(_tenant_id, _expected_count, _n_live_tup, nil) do
+  defp check_stat_values(_tenant_id, _inserted_count, _actual_count, _n_live_tup, nil, nil) do
+    # last_analyze is nil and pre_analyze_ts was also nil → this is a
+    # never-analyzed table. The stats collector has not yet flushed the
+    # result of the ANALYZE we just ran. Caller will retry.
     {:error,
      "ANALYZE did not run on articles table — last_analyze is nil. " <>
        "This usually means the table was not yet analyzed after the bulk insert. " <>
        "Try running ANALYZE manually or check AdminRepo connectivity."}
   end
 
-  defp check_stat_values(tenant_id, expected_count, n_live_tup, _last_analyze)
-       when n_live_tup < expected_count do
-    # pg_stat_user_tables n_live_tup is an estimate and may lag slightly for
-    # massive inserts. Accept values within 5% tolerance for large corpora.
-    # The key property is that n_live_tup > 0 and >> default test-suite row count.
-    tolerance = max(50, div(expected_count, 20))
-
-    if n_live_tup >= expected_count - tolerance do
-      :ok
-    else
-      {:error,
-       "pg_stat_user_tables n_live_tup (#{n_live_tup}) is far below expected " <>
-         "#{expected_count} for tenant #{tenant_id}. ANALYZE may have seen stale " <>
-         "or rolled-back rows. Ensure seeding runs OUTSIDE the DataCase sandbox."}
-    end
+  defp check_stat_values(
+         _tenant_id,
+         _inserted_count,
+         _actual_count,
+         _n_live_tup,
+         nil,
+         _pre_analyze_ts
+       ) do
+    # Same nil case but we had a non-nil pre_analyze_ts — stats collector
+    # transiently returned nil. Caller will retry.
+    {:error,
+     "ANALYZE did not run on articles table — last_analyze is nil. " <>
+       "This usually means the table was not yet analyzed after the bulk insert. " <>
+       "Try running ANALYZE manually or check AdminRepo connectivity."}
   end
 
-  defp check_stat_values(_tenant_id, _expected_count, _n_live_tup, _last_analyze), do: :ok
+  defp check_stat_values(
+         tenant_id,
+         inserted_count,
+         actual_count,
+         _n_live_tup,
+         _last_analyze,
+         _pre_analyze_ts
+       )
+       when actual_count < inserted_count do
+    # Exact tenant-scoped count is below what was inserted — either the seed
+    # genuinely inserted fewer rows (on_conflict: :nothing dups) or this is
+    # a logic error. Surface the discrepancy so callers know the DB state.
+    {:error,
+     "Tenant-scoped article count (#{actual_count}) is below inserted count (#{inserted_count}) " <>
+       "for tenant #{tenant_id}. Seeded rows may not have committed or were deduplicated by " <>
+       "on_conflict: :nothing. Ensure seeding runs OUTSIDE the DataCase sandbox."}
+  end
+
+  defp check_stat_values(
+         _tenant_id,
+         _inserted_count,
+         _actual_count,
+         n_live_tup,
+         last_analyze,
+         pre_analyze_ts
+       ) do
+    # last_analyze advanced past pre_analyze_ts (or pre was nil) — ANALYZE ran.
+    analyze_advanced? =
+      is_nil(pre_analyze_ts) or
+        case DateTime.compare(last_analyze, pre_analyze_ts) do
+          :gt -> true
+          _ -> false
+        end
+
+    cond do
+      not analyze_advanced? ->
+        {:error,
+         "pg_stat_user_tables.last_analyze (#{inspect(last_analyze)}) did not advance " <>
+           "past pre-ANALYZE timestamp (#{inspect(pre_analyze_ts)}). " <>
+           "The stats collector may be lagging — retry or check connectivity."}
+
+      n_live_tup == 0 ->
+        {:error,
+         "pg_stat_user_tables n_live_tup is 0 after ANALYZE. " <>
+           "Ensure seeding runs OUTSIDE the DataCase sandbox."}
+
+      true ->
+        :ok
+    end
+  end
 
   defp l2_normalize(floats) do
     norm = floats |> Enum.map(&(&1 * &1)) |> Enum.sum() |> :math.sqrt()

@@ -28,7 +28,7 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
       alias Loopctl.AdminRepo
       alias Loopctl.Knowledge.{Article, ArticleLink}
       alias Loopctl.Tenants.Tenant
-      Loopctl.Adapters.SQL.Sandbox.unboxed_run(AdminRepo, fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(AdminRepo, fn ->
         AdminRepo.delete_all(from l in ArticleLink, where: l.tenant_id == ^id)
         AdminRepo.delete_all(from a in Article, where: a.tenant_id == ^id)
         AdminRepo.delete_all(from t in Tenant, where: t.id == ^id)
@@ -50,6 +50,7 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ScaleSeed
+  alias Loopctl.Repo
   alias Loopctl.Tenants.Tenant
 
   # ---------------------------------------------------------------------------
@@ -284,8 +285,8 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
 
       assert count_a == 200
 
-      # tenant_b: 0 articles (AdminRepo BYPASSRLS would show leaked rows here)
-      count_b =
+      # tenant_b: 0 articles via AdminRepo BYPASSRLS (proves seed wrote correct tenant_id)
+      count_b_admin =
         AdminRepo.one!(
           from(a in Article,
             where: a.tenant_id == ^tenant_b.id,
@@ -293,7 +294,22 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
           )
         )
 
-      assert count_b == 0, "Tenant B must see 0 articles — tenant isolation violated"
+      assert count_b_admin == 0,
+             "AdminRepo (BYPASSRLS): tenant_b must see 0 articles — write-isolation violated"
+
+      # RLS isolation: verify that querying through the RLS-enforcing Repo with
+      # tenant_b's context returns 0 articles even WITHOUT an explicit tenant_id
+      # filter. This is the actual AC-27.1.9 invariant — tenant A's corpus is
+      # invisible to tenant B through the RLS path, not just through a hard
+      # tenant_id WHERE clause.
+      {:ok, count_b_rls} =
+        Repo.with_tenant(tenant_b.id, fn ->
+          Repo.one!(from(a in Article, select: count(a.id)))
+        end)
+
+      assert count_b_rls == 0,
+             "RLS path (Repo.with_tenant/2): tenant_b must see 0 articles — " <>
+               "RLS isolation violated. Tenant A's articles leaked through to tenant B."
 
       # Determinism: vector for index 5 is identical across two calls
       vec_5_first = ScaleSeed.embedding_for(5)
