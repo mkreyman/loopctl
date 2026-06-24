@@ -15,7 +15,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   remote-associates generator for computational-creativity ideation. (#152 A1)
 - **`knowledge_novelty`** — score ideas by novelty: each idea's text is embedded
   and compared to the nearest prior proposal (default tag `proposal`), returning
-  `novelty_score` (0 = identical, 1 = maximally novel). (#152 A2)
+  `novelty_score` = cosine distance (0 = identical, higher = more novel up to 2.0;
+  `null` when the idea text is blank or no priors exist, with `meta.prior_count`). (#152 A2)
 - **`knowledge_random_walk`** — random walk through the link graph from a starting
   article (no cycles), surfacing unexpected connections for incubation. (#152 A3)
 

@@ -819,7 +819,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_graph` | Multi-hop link-graph traversal from a seed article (typed edges, depth/fan-out caps) | agent |
 | `knowledge_suggest_links` | Ranked typed-link candidates for an article by embedding similarity (read-only) | agent |
 | `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in the optimal-novelty embedding band (creativity) | agent |
-| `knowledge_novelty` | Score ideas by distance to the nearest prior proposal (0 = identical, 1 = novel) | agent |
+| `knowledge_novelty` | Score ideas by cosine distance to the nearest prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no priors) | agent |
 | `knowledge_random_walk` | Random walk through the link graph from a start article (surfaces unexpected links) | agent |
 | `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture) | agent |
 | `knowledge_bulk_unpublish` | Bulk revert published articles to draft (archive), partial-success | user |

@@ -96,12 +96,16 @@ defmodule Loopctl.Knowledge do
 
   # Creativity primitives (#152). The distant-pairs self-join is O(candidates²),
   # so it samples at most @max_pair_candidates embedded articles (bounding the
-  # cross product); a random walk takes at most @max_walk_length steps.
+  # cross product); a random walk takes at most @max_walk_length steps. The
+  # candidate cap is operator-tunable via `config :loopctl, :max_pair_candidates`.
   @max_pair_candidates 1000
   @default_pair_limit 20
   @max_pair_limit 100
   @default_walk_length 4
   @max_walk_length 25
+  # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
+  # doesn't serialize 50 embedding round-trips.
+  @novelty_concurrency 5
 
   # Byte budget for full-content (`include_body: true`) list reads. An article
   # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
@@ -3000,10 +3004,12 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, [%{a: %{id,title,category}, b: %{id,title,category}, distance: float}]}`
+  - `{:ok, %{pairs: [...], total_count: integer, has_more: boolean}}`
   - `{:error, :invalid_distance}` when the band is outside 0.0–2.0 or min > max
   """
-  @spec distant_pairs(Ecto.UUID.t(), keyword()) :: {:ok, [map()]} | {:error, :invalid_distance}
+  @spec distant_pairs(Ecto.UUID.t(), keyword()) ::
+          {:ok, %{pairs: [map()], total_count: integer(), has_more: boolean()}}
+          | {:error, :invalid_distance}
   def distant_pairs(tenant_id, opts \\ []) do
     min_d = Keyword.get(opts, :min_distance, 0.3)
     max_d = Keyword.get(opts, :max_distance, 0.7)
@@ -3023,12 +3029,17 @@ defmodule Loopctl.Knowledge do
 
   defp validate_distance_band(_, _), do: {:error, :invalid_distance}
 
+  # Operator-tunable cap on the sampled candidate set (bounds the O(n²) self-join).
+  defp max_pair_candidates do
+    Application.get_env(:loopctl, :max_pair_candidates, @max_pair_candidates)
+  end
+
   defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?) do
     candidates =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
         order_by: a.id,
-        limit: ^@max_pair_candidates,
+        limit: ^max_pair_candidates(),
         select: %{
           id: a.id,
           tenant_id: a.tenant_id,
@@ -3038,13 +3049,23 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    base =
+    # Build the base query for counting total pairs
+    count_query =
+      from(a in subquery(candidates),
+        join: b in subquery(candidates),
+        on: a.id < b.id,
+        where: fragment("(? <=> ?) BETWEEN ? AND ?", a.embedding, b.embedding, ^min_d, ^max_d),
+        select: count()
+      )
+
+    # Build the paginated query for fetching pairs
+    pairs_query =
       from(a in subquery(candidates),
         join: b in subquery(candidates),
         on: a.id < b.id,
         where: fragment("(? <=> ?) BETWEEN ? AND ?", a.embedding, b.embedding, ^min_d, ^max_d),
         order_by: [asc: a.id, asc: b.id],
-        limit: ^limit,
+        limit: ^(limit + 1),
         offset: ^offset,
         select: %{
           a: %{id: a.id, title: a.title, category: a.category},
@@ -3053,9 +3074,30 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    base
-    |> maybe_filter_bridge_path(bridge?)
-    |> AdminRepo.all(timeout: 15_000)
+    # Fetch count and paginated pairs with timeout
+    {total_count, pairs_with_lookahead} =
+      AdminRepo.transaction(
+        fn ->
+          count =
+            count_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.one(timeout: 15_000)
+
+          pairs =
+            pairs_query |> maybe_filter_bridge_path(bridge?) |> AdminRepo.all(timeout: 15_000)
+
+          {count, pairs}
+        end,
+        timeout: 15_000
+      )
+      |> case do
+        {:ok, result} -> result
+        {:error, _} -> {0, []}
+      end
+
+    # Detect has_more by fetching limit+1; only return limit
+    has_more = length(pairs_with_lookahead) > limit
+    pairs = Enum.take(pairs_with_lookahead, limit)
+
+    %{pairs: pairs, total_count: total_count, has_more: has_more}
   end
 
   # Bridge filter: keep only pairs connected within ≤2 hops in the link graph —
@@ -3163,10 +3205,11 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Novelty scoring (#152 A2): for each idea, the cosine distance to its **nearest
-  prior proposal** (0 = identical to existing work, 1 = maximally novel). Embeds
-  each idea's text on the fly. Priors default to published articles tagged
-  `proposal`; pass `:prior_tag` to use a different family.
+  Novelty scoring (#152 A2): for each idea, the **cosine distance** to its nearest
+  prior proposal — `0` = identical to existing work, higher = more novel (up to `2.0`
+  for an opposite embedding). Embeds each idea's text on the fly, concurrently (bounded
+  at #{@novelty_concurrency}). Priors default to published articles tagged `proposal`;
+  pass `:prior_tag` to use a different family.
 
   ## Parameters
 
@@ -3176,25 +3219,44 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, [idea_with_novelty_score]}` — each idea gets `:novelty_score` (float, or
-    `nil` when its text couldn't be embedded; `1.0` when there are no priors)
+  - `{:ok, [idea_with_novelty_score]}` — each idea gets `:novelty_score` (float in
+    `[0, 2]`, or `nil` when its text is blank, couldn't be embedded, or there are no
+    priors to compare against)
   """
   @spec novelty_scores(Ecto.UUID.t(), [map()], keyword()) :: {:ok, [map()]}
   def novelty_scores(tenant_id, ideas, opts \\ []) when is_list(ideas) do
     prior_tag = Keyword.get(opts, :prior_tag, "proposal")
 
     scored =
-      Enum.map(ideas, fn idea ->
-        case idea |> novelty_idea_text() |> generate_embedding() do
-          {:ok, embedding} ->
-            Map.put(idea, :novelty_score, nearest_prior_distance(tenant_id, embedding, prior_tag))
-
-          {:error, _} ->
-            Map.put(idea, :novelty_score, nil)
-        end
-      end)
+      ideas
+      |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag),
+        max_concurrency: @novelty_concurrency,
+        timeout: :infinity,
+        ordered: true
+      )
+      |> Enum.map(fn {:ok, scored_idea} -> scored_idea end)
 
     {:ok, scored}
+  end
+
+  defp score_idea(tenant_id, idea, prior_tag) do
+    text = novelty_idea_text(idea)
+
+    if String.trim(text) == "" do
+      Map.put(idea, :novelty_score, nil)
+    else
+      score_embedding(tenant_id, idea, text, prior_tag)
+    end
+  end
+
+  defp score_embedding(tenant_id, idea, text, prior_tag) do
+    case generate_embedding(text) do
+      {:ok, embedding} ->
+        Map.put(idea, :novelty_score, nearest_prior_distance(tenant_id, embedding, prior_tag))
+
+      {:error, _} ->
+        Map.put(idea, :novelty_score, nil)
+    end
   end
 
   defp novelty_idea_text(idea) do
@@ -3210,8 +3272,8 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  # Min cosine distance from the idea embedding to any prior proposal; 1.0 (max
-  # novelty) when there are no embedded priors.
+  # Min cosine distance from the idea embedding to any prior proposal; nil when there
+  # are no embedded priors (distinguishable from a genuine high score).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag) do
     from(a in Article,
       where:
@@ -3220,7 +3282,6 @@ defmodule Loopctl.Knowledge do
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
     )
     |> AdminRepo.one()
-    |> Kernel.||(1.0)
   end
 
   # --- Embeddings ---

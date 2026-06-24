@@ -65,6 +65,9 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
 
       pairs = body["data"]
       assert body["meta"]["count"] == length(pairs)
+      # P–Q and P–U
+      assert body["meta"]["total_count"] == 2
+      assert body["meta"]["has_more"] == false
       # Exactly the two in-band pairs P–Q and P–U; nothing involving T.
       assert MapSet.new(Enum.map(pairs, &pair_ids/1)) ==
                MapSet.new([MapSet.new([p.id, q.id]), MapSet.new([p.id, u.id])])
@@ -120,7 +123,9 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
         |> json_response(200)
 
       assert length(page1["data"]) == 1
+      assert page1["meta"]["has_more"] == true
       assert length(page2["data"]) == 1
+      assert page2["meta"]["has_more"] == false
       assert pair_ids(hd(page1["data"])) != pair_ids(hd(page2["data"]))
     end
 
@@ -194,7 +199,7 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       assert_in_delta b["novelty_score"], 1.0, 1.0e-4
     end
 
-    test "no priors → maximal novelty (1.0)", %{conn: conn} do
+    test "no priors → nil novelty score (distinguishable from high score)", %{conn: conn} do
       {_tenant, key} = setup_tenant_key()
       stub_idea_embeddings(%{"anything" => [1.0, 0.0]})
 
@@ -204,7 +209,31 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
         |> post(~p"/api/v1/knowledge/novelty", %{ideas: [%{text: "anything"}]})
         |> json_response(200)
 
-      assert [%{"novelty_score" => 1.0}] = body["data"]
+      assert [%{"novelty_score" => nil}] = body["data"]
+    end
+
+    test "blank idea text skips embedding and returns nil (no API waste)", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
+
+      # Expect NO embedding calls for blank ideas (would be called for non-blank)
+      Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _ ->
+        {:ok, e([1.0, 0.0])}
+      end)
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> post(~p"/api/v1/knowledge/novelty", %{
+          ideas: [
+            %{text: ""},
+            %{title: "", spark: "", thesis: ""}
+          ]
+        })
+        |> json_response(200)
+
+      # Both ideas are blank → no embeddings called, both score nil
+      assert [%{"novelty_score" => nil}, %{"novelty_score" => nil}] = body["data"]
     end
 
     test "prior_tag selects a different prior family", %{conn: conn} do
@@ -222,8 +251,8 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
         })
         |> json_response(200)
 
-      # No `hypothesis`-tagged priors → maximal novelty despite the identical proposal.
-      assert [%{"novelty_score" => 1.0}] = body["data"]
+      # No `hypothesis`-tagged priors → nil novelty score.
+      assert [%{"novelty_score" => nil}] = body["data"]
     end
 
     test "empty / non-array ideas → 400" do
@@ -251,6 +280,24 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
         |> json_response(400)
 
       assert resp["error"]["message"] =~ "50"
+    end
+
+    test "response includes prior_count in meta", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      # Create 3 prior proposals.
+      for i <- 1..3 do
+        embedded(tenant.id, "Prior #{i}", [1.0, 0.0], %{tags: ["proposal"]})
+      end
+
+      stub_idea_embeddings(%{"idea" => [1.0, 0.0]})
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> post(~p"/api/v1/knowledge/novelty", %{ideas: [%{text: "idea"}]})
+        |> json_response(200)
+
+      assert body["meta"]["prior_count"] == 3
     end
   end
 

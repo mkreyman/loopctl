@@ -28,7 +28,8 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         "optimal-novelty band [`min_distance`, `max_distance`] (default 0.3–0.7) — the " <>
         "creative sweet spot. With `bridge_path=true`, only pairs also connected in the " <>
         "link graph (≤2 hops) are returned. Each pair: `{a, b, distance}`. Samples up to " <>
-        "1000 embedded published articles. Role: agent+.",
+        "1000 embedded published articles (lowest-id slice; operator-tunable). " <>
+        "`meta` carries `count`/`total_count`/`has_more` for pagination. Role: agent+.",
     parameters: [
       min_distance: [
         in: :query,
@@ -49,7 +50,31 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
       offset: [in: :query, type: :integer, description: "Pairs to skip"]
     ],
     responses: %{
-      200 => {"Pairs", "application/json", %OpenApiSpex.Schema{type: :object}},
+      200 =>
+        {"Pairs", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               description: "Distant pairs [a, b, distance]"
+             },
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 count: %OpenApiSpex.Schema{type: :integer, description: "Items in this page"},
+                 total_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Total matching pairs"
+                 },
+                 has_more: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description: "More pairs exist beyond this page"
+                 }
+               }
+             }
+           }
+         }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -61,7 +86,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
     with {:ok, min_d} <- parse_float(params["min_distance"], 0.3),
          {:ok, max_d} <- parse_float(params["max_distance"], 0.7),
-         {:ok, pairs} <-
+         {:ok, result} <-
            Knowledge.distant_pairs(tenant_id,
              min_distance: min_d,
              max_distance: max_d,
@@ -69,7 +94,14 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
              limit: parse_int(params["limit"]) || 20,
              offset: parse_int(params["offset"]) || 0
            ) do
-      json(conn, %{data: pairs, meta: %{count: length(pairs)}})
+      json(conn, %{
+        data: result.pairs,
+        meta: %{
+          count: length(result.pairs),
+          total_count: result.total_count,
+          has_more: result.has_more
+        }
+      })
     else
       {:error, :invalid_number} ->
         {:error, :bad_request, "min_distance/max_distance must be numbers"}
@@ -84,7 +116,8 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     summary: "Novelty score (distance to nearest prior)",
     description:
       "For each idea, returns `novelty_score` = cosine distance to its nearest prior " <>
-        "proposal (0 = identical to existing work, 1 = maximally novel). Each idea's text " <>
+        "proposal (0 = identical to existing work, higher = more novel, up to 2.0 = " <>
+        "opposite vectors; nil if idea text is blank or priors exist). Each idea's text " <>
         "is embedded on the fly. Priors default to published articles tagged `proposal` " <>
         "(override with `prior_tag`). Body: `{ideas: [{text|title/spark/thesis...}], " <>
         "prior_tag?}`. Role: agent+.",
@@ -99,7 +132,27 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
          }
        }},
     responses: %{
-      200 => {"Scored ideas", "application/json", %OpenApiSpex.Schema{type: :object}},
+      200 =>
+        {"Scored ideas", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               description:
+                 "Ideas with novelty_score (cosine distance to nearest prior, [0,2] or nil)"
+             },
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 prior_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Number of prior proposals"
+                 }
+               }
+             }
+           }
+         }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -111,8 +164,10 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
     with {:ok, ideas} <- validate_ideas(params["ideas"]) do
       opts = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
+      prior_tag = Keyword.get(opts, :prior_tag, "proposal")
       {:ok, scored} = Knowledge.novelty_scores(tenant_id, ideas, opts)
-      json(conn, %{data: scored})
+      prior_count = Knowledge.count_articles(tenant_id, status: :published, tags: [prior_tag])
+      json(conn, %{data: scored, meta: %{prior_count: prior_count}})
     end
   end
 
@@ -127,7 +182,23 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
       length: [in: :query, type: :integer, description: "Walk steps (default 4, max 25)"]
     ],
     responses: %{
-      200 => {"Walk", "application/json", %OpenApiSpex.Schema{type: :object}},
+      200 =>
+        {"Walk", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               description: "Sequence of articles in the random walk"
+             },
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 count: %OpenApiSpex.Schema{type: :integer, description: "Steps in the walk"}
+               }
+             }
+           }
+         }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
       404 => {"Article not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
