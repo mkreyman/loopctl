@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.16.0 — 2026-06-23 (bulk unpublish)
+
+### Added
+
+- **`knowledge_bulk_unpublish`** — revert published articles to draft in bulk,
+  partial-success style (the mirror of `knowledge_bulk_publish`). REQUIRES
+  `LOOPCTL_USER_KEY`. Per-id outcomes (`unpublished`/`skipped`/`not_found`/
+  `errored`), de-duplicated, auto-chunked, ≤5000/call; surfaces a warning when the
+  run is partial. Articles are not deleted (re-publish to restore; use
+  `knowledge_bulk_delete` to archive). Completes #148 M3. (#148 A6/M3)
+
 ## 2.15.0 — 2026-06-23 (AND-tag filtering + count/facets)
 
 ### Added

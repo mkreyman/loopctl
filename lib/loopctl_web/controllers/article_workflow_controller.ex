@@ -24,7 +24,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:drafts, :publish]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [role: :user] when action in [:unpublish, :archive, :bulk_publish, :bulk_delete]
+       [role: :user]
+       when action in [:unpublish, :archive, :bulk_publish, :bulk_unpublish, :bulk_delete]
 
   tags(["Knowledge Wiki"])
 
@@ -203,6 +204,50 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     }
   )
 
+  operation(:bulk_unpublish,
+    summary: "Bulk unpublish articles",
+    description:
+      "Unpublishes (published → draft) articles **partial-success** style — the " <>
+        "mirror of bulk-publish, for cleanup passes. Every currently-published id is " <>
+        "moved back to draft; each other id gets a per-id `outcome`: `unpublished`; " <>
+        "`skipped` (with `reason` `already_draft` — idempotent — or " <>
+        "`not_unpublishable_from_archived`/`not_unpublishable_from_superseded`); " <>
+        "`not_found`; or `errored` (`reason` `unpublish_failed`). **A 200 does NOT " <>
+        "mean everything unpublished** — inspect `meta.counts`. Duplicate ids " <>
+        "de-duplicated; auto-chunked server-side (each chunk its own transaction, " <>
+        "failing chunk retried row-by-row); bounded to 5000 ids (400 above). " <>
+        "`meta.count` = number actually unpublished; `meta.counts` has " <>
+        "requested/unpublished/skipped/not_found/errored; `meta.results` is the per-id " <>
+        "breakdown in request order. `data` is the body-less summaries of the affected " <>
+        "articles. Role: user+.",
+    request_body:
+      {"Bulk unpublish params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:article_ids],
+         properties: %{
+           article_ids: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string, format: :uuid}
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Bulk unpublish result (partial success; see meta.results / meta.counts)",
+         "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      400 => {"Bad request (empty article_ids)", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   # --- Actions ---
 
   @doc "POST /api/v1/articles/:id/publish"
@@ -251,6 +296,27 @@ defmodule LoopctlWeb.ArticleWorkflowController do
           counts: result.counts,
           # Per-id breakdown so a partial run is actionable (published / skipped /
           # not_found / errored), in request order.
+          results: result.results
+        }
+      })
+    end
+  end
+
+  @doc "POST /api/v1/knowledge/bulk-unpublish"
+  def bulk_unpublish(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+    article_ids = params["article_ids"] || []
+
+    with {:ok, result} <- Knowledge.bulk_unpublish(tenant_id, article_ids, audit_opts) do
+      json(conn, %{
+        # Body-less summaries: the affected set as confirmation; the actionable
+        # per-id detail is in meta.results.
+        data: Enum.map(result.unpublished, &ArticleJSON.article_summary/1),
+        meta: %{
+          # `count` = number actually unpublished (partial-success: inspect counts).
+          count: result.counts.unpublished,
+          counts: result.counts,
           results: result.results
         }
       })

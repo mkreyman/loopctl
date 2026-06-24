@@ -1696,6 +1696,121 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
+  Unpublishes (published → draft) articles, **partial-success** style.
+
+  The mirror of `bulk_publish/3` for cleanup passes: every currently-published id
+  is moved back to `:draft` (records the `article.unpublished` audit event) and
+  the rest get a per-id outcome instead of failing the whole call:
+
+  - `"unpublished"` -- it was published and is now a draft
+  - `"skipped"` -- already a draft (idempotent no-op), or archived/superseded
+    (`reason` says which)
+  - `"not_found"` -- no such article in this tenant
+  - `"errored"` -- the transition failed unexpectedly (chunk retried row-by-row)
+
+  Duplicate ids are de-duplicated, malformed ids resolve to `"not_found"`, ids are
+  processed in chunks of #{@bulk_publish_chunk_size} (each its own transaction),
+  and a request is bounded to #{@bulk_publish_max} ids. Partial-success: a
+  `{:ok, _}` does NOT imply everything unpublished — inspect `counts`.
+
+  ## Returns
+
+  - `{:ok, %{unpublished: [%Article{}], results: [map()], counts: map()}}`
+  - `{:error, :bad_request, message}` when `article_ids` is empty/nil or exceeds
+    #{@bulk_publish_max}
+  """
+  @spec bulk_unpublish(Ecto.UUID.t(), [Ecto.UUID.t()], keyword()) ::
+          {:ok, %{unpublished: [Article.t()], results: [map()], counts: map()}}
+          | {:error, :bad_request, String.t()}
+  def bulk_unpublish(_tenant_id, article_ids, _opts) when article_ids in [nil, []] do
+    {:error, :bad_request, "article_ids must not be empty"}
+  end
+
+  def bulk_unpublish(tenant_id, article_ids, opts) do
+    ids = article_ids |> List.wrap() |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    cond do
+      ids == [] ->
+        {:error, :bad_request, "article_ids must contain at least one UUID string"}
+
+      length(ids) > @bulk_publish_max ->
+        {:error, :bad_request,
+         "Maximum #{@bulk_publish_max} article ids per bulk unpublish; split into smaller calls"}
+
+      true ->
+        {:ok, do_bulk_unpublish(tenant_id, ids, opts)}
+    end
+  end
+
+  defp do_bulk_unpublish(tenant_id, article_ids, opts) do
+    existing = load_existing_by_ids(tenant_id, article_ids)
+
+    published =
+      for id <- article_ids,
+          match?(%Article{status: :published}, Map.get(existing, id)),
+          do: Map.fetch!(existing, id)
+
+    # Unpublishing keeps the embedding (the body is unchanged), so no post-commit
+    # re-embedding is needed — unlike bulk_publish.
+    {unpublished, errored_ids} =
+      transition_in_chunks(
+        tenant_id,
+        published,
+        :draft,
+        "article.unpublished",
+        opts,
+        fn _done -> :ok end
+      )
+
+    unpublished_ids = MapSet.new(unpublished, & &1.id)
+    errored_set = MapSet.new(errored_ids)
+
+    results =
+      Enum.map(article_ids, &bulk_unpublish_result(&1, existing, unpublished_ids, errored_set))
+
+    by_outcome = Enum.frequencies_by(results, & &1.outcome)
+
+    %{
+      unpublished: unpublished,
+      results: results,
+      counts: %{
+        requested: length(article_ids),
+        unpublished: Map.get(by_outcome, "unpublished", 0),
+        skipped: Map.get(by_outcome, "skipped", 0),
+        not_found: Map.get(by_outcome, "not_found", 0),
+        errored: Map.get(by_outcome, "errored", 0)
+      }
+    }
+  end
+
+  defp bulk_unpublish_result(id, existing, unpublished_ids, errored_set) do
+    cond do
+      MapSet.member?(errored_set, id) ->
+        %{id: id, outcome: "errored", reason: "unpublish_failed"}
+
+      MapSet.member?(unpublished_ids, id) ->
+        %{id: id, outcome: "unpublished", status: "draft"}
+
+      true ->
+        case Map.get(existing, id) do
+          nil ->
+            %{id: id, outcome: "not_found"}
+
+          %Article{status: :draft} ->
+            %{id: id, outcome: "skipped", reason: "already_draft", status: "draft"}
+
+          %Article{status: status} ->
+            %{
+              id: id,
+              outcome: "skipped",
+              reason: "not_unpublishable_from_#{status}",
+              status: to_string(status)
+            }
+        end
+    end
+  end
+
+  @doc """
   Lists draft articles for a tenant, ordered by inserted_at desc.
 
   Returns source_type and source_id for review queue visibility.
