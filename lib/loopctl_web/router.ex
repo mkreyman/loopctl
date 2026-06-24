@@ -304,6 +304,9 @@ defmodule LoopctlWeb.Router do
     get "/knowledge/count", KnowledgeFacetsController, :count
     get "/knowledge/facets", KnowledgeFacetsController, :facets
 
+    # Knowledge Graph (multi-hop traversal of the article-link graph)
+    get "/knowledge/graph", KnowledgeGraphController, :graph
+
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 
