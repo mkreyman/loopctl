@@ -20,6 +20,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.TagMatch
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -81,7 +82,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       tags: [
         in: :query,
         type: :string,
-        description: "Comma-separated tags to filter by",
+        description: "Comma-separated tags to filter by (match mode set by `match`)",
+        required: false
+      ],
+      match: [
+        in: :query,
+        type: :string,
+        description: "Tag match mode: any (default, OR) or all (AND — carries every listed tag)",
         required: false
       ],
       limit: [
@@ -223,12 +230,14 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp validate_mode(_), do: {:ok, "combined"}
 
   defp build_opts(params) do
-    with {:ok, category} <- validate_category(params["category"]) do
+    with {:ok, category} <- validate_category(params["category"]),
+         {:ok, match} <- TagMatch.parse(params) do
       opts =
         []
         |> maybe_add_opt(:project_id, params["project_id"])
         |> maybe_add_opt(:category, category)
         |> maybe_add_tags(params["tags"])
+        |> Keyword.put(:match, match)
         |> maybe_add_limit(params["limit"])
         |> maybe_add_offset(params["offset"])
 

@@ -698,7 +698,7 @@ defmodule Loopctl.Knowledge do
     base =
       base
       |> maybe_filter_by_category(Keyword.get(opts, :category))
-      |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+      |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
@@ -806,6 +806,92 @@ defmodule Loopctl.Knowledge do
     total = by_status |> Map.values() |> Enum.sum()
 
     %{total: total, by_category: by_category, by_status: by_status}
+  end
+
+  @doc """
+  Counts articles matching the given filters **without** returning any rows.
+
+  Accepts the same filters as `list_articles/2` (`:project_id`, `:category`,
+  `:status`, `:tags` + `:match`, `:source_type`, `:source_id`,
+  `:idempotency_key`), so a single call answers "how many *published* articles
+  tagged both X and Y" (status + `tags` + `match: :all`) without enumerating rows.
+
+  ## Returns
+
+  - `non_neg_integer()`
+  """
+  @spec count_articles(Ecto.UUID.t(), keyword()) :: non_neg_integer()
+  def count_articles(tenant_id, opts \\ []) do
+    from(a in Article, where: a.tenant_id == ^tenant_id)
+    |> apply_article_filters(opts)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  @doc """
+  Counts articles grouped by each distinct tag (a tag facet).
+
+  Unnests `tags` over the filtered article set and counts articles per tag, so
+  callers can get a **distinct-tag count** and per-tag totals without paginating
+  rows. Honors the same filters as `count_articles/2` (including `:status` and
+  `:tags`/`:match`), plus an optional `:tag_prefix` to restrict to a tag family
+  (e.g. `"book-"` to count distinct books). Ordered by descending count.
+
+  ## Parameters
+
+  - `opts` -- `list_articles/2` filters, plus:
+    - `:tag_prefix` -- only tags starting with this literal prefix (LIKE-escaped)
+    - `:limit` -- cap the number of facet rows returned (default all)
+
+  ## Returns
+
+  - `%{facets: [%{tag: String.t(), count: pos_integer()}], distinct_count: non_neg_integer()}`
+  """
+  @spec tag_facets(Ecto.UUID.t(), keyword()) :: %{
+          facets: [%{tag: String.t(), count: non_neg_integer()}],
+          distinct_count: non_neg_integer()
+        }
+  def tag_facets(tenant_id, opts \\ []) do
+    base =
+      from(a in Article, where: a.tenant_id == ^tenant_id)
+      |> apply_article_filters(opts)
+
+    unnested = from(a in subquery(base), select: %{tag: fragment("unnest(?)", a.tags)})
+
+    facet_query =
+      from(t in subquery(unnested),
+        group_by: t.tag,
+        select: %{tag: t.tag, count: count(t.tag)},
+        order_by: [desc: count(t.tag), asc: t.tag]
+      )
+
+    facet_query =
+      case Keyword.get(opts, :tag_prefix) do
+        prefix when is_binary(prefix) and prefix != "" ->
+          pattern = like_escape(prefix) <> "%"
+          where(facet_query, [t], like(t.tag, ^pattern))
+
+        _ ->
+          facet_query
+      end
+
+    facet_query =
+      case Keyword.get(opts, :limit) do
+        n when is_integer(n) and n > 0 -> limit(facet_query, ^n)
+        _ -> facet_query
+      end
+
+    facets = AdminRepo.all(facet_query)
+    %{facets: facets, distinct_count: length(facets)}
+  end
+
+  # Escapes LIKE metacharacters (\\, %, _) in a literal prefix so a caller-supplied
+  # `tag_prefix` is matched literally (no wildcard injection). Postgres LIKE uses
+  # backslash as the default escape character.
+  defp like_escape(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   # COUNT(*) GROUP BY <field>, returning a dense %{string_value => count} map
@@ -1242,7 +1328,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_status(status)
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
-    |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
   end
 
   # Fire-and-forget recording of search access for the result list.
@@ -2521,7 +2607,7 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_status(Keyword.get(opts, :status))
-    |> maybe_filter_by_tags(Keyword.get(opts, :tags))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
     |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
     |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
     |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
@@ -2545,10 +2631,16 @@ defmodule Loopctl.Knowledge do
     where(query, [a], a.status == ^status)
   end
 
-  defp maybe_filter_by_tags(query, nil), do: query
-  defp maybe_filter_by_tags(query, []), do: query
+  # `match` is `:any` (array overlap `&&`, the back-compat OR semantics) or
+  # `:all` (array contains `@>` — articles carrying EVERY listed tag).
+  defp maybe_filter_by_tags(query, nil, _match), do: query
+  defp maybe_filter_by_tags(query, [], _match), do: query
 
-  defp maybe_filter_by_tags(query, tags) when is_list(tags) do
+  defp maybe_filter_by_tags(query, tags, :all) when is_list(tags) do
+    where(query, [a], fragment("? @> ?", a.tags, ^tags))
+  end
+
+  defp maybe_filter_by_tags(query, tags, _any) when is_list(tags) do
     where(query, [a], fragment("? && ?", a.tags, ^tags))
   end
 
