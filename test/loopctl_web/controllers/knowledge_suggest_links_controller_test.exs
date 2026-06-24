@@ -38,36 +38,90 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
 
-  describe "suggestion query shape (#168 RED→GREEN structural guard)" do
-    # The production 500 couldn't be reproduced in the test DB (the column is
-    # vector(1536) and PostgrexTypes is shared across envs, so the stored-vector
-    # re-interpolation encodes fine locally). This guard instead asserts the QUERY
-    # SHAPE that caused it is gone: the target vector must NOT be a bound parameter,
-    # and the cosine must be computed between two embedding COLUMNS. Both assertions
-    # FAIL on the pre-fix query (which bound `^embedding::vector`) and PASS on the fix.
-    test "does not re-interpolate the target vector as a query parameter" do
+  describe "suggestion query shape (#168 + #172 RED→GREEN structural guard)" do
+    # Neither production 500 reproduces in the test DB: #168 (re-interpolating a stored
+    # %Pgvector{}) encodes fine locally, and #172 (a full-corpus scan + sort) only times
+    # out at prod scale (~76k published articles) — a handful of test rows never exhibit
+    # it. This guard asserts the QUERY SHAPE instead, catching BOTH regressions:
+    #
+    #   * #172: the target embedding is a BOUND list parameter and the `articles` table
+    #     appears EXACTLY ONCE — there is no self-join to read the target vector as a
+    #     column. The bound-`^param` left-vs-const form is what the HNSW index
+    #     (`articles_embedding_idx`, vector_cosine_ops) accelerates; the old self-join
+    #     forced a per-row cosine + full sort over the whole corpus.
+    #   * #168: that bound param is a plain LIST of floats, NEVER the stored `%Pgvector{}`
+    #     struct (binding the struct was the original 500).
+    #
+    # A literal 76k-row seed is infeasible in an async unit test, so this fast SQL-shape
+    # check is the first guard; the EXPLAIN test below is the stronger one — it asserts the
+    # planner can actually use the HNSW index (the real "does not full-scan" property).
+    test "binds the target as a list param (HNSW-indexable), with no full-corpus self-join" do
       {tenant, _key} = setup_tenant_key()
       target = embedded(tenant.id, "T", [1.0, 0.0])
 
-      query = Knowledge.suggestion_candidates_query(tenant.id, target.id, 0.5, 5, nil)
+      query =
+        Knowledge.suggestion_candidates_query(tenant.id, target.id, e([1.0, 0.0]), 0.5, 5, nil)
+
       {sql, params} = SQL.to_sql(:all, AdminRepo, query)
 
-      # No parameter is a vector/list — only ids, threshold, limit. The #168 bug
-      # bound the stored target vector here.
-      refute Enum.any?(params, fn p -> is_list(p) or match?(%Pgvector{}, p) end)
+      # #172: the target vector is a BOUND parameter (a list), enabling the indexable
+      # `ORDER BY embedding <=> $const LIMIT k` form.
+      assert Enum.any?(params, &is_list/1)
 
-      # The distance is computed between two `embedding` COLUMNS (the candidate's and
-      # the self-joined target's) — not a column vs a parameter.
+      # #168: that param is a plain list, NEVER the stored %Pgvector{} struct.
+      refute Enum.any?(params, &match?(%Pgvector{}, &1))
+
+      # #172: exactly one `articles` table reference — no self-join driving a
+      # full-corpus scan. (The only other table is the `article_links` exclusion join.)
       assert sql =~ "<=>"
-      assert length(Regex.scan(~r/\."embedding"/, sql)) >= 2
+      assert length(Regex.scan(~r/"articles"/, sql)) == 1
+      assert sql =~ ~r/order by .*<=>/i
+    end
+
+    # The SQL-shape check above guards the self-join specifically; this guards the broader
+    # #172 regression CLASS — "the ORDER BY can use the HNSW index" — which a shape regex
+    # can't see. Disabling seq-scan AND sort forces the planner onto the only ordered path:
+    # if `ORDER BY embedding <=> $const` is index-matchable it satisfies it via
+    # `articles_embedding_idx` with NO Sort node; an index-INELIGIBLE rewrite (a self-join
+    # column operand like #170, a wrapped/computed order expr, or a dropped index) cannot,
+    # so the plan is forced to a (disabled-cost) Sort — failing this test. Catches a
+    # reintroduced full-corpus scan that every behavioral test (which seq-scans at test
+    # scale) would miss. Deterministic at any row count — asserts index ELIGIBILITY, not the
+    # planner's cost-based choice at scale.
+    test "EXPLAIN: the suggestion query is HNSW-index-eligible (no Sort / full-corpus scan)" do
+      {tenant, _key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+      for i <- 1..5, do: embedded(tenant.id, "C#{i}", [1.0, 0.0])
+
+      query =
+        Knowledge.suggestion_candidates_query(tenant.id, target.id, e([1.0, 0.0]), 0.5, 5, nil)
+
+      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
+
+      {:ok, plan} =
+        AdminRepo.transaction(fn ->
+          # Force the planner past cost-based choices so the assertion reflects index
+          # ELIGIBILITY, not whether HNSW happens to win at 6 rows.
+          AdminRepo.query!("SET LOCAL enable_seqscan = off")
+          AdminRepo.query!("SET LOCAL enable_sort = off")
+          %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
+          Enum.map_join(rows, "\n", &Enum.join(&1, " "))
+        end)
+
+      # Uses the HNSW index for the ordering...
+      assert plan =~ "articles_embedding_idx"
+      # ...and therefore needs no Sort node (a full-corpus scan + sort would have one).
+      refute plan =~ ~r/\bSort\b/
     end
   end
 
   describe "GET /api/v1/knowledge/articles/:id/suggested_links (#150)" do
-    # #168 regression: the endpoint 500'd in production because the target's stored
-    # vector was round-tripped back in as a `^param::vector`. The query now does the
-    # cosine column-to-column via a self-join. This guards the end-to-end HTTP path
-    # (controller → query → JSON) returns 200 with the documented candidate shape.
+    # #168/#172 regression: the endpoint 500'd in production. #168 was re-interpolating
+    # the stored `%Pgvector{}` as a `^param::vector`; #172 was the self-join that read the
+    # target vector as a column, forcing a full-corpus scan. The query now binds the target
+    # as a plain list param (HNSW-indexable `ORDER BY embedding <=> $const LIMIT k`). This
+    # guards the end-to-end HTTP path (controller → query → JSON) returns 200 with the
+    # documented candidate shape.
     test "returns 200 with ranked candidate shape (no 500) — #168", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target168", [1.0, 0.0])
@@ -132,6 +186,36 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       assert target.id not in ids(body)
       assert linked.id not in ids(body)
       assert free.id in ids(body)
+    end
+
+    # Exclusion-under-limit contract: every already-linked near-neighbor is removed and
+    # none leaks through, and the result is filled from the remaining unlinked candidates
+    # rather than truncated by the anti-join. (Exact at test scale; the prod recall ceiling
+    # is documented on `suggest_links/3` — approximate-NN bounded by HNSW `ef_search`.)
+    test "excludes all already-linked near-neighbors and fills from the unlinked remainder",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0])
+      # Six equally-similar candidates; pre-link four so only two remain unlinked.
+      linked = for i <- 1..4, do: embedded(tenant.id, "Linked#{i}", [1.0])
+      free1 = embedded(tenant.id, "Free1", [1.0])
+      free2 = embedded(tenant.id, "Free2", [1.0])
+
+      for l <- linked do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: target.id,
+          target_article_id: l.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      returned = ids(suggest(conn, key, target.id, %{limit: 2}))
+
+      # Exactly the two unlinked candidates — none of the four linked ones leak through,
+      # and the result is not starved below the requested limit.
+      assert Enum.sort(returned) == Enum.sort([free1.id, free2.id])
+      for l <- linked, do: assert(l.id not in returned)
     end
 
     test "is read-only — creates no links", %{conn: conn} do

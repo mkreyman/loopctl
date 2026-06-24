@@ -2805,6 +2805,14 @@ defmodule Loopctl.Knowledge do
   `:suggestion_similarity_threshold` config or 0.5) and `:limit` (default
   #{@default_suggestion_limit}), ordered most-similar first. Tenant-scoped.
 
+  Ranking is approximate nearest-neighbor over the HNSW embedding index
+  (`articles_embedding_idx`, cosine), bounded by the index search list
+  (`hnsw.ef_search`) exactly like the semantic-search path. In the rare case
+  that an article's nearest neighbors are almost all already linked, the result
+  may contain fewer than `:limit` suggestions — by design, consistent with
+  semantic search; deeper recall is intentionally not traded for holding an
+  AdminRepo connection on this hot, pool-constrained endpoint.
+
   ## Returns
 
   - `{:ok, [%{id, title, category, similarity_score}]}` (highest similarity first)
@@ -2832,8 +2840,8 @@ defmodule Loopctl.Knowledge do
         %{embedding: nil} ->
           {:ok, []}
 
-        %{embedding: _embedding} ->
-          {:ok, suggestion_candidates(tenant_id, article_id, threshold, limit, vis)}
+        %{embedding: embedding} ->
+          {:ok, suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)}
       end
     end
   end
@@ -2857,32 +2865,45 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp suggestion_candidates(tenant_id, article_id, threshold, limit, vis) do
-    suggestion_candidates_query(tenant_id, article_id, threshold, limit, vis)
-    |> AdminRepo.all(timeout: 5_000)
+  defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
+    # Bare AdminRepo.all (NO transaction) — deliberately mirrors `search_semantic` and
+    # `distant_pairs`, which avoid holding an AdminRepo connection. The prod admin pool is
+    # only 3 (`ADMIN_POOL_SIZE`), shared by every cross-tenant read, so wrapping this hot
+    # endpoint in a per-request transaction would risk pool starvation under concurrent
+    # agent load — the exact pattern the `distant_pairs` note (below in this module) was
+    # written to avoid. The HNSW-indexable query returns in single-digit ms; the 15s
+    # timeout is a backstop, matching `nearest_prior_distance`/`distant_pairs`.
+    suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
+    |> AdminRepo.all(timeout: 15_000)
   end
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can
   # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.
   #
-  # Ranks candidates by cosine similarity to the target. The target's vector is
-  # referenced COLUMN-to-column via a self-join (`a.embedding <=> t.embedding`), NEVER
-  # round-tripped back in as a `^param`/`::vector` cast — that re-interpolation of a
-  # stored `%Pgvector{}` was the #168 production 500. This mirrors `distant_pairs`,
-  # whose column-to-column cosine works in production. The caller has already confirmed
-  # the target exists / is published / is embedded / is visible (fetch_article_embedding).
+  # Ranks candidates by cosine similarity to the target. The target embedding (already
+  # fetched by the caller, `fetch_article_embedding`) is passed as a BOUND `^param`
+  # LIST of floats — exactly the form `search_semantic` ships in production. This is the
+  # HNSW-indexable shape `ORDER BY embedding <=> $const LIMIT k`
+  # (`articles_embedding_idx`, vector_cosine_ops), so the planner does an approximate-NN
+  # index scan instead of a per-row cosine + full sort over every published article.
   #
-  # Perf tradeoff (#168): because the right operand is a COLUMN (`t.embedding`), the
-  # HNSW index (`articles_embedding_idx`, vector_cosine_ops) — which only accelerates
-  # `ORDER BY embedding <=> CONSTANT LIMIT k` — is intentionally not used; the query is
-  # a published-candidate scan + per-row cosine + sort, bounded by `status`, `limit`,
-  # and a 5s timeout. Negligible at current scale and consistent with the already-
-  # shipped `distant_pairs`; revisit if a tenant grows to tens of thousands of articles.
+  # Two regressions are deliberately avoided here:
+  #   * #168 — NEVER bind the *stored* `%Pgvector{}` struct as a param (that
+  #     re-interpolation was the original 500). We convert it to a plain list first
+  #     (`to_embedding_list/1`), the same value shape `search_semantic` binds.
+  #   * #172 — NEVER self-join `articles` to read the target vector as a *column*
+  #     (`a.embedding <=> t.embedding`). A column right-operand defeats the HNSW index
+  #     and forces a full-corpus scan + sort, which timed out at prod scale (~76k
+  #     published articles) → 500. The bound `^param` left-vs-const form is indexable.
+  #
+  # The caller has already confirmed the target exists / is published / is embedded /
+  # is visible. Bounded by `status`, `limit`, and a 15s timeout (matching the other
+  # vector paths, `nearest_prior_distance`/`distant_pairs`).
   @doc false
-  def suggestion_candidates_query(tenant_id, article_id, threshold, limit, vis) do
+  def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
+    target = to_embedding_list(embedding)
+
     from(a in Article,
-      join: t in Article,
-      on: t.id == ^article_id and t.tenant_id == ^tenant_id,
       where: a.tenant_id == ^tenant_id and a.status == :published,
       where: not is_nil(a.embedding),
       where: a.id != ^article_id,
@@ -2893,18 +2914,24 @@ defmodule Loopctl.Knowledge do
           ((l.source_article_id == ^article_id and l.target_article_id == a.id) or
              (l.target_article_id == ^article_id and l.source_article_id == a.id)),
       where: is_nil(l.id),
-      where: fragment("GREATEST(0, 1 - (? <=> ?)) > ?", a.embedding, t.embedding, ^threshold),
-      order_by: [asc: fragment("? <=> ?", a.embedding, t.embedding)],
+      where: fragment("GREATEST(0, 1 - (? <=> ?)) > ?", a.embedding, ^target, ^threshold),
+      order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
       limit: ^limit,
       select: %{
         id: a.id,
         title: a.title,
         category: a.category,
-        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, t.embedding)
+        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
       }
     )
     |> maybe_filter_by_visibility(vis)
   end
+
+  # The HNSW-indexable cosine form binds the target as a plain `[float()]` list (the
+  # same value shape `search_semantic` binds), NEVER the stored `%Pgvector{}` struct —
+  # re-interpolating that struct was the #168 production 500.
+  defp to_embedding_list(%Pgvector{} = vector), do: Pgvector.to_list(vector)
+  defp to_embedding_list(vector) when is_list(vector), do: vector
 
   @doc """
   Multi-hop traversal of the published article-link graph from a starting article.
