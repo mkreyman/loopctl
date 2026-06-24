@@ -38,6 +38,35 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
 
   describe "GET /api/v1/knowledge/articles/:id/suggested_links (#150)" do
+    # #168 regression: the endpoint 500'd in production because the target's stored
+    # vector was round-tripped back in as a `^param::vector`. The query now does the
+    # cosine column-to-column via a self-join. This guards the end-to-end HTTP path
+    # (controller → query → JSON) returns 200 with the documented candidate shape.
+    test "returns 200 with ranked candidate shape (no 500) — #168", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target168", [1.0, 0.0])
+      c1 = embedded(tenant.id, "Cand1", [1.0, 0.0])
+      c2 = embedded(tenant.id, "Cand2", [0.9, 0.1])
+
+      conn =
+        conn |> auth_conn(key) |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+
+      # The key assertion: a clean 200, never a 500.
+      body = json_response(conn, 200)
+      returned = ids(body)
+      assert c1.id in returned
+      assert c2.id in returned
+      refute target.id in returned
+
+      for cand <- body["data"] do
+        assert is_binary(cand["id"])
+        assert is_binary(cand["title"])
+        assert cand["category"]
+        assert is_number(cand["similarity_score"])
+        assert cand["similarity_score"] >= 0.5
+      end
+    end
+
     test "returns candidates ranked by similarity, highest first, excluding below-threshold",
          %{conn: conn} do
       {tenant, key} = setup_tenant_key()
