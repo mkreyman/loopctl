@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.19.0 — 2026-06-23 (agent-memory scoped context)
+
+### Added
+
+- `knowledge_context` gains agent-memory scoping filters: `memory_types`
+  (comma-separated, OR — observation/finding/summary/decision/question/task),
+  `agents` (comma-separated agent_ids, OR), and `conversation_id` (exact). These
+  filter on the article's `metadata` (JSONB containment), turning the wiki into a
+  queryable agent memory scoped to a memory type, agent, or conversation. Server
+  validates `memory_type`/`visibility`/`agent_id` conventions on write when an
+  `agent_id` is present, and adds a GIN index on `metadata`. (#151)
+
 ## 2.18.0 — 2026-06-23 (suggest typed links)
 
 ### Added

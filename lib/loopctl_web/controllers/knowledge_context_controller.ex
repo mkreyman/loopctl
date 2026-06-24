@@ -70,6 +70,27 @@ defmodule LoopctlWeb.KnowledgeContextController do
             "Only effective for user/superadmin roles. " <>
             "Agent/orchestrator roles are forced to published.",
         required: false
+      ],
+      memory_types: [
+        in: :query,
+        type: :string,
+        description:
+          "Agent-memory scope: comma-separated memory_types (OR) — " <>
+            "observation|finding|summary|decision|question|task. Filters via metadata @>.",
+        required: false
+      ],
+      agents: [
+        in: :query,
+        type: :string,
+        description:
+          "Agent-memory scope: comma-separated agent_ids (OR). Filters via metadata @>.",
+        required: false
+      ],
+      conversation_id: [
+        in: :query,
+        type: :string,
+        description: "Agent-memory scope: exact conversation_id. Filters via metadata @>.",
+        required: false
       ]
     ],
     responses: %{
@@ -142,6 +163,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
       |> maybe_add_project_id(params["project_id"])
       |> maybe_add_limit(params["limit"])
       |> maybe_add_recency_weight(params["recency_weight"])
+      |> maybe_add_csv(:memory_types, params["memory_types"])
+      |> maybe_add_csv(:agents, params["agents"])
+      |> maybe_add_conversation_id(params["conversation_id"])
 
     # Agent role forced to published; user role can override via ?status= param
     role_atom = if is_binary(role), do: String.to_existing_atom(role), else: role
@@ -198,4 +222,26 @@ defmodule LoopctlWeb.KnowledgeContextController do
   end
 
   defp maybe_add_recency_weight(opts, _), do: opts
+
+  # Comma-separated value → list (OR semantics in the query). Absent/blank → no opt.
+  defp maybe_add_csv(opts, _key, value) when value in [nil, ""], do: opts
+
+  defp maybe_add_csv(opts, key, value) when is_binary(value) do
+    case value
+         |> String.split(",", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == "")) do
+      [] -> opts
+      list -> [{key, list} | opts]
+    end
+  end
+
+  defp maybe_add_csv(opts, _key, _), do: opts
+
+  defp maybe_add_conversation_id(opts, value) when value in [nil, ""], do: opts
+
+  defp maybe_add_conversation_id(opts, value) when is_binary(value),
+    do: [{:conversation_id, value} | opts]
+
+  defp maybe_add_conversation_id(opts, _), do: opts
 end
