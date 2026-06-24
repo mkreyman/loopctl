@@ -26,6 +26,32 @@ defmodule LoopctlWeb.ErrorJSON do
     %{error: %{status: 500, message: "Internal server error"}}
   end
 
+  # US-27.3: raised DB exceptions that escape an action are mapped to these
+  # statuses by LoopctlWeb.Plugs.DBErrorHandler (Plug.Exception). The body
+  # stays safe and generic — no SQL/params/vectors/stack trace — and carries a
+  # `code` so a timeout is self-identifying vs. a logic 500. The deterministic
+  # SQLSTATE log happens on the rescue→FallbackController path; here we only
+  # ensure the escaped-error body is safe and labelled.
+  def render("504.json", _assigns) do
+    %{
+      error: %{
+        status: 504,
+        code: "db_statement_timeout",
+        message: "The request timed out while querying the database. Please retry."
+      }
+    }
+  end
+
+  def render("503.json", _assigns) do
+    %{
+      error: %{
+        status: 503,
+        code: "db_unavailable",
+        message: "The database is temporarily unavailable. Please retry."
+      }
+    }
+  end
+
   # Catch-all for any other status code templates
   def render(template, _assigns) do
     status =

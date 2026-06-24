@@ -193,4 +193,167 @@ defmodule LoopctlWeb.FallbackControllerTest do
       assert Plug.Exception.status(exception) == 404
     end
   end
+
+  # --- US-27.3: structured DB-error surfacing (map SQLSTATE → safe, logged) ---
+
+  # Build a Postgrex.Error the way Postgrex does, so .postgres has both the
+  # atom code and the numeric pg_code string. `query:` is set to a value that
+  # WOULD leak (raw SQL + a vector literal) if anything ever called
+  # Exception.message/1 — the no-leak assertions below prove we don't.
+  defp pg_error(code, pg_code) do
+    %Postgrex.Error{
+      postgres: %{
+        code: code,
+        pg_code: pg_code,
+        severity: "ERROR",
+        message: "canceling statement due to statement timeout"
+      },
+      query:
+        "SELECT id FROM articles ORDER BY embedding <=> '[0.123,0.456,0.789]'::vector LIMIT 5"
+    }
+  end
+
+  describe "Postgrex.Error SQLSTATE mapping (AC-27.3.1 / .2 / .4)" do
+    test "57014 query_canceled -> 504 db_statement_timeout", %{conn: conn} do
+      conn = call_fallback(conn, {:error, pg_error(:query_canceled, "57014")})
+
+      assert conn.status == 504
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 504
+      assert body["error"]["code"] == "db_statement_timeout"
+      assert is_binary(body["error"]["message"])
+      # No Retry-After on a timeout (504).
+      assert Plug.Conn.get_resp_header(conn, "retry-after") == []
+    end
+
+    test "40001 serialization_failure -> 503 with Retry-After", %{conn: conn} do
+      conn = call_fallback(conn, {:error, pg_error(:serialization_failure, "40001")})
+
+      assert conn.status == 503
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 503
+      assert body["error"]["code"] == "db_serialization_failure"
+      assert Plug.Conn.get_resp_header(conn, "retry-after") != []
+    end
+
+    test "40P01 deadlock_detected -> 503 with Retry-After", %{conn: conn} do
+      conn = call_fallback(conn, {:error, pg_error(:deadlock_detected, "40P01")})
+
+      assert conn.status == 503
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 503
+      assert body["error"]["code"] == "db_deadlock"
+      assert Plug.Conn.get_resp_header(conn, "retry-after") != []
+    end
+
+    test "any other Postgrex.Error -> 500 db_error (generic)", %{conn: conn} do
+      conn = call_fallback(conn, {:error, pg_error(:undefined_table, "42P01")})
+
+      assert conn.status == 500
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 500
+      assert body["error"]["code"] == "db_error"
+    end
+
+    test "DBConnection.ConnectionError -> 503 db_unavailable with Retry-After", %{conn: conn} do
+      conn = call_fallback(conn, {:error, %DBConnection.ConnectionError{message: "tcp closed"}})
+
+      assert conn.status == 503
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 503
+      assert body["error"]["code"] == "db_unavailable"
+      assert Plug.Conn.get_resp_header(conn, "retry-after") != []
+    end
+  end
+
+  describe "DB-error body never leaks SQL/params/vectors/stack (AC-27.3.2 / .8)" do
+    test "client body contains only status/code/message — no SQL, vector, or stack", %{
+      conn: conn
+    } do
+      conn = call_fallback(conn, {:error, pg_error(:query_canceled, "57014")})
+
+      body = Jason.decode!(conn.resp_body)
+
+      # Exactly the safe envelope.
+      assert Map.keys(body) == ["error"]
+      assert Enum.sort(Map.keys(body["error"])) == ["code", "message", "status"]
+
+      raw = conn.resp_body
+      # No raw SQL fragment, no vector literal, no stack-trace markers.
+      refute raw =~ "SELECT"
+      refute raw =~ "embedding <=>"
+      refute raw =~ "::vector"
+      refute raw =~ "0.123"
+      refute raw =~ "stacktrace"
+      refute raw =~ ".ex:"
+    end
+  end
+
+  describe "structured DB-error log (AC-27.3.3 / .8)" do
+    import ExUnit.CaptureLog
+
+    test "logs sqlstate + mapped_code at error level, no SQL/vector leak", %{conn: conn} do
+      log =
+        capture_log(fn ->
+          call_fallback(conn, {:error, pg_error(:query_canceled, "57014")})
+        end)
+
+      assert log =~ "sqlstate=57014"
+      assert log =~ "mapped_code=db_statement_timeout"
+      # The raw SQL / vector literal must NOT appear in the log.
+      refute log =~ "embedding <=>"
+      refute log =~ "0.123"
+      refute log =~ "::vector"
+    end
+  end
+
+  describe "Plug.Exception safety net for raised DB errors (AC-27.3.1)" do
+    test "Postgrex.Error 57014 maps to 504 via Plug.Exception" do
+      assert Plug.Exception.status(pg_error(:query_canceled, "57014")) == 504
+    end
+
+    test "Postgrex.Error 40001 maps to 503 via Plug.Exception" do
+      assert Plug.Exception.status(pg_error(:serialization_failure, "40001")) == 503
+    end
+
+    test "unmapped Postgrex.Error maps to 500 via Plug.Exception" do
+      assert Plug.Exception.status(pg_error(:undefined_table, "42P01")) == 500
+    end
+
+    test "DBConnection.ConnectionError maps to 503 via Plug.Exception" do
+      assert Plug.Exception.status(%DBConnection.ConnectionError{message: "closed"}) == 503
+    end
+
+    test "ErrorJSON renders safe, labelled 504/503 bodies" do
+      assert %{error: %{status: 504, code: "db_statement_timeout", message: msg}} =
+               LoopctlWeb.ErrorJSON.render("504.json", %{})
+
+      assert is_binary(msg)
+      refute msg =~ "SELECT"
+
+      assert %{error: %{status: 503, code: "db_unavailable"}} =
+               LoopctlWeb.ErrorJSON.render("503.json", %{})
+    end
+  end
+
+  describe "DBError unit mapping" do
+    alias LoopctlWeb.DBError
+
+    test "db_error?/1 recognizes the two DB structs only" do
+      assert DBError.db_error?(pg_error(:query_canceled, "57014"))
+      assert DBError.db_error?(%DBConnection.ConnectionError{message: "x"})
+      refute DBError.db_error?(%RuntimeError{message: "x"})
+      refute DBError.db_error?(:not_found)
+    end
+
+    test "map/1 returns :unmapped for non-DB errors" do
+      assert DBError.map(%RuntimeError{message: "boom"}) == :unmapped
+      assert DBError.map(:not_found) == :unmapped
+    end
+
+    test "sqlstate/1 surfaces the numeric pg_code, never nil for Postgrex" do
+      assert DBError.sqlstate(pg_error(:query_canceled, "57014")) == "57014"
+      assert DBError.sqlstate(%DBConnection.ConnectionError{message: "x"}) == nil
+    end
+  end
 end

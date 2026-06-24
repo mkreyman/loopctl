@@ -32,9 +32,25 @@ config :loopctl, LoopctlWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
-# Use simple formatter in test (override JSON default from config.exs)
+# Use simple formatter in test (override JSON default from config.exs).
+# The template prints only level + message (custom metadata is asserted via the
+# message string in tests), but declare `metadata: :all` so Credo's
+# MissedMetadataKeyInLoggerConfig check knows arbitrary structured keys
+# (sqlstate, mapped_code, … — US-27.3) are permitted in this env.
 config :logger, :default_handler,
   formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
+
+config :logger, :default_formatter,
+  metadata: [
+    :request_id,
+    :tenant_id,
+    :remote_ip,
+    :sqlstate,
+    :mapped_code,
+    :controller,
+    :action,
+    :pg_message
+  ]
 
 # Oban: inline testing mode (jobs execute synchronously in tests)
 config :loopctl, Oban, testing: :inline
@@ -109,6 +125,12 @@ config :loopctl, :webauthn,
 
 # DI: Use mock secrets adapter in tests
 config :loopctl, :secrets_adapter, Loopctl.MockSecrets
+
+# DI (US-27.3): suggested-links executor. The default stub in
+# DataCase.stub_all_defaults/0 delegates to the real Loopctl.Knowledge, so
+# existing tests exercise the genuine query; the DB-error-surfacing test
+# overrides it with Mox.expect/3 to inject a deterministic Postgrex.Error.
+config :loopctl, :knowledge_suggest_links, Loopctl.MockSuggestLinks
 
 # Witness header enforcement disabled in tests — dedicated tests verify
 # the plug directly. Other tests don't send the header on secondary conns.

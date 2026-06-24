@@ -21,11 +21,16 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
+  - `{:error, %Postgrex.Error{}}` -> 504/503/500 by SQLSTATE class (US-27.3)
+  - `{:error, %DBConnection.ConnectionError{}}` -> 503 with Retry-After (US-27.3)
   """
 
   use LoopctlWeb, :controller
 
+  require Logger
+
   alias Ecto.Changeset
+  alias LoopctlWeb.DBError
 
   def call(conn, {:error, :not_found}) do
     conn
@@ -253,6 +258,14 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-27.3: map a recognized DB exception (returned as a tuple by a controller
+  # that rescued it) to a pinned status + safe body + structured error log
+  # carrying the real SQLSTATE. NEVER leaks SQL/params/vectors/stack traces.
+  def call(conn, {:error, %Postgrex.Error{} = error}), do: render_db_error(conn, error)
+
+  def call(conn, {:error, %DBConnection.ConnectionError{} = error}),
+    do: render_db_error(conn, error)
+
   def call(conn, {:error, %Changeset{} = changeset}) do
     details = format_changeset_errors(changeset)
 
@@ -278,6 +291,99 @@ defmodule LoopctlWeb.FallbackController do
     |> put_status(:unprocessable_entity)
     |> json(%{error: %{status: 422, message: message}})
   end
+
+  # US-27.3: shared DB-error rendering for both Postgrex.Error and
+  # DBConnection.ConnectionError. `DBError.map/1` returns the pinned status,
+  # safe client message, and the real SQLSTATE for the log. A non-DB error
+  # never reaches here (the call/2 clauses only match the two DB structs).
+  defp render_db_error(conn, error) do
+    case DBError.map(error) do
+      {:ok, mapping} ->
+        log_db_error(conn, error, mapping)
+
+        conn
+        |> maybe_put_retry_after(mapping.retry_after)
+        |> put_status(mapping.status)
+        |> json(%{
+          error: %{status: mapping.status, code: mapping.code, message: mapping.message}
+        })
+
+      :unmapped ->
+        # Should be unreachable: call/2 only dispatches here for the two DB
+        # structs DBError knows. Re-raise rather than silently swallow.
+        raise error
+    end
+  end
+
+  defp maybe_put_retry_after(conn, nil), do: conn
+
+  defp maybe_put_retry_after(conn, seconds) when is_integer(seconds) do
+    put_resp_header(conn, "retry-after", Integer.to_string(seconds))
+  end
+
+  # Structured error log with: sqlstate, mapped_code, controller, action,
+  # tenant_id, request_id (AC-27.3.3). Sanitized: no raw SQL, no bound params,
+  # no vector literals, no article bodies, no stack trace (AC-27.3.8). We log
+  # only the bare PG message (`postgres.message`), never `Exception.message/1`
+  # (which interpolates `e.query`).
+  #
+  # The diagnostic fields are embedded in the MESSAGE STRING (key=value) as well
+  # as passed as Logger metadata: the prod JSON formatter
+  # (LoggerJSON.Formatters.Basic) emits the metadata, while the message keeps the
+  # fields visible regardless of which formatter/metadata set a given env
+  # configures — so the suggested_links 57014 is self-identifying everywhere.
+  defp log_db_error(conn, error, mapping) do
+    sqlstate = mapping.sqlstate || "unknown"
+    controller = phoenix_private(conn, :phoenix_controller)
+    action = phoenix_private(conn, :phoenix_action)
+    tenant_id = db_error_tenant_id(conn)
+    request_id = db_error_request_id(conn)
+
+    message =
+      "db_error mapped to HTTP #{mapping.status} " <>
+        "sqlstate=#{sqlstate} mapped_code=#{mapping.mapped_code} " <>
+        "controller=#{controller} action=#{action} " <>
+        "tenant_id=#{tenant_id} request_id=#{request_id}"
+
+    Logger.error(message,
+      sqlstate: sqlstate,
+      mapped_code: mapping.mapped_code,
+      controller: controller,
+      action: action,
+      tenant_id: tenant_id,
+      request_id: request_id,
+      pg_message: safe_pg_message(error)
+    )
+  end
+
+  defp phoenix_private(conn, key) do
+    case conn.private do
+      %{^key => value} -> inspect(value)
+      _ -> nil
+    end
+  end
+
+  defp db_error_tenant_id(conn) do
+    case conn.assigns do
+      %{current_api_key: %{tenant_id: tid}} -> tid
+      _ -> nil
+    end
+  end
+
+  defp db_error_request_id(conn) do
+    conn |> get_resp_header("x-request-id") |> List.first() ||
+      Logger.metadata()[:request_id]
+  end
+
+  # The bare PostgreSQL message (`postgres.message`) does NOT include bound
+  # values or the query text, unlike `Exception.message/1`. For connection
+  # errors there is no `.postgres` map; we omit the message entirely rather than
+  # risk leaking anything. Defensive truncation as a belt-and-suspenders guard.
+  defp safe_pg_message(%Postgrex.Error{postgres: %{message: msg}}) when is_binary(msg) do
+    String.slice(msg, 0, 200)
+  end
+
+  defp safe_pg_message(_), do: nil
 
   defp format_changeset_errors(changeset) do
     Changeset.traverse_errors(changeset, fn {msg, opts} ->

@@ -75,6 +75,22 @@ config :loopctl, :webauthn,
 config :logger, :default_handler,
   formatter: {:logger_formatter, %{template: [:level, ": ", :message, "\n"]}}
 
+# Declare the structured metadata keys the app emits (US-27.3 DB-error fields,
+# request/tenant context). The dev handler above prints only level + message,
+# but this `:default_formatter` declaration is what Credo's
+# MissedMetadataKeyInLoggerConfig check reads to know these keys are intended.
+config :logger, :default_formatter,
+  metadata: [
+    :request_id,
+    :tenant_id,
+    :remote_ip,
+    :sqlstate,
+    :mapped_code,
+    :controller,
+    :action,
+    :pg_message
+  ]
+
 # Set a higher stacktrace during development. Avoid configuring such
 # in production as building large stacktraces may be expensive.
 config :phoenix, :stacktrace_depth, 20
