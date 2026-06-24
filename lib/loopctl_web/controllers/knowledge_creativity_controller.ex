@@ -29,7 +29,9 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         "creative sweet spot. With `bridge_path=true`, only pairs also connected in the " <>
         "link graph (≤2 hops) are returned. Each pair: `{a, b, distance}`. Samples up to " <>
         "1000 embedded published articles (lowest-id slice; operator-tunable). " <>
-        "`meta` carries `count`/`total_count`/`has_more` for pagination. Role: agent+.",
+        "`meta` carries `count`/`total_count`/`has_more` for pagination — `total_count` is " <>
+        "over the sampled slice, so it can undercount on tenants with >1000 embedded " <>
+        "articles. Role: agent+.",
     parameters: [
       min_distance: [
         in: :query,
@@ -117,10 +119,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
     description:
       "For each idea, returns `novelty_score` = cosine distance to its nearest prior " <>
         "proposal (0 = identical to existing work, higher = more novel, up to 2.0 = " <>
-        "opposite vectors; nil if idea text is blank or priors exist). Each idea's text " <>
-        "is embedded on the fly. Priors default to published articles tagged `proposal` " <>
-        "(override with `prior_tag`). Body: `{ideas: [{text|title/spark/thesis...}], " <>
-        "prior_tag?}`. Role: agent+.",
+        "opposite vectors; `null` when the idea text is blank, no priors exist, or " <>
+        "embedding fails). Each idea's text is embedded on the fly. Priors default to " <>
+        "published articles tagged `proposal` (override with `prior_tag`). `meta.prior_count` " <>
+        "is the number of embedded priors actually compared against (0 ⇒ every score is " <>
+        "null). Body: `{ideas: [{text|title/spark/thesis...}], prior_tag?}`. Role: agent+.",
     request_body:
       {"Ideas to score", "application/json",
        %OpenApiSpex.Schema{
@@ -147,7 +150,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
                properties: %{
                  prior_count: %OpenApiSpex.Schema{
                    type: :integer,
-                   description: "Number of prior proposals"
+                   description: "Number of embedded priors compared against (0 ⇒ all scores null)"
                  }
                }
              }
@@ -164,9 +167,7 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
 
     with {:ok, ideas} <- validate_ideas(params["ideas"]) do
       opts = if is_binary(params["prior_tag"]), do: [prior_tag: params["prior_tag"]], else: []
-      prior_tag = Keyword.get(opts, :prior_tag, "proposal")
-      {:ok, scored} = Knowledge.novelty_scores(tenant_id, ideas, opts)
-      prior_count = Knowledge.count_articles(tenant_id, status: :published, tags: [prior_tag])
+      {:ok, scored, prior_count} = Knowledge.novelty_scores(tenant_id, ideas, opts)
       json(conn, %{data: scored, meta: %{prior_count: prior_count}})
     end
   end

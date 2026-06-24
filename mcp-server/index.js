@@ -2289,8 +2289,9 @@ const TOOLS = [
     description:
       "Score the NOVELTY of ideas: each idea's text is embedded and compared to the nearest " +
       "prior proposal, returning novelty_score = cosine distance (0 = identical to existing " +
-      "work, higher = more novel, up to 2.0; null when the idea text is blank or no priors " +
-      "exist). Priors default to published articles tagged 'proposal' (override with prior_tag). " +
+      "work, higher = more novel, up to 2.0; null when the idea text is blank, no priors " +
+      "exist, or embedding fails). Priors default to published articles tagged 'proposal' " +
+      "(override with prior_tag). " +
       "Returns { data: [{...idea, novelty_score}], meta: { prior_count } }. Use to rerank " +
       "generated ideas by novelty × value and avoid repeating prior work.",
     inputSchema: {

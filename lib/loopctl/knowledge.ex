@@ -3097,6 +3097,9 @@ defmodule Loopctl.Knowledge do
 
   # Bridge filter: keep only pairs connected within ≤2 hops in the link graph —
   # directly linked, or sharing a common neighbor (the #149 "bridgeable" notion).
+  # The shared neighbor must be a distinct *published* article, consistent with
+  # random_walk's published-only neighbors — a pair doesn't bridge through an
+  # archived/draft middle. All node/link references are tenant-scoped.
   defp maybe_filter_bridge_path(query, false), do: query
 
   defp maybe_filter_bridge_path(query, true) do
@@ -3112,13 +3115,15 @@ defmodule Loopctl.Knowledge do
         a.id
       ) or
         fragment(
-          "EXISTS (SELECT 1 FROM article_links la JOIN article_links lb ON la.tenant_id = lb.tenant_id AND (CASE WHEN la.source_article_id = ? THEN la.target_article_id ELSE la.source_article_id END) = (CASE WHEN lb.source_article_id = ? THEN lb.target_article_id ELSE lb.source_article_id END) WHERE la.tenant_id = ? AND (la.source_article_id = ? OR la.target_article_id = ?) AND (lb.source_article_id = ? OR lb.target_article_id = ?))",
-          a.id,
-          b.id,
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND m.id <> ? AND m.id <> ?)",
           a.tenant_id,
           a.id,
           a.id,
+          a.tenant_id,
           b.id,
+          b.id,
+          a.tenant_id,
+          a.id,
           b.id
         )
     )
@@ -3214,37 +3219,52 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, [idea_with_novelty_score]}` — each idea gets `:novelty_score` (float in
-    `[0, 2]`, or `nil` when its text is blank, couldn't be embedded, or there are no
-    priors to compare against)
+  - `{:ok, [idea_with_novelty_score], prior_count}` — each idea gets `:novelty_score`
+    (float in `[0, 2]`, or `nil` when its text is blank, couldn't be embedded, or there
+    are no comparable priors). `prior_count` is the number of **embedded** prior
+    proposals actually available for comparison (when it is `0`, every score is `nil`
+    and no embedding work is done).
   """
-  @spec novelty_scores(Ecto.UUID.t(), [map()], keyword()) :: {:ok, [map()]}
+  @spec novelty_scores(Ecto.UUID.t(), [map()], keyword()) :: {:ok, [map()], non_neg_integer()}
   def novelty_scores(tenant_id, ideas, opts \\ []) when is_list(ideas) do
     prior_tag = Keyword.get(opts, :prior_tag, "proposal")
+    prior_count = count_embedded_priors(tenant_id, prior_tag)
 
     scored =
-      ideas
-      |> Enum.with_index()
-      |> Task.async_stream(fn {idea, _idx} -> score_idea(tenant_id, idea, prior_tag) end,
-        max_concurrency: @novelty_concurrency,
-        timeout: :infinity,
-        ordered: true
-      )
-      |> Enum.zip(ideas)
-      |> Enum.map(fn
-        {{:ok, scored_idea}, _original_idea} ->
-          scored_idea
+      if prior_count == 0 do
+        # No comparable (embedded) priors — skip embedding entirely; nothing to score
+        # against, so no upstream calls are made and every idea scores nil.
+        Enum.map(ideas, &Map.put(&1, :novelty_score, nil))
+      else
+        ideas
+        |> Task.async_stream(&score_idea(tenant_id, &1, prior_tag),
+          max_concurrency: @novelty_concurrency,
+          timeout: :infinity,
+          ordered: true
+        )
+        |> Enum.zip(ideas)
+        |> Enum.map(fn
+          {{:ok, scored_idea}, _original_idea} ->
+            scored_idea
 
-        {{:exit, reason}, original_idea} ->
-          Logger.warning("novelty_scores: idea scoring task exited: #{inspect(reason)}")
-          Map.put(original_idea, :novelty_score, nil)
+          {{:exit, reason}, original_idea} ->
+            Logger.warning("novelty_scores: idea scoring task exited: #{inspect(reason)}")
+            Map.put(original_idea, :novelty_score, nil)
+        end)
+      end
 
-        {{other, _}, original_idea} ->
-          Logger.warning("novelty_scores: unexpected task result: #{inspect(other)}")
-          Map.put(original_idea, :novelty_score, nil)
-      end)
+    {:ok, scored, prior_count}
+  end
 
-    {:ok, scored}
+  # Count of embedded prior proposals — the set actually compared against (matches
+  # nearest_prior_distance's filter), so it's a truthful disambiguator for nil scores.
+  defp count_embedded_priors(tenant_id, prior_tag) do
+    from(a in Article,
+      where:
+        a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
+          fragment("? && ?", a.tags, ^[prior_tag])
+    )
+    |> AdminRepo.aggregate(:count, timeout: 15_000)
   end
 
   defp score_idea(tenant_id, idea, prior_tag) do
@@ -3297,7 +3317,7 @@ defmodule Loopctl.Knowledge do
           fragment("? && ?", a.tags, ^[prior_tag]),
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
     )
-    |> AdminRepo.one()
+    |> AdminRepo.one(timeout: 15_000)
   end
 
   # --- Embeddings ---

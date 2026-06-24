@@ -109,6 +109,61 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       assert Enum.map(body["data"], &pair_ids/1) == [MapSet.new([p.id, q.id])]
     end
 
+    test "bridge_path=true matches a 2-hop shared-neighbor path", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      p = embedded(tenant.id, "P", [1.0, 0.0])
+      q = embedded(tenant.id, "Q", [0.5, 0.866])
+      # M is orthogonal-ish to both, so it forms no in-band pair of its own; P–Q are
+      # NOT directly linked but share M as a published neighbor (P→M→Q).
+      m = embedded(tenant.id, "Middle", [0.0, 1.0])
+      link(tenant.id, p, m)
+      link(tenant.id, m, q)
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/pairs?bridge_path=true")
+        |> json_response(200)
+
+      assert Enum.map(body["data"], &pair_ids/1) == [MapSet.new([p.id, q.id])]
+    end
+
+    test "bridge_path=true ignores a draft/archived shared neighbor", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      p = embedded(tenant.id, "P", [1.0, 0.0])
+      q = embedded(tenant.id, "Q", [0.5, 0.866])
+      # Same 2-hop topology, but the only shared neighbor is a draft → not a valid
+      # bridge (consistent with random_walk's published-only neighbors).
+      m = embedded(tenant.id, "Middle", [0.0, 1.0], %{status: :draft})
+      link(tenant.id, p, m)
+      link(tenant.id, m, q)
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/pairs?bridge_path=true")
+        |> json_response(200)
+
+      assert body["data"] == []
+    end
+
+    test "samples at most the configured candidate cap (truncates large corpora)",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      # Test cap is 25 (config/test.exs). 26 identical-embedding articles → every pair
+      # is at distance 0; the band [0, 0.1] admits them all. total_count is C(25,2)=300
+      # if the cap truncated 26→25 candidates (vs C(26,2)=325 uncapped).
+      for i <- 1..26, do: embedded(tenant.id, "Dup #{i}", [1.0, 0.0])
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/pairs?min_distance=0&max_distance=0.1&limit=1")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 300
+    end
+
     test "paginates deterministically with limit/offset", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       band_fixture(tenant.id)
@@ -234,6 +289,23 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
 
       # Both ideas are blank → no embeddings called, both score nil
       assert [%{"novelty_score" => nil}, %{"novelty_score" => nil}] = body["data"]
+    end
+
+    test "embedding failure yields nil score, distinct from a no-priors null", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
+      # Embedding service errors → that idea scores nil, but prior_count > 0 lets a
+      # client tell "embed failed" apart from "no priors to compare against".
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _ -> {:error, :boom} end)
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> post(~p"/api/v1/knowledge/novelty", %{ideas: [%{text: "x"}]})
+        |> json_response(200)
+
+      assert [%{"novelty_score" => nil}] = body["data"]
+      assert body["meta"]["prior_count"] == 1
     end
 
     test "prior_tag selects a different prior family", %{conn: conn} do
