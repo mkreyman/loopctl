@@ -113,8 +113,11 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
           Enum.map_join(rows, "\n", &Enum.join(&1, " "))
         end)
 
-      # The corpus is read through the HNSW index...
-      assert plan =~ "articles_embedding_idx"
+      # The corpus is read through the HNSW index as an INDEX SCAN for the ordering
+      # (not merely the index name appearing somewhere). Tolerates the index-name drift
+      # between envs (`articles_embedding_idx` in test, `articles_embedding_hnsw_idx` in
+      # prod) — both are the HNSW cosine index.
+      assert plan =~ ~r/Index Scan using articles_embedding(_hnsw)?_idx/
       # ...never a full-corpus Seq Scan (the #170/#172 production 500).
       refute plan =~ ~r/Seq Scan on articles\b/i
     end

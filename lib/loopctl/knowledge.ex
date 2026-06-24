@@ -2805,13 +2805,18 @@ defmodule Loopctl.Knowledge do
   `:suggestion_similarity_threshold` config or 0.5) and `:limit` (default
   #{@default_suggestion_limit}), ordered most-similar first. Tenant-scoped.
 
-  Ranking is approximate nearest-neighbor over the HNSW embedding index
-  (`articles_embedding_idx`, cosine), bounded by the index search list
-  (`hnsw.ef_search`) exactly like the semantic-search path. In the rare case
-  that an article's nearest neighbors are almost all already linked, the result
-  may contain fewer than `:limit` suggestions — by design, consistent with
-  semantic search; deeper recall is intentionally not traded for holding an
-  AdminRepo connection on this hot, pool-constrained endpoint.
+  Ranking is approximate nearest-neighbor over the HNSW embedding index, like the
+  semantic-search path. Mechanically: the query pulls the nearest *candidate pool*
+  (≈ `limit × 5`, min 100) via the index, then excludes the article's already-linked
+  neighbors and any below-`threshold` and returns the top `:limit`. The
+  already-linked exclusion is applied to that pool — NOT the whole corpus — because
+  pushing the exclusion (or the distance floor) into the index scan defeats the HNSW
+  index and forces a full-corpus Seq Scan (the #170/#172 prod 500; EXPLAIN-verified).
+  Consequence: for a densely-linked "hub" whose nearest neighbors are almost all
+  already linked, the result may contain fewer than `:limit` suggestions (or be
+  empty) even though more-distant unlinked candidates exist — by design, the price of
+  the indexed path. Recall is additionally bounded by `hnsw.ef_search`, as in
+  semantic search.
 
   ## Returns
 
@@ -2946,6 +2951,9 @@ defmodule Loopctl.Knowledge do
   defp suggestion_candidate_pool(limit) do
     max(limit * 5, 100)
     |> min(Application.get_env(:loopctl, :max_suggestion_candidate_pool, 500))
+    # Never let a misconfigured cap drop the pool below `limit` — that would truncate the
+    # candidate set before the outer exclusions even run.
+    |> max(limit)
   end
 
   # The HNSW-indexable cosine form binds the target as a plain `[float()]` list (the
