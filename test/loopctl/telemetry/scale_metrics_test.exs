@@ -17,8 +17,14 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   child in `:test` (no `:9568` bind) while `metrics/0` still returns the scale defs.
 
   Pure metric-definition / `tag_values` inspection — no DB, no running server.
+
+  `async: false` (R2 review): the cap-gate tests MUTATE the process-global
+  `:persistent_term` gate (`{ScaleMetrics, :tenant_label?}`), which is shared across the
+  whole VM. Running concurrently with another async test that reads the gate (e.g. via
+  `scale_tags/1`) could make that test observe the flipped value mid-run. Matching the
+  project's existing async:false precedent for shared-global-state tests.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Loopctl.Telemetry.ScaleMetrics
 
@@ -222,6 +228,21 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       # Nothing is listening on the metrics port in test.
       assert {:error, :econnrefused} =
                :gen_tcp.connect(~c"127.0.0.1", 9568, [:binary, active: false], 200)
+    end
+
+    test "ScaleAlerts is NOT auto-started in :test (no background timers / ETS table)" do
+      refute Application.get_env(:loopctl, :scale_alerts_enabled, false),
+             "scale_alerts_enabled must stay false in :test so the suite never auto-runs " <>
+               "ScaleAlerts timers or owns its ETS table"
+
+      children = Supervisor.which_children(LoopctlWeb.Telemetry)
+      child_ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+      refute Enum.any?(child_ids, &(&1 == Loopctl.Telemetry.ScaleAlerts)),
+             "ScaleAlerts must not be supervised in :test (tests start it directly)"
+
+      # The default ScaleAlerts ETS table is not owned by anyone in :test.
+      assert :ets.info(:loopctl_scale_alerts) == :undefined
     end
   end
 end

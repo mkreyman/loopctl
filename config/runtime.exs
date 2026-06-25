@@ -128,6 +128,32 @@ if config_env() == :prod do
          :metrics_tenant_label_cap,
          String.to_integer(System.get_env("METRICS_TENANT_LABEL_CAP") || "1000")
 
+  # US-27.15 (AC-27.15.2): the FIRING alert path. ScaleAlerts is cheap (it only POSTs
+  # when a webhook URL is set AND a threshold breaches), so start it in prod always; it
+  # is opt-in until SCALE_ALERT_WEBHOOK_URL is configured (no URL → breaches are logged,
+  # nothing is POSTed). Point SCALE_ALERT_WEBHOOK_URL at a Slack/PagerDuty/generic
+  # incoming webhook. Thresholds default to the documented values and are tunable per
+  # environment via env vars (per-minute rates / ms). The alert payload is id-only — no
+  # tenant content / vectors / SQL.
+  config :loopctl, :scale_alerts_enabled, true
+  config :loopctl, :scale_alert_webhook_url, System.get_env("SCALE_ALERT_WEBHOOK_URL")
+
+  config :loopctl,
+         :scale_alert_check_interval_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_CHECK_INTERVAL_MS") || "60000")
+
+  config :loopctl,
+         :scale_alert_timeout_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_TIMEOUT_RATE_PER_MIN") || "5")
+
+  config :loopctl,
+         :scale_alert_p95_latency_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_P95_LATENCY_MS") || "2000")
+
+  config :loopctl,
+         :scale_alert_under_fill_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_UNDER_FILL_RATE_PER_MIN") || "30")
+
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),

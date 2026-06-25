@@ -9,6 +9,11 @@ Mox.defmock(Loopctl.MockContentExtractor, for: Loopctl.Knowledge.ContentExtracto
 Mox.defmock(Loopctl.MockWebAuthn, for: Loopctl.WebAuthn.Behaviour)
 Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
+# US-27.15: webhook delivery DI. ScaleAlerts and the webhook worker share the
+# `:webhook_delivery` key. In :test it resolves to this mock; the DataCase default stub
+# delegates to Loopctl.Webhooks.ReqDelivery so the existing Req.Test-stub-based webhook
+# worker tests keep working, while the ScaleAlerts tests override deliver/3 directly.
+Mox.defmock(Loopctl.MockDelivery, for: Loopctl.Webhooks.DeliveryBehaviour)
 
 # US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on

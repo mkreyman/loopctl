@@ -2,6 +2,7 @@ defmodule LoopctlWeb.Telemetry do
   use Supervisor
   import Telemetry.Metrics
 
+  alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
 
   # US-27.15: the internal port the Prometheus reporter binds for `/metrics`. It is
@@ -21,7 +22,7 @@ defmodule LoopctlWeb.Telemetry do
         # Telemetry poller will execute the given period measurements
         # every 10_000ms. Learn more here: https://hexdocs.pm/telemetry_metrics
         {:telemetry_poller, measurements: periodic_measurements(), period: 10_000}
-      ] ++ reporter_children()
+      ] ++ reporter_children() ++ scale_alerts_children()
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -49,6 +50,25 @@ defmodule LoopctlWeb.Telemetry do
 
   defp metrics_reporter_enabled? do
     Application.get_env(:loopctl, :metrics_reporter_enabled, false)
+  end
+
+  # US-27.15 (AC-27.15.2): the firing alert path. Supervised here so its ETS table +
+  # telemetry handlers + check timer share the telemetry supervisor's lifecycle. Started
+  # ONLY when `:scale_alerts_enabled` is true (prod via runtime.exs; OMITTED in :test so
+  # the suite never runs background timers or owns the ETS table — tests start it
+  # directly with a short window and drive `evaluate/0`). It is cheap and self-isolating:
+  # its handlers self-rescue and it only POSTs when a webhook URL is set and a threshold
+  # breaches.
+  defp scale_alerts_children do
+    if scale_alerts_enabled?() do
+      [ScaleAlerts]
+    else
+      []
+    end
+  end
+
+  defp scale_alerts_enabled? do
+    Application.get_env(:loopctl, :scale_alerts_enabled, false)
   end
 
   defp metrics_port do

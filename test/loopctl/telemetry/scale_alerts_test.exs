@@ -1,0 +1,315 @@
+defmodule Loopctl.Telemetry.ScaleAlertsTest do
+  @moduledoc """
+  US-27.15 / TC-27.15.2 (AC-27.15.2): the FIRING alert path actually FIRES.
+
+  This is the test the R2 round exists to add — the prior "alert path" only documented
+  PromQL rules that fly-metrics.net Grafana cannot run, so nothing fired. Here we drive
+  the three scale signals THROUGH the real telemetry handlers, call `evaluate/0`
+  synchronously, and prove:
+
+    * a breach POSTs an id-only alert via the `:webhook_delivery` DI (the Mox mock),
+      with the right metric, value, threshold, and NO leaked tenant/vector/SQL content;
+    * under threshold → NO delivery;
+    * the edge-triggered DEBOUNCE: a sustained breach does NOT re-fire on the next
+      `evaluate/0`; after the metric clears, a fresh breach fires again;
+    * the bucketed p95 honors its sample floor and crosses at the right bucket.
+
+  `async: false`: the handlers attach GLOBAL `:telemetry` listeners on the three scale
+  events, so a concurrent async test issuing a real heavy-read / db-error would pollute
+  this instance's window counters. Running serially keeps the counts deterministic. It
+  also lets us use Mox GLOBAL mode so the alert POST (which happens INSIDE the ScaleAlerts
+  process, not the test process) is allowed without per-pid `Mox.allow`.
+
+  Config (config/test.exs, NO put_env in the body): `:webhook_delivery` →
+  `Loopctl.MockDelivery`, a deterministic `:scale_alert_webhook_url`, a 60s window.
+  Thresholds are set PER TEST through the start opts' env? No — thresholds read from app
+  env; we choose event COUNTS relative to the documented defaults instead, so we never
+  mutate global config.
+  """
+  use ExUnit.Case, async: false
+
+  import Mox
+
+  alias Loopctl.Telemetry.ScaleAlerts
+  alias Loopctl.TelemetryEvents
+
+  setup :set_mox_global
+  setup :verify_on_exit!
+
+  # Documented defaults (config.exs): timeouts 5/min, p95 2000ms, under-fill 30/min.
+  # The test-env window is 60s, so a per-minute rate == the raw count in one window.
+
+  setup do
+    # A unique ETS table + name per test so instances never collide, and so the
+    # per-table telemetry handler id is unique. Start under the test supervisor; stop on
+    # exit (which detaches the handlers via terminate/2).
+    table = :"scale_alerts_test_#{System.unique_integer([:positive])}"
+    name = :"scale_alerts_srv_#{System.unique_integer([:positive])}"
+
+    pid = start_supervised!({ScaleAlerts, table: table, name: name})
+
+    # Default permissive stub (DataCase isn't used here — this is a plain ExUnit.Case),
+    # so an unexpected deliver doesn't crash; tests that assert a POST override with
+    # expect/3. Allowed in global mode for any process.
+    stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+      {:ok, %{status: 200, body: "ok"}}
+    end)
+
+    %{server: name, pid: pid, table: table}
+  end
+
+  # --- helpers that drive the REAL handlers via :telemetry.execute ---
+
+  defp emit_timeout(n) do
+    for _ <- 1..n do
+      :telemetry.execute(TelemetryEvents.db_error(), %{count: 1}, %{
+        mapped_code: "db_statement_timeout",
+        endpoint: :suggested_links,
+        tenant_id: "t-123"
+      })
+    end
+  end
+
+  defp emit_non_timeout(n) do
+    for _ <- 1..n do
+      :telemetry.execute(TelemetryEvents.db_error(), %{count: 1}, %{
+        mapped_code: "db_serialization_failure",
+        endpoint: :suggested_links
+      })
+    end
+  end
+
+  defp emit_under_fill(n) do
+    for _ <- 1..n do
+      :telemetry.execute(TelemetryEvents.vector_search_under_fill(), %{requested: 10}, %{
+        endpoint: :suggested_links,
+        tenant_id: "t-123"
+      })
+    end
+  end
+
+  # Heavy-read latency in ms → native units the real heavy-read query event carries.
+  defp emit_latency(ms, n) do
+    native = System.convert_time_unit(ms, :millisecond, :native)
+
+    for _ <- 1..n do
+      :telemetry.execute([:loopctl, :heavy_read_repo, :query], %{total_time: native}, %{
+        options: [endpoint: :semantic_search]
+      })
+    end
+  end
+
+  defp expect_delivery(test_pid) do
+    expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
+      send(test_pid, {:alert_delivered, url, body, headers})
+      {:ok, %{status: 200, body: "ok"}}
+    end)
+  end
+
+  describe "firing on breach (AC-27.15.2)" do
+    test "db_statement_timeout rate over threshold POSTs an id-only alert", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 6 timeouts in a 60s window = 6/min > the 5/min default threshold.
+      emit_timeout(6)
+      # non-timeout db errors must NOT count toward the timeout rate.
+      emit_non_timeout(10)
+
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, url, body, headers}
+      assert url == "https://alerts.test.invalid/scale"
+      assert {"content-type", "application/json"} in headers
+
+      payload = Jason.decode!(body)
+      assert payload["alert"] == "scale_degradation"
+      assert payload["metric"] == "db_statement_timeout_rate"
+      assert payload["value"] == 6.0
+      assert payload["threshold"] == 5
+      assert payload["window_seconds"] == 60
+      assert is_binary(payload["at"])
+    end
+
+    test "under_fill rate over threshold fires the under_fill metric", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 31 > 30/min default.
+      emit_under_fill(31)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "under_fill_rate"
+      assert payload["value"] == 31.0
+      assert payload["threshold"] == 30
+    end
+
+    test "p95 heavy-read latency over threshold fires the p95 metric", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      # 100 samples at 5000ms: p95 sits well above the 2000ms threshold. lat_total=100 is
+      # above the @p95_min_samples floor (20), so p95 is evaluated. 5000ms lands in the
+      # 5000 bucket → p95 estimate 5000 > 2000.
+      emit_latency(5_000, 100)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      payload = Jason.decode!(body)
+      assert payload["metric"] == "heavy_read_p95_latency_ms"
+      assert payload["value"] == 5_000
+      assert payload["threshold"] == 2_000
+    end
+
+    test "alert payload carries NO tenant content / vectors / SQL", %{server: server} do
+      test_pid = self()
+      expect_delivery(test_pid)
+
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      assert_received {:alert_delivered, _url, body, _headers}
+      # The tenant id we emitted MUST NOT appear anywhere in the payload.
+      refute body =~ "t-123"
+      refute body =~ "tenant"
+      refute body =~ "vector"
+      refute body =~ "SELECT"
+      refute body =~ "embedding"
+
+      keys = body |> Jason.decode!() |> Map.keys() |> Enum.sort()
+      assert keys == ["alert", "at", "metric", "threshold", "value", "window_seconds"]
+    end
+  end
+
+  describe "no firing under threshold" do
+    test "timeout count at/under threshold does NOT deliver", %{server: server} do
+      # No expect/3 → the permissive stub stands; verify_on_exit! would FAIL if an
+      # unexpected expect were set, but here we assert NO delivery by counting calls.
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # 5/min == threshold; the check is strictly `>` so 5 does NOT breach.
+      emit_timeout(5)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
+    end
+
+    test "p95 below the sample floor is skipped (no noise alert)", %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # Only 5 samples (< @p95_min_samples = 20), even though each is 9000ms.
+      emit_latency(9_000, 5)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      refute_received :unexpected_delivery
+    end
+  end
+
+  describe "edge-triggered debounce" do
+    test "a sustained breach fires ONCE, not on every evaluate", %{server: server} do
+      test_pid = self()
+
+      # Override the setup stub so EVERY deliver call is observable (a 2nd fire that fell
+      # through to a silent stub would otherwise hide a debounce regression). Any call
+      # sends {:fired, ...}, so refute_received is airtight.
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+        send(test_pid, {:fired, Jason.decode!(body)["metric"]})
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+      assert_received {:fired, "db_statement_timeout_rate"}
+
+      # Second window STILL breaches (another 6) but the metric is already in breach →
+      # debounced, NO new delivery.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+      refute_received {:fired, _}
+    end
+
+    test "after the metric clears, a fresh breach fires again", %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+        send(test_pid, {:fired, Jason.decode!(body)["value"]})
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # Breach #1
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+      assert_received {:fired, 6.0}
+
+      # Clear: an empty window (0 timeouts) re-arms the metric — and does NOT re-fire.
+      assert :ok = ScaleAlerts.evaluate(server)
+      refute_received {:fired, _}
+
+      # Breach #2 fires again now that it re-armed.
+      emit_timeout(7)
+      assert :ok = ScaleAlerts.evaluate(server)
+      assert_received {:fired, 7.0}
+    end
+  end
+
+  describe "tumbling window reset" do
+    test "counters reset each evaluate so a one-off spike doesn't persist", %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :fired)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+      assert_received :fired
+
+      # Window was reset; this evaluate sees 0 timeouts → clears, no fire.
+      assert :ok = ScaleAlerts.evaluate(server)
+      refute_received :fired
+    end
+  end
+
+  describe "no webhook url configured (log-only opt-in)" do
+    test "with a nil url, a breach logs and does NOT POST" do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # Start a SEPARATE instance with the URL overridden to nil via a start opt (NO
+      # put_env in the body — the override is instance config, restored automatically when
+      # this supervised process stops). A breach must log, not POST.
+      table = :"scale_alerts_nilurl_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_nilurl_srv_#{System.unique_integer([:positive])}"
+
+      _pid =
+        start_supervised!({ScaleAlerts, table: table, name: name, webhook_url: nil}, id: name)
+
+      for _ <- 1..6 do
+        :telemetry.execute(TelemetryEvents.db_error(), %{count: 1}, %{
+          mapped_code: "db_statement_timeout",
+          endpoint: :suggested_links
+        })
+      end
+
+      assert :ok = ScaleAlerts.evaluate(name)
+      refute_received :unexpected_delivery
+    end
+  end
+end

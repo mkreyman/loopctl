@@ -66,6 +66,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   import Telemetry.Metrics
 
+  require Logger
+
   alias Loopctl.Tenants
 
   @persistent_term_key {__MODULE__, :tenant_label?}
@@ -200,7 +202,20 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       try do
         Tenants.count() <= tenant_label_cap()
       rescue
-        _ -> false
+        # Fail-soft to a BOUNDED gate (force OFF → aggregate to the sentinel) ONLY for DB
+        # faults — a transient connection / ownership / Postgres error must not crash the
+        # shared poller. But the rescue is NARROW (security AREA-6): a persistently-failing
+        # gate (schema drift / misconfig that always raises) would otherwise stay silently
+        # stuck OFF, so we LOG it at :warning to make it visible. A genuine programmer
+        # error (anything outside the DB-exception set) is re-raised so it still surfaces
+        # rather than being masked as "gate off".
+        e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+          Logger.warning(
+            "tenant-label gate refresh failed (#{inspect(e.__struct__)}); forcing gate OFF " <>
+              "(tenant_id label aggregates to the sentinel until the count succeeds)"
+          )
+
+          false
       end
 
     # Put ONLY on an actual transition (team review F3). `:persistent_term.put/2` triggers
