@@ -22,7 +22,9 @@ defmodule LoopctlWeb.DBErrorMetricTest do
 
   import ExUnit.CaptureLog, only: [with_log: 1]
 
+  alias Loopctl.HeavyReadRepo
   alias Loopctl.Knowledge
+  alias Loopctl.Telemetry.ScaleMetrics
   alias Loopctl.TelemetryEvents
 
   setup :verify_on_exit!
@@ -156,6 +158,50 @@ defmodule LoopctlWeb.DBErrorMetricTest do
       refute flat =~ "1.0"
       refute flat =~ "::vector"
       refute flat =~ "embedding"
+    end
+  end
+
+  describe "heavy-read latency metric source (US-27.15 drift-guard)" do
+    test "the latency distribution subscribes to the event the REAL HeavyReadRepo fires" do
+      # The latency metric subscribes to [:loopctl, :heavy_read_repo, :query], but in
+      # :test HeavyRead's DI routes heavy reads to AdminRepo (a DIFFERENT event), so the
+      # app code path never fires this exact event — an event-name / Ecto-prefix /
+      # telemetry_options drift would silently leave the p95 alert empty. Fire the REAL
+      # HeavyReadRepo query event end-to-end and assert the metric reads keys it carries.
+      hist =
+        Enum.find(ScaleMetrics.scale_metrics(), fn m ->
+          m.name == [:loopctl, :heavy_read_repo, :query, :duration]
+        end)
+
+      assert hist.event_name == [:loopctl, :heavy_read_repo, :query]
+
+      test_pid = self()
+      handler = "hr-latency-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :heavy_read_repo, :query],
+        fn _e, meas, meta, _ ->
+          if self() == test_pid, do: send(test_pid, {:hr_query, meas, meta})
+        end,
+        nil
+      )
+
+      try do
+        HeavyReadRepo.query!(
+          "SELECT version FROM schema_migrations LIMIT 1",
+          [],
+          telemetry_options: [endpoint: :semantic_search]
+        )
+      after
+        :telemetry.detach(handler)
+      end
+
+      assert_received {:hr_query, meas, meta}
+      # The metric reads measurement :total_time — it must be present on the real event.
+      assert is_integer(meas.total_time)
+      # And latency_tags/1 extracts a BOUNDED endpoint from the REAL metadata shape.
+      assert ScaleMetrics.latency_tags(meta) == %{endpoint: :semantic_search}
     end
   end
 

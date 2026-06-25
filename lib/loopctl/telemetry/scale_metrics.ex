@@ -203,7 +203,14 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         _ -> false
       end
 
-    :persistent_term.put(@persistent_term_key, allowed?)
+    # Put ONLY on an actual transition (team review F3). `:persistent_term.put/2` triggers
+    # a global term-table scan, so writing the unchanged steady-state value every 10s is
+    # wasteful; the gate is stable once a fleet settles above/below the cap, so this makes
+    # the steady-state cost zero puts and writes only on a real gate flip.
+    if :persistent_term.get(@persistent_term_key, :unset) != allowed? do
+      :persistent_term.put(@persistent_term_key, allowed?)
+    end
+
     allowed?
   end
 

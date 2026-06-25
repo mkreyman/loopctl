@@ -373,9 +373,10 @@ rules below are the documented threshold path (AC-27.15.2).
 > **Scope (AC-27.15.4 — USER-signed-off):** metric emission + the Prometheus reporter +
 > the documented Grafana/Prometheus **alert rules** below SHIP in this story. Bespoke
 > Grafana **dashboard JSON** and an external **alertmanager** wiring (beyond these rules)
-> are a recorded **backlog follow-up**, not silently dropped. loopctl has no Sentry; this
-> is the durable-signal path the fly-logs "persisted signals" guidance prefers over 7-day
-> logs.
+> are a recorded **backlog follow-up** — tracked concretely in **GitHub issue #196**, not
+> silently dropped. loopctl has no Sentry; this is the durable-signal path the fly-logs
+> "persisted signals" guidance prefers over 7-day logs. To inspect `/metrics` locally,
+> set `config :loopctl, :metrics_reporter_enabled, true` in `config/dev.exs`.
 
 ### Surface & security
 

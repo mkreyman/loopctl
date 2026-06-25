@@ -212,8 +212,12 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       children = Supervisor.which_children(LoopctlWeb.Telemetry)
       child_ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
 
-      refute Enum.any?(child_ids, &(&1 == TelemetryMetricsPrometheus)),
-             "TelemetryMetricsPrometheus must not be supervised in :test"
+      # The reporter is supervised through the `Loopctl.Telemetry.MetricsReporter`
+      # wrapper, so THAT module is the child id to look for. (The old assertion checked
+      # `TelemetryMetricsPrometheus`, whose own child id is its `:name` — so the refute
+      # could never fail and gave false confidence.)
+      refute Enum.any?(child_ids, &(&1 == Loopctl.Telemetry.MetricsReporter)),
+             "the metrics reporter wrapper must not be supervised in :test"
 
       # Nothing is listening on the metrics port in test.
       assert {:error, :econnrefused} =

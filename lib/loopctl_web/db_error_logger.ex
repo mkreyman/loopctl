@@ -93,16 +93,25 @@ defmodule LoopctlWeb.DBErrorLogger do
     )
 
     :ok
+  rescue
+    # This runs on the ERROR path — the request is ALREADY failing on a DB exception.
+    # Observability must never WORSEN that: a raising attached handler, or an unexpected
+    # `conn` shape, would otherwise escape and crash a request that was about to render a
+    # clean sanitized 5xx (possibly via the very crash-log path US-27.3 sanitized). So
+    # fail-soft, mirroring `Loopctl.Telemetry.SlowQueryLogger.handle_event/4` (team F2).
+    e ->
+      Logger.error("db_error metric emit failed: #{Exception.message(e)}")
+      :ok
   end
 
   # The BOUNDED endpoint dimension: the matched Phoenix `Controller.action` atom,
   # NOT the raw request path (a raw path embeds ids → unbounded label cardinality).
   # `phoenix_controller` (a module atom) and `phoenix_action` (an atom the router sets
-  # from a compile-time-known action name) ALREADY EXIST as atoms — we only look them
-  # up and combine via `Module.concat/2` (interns an existing-segment atom), NEVER
-  # `String.to_atom/1` on user input. Both come from the FINITE set of compiled
-  # controllers/actions, so the label is bounded by construction. Falls back to the
-  # controller alone (still bounded), then `:unknown`, if a stage is missing.
+  # from a compile-time-known action name) are read from `conn.private`. `Module.concat/2`
+  # CREATES a new atom (e.g. `LoopctlWeb.FooController.index`) — but from two atoms drawn
+  # from FINITE, compile-time-known sets (controllers × actions), so the resulting label
+  # set is bounded by construction. It is NEVER `String.to_atom/1` on user input. Falls
+  # back to the controller alone (still bounded), then `:unknown`, if a stage is missing.
   defp endpoint(conn) do
     controller = Map.get(conn.private, :phoenix_controller)
     action = Map.get(conn.private, :phoenix_action)

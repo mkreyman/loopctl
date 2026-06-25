@@ -34,8 +34,12 @@ defmodule LoopctlWeb.Telemetry do
   # reporter so the scraped metrics and the tested defs can never drift.
   defp reporter_children do
     if metrics_reporter_enabled?() do
+      # Started through the fault-isolating `Loopctl.Telemetry.MetricsReporter` wrapper
+      # (NOT `TelemetryMetricsPrometheus` directly) so a bind failure on the internal
+      # :9568 port can never crash this supervisor and cascade into the app (team review
+      # F1). The wrapper's init always succeeds; it starts/retries the reporter out of band.
       [
-        {TelemetryMetricsPrometheus,
+        {Loopctl.Telemetry.MetricsReporter,
          metrics: metrics(), port: metrics_port(), name: :loopctl_metrics}
       ]
     else
@@ -120,6 +124,11 @@ defmodule LoopctlWeb.Telemetry do
   end
 
   defp periodic_measurements do
+    # NOTE: `telemetry_poller` runs every measurement in its OWN process and does NOT
+    # isolate them — an uncaught raise in any measurement crashes the shared poller (and
+    # with it the gate refresh). So EVERY measurement added here MUST be self-rescuing.
+    # `refresh_tenant_label_gate/0` guards its only raising op (the DB count) with
+    # try/rescue (fail-soft to a bounded gate); keep that invariant for future additions.
     [
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
