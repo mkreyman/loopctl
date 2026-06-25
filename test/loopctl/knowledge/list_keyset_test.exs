@@ -258,6 +258,243 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
     end
   end
 
+  describe "list_keyset/2 — include_body + has_more (US-27.10)" do
+    test "body-less is the default: no :body key on any row" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published, body: "secret body"})
+
+      {:ok, %{results: [row], include_body: include_body}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20)
+
+      refute include_body
+      refute Map.has_key?(row, :body)
+    end
+
+    test "include_body: true threads :body into each row's select" do
+      tenant = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        body: "the full body content"
+      })
+
+      {:ok, %{results: [row], include_body: include_body}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20, include_body: true)
+
+      assert include_body
+      assert row.body == "the full body content"
+    end
+
+    test "has_more mirrors the keyset peek (next_cursor != nil), not a COUNT" do
+      tenant = fixture(:tenant)
+
+      for i <- 1..5 do
+        fixture(:article, %{tenant_id: tenant.id, status: :published, title: "h#{i}"})
+      end
+
+      # Page of 2 over 5 rows: more remains.
+      {:ok, %{next_cursor: next_cursor, has_more: has_more}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 2)
+
+      assert has_more
+      refute is_nil(next_cursor)
+
+      # A page large enough to exhaust the set: has_more false, next_cursor nil.
+      {:ok, %{next_cursor: last_cursor, has_more: last_has_more}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 50)
+
+      refute last_has_more
+      assert is_nil(last_cursor)
+    end
+
+    test "body-less default is never byte_truncated" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published, body: "x"})
+
+      {:ok, %{byte_truncated: byte_truncated}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20)
+
+      refute byte_truncated
+    end
+
+    # The test budget is 100_000 bytes (config/test.exs). Two 40 KB bodies fit
+    # (80 KB); the 3rd would exceed it, so the page trims to 2, sets byte_truncated,
+    # and recomputes next_cursor from the LAST KEPT row so the walk resumes over the
+    # dropped row with no gap.
+    test "include_body trims the page by the byte budget and resumes drift-free" do
+      tenant = fixture(:tenant)
+      big = String.duplicate("x", 40_000)
+
+      ids =
+        for i <- 1..3 do
+          a =
+            fixture(:article, %{
+              tenant_id: tenant.id,
+              status: :published,
+              title: "bt#{i}",
+              body: big
+            })
+
+          a.id
+        end
+
+      {:ok, %{results: page1, next_cursor: cursor1, has_more: more1, byte_truncated: trunc1}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 25, include_body: true)
+
+      assert trunc1
+      assert length(page1) == 2
+      assert more1
+      refute is_nil(cursor1)
+
+      {:ok, %{results: page2, next_cursor: cursor2, byte_truncated: trunc2}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          limit: 25,
+          include_body: true,
+          cursor: cursor1
+        )
+
+      assert length(page2) == 1
+      refute trunc2
+      assert is_nil(cursor2)
+
+      seen = Enum.map(page1 ++ page2, & &1.id)
+      assert Enum.sort(seen) == Enum.sort(ids)
+      assert length(seen) == length(Enum.uniq(seen)), "no duplicate across the trim boundary"
+    end
+
+    test "always keeps ≥1 row even if a single body alone exceeds the budget" do
+      tenant = fixture(:tenant)
+      # One body alone (120 KB) exceeds the 100 KB test budget; progress requires
+      # keeping it anyway (the always-take-≥1 rule).
+      huge = String.duplicate("y", 120_000)
+
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, body: huge})
+
+      {:ok, %{results: results, byte_truncated: byte_truncated}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 25, include_body: true)
+
+      assert length(results) == 1
+      assert hd(results).id == a.id
+      # A single over-budget row is not a truncation of OTHER rows — nothing was dropped.
+      refute byte_truncated
+    end
+
+    # Scenario B (peek=true AND byte-trim drops rows): a page that has MORE matching
+    # rows than `limit` (so the peek says has_more) AND is byte-trimmed below `limit`.
+    # The recomputed cursor must walk over the dropped rows with no gap/dup and the walk
+    # must end on a real (non-phantom) page. Also pins the invariant
+    # `byte_truncated == true ⟹ next_cursor != nil` on every page.
+    test "byte-trimmed multi-page walk (peek + trim) is gap-free and never strands a row" do
+      tenant = fixture(:tenant)
+      big = String.duplicate("z", 40_000)
+
+      ids =
+        for i <- 1..12 do
+          a =
+            fixture(:article, %{
+              tenant_id: tenant.id,
+              status: :published,
+              tags: ["sb"],
+              title: "sb#{i}",
+              body: big
+            })
+
+          a.id
+        end
+
+      # limit 5 ⇒ early pages have a peek row (has_more), and the 100 KB budget trims
+      # each page to 2 rows (2×40 KB ≤ 100 KB; the 3rd would exceed) ⇒ byte_truncated.
+      seen = scenario_b_walk(tenant.id, nil, [])
+
+      assert Enum.sort(seen) == Enum.sort(ids), "every row served exactly across the walk"
+      assert length(seen) == length(Enum.uniq(seen)), "no duplicate across trim+peek seams"
+      assert length(seen) == 12
+    end
+  end
+
+  # Walk include_body pages, asserting per-page that a byte-truncated page always
+  # carries a continuation cursor (never strands the dropped rows) and never returns
+  # an empty page while claiming more remains.
+  defp scenario_b_walk(_tid, _cursor, acc) when length(acc) > 1_000,
+    do: flunk("scenario B walk did not terminate")
+
+  defp scenario_b_walk(tenant_id, cursor, acc) do
+    {:ok, %{results: page, next_cursor: next, byte_truncated: trunc?, has_more: more?}} =
+      Knowledge.list_keyset(tenant_id,
+        status: :published,
+        tags: ["sb"],
+        limit: 5,
+        include_body: true,
+        cursor: cursor
+      )
+
+    if trunc?, do: assert(next, "byte_truncated page must carry a next_cursor")
+    if more?, do: assert(page != [], "has_more must not be signalled on an empty page")
+
+    acc = acc ++ Enum.map(page, & &1.id)
+    if next, do: scenario_b_walk(tenant_id, next, acc), else: acc
+  end
+
+  describe "list_keyset/2 — include_body respects visibility scope (AC-27.10.5)" do
+    test "a private memory's body never leaks to a non-owning agent" do
+      tenant = fixture(:tenant)
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      private =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          body: "PRIVATE BODY — must not leak",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+        })
+
+      # The non-owning agent enumerates WITH include_body. The visibility filter
+      # is applied before the projection, so the private row is excluded entirely
+      # — its body is never selected, let alone returned.
+      {:ok, %{results: results}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          include_body: true,
+          limit: 50,
+          visibility_agent_id: to_string(other_agent.id)
+        )
+
+      refute Enum.any?(results, &(&1.id == private.id))
+      refute Enum.any?(results, fn r -> Map.get(r, :body) == "PRIVATE BODY — must not leak" end)
+
+      # The OWNER, by contrast, does see its own private memory's body.
+      {:ok, %{results: owner_results}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          include_body: true,
+          limit: 50,
+          visibility_agent_id: to_string(owner_agent.id)
+        )
+
+      owner_row = Enum.find(owner_results, &(&1.id == private.id))
+      assert owner_row.body == "PRIVATE BODY — must not leak"
+    end
+
+    test "include_body never returns a body across tenants" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant_b.id,
+        status: :published,
+        body: "TENANT B BODY"
+      })
+
+      {:ok, %{results: results}} =
+        Knowledge.list_keyset(tenant_a.id, status: :published, include_body: true, limit: 50)
+
+      assert results == []
+    end
+  end
+
   describe "keyset_query/2 — request-path query shape" do
     test "is the query list_keyset runs, and is tenant-scoped" do
       tenant = fixture(:tenant)
@@ -269,6 +506,26 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
       assert sql =~ "tenant_id"
       assert sql =~ ~r/order by.*inserted_at.*id/i
       assert sql =~ ~r/limit/i
+    end
+
+    test "body-less by default; include_body: true selects the body column (US-27.10)" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {bodyless_sql, _} =
+        :all
+        |> SQL.to_sql(AdminRepo, Knowledge.keyset_query(tenant.id, status: :published))
+
+      refute bodyless_sql =~ ~r/\bbody\b/i
+
+      {full_sql, _} =
+        :all
+        |> SQL.to_sql(
+          AdminRepo,
+          Knowledge.keyset_query(tenant.id, status: :published, include_body: true)
+        )
+
+      assert full_sql =~ ~r/\bbody\b/i
     end
   end
 end

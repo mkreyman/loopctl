@@ -62,6 +62,16 @@ defmodule Loopctl.Knowledge do
   # path fetches `@default_page_size + 1` to detect a next page without a COUNT.
   @default_page_size 20
 
+  # Maximum effective page size for which the keyset enumeration path will honor
+  # `include_body: true` (US-27.10). Body-less is the default (#166); opting into
+  # full bodies is bounded WELL below `@max_page_size` so a caller can't request
+  # bodies for thousands of rows. Bodies are up to 500KB (see @max_body_bytes),
+  # so 25 rows max × 500KB is a 12.5MB worst case, trimmed by the 5MB
+  # full_content_byte_budget in the view. A request for `include_body: true` with
+  # a requested `limit` above this is rejected by the HTTP layer with 400 (never
+  # a silent oversized response).
+  @max_include_body_page 25
+
   @doc """
   The maximum page size (`limit`) honored by the **enumeration** paths
   (`list_articles/2`, `list_filtered/2`, `list_keyset/2`, `list_drafts/2`,
@@ -72,6 +82,18 @@ defmodule Loopctl.Knowledge do
   """
   @spec max_page_size() :: pos_integer()
   def max_page_size, do: @max_page_size
+
+  @doc """
+  The maximum effective page size for which the keyset enumeration path honors
+  `include_body: true` (US-27.10).
+
+  Body-less is the default (#166); opting into full bodies is bounded to this so
+  a caller can't request bodies for thousands of rows and reproduce the large
+  chunked-payload failure. The HTTP layer rejects an `include_body: true` request
+  whose requested `limit` exceeds this with a 400 — it is NOT silently clamped.
+  """
+  @spec max_include_body_page() :: pos_integer()
+  def max_include_body_page, do: @max_include_body_page
 
   # Maximum result count for the **relevance** search modes (keyword / semantic /
   # combined). These return a ranked top-N, not an exhaustive enumeration, so
@@ -123,13 +145,14 @@ defmodule Loopctl.Knowledge do
   @max_idea_text_bytes 4 * 1024 * 1024
 
   # Byte budget for full-content (`include_body: true`) list reads. An article
-  # `body` is up to 100 KB, so a 1000-row full-body page could be ~100 MB — an
+  # `body` is up to 500 KB, so a 1000-row full-body page could be ~500 MB — an
   # agent-callable memory/DoS vector. Full-content pages therefore return as many
   # rows as fit within this serialized-body budget (always ≥1 for progress), plus
-  # `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` to continue. Bounds
-  # the response regardless of the requested `limit` or per-row body size.
-  # Worst case per page is ~budget + one body: the always-take-≥1 rule can include
-  # one row beyond the budget, and `body` is byte-validated (≤500_000 bytes, see
+  # `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` to continue (offset
+  # path) or early page termination (keyset path, US-27.10). Bounds the response
+  # regardless of the requested `limit` or per-row body size. Worst case per page
+  # is ~budget + one body: the always-take-≥1 rule can include one row beyond the
+  # budget, and `body` is byte-validated (≤500_000 bytes, see
   # Article @max_body_bytes), so worst case is ≤ ~5.5 MB total here.
   # Enumeration that doesn't need bodies should use the body-less summary
   # (the default) or `GET /knowledge/index`.
@@ -1498,40 +1521,144 @@ defmodule Loopctl.Knowledge do
     - `:project_id`, `:category`, `:tags`, `:match`, `:memory_types`, `:agents`,
       `:conversation_id`, `:visibility_agent_id` -- same filters as `list_filtered/2`
 
+    - `:include_body` -- when `true`, each result map carries the article `body`
+      (US-27.10). Defaults to `false` (body-less summary projection, #166). The
+      HTTP layer bounds this to `max_include_body_page/0`; the context honors it
+      as passed so direct callers stay in control. When `true`, the returned page
+      is ALSO bounded by `full_content_byte_budget/0` (the same serialized-body
+      budget the offset full-content path uses) — see Returns.
+
   ## Returns
 
-  - `{:ok, %{results: [map()], next_cursor: position_or_nil, limit: effective_limit}}`
-    where `next_cursor` is the `(inserted_at, id)` tuple of the LAST returned row
-    when another page exists, else `nil`. The HTTP layer encodes it back into an
-    opaque cursor string.
+  - `{:ok, %{results: [map()], next_cursor: position_or_nil, has_more: bool,
+    limit: effective_limit, include_body: bool, byte_truncated: bool}}` where
+    `next_cursor` is the `(inserted_at, id)` tuple of the LAST returned row when
+    another page exists, else `nil`. `has_more?` is exactly `next_cursor != nil`,
+    never a COUNT.
+
+    When `include_body: true`, the page (already ≤ `max_include_body_page/0` rows)
+    is trimmed to the longest prefix whose cumulative `byte_size(body)` stays
+    within `full_content_byte_budget/0` (always keeping ≥1 row for progress). The
+    ≤25-row cap alone permits 25 × `Article` `@max_body_bytes` (500 KB) = 12.5 MB
+    worst case; the byte budget keeps the keyset full-content page consistent with
+    the offset path (~5.5 MB worst case *returned*). NB: unlike the offset path's
+    sized pre-query, this trims IN MEMORY, so it transiently FETCHES up to
+    `(max_include_body_page/0 + 1) × @max_body_bytes` (~13 MB) before trimming — a
+    bounded cost justified at the 25-row cap (see the body comment). If the trim drops
+    rows, `next_cursor` is
+    recomputed from the LAST KEPT row (so the walk resumes over the dropped rows —
+    drift-free by construction), `has_more` is forced `true`, and `byte_truncated`
+    is `true`. When not trimmed (or body-less), `byte_truncated` is `false` and
+    behavior is unchanged. The HTTP layer encodes `next_cursor` into an opaque
+    cursor string.
   """
   @spec list_keyset(Ecto.UUID.t(), keyword()) ::
           {:ok,
            %{
              results: [map()],
              next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil,
-             limit: pos_integer()
+             has_more: boolean(),
+             limit: pos_integer(),
+             include_body: boolean(),
+             byte_truncated: boolean()
            }}
   def list_keyset(tenant_id, opts \\ []) do
     limit = opts |> Keyword.get(:limit, @default_page_size) |> max(1) |> min(@max_page_size)
+    include_body? = Keyword.get(opts, :include_body, false) == true
 
     # Fetch limit+1 to detect a next page without a COUNT (AC-27.9a.1).
     rows =
       tenant_id
-      |> keyset_query(Keyword.put(opts, :limit, limit + 1))
+      |> keyset_query(
+        opts
+        |> Keyword.put(:limit, limit + 1)
+        |> Keyword.put(:include_body, include_body?)
+      )
       |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:enumeration)))
 
     {page, has_more?} = split_peek(rows, limit)
 
-    next_cursor =
-      if has_more? do
-        last = List.last(page)
-        {last.inserted_at, last.id}
-      end
+    # US-27.10: when bodies are included, bound the (≤25-row) page by the
+    # serialized-body byte budget so it can't balloon past the offset path's cap.
+    # The page rows already carry `body`, so this is an IN-MEMORY trim — no second
+    # query. This deliberately diverges from `paginate_with_body_budget/4` (the offset
+    # path), which runs a sized pre-query (`octet_length(body)`) so it never fetches a
+    # body it will trim. The divergence is intentional and bounded: the offset path can
+    # serve up to `@max_page_size` (1000) rows — a pre-query is essential there (else
+    # ~500 MB fetched). The keyset path is HARD-capped at `@max_include_body_page` (25),
+    # so the worst-case transient fetch is (25+1) × `@max_body_bytes` ≈ 13 MB per request,
+    # naturally backpressured by the dedicated HeavyRead pool (HEAVY_READ_POOL_SIZE, ~8)
+    # and its statement_timeout. At that bound the pre-query's saved bytes don't justify a
+    # second query + read-only transaction per page, so the simpler in-memory trim wins.
+    {page, has_more?, byte_truncated?} = maybe_byte_trim(page, has_more?, include_body?)
+
+    # Surface budget truncation for ops tuning of `:full_content_byte_budget` (it is
+    # otherwise only visible in the per-response `meta.byte_truncated`).
+    if byte_truncated? do
+      :telemetry.execute(
+        [:loopctl, :knowledge, :keyset_byte_truncated],
+        %{returned: length(page)},
+        %{tenant_id: tenant_id}
+      )
+    end
+
+    next_cursor = keyset_next_cursor(page, has_more?)
 
     maybe_record_search_access(tenant_id, page, "", opts, "list_keyset")
 
-    {:ok, %{results: page, next_cursor: next_cursor, limit: limit}}
+    {:ok,
+     %{
+       results: page,
+       next_cursor: next_cursor,
+       has_more: has_more?,
+       limit: limit,
+       include_body: include_body?,
+       byte_truncated: byte_truncated?
+     }}
+  end
+
+  # next_cursor is the {inserted_at, id} of the LAST row of the page when more
+  # remains (peek OR byte-trim), else nil. Computed AFTER any byte-trim so a
+  # trimmed page resumes at the last KEPT row — no gap over the dropped rows.
+  defp keyset_next_cursor([], _has_more?), do: nil
+  defp keyset_next_cursor(_page, false), do: nil
+
+  defp keyset_next_cursor(page, true) do
+    last = List.last(page)
+    {last.inserted_at, last.id}
+  end
+
+  # Body-less pages have no body bytes to bound — pass through unchanged.
+  defp maybe_byte_trim(page, has_more?, false), do: {page, has_more?, false}
+
+  # Full-content page: take the longest prefix within `full_content_byte_budget/0`
+  # (always ≥1 row). If rows were dropped, the page now ends earlier than the peek
+  # said, so MORE remains regardless of the peek → force has_more? true and let
+  # `keyset_next_cursor/2` seek from the last kept row.
+  defp maybe_byte_trim(page, has_more?, true) do
+    {kept, truncated?} = take_within_byte_budget_by_body(page, full_content_byte_budget())
+
+    {kept, has_more? or truncated?, truncated?}
+  end
+
+  # In-memory sibling of `take_within_byte_budget/2` (the offset path's id/:bytes
+  # version): keys on `byte_size(row.body || "")` over the already-fetched rows.
+  # Always keeps ≥1 row so a single oversized body still makes progress. Returns
+  # `{kept_rows_in_order, truncated?}`.
+  defp take_within_byte_budget_by_body(rows, budget) do
+    {rev_kept, _sum, truncated?} =
+      Enum.reduce_while(rows, {[], 0, false}, fn row, {acc, sum, _trunc} ->
+        bytes = byte_size(row.body || "")
+        new_sum = sum + bytes
+
+        cond do
+          acc == [] -> {:cont, {[row], bytes, false}}
+          new_sum > budget -> {:halt, {acc, sum, true}}
+          true -> {:cont, {[row | acc], new_sum, false}}
+        end
+      end)
+
+    {Enum.reverse(rev_kept), truncated?}
   end
 
   @doc """
@@ -1542,6 +1669,13 @@ defmodule Loopctl.Knowledge do
   Same `opts` as `list_keyset/2`; `:limit` is applied as-is here (the caller adds
   the `+1` peek). This is the EXACT query `list_keyset/2` runs, so the plan
   assertion guards the request path, not a stunt double.
+
+  `:include_body` (default `false`) controls whether the `select` map carries the
+  potentially-huge `body` column (US-27.10). Body-less is the default so `body` is
+  never transferred from Postgres for enumeration reads; `include_body: true` adds
+  it (the HTTP layer bounds that to `max_include_body_page/0`). Tenant scope and
+  visibility filtering are applied BEFORE the projection, so a `body` is only ever
+  selected for a row the caller could already read.
 
   Plan note: with no filter or a scalar `:category` filter the planner walks the
   `(tenant_id, inserted_at, id)` btree in order (true keyset, no Sort). With a
@@ -1563,7 +1697,15 @@ defmodule Loopctl.Knowledge do
     base
     |> apply_search_filters(status, opts)
     |> apply_keyset_seek(Keyword.get(opts, :cursor))
-    |> select([a], %{
+    |> keyset_select(Keyword.get(opts, :include_body, false) == true)
+    |> order_by([a], asc: a.inserted_at, asc: a.id)
+    |> limit(^limit)
+  end
+
+  # Body-less projection (the default, #166): `body` is never transferred from
+  # Postgres for enumeration reads, keeping payloads small.
+  defp keyset_select(query, false) do
+    select(query, [a], %{
       id: a.id,
       tenant_id: a.tenant_id,
       project_id: a.project_id,
@@ -1574,8 +1716,23 @@ defmodule Loopctl.Knowledge do
       inserted_at: a.inserted_at,
       updated_at: a.updated_at
     })
-    |> order_by([a], asc: a.inserted_at, asc: a.id)
-    |> limit(^limit)
+  end
+
+  # Full-content projection (US-27.10, `include_body: true`): same summary fields
+  # plus the `body` column. Bounded to `max_include_body_page/0` by the HTTP layer.
+  defp keyset_select(query, true) do
+    select(query, [a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      body: a.body,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at
+    })
   end
 
   # No cursor: enumerate from the start.

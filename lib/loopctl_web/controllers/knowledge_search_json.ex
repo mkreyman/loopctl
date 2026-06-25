@@ -24,22 +24,51 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   end
 
   @doc """
-  Renders a KEYSET (cursor) list page (US-27.9a).
+  Renders a KEYSET (cursor) list page (US-27.9a, US-27.10).
 
   Unlike `search/2`, the keyset list path carries no relevance score/snippet, and
-  its `meta` documents `next_cursor` (the opaque, already-encoded cursor for the
-  next page, or `null` when the walk is exhausted) and the effective `limit`
-  instead of an offset/total_count. `next_cursor` is encoded by the controller
-  (it needs the tenant key), so this view receives it as a ready string or `nil`.
+  its `meta` fully documents the cursor contract (US-27.10) so an agent can drive
+  pagination purely from the response:
+
+  - `next_cursor` — the opaque, already-encoded cursor for the next page, or
+    `null` when the walk is exhausted (the only exhaustion signal — there is no
+    total_count to drift).
+  - `has_more` — boolean, derived from the keyset peek (exactly `next_cursor != null`),
+    never a COUNT.
+  - `limit` — the effective per-page limit that actually ran.
+  - `count` — the number of rows in THIS page (`length(data)`).
+  - `include_body` — whether each row carries the article `body` (US-27.10).
+  - `byte_truncated` — whether the page was shortened by the serialized-body byte
+    budget (US-27.10). Only ever `true` when `include_body` is `true`.
+
+  When `include_body: true`, the CONTEXT (`Loopctl.Knowledge.list_keyset/2`) has
+  already trimmed the page to `full_content_byte_budget/0` and recomputed
+  `next_cursor`/`has_more` from the LAST KEPT row, so the walk resumes over the
+  dropped rows with no gap. This view does NOT trim — it renders exactly what the
+  context returns and surfaces `byte_truncated` from the context.
+
+  `next_cursor` is encoded by the controller (it needs the tenant key), so this
+  view receives it as a ready string or `nil`.
   """
-  def keyset(%{results: results, next_cursor: next_cursor, limit: limit}) do
+  def keyset(%{
+        results: results,
+        next_cursor: next_cursor,
+        has_more: has_more,
+        limit: limit,
+        include_body: include_body,
+        byte_truncated: byte_truncated
+      }) do
     %{
-      data: Enum.map(results, &render_list_row/1),
+      data: Enum.map(results, &render_list_row(&1, include_body)),
       meta: %{
         # The cursor walk is drift-free precisely BECAUSE it carries no
         # total_count to drift; `next_cursor: null` is the exhaustion signal.
         next_cursor: next_cursor,
+        has_more: has_more,
         limit: limit,
+        count: length(results),
+        include_body: include_body,
+        byte_truncated: byte_truncated,
         search_mode: "list_keyset"
       }
     }
@@ -49,14 +78,17 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   # `select` (every field present; `tags` is a non-null `{:array}` default `[]`), so
   # direct field access is correct — and a missing field SHOULD crash loudly rather than
   # silently degrade. (`render_result/1` keeps the dual accessor because search results
-  # may be structs.)
-  defp render_list_row(result) do
-    %{
+  # may be structs.) `body` is present ONLY when the query was run with
+  # `include_body: true` (US-27.10); body-less (the default) carries no `body` key.
+  defp render_list_row(result, include_body) do
+    base = %{
       id: result.id,
       title: result.title,
       category: to_string(result.category),
       tags: result.tags
     }
+
+    if include_body, do: Map.put(base, :body, result.body), else: base
   end
 
   defp render_result(result, mode) do
