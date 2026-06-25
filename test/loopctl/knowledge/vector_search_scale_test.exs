@@ -27,10 +27,10 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
   @moduletag timeout: :timer.minutes(30)
 
   # The pool-level heavy-read statement_timeout backstop (worst-case must beat it).
-  # This is the PRODUCTION default (HEAVY_READ_STATEMENT_TIMEOUT_MS, runtime.exs) —
-  # NOT a loose local literal. A worst-case kNN that beats 30s but not the real 10s
-  # prod backstop would be killed in production, so the gate must use the real value.
-  @heavy_read_statement_timeout_ms 10_000
+  # Reads from System env (the prod source of truth), so any operator override
+  # (e.g., HEAVY_READ_STATEMENT_TIMEOUT_MS=5000) is faithfully tested here too.
+  @heavy_read_statement_timeout_ms System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS", "10000")
+                                   |> String.to_integer()
 
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
@@ -150,7 +150,9 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
         VectorSearch.nearest(tenant.id, target.embedding, VectorSearch.max_k(),
           exclude_id: target.id,
           exclude_linked: true,
-          threshold: 0.0
+          threshold: 0.0,
+          tags: ["scale-tag-3"],
+          category: :decision
         )
       end
 

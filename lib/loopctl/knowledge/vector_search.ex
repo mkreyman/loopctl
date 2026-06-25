@@ -36,11 +36,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
       `:exclude_id` anchor), the `similarity_score > threshold` floor, the final
       `ORDER BY similarity_score DESC`, and `LIMIT k`.
 
-  `pool` over-fetches well beyond `k` so the outer exclusions rarely starve the
-  result; effective recall is additionally bounded by `hnsw.ef_search` (default
-  40), consistent with `search_semantic`. (Over-fetch sizing, recall semantics,
-  and under-fill monitoring are tuned in US-27.6b — this module is the
-  index-correct core + caller-cost bounds + tenant isolation.)
+  The `pool` over-fetches well beyond `k` for **anti-join + threshold** (structural
+  exclusions of already-linked articles, similarity floor); these rarely starve
+  the result because they act on ~small row counts. However, **`tags` and `category`
+  are post-ANN filters applied to the ≤500-row pool** and can severely under-fill:
+  a selective tag matching <1% of the corpus will rarely survive the pool's
+  top-`pool`-by-cosine approximation, returning 0 results even when k matching
+  articles exist corpus-wide. This is a known limitation of post-ANN filters;
+  recall-tuning (e.g., raising pool for selective filters) is handled in US-27.6b
+  telemetry + response meta. This module is the index-correct core + caller-cost
+  bounds + tenant isolation.
 
   ## Caller-cost bounds (AC-27.6a.4 — OWASP A06, insecure design)
 
@@ -168,9 +173,13 @@ defmodule Loopctl.Knowledge.VectorSearch do
         (any relationship type), applied in the OUTER query over the pool.
       * `:threshold` — minimum `similarity_score` (clamped to `[0.0, 1.0]`,
         default `0.0` — no floor); applied in the outer query.
-      * `:tags` — index-residual tag overlap (`&&`) filter on the candidate scan
-        (truncated to `max_tags/0`).
-      * `:category` — index-residual `category =` filter on the candidate scan.
+      * `:tags` — tag overlap (`&&`) filter applied **AFTER the ANN fetch** over the
+        over-fetched pool (truncated to `max_tags/0`). A selective tag can yield
+        materially fewer than `k` results (even 0) when matching articles fall
+        outside the top-pool nearest-by-distance.
+      * `:category` — category equality (`=`) filter applied **AFTER the ANN fetch**
+        over the pool. This is a post-ANN filter, not a tag-scoped kNN; recall
+        depends on whether matching articles are in the top-`pool` nearest.
       * `:visibility_agent_id` — the agent visibility scope (same metadata
         predicate as the other knowledge reads).
       * `:pool` — override the over-fetch pool (still clamped by `max_pool/0` and
@@ -240,7 +249,6 @@ defmodule Loopctl.Knowledge.VectorSearch do
         id: c.id,
         title: c.title,
         category: c.category,
-        tags: c.tags,
         similarity_score: c.similarity_score
       }
     )
