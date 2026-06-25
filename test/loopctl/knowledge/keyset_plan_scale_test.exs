@@ -20,11 +20,20 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
     (`refute_full_scan/1`). This is the core keyset promise.
   - ARRAY shape (`+tags`, `+tags+category`): `tags &&` is served by a GIN index and
     no btree can provide both array containment AND `(inserted_at, id)` order, so the
-    planner BitmapAnds the tags GIN with the keyset btree and Sorts. That is bounded
-    by TAG SELECTIVITY, not the corpus, and is non-regressive vs the tag-filtered
-    OFFSET query. We assert the catastrophe-guard (`refute_seq_scan/1` — no unbounded
-    full-corpus read) plus `assert_index_used/2` for BOTH the selective tags GIN and
-    the keyset btree, proving the bound is real. See docs/runbooks/knowledge-scale.md.
+    planner uses the tags GIN and Sorts. That is bounded by TAG SELECTIVITY, not the
+    corpus, and is non-regressive vs the tag-filtered OFFSET query. We assert the
+    catastrophe-guard (`refute_seq_scan/1` — no unbounded full-corpus read), that the
+    selective tags GIN drives the scan (`assert_index_used/2`), AND that the scan's
+    estimated rows stay bounded by tag selectivity (`assert_scan_rows_below/2`) so the
+    relaxation can't hide a heap-filter-over-corpus regression. We deliberately do NOT
+    pin the BitmapAnd-with-keyset-btree shape: once the GIN cuts the corpus to ~2% the
+    planner may apply the cursor as a cheap heap filter, a cost-marginal choice at the
+    80k floor that would make the gate flaky without catching a real regression. See
+    docs/runbooks/knowledge-scale.md.
+
+  It also asserts the enumeration endpoint's per-request TIMEOUT at scale: the deep
+  residual-free keyset page must EXECUTE well under the heavy-read `statement_timeout`
+  (US-27.4), so the gate covers timing, not only plan shape (AC-27.5.3).
 
   The corpus is seeded with a realistic ~20% non-published `status_mix` so the
   `status = :published` residual itself has selectivity (the walk must skip
@@ -47,6 +56,12 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
 
   @moduletag :scale_nightly
   @moduletag timeout: :timer.minutes(30)
+
+  # Pool-level heavy-read statement_timeout backstop (US-27.4): a deep keyset page must
+  # EXECUTE well under it. Same env source as vector_search_scale_test, so an operator
+  # override is honored.
+  @heavy_read_statement_timeout_ms System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS", "10000")
+                                   |> String.to_integer()
 
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
@@ -141,13 +156,20 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
       end
 
       # ARRAY path (`tags &&`, served by the GIN index): no btree can provide BOTH
-      # array containment AND `(inserted_at, id)` order, so the planner intersects the
-      # tags GIN with the keyset btree (BitmapAnd) and Sorts the result. That is bounded
-      # by TAG SELECTIVITY (not the corpus) and is the same plan a tag-filtered OFFSET
-      # query already used (non-regressive) — see docs/runbooks/knowledge-scale.md. We
-      # therefore assert the catastrophe-guard (no unbounded Seq Scan) AND that the bound
-      # is real: both the selective tags GIN and the keyset btree (which applies the
-      # cursor) drive the scan via the index, not a heap filter over the corpus.
+      # array containment AND `(inserted_at, id)` order, so the planner uses the tags
+      # GIN and Sorts. That is bounded by TAG SELECTIVITY (not the corpus) and is the
+      # same plan a tag-filtered OFFSET query already used (non-regressive) — see
+      # docs/runbooks/knowledge-scale.md. We assert the catastrophe-guard (no unbounded
+      # Seq Scan) AND that the bound is REAL: the selective tags GIN drives the scan,
+      # so cost scales with tag-matches, not corpus.
+      #
+      # We deliberately do NOT also require the keyset btree to appear in the plan: once
+      # the tags GIN has cut the corpus to ~2%, the planner is free to apply the cursor
+      # as a cheap heap filter instead of a second BitmapAnd index — a cost-marginal
+      # choice at exactly the 80k floor that a small stats shift can flip. Asserting that
+      # specific BitmapAnd shape would make the nightly gate flaky (false RED) without
+      # catching any real regression; the tags-GIN bound + no-Seq-Scan is the invariant
+      # that actually matters.
       for {label, opts} <- [
             {"+tags", [status: :published, cursor: cursor, limit: 21, tags: ["scale-tag-7"]]},
             {"+tags+category",
@@ -167,9 +189,30 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
         assert :ok = PlanAssertions.assert_index_used(query, "articles_tags_index"),
                "tag-filtered keyset plan for #{label} must be bounded by the selective tags GIN"
 
-        assert :ok = PlanAssertions.assert_index_used(query, "articles_tenant_inserted_id_idx"),
-               "tag-filtered keyset plan for #{label} must apply the cursor via the keyset btree"
+        # Re-tighten what dropping the keyset-btree pin relaxed: the `articles` scan must
+        # stay BOUNDED by tag selectivity (~2% of corpus), not degrade to a heap filter
+        # over the whole tenant corpus (which refute_seq_scan alone wouldn't catch). The
+        # bound is a small fraction of the prod floor — far above ~2% selectivity, far
+        # below the published-row count.
+        max_bounded = div(ScaleSeed.prod_article_floor(), 8)
+
+        assert :ok = PlanAssertions.assert_scan_rows_below(query, max_bounded),
+               "tag-filtered keyset plan for #{label} must stay bounded by tag selectivity, " <>
+                 "not scan the corpus"
       end
+
+      # AC-27.5.3 timeout coverage: the enumeration endpoint's deep page must EXECUTE
+      # (not just plan) well under the heavy-read statement_timeout backstop (US-27.4).
+      deep_query =
+        Knowledge.keyset_query(tenant.id, status: :published, cursor: cursor, limit: 21)
+
+      {elapsed_us, _rows} = :timer.tc(fn -> AdminRepo.all(deep_query) end)
+      elapsed_ms = div(elapsed_us, 1000)
+
+      assert elapsed_ms < @heavy_read_statement_timeout_ms,
+             "deep keyset page took #{elapsed_ms}ms, expected < " <>
+               "#{@heavy_read_statement_timeout_ms}ms (must beat the heavy-read " <>
+               "statement_timeout backstop)"
     end)
   end
 end
