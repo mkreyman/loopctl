@@ -113,6 +113,45 @@ and `request_id=` empty. Lower the threshold to surface a trend before it become
 config :loopctl, :slow_query_threshold_ms, 500
 ```
 
+## Keyset pagination index (US-27.9a)
+
+The article keyset cursor seeks on `(tenant_id, inserted_at, id)`, backed by
+`articles_tenant_inserted_id_idx` (built `CREATE INDEX CONCURRENTLY`,
+`@disable_ddl_transaction`).
+
+**Plan profile by filter shape (verified at 80k, `keyset_plan_scale_test.exs`):**
+
+| List query shape | Plan at prod scale | Cost profile |
+| ---------------- | ------------------ | ------------ |
+| no filter / `category=` (scalar) | Index Scan on the keyset btree, walked in order, **no Sort** | true keyset — O(page) per page |
+| `tags=` (array `&&`) | **BitmapAnd**(tags GIN ∩ keyset btree) → Bitmap Heap Scan → **Sort** | bounded by **tag selectivity**, not corpus |
+
+The array (`tags`) path Sorts because no btree can serve BOTH array containment
+(needs GIN) AND `(inserted_at, id)` order. This is **expected and non-regressive** —
+a tag-filtered *offset* query used the same GIN+Sort plan; the keyset version adds
+drift-freedom on top. It is bounded by how many rows carry the tag (the GIN driver),
+never a full-corpus Seq Scan. If a single tag ever grows to a large fraction of a
+tenant's corpus and tag-filtered deep enumeration becomes hot, the lever is a
+partial/covering index for that workload — not a change to the keyset mechanic.
+The scale test enforces this: scalar shapes must stay strictly index-ordered
+(`refute_full_scan`); the tags shape must avoid a Seq Scan and prove both the tags
+GIN and the keyset btree drive the plan (`refute_seq_scan` + `assert_index_used`).
+
+**Boot probe:** `Loopctl.IndexHealth.warn_if_invalid_indexes/0` runs at boot (prod)
+and logs a WARNING + emits `[:loopctl, :index_health, :invalid]` telemetry if
+`articles_tenant_inserted_id_idx` is missing or INVALID — so the recovery below is
+triggered by an alert, not a latency incident. **Operational note:** if the concurrent build is
+interrupted, Postgres can leave an **INVALID** index behind, and the migration's
+`IF NOT EXISTS` re-run will NOT rebuild it (it sees the name and no-ops). The query
+still returns correct rows (it degrades to a Seq Scan — slower, not wrong). Recovery
+is manual: `DROP INDEX CONCURRENTLY IF EXISTS articles_tenant_inserted_id_idx;` then
+re-run the migration. Verify validity after deploy:
+
+```sql
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index WHERE indexrelid = 'articles_tenant_inserted_id_idx'::regclass;
+```
+
 ## Bulk write path — set-based archive/delete (US-27.12)
 
 `Loopctl.Knowledge.BulkOps` mutates a whole selected set (by ids/tag/source) in

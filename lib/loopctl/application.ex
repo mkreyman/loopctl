@@ -38,6 +38,12 @@ defmodule Loopctl.Application do
     # log-only, never blocks boot.
     if Application.get_env(:loopctl, :env) == :prod, do: Loopctl.DbCapacity.warn_if_over_budget()
 
+    # US-27.9a: warn if a CONCURRENTLY-built critical index (e.g. the article keyset
+    # index) is missing/INVALID after an interrupted build — silent Seq-Scan degradation
+    # otherwise. Prod only, log + telemetry, never blocks boot.
+    if Application.get_env(:loopctl, :env) == :prod,
+      do: Loopctl.IndexHealth.warn_if_invalid_indexes()
+
     result
   end
 

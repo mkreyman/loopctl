@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleCursor
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
@@ -108,6 +109,21 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         type: :integer,
         description: "Results to skip for pagination (default 0)",
         required: false
+      ],
+      cursor: [
+        in: :query,
+        type: :string,
+        description:
+          "Opaque KEYSET cursor for drift-free list enumeration (list mode only). " <>
+            "To use cursor pagination, pass an empty string (`cursor=`) on the FIRST request " <>
+            "to opt into the keyset path (which orders by `inserted_at ASC, id ASC`); then " <>
+            "follow `meta.next_cursor` verbatim on subsequent requests. Omitting the `cursor` " <>
+            "parameter entirely uses the legacy offset path (orders by `updated_at DESC`), " <>
+            "which does not emit `next_cursor`. Do not mix the two paths mid-enumeration, " <>
+            "as the sort order differs. The cursor is integrity-protected and tenant-bound — " <>
+            "a tampered/forged cursor is rejected with 400. Not valid with `q` (relevance " <>
+            "modes return a ranked top-N, not a walk).",
+        required: false
       ]
     ],
     responses: %{
@@ -174,21 +190,97 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         |> Keyword.put(:api_key_id, api_key_id)
         |> Keyword.merge(Visibility.scope_opts(conn))
 
-      case execute_search(tenant_id, query_spec, mode, opts) do
-        {:ok, result} ->
-          json(conn, LoopctlWeb.KnowledgeSearchJSON.search(result, mode))
+      # US-27.9a: the presence of a `cursor` query param (even empty) opts the
+      # LIST path into drift-free keyset pagination. Tenant scope is the
+      # principal's (`tenant_id`), never the cursor; the cursor is
+      # decoded+verified with the caller's tenant key.
+      #
+      #   - param ABSENT      → legacy offset list path (back-compat, unchanged)
+      #   - param EMPTY       → keyset walk FROM THE START (first page, no seek)
+      #   - param a token     → keyset seek AFTER the decoded position
+      #   - param malformed   → 400 (not a string)
+      case keyset_cursor(params) do
+        :none ->
+          run_search(conn, tenant_id, query_spec, mode, opts)
 
-        {:error, :embedding_unavailable} ->
-          conn
-          |> put_status(503)
-          |> json(%{error: %{status: 503, message: "Embedding service unavailable"}})
+        :invalid ->
+          {:error, :bad_request, "cursor parameter must be a string"}
 
-        {:error, :empty_query} ->
-          {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
-
-        {:error, :bad_request, msg} ->
-          {:error, :bad_request, msg}
+        cursor_mode ->
+          run_keyset(conn, tenant_id, query_spec, cursor_mode, opts)
       end
+    end
+  end
+
+  defp run_search(conn, tenant_id, query_spec, mode, opts) do
+    case execute_search(tenant_id, query_spec, mode, opts) do
+      {:ok, result} ->
+        json(conn, LoopctlWeb.KnowledgeSearchJSON.search(result, mode))
+
+      {:error, :embedding_unavailable} ->
+        conn
+        |> put_status(503)
+        |> json(%{error: %{status: 503, message: "Embedding service unavailable"}})
+
+      {:error, :empty_query} ->
+        {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
+
+      {:error, :bad_request, msg} ->
+        {:error, :bad_request, msg}
+    end
+  end
+
+  # The keyset cursor is a LIST-mode (enumeration) concept; pairing it with a
+  # relevance `q` is a client error (the relevance modes return a ranked top-N,
+  # not a stable-tuple walk), so reject rather than silently ignore one of them.
+  defp run_keyset(_conn, _tenant_id, {:search, _q}, _cursor_mode, _opts) do
+    {:error, :bad_request,
+     "cursor pagination is only available for list enumeration; drop 'q' " <>
+       "(supply 'tags' and/or 'category' to enumerate the filtered set)"}
+  end
+
+  # Empty cursor → start the walk from the beginning (no seek position).
+  defp run_keyset(conn, tenant_id, :list, :start, opts) do
+    render_keyset(conn, tenant_id, opts, nil)
+  end
+
+  # Token cursor → defensive decode (garbage / bit-flipped / wrong-tenant → 400,
+  # never a 500 and never a silent reset to page 1, AC-27.9a.4). Tenant scope is
+  # ALWAYS the principal's `tenant_id`; the cursor only carries a position.
+  defp run_keyset(conn, tenant_id, :list, {:cursor, raw}, opts) do
+    case ArticleCursor.decode(tenant_id, raw) do
+      {:ok, position} ->
+        render_keyset(conn, tenant_id, opts, position)
+
+      {:error, :invalid} ->
+        {:error, :bad_request,
+         "Invalid or tampered cursor. Send an empty 'cursor' to start from the " <>
+           "beginning, then follow 'meta.next_cursor' verbatim to paginate."}
+    end
+  end
+
+  defp render_keyset(conn, tenant_id, opts, position) do
+    {:ok, result} = Knowledge.list_keyset(tenant_id, Keyword.put(opts, :cursor, position))
+
+    encoded =
+      case result.next_cursor do
+        nil -> nil
+        cursor -> ArticleCursor.encode(tenant_id, cursor)
+      end
+
+    json(conn, LoopctlWeb.KnowledgeSearchJSON.keyset(%{result | next_cursor: encoded}))
+  end
+
+  # Classifies the `cursor` query param: ABSENT → `:none` (legacy offset path);
+  # PRESENT-but-empty → `:start` (keyset from the beginning); a non-empty string →
+  # `{:cursor, raw}` (keyset seek); a non-string `cursor[]=` form → `:invalid` (400,
+  # not a 500 and not a silent page-1 reset).
+  defp keyset_cursor(params) when is_map(params) do
+    case Map.fetch(params, "cursor") do
+      :error -> :none
+      {:ok, ""} -> :start
+      {:ok, raw} when is_binary(raw) -> {:cursor, raw}
+      {:ok, _non_string} -> :invalid
     end
   end
 

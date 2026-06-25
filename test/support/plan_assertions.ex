@@ -62,6 +62,63 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Weaker than `refute_full_scan/1`: asserts `articles` is not read by a `Seq Scan`
+  or `Parallel Seq Scan` (the genuinely UNBOUNDED full-corpus shapes), while ALLOWING
+  a `Bitmap Heap Scan` driven by a selective index.
+
+  This is for query shapes that legitimately cannot be served by a single ordered
+  index — specifically a keyset walk combined with an ARRAY-membership residual
+  (`tags &&`, served by a GIN index). No btree can provide both array containment AND
+  the `(inserted_at, id)` order, so the planner intersects the GIN bitmap with the
+  keyset btree (a `BitmapAnd`) and Sorts the (selective) result. That is bounded by
+  the residual's selectivity — NOT the corpus — and is the same plan a tag-filtered
+  OFFSET query already used; it is therefore non-regressive, just not true-keyset-cheap.
+  Pair this with `assert_index_used/2` for the selective driver to prove the bound.
+  """
+  def refute_seq_scan(queryable_or_sql) do
+    assert_fresh_stats!()
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = article_scan_nodes(root)
+    bad = Enum.filter(scans, &(&1.node_type == "Seq Scan"))
+
+    cond do
+      scans == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches the `articles` relation — cannot judge scan shape. Plan:\n#{elide(raw)}"
+
+      bad != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected no Seq Scan on `articles` (unbounded full-corpus read), but one is present. " <>
+              "Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Asserts the plan reaches `articles` via the given index `name` somewhere (an
+  `Index Scan`, `Index Only Scan`, or `Bitmap Index Scan` naming it). Proves a
+  selective index actually drives the scan (e.g. the `tags` GIN bounds a tag-filtered
+  keyset query, and the keyset btree applies the cursor) rather than the planner
+  reading the corpus and filtering in the heap.
+  """
+  def assert_index_used(queryable_or_sql, name) when is_binary(name) do
+    {root, raw} = explain_json(queryable_or_sql)
+
+    if name in index_names(root) do
+      :ok
+    else
+      raise ExUnit.AssertionError,
+        message:
+          "Expected the plan to use index #{inspect(name)}, but it does not appear. " <>
+            "Plan:\n#{elide(raw)}"
+    end
+  end
+
+  @doc """
   Asserts `articles` is reached by EXACTLY ONE scan node, which is an `Index Scan`
   (or `Index Only Scan`) on an HNSW index (`pg_am.amname='hnsw'`, verified via catalog,
   not a name match). A sibling/outer full-scan on `articles` therefore cannot hide
@@ -246,6 +303,19 @@ defmodule Loopctl.PlanAssertions do
       node
       |> Map.get("Plans", [])
       |> Enum.flat_map(&article_scan_nodes/1)
+
+    here ++ children
+  end
+
+  # Collect every "Index Name" anywhere in the plan tree (Index Scan, Index Only Scan,
+  # Bitmap Index Scan — the last has no "Relation Name", only "Index Name").
+  defp index_names(node) when is_map(node) do
+    here = if name = node["Index Name"], do: [name], else: []
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&index_names/1)
 
     here ++ children
   end

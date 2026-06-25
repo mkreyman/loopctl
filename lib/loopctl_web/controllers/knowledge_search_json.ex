@@ -23,6 +23,42 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     }
   end
 
+  @doc """
+  Renders a KEYSET (cursor) list page (US-27.9a).
+
+  Unlike `search/2`, the keyset list path carries no relevance score/snippet, and
+  its `meta` documents `next_cursor` (the opaque, already-encoded cursor for the
+  next page, or `null` when the walk is exhausted) and the effective `limit`
+  instead of an offset/total_count. `next_cursor` is encoded by the controller
+  (it needs the tenant key), so this view receives it as a ready string or `nil`.
+  """
+  def keyset(%{results: results, next_cursor: next_cursor, limit: limit}) do
+    %{
+      data: Enum.map(results, &render_list_row/1),
+      meta: %{
+        # The cursor walk is drift-free precisely BECAUSE it carries no
+        # total_count to drift; `next_cursor: null` is the exhaustion signal.
+        next_cursor: next_cursor,
+        limit: limit,
+        search_mode: "list_keyset"
+      }
+    }
+  end
+
+  # Keyset rows always arrive as plain atom-keyed maps from `Knowledge.keyset_query/2`'s
+  # `select` (every field present; `tags` is a non-null `{:array}` default `[]`), so
+  # direct field access is correct — and a missing field SHOULD crash loudly rather than
+  # silently degrade. (`render_result/1` keeps the dual accessor because search results
+  # may be structs.)
+  defp render_list_row(result) do
+    %{
+      id: result.id,
+      title: result.title,
+      category: to_string(result.category),
+      tags: result.tags
+    }
+  end
+
   defp render_result(result, mode) do
     base = %{
       id: result[:id] || result.id,

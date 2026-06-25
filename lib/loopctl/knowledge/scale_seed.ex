@@ -110,6 +110,17 @@ defmodule Loopctl.Knowledge.ScaleSeed do
 
   defp visibility_metadata(_i), do: %{"visibility" => "shared"}
 
+  # Status distribution. Default: all `:published` (US-27.1/27.2/27.6a scale tests
+  # assume a fully-published corpus, so this must not change for them). With
+  # `status_mix: true` (US-27.9a keyset plan test), interleave ~20% non-published
+  # (~10% `:archived`, ~10% `:draft`) so the keyset query's `status = :published`
+  # residual has REAL selectivity — the walk must then skip index entries that don't
+  # match, exercising the deep-page cost the all-published seed hides.
+  defp seed_status(_i, false), do: :published
+  defp seed_status(i, true) when rem(i, 10) == 0, do: :archived
+  defp seed_status(i, true) when rem(i, 10) == 5, do: :draft
+  defp seed_status(_i, true), do: :published
+
   @doc """
   Seeds `count` published articles for `tenant_id`, seeds inter-article links,
   runs ANALYZE, and verifies statistics.
@@ -160,9 +171,11 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     count = Keyword.get(opts, :count, 1_000)
     link_density = Keyword.get(opts, :link_density, 5)
     batch_size = Keyword.get(opts, :batch_size, 1_000)
+    status_mix = Keyword.get(opts, :status_mix, false)
 
     with :ok <- assert_hnsw_index_present!(),
-         {:ok, article_ids} <- insert_articles_in_batches(tenant_id, count, batch_size),
+         {:ok, article_ids} <-
+           insert_articles_in_batches(tenant_id, count, batch_size, status_mix),
          {:ok, link_count} <- seed_links(tenant_id, article_ids, link_density),
          :ok <- analyze_and_verify(tenant_id, length(article_ids)) do
       {:ok, %{articles: length(article_ids), links: link_count}}
@@ -301,7 +314,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     end
   end
 
-  defp insert_articles_in_batches(tenant_id, total_count, batch_size) do
+  defp insert_articles_in_batches(tenant_id, total_count, batch_size, status_mix) do
     article_ids =
       0..(total_count - 1)
       |> Enum.chunk_every(batch_size)
@@ -339,7 +352,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
               # ~10% private memory. NB: suggested_links / US-27.1 / US-27.2 scale tests
               # don't filter on these, so the variation doesn't change their plans.
               category: Enum.at(@scale_categories, rem(i, length(@scale_categories))),
-              status: :published,
+              status: seed_status(i, status_mix),
               slug: slug,
               tags: ["scale-tag-#{rem(i, 50)}"],
               metadata: visibility_metadata(i),

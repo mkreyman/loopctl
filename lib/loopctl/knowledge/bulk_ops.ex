@@ -695,10 +695,16 @@ defmodule Loopctl.Knowledge.BulkOps do
   # Per-tenant confirm secret for the re-confirm-on-drift hash. Derived from the
   # app secret_key_base + tenant_id so it's stable across nodes without storing a
   # separate per-tenant key. NEVER trusted as a delete target — only compared.
+  #
+  # FAIL CLOSED: `secret_key_base` is fetched, not defaulted — signing a confirm
+  # hash with a guessable constant would let a caller forge a drift-confirm. The
+  # raise is unreachable in every real env (runtime.exs requires SECRET_KEY_BASE;
+  # test/dev configs set it). Mirrors `Loopctl.Knowledge.ArticleCursor.secret/1`.
   defp confirm_secret(tenant_id) do
     base =
-      Application.get_env(:loopctl, LoopctlWeb.Endpoint, [])
-      |> Keyword.get(:secret_key_base, "loopctl-bulk-delete-confirm")
+      :loopctl
+      |> Application.fetch_env!(LoopctlWeb.Endpoint)
+      |> Keyword.fetch!(:secret_key_base)
 
     base <> ":" <> to_string(tenant_id)
   end

@@ -58,9 +58,14 @@ defmodule Loopctl.Knowledge do
   # caused callers advancing `offset` by the requested limit to skip rows).
   @max_page_size 1000
 
+  # Default enumeration page size when the caller passes no `:limit`. The keyset
+  # path fetches `@default_page_size + 1` to detect a next page without a COUNT.
+  @default_page_size 20
+
   @doc """
   The maximum page size (`limit`) honored by the **enumeration** paths
-  (`list_articles/2`, `list_filtered/2`, `list_drafts/2`, `list_index/2`).
+  (`list_articles/2`, `list_filtered/2`, `list_keyset/2`, `list_drafts/2`,
+  `list_index/2`).
 
   Exposed so the controller can reject an over-large requested `limit` with a
   400 instead of silently clamping it.
@@ -1456,6 +1461,153 @@ defmodule Loopctl.Knowledge do
          total_count_scope: "filtered_set"
        }
      }}
+  end
+
+  @doc """
+  KEYSET (cursor) enumeration of the filtered article set (US-27.9a).
+
+  The additive, drift-free companion to `list_filtered/2`. Where `list_filtered/2`
+  uses `OFFSET` (which drifts under the concurrent writes this KB sees — a tag
+  count was observed swinging 9,881 → 4,981 mid-enumeration), this seeks on the
+  stable unique tuple `(inserted_at, id)`:
+
+      WHERE tenant_id = ^tenant_id
+        AND (cursor? -> (inserted_at, id) > (^c_inserted, ^c_id))
+      ORDER BY inserted_at ASC, id ASC
+      LIMIT ^(limit + 1)
+
+  The `id` tie-break is mandatory: `inserted_at` is `utc_datetime_usec` and bulk
+  `insert_all` ties timestamps per batch, so `inserted_at` alone is not unique and
+  a page boundary could land mid-batch. The `limit + 1` "peek" tells us whether a
+  next page exists WITHOUT a `COUNT` — so there is no count to drift either.
+
+  Tenant scope comes from `tenant_id` (the caller's authenticated principal),
+  NEVER from the cursor. The cursor encodes only the intra-tenant ordering
+  position and is decoded/verified at the HTTP layer
+  (`Loopctl.Knowledge.ArticleCursor`).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID (from the auth principal)
+  - `opts` -- keyword list:
+    - `:cursor` -- the decoded `{inserted_at, id}` position to seek AFTER, or
+      `nil`/absent to start from the beginning
+    - `:limit` -- max results per page (default 20, max #{@max_page_size}, min 1);
+      clamped here as a safety net, the HTTP layer 400s an over-large request
+    - `:status` -- filter by status atom (default `:published`)
+    - `:project_id`, `:category`, `:tags`, `:match`, `:memory_types`, `:agents`,
+      `:conversation_id`, `:visibility_agent_id` -- same filters as `list_filtered/2`
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], next_cursor: position_or_nil, limit: effective_limit}}`
+    where `next_cursor` is the `(inserted_at, id)` tuple of the LAST returned row
+    when another page exists, else `nil`. The HTTP layer encodes it back into an
+    opaque cursor string.
+  """
+  @spec list_keyset(Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             results: [map()],
+             next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil,
+             limit: pos_integer()
+           }}
+  def list_keyset(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, @default_page_size) |> max(1) |> min(@max_page_size)
+
+    # Fetch limit+1 to detect a next page without a COUNT (AC-27.9a.1).
+    rows =
+      tenant_id
+      |> keyset_query(Keyword.put(opts, :limit, limit + 1))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:enumeration)))
+
+    {page, has_more?} = split_peek(rows, limit)
+
+    next_cursor =
+      if has_more? do
+        last = List.last(page)
+        {last.inserted_at, last.id}
+      end
+
+    maybe_record_search_access(tenant_id, page, "", opts, "list_keyset")
+
+    {:ok, %{results: page, next_cursor: next_cursor, limit: limit}}
+  end
+
+  @doc """
+  Builds the keyset seek QUERYABLE for the article list (US-27.9a), returned (not
+  executed) so the `:scale_nightly` plan test can assert it is index-backed
+  (`(tenant_id, inserted_at, id)`, no Seq Scan) via `EXPLAIN`.
+
+  Same `opts` as `list_keyset/2`; `:limit` is applied as-is here (the caller adds
+  the `+1` peek). This is the EXACT query `list_keyset/2` runs, so the plan
+  assertion guards the request path, not a stunt double.
+
+  Plan note: with no filter or a scalar `:category` filter the planner walks the
+  `(tenant_id, inserted_at, id)` btree in order (true keyset, no Sort). With a
+  `:tags` (array `&&`) filter it BitmapAnds the tags GIN with the keyset btree and
+  Sorts — bounded by tag selectivity, NOT the corpus, since no single index can serve
+  both array containment and the order key. This is expected and non-regressive; do
+  NOT try to "fix" the Sort away (see `keyset_plan_scale_test.exs` and
+  docs/runbooks/knowledge-scale.md).
+  """
+  @spec keyset_query(Ecto.UUID.t(), keyword()) :: Ecto.Query.t()
+  def keyset_query(tenant_id, opts \\ []) do
+    # Default mirrors list_keyset/2's page (@default_page_size) + 1 peek row, so the
+    # :scale_nightly plan test exercises the same shape the request path runs.
+    limit = opts |> Keyword.get(:limit, @default_page_size + 1) |> max(1)
+    status = Keyword.get(opts, :status, :published)
+
+    base = from(a in Article, where: a.tenant_id == ^tenant_id)
+
+    base
+    |> apply_search_filters(status, opts)
+    |> apply_keyset_seek(Keyword.get(opts, :cursor))
+    |> select([a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at
+    })
+    |> order_by([a], asc: a.inserted_at, asc: a.id)
+    |> limit(^limit)
+  end
+
+  # No cursor: enumerate from the start.
+  defp apply_keyset_seek(query, nil), do: query
+
+  # Row-value comparison `(inserted_at, id) > (^ins, ^id)`: the standard keyset
+  # seek that the composite (tenant_id, inserted_at, id) btree serves directly.
+  defp apply_keyset_seek(query, {%DateTime{} = inserted_at, id})
+       when is_binary(id) do
+    # `type/2` tells Ecto the bound params' DB types: the raw `fragment` row-value
+    # comparison would otherwise send `id` as text and `inserted_at` without the
+    # column's type, which Postgrex rejects (id is binary_id / uuid).
+    where(
+      query,
+      [a],
+      fragment(
+        "(?, ?) > (?, ?)",
+        a.inserted_at,
+        a.id,
+        type(^inserted_at, a.inserted_at),
+        type(^id, a.id)
+      )
+    )
+  end
+
+  # Split limit+1 peek rows into the page (≤ limit) and whether more remain.
+  defp split_peek(rows, limit) do
+    if length(rows) > limit do
+      {Enum.take(rows, limit), true}
+    else
+      {rows, false}
+    end
   end
 
   defp apply_search_filters(query, status, opts) do
