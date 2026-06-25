@@ -5,6 +5,40 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.22.0 — 2026-06-24 (bulk-delete: set-based + irreversible hard delete)
+
+### Added
+
+- **`knowledge_bulk_delete`** gains four params for US-27.12:
+  - `dry_run` (bool) — preview only, mutates nothing; returns `meta.would_affect`.
+    With `hard:true` the preview also returns a single-use `meta.token` (or, for a
+    selector larger than the frozen-token bound, a `meta.confirm_hash`).
+  - `hard` (bool) — IRREVERSIBLE hard delete (vs the default reversible archive).
+    Two-step ceremony: dry-run with `hard:true` to obtain a token, then call again
+    with `hard:true` + that `token` to FK-correctly delete the FROZEN id-set
+    (article_links removed first, access events cascade). The token is server-minted,
+    single-use, and TTL-bounded.
+  - `token` (string) — the frozen-set token from the dry-run, required for the hard
+    delete.
+  - `confirm_hash` (string) — for an oversized hard-delete selector (no token):
+    echo back the dry-run's `meta.confirm_hash` to re-confirm the id-set hasn't
+    drifted.
+  Requires `LOOPCTL_USER_KEY` for every variant (agents/orchestrators get 403).
+
+### Changed
+
+- **`knowledge_bulk_delete` response shape (default soft archive).** The default
+  (soft) path is now **set-based** (one statement + one audit event) instead of
+  per-row. The response is a backward-compatible superset: `meta.counts`
+  (`requested`/`archived`/`skipped`/`not_found`/`errored`) and `meta.count` are
+  still present (so existing consumers of the partial-success warning keep working),
+  but **`meta.results` is now always `[]`** (the set-based op has no per-id
+  breakdown — use `meta.affected`/`meta.counts`), and **`meta.counts.skipped` is
+  redefined** as `resolved − affected` (rows already archived/inactive) rather than
+  a per-id skip-with-reason. New additive fields: `meta.affected`, `meta.set_based`,
+  `meta.op`. A zero-match selector now returns `200` with `affected: 0` (idempotent)
+  instead of `400`.
+
 ## 2.21.1 — 2026-06-24 (novelty accepts the AC request shape)
 
 ### Fixed

@@ -113,6 +113,31 @@ and `request_id=` empty. Lower the threshold to surface a trend before it become
 config :loopctl, :slow_query_threshold_ms, 500
 ```
 
+## Bulk write path — set-based archive/delete (US-27.12)
+
+`Loopctl.Knowledge.BulkOps` mutates a whole selected set (by ids/tag/source) in
+ONE `update_all`/`delete_all` + ONE audit event, inside a single `AdminRepo`
+transaction. The hard-delete is FK-correct (article_links removed first, both
+directions; access events cascade). Knobs (all config-driven):
+
+| Setting | Default | Purpose |
+| ------- | ------- | ------- |
+| selector cap | 5000 | max rows a selector may match (else `:too_many`) |
+| `:bulk_op_statement_timeout_ms` | 10s | per-statement `SET LOCAL statement_timeout` (blast-radius bound) |
+| `:bulk_op_transaction_timeout_ms` | 15s | transaction-level checkout bound (reclaims the connection if statements chain) |
+| `:bulk_delete_frozen_max` | 1000 | max id-set stored in a single-use dry-run token; larger selectors use the `confirm_hash` re-confirm-on-drift path |
+| `:bulk_delete_token_ttl_seconds` | 300 | dry-run token lifetime (swept hourly by `BulkDeleteTokenCleanupWorker`) |
+
+**Worst-case connection hold (AC-27.12.5):** a single bulk op runs on the small
+**3-connection `AdminRepo`** pool and holds one connection for up to the
+transaction timeout (~15s worst case). **Caveat:** a few concurrent bulk deletes
+can transiently saturate the shared admin pool (other BYPASSRLS admin callers see
+queue latency until they drain) — bounded, not corrupting, and gated to
+`role: :user`. For a very large cleanup, run it off-peak or in narrower selectors;
+do NOT raise the selector cap without re-checking the US-27.11 pool budget. The
+statement timeout is intentionally short so a pathological plan fails fast and
+frees the connection rather than holding it.
+
 ## `hnsw.ef_search` recall lever (US-27.11 → US-27.6b)
 
 `hnsw.ef_search` is a pgvector **custom** GUC that does not exist until the

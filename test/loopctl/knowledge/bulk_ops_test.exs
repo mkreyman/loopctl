@@ -292,6 +292,30 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       assert AdminRepo.get(Article, a3.id)
     end
 
+    test "tokened delete audit records the FROZEN id count (forensic record of the irreversible op)" do
+      # The delete audit for the token path must record how many ids the token
+      # FROZE — not just the token id — so the immutable record of an IRREVERSIBLE
+      # delete carries the blast size. selector.count == the frozen set size.
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["audctf"]})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["audctf"]})
+
+      assert {:ok, %{token: token_id}} =
+               BulkOps.preview(tenant.id, :delete, {:tag, "audctf"}, audit_opts())
+
+      assert {:ok, %{affected: 2}} =
+               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+
+      audits = bulk_audits(tenant.id, "article.bulk_deleted")
+      assert length(audits) == 1
+      selector = hd(audits).metadata["selector"]
+      assert selector["type"] == "token"
+      assert selector["token"] == token_id
+      # The frozen count (2) is recorded — the load-bearing forensic detail.
+      assert selector["count"] == 2
+      assert hd(audits).metadata["affected_count"] == 2
+    end
+
     test "token is single-use: the SECOND consumption is REFUSED (not silently affected:0)" do
       tenant = fixture(:tenant)
       survivor = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["twice"]})
@@ -419,6 +443,32 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       assert would == max + 1
       assert length(ids) == max + 1
+
+      # No FROZEN-set token is minted over the bound (the re-confirm path freezes
+      # nothing). The oversized path mints exactly one reconfirm NONCE (replay
+      # marker), so there are zero frozen_token rows and one reconfirm_nonce row.
+      assert AdminRepo.aggregate(
+               from(t in BulkDeleteToken, where: t.type == "frozen_token"),
+               :count,
+               :id
+             ) == 0
+
+      assert AdminRepo.aggregate(
+               from(t in BulkDeleteToken, where: t.type == "reconfirm_nonce"),
+               :count,
+               :id
+             ) == 1
+    end
+
+    test "zero-match hard dry-run mints NO token (token: nil, no rows minted)" do
+      # A selector that matches nothing must NOT mint a single-use frozen-set token
+      # that could only ever delete nothing — pure table noise. would_affect is 0
+      # and token is nil, with zero rows in the table.
+      tenant = fixture(:tenant)
+      # no articles tagged "ghost" exist
+      assert {:ok, %{would_affect: 0, token: nil}} =
+               BulkOps.preview(tenant.id, :delete, {:tag, "ghost"}, audit_opts())
+
       assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
     end
   end

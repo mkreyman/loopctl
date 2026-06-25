@@ -10,8 +10,13 @@ defmodule Loopctl.Repo.Migrations.CreateKnowledgeBulkDeleteTokens do
   # delete operates on exactly the previewed rows (not whatever the selector
   # matches at execution time — that closes the TOCTOU window). Tokens are
   # single-use (`used_at`) and TTL-bounded (`expires_at`). A forged token can't
-  # target another tenant's rows: the row carries `tenant_id` and is loaded by
-  # (id AND tenant_id), and RLS scopes it as well.
+  # target another tenant's rows: the row carries `tenant_id` and EVERY query is
+  # loaded by (id AND tenant_id).
+  #
+  # NOTE: all queries against this table run on Loopctl.AdminRepo (BYPASSRLS), so
+  # the RLS policy enabled below is NEVER evaluated on the live path and is NOT an
+  # active backstop — tenant isolation rests solely on the explicit tenant_id
+  # predicates above. The policy is kept for defense-in-depth / future RLS-repo use.
   def change do
     create table(:knowledge_bulk_delete_tokens, primary_key: false) do
       add :id, :binary_id, primary_key: true

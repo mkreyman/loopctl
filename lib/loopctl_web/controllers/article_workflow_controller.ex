@@ -463,8 +463,24 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
-  # Re-confirm-on-drift: oversized selector (no token). Re-resolve the selector
-  # now and refuse if the id-set changed since the dry-run (compare confirm_hash).
+  # Re-confirm-on-drift: oversized selector (no frozen token). This path is NOT
+  # single-use (an oversized selector mints no frozen-set token) — its safety comes
+  # entirely from a live drift check, not from token consumption:
+  #
+  #   1. The server RE-RESOLVES the selector right now (BulkOps.resolve_selector),
+  #      getting the CURRENT matching, tenant-scoped, active id-set.
+  #   2. It recomputes confirm_hash over that live set and compares it to the hash
+  #      the dry-run echoed to the client.
+  #   3. If the id-set GREW (a new row started matching the tag/source after the
+  #      dry-run) OR shrank, the hash differs → 400 "drift", nothing is deleted.
+  #
+  # This is exactly the harmful case a replay could otherwise cause: it is
+  # IMPOSSIBLE to sweep newly-matching rows the operator never previewed, because
+  # any such new row changes the hash and is refused. A byte-identical replay (same
+  # selector, same hash, set unchanged) re-deletes an already-gone set → affected 0,
+  # harmless. So "not single-use" does not mean "replayable into damage": the drift
+  # check, not a nonce, is the guarantee. (The minted reconfirm nonce is a
+  # belt-and-suspenders replay marker; the load-bearing protection is the hash.)
   defp bulk_delete_reconfirm(conn, tenant_id, params, audit_opts) do
     confirm_hash = params["confirm_hash"]
 

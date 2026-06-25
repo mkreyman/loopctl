@@ -73,6 +73,19 @@ defmodule Loopctl.Knowledge.BulkOps do
   backstop; the integration test (`delete/3` over ~100 articles, each with links
   and several access events) exercises this end-to-end below the :scale tier.
 
+  ### Pool-saturation caveat (honest framing)
+
+  The bound above is per-transaction (ONE connection held for ≤15s). It is NOT a
+  whole-pool bound. The AdminRepo pool is small (3 connections, US-27.11), so a
+  handful of concurrent bulk deletes can transiently occupy ALL of it: while they
+  run, other admin callers (other bulk ops, BYPASSRLS reads) queue for a
+  connection and see degraded latency until one frees up. This is bounded — each
+  holder is capped at the ≤15s transaction timeout, so the worst-case wait is also
+  ≤~15s, and there is NO data corruption (every op is still all-or-nothing) — but
+  it IS a real, observable latency hit on the shared admin pool under concurrency,
+  not merely a single-connection hold. Operators sizing the admin pool or running
+  many bulk deletes in parallel should account for this.
+
   ## Idempotency
 
   Archive/unpublish gate on `status in <archivable>`, so re-running on
@@ -171,7 +184,12 @@ defmodule Loopctl.Knowledge.BulkOps do
   (tenant-scoped) FIRST, then delete the articles (`article_access_events`
   cascade), then write one audit event. Returns
   `{:ok, %{affected: n, resolved_count: r}}` where `n` is the number of articles
-  deleted (`r == n` for the frozen-set delete).
+  actually deleted, and `r` is `length(frozen_ids)` after sanitization (dedup +
+  drop of non-UUID junk). `r` is NOT guaranteed to equal `n` (`would_affect`): it
+  can EXCEED `affected` when some frozen ids are cross-tenant or already gone —
+  those resolve to "no row deleted" but still count toward the frozen set the
+  caller asked us to operate on. Treat `r` as the size of the requested set, not a
+  delete count.
   """
   @spec delete(Ecto.UUID.t(), [Ecto.UUID.t()], audit_opts()) ::
           {:ok, %{affected: non_neg_integer(), resolved_count: non_neg_integer()}}
@@ -210,14 +228,40 @@ defmodule Loopctl.Knowledge.BulkOps do
   def preview(tenant_id, :delete, selector, _audit_opts) do
     with {:ok, ids} <- resolve_selector(tenant_id, selector) do
       sorted = Enum.sort(ids)
-      n = length(sorted)
+      preview_delete_result(tenant_id, sorted)
+    end
+  end
 
-      if n <= frozen_token_max() do
-        token = mint_token!(tenant_id, sorted)
-        {:ok, %{would_affect: n, token: token.id, frozen_ids: sorted}}
-      else
-        {:ok, %{would_affect: n, token: nil, oversized: true, frozen_ids: sorted}}
-      end
+  defp preview_delete_result(_tenant_id, []) do
+    # A zero-match selector mints NO token: a single-use frozen-set token over an
+    # empty id-set could only ever delete nothing, so it is pure table noise (and
+    # one more row for the TTL sweeper to reap). The caller can re-run the dry-run
+    # if the selector later matches rows.
+    {:ok, %{would_affect: 0, token: nil}}
+  end
+
+  defp preview_delete_result(tenant_id, sorted) do
+    n = length(sorted)
+
+    if n <= frozen_token_max() do
+      token = mint_token!(tenant_id, sorted)
+      {:ok, %{would_affect: n, token: token.id, frozen_ids: sorted}}
+    else
+      preview_delete_oversized(tenant_id, n, sorted)
+    end
+  end
+
+  defp preview_delete_oversized(tenant_id, n, sorted) do
+    with {:ok, nonce_id} <- mint_nonce_for_oversized(tenant_id) do
+      {:ok,
+       %{
+         would_affect: n,
+         token: nil,
+         oversized: true,
+         nonce: nonce_id,
+         frozen_ids: sorted,
+         confirm_hash: confirm_hash(tenant_id, sorted)
+       }}
     end
   end
 
@@ -248,6 +292,112 @@ defmodule Loopctl.Knowledge.BulkOps do
   end
 
   def delete_with_token(_tenant_id, _token_id, _audit_opts), do: {:error, :invalid_token}
+
+  @doc """
+  Mint a single-use nonce for the oversized reconfirm path.
+
+  When a delete selector exceeds the frozen-token bound, the dry-run returns
+  `oversized: true` and mints a placeholder nonce row instead of a frozen-token.
+  The nonce is consumed once on the reconfirm-on-drift path to prevent replays of
+  the same set. Returns `{:ok, nonce_id}` or `{:error, reason}`.
+  """
+  @spec mint_reconfirm_nonce(Ecto.UUID.t()) :: {:ok, Ecto.UUID.t()} | {:error, term()}
+  def mint_reconfirm_nonce(tenant_id) do
+    expires_at = DateTime.add(DateTime.utc_now(), token_ttl_seconds(), :second)
+
+    %BulkDeleteToken{tenant_id: tenant_id}
+    |> BulkDeleteToken.create_changeset(%{
+      type: "reconfirm_nonce",
+      article_ids: [],
+      expires_at: expires_at
+    })
+    |> AdminRepo.insert()
+    |> case do
+      {:ok, token} -> {:ok, token.id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Consume a reconfirm nonce and delete over a re-resolved selector.
+
+  For oversized selectors, the dry-run returns `oversized: true` and a nonce id.
+  The real run re-resolves the selector, recomputes the hash, and compares it to
+  the dry-run hash. If they match (no drift), the nonce is consumed (single-use)
+  and the delete proceeds over the re-resolved ids. If the nonce is already used,
+  expired, or missing, returns `{:error, :invalid_nonce}`. If hashes don't match
+  (drift detected), returns `{:error, :hash_mismatch}`.
+  """
+  @spec delete_with_reconfirm(Ecto.UUID.t(), Ecto.UUID.t(), selector(), String.t(), audit_opts()) ::
+          {:ok, %{affected: non_neg_integer(), resolved_count: non_neg_integer()}}
+          | {:error, :invalid_nonce}
+          | {:error, :hash_mismatch}
+          | {:error, term()}
+  def delete_with_reconfirm(tenant_id, nonce_id, selector, confirm_hash_value, audit_opts)
+      when is_binary(nonce_id) do
+    if valid_uuid?(nonce_id) do
+      delete_with_reconfirm_valid(tenant_id, nonce_id, selector, confirm_hash_value, audit_opts)
+    else
+      {:error, :invalid_nonce}
+    end
+  end
+
+  def delete_with_reconfirm(_tenant_id, _nonce_id, _selector, _confirm_hash, _audit_opts),
+    do: {:error, :invalid_nonce}
+
+  defp delete_with_reconfirm_valid(tenant_id, nonce_id, selector, confirm_hash_value, audit_opts) do
+    with {:ok, ids} <- resolve_selector(tenant_id, selector) do
+      sorted = Enum.sort(ids)
+
+      if confirm_hash(tenant_id, sorted) != confirm_hash_value do
+        {:error, :hash_mismatch}
+      else
+        tenant_id
+        |> delete_with_reconfirm_multi(nonce_id, sorted, audit_opts)
+        |> run_multi(length(sorted))
+      end
+    end
+  end
+
+  @doc """
+  Mint a reconfirm nonce for an oversized selector.
+
+  Called by the preview path when the selector exceeds frozen_token_max.
+  Returns the nonce id to be passed back to delete_with_reconfirm.
+  """
+  @spec mint_nonce_for_oversized(Ecto.UUID.t()) :: {:ok, Ecto.UUID.t()} | {:error, term()}
+  def mint_nonce_for_oversized(tenant_id) do
+    mint_reconfirm_nonce(tenant_id)
+  end
+
+  # Consume a reconfirm nonce and run the delete over re-resolved ids.
+  # Similar to delete_with_token but uses a different nonce type and doesn't
+  # freeze the article_ids (they are re-resolved on each call for drift detection).
+  defp delete_with_reconfirm_multi(tenant_id, nonce_id, article_ids, audit_opts) do
+    now = DateTime.utc_now()
+
+    consume_query =
+      from(t in BulkDeleteToken,
+        where:
+          t.id == ^nonce_id and t.tenant_id == ^tenant_id and t.type == "reconfirm_nonce" and
+            is_nil(t.used_at) and t.expires_at > ^now
+      )
+
+    timeout_multi()
+    |> Multi.update_all(:consume_nonce, consume_query, set: [used_at: now])
+    |> Multi.run(:assert_consumed, fn _repo, %{consume_nonce: {count, _returned}} ->
+      if count == 1, do: {:ok, :consumed}, else: {:error, :invalid_nonce}
+    end)
+    |> Multi.merge(fn _changes ->
+      append_delete_steps(
+        Multi.new(),
+        tenant_id,
+        article_ids,
+        %{nonce: nonce_id, resolved_count: length(article_ids)},
+        audit_opts
+      )
+    end)
+  end
 
   @doc """
   Hash of a sorted id-set, for the re-confirm-on-drift path used when a delete
@@ -370,7 +520,7 @@ defmodule Loopctl.Knowledge.BulkOps do
         Multi.new(),
         tenant_id,
         article_ids,
-        %{token: token_id, count: length(article_ids)},
+        %{token: token_id, ids: article_ids},
         audit_opts
       )
     end)
@@ -470,12 +620,18 @@ defmodule Loopctl.Knowledge.BulkOps do
   defp summarize_selector({:source, source_id}),
     do: %{"type" => "source", "source_id" => source_id}
 
+  # Token-path delete: record the FROZEN id COUNT alongside the token id. The
+  # token id alone is a weak forensic record of an IRREVERSIBLE delete; the
+  # frozen count is the load-bearing "how many rows did this token authorize"
+  # detail. We record the count (not the full id list) to keep audit metadata
+  # bounded — the frozen set can be up to bulk_delete_frozen_max ids.
+  defp summarize_selector(%{token: token_id, ids: ids}),
+    do: %{"type" => "token", "token" => token_id, "count" => length(ids)}
+
   defp summarize_selector(%{ids: ids}), do: %{"type" => "ids", "count" => length(ids)}
 
-  defp summarize_selector(%{token: token_id, count: count}),
-    do: %{"type" => "token", "token" => token_id, "count" => count}
-
-  defp summarize_selector(%{token: token_id}), do: %{"type" => "token", "token" => token_id}
+  defp summarize_selector(%{nonce: nonce_id, resolved_count: resolved_count}),
+    do: %{"type" => "nonce", "nonce" => nonce_id, "resolved_count" => resolved_count}
 
   defp maybe_put_source_type(map, st) when is_binary(st), do: Map.put(map, "source_type", st)
   defp maybe_put_source_type(map, _), do: map
