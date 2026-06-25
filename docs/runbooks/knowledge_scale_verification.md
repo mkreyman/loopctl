@@ -45,6 +45,16 @@ curl -sS -H "Authorization: Bearer $LOOPCTL_KEY" \
   "https://loopctl.com/api/v1/knowledge/<endpoint>?<repro-params>" -o /dev/null -w '%{http_code}\n'
 ```
 
+> **`$LOOPCTL_KEY` must be an API key for the SAME tenant on the issue.** Requests are
+> RLS-scoped: a key for the wrong tenant returns `404`/empty (not the timeout), so
+> "confirming 200" with a mismatched key is itself a false-green. Use a read-scoped key
+> for the repro tenant (mint via the dispatch pattern / an existing tenant API key), not
+> a write/orchestrator key.
+>
+> **`fly` access** (`fly logs`, `fly ssh console`) requires operator CLI auth (the
+> operator's Fly account). If you don't have it, hand the `fly logs` / live `EXPLAIN`
+> steps to an operator — do NOT close the issue on the local gate alone.
+
 A statement timeout surfaces as a **`504` with code `db_statement_timeout`** (US-27.4
 maps SQLSTATE `57014` → 504; see `lib/loopctl_web/db_error.ex`). A generic `500`
 `db_error` is the catch-all for an *unmapped* SQLSTATE and does **not** carry the
@@ -58,7 +68,8 @@ issue** before claiming a fix.
 
 Two layers: (1) a **representative-scale corpus** with plan assertions in CI/local,
 and (2) a **live `EXPLAIN ANALYZE`** on the deployed build. Both are required — the
-staging corpus is an approximation (a 50–100k seed vs the 76k+ prod corpus and prod's
+staging corpus is an approximation (the ~80k `ScaleSeed.prod_article_floor` vs the 76k+
+growing prod corpus and prod's
 ANALYZE stats), so the live step is never optional.
 
 ### The scale gate (representative corpus + plan assertions)
@@ -70,17 +81,33 @@ prod scale — the vector ANN path, the enumeration/keyset path, and the shared
 plan-assertion suite — under the planner's **natural** choice (no `enable_seqscan=off`),
 which is the distinction that produced the false-green in #172.
 
+**What the gate asserts (be precise — the gate's value is knowing exactly what it covers):**
+- **Plan shape at scale** — index-backed, no full-corpus Seq Scan — for the vector ANN
+  (`vector_search_scale_test.exs`), the enumeration/keyset path
+  (`keyset_plan_scale_test.exs`), and the shared assertions (`plan_assertions_scale_test.exs`).
+- **Per-request timeout at scale** — the worst-case ANN and the deep keyset page must
+  EXECUTE under the heavy-read pool `statement_timeout` backstop (US-27.4). NB: this is
+  the **pool-level** backstop on those two endpoints. The per-endpoint `statement_timeout`
+  **overrides** (`:heavy_read_statement_timeout_overrides`) are unit-tested
+  (`heavy_read_statement_timeout_test.exs`), NOT scale-tested — the scale gate covers the
+  backstop that actually protects prod, not every override permutation.
+
 It runs in two places:
 
 - **CI nightly** (`.github/workflows/ci.yml`, job `Scale Nightly`): on the 02:00 UTC
-  schedule, `SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly`. This
-  runs **all** `:scale_nightly` tests — `scale_seed_nightly_test.exs`,
-  `vector_search_scale_test.exs`, `plan_assertions_scale_test.exs`, and
-  `keyset_plan_scale_test.exs` — not just one file.
-- **Locally, before merging any Theme 2/3/4 (vector / timeout / pagination) PR** — the
-  gate is nightly-only in CI (an 80k seed is too slow for every PR and there is no
-  always-on staging env), so a perf PR is **verified locally** against the seed before
-  merge:
+  schedule, as a **matrix — one isolated job per scale file** (each with a fresh Postgres,
+  so a committed-row corpus from one file can't pollute another's global planner stats).
+  Each leg runs `SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly <file>`.
+  Across the matrix it covers `scale_seed_nightly_test.exs`, `vector_search_scale_test.exs`,
+  `plan_assertions_scale_test.exs`, and `keyset_plan_scale_test.exs`. The matrix list is
+  kept in lock-step with the tagged files by `scale_verification_runbook_test.exs` (set-equality).
+- **Before merging any Theme 2/3/4 (vector / timeout / pagination) PR** — the gate is
+  schedule-only in CI (4×80k seeds is too slow for every PR, and there is no always-on
+  staging env), so a perf PR is verified pre-merge by EITHER:
+  1. **triggering the gate on your branch** — `gh workflow run CI --ref <your-branch>`
+     (the `workflow_dispatch` trigger runs the full matrix on the branch; confirm all four
+     legs go green), OR
+  2. **running it locally** against the seed:
 
   ```sh
   # Reset first — scale tests COMMIT rows (unboxed) that otherwise pollute later runs.
@@ -92,6 +119,11 @@ It runs in two places:
   MIX_ENV=test mix ecto.reset   # leave the DB clean for the normal suite
   ```
 
+  This pre-merge run is **required**, not optional, for a query/index change — it is the
+  enforced substitute for an every-PR gate. (Likewise: any change to the `scale-nightly`
+  matrix job itself must be `workflow_dispatch`-validated on its branch before merge,
+  since the job does not run on the PR.)
+
 The plain `mix test` suite **always excludes** `:scale` and `:scale_nightly`
 (`test/test_helper.exs`), so the gate never slows the default unit run.
 
@@ -101,13 +133,25 @@ CI proves the plan on a *seeded* corpus; this proves it on the *real* one with p
 stats, on the *currently deployed* release. loopctl has no Sentry but it has a remote
 console — use the release `rpc` (the bin is `/app/bin/loopctl`):
 
+Build `q` from the SAME query builder the endpoint and the scale tests use — e.g.
+`Loopctl.Knowledge.keyset_query/2` (enumeration) or the `Knowledge.*_query` /
+`suggestion_candidates_query` builders (vector) — so you EXPLAIN the real request path,
+not a hand-written approximation.
+
 ```sh
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc '
   import Ecto.Query
-  q = <the exact query the endpoint builds>
+  # q MUST carry an explicit tenant_id filter (see caution below).
+  q = Loopctl.Knowledge.keyset_query(\"<tenant-uuid>\", status: :published, cursor: nil, limit: 21)
   IO.puts(Loopctl.AdminRepo.explain(:all, q, analyze: true))
 '"
 ```
+
+> **⚠ `AdminRepo` is the BYPASSRLS repo.** It does NOT enforce tenant isolation. Every
+> probe query MUST carry an explicit `tenant_id` filter, and use it for `explain` only —
+> never adapt this block into an `AdminRepo.all` data read, which would read across
+> tenants. Scrub tenant slugs / `request_id`s from any `fly logs` output before pasting
+> it onto a public issue.
 
 Read the plan the SAME way the assertions do: the relation must be reached by an
 **Index Scan** on the expected index (HNSW for ANN, the `(tenant_id, inserted_at, id)`

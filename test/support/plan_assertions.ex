@@ -99,6 +99,40 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Asserts every scan node on `articles` has an estimated row count below `max_rows`.
+
+  Companion to `refute_seq_scan/1` for the tag-filtered keyset shape: it proves the
+  scan is BOUNDED (cost scales with the selective residual, not the corpus), so a
+  regression that turns the cursor into a heap filter over the whole tenant corpus —
+  which `refute_seq_scan` alone would NOT catch (it'd still be a Bitmap/Index scan, just
+  an unbounded one) — trips this instead. Pick `max_rows` as a small multiple of the
+  residual's expected selectivity, comfortably below the corpus size.
+  """
+  def assert_scan_rows_below(queryable_or_sql, max_rows) when is_integer(max_rows) do
+    assert_fresh_stats!()
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = article_scan_nodes(root)
+
+    over = Enum.filter(scans, &(is_number(&1.rows) and &1.rows >= max_rows))
+
+    cond do
+      scans == [] ->
+        raise ExUnit.AssertionError,
+          message: "Plan never reaches `articles` — cannot judge scan rows. Plan:\n#{elide(raw)}"
+
+      over != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected every `articles` scan estimate < #{max_rows} (bounded by residual " <>
+              "selectivity), but got #{inspect(Enum.map(over, & &1.rows))} — an unbounded scan " <>
+              "over the corpus. Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
   Asserts the plan reaches `articles` via the given index `name` somewhere (an
   `Index Scan`, `Index Only Scan`, or `Bitmap Index Scan` naming it). Proves a
   selective index actually drives the scan (e.g. the `tags` GIN bounds a tag-filtered
@@ -294,7 +328,13 @@ defmodule Loopctl.PlanAssertions do
   defp article_scan_nodes(node) when is_map(node) do
     here =
       if node["Relation Name"] == "articles" do
-        [%{node_type: node["Node Type"], index_name: node["Index Name"]}]
+        [
+          %{
+            node_type: node["Node Type"],
+            index_name: node["Index Name"],
+            rows: node["Plan Rows"]
+          }
+        ]
       else
         []
       end

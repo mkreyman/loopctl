@@ -101,25 +101,38 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
     # test/loopctl/knowledge/ MUST be listed in the CI matrix, or it would silently
     # never run in CI (the exact bug US-27.5 fixes — the plan-assertion scale tests
     # were tagged :scale_nightly but no job ran them). Add a scale test → wire it here.
-    test "every :scale_nightly test file is wired into the CI matrix (no silent gaps)" do
-      ci = File.read!(@ci)
+    test "the CI matrix exactly equals the set of :scale_nightly test files (no silent gaps)" do
+      # Source of truth = the filesystem. Scan the WHOLE test tree for a scale_nightly
+      # tag in ANY accepted ExUnit form, LINE-ANCHORED so a commented-out `# @moduletag`
+      # or a tag mentioned in a string/comment does NOT count (security: false-positive
+      # and false-negative both close the gate-erosion hole).
+      tag_re = ~r/^\s*@(?:moduletag|tag)\b.*:scale_nightly\b/m
 
-      # Scan the WHOLE test tree, not one dir — a :scale_nightly test added anywhere
-      # must be wired into the matrix or it silently never runs in CI.
-      # Full relative paths (the matrix lists full paths, so a scale test anywhere in
-      # the tree is wireable without a dir assumption).
       tagged_files =
         "test/**/*_test.exs"
         |> Path.wildcard()
-        |> Enum.filter(&(File.read!(&1) =~ ~r/@moduletag\s+:scale_nightly/))
+        |> Enum.filter(&(File.read!(&1) =~ tag_re))
+        |> MapSet.new()
 
-      assert tagged_files != [], "expected to find :scale_nightly-tagged test files"
+      # The matrix is the source of what CI RUNS. Parse the actual list items (not a
+      # whole-file substring — a path in a comment must NOT satisfy the guard), scoped
+      # to the `scale_file:` block.
+      matrix_files = ci_matrix_files() |> MapSet.new()
 
-      for f <- tagged_files do
-        assert ci =~ f,
-               "scale_nightly test #{f} is NOT listed in the CI scale matrix — it would " <>
-                 "never run in CI. Add it to strategy.matrix.scale_file in ci.yml."
-      end
+      assert MapSet.size(tagged_files) > 0, "expected to find :scale_nightly-tagged test files"
+
+      # SET-EQUALITY, both directions: a tagged file missing from the matrix would never
+      # run in CI; a matrix entry with no tagged file is stale (renamed/deleted) and that
+      # leg would error (`mix test` exits non-zero on a bad path, but catch it here at
+      # PR time, not at 02:00 UTC).
+      missing_from_matrix = MapSet.difference(tagged_files, matrix_files)
+      stale_in_matrix = MapSet.difference(matrix_files, tagged_files)
+
+      assert MapSet.equal?(tagged_files, matrix_files),
+             "CI scale matrix is out of sync with the :scale_nightly test files.\n" <>
+               "Missing from matrix (would never run in CI): #{inspect(MapSet.to_list(missing_from_matrix))}\n" <>
+               "Stale in matrix (no such tagged file): #{inspect(MapSet.to_list(stale_in_matrix))}\n" <>
+               "Fix strategy.matrix.scale_file in #{@ci}."
     end
 
     test "the default `mix test` suite excludes scale tags (gate never slows it)" do
@@ -127,6 +140,22 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
       assert helper =~ ":scale", "test_helper must exclude :scale by default"
       assert helper =~ ":scale_nightly", "test_helper must exclude :scale_nightly by default"
     end
+  end
+
+  # Parse the `strategy.matrix.scale_file:` YAML block-list items from ci.yml — only the
+  # actual list entries, NOT path strings that appear in comments or other jobs. We take
+  # the lines following `scale_file:` while they are `- <path>` list items at a deeper
+  # indent, stopping at the first line that isn't one (the next key / dedent).
+  defp ci_matrix_files do
+    lines = @ci |> File.read!() |> String.split("\n")
+    start = Enum.find_index(lines, &(&1 =~ ~r/^\s*scale_file:\s*$/))
+
+    refute is_nil(start), "ci.yml must declare strategy.matrix.scale_file"
+
+    lines
+    |> Enum.drop(start + 1)
+    |> Enum.take_while(&(String.trim(&1) =~ ~r/^- \S/))
+    |> Enum.map(fn line -> line |> String.trim() |> String.replace_prefix("- ", "") end)
   end
 
   # Split a markdown doc into %{"Heading" => content} for `##`/`###` headings.

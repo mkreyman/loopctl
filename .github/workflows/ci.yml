@@ -8,6 +8,10 @@ on:
   schedule:
     # Nightly at 02:00 UTC — runs scale-nightly job (TC-27.1.5, prod-floor HNSW plan check)
     - cron: "0 2 * * *"
+  # Manual trigger so the (otherwise schedule-only) scale-nightly matrix can be RUN and
+  # validated on a branch BEFORE merge — `gh workflow run CI --ref <branch>` (US-27.5).
+  # Without this the matrix change is never exercised by its own PR.
+  workflow_dispatch:
 
 env:
   MIX_ENV: test
@@ -303,7 +307,11 @@ jobs:
     # so cross-file pollution is impossible by construction, and wall-clock is max(file)
     # not sum(files). Adding a :scale_nightly test? Add its file here or it won't gate.
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    # Schedule (nightly) OR manual dispatch (pre-merge validation on a branch). Not
+    # every-PR: the 4×80k seed is too slow for every push, so the enforced pre-merge
+    # step for a Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>`
+    # or the local run in docs/runbooks/knowledge_scale_verification.md.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -393,11 +401,20 @@ jobs:
       # The file list lives in strategy.matrix.scale_file (above); the runbook test
       # (scale_verification_runbook_test.exs) guards that every :scale_nightly file is
       # listed there, so gate coverage cannot silently erode.
+      #
+      # NB: `--only scale_nightly` is the SOLE test selector here. The env vars are NOT
+      # load-bearing for selection (they gate the SCALE_NIGHTLY exclude in test_helper,
+      # but `--only` overrides the exclude regardless). Do NOT "simplify" by dropping
+      # `--only` and trusting the env: without it the normal suite runs and exits 0 — a
+      # false-green where the gate silently never ran.
       - name: Run nightly scale gate (US-27.1 prod-floor + US-27.2 plan assertions at scale)
         run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly ${{ matrix.scale_file }}
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
-        timeout-minutes: 35
+        # 45 > the per-test ExUnit `@moduletag timeout: 30 min`, so ExUnit's timer always
+        # binds first and a slow run fails with a legible test error, not an opaque
+        # GitHub step cancel. One 80k seed + assertions; the old 45 covered all four.
+        timeout-minutes: 45
 
   deploy:
     name: Deploy
