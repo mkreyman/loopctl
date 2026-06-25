@@ -40,7 +40,10 @@ config :loopctl, Loopctl.HeavyReadRepo,
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2,
   ownership_timeout: :timer.minutes(30),
-  parameters: [statement_timeout: "250ms"]
+  # Bare-integer ms (the format the prod path ships, validated in runtime.exs); a low
+  # 250ms so the fast-fire mechanism tests are sub-second. Postgres normalizes the
+  # display to "250ms" (asserted in heavy_read_repo_test).
+  parameters: [statement_timeout: "250"]
 
 # DI (US-27.11): route Loopctl.HeavyRead's heavy reads to AdminRepo in tests, so
 # they see the same sandbox transaction that fixtures write to. Prod/dev default to

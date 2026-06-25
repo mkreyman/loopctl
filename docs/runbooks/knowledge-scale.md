@@ -31,11 +31,15 @@ re-checking the connection budget below.
 
 Per node: `10 + 3 + 8 = 21`. **Peak** during a rolling deploy (fly replaces one
 machine at a time, so old + new briefly overlap) at 2 app nodes:
-`42 (steady) + 21 (overlap node) + 4 (ops: migration + Oban notifier + console)` =
-**67** < 100. Ceiling: **3 app nodes** (`max_supported_nodes`). Encoded in
-`Loopctl.DbCapacity`; asserted by `db_capacity_test.exs`. **If you scale past 3
-nodes or raise any pool size, the budget no longer fits — re-derive it and resize
-the DB plan first.**
+`42 (steady) + 21 (overlap node) + 2 (Oban notifier, 1/node) + 2 (fixed: migration +
+console)` = **67** < 100 at 2 nodes (3-node ceiling peak = 89). Ceiling: **3 app
+nodes** (`DbCapacity.max_supported_nodes`). Encoded in `Loopctl.DbCapacity`; asserted
+by `db_capacity_test.exs`, and checked at **boot** against the ACTUAL runtime pool
+sizes + live `max_connections` by `DbCapacity.warn_if_over_budget/0` (logs a warning
+if exceeded). **If you scale past 3 machines or raise any pool size, the budget no
+longer fits — re-derive it and resize the DB plan first.** The deploy strategy is
+pinned to `rolling` in `fly.toml`; `bluegreen` would double the fleet's connections
+and blow the budget.
 
 **Live value (re-verify post-deploy and after any DB-plan resize):**
 
@@ -43,9 +47,10 @@ the DB plan first.**
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.AdminRepo.query!(\"SHOW max_connections\").rows)'"
 ```
 
-Last verified: **2026-06-24 → `max_connections = 100`** (budget ~56 fits with
+Last verified: **2026-06-24 → `max_connections = 100`** (2-node peak 67 fits with
 headroom). If you raise any pool size or node count, re-run the above and confirm
-`Loopctl.DbCapacity.fits?(live_max, nodes)` stays true.
+`Loopctl.DbCapacity.fits?(live_max, nodes)` stays true (the boot check logs a warning
+otherwise).
 
 ## Server-side `statement_timeout` (US-27.11 → US-27.4)
 
@@ -64,8 +69,11 @@ fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyRea
 ```
 
 > **Note for US-27.16 (streamed export):** a minutes-long export must NOT inherit
-> the fast read timeout. Raise it per-checkout (`SET LOCAL statement_timeout`
-> inside the export's streaming transaction) rather than relaxing the pool default.
+> the fast read timeout. Use `Loopctl.HeavyRead.transaction(fun, statement_timeout:
+> ms)`, which issues `SET LOCAL statement_timeout = ms` scoped to that transaction
+> (the stream must be enumerated INSIDE the transaction). A POSITIVE explicit bound
+> is required — `0`/unlimited is rejected, so a runaway export can't pin a connection
+> on the small heavy pool forever.
 
 ## `hnsw.ef_search` recall lever (US-27.11 → US-27.6b)
 

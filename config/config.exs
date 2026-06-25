@@ -9,6 +9,9 @@ import Config
 
 config :loopctl,
   ecto_repos: [Loopctl.Repo],
+  # Compile-time env marker (per-env), so runtime code (e.g. the US-27.11 boot-time
+  # connection-budget check) can gate prod-only behavior without Mix at runtime.
+  env: config_env(),
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   embedding_dimensions: 1536,
   # Cosine similarity threshold for auto-linking articles.

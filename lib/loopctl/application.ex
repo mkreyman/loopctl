@@ -26,7 +26,14 @@ defmodule Loopctl.Application do
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
-    Supervisor.start_link(children, opts)
+    result = Supervisor.start_link(children, opts)
+
+    # US-27.11 (AC-27.11.5): warn if the actual configured pools would exceed the live
+    # DB max_connections at the expected node count. Prod only (dev/test pools differ),
+    # log-only, never blocks boot.
+    if Application.get_env(:loopctl, :env) == :prod, do: Loopctl.DbCapacity.warn_if_over_budget()
+
+    result
   end
 
   # Tell Phoenix to update the endpoint configuration

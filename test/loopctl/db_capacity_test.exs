@@ -1,13 +1,13 @@
 defmodule Loopctl.DbCapacityTest do
   @moduledoc """
   AC-27.11.5 / TC-27.11.3: the PEAK connection budget (all pools × nodes + rolling-
-  deploy overlap + ops headroom) must fit within `max_connections`.
+  deploy overlap + per-node Oban notifier + ops) must fit within `max_connections`.
 
-  This test reads the `max_connections` of the DB it is connected to (local/CI
-  Postgres) as a sanity check AND asserts against the human-verified fly-mpg value
-  recorded in `Loopctl.DbCapacity`. The AUTHORITATIVE live production check is the
-  runbook command (docs/runbooks/knowledge-scale.md) — the CI DB is not prod, so
-  this test cannot itself prove the prod budget; it guards the budget MODEL and the
+  This test reads the `max_connections` of the DB it is connected to (CI Postgres) as a
+  sanity check AND asserts against the human-verified fly-mpg value in
+  `Loopctl.DbCapacity`. The AUTHORITATIVE prod check is the boot-time
+  `warn_if_over_budget/0` (against the live DB + the ACTUAL runtime pool sizes) plus the
+  runbook command — the CI DB is not prod, so this test guards the budget MODEL and the
   verified constant from regressing.
   """
   use Loopctl.DataCase, async: true
@@ -28,9 +28,9 @@ defmodule Loopctl.DbCapacityTest do
     assert pool == DbCapacity.prod_pool_sizes().heavy_read_repo
   end
 
-  test "peak budget models rolling-deploy overlap (steady + one node + ops headroom)" do
-    # 2 nodes: 42 steady + 21 deploy-overlap + 4 ops = 67.
-    assert DbCapacity.peak_total(2) == 42 + 21 + DbCapacity.ops_headroom()
+  test "peak budget = steady + one overlap node + per-node notifier + fixed ops" do
+    # 2 nodes: 42 steady + 21 overlap + 2 notifier(1/node) + 2 fixed = 67.
+    assert DbCapacity.peak_total(2) == 67
   end
 
   test "the PEAK budget fits within the LIVE max_connections and the verified value (TC-27.11.3)" do
@@ -45,8 +45,23 @@ defmodule Loopctl.DbCapacityTest do
 
   test "max_supported_nodes is honest: more nodes than that would exhaust connections" do
     n = DbCapacity.max_supported_nodes()
+    assert n == 3
     assert DbCapacity.fits?(DbCapacity.verified_live_max_connections(), n)
     refute DbCapacity.fits?(DbCapacity.verified_live_max_connections(), n + 1)
+  end
+
+  test "budget_status flags an over-budget pool configuration (operator pool bump)" do
+    # A 30-conn heavy pool blows the budget on the verified 100-conn DB.
+    bloated = %{repo: 10, admin_repo: 3, heavy_read_repo: 30}
+    assert {:over, msg} = DbCapacity.budget_status(100, 2, bloated)
+    assert msg =~ "EXCEEDED"
+    assert :ok = DbCapacity.budget_status(100, 2, DbCapacity.prod_pool_sizes())
+  end
+
+  test "runtime_pool_sizes reads the actually-configured pools" do
+    sizes = DbCapacity.runtime_pool_sizes()
+    assert Map.keys(sizes) |> Enum.sort() == [:admin_repo, :heavy_read_repo, :repo]
+    assert Enum.all?(Map.values(sizes), &(is_integer(&1) and &1 > 0))
   end
 
   test "the verified live value carries a verification date (operator re-check anchor)" do

@@ -100,8 +100,12 @@ if config_env() == :prod do
   #   deploy at 2 nodes = 42 + 21 (overlap node) + 4 ops = 67 < 100 (max ~3 nodes).
   # K (HeavyReadRepo, default 8): ~6 concurrent sub-2s heavy vector reads + ~2 reserved
   # for long-held streamed-export checkouts (US-27.16), a different profile than fast reads.
+  # Parse to an integer so a garbage/typo value (e.g. "10s", "10,000") fails LOUDLY at
+  # boot rather than being sent verbatim and rejected by Postgres per-connection (which
+  # would fail the whole pool's startup). Postgres reads a bare integer as milliseconds,
+  # matching the `_MS` env name; re-stringified for the startup packet.
   heavy_read_statement_timeout_ms =
-    System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000"
+    String.to_integer(System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000")
 
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
@@ -110,7 +114,7 @@ if config_env() == :prod do
     connect_timeout: 15_000,
     queue_target: 5_000,
     queue_interval: 10_000,
-    parameters: [statement_timeout: heavy_read_statement_timeout_ms]
+    parameters: [statement_timeout: "#{heavy_read_statement_timeout_ms}"]
 
   # OpenAI embedding provider for semantic search (Knowledge Wiki)
   if openai_key = System.get_env("OPENAI_API_KEY") do

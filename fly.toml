@@ -10,6 +10,10 @@ primary_region = "lax"
 
 [deploy]
   release_command = "/app/bin/migrate"
+  # Pin rolling (one machine replaced at a time) so the DB connection budget in
+  # Loopctl.DbCapacity holds. Switching to "bluegreen" doubles the fleet's connections
+  # transiently and would blow the max_connections budget — re-derive it first.
+  strategy = "rolling"
 
 [env]
   PHX_HOST = "loopctl.com"
