@@ -134,8 +134,12 @@ never a full-corpus Seq Scan. If a single tag ever grows to a large fraction of 
 tenant's corpus and tag-filtered deep enumeration becomes hot, the lever is a
 partial/covering index for that workload — not a change to the keyset mechanic.
 The scale test enforces this: scalar shapes must stay strictly index-ordered
-(`refute_full_scan`); the tags shape must avoid a Seq Scan and prove both the tags
-GIN and the keyset btree drive the plan (`refute_seq_scan` + `assert_index_used`).
+(`refute_full_scan`); the tags shape must avoid a Seq Scan and prove the selective
+tags GIN drives the scan (`refute_seq_scan` + `assert_index_used` on the tags GIN).
+It deliberately does NOT pin the BitmapAnd-with-keyset-btree shape — once the GIN cuts
+the corpus to ~2% the planner may apply the cursor as a cheap heap filter, a
+cost-marginal choice at the 80k floor that would make the gate flaky without catching
+any real regression.
 
 **Boot probe:** `Loopctl.IndexHealth.warn_if_invalid_indexes/0` runs at boot (prod)
 and logs a WARNING + emits `[:loopctl, :index_health, :invalid]` telemetry if

@@ -45,8 +45,12 @@ curl -sS -H "Authorization: Bearer $LOOPCTL_KEY" \
   "https://loopctl.com/api/v1/knowledge/<endpoint>?<repro-params>" -o /dev/null -w '%{http_code}\n'
 ```
 
-A `500`/`504` here with a `db_statement_timeout` (US-27.4) in `fly logs` is the real
-prod error. **Capture it on the issue** before claiming a fix.
+A statement timeout surfaces as a **`504` with code `db_statement_timeout`** (US-27.4
+maps SQLSTATE `57014` → 504; see `lib/loopctl_web/db_error.ex`). A generic `500`
+`db_error` is the catch-all for an *unmapped* SQLSTATE and does **not** carry the
+`db_statement_timeout` code — so a timeout is specifically a 504, not a 500. Either,
+with the matching exception in `fly logs`, is the real prod error. **Capture it on the
+issue** before claiming a fix.
 
 ---
 
@@ -164,8 +168,13 @@ WHERE tablename = 'articles' AND indexdef ILIKE '%hnsw%';
 **⚠ The silent no-op hazard:** `DROP INDEX IF EXISTS articles_embedding_idx` run
 against prod **does nothing** — the live index is named `articles_embedding_hnsw_idx`,
 so `IF EXISTS` matches nothing and the real HNSW index survives a rollback that
-*looks* like it dropped it. Always drop/inspect HNSW indexes by `amname='hnsw'`
-detection, not by the migration's assumed name. The same `IF NOT EXISTS`/`IF EXISTS`
-name-blindness applies to the keyset index recovery in
+*looks* like it dropped it. The HNSW migration's own down-step has **already been
+remediated** to detect by `amname='hnsw'` (US-27.14;
+`20260410022906_add_embedding_hnsw_index.exs` + `20260624120000_reconcile_hnsw_index_name.exs`),
+so this is the *rationale* for the capability-detection rule, not an open bug in the
+migrations — but the trap still bites any ad-hoc `psql` `DROP` you type by name.
+Always drop/inspect HNSW indexes by `amname='hnsw'` detection, not by an assumed name.
+The same `IF NOT EXISTS`/`IF EXISTS` name-blindness applies to the keyset index
+recovery in
 [`knowledge-scale.md`](knowledge-scale.md) — verify with `pg_index.indisvalid`, not by
 name presence.

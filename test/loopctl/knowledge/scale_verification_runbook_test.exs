@@ -42,6 +42,25 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
       end
     end
 
+    test "documents the concrete prod-verification commands (AC-27.5.1)" do
+      body = File.read!(@runbook)
+
+      # The prod error is read via `fly logs` (under "## Retrieving the prod error").
+      prod = Map.fetch!(split_sections(body), "Retrieving the prod error")
+      assert prod =~ "fly logs", "must show how to read the prod error via fly logs"
+
+      # The live EXPLAIN commands live under a `###` subsection of "Verifying at scale"
+      # (split_sections keys `###` separately), so assert them at body level.
+      assert body =~ ~r/AdminRepo\.explain/,
+             "must show the live EXPLAIN via AdminRepo.explain"
+
+      assert body =~ ~r/fly ssh console/,
+             "must show running the EXPLAIN against the live build via fly ssh console rpc"
+
+      assert body =~ ~r/ScaleSeed/,
+             "must reference the US-27.1 scale fixture (ScaleSeed) for the at-scale corpus"
+    end
+
     test "states explicitly that loopctl has NO Sentry (AC-27.5.2)" do
       body = File.read!(@runbook)
       assert body =~ ~r/no\s+sentry/i, "runbook must state loopctl uses no Sentry (AC-27.5.2)"
@@ -69,24 +88,37 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
   end
 
   describe "CI scale gate wiring (TC-27.5.2 / AC-27.5.3)" do
-    test "the nightly scale gate runs ALL :scale_nightly tests, not a single file" do
+    test "the gate invokes `mix test --only scale_nightly` (runs the plan assertions)" do
       ci = File.read!(@ci)
 
-      gate_line =
-        ci
-        |> String.split("\n")
-        |> Enum.find(fn line ->
-          String.contains?(line, "mix test --only scale_nightly")
+      assert ci =~ ~r/mix test --only scale_nightly/,
+             "CI must run `mix test --only scale_nightly` (the scale gate)"
+    end
+
+    # The whole point of US-27.5 is a NON-ERODING gate. The gate runs as a matrix, one
+    # job per scale file (isolated DB, no cross-file pollution). This is the guard that
+    # makes coverage un-erodable: EVERY `:scale_nightly`-tagged test file under
+    # test/loopctl/knowledge/ MUST be listed in the CI matrix, or it would silently
+    # never run in CI (the exact bug US-27.5 fixes — the plan-assertion scale tests
+    # were tagged :scale_nightly but no job ran them). Add a scale test → wire it here.
+    test "every :scale_nightly test file is wired into the CI matrix (no silent gaps)" do
+      ci = File.read!(@ci)
+
+      tagged_files =
+        "test/loopctl/knowledge"
+        |> File.ls!()
+        |> Enum.filter(fn f ->
+          String.ends_with?(f, "_test.exs") and
+            File.read!("test/loopctl/knowledge/#{f}") =~ ~r/@moduletag\s+:scale_nightly/
         end)
 
-      assert gate_line, "CI must run `mix test --only scale_nightly` (the scale gate)"
+      assert tagged_files != [], "expected to find :scale_nightly-tagged test files"
 
-      # The gate must NOT restrict to a single test path — that is the bug US-27.5
-      # fixes (the plan-assertion scale tests were tagged :scale_nightly but skipped
-      # because the job named only scale_seed_nightly_test.exs).
-      refute gate_line =~ ~r/scale_nightly\s+test\/[^\s]+\.exs/,
-             "the scale gate must not pin a single test file — it must run every " <>
-               ":scale_nightly test (vector ANN, keyset, plan assertions)"
+      for f <- tagged_files do
+        assert ci =~ f,
+               "scale_nightly test #{f} is NOT listed in the CI scale matrix — it would " <>
+                 "never run in CI. Add it to strategy.matrix.scale_file in ci.yml."
+      end
     end
 
     test "the default `mix test` suite excludes scale tags (gate never slows it)" do
@@ -97,6 +129,10 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
   end
 
   # Split a markdown doc into %{"Heading" => content} for `##`/`###` headings.
+  # NB: fence-blind — assumes the runbook never starts a line with `## `/`### ` INSIDE
+  # a fenced code block (which would create a phantom section). That invariant holds
+  # for knowledge_scale_verification.md (its code blocks use `#`/`--` single-line
+  # comments, never `## `). Keep it that way when editing the runbook.
   defp split_sections(body) do
     body
     |> String.split(~r/^#{"#"}{2,3}\s+/m, trim: false)

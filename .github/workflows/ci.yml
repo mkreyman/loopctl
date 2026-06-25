@@ -289,13 +289,29 @@ jobs:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
   scale-nightly:
-    name: Scale Nightly (prod-floor plan gate — US-27.1/27.2/27.5)
+    name: Scale Nightly (${{ matrix.scale_file }})
     # Runs nightly to assert every heavy endpoint's planner path at PROD_ARTICLE_FLOOR
     # (~80k articles) — the cost-based choices that only appear at production scale.
-    # US-27.5 (AC-27.5.3): this is the scale GATE — it runs ALL :scale_nightly tests
+    # US-27.5 (AC-27.5.3): this is the scale GATE — it runs every :scale_nightly test
     # (HNSW ANN, keyset enumeration, shared plan assertions), not just scale_seed.
+    #
+    # MATRIX, one isolated job per scale file: each scale test seeds ~80k COMMITTED
+    # (unboxed) rows and cleans up only its own tenant. Running them in one process
+    # against one DB lets a leaked corpus (best-effort cleanup) poison the next file's
+    # GLOBAL planner stats — a "small tenant in a large corpus" flip that fails
+    # assert_hnsw_index, a false RED. A matrix gives each file a FRESH Postgres service,
+    # so cross-file pollution is impossible by construction, and wall-clock is max(file)
+    # not sum(files). Adding a :scale_nightly test? Add its file here or it won't gate.
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        scale_file:
+          - scale_seed_nightly_test.exs
+          - vector_search_scale_test.exs
+          - plan_assertions_scale_test.exs
+          - keyset_plan_scale_test.exs
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -370,16 +386,18 @@ jobs:
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
 
-      # US-27.5 (AC-27.5.3): the scale GATE runs EVERY :scale_nightly test against the
-      # ~80k prod-floor corpus — not just scale_seed_nightly. This is what makes the
-      # vector ANN, enumeration/keyset, and shared plan assertions actually execute at
-      # scale (they were tagged :scale_nightly but no CI job ran them before this). No
-      # path filter: `--only scale_nightly` picks them all up across the suite.
+      # US-27.5 (AC-27.5.3): the scale GATE. Each matrix job runs ONE :scale_nightly
+      # file against its own fresh ~80k prod-floor corpus. Across the matrix this
+      # exercises the vector ANN, enumeration/keyset, and shared plan assertions at
+      # scale — they were tagged :scale_nightly but no CI job ran them before this.
+      # The file list lives in strategy.matrix.scale_file (above); the runbook test
+      # (scale_verification_runbook_test.exs) guards that every :scale_nightly file is
+      # listed there, so gate coverage cannot silently erode.
       - name: Run nightly scale gate (US-27.1 prod-floor + US-27.2 plan assertions at scale)
-        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly
+        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly test/loopctl/knowledge/${{ matrix.scale_file }}
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
-        timeout-minutes: 45
+        timeout-minutes: 35
 
   deploy:
     name: Deploy

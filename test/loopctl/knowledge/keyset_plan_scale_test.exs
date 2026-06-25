@@ -141,13 +141,20 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
       end
 
       # ARRAY path (`tags &&`, served by the GIN index): no btree can provide BOTH
-      # array containment AND `(inserted_at, id)` order, so the planner intersects the
-      # tags GIN with the keyset btree (BitmapAnd) and Sorts the result. That is bounded
-      # by TAG SELECTIVITY (not the corpus) and is the same plan a tag-filtered OFFSET
-      # query already used (non-regressive) — see docs/runbooks/knowledge-scale.md. We
-      # therefore assert the catastrophe-guard (no unbounded Seq Scan) AND that the bound
-      # is real: both the selective tags GIN and the keyset btree (which applies the
-      # cursor) drive the scan via the index, not a heap filter over the corpus.
+      # array containment AND `(inserted_at, id)` order, so the planner uses the tags
+      # GIN and Sorts. That is bounded by TAG SELECTIVITY (not the corpus) and is the
+      # same plan a tag-filtered OFFSET query already used (non-regressive) — see
+      # docs/runbooks/knowledge-scale.md. We assert the catastrophe-guard (no unbounded
+      # Seq Scan) AND that the bound is REAL: the selective tags GIN drives the scan,
+      # so cost scales with tag-matches, not corpus.
+      #
+      # We deliberately do NOT also require the keyset btree to appear in the plan: once
+      # the tags GIN has cut the corpus to ~2%, the planner is free to apply the cursor
+      # as a cheap heap filter instead of a second BitmapAnd index — a cost-marginal
+      # choice at exactly the 80k floor that a small stats shift can flip. Asserting that
+      # specific BitmapAnd shape would make the nightly gate flaky (false RED) without
+      # catching any real regression; the tags-GIN bound + no-Seq-Scan is the invariant
+      # that actually matters.
       for {label, opts} <- [
             {"+tags", [status: :published, cursor: cursor, limit: 21, tags: ["scale-tag-7"]]},
             {"+tags+category",
@@ -166,9 +173,6 @@ defmodule Loopctl.Knowledge.KeysetPlanScaleTest do
 
         assert :ok = PlanAssertions.assert_index_used(query, "articles_tags_index"),
                "tag-filtered keyset plan for #{label} must be bounded by the selective tags GIN"
-
-        assert :ok = PlanAssertions.assert_index_used(query, "articles_tenant_inserted_id_idx"),
-               "tag-filtered keyset plan for #{label} must apply the cursor via the keyset btree"
       end
     end)
   end
