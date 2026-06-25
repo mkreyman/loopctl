@@ -321,5 +321,65 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
       assert resp["meta"]["offset"] == 0
       assert is_list(resp["data"])
     end
+
+    # BA gap: the over-max-limit 400 (the #148 no-silent-clamp fix) must also hold on
+    # the LEGACY offset path, not only the keyset path. `validate_search_limit` runs
+    # before cursor branching, but pin it on the no-cursor path so a future refactor
+    # can't reintroduce a silent clamp there.
+    test "offset path (no cursor) rejects over-max limit with 400, never clamps", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["bc"]})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{"tags" => "bc", "limit" => "5000"})
+
+      assert resp.status == 400
+    end
+  end
+
+  describe "exact-multiple page boundary (split_peek)" do
+    # BA gap: when the row count is an exact multiple of the page size, the FINAL full
+    # page must signal exhaustion (next_cursor null) and NOT emit a cursor that fetches
+    # an empty phantom page. Exercises split_peek's `length == limit` (no-more) branch.
+    test "final full page has next_cursor null, no phantom empty page", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      for i <- 1..8 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          tags: ["em"],
+          title: "em#{i}"
+        })
+      end
+
+      # Page 1 of 2 (8 rows, page size 4): a full page, more remains.
+      page1 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{"tags" => "em", "limit" => "4", "cursor" => ""})
+        |> json_response(200)
+
+      assert length(page1["data"]) == 4
+      assert page1["meta"]["next_cursor"]
+
+      # Page 2 of 2: the final full page — exhaustion, next_cursor must be null.
+      page2 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "em",
+          "limit" => "4",
+          "cursor" => page1["meta"]["next_cursor"]
+        })
+        |> json_response(200)
+
+      assert length(page2["data"]) == 4
+      refute page2["meta"]["next_cursor"]
+    end
   end
 end

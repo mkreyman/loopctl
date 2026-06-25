@@ -45,12 +45,17 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     }
   end
 
+  # Keyset rows always arrive as plain atom-keyed maps from `Knowledge.keyset_query/2`'s
+  # `select` (every field present; `tags` is a non-null `{:array}` default `[]`), so
+  # direct field access is correct — and a missing field SHOULD crash loudly rather than
+  # silently degrade. (`render_result/1` keeps the dual accessor because search results
+  # may be structs.)
   defp render_list_row(result) do
     %{
-      id: result[:id] || result.id,
-      title: result[:title] || result.title,
-      category: to_string(result[:category] || result.category),
-      tags: result[:tags] || result.tags || []
+      id: result.id,
+      title: result.title,
+      category: to_string(result.category),
+      tags: result.tags
     }
   end
 

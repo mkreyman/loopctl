@@ -134,11 +134,23 @@ defmodule Loopctl.Knowledge.ArticleCursor do
 
   # Per-tenant HMAC key: app secret_key_base + tenant_id. Stable across nodes
   # without storing a per-tenant secret. Mirrors BulkOps.confirm_secret/1.
+  #
+  # FAIL CLOSED: `secret_key_base` is fetched (not defaulted). If it were ever
+  # absent, signing with a guessable constant would silently defeat the entire
+  # tenant-binding/forgery guarantee (a known key + a non-secret tenant_id = a
+  # forgeable cursor); raising instead is the safe failure. `runtime.exs` already
+  # requires SECRET_KEY_BASE in prod and the test/dev configs set it, so this
+  # raise is unreachable in every real environment — it is a guard, not a path.
+  #
+  # The `:article_cursor:` infix namespaces this key away from
+  # `BulkOps.confirm_secret/1` and binds it to the tenant. `tenant_id` is an Ecto
+  # `binary_id` (a canonical UUID), which cannot contain the `:` delimiter, so no
+  # two distinct tenants can derive the same key string — no cross-tenant collision.
   defp secret(tenant_id) do
     base =
       :loopctl
-      |> Application.get_env(LoopctlWeb.Endpoint, [])
-      |> Keyword.get(:secret_key_base, "loopctl-article-cursor")
+      |> Application.fetch_env!(LoopctlWeb.Endpoint)
+      |> Keyword.fetch!(:secret_key_base)
 
     base <> ":article_cursor:" <> to_string(tenant_id)
   end

@@ -135,6 +135,40 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
 
       assert length(seen) == length(Enum.uniq(seen)), "no duplicates in the whole walk"
     end
+
+    # BA gap: the symmetric drift case — a row that sorts AFTER the cursor is archived
+    # BEFORE the walk reaches it. A forward-only keyset walk must then simply not
+    # return it (it correctly vanishes), with no error and no gap for its neighbors.
+    test "a row archived before the walk reaches it vanishes, leaving no gap" do
+      tenant = fixture(:tenant)
+
+      ids =
+        for i <- 1..20 do
+          a = fixture(:article, %{tenant_id: tenant.id, status: :published, title: "orig#{i}"})
+          a.id
+        end
+
+      # The last-inserted row has the latest inserted_at, so it sorts LAST. Archiving
+      # it after every page (idempotent) removes it after page 1 — long before the
+      # cursor (page size 4) reaches it near page 5.
+      future_id = List.last(ids)
+
+      mutate = fn _page ->
+        Article
+        |> where([a], a.id == ^future_id)
+        |> AdminRepo.update_all(set: [status: :archived])
+      end
+
+      seen = walk(tenant.id, 4, [status: :published], mutate)
+
+      refute future_id in seen, "a row archived before being reached must not appear"
+
+      # Its disappearance created no gap: every other original is still seen once.
+      for id <- List.delete(ids, future_id) do
+        assert Enum.count(seen, &(&1 == id)) == 1,
+               "neighbor #{id} should appear exactly once after a future row was archived"
+      end
+    end
   end
 
   describe "list_keyset/2 — batch-tied timestamps (TUPLE tie-break, AC-27.9a.2)" do

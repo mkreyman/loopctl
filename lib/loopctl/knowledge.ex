@@ -58,6 +58,10 @@ defmodule Loopctl.Knowledge do
   # caused callers advancing `offset` by the requested limit to skip rows).
   @max_page_size 1000
 
+  # Default enumeration page size when the caller passes no `:limit`. The keyset
+  # path fetches `@default_page_size + 1` to detect a next page without a COUNT.
+  @default_page_size 20
+
   @doc """
   The maximum page size (`limit`) honored by the **enumeration** paths
   (`list_articles/2`, `list_filtered/2`, `list_keyset/2`, `list_drafts/2`,
@@ -1509,7 +1513,7 @@ defmodule Loopctl.Knowledge do
              limit: pos_integer()
            }}
   def list_keyset(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(@max_page_size)
+    limit = opts |> Keyword.get(:limit, @default_page_size) |> max(1) |> min(@max_page_size)
 
     # Fetch limit+1 to detect a next page without a COUNT (AC-27.9a.1).
     rows =
@@ -1538,10 +1542,20 @@ defmodule Loopctl.Knowledge do
   Same `opts` as `list_keyset/2`; `:limit` is applied as-is here (the caller adds
   the `+1` peek). This is the EXACT query `list_keyset/2` runs, so the plan
   assertion guards the request path, not a stunt double.
+
+  Plan note: with no filter or a scalar `:category` filter the planner walks the
+  `(tenant_id, inserted_at, id)` btree in order (true keyset, no Sort). With a
+  `:tags` (array `&&`) filter it BitmapAnds the tags GIN with the keyset btree and
+  Sorts — bounded by tag selectivity, NOT the corpus, since no single index can serve
+  both array containment and the order key. This is expected and non-regressive; do
+  NOT try to "fix" the Sort away (see `keyset_plan_scale_test.exs` and
+  docs/runbooks/knowledge-scale.md).
   """
   @spec keyset_query(Ecto.UUID.t(), keyword()) :: Ecto.Query.t()
   def keyset_query(tenant_id, opts \\ []) do
-    limit = opts |> Keyword.get(:limit, 21) |> max(1)
+    # Default mirrors list_keyset/2's page (@default_page_size) + 1 peek row, so the
+    # :scale_nightly plan test exercises the same shape the request path runs.
+    limit = opts |> Keyword.get(:limit, @default_page_size + 1) |> max(1)
     status = Keyword.get(opts, :status, :published)
 
     base = from(a in Article, where: a.tenant_id == ^tenant_id)
