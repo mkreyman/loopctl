@@ -380,6 +380,61 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
       # A single over-budget row is not a truncation of OTHER rows — nothing was dropped.
       refute byte_truncated
     end
+
+    # Scenario B (peek=true AND byte-trim drops rows): a page that has MORE matching
+    # rows than `limit` (so the peek says has_more) AND is byte-trimmed below `limit`.
+    # The recomputed cursor must walk over the dropped rows with no gap/dup and the walk
+    # must end on a real (non-phantom) page. Also pins the invariant
+    # `byte_truncated == true ⟹ next_cursor != nil` on every page.
+    test "byte-trimmed multi-page walk (peek + trim) is gap-free and never strands a row" do
+      tenant = fixture(:tenant)
+      big = String.duplicate("z", 40_000)
+
+      ids =
+        for i <- 1..12 do
+          a =
+            fixture(:article, %{
+              tenant_id: tenant.id,
+              status: :published,
+              tags: ["sb"],
+              title: "sb#{i}",
+              body: big
+            })
+
+          a.id
+        end
+
+      # limit 5 ⇒ early pages have a peek row (has_more), and the 100 KB budget trims
+      # each page to 2 rows (2×40 KB ≤ 100 KB; the 3rd would exceed) ⇒ byte_truncated.
+      seen = scenario_b_walk(tenant.id, nil, [])
+
+      assert Enum.sort(seen) == Enum.sort(ids), "every row served exactly across the walk"
+      assert length(seen) == length(Enum.uniq(seen)), "no duplicate across trim+peek seams"
+      assert length(seen) == 12
+    end
+  end
+
+  # Walk include_body pages, asserting per-page that a byte-truncated page always
+  # carries a continuation cursor (never strands the dropped rows) and never returns
+  # an empty page while claiming more remains.
+  defp scenario_b_walk(_tid, _cursor, acc) when length(acc) > 1_000,
+    do: flunk("scenario B walk did not terminate")
+
+  defp scenario_b_walk(tenant_id, cursor, acc) do
+    {:ok, %{results: page, next_cursor: next, byte_truncated: trunc?, has_more: more?}} =
+      Knowledge.list_keyset(tenant_id,
+        status: :published,
+        tags: ["sb"],
+        limit: 5,
+        include_body: true,
+        cursor: cursor
+      )
+
+    if trunc?, do: assert(next, "byte_truncated page must carry a next_cursor")
+    if more?, do: assert(page != [], "has_more must not be signalled on an empty page")
+
+    acc = acc ++ Enum.map(page, & &1.id)
+    if next, do: scenario_b_walk(tenant_id, next, acc), else: acc
   end
 
   describe "list_keyset/2 — include_body respects visibility scope (AC-27.10.5)" do

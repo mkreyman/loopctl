@@ -1541,7 +1541,11 @@ defmodule Loopctl.Knowledge do
     within `full_content_byte_budget/0` (always keeping ≥1 row for progress). The
     ≤25-row cap alone permits 25 × `Article` `@max_body_bytes` (500 KB) = 12.5 MB
     worst case; the byte budget keeps the keyset full-content page consistent with
-    the offset path (~5.5 MB worst case). If the trim drops rows, `next_cursor` is
+    the offset path (~5.5 MB worst case *returned*). NB: unlike the offset path's
+    sized pre-query, this trims IN MEMORY, so it transiently FETCHES up to
+    `(max_include_body_page/0 + 1) × @max_body_bytes` (~13 MB) before trimming — a
+    bounded cost justified at the 25-row cap (see the body comment). If the trim drops
+    rows, `next_cursor` is
     recomputed from the LAST KEPT row (so the walk resumes over the dropped rows —
     drift-free by construction), `has_more` is forced `true`, and `byte_truncated`
     is `true`. When not trimmed (or body-less), `byte_truncated` is `false` and
@@ -1576,8 +1580,27 @@ defmodule Loopctl.Knowledge do
 
     # US-27.10: when bodies are included, bound the (≤25-row) page by the
     # serialized-body byte budget so it can't balloon past the offset path's cap.
-    # The page rows already carry `body`, so this is in-memory — no second query.
+    # The page rows already carry `body`, so this is an IN-MEMORY trim — no second
+    # query. This deliberately diverges from `paginate_with_body_budget/4` (the offset
+    # path), which runs a sized pre-query (`octet_length(body)`) so it never fetches a
+    # body it will trim. The divergence is intentional and bounded: the offset path can
+    # serve up to `@max_page_size` (1000) rows — a pre-query is essential there (else
+    # ~500 MB fetched). The keyset path is HARD-capped at `@max_include_body_page` (25),
+    # so the worst-case transient fetch is (25+1) × `@max_body_bytes` ≈ 13 MB per request,
+    # naturally backpressured by the dedicated HeavyRead pool (HEAVY_READ_POOL_SIZE, ~8)
+    # and its statement_timeout. At that bound the pre-query's saved bytes don't justify a
+    # second query + read-only transaction per page, so the simpler in-memory trim wins.
     {page, has_more?, byte_truncated?} = maybe_byte_trim(page, has_more?, include_body?)
+
+    # Surface budget truncation for ops tuning of `:full_content_byte_budget` (it is
+    # otherwise only visible in the per-response `meta.byte_truncated`).
+    if byte_truncated? do
+      :telemetry.execute(
+        [:loopctl, :knowledge, :keyset_byte_truncated],
+        %{returned: length(page)},
+        %{tenant_id: tenant_id}
+      )
+    end
 
     next_cursor = keyset_next_cursor(page, has_more?)
 
