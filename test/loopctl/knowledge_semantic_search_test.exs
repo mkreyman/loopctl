@@ -778,4 +778,81 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert deep_meta.pool_capped == true
     end
   end
+
+  describe "search_semantic/3 - relevance-pool R2 edges (filter starvation, status:nil)" do
+    test "selective filter whose matches fall outside the pool: pool_capped true (not a false negative)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Fill the (test) relevance pool (cap 5) with near-identical :reference articles, and
+      # put the ONLY :pattern match far away (orthogonal → similarity 0, ranked last), so it
+      # sits OUTSIDE the top-5 nearest. A category:pattern search then starves the pool below
+      # the cap. The honest signal must flag this — `total_count > cap` ALONE would miss it.
+      for i <- 1..5,
+          do:
+            create_article_with_embedding(
+              tenant.id,
+              %{title: "Ref #{i}", category: :reference},
+              :query
+            )
+
+      create_article_with_embedding(tenant.id, %{title: "Lone Pattern", category: :pattern}, :far)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query),
+          category: :pattern,
+          limit: 10
+        )
+
+      # total_count is the full filtered corpus (1 :pattern article)...
+      assert meta.total_count == 1
+      # ...but it fell outside the top-5 nearest, so the page is starved (< total_count)
+      # and the signal flags incompleteness rather than lying "reachable".
+      assert length(results) < meta.total_count
+      assert meta.pool_capped == true
+    end
+
+    test "status: nil ('all statuses') ranks every status — results and count stay consistent" do
+      %{tenant: tenant} = setup_tenant()
+
+      _pub = create_article_with_embedding(tenant.id, %{title: "Pub", status: :published}, :query)
+      _draft = create_article_with_embedding(tenant.id, %{title: "Draft", status: :draft}, :query)
+
+      # status: nil must NOT force `status == NULL` on the inner (which would return empty
+      # against a non-zero count) — it means "all statuses", matching the count path.
+      {:ok, %{results: all_results, meta: all_meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), status: nil)
+
+      assert all_meta.total_count == 2
+      assert length(all_results) == 2
+      assert Enum.sort(Enum.map(all_results, & &1.status)) == [:draft, :published]
+
+      # Default (published) still excludes the draft — proving the nil-skip is scoped.
+      {:ok, %{results: pub_results}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query))
+
+      assert length(pub_results) == 1
+      assert hd(pub_results).status == :published
+    end
+  end
+
+  describe "search_combined/3 - relevance-pool truncation propagation (US-27.7a)" do
+    test "combined carries the semantic half's pool_capped (default mode is not silent)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # cap+2 embedded articles → the semantic sub-search is pool-capped; combined must
+      # surface that, not drop it (combined is the DEFAULT search mode).
+      for i <- 1..7, do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      Knowledge.reset_circuit_breaker()
+
+      {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "hub")
+
+      assert meta.search_mode == "combined"
+      assert meta.pool_capped == true
+    end
+  end
 end

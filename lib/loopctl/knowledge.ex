@@ -4657,16 +4657,27 @@ defmodule Loopctl.Knowledge do
          # without an embedding are excluded). Use knowledge_stats for the
          # full wiki size.
          total_count_scope: "ranked_corpus",
-         # US-27.7a relevance-pool truncation signal (NOT silent — mirrors the
-         # `recall_truncated` / keyset `next_cursor: null` exhaustion conventions).
-         # Results are drawn from the top-`cap` relevance pool, so when the ranked
-         # corpus is larger than the cap, the tail beyond it is NOT reachable by a
-         # deeper `offset` (a page past the cap returns empty). `pool_capped: true`
-         # tells the consumer "there are more ranked results than relevance
-         # pagination can surface — switch to list mode for full enumeration."
-         pool_capped: total_count > semantic_result_pool_cap()
+         pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
        }
      }}
+  end
+
+  # Relevance-pool truncation signal (US-27.7a — NOT silent; mirrors the suggested-links
+  # `recall_truncated` / keyset `next_cursor: null` exhaustion conventions). Results come
+  # from the top-`cap` relevance pool with the selective filters applied POST-ANN, so the
+  # ranked+filtered set may exceed what pagination can reach. Two truncation modes, both
+  # flagged (a `false` therefore means "this query's results are complete"):
+  #
+  #   * CAP truncation — `total_count > cap`: the corpus is larger than the reachable pool
+  #     (true regardless of `offset`, even on a full page).
+  #   * POOL/FILTER starvation — a SHORT page (`returned < limit`) while MORE filtered
+  #     results exist than were surfaced (`offset + returned < total_count`). This catches
+  #     the case a `total_count > cap`-only check MISSED: a selective filter whose matches
+  #     fall outside the top-`pool` nearest starves the page below the cap. (A genuine
+  #     last page — `offset + returned == total_count` — is NOT flagged.)
+  defp semantic_pool_capped?(total_count, returned, limit, offset) do
+    total_count > semantic_result_pool_cap() or
+      (returned < limit and offset + returned < total_count)
   end
 
   # Builds `search_semantic`'s paginated RESULTS query (returned, not executed) — the
@@ -4955,7 +4966,12 @@ defmodule Loopctl.Knowledge do
          # Size of the deduplicated UNION of a keyword and a semantic sub-search
          # (each capped at 100, so up to ~200 with no overlap), NOT a corpus total
          # or full match count. Use list mode or knowledge_stats to size the corpus.
-         total_count_scope: "merged_candidates"
+         total_count_scope: "merged_candidates",
+         # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
+         # — combined is the DEFAULT mode, so silently dropping the flag would hide
+         # truncation on the most-used path. `maybe_put` keeps the key absent unless the
+         # semantic half was actually pool-capped.
+         pool_capped: Map.get(semantic_result.meta, :pool_capped, false)
        }
      }}
   end

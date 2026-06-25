@@ -391,16 +391,29 @@ defmodule Loopctl.Knowledge.VectorSearch do
 
     base =
       from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == ^status,
+        where: a.tenant_id == ^tenant_id,
         where: not is_nil(a.embedding),
         order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
         limit: ^pool
       )
+      |> maybe_filter_by_status(status)
       |> maybe_exclude_self(exclude_id)
       |> maybe_filter_by_visibility(vis)
 
     pool_select(base, Keyword.get(opts, :select, :knn), target)
   end
+
+  # Status equality on the inner ANN (index-safe, like the tenant/not-null filters).
+  # NIL-SKIPPING to match `Loopctl.Knowledge.maybe_filter_by_status/2` and the
+  # search_semantic COUNT path: `status: nil` means "all statuses" (no filter), so the
+  # inner pool and the separate full-corpus count stay over the SAME population — without
+  # this, `status == ^nil` would match nothing and a `status: nil` semantic search would
+  # return empty results against a non-zero total_count. Suggested-links / the worker pass
+  # no `:status`, so they keep the default `:published`.
+  defp maybe_filter_by_status(query, nil), do: query
+
+  defp maybe_filter_by_status(query, status),
+    do: where(query, [a], a.status == ^status)
 
   # The index-safe inner's SELECT list. Varies by consumer but NEVER touches the
   # HNSW-load-bearing WHERE/ORDER BY/LIMIT above.
