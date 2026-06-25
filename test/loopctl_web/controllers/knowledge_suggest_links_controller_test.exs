@@ -7,6 +7,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
   alias Loopctl.Knowledge.ArticleLink
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   setup :verify_on_exit!
 
@@ -523,6 +524,45 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
       assert body["error"]["status"] == 404
       refute body["error"]["code"] in ["db_statement_timeout", "db_error", "db_unavailable"]
+    end
+
+    # TC-27.4.1: the per-endpoint statement_timeout override fires a GENUINE 57014 on
+    # the real HeavyRead path (not a fabricated error), and that surfaces as the
+    # structured 504 db_statement_timeout at the HTTP boundary — proving
+    # override config → real query → 57014 → 504 end-to-end through the controller.
+    test "statement_timeout override -> real 57014 -> 504 db_statement_timeout at HTTP",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+
+      # The DI seam runs the REAL override→timeout path: a tight 50ms SET LOCAL
+      # statement_timeout on a deliberately slow, tenant-scoped query → genuine
+      # query_canceled (57014), bounded near 50ms (never the full 1s sleep).
+      expect(Loopctl.MockSuggestLinks, :suggest_links, fn t, _a, _o ->
+        slow =
+          from(a in Loopctl.Knowledge.Article,
+            where: a.tenant_id == ^t,
+            where: fragment("pg_sleep(1) IS NULL")
+          )
+
+        Loopctl.HeavyRead.all(t, slow, statement_timeout: 50)
+      end)
+
+      {elapsed_us, resp_conn} =
+        :timer.tc(fn ->
+          conn
+          |> auth_conn(key)
+          |> get(~p"/api/v1/knowledge/articles/#{target.id}/suggested_links")
+        end)
+
+      assert resp_conn.status == 504
+      body = json_response(resp_conn, 504)
+      assert body["error"]["code"] == "db_statement_timeout"
+
+      # Bounded near the 50ms server-side timeout, NOT held for the 1s pg_sleep
+      # (generous CI headroom; the precise timing assertion is in the unit test).
+      assert elapsed_us / 1_000 < 900,
+             "request should fast-fail near the timeout, took #{elapsed_us / 1_000}ms"
     end
   end
 end

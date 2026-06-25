@@ -107,6 +107,13 @@ if config_env() == :prod do
   heavy_read_statement_timeout_ms =
     String.to_integer(System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000")
 
+  # Slow-query logging threshold (US-27.4). Parse to integer for the same reason —
+  # garbage values fail loudly at boot. Default 1000ms.
+  slow_query_threshold_ms =
+    String.to_integer(System.get_env("SLOW_QUERY_THRESHOLD_MS") || "1000")
+
+  config :loopctl, :slow_query_threshold_ms, slow_query_threshold_ms
+
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),

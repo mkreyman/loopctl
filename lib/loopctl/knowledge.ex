@@ -1417,9 +1417,12 @@ defmodule Loopctl.Knowledge do
     base = from(a in Article, where: a.tenant_id == ^tenant_id)
     filtered = apply_search_filters(base, status, opts)
 
-    total_count = AdminRepo.aggregate(filtered, :count, :id)
+    # US-27.4: Count and results both route through HeavyRead to inherit the
+    # pool-level statement_timeout and optional per-endpoint override.
+    count_query = from(a in filtered, select: count(a.id))
+    total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:enumeration))
 
-    results =
+    results_query =
       filtered
       |> select([a], %{
         id: a.id,
@@ -1435,7 +1438,8 @@ defmodule Loopctl.Knowledge do
       |> order_by([a], desc: a.updated_at, asc: a.id)
       |> limit(^limit)
       |> offset(^offset)
-      |> AdminRepo.all()
+
+    results = HeavyRead.all(tenant_id, results_query, heavy_read_opts(:enumeration))
 
     maybe_record_search_access(tenant_id, results, "", opts, "list")
 
@@ -2884,7 +2888,31 @@ defmodule Loopctl.Knowledge do
     # tenant predicate lives in this query's inner subquery. The 15s client timeout
     # is a backstop above the server-side statement_timeout.
     query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
-    HeavyRead.all(tenant_id, query, timeout: 15_000)
+    HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
+  end
+
+  @doc false
+  # Per-read options for a heavy endpoint (US-27.4): the 15s CLIENT timeout backstop
+  # plus an optional per-endpoint SERVER-SIDE statement_timeout override (config
+  # `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`). When
+  # no override is configured the read uses the pool-level statement_timeout (the
+  # default path, no per-request transaction). Also passes the endpoint key via
+  # telemetry_options so slow-query logs can trace which endpoint triggered the query.
+  # Public-but-`@doc false` so the slow-query telemetry test can exercise the real
+  # opts-building path (incl. the override branch).
+  def heavy_read_opts(endpoint) do
+    base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
+
+    case heavy_read_statement_timeout(endpoint) do
+      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
+      _ -> base
+    end
+  end
+
+  defp heavy_read_statement_timeout(endpoint) do
+    :loopctl
+    |> Application.get_env(:heavy_read_statement_timeout_overrides, %{})
+    |> Map.get(endpoint)
   end
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can
@@ -3271,12 +3299,12 @@ defmodule Loopctl.Knowledge do
     total_count =
       count_query
       |> maybe_filter_bridge_path(bridge?, vis)
-      |> then(&HeavyRead.one(tenant_id, &1, timeout: 15_000))
+      |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:distant_pairs)))
 
     pairs_with_lookahead =
       pairs_query
       |> maybe_filter_bridge_path(bridge?, vis)
-      |> then(&HeavyRead.all(tenant_id, &1, timeout: 15_000))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:distant_pairs)))
 
     # Detect has_more by fetching limit+1; only return limit
     has_more = length(pairs_with_lookahead) > limit
@@ -3570,7 +3598,7 @@ defmodule Loopctl.Knowledge do
     )
     |> maybe_filter_by_visibility(vis)
     # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
-    |> then(&HeavyRead.one(tenant_id, &1, timeout: 15_000))
+    |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:novelty)))
   end
 
   # --- Embeddings ---
@@ -4049,13 +4077,13 @@ defmodule Loopctl.Knowledge do
     # statement_timeout, isolated from the small AdminRepo pool. `filtered_query`
     # filters `a.tenant_id`; the count's tenant predicate lives in its inner subquery.
     count_query = from(q in subquery(filtered_query), select: count())
-    total_count = HeavyRead.one(tenant_id, count_query)
+    total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:semantic_search))
 
     results =
       filtered_query
       |> limit(^limit)
       |> offset(^offset)
-      |> then(&HeavyRead.all(tenant_id, &1))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:semantic_search)))
 
     maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
 

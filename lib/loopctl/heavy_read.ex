@@ -59,16 +59,44 @@ defmodule Loopctl.HeavyRead do
   @doc """
   Like `Repo.all/2`, but requires a `tenant_id` and a query whose every base-table
   source is scoped to it. Raises `ArgumentError` otherwise.
+
+  A per-endpoint `:statement_timeout` (positive ms) option overrides the pool-level
+  default for THIS read only, via a `SET LOCAL` inside a transaction (US-27.4). Omit
+  it to use the pool default (no per-request transaction — the common, preferred
+  path).
   """
   @spec all(binary(), Ecto.Queryable.t(), keyword()) :: [term()]
   def all(tenant_id, queryable, opts \\ []) do
-    repo().all(guard!(tenant_id, queryable), opts)
+    {st, opts} = Keyword.pop(opts, :statement_timeout)
+    query = guard!(tenant_id, queryable)
+    with_statement_timeout(st, fn -> repo().all(query, opts) end)
   end
 
-  @doc "Like `Repo.one/2`, with the same tenant-scoping guard as `all/3`."
+  @doc "Like `Repo.one/2`, with the same tenant-scoping guard and `:statement_timeout` as `all/3`."
   @spec one(binary(), Ecto.Queryable.t(), keyword()) :: term() | nil
   def one(tenant_id, queryable, opts \\ []) do
-    repo().one(guard!(tenant_id, queryable), opts)
+    {st, opts} = Keyword.pop(opts, :statement_timeout)
+    query = guard!(tenant_id, queryable)
+    with_statement_timeout(st, fn -> repo().one(query, opts) end)
+  end
+
+  # Run `fun` under a per-read SET LOCAL statement_timeout (when given) or directly
+  # (pool default). `nil` means "no override" — the common path, no transaction.
+  defp with_statement_timeout(nil, fun), do: fun.()
+
+  defp with_statement_timeout(ms, fun) when is_integer(ms) and ms > 0 do
+    case transaction(fun, statement_timeout: ms) do
+      {:ok, result} ->
+        result
+
+      {:error, reason} ->
+        raise "heavy read aborted: #{inspect(reason)}"
+    end
+  end
+
+  defp with_statement_timeout(ms, _fun) do
+    raise ArgumentError,
+          ":statement_timeout (got #{inspect(ms)}) must be a positive integer (ms)"
   end
 
   @doc """
