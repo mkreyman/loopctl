@@ -3865,7 +3865,8 @@ defmodule Loopctl.Knowledge do
   # is `to_embedding_list/1`, which normalizes the const to a plain `[float()]` param —
   # the SAME value shape `nearest/4` binds — so the `::vector` cast never re-interpolates a
   # stored `%Pgvector{}` struct (the #168 production 500). The query stays tenant-scoped
-  # (`a.tenant_id == ^tenant_id`) and bounded by the `tags &&` GIN residual, never the corpus.
+  # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
+  # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
     tenant_id
     |> novelty_distance_query(embedding, prior_tag, vis)
@@ -3878,8 +3879,17 @@ defmodule Loopctl.Knowledge do
   # (it executes inside a `Task.async_stream`, off the test process, so it can't be captured
   # in-process). The const is normalized to a plain `[float()]` via `to_embedding_list/1`
   # — the SAME value shape `nearest/4` binds — so the `::vector` cast never re-interpolates
-  # a stored `%Pgvector{}` (the #168 prod 500). Tenant-scoped + bounded by the `tags &&` GIN
-  # residual; NOT a top-k helper (registered in `Loopctl.Knowledge.CosineLintExceptions`).
+  # a stored `%Pgvector{}` (the #168 prod 500). NOT a top-k helper (registered in
+  # `Loopctl.Knowledge.CosineLintExceptions` — this function holds the `<=>` literal).
+  #
+  # BOUND (verified at 80k via EXPLAIN ANALYZE): tenant-scoped and bounded by prior-tag
+  # selectivity, NEVER a full-corpus read. Postgres rewrites `MIN(embedding <=> $const)` into
+  # `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW index
+  # (`articles_embedding_hnsw_idx`) with `tags &&` as a Filter (~0.3ms / 676 buffers); for a
+  # less-HNSW-friendly target/stats it may instead intersect the `tags &&` GIN
+  # (`articles_tags_index`) bitmap. The planner picks by cost — both are bounded; the
+  # invariant the scale test asserts is "bounded by prior-tag selectivity, not Seq Scan",
+  # accepting EITHER plan (it does NOT pin the node type).
   @doc false
   def novelty_distance_query(tenant_id, embedding, prior_tag, vis) do
     target = to_embedding_list(embedding)

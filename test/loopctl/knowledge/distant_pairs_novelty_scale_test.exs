@@ -7,9 +7,14 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
     * `distant_pairs` — the column-to-column self-join reads `articles` ONLY through the
       `LIMIT max_pair_candidates()` SAMPLED subquery, so every base-table scan is bounded
       by the sample cap (NOT an O(n²)/Seq read over the whole 80k corpus).
-    * `novelty` (`nearest_prior_distance`) — the `MIN(<=>)` aggregate is scoped by the
-      `tags &&` GIN residual (`articles_tags_index`), so it reaches `articles` via a
-      Bitmap Index Scan bounded by the tag's selectivity, NOT a Seq Scan over 80k.
+    * `novelty` (`nearest_prior_distance` → `novelty_distance_query/4`) — the `MIN(<=>)`
+      aggregate is bounded by prior-tag selectivity, NOT a full-corpus read. The planner
+      picks by cost between TWO bounded plans: an HNSW `ORDER BY <=> LIMIT 1` rewrite of the
+      MIN (verified at 80k — `articles_embedding_hnsw_idx`, `tags &&` as a Filter) OR a
+      `tags &&` GIN-bounded scan (`articles_tags_index`). The test asserts the structural
+      invariant (no unbounded Seq Scan + the `articles` scan estimate stays below a small
+      multiple of the tag's ~2% selectivity), accepting EITHER plan — it does NOT pin the
+      node type, so a legitimate planner switch to the GIN bitmap can't false-RED it.
 
   We assert on the ACTUAL SQL+params the request path emits (captured via
   `PlanAssertions.capture_repo_queries/1`), not an independently reconstructed query, then
@@ -148,15 +153,28 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
       # path uses (`novelty_distance_query/4`) with the SAME const + tag — same SQL+params.
       query = Knowledge.novelty_distance_query(tenant.id, idea_vec, @prior_tag, nil)
 
-      # FINDING (verified at 80k via EXPLAIN ANALYZE): Postgres rewrites `MIN(embedding <=>
-      # $const)` into `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW
-      # index (`articles_embedding_hnsw_idx`), applying `tags &&` as an in-line Filter — a
-      # SINGLE Index Scan, ~0.3ms / 676 buffers. So the bound here is the HNSW LIMIT-1
-      # rewrite, NOT the `tags &&` GIN bitmap the story hypothesized; either way it is
-      # bounded and tenant-scoped, never a Seq/Bitmap full-corpus read. `refute_full_scan`
-      # (forbids Seq Scan, Parallel Seq Scan, AND Bitmap Heap Scan, and requires the relation
-      # to actually be reached) is the precise guard for that.
-      assert :ok = PlanAssertions.refute_full_scan(query)
+      # The REAL invariant is "bounded by prior-tag selectivity, NOT a full-corpus read" —
+      # and there are TWO legitimate bounded plans the cost-based planner may pick, so we must
+      # NOT pin the node type (that is the architect's HIGH finding):
+      #
+      #   * verified at 80k: Postgres rewrites `MIN(embedding <=> $const)` into
+      #     `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW index
+      #     (`articles_embedding_hnsw_idx`), `tags &&` as an in-line Filter — a single Index
+      #     Scan, ~0.3ms / 676 buffers, scan estimate ≈ the tag-filtered ~1.6k rows; OR
+      #   * for a less-HNSW-friendly target/stats, a `tags &&` GIN bitmap
+      #     (`articles_tags_index`) — a Bitmap Heap Scan, also bounded by the ~2% tag.
+      #
+      # `refute_full_scan` would FALSE-RED the second (legitimately bounded) plan because it
+      # forbids Bitmap Heap Scan. So instead assert the STRUCTURAL bound, accepting either:
+      #   1. no unbounded Seq Scan (a bounded bitmap is allowed), AND
+      #   2. every `articles` scan estimate is below a small multiple of the tag selectivity
+      #      (~2% ⇒ ~1.6k at 80k) — comfortably below the corpus, so a full-corpus scan trips
+      #      it while both bounded plans (HNSW ~1.6k, GIN bitmap ~1.6k) pass.
+      # Ceiling = floor/8 = 10_000 (≫ the ~1.6k tag set, ≪ the 80k corpus).
+      ceiling = div(ScaleSeed.prod_article_floor(), 8)
+
+      assert :ok = PlanAssertions.refute_seq_scan(query)
+      assert :ok = PlanAssertions.assert_scan_rows_below(query, ceiling)
     end)
   end
 end

@@ -4,21 +4,31 @@ defmodule Loopctl.Knowledge.CosineLintExceptionsTest do
   legitimately live OUTSIDE `VectorSearch` (the future US-27.8 "no hand-rolled cosine"
   guard reads this registry so it does not false-positive on these two shapes).
 
-  Asserts BOTH `do_distant_pairs` and `nearest_prior_distance` are registered, each with a
-  non-empty rationale, and that the registry is the programmatic source of exceptions
-  (`registered?/3` matches exactly the documented `{module, function, arity}` triples).
+  Asserts the `<=>`-bearing functions (`do_distant_pairs/7` and `novelty_distance_query/4`,
+  the function the US-27.7b extraction moved the cosine literal into) AND the logical owner
+  `nearest_prior_distance/4` are registered, each with a non-empty rationale, and that the
+  registry is the programmatic source of exceptions (`registered?/3` matches exactly the
+  documented `{module, function, arity}` triples AND requires a non-empty rationale).
   """
   use ExUnit.Case, async: true
 
   alias Loopctl.Knowledge.CosineLintExceptions
 
   describe "exceptions/0 — the auditable allowlist (AC-27.7b.3)" do
-    test "registers BOTH distant_pairs and nearest_prior_distance" do
+    test "registers the `<=>`-bearing functions AND the logical owner" do
       registered =
         CosineLintExceptions.exceptions()
         |> Enum.map(&{&1.module, &1.function, &1.arity})
 
+      # do_distant_pairs/7 textually contains its `a.embedding <=> b.embedding`.
       assert {Loopctl.Knowledge, :do_distant_pairs, 7} in registered
+
+      # novelty_distance_query/4 is where the US-27.7b extraction PUT the `MIN(<=>)` literal,
+      # so a US-27.8 lint that maps a flagged `<=>` site to its enclosing def lands HERE —
+      # it MUST be registered or the lint false-positives.
+      assert {Loopctl.Knowledge, :novelty_distance_query, 4} in registered
+
+      # nearest_prior_distance/4 is the logical owner (kept for documentation).
       assert {Loopctl.Knowledge, :nearest_prior_distance, 4} in registered
     end
 
@@ -37,10 +47,19 @@ defmodule Loopctl.Knowledge.CosineLintExceptionsTest do
       assert rationale =~ ~r/\$const|HNSW/
     end
 
-    test "nearest_prior_distance rationale names the MIN-aggregate reason" do
-      rationale = rationale_for(:nearest_prior_distance, 4)
+    test "novelty_distance_query rationale names the MIN-aggregate reason + the bound" do
+      rationale = rationale_for(:novelty_distance_query, 4)
       assert rationale =~ "MIN"
-      assert rationale =~ ~r/aggregate|min/
+      assert rationale =~ ~r/<=>|aggregate|min/
+      # Bound is honestly stated as prior-tag selectivity / never full-corpus.
+      assert rationale =~ "prior-tag"
+      assert rationale =~ "never full-corpus"
+    end
+
+    test "nearest_prior_distance rationale marks it the logical owner" do
+      rationale = rationale_for(:nearest_prior_distance, 4)
+      assert rationale =~ ~r/owner/i
+      assert rationale =~ "novelty_distance_query"
     end
 
     test "the registry is the programmatic source (each entry has a well-formed shape)" do
@@ -53,8 +72,9 @@ defmodule Loopctl.Knowledge.CosineLintExceptionsTest do
   end
 
   describe "registered?/3 — what the US-27.8 guard calls (AC-27.7b.3)" do
-    test "true for both registered exceptions" do
+    test "true for every registered exception, including the `<=>`-bearing builder" do
       assert CosineLintExceptions.registered?(Loopctl.Knowledge, :do_distant_pairs, 7)
+      assert CosineLintExceptions.registered?(Loopctl.Knowledge, :novelty_distance_query, 4)
       assert CosineLintExceptions.registered?(Loopctl.Knowledge, :nearest_prior_distance, 4)
     end
 
@@ -62,6 +82,17 @@ defmodule Loopctl.Knowledge.CosineLintExceptionsTest do
       refute CosineLintExceptions.registered?(Loopctl.Knowledge, :search_semantic, 3)
       refute CosineLintExceptions.registered?(Loopctl.Knowledge, :do_distant_pairs, 99)
       refute CosineLintExceptions.registered?(SomeOther.Module, :do_distant_pairs, 7)
+    end
+
+    test "every registered entry's rationale is non-empty, so registered?/3 actually suppresses" do
+      # registered?/3 requires a non-empty rationale; this proves no real entry is suppressed
+      # by accident AND documents the contract that a blank rationale would NOT suppress.
+      for exc <- CosineLintExceptions.exceptions() do
+        assert CosineLintExceptions.registered?(exc.module, exc.function, exc.arity),
+               "#{inspect({exc.module, exc.function, exc.arity})} must be recognized by registered?/3"
+
+        assert String.trim(exc.rationale) != ""
+      end
     end
   end
 
