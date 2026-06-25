@@ -100,7 +100,10 @@ config :logger, :default_formatter,
     :mapped_code,
     :controller,
     :action,
-    :pg_message
+    :pg_message,
+    :duration_ms,
+    :repo,
+    :source
   ]
 
 # Set a higher stacktrace during development. Avoid configuring such

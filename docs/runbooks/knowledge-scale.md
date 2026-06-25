@@ -75,6 +75,36 @@ fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyRea
 > is required — `0`/unlimited is rejected, so a runaway export can't pin a connection
 > on the small heavy pool forever.
 
+## Per-endpoint `statement_timeout` + slow-query logging (US-27.4)
+
+**Default heavy-read timeout:** every heavy read runs under the pool-level
+`statement_timeout` (`HEAVY_READ_STATEMENT_TIMEOUT_MS`, default 10s — see above). When
+it fires, the request fast-fails as the structured **504 `db_statement_timeout`**
+(US-27.3) and the connection is released promptly — no 30s hang, no per-request
+transaction.
+
+**Per-endpoint override (optional):** to give one endpoint a tighter (or looser) bound,
+set `:heavy_read_statement_timeout_overrides` (ms) in config — keys
+`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`:
+
+```elixir
+config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
+```
+
+An override applies via `SET LOCAL` inside a transaction on the dedicated heavy pool
+(justified by the 8-conn sizing); endpoints with no override use the pool default (no
+transaction). Leave it empty unless an endpoint needs a different bound.
+
+**Slow-query logging:** `Loopctl.Telemetry.SlowQueryLogger` (attached at boot) logs any
+query slower than `:slow_query_threshold_ms` (default **1000**, tunable in config/env)
+at `:warning` with `duration_ms`, `repo`, `source`, and the request `tenant_id` /
+`request_id`. Raw SQL / params / vectors are never logged. Lower the threshold to surface
+a trend before it becomes an incident:
+
+```elixir
+config :loopctl, :slow_query_threshold_ms, 500
+```
+
 ## `hnsw.ef_search` recall lever (US-27.11 → US-27.6b)
 
 `hnsw.ef_search` is a pgvector **custom** GUC that does not exist until the

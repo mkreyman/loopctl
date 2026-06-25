@@ -5,9 +5,14 @@ defmodule Loopctl.Application do
 
   use Application
 
+  alias Loopctl.Telemetry.SlowQueryLogger
+
   @impl true
   def start(_type, _args) do
     Loopctl.TenantKeys.init_cache()
+
+    # US-27.4: uniform slow-query logging across all repos via one telemetry handler.
+    SlowQueryLogger.attach()
 
     children = [
       LoopctlWeb.Telemetry,

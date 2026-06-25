@@ -18,7 +18,16 @@ config :loopctl,
   # 0.6 is calibrated for relationship discovery (related topics).
   # 0.8+ is only useful for near-duplicate detection.
   article_link_threshold: 0.6,
-  article_link_max_comparisons: 50
+  article_link_max_comparisons: 50,
+  # US-27.4: log any query slower than this (ms) via the SlowQueryLogger telemetry
+  # handler. Tunable in config/env without a code change.
+  slow_query_threshold_ms: 1_000,
+  # US-27.4: optional per-endpoint SERVER-SIDE statement_timeout overrides (ms) for
+  # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the
+  # pool-level statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s) with
+  # no per-request transaction. Keys: :suggested_links, :semantic_search,
+  # :distant_pairs, :novelty.
+  heavy_read_statement_timeout_overrides: %{}
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
@@ -69,7 +78,11 @@ config :logger, :default_handler,
        :mapped_code,
        :controller,
        :action,
-       :pg_message
+       :pg_message,
+       # US-27.4: slow-query log fields.
+       :duration_ms,
+       :repo,
+       :source
      ]}
 
 # Configure esbuild (the version is required)
