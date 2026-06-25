@@ -370,7 +370,7 @@ defmodule Loopctl.Knowledge.BulkOps do
         Multi.new(),
         tenant_id,
         article_ids,
-        %{token: token_id},
+        %{token: token_id, count: length(article_ids)},
         audit_opts
       )
     end)
@@ -471,6 +471,10 @@ defmodule Loopctl.Knowledge.BulkOps do
     do: %{"type" => "source", "source_id" => source_id}
 
   defp summarize_selector(%{ids: ids}), do: %{"type" => "ids", "count" => length(ids)}
+
+  defp summarize_selector(%{token: token_id, count: count}),
+    do: %{"type" => "token", "token" => token_id, "count" => count}
+
   defp summarize_selector(%{token: token_id}), do: %{"type" => "token", "token" => token_id}
 
   defp maybe_put_source_type(map, st) when is_binary(st), do: Map.put(map, "source_type", st)
