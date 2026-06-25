@@ -184,6 +184,21 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
     # compare). Touch a vector op first so pgvector's custom GUC is registered for the
     # session, then read it. ef_search is never SET today, so both must report the
     # pgvector default — pinned so a future prod ALTER ROLE can't diverge from the gate.
+    #
+    # SHARED-ROLE ASSUMPTION (the one scenario this guard could go silently green while
+    # prod diverges — document it so a future reader knows when to revisit):
+    #   (a) The `gate == prod` parity check assumes AdminRepo and HeavyReadRepo connect
+    #       as ONE Postgres role (true in prod today — both use admin_database_url's
+    #       BYPASSRLS role). `hnsw.ef_search` is set per-ROLE via `ALTER ROLE … SET`
+    #       (US-27.11), so a single ALTER ROLE moves BOTH pools together → parity holds
+    #       by construction even after an override.
+    #   (b) IF those repos are ever split onto DIFFERENT Postgres roles, an ALTER ROLE on
+    #       one role would NOT move the other, and THIS test is the only thing that would
+    #       catch the silent gate-vs-prod divergence — so it MUST be revisited then
+    #       (read ef_search on each role explicitly, not assume one ALTER ROLE covers both).
+    #   (c) The `== "40"` pin below is a deliberate tripwire for "still pgvector default".
+    #       When US-27.11 lands a non-default `ALTER ROLE … SET hnsw.ef_search = N`, this
+    #       pin MUST be updated to the new value (and (a)'s shared-role reasoning re-checked).
     gate_ef =
       unboxed(fn ->
         AdminRepo.query!("SELECT '[1,2,3]'::vector")

@@ -64,6 +64,9 @@ defmodule Loopctl.Knowledge.VectorSearch do
   emits a `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event and
   a response-`meta` flag when the pool was filled to cap but filters cut it below
   `k` (see that function + `Loopctl.TelemetryEvents.vector_search_under_fill/0`).
+  The event's `excluded_total` measurement is the COMBINED post-ANN exclusion count
+  (anti-join + threshold); a per-reason split is deferred to US-27.15 because
+  separating the two would cost an extra per-request read (AC-27.6b.5 cost bound).
 
   **Raising recall is deliberately NOT done per-request here.** `hnsw.ef_search` is
   a pgvector **custom GUC** that does not exist until the extension loads per

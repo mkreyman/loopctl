@@ -3274,12 +3274,25 @@ defmodule Loopctl.Knowledge do
       if pool_exhausted? do
         :telemetry.execute(
           Loopctl.TelemetryEvents.vector_search_under_fill(),
-          %{requested: limit, returned: returned, pool: pool, available: available},
+          %{
+            requested: limit,
+            returned: returned,
+            pool: pool,
+            available: available,
+            # TOTAL post-ANN exclusions: how many of the FULL pool the post-ANN filters
+            # (already-linked anti-join + similarity threshold, COMBINED) cut away to land
+            # at `returned`. This is intentionally the aggregate, not a per-reason split:
+            # separating anti-join drops from threshold drops would require an ADDITIONAL
+            # bounded read per request (the current flow knows neither component count —
+            # the main query returns only survivors and `available` is the pre-filter
+            # eligible count), which the AC-27.6b.5 one-bounded-read cost bound discourages.
+            # The per-reason breakdown is deferred to US-27.15's metrics aggregation, which
+            # consumes this event. See `Loopctl.TelemetryEvents.vector_search_under_fill/0`.
+            excluded_total: max(pool - returned, 0)
+          },
           %{
             tenant_id: tenant_id,
-            endpoint: :suggested_links,
-            # how many of the full pool the post-ANN filters cut away to land at `returned`
-            excluded_by_filters: max(pool - returned, 0)
+            endpoint: :suggested_links
           }
         )
 

@@ -110,9 +110,12 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
       assert measurements.returned < 5
       assert measurements.pool == 6
       assert measurements.available >= measurements.pool
+      # excluded_total is the COMBINED post-ANN exclusion count (anti-join + threshold),
+      # a measurement (numeric), NOT a per-reason split (deferred to US-27.15).
+      assert measurements.excluded_total == measurements.pool - measurements.returned
+      assert measurements.excluded_total >= 1
       assert metadata.tenant_id == tenant.id
       assert metadata.endpoint == :suggested_links
-      assert metadata.excluded_by_filters >= 1
 
       # Exactly ONE event (AC-27.6b.5: one per request, not per filtered candidate).
       refute_received {:under_fill, _, _, _}

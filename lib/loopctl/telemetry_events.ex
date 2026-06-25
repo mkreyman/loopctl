@@ -48,9 +48,21 @@ defmodule Loopctl.TelemetryEvents do
   requested `k` candidates DESPITE the inner ANN pool being filled to its cap —
   i.e. the post-ANN filters (already-linked anti-join / similarity threshold)
   cut the full pool below `k`, not a genuinely-small corpus. Emitted at most
-  ONCE per request. Carries an id-only payload (tenant_id, endpoint, requested,
-  pool, returned, available, excluded_by_filters) — NEVER a vector literal or
-  article body (AC-27.6b.5). Aggregated by US-27.15 metrics/alerting.
+  ONCE per request.
+
+  ## Payload (id-only — NEVER a vector literal or article body, AC-27.6b.5)
+
+    * `measurements`: `%{requested, returned, pool, available, excluded_total}`
+      where `excluded_total = pool - returned` is the **TOTAL** post-ANN
+      exclusion count — the anti-join drops and the below-threshold drops
+      COMBINED, NOT a per-reason split. A per-reason breakdown (anti-join vs
+      threshold) is intentionally **deferred to US-27.15** (the metrics
+      aggregation that consumes this event): computing the two components
+      separately would cost an ADDITIONAL bounded read per request, which the
+      AC-27.6b.5 one-bounded-read cost bound discourages.
+    * `metadata`: `%{tenant_id, endpoint}` — `tenant_id` is an id, not content.
+
+  Aggregated by US-27.15 metrics/alerting.
   """
   def vector_search_under_fill, do: [:loopctl, :knowledge, :vector_search, :under_fill]
 
