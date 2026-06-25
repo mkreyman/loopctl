@@ -14,30 +14,40 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
 
   ## How it detects (pure AST, no process, no DB)
 
-  A cosine `<=>` reaches the database only inside a SQL string passed to `fragment(...)`
-  / a raw `query`/`query!`/`explain` call. So the check walks the source AST (descending
-  manually to keep each `<=>` attributed to its enclosing module + `def`/`defp`) and, for
-  every SQL-bearing call, DEEP-WALKS its argument subtrees for ANY binary literal
-  containing `"<=>"`. The deep walk is deliberate: the `<=>` may be a plain literal
-  (`fragment("? <=> ?", …)`), an INTERPOLATED string (`fragment("\#{col} <=> ?", …)` — the
-  `<=>` lives in a `{:<<>>, …}` segment), or a CONCATENATION (`fragment("? <=>" <> "?", …)`
-  — a `{:<>, …}` node). A shallow direct-child check would MISS the interpolated/concat
-  forms (the rot can be written with one interpolated token), so we recurse through the
-  arg trees. For each site it resolves:
+  A pgvector distance reaches the database only inside a SQL string passed to `fragment(...)`
+  or a raw-SQL call (`query`/`query!`/`query_many`/`query_many!`/`stream`/`explain`, bare or
+  qualified like `Repo.query!`). So the check walks the source AST (descending manually to
+  keep each site attributed to its enclosing module + `def`/`defp`) and, for every SQL-bearing
+  call, scans its SQL-template argument subtree(s) for ANY binary literal containing a pgvector
+  DISTANCE TOKEN — not just the `<=>` operator but the whole family `@distance_tokens`
+  (`<=>` / `<->` / `<#>` and the `cosine_distance(` / `l2_distance(` / `inner_product(`
+  function spellings), since each defeats the cosine HNSW index the same way (review F1). The
+  scan is a DEEP walk, deliberately: the token may be a plain literal (`fragment("? <=> ?", …)`),
+  an INTERPOLATED string (`fragment("\#{col} <=> ?", …)` — the token lives in a `{:<<>>, …}`
+  segment), or a CONCATENATION (`fragment("? <=>" <> "?", …)` — a `{:<>, …}` node). A shallow
+  direct-child check would MISS the interpolated/concat forms (the rot can be written with one
+  interpolated token), so we recurse through the arg trees. For `fragment` the SQL is ALWAYS
+  arg 1 (the rest are bound VALUES), so only arg 1 is scanned — a token in a value arg
+  (`fragment("?", "a <=> b")`) is NOT flagged (review F3); for the raw-SQL calls the SQL may be
+  arg 1 or arg 2, so all args are scanned. For each site it resolves:
 
     * the enclosing `def`/`defp` **name + arity** (the nearest such ancestor), and
     * the **enclosing module** — tracked through `defmodule` nodes during the walk, so a
       site in a NESTED module gets its own full name (`Outer.Inner`) and is exempted on its
       own module (the VectorSearch whole-module exemption can never wholesale-suppress a
-      rogue `<=>` in an unrelated module merely nested inside an exempt one).
+      rogue distance op in an unrelated module merely nested inside an exempt one).
 
   ### Residual boundary (documented)
 
-  A `<=>` SQL string assembled in a VARIABLE and then piped into `query!` (`sql = "… <=>
-  …"; Repo.query!(sql, …)`) is NOT caught — the call's argument is a var node, not a
-  literal, and tracking it would require data-flow analysis. loopctl builds every real
-  cosine query via `fragment` literals, so this boundary is currently empty; if a raw-SQL
-  var path is ever introduced, register it explicitly (or route it through the helper).
+  A distance SQL string that has no LITERAL at the call site is NOT caught — the AST has
+  nothing to scan there. Two forms: a string assembled in a VARIABLE then piped into a call
+  (`sql = "… <=> …"; Repo.query!(sql, …)`), or one held in a module ATTRIBUTE (`@q "… <=> …"`)
+  then referenced. Closing either needs data-flow analysis. loopctl builds every real cosine
+  query via `fragment` literals, so this boundary is currently empty in `lib/loopctl`; it is
+  backstopped COARSELY by the test-side file-set tripwire (a NEW lib file carrying a distance
+  token — including a var/attr literal — expands the discovered set and fails the regression
+  guard, forcing review). If a raw-SQL var/attr path is ever introduced, register it
+  explicitly or route it through the helper.
 
   ## Exemptions (the allowlist exempts the LINT, never the scale gate)
 
@@ -122,6 +132,9 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
       {:ok, ast} ->
         ast
         |> cosine_sites()
+        # A nested distance fragment matches at both the outer + inner call → ONE logical
+        # site, so collapse duplicates by {module, fun, arity, line} (review F5).
+        |> Enum.uniq_by(fn s -> {s.module, s.fun, s.arity, s.line} end)
         |> Enum.reject(fn site -> exempt?(site, allowlist) end)
         |> Enum.map(&issue_for(issue_meta, &1))
 
@@ -184,9 +197,26 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
     |> Enum.reverse()
   end
 
-  # SQL-bearing call names whose string arguments are real query text (where a `<=>`
-  # is a hand-rolled cosine site), as opposed to docstrings / data / regex literals.
-  @sql_call_names [:fragment, :query, :query!, :explain]
+  # SQL-bearing call names whose string arguments are real query text (where a distance
+  # site lives), as opposed to docstrings / data / regex literals. Covers every raw-SQL
+  # Ecto/Postgrex entrypoint (`query_many`/`stream` included — review SQL-1/SQL-2: those
+  # send arbitrary SQL too and a cosine ORDER BY through them must NOT slip past).
+  @sql_call_names [
+    :fragment,
+    :query,
+    :query!,
+    :query_many,
+    :query_many!,
+    :stream,
+    :explain
+  ]
+
+  # The pgvector distance spellings a hand-rolled site can use — ALL defeat the (cosine)
+  # HNSW index when put in an ORDER BY / distance filter outside the helper. The guard is
+  # NOT just the `<=>` OPERATOR: `cosine_distance(a,b)` is the SAME operation (review F1),
+  # and `<->` / `<#>` (and their function spellings) are the other pgvector distance ops
+  # that would equally full-scan since only the cosine HNSW index exists.
+  @distance_tokens ["<=>", "<->", "<#>", "cosine_distance(", "l2_distance(", "inner_product("]
 
   # State threaded down the walk:
   #   * `module` — the current enclosing module (nil before the first `defmodule`).
@@ -233,9 +263,9 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
     call_line = meta[:line] || line
 
     acc =
-      if sql_call?(form) and Enum.any?(children, &arg_has_cosine?/1) do
+      if sql_call?(form) and cosine_in_sql_args?(form, children) do
         {fun, arity} = scope || {nil, nil}
-        [%{module: module, fun: fun, arity: arity, line: call_line, trigger: "<=>"} | acc]
+        [%{module: module, fun: fun, arity: arity, line: call_line, trigger: "distance"} | acc]
       else
         acc
       end
@@ -265,13 +295,29 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
   defp sql_call?({:., _, [_target, name]}) when is_atom(name), do: name in @sql_call_names
   defp sql_call?(_), do: false
 
-  # Deep-walk an argument subtree for ANY binary literal containing `<=>` — so the cosine
-  # operator is caught whether the SQL string is a plain literal, an INTERPOLATED string
-  # (a `{:<<>>,…}` node with a `" <=> ?"` segment), or a CONCATENATION (`{:<>,…}`). Gated by
-  # `sql_call?` at the call site, so doc/comment/regex/data strings (never SQL-call args)
-  # are not examined. A var-held SQL string (not a literal) is the documented residual
-  # boundary — there is no literal to find.
-  defp arg_has_cosine?(node) when is_binary(node), do: String.contains?(node, "<=>")
+  # Which args carry the SQL TEMPLATE to scan for a distance token:
+  #   * `fragment` — the SQL is ALWAYS the FIRST arg; the rest are bound VALUES. Scan ONLY
+  #     arg 1, so a distance token appearing in a bound value (`fragment("?", "a <=> b")`)
+  #     is NOT a false-positive (review F3). `fragment` never carries SQL in a later arg.
+  #   * raw-SQL calls (`query`/`query!`/`query_many`/`stream`/`explain`, bare or qualified)
+  #     — the SQL can be arg 1 (`Repo.query(sql, …)`) OR arg 2 (`SQL.query(repo, sql, …)`),
+  #     so scan ALL args (favoring no-false-NEGATIVE over the rare false-positive of a
+  #     non-Ecto same-named call — review F4, a documented accepted edge).
+  defp cosine_in_sql_args?(:fragment, [template | _]), do: arg_has_cosine?(template)
+  defp cosine_in_sql_args?(:fragment, []), do: false
+  defp cosine_in_sql_args?(_other, children), do: Enum.any?(children, &arg_has_cosine?/1)
+
+  # Deep-walk an argument subtree for ANY binary literal containing a pgvector DISTANCE
+  # token (`@distance_tokens` — the `<=>`/`<->`/`<#>` operators AND the `cosine_distance(`/
+  # `l2_distance(`/`inner_product(` function spellings; review F1). Caught whether the SQL
+  # string is a plain literal, an INTERPOLATED string (a `{:<<>>,…}` node with the token in a
+  # segment), or a literal CONCATENATION (`{:<>,…}`). Gated by `sql_call?` + the template-arg
+  # selection above, so doc/comment/regex/value-data strings are not examined. RESIDUAL
+  # (documented, requires data-flow to close — currently empty in lib/loopctl): a distance
+  # token held in a VARIABLE or a module ATTRIBUTE then passed to the call — there is no
+  # literal at the call site to find.
+  defp arg_has_cosine?(node) when is_binary(node),
+    do: Enum.any?(@distance_tokens, &String.contains?(node, &1))
 
   defp arg_has_cosine?({_, _, children}) when is_list(children),
     do: Enum.any?(children, &arg_has_cosine?/1)
@@ -291,9 +337,9 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
     mfa = format_mfa(module, fun, arity)
 
     message =
-      "hand-rolled cosine `<=>` in #{mfa} outside Loopctl.Knowledge.VectorSearch — " <>
-        "route single-target top-k similarity through the shared helper " <>
-        "(Loopctl.Knowledge.VectorSearch), or, if it is a justified exception " <>
+      "hand-rolled pgvector distance (`<=>`/`cosine_distance(`/…) in #{mfa} outside " <>
+        "Loopctl.Knowledge.VectorSearch — route single-target top-k similarity through the " <>
+        "shared helper (Loopctl.Knowledge.VectorSearch), or, if it is a justified exception " <>
         "(column-to-column self-join / MIN aggregate), register it with a rationale " <>
         "in Loopctl.Knowledge.CosineLintExceptions."
 

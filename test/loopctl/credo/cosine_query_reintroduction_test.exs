@@ -72,7 +72,7 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
         assert issue.message =~ "My.Rogue.Search.nearest/2"
         assert issue.message =~ "Loopctl.Knowledge.VectorSearch"
         assert issue.message =~ "CosineLintExceptions"
-        assert issue.trigger == "<=>"
+        assert issue.trigger == "distance"
       end)
     end
 
@@ -128,7 +128,7 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
       |> run_check(CosineQueryReintroduction)
       |> assert_issue(fn issue ->
         assert issue.message =~ "My.Rogue.Interp.nearest/2"
-        assert issue.trigger == "<=>"
+        assert issue.trigger == "distance"
       end)
     end
 
@@ -168,6 +168,105 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
       |> assert_issue(fn issue ->
         assert issue.message =~ "My.Outer.Inner.nearest/1"
       end)
+    end
+  end
+
+  describe "flags alternate distance spellings + raw-SQL entrypoints (review F1/SQL-1/SQL-2)" do
+    test "the `cosine_distance(...)` FUNCTION spelling is flagged — same op as `<=>` (review F1)" do
+      """
+      defmodule My.Rogue.FnSpelling do
+        import Ecto.Query
+
+        def nearest(t) do
+          from(a in Article, order_by: fragment("cosine_distance(embedding, ?)", ^t))
+        end
+      end
+      """
+      |> to_source_file("lib/my/rogue/fn_spelling.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue -> assert issue.message =~ "My.Rogue.FnSpelling.nearest/1" end)
+    end
+
+    test "a raw `Repo.query_many!` cosine SQL is flagged (review SQL-1)" do
+      """
+      defmodule My.Rogue.QueryMany do
+        def topk(target, k) do
+          Repo.query_many!(
+            "SELECT id FROM articles ORDER BY embedding <=> $1 LIMIT $2",
+            [target, k]
+          )
+        end
+      end
+      """
+      |> to_source_file("lib/my/rogue/query_many.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue -> assert issue.message =~ "My.Rogue.QueryMany.topk/2" end)
+    end
+
+    test "a raw `Repo.stream` cosine SQL is flagged (review SQL-2)" do
+      """
+      defmodule My.Rogue.Stream do
+        def each(target) do
+          Repo.stream("SELECT id FROM articles ORDER BY embedding <=> $1", [target])
+        end
+      end
+      """
+      |> to_source_file("lib/my/rogue/stream.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue -> assert issue.message =~ "My.Rogue.Stream.each/1" end)
+    end
+  end
+
+  describe "precision + documented residuals (review F3 false-pos, var-pipe residual)" do
+    test "a distance token in a fragment VALUE arg (not the SQL template) is NOT flagged (review F3)" do
+      # `<=>` here is BOUND DATA, not the SQL template — fragment's SQL is arg 1 only, so a
+      # token in a later (value) arg must not false-positive.
+      """
+      defmodule My.Fine.ValueArg do
+        import Ecto.Query
+
+        def f(t) do
+          from(a in Article, where: fragment("? = ?", a.name, "prefix <=> suffix") and a.id == ^t)
+        end
+      end
+      """
+      |> to_source_file("lib/my/fine/value_arg.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> refute_issues()
+    end
+
+    test "a var-held cosine SQL string piped to query! is the DOCUMENTED residual (NOT caught)" do
+      # No literal at the call site → the AST can't see it (closing this needs data-flow
+      # analysis). Pinned so the boundary is DELIBERATE + visible; loopctl never builds a
+      # cosine query this way (the coarse file-set guard backstops a new-file occurrence).
+      """
+      defmodule My.Residual.VarPipe do
+        def f(t) do
+          sql = "SELECT id FROM articles ORDER BY embedding <=> $1"
+          Repo.query!(sql, [t])
+        end
+      end
+      """
+      |> to_source_file("lib/my/residual/var_pipe.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> refute_issues()
+    end
+
+    test "a cosine SQL string held in a MODULE ATTRIBUTE then referenced is the DOCUMENTED residual (NOT caught)" do
+      # The `@cosine_sql "…<=>…"` definition is an `@` attribute node, NOT a SQL-bearing call,
+      # and the usage `Repo.query!(@cosine_sql, …)` passes an attribute REFERENCE (no literal at
+      # the call). Like the var-pipe, closing this needs data-flow; pinned as a deliberate, visible
+      # boundary. The file-set tripwire backstops it: the `<=>` literal in the @attr def lands in
+      # the discovered set, so a NEW file shaped this way fails the regression guard.
+      """
+      defmodule My.Residual.AttrRef do
+        @cosine_sql "SELECT id FROM articles ORDER BY embedding <=> $1"
+        def f(t), do: Repo.query!(@cosine_sql, [t])
+      end
+      """
+      |> to_source_file("lib/my/residual/attr_ref.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> refute_issues()
     end
   end
 
@@ -308,31 +407,119 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
     end
   end
 
-  describe "REGRESSION — the real lib/loopctl cosine sites all pass (TC-27.8.4)" do
-    @real_cosine_files [
-      "lib/loopctl/knowledge/vector_search.ex",
-      "lib/loopctl/knowledge.ex",
-      "lib/loopctl/knowledge/cosine_lint_exceptions.ex"
-    ]
+  describe "REGRESSION — every real lib distance-token file passes the check (TC-27.8.4)" do
+    # The SAME distance tokens the check itself scans for. Kept in sync deliberately: if the
+    # check learns a new spelling, this discovery must learn it too (else a new family of
+    # hand-rolled distance query could land in a file this guard never inspects).
+    @distance_tokens ["<=>", "<->", "<#>", "cosine_distance(", "l2_distance(", "inner_product("]
 
-    test "every real cosine-bearing lib file reports ZERO issues (helper + registered exempt)" do
-      for path <- @real_cosine_files do
-        source = File.read!(path)
+    # DISCOVERED at compile time: every lib/ source that textually carries ANY distance token
+    # (real query, or doc/comment prose). Computed, not hardcoded, so a NEW cosine-bearing file
+    # is automatically pulled into the per-file check below.
+    @lib_distance_files Path.wildcard("lib/**/*.ex")
+                        |> Enum.filter(fn p ->
+                          src = File.read!(p)
+                          Enum.any?(@distance_tokens, &String.contains?(src, &1))
+                        end)
+                        |> Enum.sort()
 
-        source
+    # The ALLOWLISTED set of files permitted to carry a distance token today, each annotated.
+    # A diff to this list is a visible, reviewable decision — exactly the tripwire that closes
+    # the documented var-pipe residual at FILE granularity: a `<=>` literal assembled into a
+    # variable still lands its string in the file, so a NEW file carrying it expands the
+    # discovered set and trips the set-equality test, forcing review even though the per-site
+    # check (which needs a literal AT the call) can't see it.
+    @allowed_distance_files [
+                              # real cosine query sites:
+                              "lib/loopctl/knowledge.ex",
+                              "lib/loopctl/knowledge/vector_search.ex",
+                              # registry rationale strings quote the operators (data, not query):
+                              "lib/loopctl/knowledge/cosine_lint_exceptions.ex",
+                              # doc-only tokens (a `<->` arrow in prose / a `<=>` inside a comment):
+                              "lib/loopctl/knowledge/okf.ex",
+                              "lib/loopctl/workers/article_linking_worker.ex"
+                            ]
+                            |> Enum.sort()
+
+    test "every lib file carrying a distance token reports ZERO issues (helper + registered + docs exempt)" do
+      # Covers the real cosine sites AND the doc-only files: a real hand-rolled query later
+      # added to ANY of them (e.g. okf.ex / the worker) would be flagged, because only
+      # VectorSearch + the registered fns are exempt — doc prose is not.
+      for path <- @lib_distance_files do
+        path
+        |> File.read!()
         |> to_source_file(path)
         |> run_check(CosineQueryReintroduction)
         |> refute_issues()
       end
     end
 
-    test "the real files genuinely CONTAIN `<=>` (the regression test isn't vacuous)" do
-      # Guard against a future refactor that removes all `<=>` from these files and
-      # makes the zero-issue assertion meaningless: at least one real file must still
-      # carry the operator (in a fragment), so the exemption is actually exercised.
-      assert Enum.any?(@real_cosine_files, fn path ->
-               File.read!(path) =~ "<=>"
-             end)
+    test "the discovered distance-token file set EQUALS the reviewed allowlist (file-set tripwire)" do
+      # Set-equality (not subset): a NEW file carrying a distance token trips this (review it —
+      # route a real query through VectorSearch or register it; if doc-only, add it here with a
+      # note). Removal also trips it (the regression could have gone vacuous). This is the coarse
+      # backstop for the var-pipe residual that the per-site AST check structurally cannot catch.
+      assert @lib_distance_files == @allowed_distance_files,
+             "lib distance-token files drifted from the reviewed allowlist.\n" <>
+               "  discovered: #{inspect(@lib_distance_files)}\n" <>
+               "  allowed:    #{inspect(@allowed_distance_files)}\n" <>
+               "A new file here means a hand-rolled distance op (or a var-assembled cosine SQL " <>
+               "string) landed outside VectorSearch — route it through the helper / register it, " <>
+               "or (if it's doc-only) add it to @allowed_distance_files with a one-line reason."
+    end
+
+    test "at least one allowed file genuinely CONTAINS a real `<=>` (the regression isn't vacuous)" do
+      assert Enum.any?(@allowed_distance_files, fn path -> File.read!(path) =~ "<=>" end)
+    end
+  end
+
+  describe "WIRING — the check is actually enabled in .credo.exs and not inline-disabled (E1/DISABLE-1)" do
+    @credo_config File.read!(".credo.exs")
+
+    test "`.credo.exs` ENABLES the cosine check and REQUIRES both its source + the registry (E1)" do
+      # If a future edit drops the check from the enabled set or stops `requires:`-ing it, the
+      # guard silently stops running (`mix credo --strict` would pass without it). Pin both.
+      assert @credo_config =~ "Loopctl.Credo.Check.CosineQueryReintroduction",
+             "the cosine reintroduction check is no longer listed in .credo.exs — it must stay " <>
+               "in the enabled `checks` so `mix credo --strict` runs it on every PR"
+
+      assert @credo_config =~ ".credo/checks/cosine_query_reintroduction.ex",
+             "`.credo.exs` must `require` the out-of-lib check source (it lives outside lib/ so " <>
+               "it isn't auto-compiled; dropping the require makes the check a no-op)"
+
+      assert @credo_config =~ "lib/loopctl/knowledge/cosine_lint_exceptions.ex",
+             "`.credo.exs` must `require` the allowlist registry — the check reads it at load " <>
+               "time and fails-closed (:nofile) without it (DISPROVED architect F2; load-bearing)"
+    end
+
+    test "no lib/ source DISABLES the cosine check inline (DISABLE-1)" do
+      # A `# credo:disable-...CosineQueryReintroduction` (named) OR a blanket file-level disable
+      # in one of the cosine-bearing files would silently re-open the regression. Forbid both.
+      named_disables =
+        Path.wildcard("lib/**/*.ex")
+        |> Enum.filter(fn p ->
+          src = File.read!(p)
+          src =~ ~r/credo:disable[^\n]*CosineQueryReintroduction/
+        end)
+
+      assert named_disables == [],
+             "found an inline `credo:disable` targeting the cosine check in: " <>
+               "#{inspect(named_disables)} — that re-opens the #168/#170/#172 regression silently. " <>
+               "Register a real exception in CosineLintExceptions instead."
+
+      blanket_disables_in_cosine_files =
+        @allowed_distance_files
+        |> Enum.filter(fn p ->
+          # a disable with NO check name (directive ENDS the line) disables ALL checks — incl.
+          # ours — for that file/line. A NAMED one (`… this-file Credo.Check.X`) is fine: the
+          # check name follows, so `\s*$` won't match. `/m` makes `$` an end-of-LINE anchor.
+          File.read!(p) =~ ~r/credo:disable-for-(this-file|next-line|lines:\d+)\s*$/m
+        end)
+
+      assert blanket_disables_in_cosine_files == [],
+             "found a blanket (un-named) `credo:disable` in a cosine-bearing file: " <>
+               "#{inspect(blanket_disables_in_cosine_files)} — it would disable the cosine guard " <>
+               "too. Scope the disable to the specific unrelated check by name."
     end
   end
 end

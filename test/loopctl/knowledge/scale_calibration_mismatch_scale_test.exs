@@ -104,20 +104,61 @@ defmodule Loopctl.Knowledge.ScaleCalibrationMismatchScaleTest do
     end)
   end
 
-  test "an ef_search MISMATCH fails the gate-vs-prod parity assertion (failure direction, TC-27.8.3)" do
+  test "a REAL ef_search session divergence fails the gate-vs-prod parity assertion (failure direction, TC-27.8.3)" do
     # The under-fill gate asserts the EFFECTIVE `hnsw.ef_search` is identical on the gate
     # connection and a prod-shaped one (`SHOW hnsw.ef_search`). Here we drive the FAILURE
-    # direction with two deliberately-divergent effective values and assert the SAME parity
-    # form raises — so a real prod-vs-gate divergence cannot pass green.
-    # Drive the SHARED `PlanAssertions.assert_ef_search_parity!/2` (the SAME assertion the
-    # under-fill scale gate uses for the success direction) with two deliberately-divergent
-    # effective values — so this failure path exercises the REAL comparison + message, not a
-    # duplicated local copy that could silently drift from the real gate.
+    # direction with a REAL pgvector GUC divergence end-to-end (not synthetic string literals,
+    # review BA 4.1): inside ONE transaction we `SET LOCAL hnsw.ef_search = 80` and read it
+    # back via `SHOW`, producing a genuinely-divergent effective value, then feed that REAL
+    # read + a baseline read into the SAME shared `PlanAssertions.assert_ef_search_parity!/2`
+    # the gate uses, and assert it raises. This proves the parity gate would actually catch a
+    # prod `ALTER ROLE … SET hnsw.ef_search = N` drift — exercising the real GUC + SHOW path,
+    # the real comparison, and the real message, with no duplicated local copy that could drift.
+
+    # Baseline effective value on an untouched connection (pgvector default today, "40").
+    baseline_ef =
+      unboxed(fn ->
+        AdminRepo.query!("SELECT '[1,2,3]'::vector")
+        %{rows: [[v]]} = AdminRepo.query!("SHOW hnsw.ef_search")
+        v
+      end)
+
+    # A REAL divergent read: `SET LOCAL` is TRANSACTION-scoped (auto-reverts at commit), and
+    # all queries in one transaction share the connection, so the `SHOW` observes the override.
+    diverged_ef =
+      unboxed(fn ->
+        {:ok, v} =
+          AdminRepo.transaction(fn ->
+            AdminRepo.query!("SET LOCAL hnsw.ef_search = 80")
+            %{rows: [[val]]} = AdminRepo.query!("SHOW hnsw.ef_search")
+            val
+          end)
+
+        v
+      end)
+
+    # The override actually took effect (real divergence, not a no-op) and differs from baseline.
+    assert diverged_ef == "80"
+    assert diverged_ef != baseline_ef
+
+    # The SHARED parity assertion (the SAME one the under-fill gate drives in the success
+    # direction) RAISES on the real divergent-vs-baseline reads — so a real prod/gate ef_search
+    # drift cannot pass green.
     assert_raise ExUnit.AssertionError, ~r/ef_search diverged/, fn ->
-      PlanAssertions.assert_ef_search_parity!("40", "80")
+      PlanAssertions.assert_ef_search_parity!(diverged_ef, baseline_ef)
     end
 
-    # And it does NOT raise when they match (the success direction the real gate asserts).
-    assert :ok = PlanAssertions.assert_ef_search_parity!("40", "40")
+    # `SET LOCAL` reverted at the transaction boundary — a fresh read is back to baseline, so
+    # this failure-direction probe left NO session pollution on the pooled connection, and the
+    # matched reads pass (the success direction the real gate asserts).
+    post_ef =
+      unboxed(fn ->
+        AdminRepo.query!("SELECT '[1,2,3]'::vector")
+        %{rows: [[v]]} = AdminRepo.query!("SHOW hnsw.ef_search")
+        v
+      end)
+
+    assert post_ef == baseline_ef
+    assert :ok = PlanAssertions.assert_ef_search_parity!(post_ef, baseline_ef)
   end
 end

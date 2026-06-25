@@ -98,9 +98,21 @@ which is the distinction that produced the false-green in #172.
   ADVISORY end-to-end wall-clock budget measured through the real HTTP conn
   (`vector_endpoint_e2e_latency_scale_test.exs`, `:scale_latency_budget_ms` default 2000ms).
   Calibration is asserted, not assumed: a sub-floor seed or `ef_search` mismatch FAILS
-  loudly (`scale_calibration_mismatch_scale_test.exs`). See the **Standing vector-endpoint
-  CI gates (US-27.8)** section of [`knowledge-scale.md`](knowledge-scale.md) for the lint
-  guard, the latency-budget/seed-floor knobs, and the floor-bump step.
+  loudly (`scale_calibration_mismatch_scale_test.exs`) — and the `ef_search` failure
+  direction now drives a REAL `SET LOCAL hnsw.ef_search` session divergence (read back via
+  `SHOW`), not a synthetic string compare, so the parity gate is proven against the actual
+  pgvector GUC. See the **Standing vector-endpoint CI gates (US-27.8)** section of
+  [`knowledge-scale.md`](knowledge-scale.md) for the lint guard, the latency-budget/seed-floor
+  knobs, and the floor-bump step.
+  - **PARTIAL COVERAGE (AC-27.8.4) — know exactly what the e2e timing does NOT cover.** In
+    `:test` the heavy-read DI routes through `AdminRepo`, NOT the dedicated `HeavyReadRepo`
+    pool, so the `vector_endpoint_e2e_latency_scale_test.exs` wall-clock does **not** exercise
+    the heavy-pool checkout / pool-level `statement_timeout` dimension. That dimension is
+    covered SEPARATELY by the per-request-timeout assertions on the worst-case ANN and deep
+    keyset page (the bullet above; `topk_endpoints_scale_test.exs`). The e2e test's distinct
+    value is the full HTTP path (auth → RLS context → query → serialize → render) wall-clock;
+    do not read a green e2e budget as evidence the heavy pool behaves under load — that is the
+    timeout bullet's job.
 - **No cosine-`<=>` reintroduction (US-27.8, the `lint` job)** — `mix credo --strict` runs
   the `Loopctl.Credo.Check.CosineQueryReintroduction` custom check, which fails the build
   if a NEW hand-rolled cosine `<=>` appears in `lib/loopctl` outside
@@ -114,15 +126,25 @@ It runs in two places:
   schedule, as a **matrix — one isolated job per scale file** (each with a fresh Postgres,
   so a committed-row corpus from one file can't pollute another's global planner stats).
   Each leg runs `SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly <file>`.
-  Across the matrix it covers `scale_seed_nightly_test.exs`, `vector_search_scale_test.exs`,
-  `plan_assertions_scale_test.exs`, and `keyset_plan_scale_test.exs`. The matrix list is
-  kept in lock-step with the tagged files by `scale_verification_runbook_test.exs` (set-equality).
-- **Before merging any Theme 2/3/4 (vector / timeout / pagination) PR** — the gate is
-  schedule-only in CI (4×80k seeds is too slow for every PR, and there is no always-on
-  staging env), so a perf PR is verified pre-merge by EITHER:
+  The matrix covers **every `:scale_nightly`-tagged file** (the US-27.1 seed-floor check, the
+  HNSW ANN / keyset / shared-assertion plan gates, and the US-27.8 per-endpoint index-usage,
+  e2e-latency, and calibration-mismatch gates). The exact list is NOT enumerated here on
+  purpose — it is kept in lock-step with the tagged files by `scale_verification_runbook_test.exs`
+  (set-equality, both directions), so this prose can't go stale as files are added.
+- **Don't confuse the per-PR `Scale Tests` job with the nightly plan GATE (E3).** A separate
+  job, **`Scale Tests (US-27.1)`**, DOES run on every push/PR — but it runs only
+  `--only scale .../scale_seed_test.exs`: it proves the seed/fixture machinery (and its
+  `OwnershipError`-class regressions) still works, NOT the 80k planner paths. The
+  `:scale_nightly` plan gate (index-backed shape, per-request timeout, e2e latency,
+  calibration) is **schedule/dispatch-only** — a green `Scale Tests ✓` on your PR is **not**
+  evidence the plan gates ran. Tag discipline: a new 80k plan assertion must be `:scale_nightly`
+  (so the matrix + set-equality test pick it up), not `:scale`.
+- **Before merging any Theme 2/3/4 (vector / timeout / pagination) PR** — the plan gate is
+  schedule-only in CI (each leg reseeds ~80k committed rows — too slow for every PR, and there
+  is no always-on staging env), so a perf PR is verified pre-merge by EITHER:
   1. **triggering the gate on your branch** — `gh workflow run CI --ref <your-branch>`
-     (the `workflow_dispatch` trigger runs the full matrix on the branch; confirm all four
-     legs go green), OR
+     (the `workflow_dispatch` trigger runs the full matrix on the branch; confirm EVERY
+     leg goes green), OR
   2. **running it locally** against the seed:
 
   ```sh
