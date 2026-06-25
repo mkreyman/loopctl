@@ -5,11 +5,27 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
 
   ## Why this exists
 
-  The shared `VectorSearch.nearest/4` helper is the ONLY place a top-k
-  `ORDER BY embedding <=> $const LIMIT k` should be written — its exact SQL shape is
-  load-bearing (the #168/#170/#172 production 500s came from variations that defeated
-  the HNSW index). US-27.8 introduces a "no hand-rolled cosine ORDER BY/distance outside
-  the helper" source-lint to prevent that shape from being reintroduced ad hoc.
+  The shared `Loopctl.Knowledge.VectorSearch` module is the sanctioned home for top-k
+  `ORDER BY embedding <=> $const LIMIT k` — its exact SQL shape is load-bearing (the
+  #168/#170/#172 production 500s came from variations that defeated the HNSW index). US-27.8
+  introduces a "no hand-rolled cosine ORDER BY/distance outside the helper" source-lint to
+  prevent that shape from being reintroduced ad hoc.
+
+  This registry is NOT a claim that no other `<=>` exists in the codebase — it is the
+  auditable list of the TWO US-27.7b-owned exceptions (distant_pairs + novelty). The broader
+  cosine-site inventory and the lint's full exemption policy are US-27.8's design. For
+  context, the other known cosine sites the US-27.8 lint must account for (NOT registered
+  here — out of US-27.7b's scope) are:
+
+    * `Loopctl.Knowledge.VectorSearch`'s own query builders (e.g. `candidate_query/4`) —
+      they necessarily CONTAIN the `<=>` literal because that module IS the sanctioned top-k
+      helper; US-27.8 will exempt the whole `VectorSearch` module as its home, not via this
+      per-function registry.
+    * `Loopctl.Knowledge.suggestion_candidates_query/6` — a known, intentional INLINE top-k
+      `ORDER BY embedding <=> $const LIMIT pool` whose own comment frames the inline split as
+      the #170/#172 prod-500 FIX (the index-defeating anti-join/threshold was moved to the
+      OUTER query so the inner ANN stays HNSW-eligible). Its lint disposition is a US-27.8
+      decision, deliberately left out of this US-27.7b registry.
 
   Some functions in `Loopctl.Knowledge` legitimately compute a cosine `<=>` distance WITHOUT
   going through (and MUST NOT be routed through) `nearest/4`, because neither is a
@@ -112,9 +128,29 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
   @spec registered?(module(), atom(), arity()) :: boolean()
   def registered?(module, function, arity)
       when is_atom(module) and is_atom(function) and is_integer(arity) do
-    Enum.any?(@exceptions, fn exc ->
-      exc.module == module and exc.function == function and exc.arity == arity and
-        is_binary(exc.rationale) and String.trim(exc.rationale) != ""
+    registered_in?(@exceptions, module, function, arity)
+  end
+
+  @doc """
+  Pure form of `registered?/3` that takes the exception list explicitly: true iff
+  `{module, function, arity}` matches an entry in `exceptions` whose rationale is non-empty.
+
+  Extracted so the rationale-rejection branch (an entry with a blank/nil rationale does NOT
+  suppress the lint) is reachable by tests — the compile-time `@exceptions` constant is
+  all-non-empty by construction, so without this seam that branch would be untestable.
+  """
+  @spec registered_in?([exception()] | [map()], module(), atom(), arity()) :: boolean()
+  def registered_in?(exceptions, module, function, arity)
+      when is_list(exceptions) and is_atom(module) and is_atom(function) and is_integer(arity) do
+    Enum.any?(exceptions, fn exc ->
+      exc[:module] == module and exc[:function] == function and exc[:arity] == arity and
+        non_empty_rationale?(exc[:rationale])
     end)
+  end
+
+  # A rationale suppresses the lint only when it is a present, non-blank string. A nil or
+  # whitespace-only rationale must NOT suppress — it forces a real justification to be written.
+  defp non_empty_rationale?(rationale) do
+    is_binary(rationale) and String.trim(rationale) != ""
   end
 end

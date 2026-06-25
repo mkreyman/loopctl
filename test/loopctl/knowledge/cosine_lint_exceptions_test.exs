@@ -96,6 +96,38 @@ defmodule Loopctl.Knowledge.CosineLintExceptionsTest do
     end
   end
 
+  describe "registered_in?/4 — the rationale-rejection branch (AC-27.7b.3)" do
+    # @exceptions is all-non-empty by construction, so the rejection branch is unreachable
+    # via registered?/3. registered_in?/4 takes the list explicitly, letting us PROVE the
+    # gate REJECTS a blank/nil/whitespace rationale (a blank justification must not suppress).
+    test "a present, non-blank rationale suppresses (true)" do
+      list = [%{module: Foo, function: :bar, arity: 1, rationale: "real reason"}]
+      assert CosineLintExceptions.registered_in?(list, Foo, :bar, 1)
+    end
+
+    test "an empty-string rationale does NOT suppress (false)" do
+      list = [%{module: Foo, function: :bar, arity: 1, rationale: ""}]
+      refute CosineLintExceptions.registered_in?(list, Foo, :bar, 1)
+    end
+
+    test "a whitespace-only rationale does NOT suppress (false)" do
+      list = [%{module: Foo, function: :bar, arity: 1, rationale: "   \t\n"}]
+      refute CosineLintExceptions.registered_in?(list, Foo, :bar, 1)
+    end
+
+    test "a nil rationale does NOT suppress (false)" do
+      list = [%{module: Foo, function: :bar, arity: 1, rationale: nil}]
+      refute CosineLintExceptions.registered_in?(list, Foo, :bar, 1)
+    end
+
+    test "a non-matching {module, function, arity} does NOT suppress even with a good rationale" do
+      list = [%{module: Foo, function: :bar, arity: 1, rationale: "real reason"}]
+      refute CosineLintExceptions.registered_in?(list, Foo, :bar, 2)
+      refute CosineLintExceptions.registered_in?(list, Foo, :baz, 1)
+      refute CosineLintExceptions.registered_in?([], Foo, :bar, 1)
+    end
+  end
+
   defp rationale_for(function, arity) do
     CosineLintExceptions.exceptions()
     |> Enum.find(&(&1.function == function and &1.arity == arity))

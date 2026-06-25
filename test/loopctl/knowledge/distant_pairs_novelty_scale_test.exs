@@ -12,14 +12,21 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
       picks by cost between TWO bounded plans: an HNSW `ORDER BY <=> LIMIT 1` rewrite of the
       MIN (verified at 80k — `articles_embedding_hnsw_idx`, `tags &&` as a Filter) OR a
       `tags &&` GIN-bounded scan (`articles_tags_index`). The test asserts the structural
-      invariant (no unbounded Seq Scan + the `articles` scan estimate stays below a small
-      multiple of the tag's ~2% selectivity), accepting EITHER plan — it does NOT pin the
-      node type, so a legitimate planner switch to the GIN bitmap can't false-RED it.
+      invariant (no unbounded Seq Scan + every `articles` scan touches fewer than a small
+      multiple of the tag's ~2% selectivity in ACTUAL rows, via EXPLAIN ANALYZE), accepting
+      EITHER plan — it does NOT pin the node type, so a legitimate planner switch to the GIN
+      bitmap can't false-RED it, while a low-estimate/high-actual full-corpus regression IS
+      caught by real rows.
 
-  We assert on the ACTUAL SQL+params the request path emits (captured via
-  `PlanAssertions.capture_repo_queries/1`), not an independently reconstructed query, then
-  EXPLAIN it under the planner's NATURAL choice (no enable_seqscan=off) against the
-  committed, ANALYZEd ~80k corpus from `Loopctl.Knowledge.ScaleSeed`.
+  The bounds are checked under the planner's NATURAL choice (no enable_seqscan=off) against
+  the committed, ANALYZEd ~80k corpus from `Loopctl.Knowledge.ScaleSeed`:
+
+    * distant_pairs: EXPLAIN on the ACTUAL count + pairs SQL the request path emits (captured
+      via `PlanAssertions.capture_repo_queries/1`), asserting the `Limit ≤ max_pair_candidates`
+      sample cap dominates every `articles` scan.
+    * novelty: EXPLAIN ANALYZE on `novelty_distance_query/4` (the MIN runs inside a
+      `Task.async_stream`, off the test process, so capture can't see it — the builder emits
+      the identical SQL+params), asserting ACTUAL `articles` rows stay bounded.
 
   Seeds ~80k committed rows, so this is `:scale_nightly` (runs on the nightly/scale gate,
   NOT the default async suite which has no seeded corpus).
@@ -155,26 +162,29 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
 
       # The REAL invariant is "bounded by prior-tag selectivity, NOT a full-corpus read" —
       # and there are TWO legitimate bounded plans the cost-based planner may pick, so we must
-      # NOT pin the node type (that is the architect's HIGH finding):
+      # NOT pin the node type (the prior HIGH finding):
       #
-      #   * verified at 80k: Postgres rewrites `MIN(embedding <=> $const)` into
-      #     `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW index
+      #   * verified at 80k via EXPLAIN ANALYZE: Postgres rewrites `MIN(embedding <=> $const)`
+      #     into `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW index
       #     (`articles_embedding_hnsw_idx`), `tags &&` as an in-line Filter — a single Index
-      #     Scan, ~0.3ms / 676 buffers, scan estimate ≈ the tag-filtered ~1.6k rows; OR
+      #     Scan, ~0.3ms / 676 buffers, ~0 ACTUAL rows touched on the articles node; OR
       #   * for a less-HNSW-friendly target/stats, a `tags &&` GIN bitmap
-      #     (`articles_tags_index`) — a Bitmap Heap Scan, also bounded by the ~2% tag.
+      #     (`articles_tags_index`) — a Bitmap Heap Scan, also bounded by the ~2% tag
+      #     (≤ ~1.6k ACTUAL rows at 80k).
       #
       # `refute_full_scan` would FALSE-RED the second (legitimately bounded) plan because it
-      # forbids Bitmap Heap Scan. So instead assert the STRUCTURAL bound, accepting either:
+      # forbids Bitmap Heap Scan. So assert the STRUCTURAL bound, accepting either plan:
       #   1. no unbounded Seq Scan (a bounded bitmap is allowed), AND
-      #   2. every `articles` scan estimate is below a small multiple of the tag selectivity
-      #      (~2% ⇒ ~1.6k at 80k) — comfortably below the corpus, so a full-corpus scan trips
-      #      it while both bounded plans (HNSW ~1.6k, GIN bitmap ~1.6k) pass.
+      #   2. every `articles` scan produced fewer than corpus/8 ACTUAL rows — via
+      #      EXPLAIN ANALYZE, NOT the planner ESTIMATE, so a low-estimate/high-actual
+      #      regression that heap-rechecks the whole corpus at runtime (the #168/#172 shape)
+      #      is caught by REAL rows. Both bounded plans (HNSW ~0, GIN bitmap ~1.6k) pass;
+      #      a full-corpus scan (~80k actual) trips it.
       # Ceiling = floor/8 = 10_000 (≫ the ~1.6k tag set, ≪ the 80k corpus).
       ceiling = div(ScaleSeed.prod_article_floor(), 8)
 
       assert :ok = PlanAssertions.refute_seq_scan(query)
-      assert :ok = PlanAssertions.assert_scan_rows_below(query, ceiling)
+      assert :ok = PlanAssertions.assert_actual_scan_rows_below(query, ceiling)
     end)
   end
 end

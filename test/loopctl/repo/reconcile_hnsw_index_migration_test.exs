@@ -38,6 +38,12 @@ defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
   """
   use ExUnit.Case, async: false
 
+  # Building a real HNSW index (CREATE INDEX ... USING hnsw) over the test corpus
+  # legitimately takes ~60-70s on a loaded machine — over ExUnit's 60s default — which
+  # intermittently RED-flaked `mix precommit` and the CI Test job. Give the index DDL
+  # ample headroom so this is a deterministic pass, not a timing race. (Test-infra only.)
+  @moduletag timeout: :timer.minutes(5)
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
