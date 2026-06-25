@@ -20,6 +20,18 @@ config :loopctl, Loopctl.AdminRepo,
   show_sensitive_data_on_connection_error: true,
   pool_size: 3
 
+# HeavyReadRepo — same credentials/database in dev (BYPASSRLS role in production).
+# Small pool in dev; a real statement_timeout :parameters is configured in prod
+# (runtime.exs). See Loopctl.HeavyReadRepo.
+config :loopctl, Loopctl.HeavyReadRepo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "loopctl_dev",
+  stacktrace: true,
+  show_sensitive_data_on_connection_error: true,
+  pool_size: 3
+
 # For development, we disable any cache and enable
 # debugging and code reloading.
 #

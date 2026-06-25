@@ -83,6 +83,39 @@ if config_env() == :prod do
     queue_target: 5_000,
     queue_interval: 10_000
 
+  # HeavyReadRepo (US-27.11) — dedicated BYPASSRLS pool for heavy vector/enumeration
+  # reads, isolated from the small AdminRepo pool so a slow read can't starve light
+  # admin ops (and vice-versa). Its `:parameters` carry a pool-level, server-side
+  # `statement_timeout` (a CORE GUC, settable via the startup packet) — the clean
+  # fast-fail lever US-27.4 builds on, with no per-request transaction. A long-held
+  # US-27.16 export overrides it per-transaction via SET LOCAL (see Loopctl.HeavyRead
+  # `transaction/2` `:statement_timeout`). `ef_search` is NOT set here (pgvector custom
+  # GUC, rejected via :parameters on managed PG); see docs/runbooks/knowledge-scale.md
+  # for the ALTER ROLE mechanism if it must be raised.
+  #
+  # Pool sizes here MUST stay in lockstep with `Loopctl.DbCapacity` (which models the
+  # connection budget and is asserted in db_capacity_test.exs). Sizing (AC-27.11.1/.5),
+  # vs the live fly mpg max_connections = 100 (runbook re-verifies post-deploy):
+  #   per-node: Repo 10 + AdminRepo 3 + HeavyReadRepo 8 = 21; peak during a rolling
+  #   deploy at 2 nodes = 42 + 21 (overlap node) + 4 ops = 67 < 100 (max ~3 nodes).
+  # K (HeavyReadRepo, default 8): ~6 concurrent sub-2s heavy vector reads + ~2 reserved
+  # for long-held streamed-export checkouts (US-27.16), a different profile than fast reads.
+  # Parse to an integer so a garbage/typo value (e.g. "10s", "10,000") fails LOUDLY at
+  # boot rather than being sent verbatim and rejected by Postgres per-connection (which
+  # would fail the whole pool's startup). Postgres reads a bare integer as milliseconds,
+  # matching the `_MS` env name; re-stringified for the startup packet.
+  heavy_read_statement_timeout_ms =
+    String.to_integer(System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000")
+
+  config :loopctl, Loopctl.HeavyReadRepo,
+    url: admin_database_url,
+    pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),
+    socket_options: maybe_ipv6,
+    connect_timeout: 15_000,
+    queue_target: 5_000,
+    queue_interval: 10_000,
+    parameters: [statement_timeout: "#{heavy_read_statement_timeout_ms}"]
+
   # OpenAI embedding provider for semantic search (Knowledge Wiki)
   if openai_key = System.get_env("OPENAI_API_KEY") do
     config :loopctl, :embedding_provider, %{

@@ -9,6 +9,9 @@ import Config
 
 config :loopctl,
   ecto_repos: [Loopctl.Repo],
+  # Compile-time env marker (per-env), so runtime code (e.g. the US-27.11 boot-time
+  # connection-budget check) can gate prod-only behavior without Mix at runtime.
+  env: config_env(),
   generators: [timestamp_type: :utc_datetime, binary_id: true],
   embedding_dimensions: 1536,
   # Cosine similarity threshold for auto-linking articles.
@@ -20,6 +23,15 @@ config :loopctl,
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
 config :loopctl, Loopctl.AdminRepo,
+  migration_primary_key: [type: :binary_id],
+  migration_foreign_key: [type: :binary_id],
+  types: Loopctl.PostgrexTypes
+
+# HeavyReadRepo (US-27.11) — a dedicated pool for heavy BYPASSRLS vector/enumeration
+# reads, isolated from the small AdminRepo pool and carrying a pool-level
+# statement_timeout (set in runtime.exs). Same database as Repo/AdminRepo; never in
+# `ecto_repos` (it owns no migrations). See Loopctl.HeavyReadRepo / Loopctl.HeavyRead.
+config :loopctl, Loopctl.HeavyReadRepo,
   migration_primary_key: [type: :binary_id],
   migration_foreign_key: [type: :binary_id],
   types: Loopctl.PostgrexTypes
