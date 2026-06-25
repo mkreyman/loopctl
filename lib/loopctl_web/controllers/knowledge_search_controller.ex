@@ -124,6 +124,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
             "a tampered/forged cursor is rejected with 400. Not valid with `q` (relevance " <>
             "modes return a ranked top-N, not a walk).",
         required: false
+      ],
+      include_body: [
+        in: :query,
+        type: :boolean,
+        description:
+          "Opt into article `body` on each keyset (`cursor`) list row (default false). " <>
+            "Body-less is the default to keep payloads small and avoid large chunked " <>
+            "responses. Honored ONLY for an effective `limit <= 25`; a request with " <>
+            "`include_body=true` AND a requested `limit > 25` is rejected with 400 (never " <>
+            "a silent oversized response). Only `true` enables it; any other value is false.",
+        required: false
       ]
     ],
     responses: %{
@@ -138,6 +149,10 @@ defmodule LoopctlWeb.KnowledgeSearchController do
              },
              meta: %OpenApiSpex.Schema{
                type: :object,
+               description:
+                 "Offset/relevance modes return total_count/offset; the keyset list path " <>
+                   "(`cursor`) instead returns the self-describing cursor contract: " <>
+                   "next_cursor, has_more, limit, count, include_body.",
                properties: %{
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  total_count_scope: %OpenApiSpex.Schema{
@@ -147,12 +162,49 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                  },
                  search_mode: %OpenApiSpex.Schema{
                    type: :string,
-                   enum: ["keyword", "list", "semantic_only", "combined", "keyword_only"],
+                   enum: [
+                     "keyword",
+                     "list",
+                     "list_keyset",
+                     "semantic_only",
+                     "combined",
+                     "keyword_only"
+                   ],
                    description:
-                     "The mode that actually ran (keyword_only = combined degraded to keyword)"
+                     "The mode that actually ran (keyword_only = combined degraded to keyword; " <>
+                       "list_keyset = the cursor enumeration path)"
                  },
-                 limit: %OpenApiSpex.Schema{type: :integer},
-                 offset: %OpenApiSpex.Schema{type: :integer}
+                 limit: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Effective per-page limit that actually ran"
+                 },
+                 offset: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Offset path only; absent on the keyset (`cursor`) path"
+                 },
+                 next_cursor: %OpenApiSpex.Schema{
+                   type: :string,
+                   nullable: true,
+                   description:
+                     "Keyset path: opaque cursor for the next page; null when the walk is " <>
+                       "exhausted (the only exhaustion signal — there is no total_count)"
+                 },
+                 has_more: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Keyset path: whether another page exists (exactly next_cursor != null), " <>
+                       "derived from the limit+1 peek, never a COUNT"
+                 },
+                 count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "Keyset path: number of rows in THIS page (length of data)"
+                 },
+                 include_body: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Keyset path: whether each row carries the article body (honored only " <>
+                       "for limit <= 25; see the include_body parameter)"
+                 }
                }
              }
            }
@@ -184,6 +236,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     with {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
          :ok <- validate_search_limit(params, query_spec),
+         :ok <- validate_include_body(params),
          {:ok, base_opts} <- build_opts(params) do
       opts =
         base_opts
@@ -336,9 +389,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         |> Keyword.put(:match, match)
         |> maybe_add_limit(params["limit"])
         |> maybe_add_offset(params["offset"])
+        |> maybe_add_include_body(params["include_body"])
 
       {:ok, opts}
     end
+  end
+
+  # Threads the parsed `:include_body` flag into opts (US-27.10). Only added when
+  # true; absent/false leaves the body-less default in place. `validate_include_body/1`
+  # has already enforced the page-size bound before we get here.
+  defp maybe_add_include_body(opts, raw) do
+    if parse_include_body(raw), do: [{:include_body, true} | opts], else: opts
   end
 
   defp maybe_add_opt(opts, _key, nil), do: opts
@@ -395,6 +456,54 @@ defmodule LoopctlWeb.KnowledgeSearchController do
            "for exhaustive enumeration drop 'q' to use list mode (max #{Knowledge.max_page_size()})"}
     end
   end
+
+  # US-27.10: `include_body=true` opts the keyset list page into full bodies, but
+  # ONLY for a requested `limit <= max_include_body_page/0`. A larger requested
+  # limit with `include_body=true` is rejected with 400 here (in the `with`,
+  # BEFORE the query runs) so a caller can never trigger a 100KB+ chunked response
+  # by accidentally requesting bodies for a large page. The bound is on the
+  # REQUESTED limit (the raw param), not the rows actually returned — so
+  # `limit=26 + include_body=true` is a 400 even if the page would return fewer.
+  # `include_body=false`/absent is unbounded (body-less default, #166).
+  defp validate_include_body(params) do
+    if parse_include_body(params["include_body"]) do
+      max = Knowledge.max_include_body_page()
+
+      case requested_limit(params["limit"]) do
+        {:ok, limit} when limit > max ->
+          {:error, :bad_request,
+           "include_body=true is only honored for limit <= #{max} (to avoid oversized " <>
+             "responses); requested limit #{limit} exceeds it. Drop include_body for a " <>
+             "body-less page, or lower the limit."}
+
+        _ ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  # Parses the requested `limit` param for the include_body bound check. Returns
+  # `{:ok, int}` only for a clean non-negative integer; anything else is `:none`
+  # (no requested limit to bound — the default page size applies and is within the
+  # include_body cap).
+  defp requested_limit(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int >= 0 -> {:ok, int}
+      _ -> :none
+    end
+  end
+
+  defp requested_limit(value) when is_integer(value) and value >= 0, do: {:ok, value}
+  defp requested_limit(_), do: :none
+
+  # `include_body` is strictly opt-in: only the literal string "true" (or boolean
+  # true) enables it; anything else — including "1", "yes", or a malformed value —
+  # is false. This keeps the safe body-less default (#166) unless explicitly asked.
+  defp parse_include_body("true"), do: true
+  defp parse_include_body(true), do: true
+  defp parse_include_body(_), do: false
 
   # `limit` is honored up to the relevant cap; over-cap requests are rejected
   # with 400 by `validate_search_limit/2` (in `search/2`) rather than silently

@@ -258,6 +258,115 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
     end
   end
 
+  describe "list_keyset/2 — include_body + has_more (US-27.10)" do
+    test "body-less is the default: no :body key on any row" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published, body: "secret body"})
+
+      {:ok, %{results: [row], include_body: include_body}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20)
+
+      refute include_body
+      refute Map.has_key?(row, :body)
+    end
+
+    test "include_body: true threads :body into each row's select" do
+      tenant = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        body: "the full body content"
+      })
+
+      {:ok, %{results: [row], include_body: include_body}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20, include_body: true)
+
+      assert include_body
+      assert row.body == "the full body content"
+    end
+
+    test "has_more mirrors the keyset peek (next_cursor != nil), not a COUNT" do
+      tenant = fixture(:tenant)
+
+      for i <- 1..5 do
+        fixture(:article, %{tenant_id: tenant.id, status: :published, title: "h#{i}"})
+      end
+
+      # Page of 2 over 5 rows: more remains.
+      {:ok, %{next_cursor: next_cursor, has_more: has_more}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 2)
+
+      assert has_more
+      refute is_nil(next_cursor)
+
+      # A page large enough to exhaust the set: has_more false, next_cursor nil.
+      {:ok, %{next_cursor: last_cursor, has_more: last_has_more}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 50)
+
+      refute last_has_more
+      assert is_nil(last_cursor)
+    end
+  end
+
+  describe "list_keyset/2 — include_body respects visibility scope (AC-27.10.5)" do
+    test "a private memory's body never leaks to a non-owning agent" do
+      tenant = fixture(:tenant)
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      private =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          body: "PRIVATE BODY — must not leak",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+        })
+
+      # The non-owning agent enumerates WITH include_body. The visibility filter
+      # is applied before the projection, so the private row is excluded entirely
+      # — its body is never selected, let alone returned.
+      {:ok, %{results: results}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          include_body: true,
+          limit: 50,
+          visibility_agent_id: to_string(other_agent.id)
+        )
+
+      refute Enum.any?(results, &(&1.id == private.id))
+      refute Enum.any?(results, fn r -> Map.get(r, :body) == "PRIVATE BODY — must not leak" end)
+
+      # The OWNER, by contrast, does see its own private memory's body.
+      {:ok, %{results: owner_results}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          include_body: true,
+          limit: 50,
+          visibility_agent_id: to_string(owner_agent.id)
+        )
+
+      owner_row = Enum.find(owner_results, &(&1.id == private.id))
+      assert owner_row.body == "PRIVATE BODY — must not leak"
+    end
+
+    test "include_body never returns a body across tenants" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant_b.id,
+        status: :published,
+        body: "TENANT B BODY"
+      })
+
+      {:ok, %{results: results}} =
+        Knowledge.list_keyset(tenant_a.id, status: :published, include_body: true, limit: 50)
+
+      assert results == []
+    end
+  end
+
   describe "keyset_query/2 — request-path query shape" do
     test "is the query list_keyset runs, and is tenant-scoped" do
       tenant = fixture(:tenant)
@@ -269,6 +378,26 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
       assert sql =~ "tenant_id"
       assert sql =~ ~r/order by.*inserted_at.*id/i
       assert sql =~ ~r/limit/i
+    end
+
+    test "body-less by default; include_body: true selects the body column (US-27.10)" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {bodyless_sql, _} =
+        :all
+        |> SQL.to_sql(AdminRepo, Knowledge.keyset_query(tenant.id, status: :published))
+
+      refute bodyless_sql =~ ~r/\bbody\b/i
+
+      {full_sql, _} =
+        :all
+        |> SQL.to_sql(
+          AdminRepo,
+          Knowledge.keyset_query(tenant.id, status: :published, include_body: true)
+        )
+
+      assert full_sql =~ ~r/\bbody\b/i
     end
   end
 end

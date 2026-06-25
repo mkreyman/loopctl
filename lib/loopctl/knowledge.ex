@@ -62,6 +62,14 @@ defmodule Loopctl.Knowledge do
   # path fetches `@default_page_size + 1` to detect a next page without a COUNT.
   @default_page_size 20
 
+  # Maximum effective page size for which the keyset enumeration path will honor
+  # `include_body: true` (US-27.10). Body-less is the default (#166); opting into
+  # full bodies is bounded WELL below `@max_page_size` so a caller can't request
+  # bodies for thousands of rows and reproduce the 100KB+ ChunkedEncodingError.
+  # A request for `include_body: true` with a requested `limit` above this is
+  # rejected by the HTTP layer with 400 (never a silent oversized response).
+  @max_include_body_page 25
+
   @doc """
   The maximum page size (`limit`) honored by the **enumeration** paths
   (`list_articles/2`, `list_filtered/2`, `list_keyset/2`, `list_drafts/2`,
@@ -72,6 +80,18 @@ defmodule Loopctl.Knowledge do
   """
   @spec max_page_size() :: pos_integer()
   def max_page_size, do: @max_page_size
+
+  @doc """
+  The maximum effective page size for which the keyset enumeration path honors
+  `include_body: true` (US-27.10).
+
+  Body-less is the default (#166); opting into full bodies is bounded to this so
+  a caller can't request bodies for thousands of rows and reproduce the large
+  chunked-payload failure. The HTTP layer rejects an `include_body: true` request
+  whose requested `limit` exceeds this with a 400 — it is NOT silently clamped.
+  """
+  @spec max_include_body_page() :: pos_integer()
+  def max_include_body_page, do: @max_include_body_page
 
   # Maximum result count for the **relevance** search modes (keyword / semantic /
   # combined). These return a ranked top-N, not an exhaustive enumeration, so
@@ -1498,27 +1518,41 @@ defmodule Loopctl.Knowledge do
     - `:project_id`, `:category`, `:tags`, `:match`, `:memory_types`, `:agents`,
       `:conversation_id`, `:visibility_agent_id` -- same filters as `list_filtered/2`
 
+    - `:include_body` -- when `true`, each result map carries the article `body`
+      (US-27.10). Defaults to `false` (body-less summary projection, #166). The
+      HTTP layer bounds this to `max_include_body_page/0`; the context honors it
+      as passed so direct callers stay in control.
+
   ## Returns
 
-  - `{:ok, %{results: [map()], next_cursor: position_or_nil, limit: effective_limit}}`
-    where `next_cursor` is the `(inserted_at, id)` tuple of the LAST returned row
-    when another page exists, else `nil`. The HTTP layer encodes it back into an
-    opaque cursor string.
+  - `{:ok, %{results: [map()], next_cursor: position_or_nil, has_more: bool,
+    limit: effective_limit, include_body: bool}}` where `next_cursor` is the
+    `(inserted_at, id)` tuple of the LAST returned row when another page exists,
+    else `nil`. `has_more?` is derived from the keyset peek (it is exactly
+    `next_cursor != nil`), never a COUNT. The HTTP layer encodes `next_cursor`
+    back into an opaque cursor string.
   """
   @spec list_keyset(Ecto.UUID.t(), keyword()) ::
           {:ok,
            %{
              results: [map()],
              next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil,
-             limit: pos_integer()
+             has_more: boolean(),
+             limit: pos_integer(),
+             include_body: boolean()
            }}
   def list_keyset(tenant_id, opts \\ []) do
     limit = opts |> Keyword.get(:limit, @default_page_size) |> max(1) |> min(@max_page_size)
+    include_body? = Keyword.get(opts, :include_body, false) == true
 
     # Fetch limit+1 to detect a next page without a COUNT (AC-27.9a.1).
     rows =
       tenant_id
-      |> keyset_query(Keyword.put(opts, :limit, limit + 1))
+      |> keyset_query(
+        opts
+        |> Keyword.put(:limit, limit + 1)
+        |> Keyword.put(:include_body, include_body?)
+      )
       |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:enumeration)))
 
     {page, has_more?} = split_peek(rows, limit)
@@ -1531,7 +1565,14 @@ defmodule Loopctl.Knowledge do
 
     maybe_record_search_access(tenant_id, page, "", opts, "list_keyset")
 
-    {:ok, %{results: page, next_cursor: next_cursor, limit: limit}}
+    {:ok,
+     %{
+       results: page,
+       next_cursor: next_cursor,
+       has_more: has_more?,
+       limit: limit,
+       include_body: include_body?
+     }}
   end
 
   @doc """
@@ -1542,6 +1583,13 @@ defmodule Loopctl.Knowledge do
   Same `opts` as `list_keyset/2`; `:limit` is applied as-is here (the caller adds
   the `+1` peek). This is the EXACT query `list_keyset/2` runs, so the plan
   assertion guards the request path, not a stunt double.
+
+  `:include_body` (default `false`) controls whether the `select` map carries the
+  potentially-huge `body` column (US-27.10). Body-less is the default so `body` is
+  never transferred from Postgres for enumeration reads; `include_body: true` adds
+  it (the HTTP layer bounds that to `max_include_body_page/0`). Tenant scope and
+  visibility filtering are applied BEFORE the projection, so a `body` is only ever
+  selected for a row the caller could already read.
 
   Plan note: with no filter or a scalar `:category` filter the planner walks the
   `(tenant_id, inserted_at, id)` btree in order (true keyset, no Sort). With a
@@ -1563,7 +1611,15 @@ defmodule Loopctl.Knowledge do
     base
     |> apply_search_filters(status, opts)
     |> apply_keyset_seek(Keyword.get(opts, :cursor))
-    |> select([a], %{
+    |> keyset_select(Keyword.get(opts, :include_body, false) == true)
+    |> order_by([a], asc: a.inserted_at, asc: a.id)
+    |> limit(^limit)
+  end
+
+  # Body-less projection (the default, #166): `body` is never transferred from
+  # Postgres for enumeration reads, keeping payloads small.
+  defp keyset_select(query, false) do
+    select(query, [a], %{
       id: a.id,
       tenant_id: a.tenant_id,
       project_id: a.project_id,
@@ -1574,8 +1630,23 @@ defmodule Loopctl.Knowledge do
       inserted_at: a.inserted_at,
       updated_at: a.updated_at
     })
-    |> order_by([a], asc: a.inserted_at, asc: a.id)
-    |> limit(^limit)
+  end
+
+  # Full-content projection (US-27.10, `include_body: true`): same summary fields
+  # plus the `body` column. Bounded to `max_include_body_page/0` by the HTTP layer.
+  defp keyset_select(query, true) do
+    select(query, [a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      body: a.body,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at
+    })
   end
 
   # No cursor: enumerate from the start.

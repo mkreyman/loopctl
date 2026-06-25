@@ -56,6 +56,29 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
     end
   end
 
+  # Walk to the LAST page and return its decoded JSON response (the page whose
+  # meta.next_cursor is null). Used to assert the exhaustion contract (US-27.10).
+  defp walk_to_final(conn, raw_key, base_params) do
+    do_walk_to_final(conn, raw_key, base_params, "", 0)
+  end
+
+  defp do_walk_to_final(_conn, _key, _params, _cursor, n) when n > 1_000 do
+    flunk("walk_to_final did not terminate")
+  end
+
+  defp do_walk_to_final(conn, raw_key, base_params, cursor, n) do
+    resp =
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/knowledge/search", Map.put(base_params, "cursor", cursor))
+      |> json_response(200)
+
+    case resp["meta"]["next_cursor"] do
+      nil -> resp
+      next -> do_walk_to_final(conn, raw_key, base_params, next, n + 1)
+    end
+  end
+
   describe "cursor walk (AC-27.9a.1 / TC-27.9a.1)" do
     test "walks the full list exactly once, ending with next_cursor null", %{conn: conn} do
       tenant = fixture(:tenant)
@@ -337,6 +360,191 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
         |> get(~p"/api/v1/knowledge/search", %{"tags" => "bc", "limit" => "5000"})
 
       assert resp.status == 400
+    end
+  end
+
+  describe "cursor contract in meta (US-27.10 / AC-27.10.1 / TC-27.10.1)" do
+    test "first page documents next_cursor/has_more/limit/count; final page signals exhaustion",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      for i <- 1..7 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          tags: ["contract"],
+          title: "c#{i}"
+        })
+      end
+
+      # First page of 3 over 7 rows: more remains, meta fully describes the page.
+      page1 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "contract",
+          "limit" => "3",
+          "cursor" => ""
+        })
+        |> json_response(200)
+
+      assert page1["meta"]["next_cursor"]
+      assert page1["meta"]["has_more"] == true
+      assert page1["meta"]["limit"] == 3
+      assert page1["meta"]["count"] == 3
+      assert page1["meta"]["count"] == length(page1["data"])
+      assert page1["meta"]["include_body"] == false
+      assert page1["meta"]["search_mode"] == "list_keyset"
+
+      # Walk to the end via next_cursor; the final page has next_cursor null,
+      # has_more false, and count == its (partial) data length.
+      final = walk_to_final(conn, raw_key, %{"tags" => "contract", "limit" => "3"})
+
+      assert final["meta"]["next_cursor"] == nil
+      assert final["meta"]["has_more"] == false
+      assert final["meta"]["count"] == length(final["data"])
+    end
+  end
+
+  describe "bounded include_body (US-27.10 / AC-27.10.2 / TC-27.10.2)" do
+    test "include_body=true with limit=25 returns 200 with body present", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        tags: ["ib"],
+        body: "full body here"
+      })
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "ib",
+          "limit" => "25",
+          "include_body" => "true",
+          "cursor" => ""
+        })
+        |> json_response(200)
+
+      assert resp["meta"]["include_body"] == true
+      [row] = resp["data"]
+      assert row["body"] == "full body here"
+    end
+
+    test "include_body=true with limit=26 returns 400 (over the include_body bound)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["ib"]})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "ib",
+          "limit" => "26",
+          "include_body" => "true",
+          "cursor" => ""
+        })
+
+      assert resp.status == 400
+      assert json_response(resp, 400)["error"]["message"] =~ "include_body"
+    end
+
+    test "the bound is on the REQUESTED limit even if the page would return fewer rows",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      # Only one row exists, but requesting limit=26 + include_body is still a 400:
+      # the bound guards the request, not the realized page size.
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["ib"]})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "ib",
+          "limit" => "26",
+          "include_body" => "true",
+          "cursor" => ""
+        })
+
+      assert resp.status == 400
+    end
+  end
+
+  describe "default body-less (US-27.10 / AC-27.10.3 / TC-27.10.3)" do
+    test "no include_body → no body key in any item", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      for i <- 1..3 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          tags: ["bl"],
+          title: "bl#{i}",
+          body: "should not appear"
+        })
+      end
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{"tags" => "bl", "cursor" => ""})
+        |> json_response(200)
+
+      assert resp["meta"]["include_body"] == false
+      refute Enum.any?(resp["data"], &Map.has_key?(&1, "body"))
+    end
+  end
+
+  describe "include_body respects visibility/tenant scope (US-27.10 / AC-27.10.5)" do
+    test "a private memory's body never leaks to a non-owning agent via include_body",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      {raw_other, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: other_agent.id})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        tags: ["vis"],
+        body: "PRIVATE — do not leak",
+        metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+      })
+
+      # A shared row the non-owner CAN see (so the request returns a page).
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        tags: ["vis"],
+        body: "shared body",
+        metadata: %{"visibility" => "shared", "agent_id" => to_string(owner_agent.id)}
+      })
+
+      resp =
+        conn
+        |> auth_conn(raw_other)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "vis",
+          "include_body" => "true",
+          "limit" => "25",
+          "cursor" => ""
+        })
+        |> json_response(200)
+
+      bodies = Enum.map(resp["data"], & &1["body"])
+      refute "PRIVATE — do not leak" in bodies
+      assert "shared body" in bodies
     end
   end
 
