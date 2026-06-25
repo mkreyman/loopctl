@@ -110,6 +110,65 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
         assert issue.message =~ "module-level"
       end)
     end
+
+    test "an INTERPOLATED fragment string is flagged (`<=>` lives in a `<<>>` node) — review FN-1" do
+      # The `\#{col}` is escaped so the FIXTURE source carries a literal interpolated
+      # `fragment("#{col} <=> ?", …)`. A shallow direct-child check missed this (the `<=>`
+      # is not a direct plain-binary arg); the deep arg-walk now catches it.
+      """
+      defmodule My.Rogue.Interp do
+        import Ecto.Query
+
+        def nearest(col, target) do
+          from(a in Article, order_by: fragment("\#{col} <=> ?", ^target))
+        end
+      end
+      """
+      |> to_source_file("lib/my/rogue/interp.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue ->
+        assert issue.message =~ "My.Rogue.Interp.nearest/2"
+        assert issue.trigger == "<=>"
+      end)
+    end
+
+    test "a CONCATENATED fragment string is flagged (`<=>` inside a `<>` node) — review FN-2" do
+      """
+      defmodule My.Rogue.Concat do
+        import Ecto.Query
+
+        def nearest(target) do
+          from(a in Article, order_by: fragment("? <=>" <> " ?", ^target))
+        end
+      end
+      """
+      |> to_source_file("lib/my/rogue/concat.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue ->
+        assert issue.message =~ "My.Rogue.Concat.nearest/1"
+      end)
+    end
+
+    test "a NESTED-module site is attributed to its OWN module (not the outer one)" do
+      # Guards the per-module exemption: a rogue `<=>` in a module nested inside an exempt
+      # one must still be flagged on its own full name, not wholesale-suppressed.
+      """
+      defmodule My.Outer do
+        defmodule Inner do
+          import Ecto.Query
+
+          def nearest(target) do
+            from(a in Article, order_by: fragment("? <=> ?", a.embedding, ^target))
+          end
+        end
+      end
+      """
+      |> to_source_file("lib/my/outer.ex")
+      |> run_check(CosineQueryReintroduction)
+      |> assert_issue(fn issue ->
+        assert issue.message =~ "My.Outer.Inner.nearest/1"
+      end)
+    end
   end
 
   describe "exempts the helper module and the registered allowlist (AC-27.8.5)" do

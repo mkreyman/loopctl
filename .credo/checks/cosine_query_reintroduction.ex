@@ -14,16 +14,30 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
 
   ## How it detects (pure AST, no process, no DB)
 
-  A cosine `<=>` only ever appears in loopctl source inside a **string literal**
-  passed to `fragment(...)` / raw SQL (e.g. `"? <=> ?"`, `"(? <=> ?) BETWEEN ..."`,
-  `"MIN(? <=> ?::vector)"`). So the check walks the source AST (`Credo.Code.prewalk`
-  is NOT used directly; we descend manually to keep each `<=>` attributed to its
-  ENCLOSING `def`/`defp`) and collects every binary-string node whose value contains
-  `"<=>"`, resolving for each:
+  A cosine `<=>` reaches the database only inside a SQL string passed to `fragment(...)`
+  / a raw `query`/`query!`/`explain` call. So the check walks the source AST (descending
+  manually to keep each `<=>` attributed to its enclosing module + `def`/`defp`) and, for
+  every SQL-bearing call, DEEP-WALKS its argument subtrees for ANY binary literal
+  containing `"<=>"`. The deep walk is deliberate: the `<=>` may be a plain literal
+  (`fragment("? <=> ?", …)`), an INTERPOLATED string (`fragment("\#{col} <=> ?", …)` — the
+  `<=>` lives in a `{:<<>>, …}` segment), or a CONCATENATION (`fragment("? <=>" <> "?", …)`
+  — a `{:<>, …}` node). A shallow direct-child check would MISS the interpolated/concat
+  forms (the rot can be written with one interpolated token), so we recurse through the
+  arg trees. For each site it resolves:
 
-    * the enclosing `def`/`defp` **name + arity** (the nearest such ancestor — loopctl
-      never nests `def`s, so attribution is unambiguous), and
-    * the **module** (the file's `defmodule`).
+    * the enclosing `def`/`defp` **name + arity** (the nearest such ancestor), and
+    * the **enclosing module** — tracked through `defmodule` nodes during the walk, so a
+      site in a NESTED module gets its own full name (`Outer.Inner`) and is exempted on its
+      own module (the VectorSearch whole-module exemption can never wholesale-suppress a
+      rogue `<=>` in an unrelated module merely nested inside an exempt one).
+
+  ### Residual boundary (documented)
+
+  A `<=>` SQL string assembled in a VARIABLE and then piped into `query!` (`sql = "… <=>
+  …"; Repo.query!(sql, …)`) is NOT caught — the call's argument is a var node, not a
+  literal, and tracking it would require data-flow analysis. loopctl builds every real
+  cosine query via `fragment` literals, so this boundary is currently empty; if a raw-SQL
+  var path is ever introduced, register it explicitly (or route it through the helper).
 
   ## Exemptions (the allowlist exempts the LINT, never the scale gate)
 
@@ -106,25 +120,24 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
 
     case Credo.Code.ast(source_file) do
       {:ok, ast} ->
-        module = defmodule_name(ast)
-
-        if module == @vector_search_module do
-          # The helper's home — every `<=>` here is the sanctioned shape.
-          []
-        else
-          ast
-          |> cosine_sites(module)
-          |> Enum.reject(fn site ->
-            MapSet.member?(allowlist, {site.module, site.fun, site.arity})
-          end)
-          |> Enum.map(&issue_for(issue_meta, &1))
-        end
+        ast
+        |> cosine_sites()
+        |> Enum.reject(fn site -> exempt?(site, allowlist) end)
+        |> Enum.map(&issue_for(issue_meta, &1))
 
       # An unparseable file is another check's problem (Credo reports the parse
       # error itself); we simply find nothing to flag here.
       _ ->
         []
     end
+  end
+
+  # A site is exempt iff its ENCLOSING module is the sanctioned VectorSearch helper
+  # (per-MODULE, not per-file — a rogue `<=>` in a module merely nested inside an exempt
+  # one is still flagged), OR its `{module, fun, arity}` is in the auditable allowlist.
+  defp exempt?(site, allowlist) do
+    site.module == @vector_search_module or
+      MapSet.member?(allowlist, {site.module, site.fun, site.arity})
   end
 
   # The set of `{module, fun, arity}` whose rationale is non-empty — read from the
@@ -154,34 +167,20 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
   defp non_empty_rationale?(%{rationale: r}) when is_binary(r), do: String.trim(r) != ""
   defp non_empty_rationale?(_), do: false
 
-  # The file's `defmodule` name (loopctl is one-module-per-file). nil if none.
-  defp defmodule_name(ast) do
-    {_, found} =
-      Macro.prewalk(ast, nil, fn
-        {:defmodule, _, [{:__aliases__, _, parts} | _]} = node, nil when is_list(parts) ->
-          {node, Module.concat(parts)}
-
-        node, acc ->
-          {node, acc}
-      end)
-
-    found
-  end
-
-  # Collect every cosine `<=>` site, attributed to its ENCLOSING `def`/`defp` (name +
-  # arity). We descend manually (NOT `prewalk`-flatten) so each site keeps its function
-  # scope AND the line of its enclosing call.
+  # Collect every cosine `<=>` site, attributed to its ENCLOSING module + `def`/`defp`
+  # (name + arity). We descend manually (NOT `prewalk`-flatten) so each site keeps its
+  # module + function scope AND the line of its enclosing call.
   #
-  # DETECTION IS SCOPED TO SQL-BEARING CALLS — a binary containing `<=>` is flagged
-  # ONLY when it is the (first) argument of a `fragment(...)` call or a `*.query!`/
-  # `query`/`explain` raw-SQL call. This is deliberate: a `<=>` in a `@moduledoc`,
-  # `@doc`, comment, rationale-data string, or a Regex is documentation/data, NOT a
-  # hand-rolled query, and must NOT be flagged (those are how the allowlist, the plan
-  # assertions, and this very check DESCRIBE the operator). loopctl's every real cosine
-  # query goes through `fragment/_`, so this is both precise and complete for the rot
-  # the guard targets. A `<=>` site outside any `def` is still reported (`fun: nil`).
-  defp cosine_sites(ast, module) do
-    do_collect(ast, module, nil, nil, [])
+  # DETECTION IS SCOPED TO SQL-BEARING CALLS — a `<=>` is flagged ONLY when it appears in
+  # an argument subtree of a `fragment(...)` / `*.query!`/`query`/`explain` raw-SQL call.
+  # This is deliberate: a `<=>` in a `@moduledoc`, `@doc`, comment, rationale-data string,
+  # or a Regex is documentation/data, NOT a hand-rolled query, and must NOT be flagged
+  # (those are how the allowlist, the plan assertions, and this very check DESCRIBE the
+  # operator). loopctl's every real cosine query goes through `fragment/_`, so this is both
+  # precise and complete for the rot the guard targets. A `<=>` site outside any `def` is
+  # still reported (`fun: nil`).
+  defp cosine_sites(ast) do
+    do_collect(ast, nil, nil, nil, [])
     |> Enum.reverse()
   end
 
@@ -190,8 +189,30 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
   @sql_call_names [:fragment, :query, :query!, :explain]
 
   # State threaded down the walk:
-  #   * `scope` — the current `{fun, arity}` (nil at module level), set on `def`/`defp`.
-  #   * `line`  — the nearest ancestor call node's `meta[:line]`, stamped on a site.
+  #   * `module` — the current enclosing module (nil before the first `defmodule`).
+  #   * `scope`  — the current `{fun, arity}` (nil at module level), set on `def`/`defp`.
+  #   * `line`   — the nearest ancestor call node's `meta[:line]`, stamped on a site.
+
+  # Entering a (possibly nested) module sets the module for its body — a NESTED module
+  # gets the full concatenated name (`Outer.Inner`) so its sites are attributed and
+  # exempted on their OWN module, never wholesale-suppressed by an enclosing exempt one.
+  # A new module resets the def scope.
+  defp do_collect(
+         {:defmodule, _meta, [{:__aliases__, _, parts} | rest]},
+         module,
+         _scope,
+         line,
+         acc
+       )
+       when is_list(parts) do
+    new_module = if module, do: Module.concat([module | parts]), else: Module.concat(parts)
+
+    Enum.reduce(rest, acc, fn child, inner ->
+      do_collect(child, new_module, nil, line, inner)
+    end)
+  end
+
+  # A `def`/`defp` sets the `{fun, arity}` scope for its body.
   defp do_collect({op, meta, [head | _] = args}, module, _scope, _line, acc)
        when op in [:def, :defp] do
     new_scope = def_scope(head)
@@ -202,16 +223,17 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
     end)
   end
 
-  # A SQL-bearing call: `fragment("…<=>…", …)`, `Repo.query!("…<=>…", …)`, etc. The
-  # call name may be bare (`{:fragment, _, args}`) or qualified
-  # (`{{:., _, [_mod, :query!]}, _, args}`). If ANY string arg holds `<=>`, record one
-  # site (the call's line), then keep descending so nested cosine fragments are caught.
+  # A SQL-bearing call: `fragment("…<=>…", …)`, `Repo.query!("…<=>…", …)`, etc. (bare or
+  # qualified). Record ONE site if ANY argument SUBTREE contains a `<=>` binary —
+  # DEEP-WALKED, so an interpolated (`{:<<>>,…}`) or concatenated (`{:<>,…}`) SQL string is
+  # caught, not just a plain direct-child literal. Then keep descending so nested cosine
+  # fragments are still found.
   defp do_collect({form, meta, children} = node, module, scope, line, acc)
        when is_list(children) do
     call_line = meta[:line] || line
 
     acc =
-      if sql_call?(form) and Enum.any?(children, &cosine_string?/1) do
+      if sql_call?(form) and Enum.any?(children, &arg_has_cosine?/1) do
         {fun, arity} = scope || {nil, nil}
         [%{module: module, fun: fun, arity: arity, line: call_line, trigger: "<=>"} | acc]
       else
@@ -243,11 +265,20 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroduction do
   defp sql_call?({:., _, [_target, name]}) when is_atom(name), do: name in @sql_call_names
   defp sql_call?(_), do: false
 
-  # True for a binary AST literal containing the cosine operator. (String literals are
-  # plain binaries in quoted AST; interpolated strings are `{:<<>>, …}` and never carry
-  # a raw `<=>` segment for our SQL purposes — fragment SQL is always a plain literal.)
-  defp cosine_string?(node) when is_binary(node), do: String.contains?(node, "<=>")
-  defp cosine_string?(_), do: false
+  # Deep-walk an argument subtree for ANY binary literal containing `<=>` — so the cosine
+  # operator is caught whether the SQL string is a plain literal, an INTERPOLATED string
+  # (a `{:<<>>,…}` node with a `" <=> ?"` segment), or a CONCATENATION (`{:<>,…}`). Gated by
+  # `sql_call?` at the call site, so doc/comment/regex/data strings (never SQL-call args)
+  # are not examined. A var-held SQL string (not a literal) is the documented residual
+  # boundary — there is no literal to find.
+  defp arg_has_cosine?(node) when is_binary(node), do: String.contains?(node, "<=>")
+
+  defp arg_has_cosine?({_, _, children}) when is_list(children),
+    do: Enum.any?(children, &arg_has_cosine?/1)
+
+  defp arg_has_cosine?({left, right}), do: arg_has_cosine?(left) or arg_has_cosine?(right)
+  defp arg_has_cosine?(list) when is_list(list), do: Enum.any?(list, &arg_has_cosine?/1)
+  defp arg_has_cosine?(_), do: false
 
   # Resolve a `def`/`defp` head to `{name, arity}`. Handles guard heads
   # (`def f(x) when g`), zero-arity (`def f`/`def f()`), and the parenthesised forms.

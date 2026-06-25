@@ -20,6 +20,14 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
   red — but it is a REAL timed conn, so a true blow-up (e.g. a reintroduced full-corpus Sort
   that the plan gate somehow missed) trips it.
 
+  ## What this does NOT exercise (review note)
+
+  In `:test` the heavy-read DI routes through `AdminRepo`, not the dedicated `HeavyReadRepo`
+  pool — so this conn timing does NOT cover the heavy-pool checkout / `statement_timeout`
+  dimension; that is covered by the worker-latency + heavy-read-timeout assertions in
+  `topk_endpoints_scale_test.exs`. This test's distinct value is the full HTTP path
+  (auth / RLS / serialize / render) wall-clock.
+
   ## How the conn sees the committed 80k corpus
 
   The scale corpus, tenant, and an agent API key are seeded COMMITTED via

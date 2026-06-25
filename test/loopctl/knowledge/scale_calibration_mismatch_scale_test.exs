@@ -109,28 +109,15 @@ defmodule Loopctl.Knowledge.ScaleCalibrationMismatchScaleTest do
     # connection and a prod-shaped one (`SHOW hnsw.ef_search`). Here we drive the FAILURE
     # direction with two deliberately-divergent effective values and assert the SAME parity
     # form raises — so a real prod-vs-gate divergence cannot pass green.
-    gate_ef = "40"
-    prod_ef = "80"
-
+    # Drive the SHARED `PlanAssertions.assert_ef_search_parity!/2` (the SAME assertion the
+    # under-fill scale gate uses for the success direction) with two deliberately-divergent
+    # effective values — so this failure path exercises the REAL comparison + message, not a
+    # duplicated local copy that could silently drift from the real gate.
     assert_raise ExUnit.AssertionError, ~r/ef_search diverged/, fn ->
-      assert_ef_search_parity!(gate_ef, prod_ef)
+      PlanAssertions.assert_ef_search_parity!("40", "80")
     end
 
     # And it does NOT raise when they match (the success direction the real gate asserts).
-    assert :ok = assert_ef_search_parity!("40", "40")
-  end
-
-  # The exact parity form the under-fill scale gate uses (gate vs prod ef_search), factored
-  # so the FAILURE direction is testable without an actual `ALTER ROLE` on the test DB. The
-  # real gate reads each side via `SHOW hnsw.ef_search`; this asserts on the read values.
-  defp assert_ef_search_parity!(gate_ef, prod_ef) do
-    if gate_ef == prod_ef do
-      :ok
-    else
-      raise ExUnit.AssertionError,
-        message:
-          "ef_search diverged: gate=#{inspect(gate_ef)} prod=#{inspect(prod_ef)} " <>
-            "(SHOW hnsw.ef_search must match between the scale gate and the prod-shaped pool)"
-    end
+    assert :ok = PlanAssertions.assert_ef_search_parity!("40", "40")
   end
 end

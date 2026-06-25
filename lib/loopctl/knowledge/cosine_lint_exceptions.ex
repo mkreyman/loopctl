@@ -58,6 +58,17 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
   auditable (each carries a non-empty one-line rationale; adding a new exception is a
   visible, reviewable diff here, not a scattered inline comment the lint can't see).
 
+  Two rules when adding an entry:
+
+    * **Register at the HEAD-slot (maximum) arity.** The lint computes arity from the
+      `def` head's argument count, so a function with default args (`def f(x \\ 1)` —
+      callable at /1 AND /2) is flagged at /2 (the head slot). Register the head-slot arity
+      or the exemption silently won't match. (All current entries are default-arg-free.)
+    * **`nearest_prior_distance/4` holds NO `<=>` literal** (it delegates to
+      `novelty_distance_query/4`). It is registered for AUDIT/documentation only — the lint
+      never produces a site there, so this entry is inert-but-harmless (it documents the
+      logical owner of the MIN-distance novelty path).
+
   ## Shape
 
   `exceptions/0` returns a list of `%{module, function, arity, rationale}` maps.

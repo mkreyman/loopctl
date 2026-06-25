@@ -31,6 +31,7 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.PlanAssertions
   alias Loopctl.TelemetryEvents
   alias Loopctl.Tenants.Tenant
 
@@ -224,9 +225,9 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         v
       end)
 
-    assert gate_ef == prod_ef,
-           "ef_search diverged: gate=#{inspect(gate_ef)} prod=#{inspect(prod_ef)} " <>
-             "(SHOW hnsw.ef_search must match between the scale gate and the prod-shaped pool)"
+    # The SHARED parity assertion (US-27.8) — the calibration-mismatch test drives the SAME
+    # function in the failure direction, so the gate and its failure-test can't drift.
+    assert :ok = PlanAssertions.assert_ef_search_parity!(gate_ef, prod_ef)
 
     # And it is the pgvector default (40) until US-27.11's ALTER ROLE lever is applied.
     assert gate_ef == "40"
