@@ -344,6 +344,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pgbouncer
+          # The apt package enables/starts a default pgbouncer (own /etc/pgbouncer.ini on
+          # :6432 with no loopctl_test db). Stop it so OUR instance owns the port.
+          sudo systemctl stop pgbouncer 2>/dev/null || true
           printf '"postgres" "postgres"\n' > /tmp/userlist.txt
           cat > /tmp/pgbouncer.ini <<'INI'
           [databases]
@@ -357,7 +360,10 @@ jobs:
           pool_mode = transaction
           max_client_conn = 50
           default_pool_size = 10
+          pidfile = /tmp/pgbouncer.pid
+          logfile = /tmp/pgbouncer.log
           INI
+          # `-d` (daemonize) REQUIRES a pidfile (FATAL otherwise).
           pgbouncer -d /tmp/pgbouncer.ini
           # Wait for pgbouncer to accept connections through to Postgres.
           for i in $(seq 1 15); do
