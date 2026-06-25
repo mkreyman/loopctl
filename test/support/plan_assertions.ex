@@ -25,6 +25,7 @@ defmodule Loopctl.PlanAssertions do
 
   alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge.ScaleSeed
 
   # Node types that read the whole `articles` relation (the #172 timeout shape).
   # "Seq Scan" covers Parallel Seq Scan (same Node Type, Parallel Aware flag).
@@ -489,11 +490,85 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Raises unless the seeded corpus is AT OR ABOVE the production floor
+  (`Loopctl.Knowledge.ScaleSeed.prod_article_floor/0`, currently 80k) — the calibration
+  precondition for a vector scale gate (US-27.8 AC-27.8.3 / TC-27.8.3).
+
+  `assert_fresh_stats!/0` only proves the corpus is non-empty + analyzed; it does NOT
+  prove it is large enough for the planner's cost-based HNSW choice to be representative.
+  At sub-floor scale the planner Seq-Scans happily and an index-usage assertion is a LIE
+  (it would false-GREEN on a regression). This guard makes a sub-floor seed FAIL LOUDLY
+  with an explicit calibration error instead.
+
+  Counts the COMMITTED rows for `tenant_id` (an ACTUAL `count(*)`, like
+  `assert_fresh_stats!/0`, not the autovacuum estimate). Tenant-scoped because each scale
+  test seeds its OWN ~80k tenant; the floor is a per-tenant property of THAT seed.
+
+  Raises `ExUnit.AssertionError` naming the actual vs required count and pointing at the
+  documented floor-bump step (AC-27.8.6) when below floor.
+  """
+  def assert_scale_floor!(tenant_id) when is_binary(tenant_id) do
+    floor = ScaleSeed.prod_article_floor()
+
+    %{rows: [[real_count]]} =
+      AdminRepo.query!("SELECT count(*) FROM articles WHERE tenant_id = $1", [
+        Ecto.UUID.dump!(tenant_id)
+      ])
+
+    cond do
+      is_nil(real_count) or real_count <= 0 ->
+        raise ExUnit.AssertionError,
+          message:
+            "Scale calibration FAILED: tenant #{inspect(tenant_id)} has an EMPTY `articles` " <>
+              "(committed count=#{inspect(real_count)}). Seed via " <>
+              "Loopctl.Knowledge.ScaleSeed.seed(tenant_id, count: ScaleSeed.prod_article_floor()) first."
+
+      real_count < floor ->
+        raise ExUnit.AssertionError,
+          message:
+            "Scale calibration FAILED (sub-floor seed): tenant #{inspect(tenant_id)} has " <>
+              "#{real_count} committed articles, BELOW the prod floor of #{floor} " <>
+              "(Loopctl.Knowledge.ScaleSeed.prod_article_floor/0). A vector index-usage gate " <>
+              "at sub-floor scale is theatre — the planner Seq-Scans happily and the assertion " <>
+              "false-GREENs. Seed at least #{floor} rows; to raise the floor as prod grows, bump " <>
+              "@prod_article_floor in Loopctl.Knowledge.ScaleSeed (a documented step — AC-27.8.6)."
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Raises unless the EFFECTIVE `hnsw.ef_search` is identical on the scale-gate connection
+  and a prod-shaped one (US-27.8 AC-27.8.3). Pass the two values each side reads via
+  `SHOW hnsw.ef_search`. This is the ONE parity assertion both the under-fill scale gate
+  (success direction — real two-connection read) and the calibration-mismatch test
+  (failure direction — injected divergent values) drive, so the failure path exercises the
+  REAL comparison + message rather than a duplicated local copy. An ef_search mismatch
+  between gate and prod silently skews recall/latency, so the gate must FAIL on it.
+  """
+  @spec assert_ef_search_parity!(String.t(), String.t()) :: :ok
+  def assert_ef_search_parity!(gate_ef, prod_ef) do
+    if gate_ef == prod_ef do
+      :ok
+    else
+      raise ExUnit.AssertionError,
+        message:
+          "ef_search diverged: gate=#{inspect(gate_ef)} prod=#{inspect(prod_ef)} " <>
+            "(SHOW hnsw.ef_search must match between the scale gate and the prod-shaped pool)"
+    end
+  end
+
+  @doc """
   Raises unless `articles` holds real, analyzed rows — verified by an ACTUAL
   `count(*)` (reflecting committed reality, not autovacuum's lazy/sticky/cross-tenant
   `n_live_tup` estimate, which is blind to stale-high) AND a non-null `last_analyze`.
   Prevents a plan assertion from running against an unseeded/empty or unanalyzed corpus
   (AC-27.2.5). ScaleSeed already asserts `last_analyze` ADVANCED for the current run.
+
+  NOTE: `assert_scale_floor!/1` is a COUNT precondition only — it does NOT check
+  freshness. Pair it with this (or a plan assertion that itself gates on fresh stats);
+  `ScaleSeed.seed/2` runs `ANALYZE articles`, so after seeding both hold.
   """
   def assert_fresh_stats! do
     %{rows: [[real_count]]} = AdminRepo.query!("SELECT count(*) FROM articles")
