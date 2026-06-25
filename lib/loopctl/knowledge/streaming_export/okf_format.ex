@@ -57,10 +57,13 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
   end
 
   # First 8 hex chars of the canonical UUID (the chars before the first `-`),
-  # lowercased — stable, URL-safe, and collision-resistant enough at the per-
-  # category+slug granularity (a 32-bit suffix). A bundle is never rejected for a
-  # suffix collision; it would just (astronomically rarely) reuse a path, which is
-  # the SAME failure mode as today's slug-only path but ~4-billion× less likely.
+  # lowercased — stable, URL-safe, a 32-bit suffix. Collisions only matter WITHIN a
+  # single (category, slug) bucket (two articles must share the slug AND the suffix
+  # to clobber). Within a bucket of k identical-slug articles the collision
+  # probability follows the BIRTHDAY bound ≈ k²/2^33 — negligible for realistic k
+  # (k=100 → ~6e-7), reaching only ~1% at ~k≈13,000 same-slug articles. So a suffix
+  # collision is a vanishingly-rare reuse of a path (the same failure mode as the
+  # pre-fix slug-only path, but bounded per-bucket, not global), never a rejection.
   defp short_id(id) when is_binary(id) do
     id |> String.downcase() |> String.replace("-", "") |> String.slice(0, 8)
   end

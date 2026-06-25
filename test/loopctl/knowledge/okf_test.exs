@@ -59,6 +59,28 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
+  describe "build_bundle/2 cap (#2 TOCTOU: enforced on the MATERIALIZED set)" do
+    test "exactly at the cap succeeds; one over rejects (peek-and-reject, no silent truncation)" do
+      tenant = fixture(:tenant)
+      for i <- 1..3, do: published(tenant.id, %{title: "Cap #{i}", category: :pattern})
+
+      # cap=3 → the materialized set (fetch is LIMIT cap+1=4) has 3 ≤ 3 → ok.
+      assert {:ok, %{meta: %{article_count: 3}}} = OKF.build_bundle(tenant.id, max_articles: 3)
+
+      # cap=2 → fetch LIMIT 3 returns 3 rows > 2 → REJECT (never silently return 2).
+      assert {:error, :payload_too_large} = OKF.build_bundle(tenant.id, max_articles: 2)
+    end
+
+    test "the fetch never materializes more than cap+1 rows (bounded under TOCTOU)" do
+      tenant = fixture(:tenant)
+      # 50 articles, cap 5 → even if a COUNT undercounted, the LIMIT cap+1 caps the
+      # materialized set; the result is a rejection, not 50 loaded rows.
+      for i <- 1..50, do: published(tenant.id, %{title: "Many #{i}", category: :reference})
+
+      assert {:error, :payload_too_large} = OKF.build_bundle(tenant.id, max_articles: 5)
+    end
+  end
+
   describe "build_bundle/2 (export)" do
     test "produces a conformant bundle with reserved files and concept docs" do
       tenant = fixture(:tenant)
@@ -243,6 +265,29 @@ defmodule Loopctl.Knowledge.OKFTest do
 
       %{data: [a]} = Knowledge.list_articles(dest.id, category: :pattern)
       assert a.title == "Legacy Zip"
+    end
+  end
+
+  describe "#7: loopctl_links_truncated is a reserved key (no metadata drift)" do
+    test "the truncation marker is stripped on import, not stashed as foreign extra" do
+      tenant = fixture(:tenant)
+
+      # A concept whose frontmatter carries the marker (as the exporter would emit
+      # for a capped hub). On import it must be CONSUMED (reserved), not preserved
+      # under metadata["okf"]["extra"] where it would re-export forever.
+      files = %{
+        "pattern/x.md" =>
+          "---\ntype: pattern\ntitle: X\nloopctl_links_truncated: true\n---\n\nbody\n"
+      }
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files)
+      assert report.created == 1
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+      okf_meta = a.metadata["okf"] || %{}
+      extra = okf_meta["extra"] || %{}
+      refute Map.has_key?(extra, "loopctl_links_truncated")
+      refute Map.has_key?(okf_meta, "loopctl_links_truncated")
     end
   end
 

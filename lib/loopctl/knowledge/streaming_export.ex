@@ -304,6 +304,14 @@ defmodule Loopctl.Knowledge.StreamingExport do
       article = to_article(row)
       {links, truncated?} = Map.get(links_by_article, row.id, {[], false})
 
+      # MUTATION-CHECK seam (#1, test-only, default OFF): when the
+      # `:export_force_materialize_for_test` flag is set, retain every article body in
+      # the producer process so the bounded-memory test can confirm its metric is
+      # LOAD-BEARING (i.e. that a materializing producer makes the ratio FAIL). The
+      # config is never set outside the mutation-check test, so prod/normal exports
+      # never retain.
+      maybe_materialize_for_test(row.body)
+
       ctx = %{
         links: links,
         links_truncated: truncated?,
@@ -319,6 +327,23 @@ defmodule Loopctl.Knowledge.StreamingExport do
     end)
   rescue
     e -> {:error, e, writer}
+  end
+
+  # MUTATION-CHECK seam (#1): default no-op. Only when the test flag is set does this
+  # accumulate bodies in the process dictionary (the producer process), turning the
+  # streaming producer into a materializing one — so the scale test can prove the
+  # bounded-memory metric actually catches it (ratio FAILS under the mutation).
+  @materialize_key {__MODULE__, :materialized_bodies}
+
+  defp maybe_materialize_for_test(body) do
+    if Application.get_env(:loopctl, :export_force_materialize_for_test, false) do
+      acc = Process.get(@materialize_key, [])
+      # Copy the binary so it's RETAINED by this process (a sub-binary of the row
+      # would be reclaimed with the row); :binary.copy forces a fresh refc binary.
+      Process.put(@materialize_key, [:binary.copy(body || <<>>) | acc])
+    end
+
+    :ok
   end
 
   # --- bounded per-page link preload (AC-27.16.3/.5, #7 truncation marker) ---

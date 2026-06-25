@@ -47,6 +47,7 @@ defmodule Loopctl.Knowledge.OKF do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ImportExport.DecompressionLimit
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -82,8 +83,14 @@ defmodule Loopctl.Knowledge.OKF do
   @category_strings Enum.map(@categories, &to_string/1)
 
   # Frontmatter keys this module owns; everything else is preserved verbatim.
+  # Frontmatter keys THIS module owns (set on export, stripped from `extra` on
+  # import so they don't survive as foreign metadata). `loopctl_links_truncated` is
+  # the #7 marker the exporter emits on a capped link list; without it here, a
+  # re-import would stash it under `metadata["okf"]["extra"]` and re-export it as
+  # foreign frontmatter forever. The dead `loopctl_links` key (never produced) is
+  # dropped.
   @reserved_fm_keys ~w(type title description resource tags timestamp
-                       loopctl_id loopctl_category loopctl_status loopctl_links)
+                       loopctl_id loopctl_category loopctl_status loopctl_links_truncated)
 
   @related_marker "<!-- okf:related -->"
 
@@ -125,12 +132,18 @@ defmodule Loopctl.Knowledge.OKF do
     project_id = Keyword.get(opts, :project_id)
     cap = Keyword.get(opts, :max_articles, max_buffered_export_articles())
 
-    # Cheap COUNT first (no body load) so an over-cap KB is rejected BEFORE
-    # materializing megabytes of rows — the buffered path must never OOM.
-    if count_published(tenant_id, project_id) > cap do
+    # (#2) The cap is enforced on the ACTUAL MATERIALIZED set, not a separate COUNT.
+    # Fetch `cap + 1` (peek): if we got more than `cap`, the bundle is over-cap →
+    # reject (never silently TRUNCATE to `cap`, which would drop articles from the
+    # json bundle). This closes the TOCTOU where rows published between a COUNT and
+    # the fetch would otherwise materialize unbounded — the SQL LIMIT hard-bounds the
+    # materialized rows at `cap + 1` regardless. The COUNT is gone; the LIMIT is the
+    # gate.
+    articles = fetch_published(tenant_id, project_id, cap + 1)
+
+    if length(articles) > cap do
       {:error, :payload_too_large}
     else
-      articles = fetch_published(tenant_id, project_id)
       paths = assign_paths(articles)
       files = build_files(articles, paths)
 
@@ -145,20 +158,18 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
-  defp count_published(tenant_id, project_id) do
-    tenant_id |> export_query(project_id) |> AdminRepo.aggregate(:count, :id)
-  end
-
   # NB: build_bundle/2 reads via AdminRepo (NOT the HeavyRead structural tenant
   # guard). The tenant scope is enforced by `export_query/2`'s explicit
-  # `a.tenant_id == ^tenant_id` predicate (and the count cap bounds the row set).
-  # The streamed backup path DOES go through HeavyRead's guard; this buffered
-  # convenience path is bounded + explicitly tenant-scoped here.
-  defp fetch_published(tenant_id, project_id) do
+  # `a.tenant_id == ^tenant_id` predicate, and the SQL LIMIT (`limit_with_peek`)
+  # hard-bounds the materialized row set so the buffered path can never OOM. The
+  # streamed backup path DOES go through HeavyRead's guard; this buffered convenience
+  # path is bounded + explicitly tenant-scoped here.
+  defp fetch_published(tenant_id, project_id, limit_with_peek) do
     tenant_id
     |> export_query(project_id)
     |> preload(outgoing_links: :target_article)
     |> order_by([a], asc: a.category, asc: a.title, asc: a.id)
+    |> limit(^limit_with_peek)
     |> AdminRepo.all()
   end
 
@@ -1057,13 +1068,17 @@ defmodule Loopctl.Knowledge.OKF do
     |> Map.new()
   end
 
-  # Defense-in-depth caps so `import_zip/3` can't be used as a zip/tar bomb.
+  # Defense-in-depth caps for `import_zip/3`. These BOUND a decompression bomb (#3):
+  # the tar.gz path stream-inflates with a running byte budget (aborts mid-bomb,
+  # never materializing it), and BOTH paths reject an over-large COMPRESSED input up
+  # front and enforce a total uncompressed-entry cap. So a 1KB→10GB bomb is rejected
+  # before it can OOM the node — not "fully inflated then checked".
   @max_zip_entries 20_000
   @max_zip_bytes 50 * 1024 * 1024
 
   # Dispatch on the archive's magic bytes: gzip (`1F 8B`, the US-27.16 streamed
-  # `.tar.gz`) → `:erl_tar` with in-memory decompression; PK (`50 4B`, a legacy
-  # `.zip`) → `:zip`. Both feed the same entry-collector (size/count caps).
+  # `.tar.gz`) → bounded streaming inflate; PK (`50 4B`, a legacy `.zip`) → `:zip`
+  # behind a compressed-input cap. Both feed the same entry-collector (size/count caps).
   defp unpack_archive(<<0x1F, 0x8B, _rest::binary>> = bin), do: untar_gz(bin)
   defp unpack_archive(<<0x50, 0x4B, _rest::binary>> = bin), do: unzip(bin)
   # Unknown magic: try zip first (back-compat), then tar.gz, before giving up.
@@ -1075,7 +1090,10 @@ defmodule Loopctl.Knowledge.OKF do
   end
 
   defp untar_gz(bin) do
-    case :erl_tar.extract({:binary, bin}, [:memory, :compressed]) do
+    # AC-27.16.3 (#3): decompression-limited extraction — compressed-input cap +
+    # streaming inflate with an uncompressed byte budget — so a gzip bomb aborts
+    # mid-decompression instead of fully inflating to gigabytes.
+    case DecompressionLimit.extract_tar_gz(bin) do
       {:ok, entries} -> collect_archive_entries(entries)
       {:error, reason} -> {:error, reason}
     end
@@ -1084,8 +1102,18 @@ defmodule Loopctl.Knowledge.OKF do
   end
 
   defp unzip(zip_binary) do
+    # `:zip.extract([:memory])` has no streaming budget (it inflates fully), so the
+    # bomb defense for the zip path is the COMPRESSED-input cap up front (#3) plus the
+    # per-entry total-uncompressed cap in collect_archive_entries/1.
+    with :ok <- DecompressionLimit.guard_compressed_size(zip_binary),
+         {:ok, entries} <- safe_zip_extract(zip_binary) do
+      collect_archive_entries(entries)
+    end
+  end
+
+  defp safe_zip_extract(zip_binary) do
     case :zip.extract(zip_binary, [:memory]) do
-      {:ok, entries} -> collect_archive_entries(entries)
+      {:ok, entries} -> {:ok, entries}
       {:error, reason} -> {:error, reason}
     end
   rescue

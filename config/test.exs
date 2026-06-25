@@ -171,6 +171,11 @@ config :loopctl, :bulk_delete_frozen_max, 3
 config :loopctl, :export_chunk_size, 3
 config :loopctl, :export_max_links_per_article, 5
 
+# US-27.16 (#3): small decompression-bomb caps so the bomb-defense test runs cheaply
+# — a ~1KB gzip that inflates past these is rejected without materializing it.
+config :loopctl, :import_export_max_compressed_bytes, 1_000_000
+config :loopctl, :import_export_max_decompressed_bytes, 5_000_000
+
 # US-27.16: small cap so the `?format=json` buffered-export 413 (over-cap) is
 # testable cheaply. Set to 2 so a 3-article corpus trips it. The OKF round-trip /
 # export CONTEXT tests that legitimately build larger bundles pass an explicit

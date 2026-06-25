@@ -69,36 +69,12 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
     global_max = max_global()
     tenant_max = max_per_tenant()
 
-    # Reserve the global slot first (atomic increment, then check). If it would
-    # exceed, undo immediately. Same for the per-tenant slot; if THAT exceeds, undo
-    # both. Net effect: a fully successful acquire leaves both incremented, a failed
-    # one leaves neither — no partial reservation can leak.
-    global_now = :ets.update_counter(@table, @global_key, {2, 1}, {@global_key, 0})
-
-    if global_now > global_max do
-      :ets.update_counter(@table, @global_key, {2, -1}, {@global_key, 0})
-      {:error, :too_many_exports}
-    else
-      acquire_tenant_slot(tenant_id, tenant_max)
-    end
-  end
-
-  defp acquire_tenant_slot(tenant_id, tenant_max) do
-    key = tenant_key(tenant_id)
-    tenant_now = :ets.update_counter(@table, key, {2, 1}, {key, 0})
-
-    if tenant_now > tenant_max do
-      :ets.update_counter(@table, key, {2, -1}, {key, 0})
-      :ets.update_counter(@table, @global_key, {2, -1}, {@global_key, 0})
-      {:error, :too_many_exports}
-    else
-      # Register for crash-safe release SYNCHRONOUSLY: the monitor is guaranteed
-      # established before acquire/1 returns, so there is no window where the slot
-      # is reserved (counters incremented) but unmonitored — a caller that crashes
-      # the instant after acquire/1 returns is still reclaimed by the :DOWN handler.
-      GenServer.call(__MODULE__, {:track, self(), tenant_id})
-      :ok
-    end
+    # Reserve the slots ONLY IF the monitor registration succeeds atomically.
+    # Use a GenServer call to atomically (on the server) check the caps, increment
+    # the counters IF both pass, and register the monitor — all in one operation.
+    # If ANY of these fail, the counters are never incremented. This prevents a
+    # monitor-setup failure from leaving an incremented but unmonitored slot (#4).
+    GenServer.call(__MODULE__, {:acquire, self(), tenant_id, global_max, tenant_max})
   end
 
   @doc """
@@ -115,10 +91,18 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
 
   Idempotent: calling it again (or without a prior successful acquire) is a no-op,
   because the pid is no longer tracked.
+
+  CRASH-SAFE: if the `ExportConcurrency` GenServer is down (so the `call` would
+  `:exit`), `release/1` swallows the exit and returns `:ok` — it is invoked from the
+  controller's `after` block, and a raised `:exit` there would MASK the streaming
+  body's real error (#4). A dead GenServer is itself a restart event that resets the
+  counters, so nothing leaks.
   """
   @spec release(binary()) :: :ok
   def release(tenant_id) when is_binary(tenant_id) do
     GenServer.call(__MODULE__, {:release, self(), tenant_id})
+  catch
+    :exit, _ -> :ok
   end
 
   @doc "Current global in-flight export count (for tests/telemetry)."
@@ -166,21 +150,15 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   end
 
   @impl true
-  def handle_call({:track, pid, tenant_id}, _from, state) do
-    # Monitor once per pid (a pid runs one export at a time on the request path).
-    case Map.get(state.pids, pid) do
-      nil ->
-        ref = Process.monitor(pid)
-
-        {:reply, :ok,
-         %{
-           state
-           | monitors: Map.put(state.monitors, ref, {pid, tenant_id}),
-             pids: Map.put(state.pids, pid, ref)
-         }}
-
-      _ref ->
-        {:reply, :ok, state}
+  def handle_call({:acquire, pid, tenant_id, global_max, tenant_max}, _from, state) do
+    # Atomic slot reservation (#4): check the caps AND increment the counters AND
+    # register the monitor all in ONE serialized GenServer operation, so a caller
+    # crash can never interleave between the increment and the monitor (no
+    # unmonitored leaked slot). `reserve_slots/4` does the increment-check-undo;
+    # `track/3` registers the crash-safe monitor.
+    case reserve_slots(state.table, tenant_id, global_max, tenant_max) do
+      :ok -> {:reply, :ok, track(state, pid, tenant_id)}
+      {:error, :too_many_exports} = err -> {:reply, err, state}
     end
   end
 
@@ -220,6 +198,54 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   end
 
   # --- Private ---
+
+  # Increment global then per-tenant; undo on either over-cap. Net: a successful
+  # reserve leaves BOTH incremented, a failed one leaves NEITHER. Called only from
+  # the (serialized) GenServer, so the increment-check-undo is atomic w.r.t. other
+  # acquires.
+  defp reserve_slots(table, tenant_id, global_max, tenant_max) do
+    global_now = :ets.update_counter(table, @global_key, {2, 1}, {@global_key, 0})
+
+    if global_now > global_max do
+      :ets.update_counter(table, @global_key, {2, -1}, {@global_key, 0})
+      {:error, :too_many_exports}
+    else
+      reserve_tenant_slot(table, tenant_id, tenant_max)
+    end
+  end
+
+  defp reserve_tenant_slot(table, tenant_id, tenant_max) do
+    key = tenant_key(tenant_id)
+    tenant_now = :ets.update_counter(table, key, {2, 1}, {key, 0})
+
+    if tenant_now > tenant_max do
+      :ets.update_counter(table, key, {2, -1}, {key, 0})
+      :ets.update_counter(table, @global_key, {2, -1}, {@global_key, 0})
+      {:error, :too_many_exports}
+    else
+      :ok
+    end
+  end
+
+  # Register the crash-safe monitor (one per pid — one export per request process).
+  # `Process.monitor` on an already-dead pid still returns a ref and immediately
+  # delivers `:DOWN`, which the handler reclaims — so there is no leak even if the
+  # request pid died before this ran.
+  defp track(state, pid, tenant_id) do
+    case Map.get(state.pids, pid) do
+      nil ->
+        ref = Process.monitor(pid)
+
+        %{
+          state
+          | monitors: Map.put(state.monitors, ref, {pid, tenant_id}),
+            pids: Map.put(state.pids, pid, ref)
+        }
+
+      _ref ->
+        state
+    end
+  end
 
   defp untrack(state, ref, pid) do
     %{state | monitors: Map.delete(state.monitors, ref), pids: Map.delete(state.pids, pid)}

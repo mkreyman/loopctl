@@ -37,18 +37,22 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
 
   alias __MODULE__
 
-  @enforce_keys [:tar, :z, :emit, :conn, :state]
-  defstruct [:tar, :z, :emit, :conn, :state]
+  @enforce_keys [:tar, :z, :emit, :conn, :state, :sample?]
+  defstruct [:tar, :z, :emit, :conn, :state, :sample?]
 
   @typedoc "The flusher: receives compressed iodata, returns the threaded conn or an error."
   @type emit_fun :: (iodata() -> {:ok, term()} | {:error, term()})
+
+  @memory_event [:loopctl, :streaming_export, :chunk_emitted]
+  @memory_module Application.compile_env(:loopctl, :memory_module, Loopctl.MemoryUsage.Default)
 
   @opaque t :: %TarGz{
             tar: term(),
             z: :zlib.zstream(),
             emit: emit_fun(),
             conn: term(),
-            state: :ets.tid()
+            state: :ets.tid(),
+            sample?: boolean()
           }
 
   @doc """
@@ -57,6 +61,11 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
   `emit` is called with compressed iodata to flush to the wire and must return
   `{:ok, conn}` (the threaded `Plug.Conn`, or any caller state) or
   `{:error, reason}`. `conn` is the initial threaded value.
+
+  The per-flush memory-sampling telemetry (`#{inspect(@memory_event)}`) is emitted
+  ONLY when a handler is attached to that event AT INIT TIME — so production (no
+  handler) pays no per-article GC/sample cost (#5). The scale test attaches the
+  handler before calling the export, so the writer samples.
 
   Returns `{:ok, writer}` or `{:error, reason}` if the initial gzip header couldn't
   be flushed.
@@ -73,7 +82,11 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
     state = :ets.new(__MODULE__.State, [:set, :private])
     :ets.insert(state, [{:buf, []}, {:pos, 0}])
 
-    writer = %TarGz{tar: nil, z: z, emit: emit, conn: conn, state: state}
+    # Decide ONCE whether to sample: only when a handler is attached. In prod (none),
+    # `sample?` is false and `flush_buffer/1` skips the GC + process_info entirely.
+    sample? = :telemetry.list_handlers(@memory_event) != []
+
+    writer = %TarGz{tar: nil, z: z, emit: emit, conn: conn, state: state, sample?: sample?}
     fun = make_writer_fun(z, state)
 
     case :erl_tar.init(:streaming, :write, fun) do
@@ -189,8 +202,9 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
     end
   end
 
-  # Pull the deflate-buffered compressed bytes and hand them to `emit`, emitting
-  # a telemetry event that includes the current process's memory (for scale testing).
+  # Pull the deflate-buffered compressed bytes and hand them to `emit`. When sampling
+  # is enabled (a handler was attached at init — never in prod), also emit a
+  # bounded-memory telemetry measurement.
   defp flush_buffer(%TarGz{state: state} = w) do
     rev = :ets.lookup_element(state, :buf, 2)
     :ets.insert(state, {:buf, []})
@@ -200,24 +214,45 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
         {:ok, w}
 
       iolist ->
-        # US-27.16 bounded-memory instrumentation (#3): emit THIS (producer) process's
-        # LIVE memory per flush as a telemetry MEASUREMENT, so a scale test can prove
-        # the PRODUCER's footprint is sub-linear in N — distinct from a VM-wide /
-        # client-buffer measurement that would be linear in bundle size. `flush_buffer`
-        # runs in the producer process (the Bandit handler over HTTP, or the test
-        # process via the helper), so `self()` IS the producer. GC first so the sample
-        # reflects retained memory, not the just-built chunk's garbage.
-        :erlang.garbage_collect()
-        {:memory, bytes} = :erlang.process_info(self(), :memory)
-
-        :telemetry.execute(
-          [:loopctl, :streaming_export, :chunk_emitted],
-          %{process_memory: bytes},
-          %{}
-        )
-
+        maybe_sample_memory(w)
         emit_threaded(w, :lists.reverse(iolist))
     end
+  end
+
+  # US-27.16 bounded-memory instrumentation (#1/#3). Gated on `sample?` so PROD never
+  # pays the per-flush GC (#5) — `sample?` is false unless a handler is attached, and
+  # in prod none is.
+  #
+  # Measures the memory that ACTUALLY MOVES with N — NOT `process_info(:memory)`,
+  # which counts only the process heap and so MISSES the article bodies (refc
+  # binaries > 64 bytes live in the SHARED binary heap, off-process) and the ETS
+  # deflate buffer. A materializing producer that retained every body would be
+  # invisible to `:memory` — hence the prior false-green. The pluggable
+  # `@memory_module` (default `Loopctl.MemoryUsage.Default`) sums the producer's
+  # RETAINED refc binaries (`process_info(self(), :binary)`) + the writer's ETS
+  # buffer size. GC first so the sample reflects RETAINED (live) memory, not the
+  # just-built chunk's garbage.
+  defp maybe_sample_memory(%TarGz{sample?: false}), do: :ok
+
+  defp maybe_sample_memory(%TarGz{sample?: true, state: state}) do
+    :erlang.garbage_collect()
+
+    retained_bytes = @memory_module.usage(self(), state)
+    {:memory, heap_bytes} = :erlang.process_info(self(), :memory)
+
+    :telemetry.execute(
+      @memory_event,
+      %{
+        # The load-bearing metric: retained refc binaries + ETS buffer — what grows
+        # if the producer accumulates bodies.
+        retained_bytes: retained_bytes,
+        # Heap memory kept for reference/debugging (NOT the assertion metric).
+        process_memory: heap_bytes
+      },
+      %{}
+    )
+
+    :ok
   end
 
   defp emit_threaded(%TarGz{} = w, iodata) do
