@@ -91,6 +91,22 @@ which is the distinction that produced the false-green in #172.
   **overrides** (`:heavy_read_statement_timeout_overrides`) are unit-tested
   (`heavy_read_statement_timeout_test.exs`), NOT scale-tested — the scale gate covers the
   backstop that actually protects prod, not every override permutation.
+- **Per-endpoint index-usage + END-TO-END latency (US-27.8)** — every vector path
+  (`suggested_links`, `semantic` search results + count, `distant_pairs`, `novelty`, AND
+  the auto-link worker) carries an 80k index-usage gate on its REAL request-path query
+  (`topk_endpoints_scale_test.exs`, `distant_pairs_novelty_scale_test.exs`), plus an
+  ADVISORY end-to-end wall-clock budget measured through the real HTTP conn
+  (`vector_endpoint_e2e_latency_scale_test.exs`, `:scale_latency_budget_ms` default 2000ms).
+  Calibration is asserted, not assumed: a sub-floor seed or `ef_search` mismatch FAILS
+  loudly (`scale_calibration_mismatch_scale_test.exs`). See the **Standing vector-endpoint
+  CI gates (US-27.8)** section of [`knowledge-scale.md`](knowledge-scale.md) for the lint
+  guard, the latency-budget/seed-floor knobs, and the floor-bump step.
+- **No cosine-`<=>` reintroduction (US-27.8, the `lint` job)** — `mix credo --strict` runs
+  the `Loopctl.Credo.Check.CosineQueryReintroduction` custom check, which fails the build
+  if a NEW hand-rolled cosine `<=>` appears in `lib/loopctl` outside
+  `Loopctl.Knowledge.VectorSearch` and not in the `Loopctl.Knowledge.CosineLintExceptions`
+  allowlist. The allowlist exempts the LINT location only — never a bad SHAPE from the plan
+  gate above.
 
 It runs in two places:
 

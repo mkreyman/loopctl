@@ -25,6 +25,7 @@ defmodule Loopctl.PlanAssertions do
 
   alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge.ScaleSeed
 
   # Node types that read the whole `articles` relation (the #172 timeout shape).
   # "Seq Scan" covers Parallel Seq Scan (same Node Type, Parallel Aware flag).
@@ -485,6 +486,55 @@ defmodule Loopctl.PlanAssertions do
             "Expected EXACTLY ONE scan on `articles` (the HNSW index), got #{length(many)}: " <>
               "#{inspect(Enum.map(many, & &1.node_type))} — a sibling full-scan could hide a " <>
               "full-corpus read. Plan:\n#{elide(raw)}"
+    end
+  end
+
+  @doc """
+  Raises unless the seeded corpus is AT OR ABOVE the production floor
+  (`Loopctl.Knowledge.ScaleSeed.prod_article_floor/0`, currently 80k) — the calibration
+  precondition for a vector scale gate (US-27.8 AC-27.8.3 / TC-27.8.3).
+
+  `assert_fresh_stats!/0` only proves the corpus is non-empty + analyzed; it does NOT
+  prove it is large enough for the planner's cost-based HNSW choice to be representative.
+  At sub-floor scale the planner Seq-Scans happily and an index-usage assertion is a LIE
+  (it would false-GREEN on a regression). This guard makes a sub-floor seed FAIL LOUDLY
+  with an explicit calibration error instead.
+
+  Counts the COMMITTED rows for `tenant_id` (an ACTUAL `count(*)`, like
+  `assert_fresh_stats!/0`, not the autovacuum estimate). Tenant-scoped because each scale
+  test seeds its OWN ~80k tenant; the floor is a per-tenant property of THAT seed.
+
+  Raises `ExUnit.AssertionError` naming the actual vs required count and pointing at the
+  documented floor-bump step (AC-27.8.6) when below floor.
+  """
+  def assert_scale_floor!(tenant_id) when is_binary(tenant_id) do
+    floor = ScaleSeed.prod_article_floor()
+
+    %{rows: [[real_count]]} =
+      AdminRepo.query!("SELECT count(*) FROM articles WHERE tenant_id = $1", [
+        Ecto.UUID.dump!(tenant_id)
+      ])
+
+    cond do
+      is_nil(real_count) or real_count <= 0 ->
+        raise ExUnit.AssertionError,
+          message:
+            "Scale calibration FAILED: tenant #{inspect(tenant_id)} has an EMPTY `articles` " <>
+              "(committed count=#{inspect(real_count)}). Seed via " <>
+              "Loopctl.Knowledge.ScaleSeed.seed(tenant_id, count: ScaleSeed.prod_article_floor()) first."
+
+      real_count < floor ->
+        raise ExUnit.AssertionError,
+          message:
+            "Scale calibration FAILED (sub-floor seed): tenant #{inspect(tenant_id)} has " <>
+              "#{real_count} committed articles, BELOW the prod floor of #{floor} " <>
+              "(Loopctl.Knowledge.ScaleSeed.prod_article_floor/0). A vector index-usage gate " <>
+              "at sub-floor scale is theatre — the planner Seq-Scans happily and the assertion " <>
+              "false-GREENs. Seed at least #{floor} rows; to raise the floor as prod grows, bump " <>
+              "@prod_article_floor in Loopctl.Knowledge.ScaleSeed (a documented step — AC-27.8.6)."
+
+      true ->
+        :ok
     end
   end
 

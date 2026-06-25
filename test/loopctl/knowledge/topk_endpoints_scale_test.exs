@@ -62,6 +62,11 @@ defmodule Loopctl.Knowledge.TopkEndpointsScaleTest do
         t
       end)
 
+    # US-27.8 AC-27.8.3: calibration guard — every assertion below assumes a >= prod-floor
+    # corpus for THIS tenant; a sub-floor seed would make the index-usage gate false-green,
+    # so fail loudly here instead.
+    unboxed(fn -> PlanAssertions.assert_scale_floor!(tenant.id) end)
+
     on_exit(fn ->
       try do
         unboxed(fn ->

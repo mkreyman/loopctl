@@ -568,3 +568,63 @@ _time:1h "mapped_code=db_statement_timeout" "tenant_id=<TENANT_UUID>"
 For slow-read latency by tenant, query the US-27.4 `slow_query` lines
 (`"slow_query" "tenant_id=<TENANT_UUID>"`). Lower `:slow_query_threshold_ms` to widen what
 the logs capture if needed (see the slow-query section above).
+
+## Standing vector-endpoint CI gates (US-27.8)
+
+US-27.8 turns "ALL vector endpoints index-backed + under budget at prod scale" into
+**standing CI properties** so a future regression fails CI, not prod. There are two kinds
+of gate, and they are independent:
+
+### 1. The cosine-`<=>` reintroduction lint (runs in the `lint` CI job)
+
+`mix credo --strict` runs a custom check,
+`Loopctl.Credo.Check.CosineQueryReintroduction`, that FAILS the build if a NEW hand-rolled
+cosine `<=>` (in a `fragment(...)` / raw SQL) appears in `lib/loopctl` **outside** the
+sanctioned helper `Loopctl.Knowledge.VectorSearch` and **not** in the auditable allowlist
+`Loopctl.Knowledge.CosineLintExceptions`.
+
+- The check lives in `.credo/checks/cosine_query_reintroduction.ex` (OUTSIDE `lib/`, so
+  `MIX_ENV=prod mix compile` never drags it into the release) and is loaded by Credo via
+  `.credo.exs` `requires:`. `.credo.exs` is the full `mix credo.gen.config` default set
+  PLUS this one check — no default check is dropped or weakened.
+- **Adding a legitimately-different cosine shape?** Register `{module, function, arity}`
+  (with a non-empty one-line rationale) in `Loopctl.Knowledge.CosineLintExceptions` — a
+  visible, reviewable diff — instead of an inline comment the lint can't see.
+- **CRITICAL:** the allowlist exempts only the LINT location. It does NOT exempt a bad
+  query SHAPE from the scale plan-gate — an index-defeating change inside an allowlisted
+  function STILL fails `refute_full_scan`/`refute_seq_scan` at 80k (proven by
+  `cosine_lint_vs_scale_gate_scale_test.exs`).
+
+### 2. The per-endpoint scale gates (run in the `Scale Nightly` matrix)
+
+Every vector path carries an 80k index-usage gate on its REAL request-path query:
+`suggested_links` + `search_semantic` (results + count) + the auto-link worker
+(`topk_endpoints_scale_test.exs`), `distant_pairs` + `novelty`
+(`distant_pairs_novelty_scale_test.exs`). Each `:scale_nightly` file is in the
+`.github/workflows/ci.yml` `scale_file` matrix; `scale_verification_runbook_test.exs`
+enforces set-equality so coverage can't silently erode.
+
+**End-to-end wall-clock latency (`vector_endpoint_e2e_latency_scale_test.exs`).** The
+PRIMARY signal is the deterministic plan assertion (index-backed, no full-corpus Sort).
+SECONDARY/ADVISORY is a wall-clock budget measured through the REAL HTTP endpoint (a timed
+`Phoenix.ConnTest` request: auth + RLS + query + serialize + render) for `suggested_links`
+and `semantic` search:
+
+- Budget config: **`:scale_latency_budget_ms`** (default **2000ms** — the Theme-2 "<2s"
+  target). Deliberately generous so it does not flake on shared CI hardware; the plan gate
+  is the real arbiter. **Tune it UP** as prod grows beyond the floor — a documented step,
+  never a silent default (AC-27.8.6).
+
+**Calibration is asserted, not assumed (`scale_calibration_mismatch_scale_test.exs`).**
+
+- **Seed floor.** The vector gates call `PlanAssertions.assert_scale_floor!/1`, which
+  RAISES a clear calibration error if the seeded tenant has fewer than
+  `Loopctl.Knowledge.ScaleSeed.prod_article_floor/0` (currently **80_000**) committed
+  articles — a sub-floor gate is theatre (the planner Seq-Scans happily at toy scale and an
+  index-usage assertion false-greens). **Bumping the floor** as prod grows = update
+  `@prod_article_floor` in `Loopctl.Knowledge.ScaleSeed` (a documented step).
+- **`hnsw.ef_search` parity.** The under-fill gate asserts the EFFECTIVE `ef_search`
+  (`SHOW hnsw.ef_search`) is identical on the gate connection and a prod-shaped one; the
+  calibration test proves the FAILURE direction (a divergent value RAISES). When US-27.11's
+  `ALTER ROLE … SET hnsw.ef_search = N` lands a non-default value, update the `== "40"` pin
+  in `vector_search_under_fill_scale_test.exs` to the new value.

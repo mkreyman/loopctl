@@ -92,6 +92,10 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
         t
       end)
 
+    # US-27.8 AC-27.8.3: calibration guard — the distant_pairs/novelty bounds below assume
+    # a >= prod-floor corpus for THIS tenant; fail loudly on a sub-floor seed.
+    unboxed(fn -> PlanAssertions.assert_scale_floor!(tenant.id) end)
+
     on_exit(fn ->
       try do
         unboxed(fn ->

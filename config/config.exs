@@ -19,6 +19,14 @@ config :loopctl,
   # 0.8+ is only useful for near-duplicate detection.
   article_link_threshold: 0.6,
   article_link_max_comparisons: 50,
+  # US-27.8 (AC-27.8.4/.6): ADVISORY end-to-end wall-clock budget (ms) for the vector
+  # scale gate's timed HTTP requests (suggested_links / semantic search) at the prod
+  # floor. SECONDARY to the deterministic plan assertion (index-backed, no full-corpus
+  # Sort), which is the real gate; this generous budget catches a serialize/round-trip
+  # blow-up without flaking on shared CI hardware. 2000 = the Theme-2 "<2s" target. Tune
+  # UP as prod grows beyond the current ScaleSeed floor (a documented step, like bumping
+  # @prod_article_floor) — never silently.
+  scale_latency_budget_ms: 2_000,
   # US-27.4: log any query slower than this (ms) via the SlowQueryLogger telemetry
   # handler. Tunable in config/env without a code change.
   slow_query_threshold_ms: 1_000,

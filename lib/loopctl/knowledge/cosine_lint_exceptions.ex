@@ -12,20 +12,20 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
   prevent that shape from being reintroduced ad hoc.
 
   This registry is NOT a claim that no other `<=>` exists in the codebase — it is the
-  auditable list of the TWO US-27.7b-owned exceptions (distant_pairs + novelty). The broader
-  cosine-site inventory and the lint's full exemption policy are US-27.8's design. For
-  context, the other known cosine sites the US-27.8 lint must account for (NOT registered
-  here — out of US-27.7b's scope) are:
+  auditable list of the cosine exceptions in `Loopctl.Knowledge` (distant_pairs + novelty).
+  The US-27.8 lint (`Loopctl.Credo.Check.CosineQueryReintroduction`) is now LIVE and reads
+  this registry as its allowlist. Its full exemption policy — DECIDED in US-27.8 — is:
 
     * `Loopctl.Knowledge.VectorSearch`'s own query builders (e.g. `candidate_query/4`) —
       they necessarily CONTAIN the `<=>` literal because that module IS the sanctioned top-k
-      helper; US-27.8 will exempt the whole `VectorSearch` module as its home, not via this
-      per-function registry.
-    * `Loopctl.Knowledge.suggestion_candidates_query/6` — a known, intentional INLINE top-k
-      `ORDER BY embedding <=> $const LIMIT pool` whose own comment frames the inline split as
-      the #170/#172 prod-500 FIX (the index-defeating anti-join/threshold was moved to the
-      OUTER query so the inner ANN stays HNSW-eligible). Its lint disposition is a US-27.8
-      decision, deliberately left out of this US-27.7b registry.
+      helper; the US-27.8 lint exempts the WHOLE `VectorSearch` module as its home (matched
+      by module name), NOT via this per-function registry. (Decision made — no longer
+      deferred.)
+    * `Loopctl.Knowledge.suggestion_candidates_query/6` — post-US-27.7a this DELEGATES to
+      `VectorSearch.candidate_query/4` and carries NO inline `<=>` literal, so the lint never
+      sees a site there: it is not a lint target and needs no registry entry. (The earlier
+      inline `ORDER BY embedding <=> $const LIMIT pool` — the #170/#172 prod-500 FIX — has
+      since been routed through the shared helper; decision made — no longer deferred.)
 
   Some functions in `Loopctl.Knowledge` legitimately compute a cosine `<=>` distance WITHOUT
   going through (and MUST NOT be routed through) `nearest/4`, because neither is a
