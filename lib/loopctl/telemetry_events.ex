@@ -45,21 +45,30 @@ defmodule Loopctl.TelemetryEvents do
 
   @doc """
   A vector-search read under-filled (US-27.6b): it returned fewer than the
-  requested `k` candidates DESPITE the inner ANN pool being filled to its cap —
-  i.e. the post-ANN filters (already-linked anti-join / similarity threshold)
-  cut the full pool below `k`, not a genuinely-small corpus. Emitted at most
-  ONCE per request.
+  requested `k` candidates AND above-threshold (near) neighbors the inner ANN
+  surfaced were hidden by the already-linked anti-join — `above_threshold >
+  returned`. NOT fired for a genuinely-sparse region whose whole ANN pool is
+  below the similarity threshold (correct emptiness, not recall loss, so
+  `above_threshold == returned`). Emitted at most ONCE per request.
 
   ## Payload (id-only — NEVER a vector literal or article body, AC-27.6b.5)
 
-    * `measurements`: `%{requested, returned, pool, available, excluded_total}`
-      where `excluded_total = pool - returned` is the **TOTAL** post-ANN
-      exclusion count — the anti-join drops and the below-threshold drops
-      COMBINED, NOT a per-reason split. A per-reason breakdown (anti-join vs
-      threshold) is intentionally **deferred to US-27.15** (the metrics
-      aggregation that consumes this event): computing the two components
-      separately would cost an ADDITIONAL bounded read per request, which the
-      AC-27.6b.5 one-bounded-read cost bound discourages.
+    * `measurements`: `%{requested, returned, pool, ann_candidates,
+      above_threshold, excluded_by_link}` where
+        - `pool` = the REQUESTED over-fetch ceiling (`pool_size/2`).
+        - `ann_candidates` = how many rows the inner ANN actually delivered —
+          bounded by `LIMIT pool` AND, under HNSW, by `~ef_search` (~40), so it
+          is typically `< pool`. A recall-BREADTH diagnostic, NOT a pool-full
+          gate (an `ann_candidates >= pool` check is degenerate under HNSW).
+        - `above_threshold` = how many of `ann_candidates` clear the similarity
+          bar — the near neighbors that actually exist.
+        - `excluded_by_link` = `above_threshold - returned` — the above-threshold
+          neighbors the already-linked anti-join HID. Because the signal only
+          fires when `returned < limit` (so the outer LIMIT never bound and every
+          unlinked above-threshold candidate WAS returned), this is an
+          UN-CONFLATED recall-loss count — purely anti-join drops, with the
+          below-threshold (sparse) drops already excluded. No extra read is
+          needed to disentangle the two.
     * `metadata`: `%{tenant_id, endpoint}` — `tenant_id` is an id, not content.
 
   Aggregated by US-27.15 metrics/alerting.

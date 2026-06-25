@@ -5,14 +5,20 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
 
   The crux distinction this proves:
 
-    * **under_fill**  — the nearest pool was FILLED to cap but the post-ANN filters
-      (already-linked anti-join / threshold) cut the result below `limit`. A
+    * **under_fill**  — above-threshold (near) neighbors the ANN surfaced were hidden by
+      the already-linked anti-join (`returned < limit AND above_threshold > returned`). A
       `[:loopctl, :knowledge, :vector_search, :under_fill]` event fires AND
-      `meta.recall_truncated` is true (TC-27.6b.2).
-    * **NOT under_fill** — the corpus simply has plenty of unlinked above-threshold
-      neighbors and the full `limit` is returned: NO event, `meta.recall_truncated`
-      false (TC-27.6b.3). And the genuinely-small-corpus case (returned < limit but
-      the pool was NEVER full) is also NOT under_fill.
+      `meta.recall_truncated` is true (TC-27.6b.2). The detector is ef_search-independent
+      — it compares counts over the set the ANN actually delivered, never a degenerate
+      `ann_candidates >= pool` gate (the bug prod-scale verification caught).
+    * **NOT under_fill** — three distinct non-incidents, none of which fire:
+        - a full result (plenty of unlinked above-threshold neighbors, full `limit`
+          returned) — TC-27.6b.3;
+        - a genuinely-small corpus (returned < limit but every above-threshold neighbor
+          the ANN surfaced WAS returned, `above_threshold == returned`);
+        - a **sparse region** (the ANN pool IS surfaced, but every neighbor is below the
+          similarity threshold, `above_threshold == returned == 0`) — correct
+          emptiness, NOT recall loss (AC-27.6b.6; adversarial F1 regression).
 
   The async suite shrinks the over-fetch pool to 6 (config/test.exs) so the pool can
   be deterministically FILLED with a handful of seeded rows — no 100-row corpus and
@@ -88,7 +94,7 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
       neighbors = for i <- 1..6, do: embedded(tenant.id, "N#{i}", [1.0, 0.0])
       for n <- neighbors, do: link!(tenant.id, target.id, n.id)
 
-      # Sanity: the pool is exactly the count we filled (so available >= pool holds).
+      # Sanity: the pool is exactly the count we filled (the ANN surfaces all 6).
       assert VectorSearch.pool_size(5) == 6
 
       {result, meta} =
@@ -109,11 +115,17 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
       assert measurements.returned == length(result)
       assert measurements.returned < 5
       assert measurements.pool == 6
-      assert measurements.available >= measurements.pool
-      # excluded_total is the COMBINED post-ANN exclusion count (anti-join + threshold),
-      # a measurement (numeric), NOT a per-reason split (deferred to US-27.15).
-      assert measurements.excluded_total == measurements.pool - measurements.returned
-      assert measurements.excluded_total >= 1
+      # ann_candidates = how many the ANN delivered (here the whole 6-row pool, since
+      # pool 6 < ef_search ~40) — a recall-breadth diagnostic, NOT a pool-full gate.
+      assert measurements.ann_candidates == 6
+      # above_threshold = the near neighbors that exist: all 6 are similarity 1.0 (> the
+      # 0.5 threshold), so they cleared the bar but were hidden by the anti-join — this is
+      # what separates real recall loss from a sparse region.
+      assert measurements.above_threshold == 6
+      # excluded_by_link = above_threshold - returned: the un-conflated count of
+      # above-threshold neighbors the already-linked anti-join removed.
+      assert measurements.excluded_by_link == measurements.above_threshold - measurements.returned
+      assert measurements.excluded_by_link >= 1
       assert metadata.tenant_id == tenant.id
       assert metadata.endpoint == :suggested_links
 
@@ -159,13 +171,14 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
   end
 
   describe "a genuinely-small corpus is NOT under-fill (AC-27.6b.2 — the key distinction)" do
-    test "returned < limit but the pool was NEVER full → no event, meta false" do
+    test "returned < limit but no above-threshold neighbor was hidden → no event, meta false" do
       tenant = fixture(:tenant)
       target = embedded(tenant.id, "Target", [1.0, 0.0])
 
-      # Only 2 eligible neighbors exist corpus-wide — fewer than the 6-row pool. This
-      # returns < limit (5) but it is a genuinely-empty-ish corpus, NOT a recall
-      # incident: the pool was never filled, so NO signal must fire.
+      # Only 2 eligible neighbors exist corpus-wide, BOTH unlinked + above threshold. This
+      # returns < limit (5), but it is NOT a recall incident: every above-threshold
+      # neighbor the ANN surfaced WAS returned (`above_threshold == returned == 2`), so the
+      # anti-join hid nothing — NO signal must fire.
       _c1 = embedded(tenant.id, "C1", [1.0, 0.0])
       _c2 = embedded(tenant.id, "C2", [1.0, 0.0])
 
@@ -180,7 +193,7 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
       assert length(result) == 2
       assert length(result) < 5
 
-      # Crucially: NO under_fill event despite returned < limit (available < pool).
+      # Crucially: NO under_fill event despite returned < limit (above_threshold == returned).
       refute_received {:under_fill, _, _, _}
       assert meta.recall_truncated == false
       assert meta.pool_exhausted == false
@@ -206,8 +219,41 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
     end
   end
 
+  describe "a sparse region is NOT under-fill (adversarial F1 regression, AC-27.6b.6)" do
+    test "pool FULL but every neighbor is below threshold → genuinely empty, no event, meta false" do
+      tenant = fixture(:tenant)
+
+      # Target points along axis 1; all neighbors point along an ORTHOGONAL axis, so
+      # cosine similarity = 0 (< the 0.5 threshold). The ANN STILL surfaces all 6 neighbors
+      # (ann_candidates = 6), but NONE clear the relevance bar — this is correct emptiness,
+      # not recall loss. The original `available >= pool`-only rule fired here FALSELY
+      # (crying wolf on every thin-corpus article, contradicting AC-27.6b.6's
+      # "distinguish an incomplete result from a genuinely-empty one"); the threshold-aware
+      # probe (`above_threshold == returned == 0`) must NOT fire.
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+      for i <- 1..6, do: embedded(tenant.id, "Orthogonal#{i}", [0.0, 1.0])
+
+      {result, meta} =
+        with_under_fill_handler(fn ->
+          {:ok, suggestions, meta} =
+            Knowledge.suggest_links_with_meta(tenant.id, target.id, limit: 5, threshold: 0.5)
+
+          {suggestions, meta}
+        end)
+
+      # Nothing clears the bar → empty result, even though the pool was full.
+      assert result == []
+
+      # Crucially: NO under_fill event despite returned (0) < limit (5) AND a FULL pool —
+      # because above_threshold == 0, no near neighbors were hidden by the anti-join.
+      refute_received {:under_fill, _, _, _}
+      assert meta.recall_truncated == false
+      assert meta.pool_exhausted == false
+    end
+  end
+
   describe "the under-fill probe is a single bounded extra read, gated on the truncated path (AC-27.6b.5)" do
-    test "a FULL result issues NO available-count probe; the truncated path adds exactly one" do
+    test "a FULL result issues NO under-fill probe; the truncated path adds exactly one" do
       # When returned >= limit there is nothing to detect, so the bounded `count(*)` probe
       # must not run at all. We isolate the probe by counting ONLY the count-aggregate
       # query (its source is the `articles` candidate subquery; the `SELECT count(...)`
@@ -246,7 +292,7 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillTest do
     end
   end
 
-  # Count ONLY the under-fill `available_candidate_count` probe queries during `fun`.
+  # Count ONLY the under-fill `under_fill_probe` queries during `fun`.
   # The probe is the lone `SELECT count(...)` over the candidate subquery on the heavy
   # pool (AdminRepo in test); we discriminate by the decoded SQL. CRITICAL for an async
   # suite: the telemetry handler is process-GLOBAL, so we ALSO scope to queries issued

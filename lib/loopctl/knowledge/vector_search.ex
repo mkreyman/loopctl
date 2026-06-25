@@ -62,11 +62,15 @@ defmodule Loopctl.Knowledge.VectorSearch do
   *identical* to "no neighbors exist" (a genuinely-empty corpus). So under-fill is
   made **observable, not silent**: `Loopctl.Knowledge.suggest_links_with_meta/3`
   emits a `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event and
-  a response-`meta` flag when the pool was filled to cap but filters cut it below
-  `k` (see that function + `Loopctl.TelemetryEvents.vector_search_under_fill/0`).
-  The event's `excluded_total` measurement is the COMBINED post-ANN exclusion count
-  (anti-join + threshold); a per-reason split is deferred to US-27.15 because
-  separating the two would cost an extra per-request read (AC-27.6b.5 cost bound).
+  a response-`meta` flag when above-threshold (near) neighbors the ANN surfaced were
+  hidden by the already-linked anti-join (`above_threshold > returned`) — NOT for a
+  sparse region whose whole ANN pool is below the threshold (correct emptiness, see
+  that function + `Loopctl.TelemetryEvents.vector_search_under_fill/0`). The detector
+  is ef_search-independent (it compares counts over the set the ANN actually
+  delivered, never a degenerate `ann_candidates >= pool` gate). The event's
+  `excluded_by_link` measurement (`above_threshold - returned`) is the un-conflated
+  count of above-threshold neighbors the anti-join removed — the recall-loss metric
+  US-27.15 aggregates, computed from the single bounded under-fill probe.
 
   **Raising recall is deliberately NOT done per-request here.** `hnsw.ef_search` is
   a pgvector **custom GUC** that does not exist until the extension loads per

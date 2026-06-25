@@ -3243,7 +3243,16 @@ defmodule Loopctl.Knowledge do
     returned = length(suggestions)
 
     meta =
-      maybe_signal_under_fill(tenant_id, article_id, embedding, vis, limit, pool, returned)
+      maybe_signal_under_fill(
+        tenant_id,
+        article_id,
+        embedding,
+        threshold,
+        vis,
+        limit,
+        pool,
+        returned
+      )
 
     {suggestions, meta}
   end
@@ -3251,88 +3260,175 @@ defmodule Loopctl.Knowledge do
   # Under-fill signal (US-27.6b AC-27.6b.2/.5/.6). Builds the response `meta` and —
   # only when recall is genuinely truncated — emits ONE telemetry event per request.
   #
-  # THE KEY DISTINCTION (the whole point of the story): emit ONLY when the inner ANN
-  # pool was actually FILLED to its cap and the post-ANN filters (the already-linked
-  # anti-join + the similarity threshold) cut the result below `limit`. We do NOT emit
-  # when the corpus simply has fewer than `limit` eligible candidates — that is a
-  # genuinely-empty result, not a recall incident.
+  # THE KEY DISTINCTION (the whole point of the story, per its background: "returns []
+  # while near neighbors EXIST"): the recall incident is when above-threshold (near)
+  # neighbors the ANN surfaced were hidden by the already-linked anti-join. We emit when:
   #
-  #   under_fill      = returned < limit AND available >= pool   (pool full, filters cut)
-  #   NOT under_fill  = returned < limit AND available <  pool   (corpus genuinely small)
+  #   recall_truncated = returned < limit
+  #                      AND above_threshold > returned
   #
-  # `available` is the count of the INNER candidate set (the same tenant / published /
-  # embedded / not-self / visible rows the ANN draws from), capped at `pool` — see
-  # `available_candidate_count/5`. When `returned >= limit` there is nothing to detect,
-  # so we skip the extra read entirely (zero added cost on the common full-result path).
-  defp maybe_signal_under_fill(tenant_id, article_id, embedding, vis, limit, pool, returned) do
+  # where `above_threshold` is how many of the candidates the inner ANN delivered clear
+  # the similarity bar (IGNORING link status). Because the signal only fires when
+  # `returned < limit` (so the outer LIMIT never bound and every unlinked above-threshold
+  # candidate WAS returned), `above_threshold > returned` means above-threshold neighbors
+  # were cut by the ANTI-JOIN specifically — a true recall incident.
+  #
+  # This is what stops the signal crying wolf on a SPARSE article whose whole ANN pool is
+  # below the similarity threshold: that is correct emptiness (nothing clears the bar), so
+  # `above_threshold == returned == 0` and we do NOT fire. The earlier `available >= pool`
+  # gate was abandoned: under HNSW the inner ANN only inspects ~`ef_search` (~40) graph
+  # nodes, so it delivers FEWER than `pool` (e.g. 100) candidates even on a huge corpus —
+  # an `ann_candidates >= pool` check is therefore degenerate (essentially never true at
+  # the default ef_search) and silently SUPPRESSED the signal at prod scale. The
+  # above-threshold detector is ef_search-independent: it compares two counts over the
+  # exact set the ANN actually surfaced.
+  #
+  # Both counts come from ONE bounded probe over the SAME inner ANN pool the main query
+  # drew from — see `under_fill_probe/6`. When `returned >= limit` there is nothing to
+  # detect, so we skip the probe entirely (zero added cost on the common full path).
+  defp maybe_signal_under_fill(
+         tenant_id,
+         article_id,
+         embedding,
+         threshold,
+         vis,
+         limit,
+         pool,
+         returned
+       ) do
     base = %{requested: limit, returned: returned, pool: pool}
+    not_truncated = Map.merge(base, %{pool_exhausted: false, recall_truncated: false})
 
     if returned < limit do
-      available = available_candidate_count(tenant_id, article_id, embedding, vis, pool)
-      pool_exhausted? = available >= pool
+      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+        # The probe is ADVISORY: its read failing (connection drop / statement_timeout)
+        # must NOT fail a request whose suggestions are already in hand. Degrade to "no
+        # truncation signal" rather than discarding a valid result (security review,
+        # AREA-5 fail-soft).
+        :error ->
+          not_truncated
 
-      if pool_exhausted? do
-        :telemetry.execute(
-          Loopctl.TelemetryEvents.vector_search_under_fill(),
-          %{
-            requested: limit,
-            returned: returned,
-            pool: pool,
-            available: available,
-            # TOTAL post-ANN exclusions: how many of the FULL pool the post-ANN filters
-            # (already-linked anti-join + similarity threshold, COMBINED) cut away to land
-            # at `returned`. This is intentionally the aggregate, not a per-reason split:
-            # separating anti-join drops from threshold drops would require an ADDITIONAL
-            # bounded read per request (the current flow knows neither component count —
-            # the main query returns only survivors and `available` is the pre-filter
-            # eligible count), which the AC-27.6b.5 one-bounded-read cost bound discourages.
-            # The per-reason breakdown is deferred to US-27.15's metrics aggregation, which
-            # consumes this event. See `Loopctl.TelemetryEvents.vector_search_under_fill/0`.
-            excluded_total: max(pool - returned, 0)
-          },
-          %{
-            tenant_id: tenant_id,
-            endpoint: :suggested_links
-          }
-        )
-
-        Logger.warning(
-          "knowledge.vector_search under_fill endpoint=suggested_links tenant_id=#{tenant_id} " <>
-            "requested=#{limit} returned=#{returned} pool=#{pool} available=#{available}"
-        )
+        {ann_candidates, above_threshold} ->
+          resolve_under_fill(
+            base,
+            tenant_id,
+            limit,
+            pool,
+            returned,
+            ann_candidates,
+            above_threshold
+          )
       end
-
-      Map.merge(base, %{pool_exhausted: pool_exhausted?, recall_truncated: pool_exhausted?})
     else
-      Map.merge(base, %{pool_exhausted: false, recall_truncated: false})
+      not_truncated
     end
   end
 
-  # Bounded "was the pool full?" probe (US-27.6b). Counts the INNER candidate set —
-  # the exact rows the ANN subquery draws from (tenant + published + embedded +
-  # not-self + visible) — but **capped at `pool`** via an inner `LIMIT pool`, so the
-  # count is `min(true_count, pool)` and the read touches at most `pool` rows (≤ the
-  # `max_vector_pool` cap, 500 by default). It runs on the SAME dedicated heavy-read
-  # pool (one bounded extra read, only on the `returned < limit` path) and carries NO
-  # vector / body data. We deliberately do NOT add the cosine ORDER BY here: order is
-  # irrelevant to "is the candidate set at least `pool` large", and omitting it keeps
-  # this a cheap index-filtered count rather than a second ANN scan.
-  defp available_candidate_count(tenant_id, article_id, embedding, vis, pool) do
-    _ = embedding
+  # The truncated-path verdict: recall is genuinely truncated when above-threshold (near)
+  # neighbors the ANN surfaced outnumber what was returned (`above_threshold > returned`)
+  # — i.e. the anti-join hid real neighbors, NOT a sparse region. Emits the signal exactly
+  # once when so, and returns the consumer-facing `meta`.
+  defp resolve_under_fill(base, tenant_id, limit, pool, returned, ann_candidates, above_threshold) do
+    recall_truncated? = above_threshold > returned
 
-    inner =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published,
-        where: not is_nil(a.embedding),
-        where: a.id != ^article_id,
-        select: %{id: a.id},
-        limit: ^pool
+    if recall_truncated? do
+      emit_under_fill(tenant_id, limit, pool, returned, ann_candidates, above_threshold)
+    end
+
+    Map.merge(base, %{pool_exhausted: recall_truncated?, recall_truncated: recall_truncated?})
+  end
+
+  # ONE telemetry event + warn log per truncated request (AC-27.6b.2/.5). When
+  # `returned < limit` the outer LIMIT never bound, so EVERY unlinked above-threshold
+  # candidate in the pool WAS returned; therefore `above_threshold - returned` is EXACTLY
+  # the above-threshold neighbors the already-linked anti-join hid — an UN-CONFLATED
+  # recall-loss count (no extra read, no separate threshold component to disentangle).
+  # This is the metric US-27.15 aggregates; see
+  # `Loopctl.TelemetryEvents.vector_search_under_fill/0`. `ann_candidates` is the
+  # ef_search-bounded count the ANN delivered — a recall-breadth diagnostic.
+  defp emit_under_fill(tenant_id, limit, pool, returned, ann_candidates, above_threshold) do
+    excluded_by_link = above_threshold - returned
+
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.vector_search_under_fill(),
+      %{
+        requested: limit,
+        returned: returned,
+        pool: pool,
+        ann_candidates: ann_candidates,
+        above_threshold: above_threshold,
+        excluded_by_link: excluded_by_link
+      },
+      %{
+        tenant_id: tenant_id,
+        endpoint: :suggested_links
+      }
+    )
+
+    Logger.warning(
+      "knowledge.vector_search under_fill endpoint=suggested_links tenant_id=#{tenant_id} " <>
+        "requested=#{limit} returned=#{returned} pool=#{pool} ann_candidates=#{ann_candidates} " <>
+        "above_threshold=#{above_threshold} excluded_by_link=#{excluded_by_link}"
+    )
+  end
+
+  # Bounded under-fill probe (US-27.6b). Over the SAME inner ANN top-`pool` subquery the
+  # main query draws from (so the candidate set is identical by construction), it returns
+  # in ONE read:
+  #
+  #   * `ann_candidates`  = COUNT(*) of the rows the inner ANN actually delivered — bounded
+  #     by `LIMIT pool` AND, under HNSW, by `~ef_search` (~40), so it doubles as a
+  #     recall-breadth diagnostic (NOT a `>= pool` pool-full gate — see
+  #     `maybe_signal_under_fill/8`). Touches at most `pool` rows (≤ `max_vector_pool`).
+  #   * `above_threshold` = COUNT(*) FILTER (similarity_score > threshold) over that same
+  #     delivered set — "do near (above-the-relevance-bar) neighbors actually exist?" — the
+  #     signal that separates a real recall incident from a genuinely-sparse region
+  #     (AC-27.6b.6).
+  #
+  # Runs on the SAME dedicated heavy-read pool, ONLY on the `returned < limit` path (one
+  # bounded extra ANN-class read; the full-result path issues none), and carries NO vector
+  # / body data. Returns `:error` (NOT raising) on a DB connectivity / timeout fault so the
+  # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
+  # Postgrex errors).
+  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
+
+    probe =
+      from(c in subquery(candidates),
+        select: %{
+          ann_candidates: count(c.id),
+          above_threshold:
+            fragment("COUNT(*) FILTER (WHERE ? > ?)", c.similarity_score, ^threshold)
+        }
       )
-      |> maybe_filter_by_visibility(vis)
 
-    count_query = from(c in subquery(inner), select: count(c.id))
+    case HeavyRead.one(tenant_id, probe, heavy_read_opts(:suggested_links)) do
+      %{ann_candidates: a, above_threshold: t} -> {a || 0, t || 0}
+      nil -> {0, 0}
+    end
+  rescue
+    e in DBConnection.ConnectionError ->
+      Logger.warning(
+        "knowledge.vector_search under_fill probe degraded (connection); suggestions returned: " <>
+          Exception.message(e)
+      )
 
-    HeavyRead.one(tenant_id, count_query, heavy_read_opts(:suggested_links)) || 0
+      :error
+
+    e in Postgrex.Error ->
+      # Degrade ONLY on a server-side cancel (statement_timeout); re-raise anything else
+      # (e.g. a malformed query) so genuine bugs surface in tests instead of silently
+      # becoming a missing signal.
+      if match?(%{postgres: %{code: :query_canceled}}, e) do
+        Logger.warning(
+          "knowledge.vector_search under_fill probe degraded (timeout); suggestions returned: " <>
+            Exception.message(e)
+        )
+
+        :error
+      else
+        reraise(e, __STACKTRACE__)
+      end
   end
 
   @doc false
@@ -3365,24 +3461,8 @@ defmodule Loopctl.Knowledge do
   # target exists / is published / is embedded / is visible.
   @doc false
   def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
-    target = to_embedding_list(embedding)
     pool = suggestion_candidate_pool(limit)
-
-    candidates =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published,
-        where: not is_nil(a.embedding),
-        where: a.id != ^article_id,
-        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
-        limit: ^pool,
-        select: %{
-          id: a.id,
-          title: a.title,
-          category: a.category,
-          similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
-        }
-      )
-      |> maybe_filter_by_visibility(vis)
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
 
     from(c in subquery(candidates),
       # Exclude any article already linked to the target (either direction, any type).
@@ -3402,6 +3482,33 @@ defmodule Loopctl.Knowledge do
         similarity_score: c.similarity_score
       }
     )
+  end
+
+  # The inner ANN top-`pool` subquery, SHARED by the main suggestion query and the
+  # under-fill probe so their candidate set is identical BY CONSTRUCTION (no drift). It
+  # is the pure top-`pool` nearest-by-cosine with only index-safe filters (tenant /
+  # status / not-null / not-self / visibility) and the computed `similarity_score`. The
+  # anti-join + threshold + final `limit` are applied by the OUTER query (see the SHAPE
+  # IS LOAD-BEARING note above); the probe reuses this same inner set to count pool
+  # fullness and above-threshold neighbors without re-running the ANN scan twice with
+  # divergent predicates.
+  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool) do
+    target = to_embedding_list(embedding)
+
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.status == :published,
+      where: not is_nil(a.embedding),
+      where: a.id != ^article_id,
+      order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
+      limit: ^pool,
+      select: %{
+        id: a.id,
+        title: a.title,
+        category: a.category,
+        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
+      }
+    )
+    |> maybe_filter_by_visibility(vis)
   end
 
   # Over-fetch factor for the inner ANN subquery: pull this many nearest candidates from

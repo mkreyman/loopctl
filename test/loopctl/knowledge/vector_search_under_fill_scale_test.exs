@@ -163,9 +163,20 @@ defmodule Loopctl.Knowledge.VectorSearchUnderFillScaleTest do
         assert_received {:under_fill, measurements, metadata}
         assert measurements.requested == 5
         assert measurements.returned < 5
-        # Pool was filled to the configured cap at prod scale.
         assert measurements.pool == VectorSearch.pool_size(5)
-        assert measurements.available >= measurements.pool
+        # The ANN delivered candidates (bounded by ef_search ~40, so typically < pool —
+        # which is exactly why the old `>= pool` pool-full gate was degenerate and is gone).
+        assert measurements.ann_candidates > 0
+        # Near neighbors genuinely EXIST among what the ANN surfaced (threshold 0.0 → the
+        # nearest are all above the bar) but the anti-join hid them — this is what separates
+        # a real recall incident from a sparse region whose pool is below threshold, and it
+        # holds REGARDLESS of ef_search (the bug prod-scale verification caught).
+        assert measurements.above_threshold > measurements.returned
+
+        assert measurements.excluded_by_link ==
+                 measurements.above_threshold - measurements.returned
+
+        assert measurements.excluded_by_link >= 1
         assert metadata.tenant_id == tenant.id
         assert metadata.endpoint == :suggested_links
 

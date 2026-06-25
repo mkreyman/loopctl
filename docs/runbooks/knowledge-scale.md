@@ -317,25 +317,37 @@ Recall on every kNN/`suggested_links` read is bounded by **two** things: `hnsw.e
 (default ~40 — the breadth above) AND the over-fetch `pool` (`pool_size/2`:
 `k * :vector_pool_factor |> max(:vector_pool_floor) |> min(:max_vector_pool) |> max(k)`,
 defaults 5 / 100 / 500). For a **densely-linked hub**, the nearest pool can be almost
-entirely already-linked or below threshold, so `suggested_links` legitimately returns
-**fewer than the requested limit** even though more-distant unlinked neighbors exist.
-**This is expected, not a bug** — it is the price of the index-correct path. The hazard
-is that it looks identical to "no neighbors exist", so it is made **observable**:
+entirely already-linked, so `suggested_links` legitimately returns **fewer than the
+requested limit** even though near (above-threshold) unlinked neighbors would exist if
+not already linked. **This is expected, not a bug** — it is the price of the
+index-correct path. The hazard is that it looks identical to "no neighbors exist", so it
+is made **observable**:
 
 - **Operator signal:** `Loopctl.Knowledge.suggest_links_with_meta/3` emits a
   `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event (id-only payload:
-  `tenant_id`, `endpoint`, `requested`, `returned`, `pool`, `available`,
-  `excluded_by_filters` — NO vector literals/bodies) **once per request**, ONLY when the
-  pool was filled to cap but the post-ANN filters cut the result below the limit. It does
-  NOT fire for a genuinely-small corpus (`available < pool`). Aggregated by US-27.15.
+  `tenant_id`, `endpoint`, `requested`, `returned`, `pool`, `ann_candidates`,
+  `above_threshold`, `excluded_by_link` — NO vector literals/bodies) **once per request**,
+  ONLY when above-threshold neighbors the ANN surfaced were hidden by the already-linked
+  anti-join (`above_threshold > returned`). It does NOT fire for a **sparse region** whose
+  whole ANN pool is below the similarity threshold (`above_threshold == returned`) — that
+  is correct emptiness, not recall loss. The detector is **ef_search-independent**: under
+  HNSW the ANN delivers only `~ef_search` (~40) candidates, so the old `ann_candidates >=
+  pool` "pool full" gate was degenerate (never true at scale, silently suppressed the
+  signal) and was removed. `excluded_by_link = above_threshold - returned` is the
+  un-conflated count of above-threshold neighbors the anti-join removed; `ann_candidates`
+  is the ef_search-bounded recall-breadth diagnostic. Aggregated by US-27.15.
 - **Consumer signal:** the `suggested_links` response `meta` carries
   `recall_truncated`/`pool_exhausted` (same flag) so an agent distinguishes an INCOMPLETE
   result from an empty one.
 
-Detecting "pool was full" costs **one bounded extra read** (a `SELECT count(*)` over the
-candidate subquery, `LIMIT pool` — so it touches at most `:max_vector_pool` rows, ≤500),
-issued ONLY on the `returned < limit` path (zero added cost on the common full-result
-path), on the same dedicated heavy-read pool.
+Detecting under-fill costs **one bounded extra read** — a single aggregate
+(`COUNT(*)` for `ann_candidates` plus a `COUNT(*) FILTER (similarity > threshold)` for
+`above_threshold`) over the **same inner ANN top-`pool` subquery** the main query draws
+from (`LIMIT pool`, so it touches at most `:max_vector_pool` rows, ≤500) — issued ONLY on
+the `returned < limit` path (zero added cost on the common full-result path), on the same
+dedicated heavy-read pool. It is an ANN-class read (same plan shape as the main query). A
+connectivity/timeout fault on this advisory probe is fail-soft: the suggestions are still
+returned with no truncation signal rather than failing the request.
 
 **Raising recall** is the `ALTER ROLE … SET hnsw.ef_search` lever above (US-27.11), never a
 per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
