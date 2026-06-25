@@ -244,6 +244,60 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       assert after_count == 0
     end
 
+    # US-27.6b AC-27.6b.6: the response carries a `meta` recall-completeness block so
+    # an agent can tell an INCOMPLETE result (densely-linked hub) from an empty one.
+    test "response meta carries recall_truncated=true for a densely-linked hub", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      hub = embedded(tenant.id, "Hub", [1.0, 0.0])
+      # Fill the test 6-row pool with 6 near neighbors, all already-linked → the
+      # anti-join exhausts the full pool below the default limit of 5.
+      neighbors = for i <- 1..6, do: embedded(tenant.id, "N#{i}", [1.0, 0.0])
+
+      for n <- neighbors do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: n.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      body = suggest(conn, key, hub.id)
+
+      assert length(body["data"]) < 5
+      assert body["meta"]["recall_truncated"] == true
+      assert body["meta"]["pool_exhausted"] == true
+      assert body["meta"]["requested"] == 5
+      assert body["meta"]["returned"] == length(body["data"])
+    end
+
+    test "response meta carries recall_truncated=false for a full result", %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "Target", [1.0, 0.0])
+      for i <- 1..6, do: embedded(tenant.id, "Free#{i}", [1.0, 0.0])
+
+      body = suggest(conn, key, target.id, %{limit: 5})
+
+      assert length(body["data"]) == 5
+      assert body["meta"]["recall_truncated"] == false
+      assert body["meta"]["pool_exhausted"] == false
+      assert body["meta"]["returned"] == 5
+    end
+
+    test "response meta is recall_truncated=false for a genuinely-empty result (not under-fill)",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+      # No embedding → empty result; this is NOT a recall incident.
+      target =
+        fixture(:article, %{tenant_id: tenant.id, title: "No Embedding", status: :published})
+
+      body = suggest(conn, key, target.id)
+
+      assert body["data"] == []
+      assert body["meta"]["recall_truncated"] == false
+      assert body["meta"]["pool_exhausted"] == false
+    end
+
     test "honors limit and threshold", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0])
@@ -354,7 +408,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0, 0.0])
 
-      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _tenant, _article, _opts ->
+      expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn _tenant, _article, _opts ->
         raise statement_timeout_error()
       end)
 
@@ -409,7 +463,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0, 0.0])
 
-      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+      expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn _t, _a, _o ->
         raise %Postgrex.Error{
           postgres: %{
             code: :undefined_table,
@@ -444,7 +498,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0, 0.0])
 
-      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+      expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn _t, _a, _o ->
         raise %Postgrex.Error{
           postgres: %{
             code: :serialization_failure,
@@ -477,7 +531,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       {tenant, key} = setup_tenant_key()
       target = embedded(tenant.id, "Target", [1.0, 0.0])
 
-      expect(Loopctl.MockSuggestLinks, :suggest_links, fn _t, _a, _o ->
+      expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn _t, _a, _o ->
         raise %DBConnection.ConnectionError{message: "tcp closed"}
       end)
 
@@ -538,7 +592,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       # The DI seam runs the REAL override→timeout path: a tight 50ms SET LOCAL
       # statement_timeout on a deliberately slow, tenant-scoped query → genuine
       # query_canceled (57014), bounded near 50ms (never the full 1s sleep).
-      expect(Loopctl.MockSuggestLinks, :suggest_links, fn t, _a, _o ->
+      expect(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn t, _a, _o ->
         slow =
           from(a in Loopctl.Knowledge.Article,
             where: a.tenant_id == ^t,

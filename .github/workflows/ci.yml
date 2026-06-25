@@ -318,6 +318,7 @@ jobs:
         scale_file:
           - test/loopctl/knowledge/scale_seed_nightly_test.exs
           - test/loopctl/knowledge/vector_search_scale_test.exs
+          - test/loopctl/knowledge/vector_search_under_fill_scale_test.exs
           - test/loopctl/knowledge/plan_assertions_scale_test.exs
           - test/loopctl/knowledge/keyset_plan_scale_test.exs
           - test/loopctl/knowledge/by_source_change_feed_plan_scale_test.exs

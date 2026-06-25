@@ -55,6 +55,21 @@ config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 # for normal tests (the timeout is much longer than any real query).
 config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
 
+# US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).
+# In the DEFAULT async suite we shrink floor/cap to 6 so the under-fill detection can be
+# exercised deterministically with a handful of seeded rows (filling a 6-row pool needs ~6
+# articles, not 100). 6 is kept >= the `k=5` used across the existing fast tests so the
+# floor-at-k invariant doesn't perturb their `pool == max_pool()` assertions. The SCALE
+# gate (`SCALE_NIGHTLY`/`SCALE_TESTS`) leaves the PROD defaults (factor 5 / floor 100 / cap
+# 500) so the dense-hub + cost-bound scale tests stay prod-shaped. This is config-based DI
+# — NO Application.put_env in any test body; the unit `pool_size/2` tests pass explicit
+# knob args, so they are independent of this value.
+unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
+  config :loopctl, :vector_pool_factor, 5
+  config :loopctl, :vector_pool_floor, 6
+  config :loopctl, :max_vector_pool, 6
+end
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :loopctl, LoopctlWeb.Endpoint,

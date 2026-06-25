@@ -48,6 +48,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
@@ -3102,8 +3103,21 @@ defmodule Loopctl.Knowledge do
   Consequence: for a densely-linked "hub" whose nearest neighbors are almost all
   already linked, the result may contain fewer than `:limit` suggestions (or be
   empty) even though more-distant unlinked candidates exist — by design, the price of
-  the indexed path. Recall is additionally bounded by `hnsw.ef_search`, as in
-  semantic search.
+  the indexed path.
+
+  ## Recall ceiling + the under-fill signal (US-27.6b)
+
+  Recall is bounded by `hnsw.ef_search` (pgvector **default ~40**) AND the over-fetch
+  pool — see the `Loopctl.Knowledge.VectorSearch` moduledoc for the full ceiling
+  discussion (why `ef_search` can't be raised via Postgrex `:parameters`, and that
+  `ALTER ROLE … SET hnsw.ef_search` is the only safe non-transaction lever, US-27.11).
+  Until that is verified on fly mpg, recall stays at the default and under-fill is made
+  **observable**: use `suggest_links_with_meta/3` (the variant the endpoint calls) — it
+  returns a `meta` flag `recall_truncated`/`pool_exhausted` AND emits a
+  `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event (once per
+  request) whenever the nearest pool was filled to cap but the anti-join / threshold cut
+  the result below `:limit`. That distinguishes an INCOMPLETE result from a
+  genuinely-empty corpus — the silent-recall failure this story closes.
 
   ## Returns
 
@@ -3116,6 +3130,48 @@ defmodule Loopctl.Knowledge do
   @spec suggest_links(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, [map()]} | {:error, :not_found} | {:error, :invalid_threshold}
   def suggest_links(tenant_id, article_id, opts \\ []) do
+    # Back-compat 2-tuple shape (the original contract). Delegates to the
+    # meta-bearing variant and drops the meta — callers that don't need the
+    # under-fill signal (and the plan/EXPLAIN scale tests) keep `{:ok, list}`.
+    case suggest_links_with_meta(tenant_id, article_id, opts) do
+      {:ok, suggestions, _meta} -> {:ok, suggestions}
+      other -> other
+    end
+  end
+
+  @doc """
+  Like `suggest_links/3`, but also returns a `meta` map describing recall
+  completeness for the consumer (US-27.6b AC-27.6b.6).
+
+  The endpoint controller calls THIS so an agent can distinguish an *incomplete*
+  result (the densely-linked-hub case: the nearest pool was filled to cap but the
+  already-linked anti-join / threshold cut it below the requested limit) from a
+  *genuinely-empty* one (the corpus simply has fewer than `limit` eligible
+  neighbors). The same condition emits the
+  `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event exactly
+  once per request (see `suggestion_candidates/6`).
+
+  ## Returns
+
+    * `{:ok, [%{id, title, category, similarity_score}], meta}` where `meta` is:
+
+          %{
+            requested: limit,         # the requested limit (post-clamp)
+            returned: length(result), # how many candidates came back
+            pool: pool_size,          # the inner over-fetch pool
+            # true when returned < requested AND the pool was filled to cap
+            # (filters exhausted a FULL pool) — i.e. recall is incomplete:
+            pool_exhausted: boolean,
+            recall_truncated: boolean # alias of pool_exhausted (consumer-facing name)
+          }
+
+    * `{:ok, [], meta}` when the article has no embedding yet (`pool_exhausted: false`)
+    * `{:error, :not_found}` / `{:error, :invalid_threshold}` as `suggest_links/3`
+  """
+  @impl Loopctl.Knowledge.SuggestLinksBehaviour
+  @spec suggest_links_with_meta(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, [map()], map()} | {:error, :not_found} | {:error, :invalid_threshold}
+  def suggest_links_with_meta(tenant_id, article_id, opts \\ []) do
     threshold = Keyword.get(opts, :threshold) || default_suggestion_threshold()
     vis = Keyword.get(opts, :visibility_agent_id)
 
@@ -3131,12 +3187,27 @@ defmodule Loopctl.Knowledge do
           {:error, :not_found}
 
         %{embedding: nil} ->
-          {:ok, []}
+          {:ok, [], empty_suggestion_meta(limit)}
 
         %{embedding: embedding} ->
-          {:ok, suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)}
+          {suggestions, meta} =
+            suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis)
+
+          {:ok, suggestions, meta}
       end
     end
+  end
+
+  # Meta for the no-embedding short-circuit: a 0-result is NOT under-fill (there is
+  # no pool to fill), so the consumer must see `pool_exhausted: false`.
+  defp empty_suggestion_meta(limit) do
+    %{
+      requested: limit,
+      returned: 0,
+      pool: suggestion_candidate_pool(limit),
+      pool_exhausted: false,
+      recall_truncated: false
+    }
   end
 
   defp default_suggestion_threshold,
@@ -3166,7 +3237,198 @@ defmodule Loopctl.Knowledge do
     # tenant predicate lives in this query's inner subquery. The 15s client timeout
     # is a backstop above the server-side statement_timeout.
     query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
-    HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
+    suggestions = HeavyRead.all(tenant_id, query, heavy_read_opts(:suggested_links))
+
+    pool = suggestion_candidate_pool(limit)
+    returned = length(suggestions)
+
+    meta =
+      maybe_signal_under_fill(
+        tenant_id,
+        article_id,
+        embedding,
+        threshold,
+        vis,
+        limit,
+        pool,
+        returned
+      )
+
+    {suggestions, meta}
+  end
+
+  # Under-fill signal (US-27.6b AC-27.6b.2/.5/.6). Builds the response `meta` and —
+  # only when recall is genuinely truncated — emits ONE telemetry event per request.
+  #
+  # THE KEY DISTINCTION (the whole point of the story, per its background: "returns []
+  # while near neighbors EXIST"): the recall incident is when above-threshold (near)
+  # neighbors the ANN surfaced were hidden by the already-linked anti-join. We emit when:
+  #
+  #   recall_truncated = returned < limit
+  #                      AND above_threshold > returned
+  #
+  # where `above_threshold` is how many of the candidates the inner ANN delivered clear
+  # the similarity bar (IGNORING link status). Because the signal only fires when
+  # `returned < limit` (so the outer LIMIT never bound and every unlinked above-threshold
+  # candidate WAS returned), `above_threshold > returned` means above-threshold neighbors
+  # were cut by the ANTI-JOIN specifically — a true recall incident.
+  #
+  # This is what stops the signal crying wolf on a SPARSE article whose whole ANN pool is
+  # below the similarity threshold: that is correct emptiness (nothing clears the bar), so
+  # `above_threshold == returned == 0` and we do NOT fire. The earlier `available >= pool`
+  # gate was abandoned: under HNSW the inner ANN only inspects ~`ef_search` (~40) graph
+  # nodes, so it delivers FEWER than `pool` (e.g. 100) candidates even on a huge corpus —
+  # an `ann_candidates >= pool` check is therefore degenerate (essentially never true at
+  # the default ef_search) and silently SUPPRESSED the signal at prod scale. The
+  # above-threshold detector is ef_search-independent: it compares two counts over the
+  # exact set the ANN actually surfaced.
+  #
+  # Both counts come from ONE bounded probe over the SAME inner ANN pool the main query
+  # drew from — see `under_fill_probe/6`. When `returned >= limit` there is nothing to
+  # detect, so we skip the probe entirely (zero added cost on the common full path).
+  defp maybe_signal_under_fill(
+         tenant_id,
+         article_id,
+         embedding,
+         threshold,
+         vis,
+         limit,
+         pool,
+         returned
+       ) do
+    base = %{requested: limit, returned: returned, pool: pool}
+    not_truncated = Map.merge(base, %{pool_exhausted: false, recall_truncated: false})
+
+    if returned < limit do
+      case under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+        # The probe is ADVISORY: its read failing (connection drop / statement_timeout)
+        # must NOT fail a request whose suggestions are already in hand. Degrade to "no
+        # truncation signal" rather than discarding a valid result (security review,
+        # AREA-5 fail-soft).
+        :error ->
+          not_truncated
+
+        {ann_candidates, above_threshold} ->
+          resolve_under_fill(
+            base,
+            tenant_id,
+            limit,
+            pool,
+            returned,
+            ann_candidates,
+            above_threshold
+          )
+      end
+    else
+      not_truncated
+    end
+  end
+
+  # The truncated-path verdict: recall is genuinely truncated when above-threshold (near)
+  # neighbors the ANN surfaced outnumber what was returned (`above_threshold > returned`)
+  # — i.e. the anti-join hid real neighbors, NOT a sparse region. Emits the signal exactly
+  # once when so, and returns the consumer-facing `meta`.
+  defp resolve_under_fill(base, tenant_id, limit, pool, returned, ann_candidates, above_threshold) do
+    recall_truncated? = above_threshold > returned
+
+    if recall_truncated? do
+      emit_under_fill(tenant_id, limit, pool, returned, ann_candidates, above_threshold)
+    end
+
+    Map.merge(base, %{pool_exhausted: recall_truncated?, recall_truncated: recall_truncated?})
+  end
+
+  # ONE telemetry event + warn log per truncated request (AC-27.6b.2/.5). When
+  # `returned < limit` the outer LIMIT never bound, so EVERY unlinked above-threshold
+  # candidate in the pool WAS returned; therefore `above_threshold - returned` is EXACTLY
+  # the above-threshold neighbors the already-linked anti-join hid — an UN-CONFLATED
+  # recall-loss count (no extra read, no separate threshold component to disentangle).
+  # This is the metric US-27.15 aggregates; see
+  # `Loopctl.TelemetryEvents.vector_search_under_fill/0`. `ann_candidates` is the
+  # ef_search-bounded count the ANN delivered — a recall-breadth diagnostic.
+  defp emit_under_fill(tenant_id, limit, pool, returned, ann_candidates, above_threshold) do
+    excluded_by_link = above_threshold - returned
+
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.vector_search_under_fill(),
+      %{
+        requested: limit,
+        returned: returned,
+        pool: pool,
+        ann_candidates: ann_candidates,
+        above_threshold: above_threshold,
+        excluded_by_link: excluded_by_link
+      },
+      %{
+        tenant_id: tenant_id,
+        endpoint: :suggested_links
+      }
+    )
+
+    Logger.warning(
+      "knowledge.vector_search under_fill endpoint=suggested_links tenant_id=#{tenant_id} " <>
+        "requested=#{limit} returned=#{returned} pool=#{pool} ann_candidates=#{ann_candidates} " <>
+        "above_threshold=#{above_threshold} excluded_by_link=#{excluded_by_link}"
+    )
+  end
+
+  # Bounded under-fill probe (US-27.6b). Over the SAME inner ANN top-`pool` subquery the
+  # main query draws from (so the candidate set is identical by construction), it returns
+  # in ONE read:
+  #
+  #   * `ann_candidates`  = COUNT(*) of the rows the inner ANN actually delivered — bounded
+  #     by `LIMIT pool` AND, under HNSW, by `~ef_search` (~40), so it doubles as a
+  #     recall-breadth diagnostic (NOT a `>= pool` pool-full gate — see
+  #     `maybe_signal_under_fill/8`). Touches at most `pool` rows (≤ `max_vector_pool`).
+  #   * `above_threshold` = COUNT(*) FILTER (similarity_score > threshold) over that same
+  #     delivered set — "do near (above-the-relevance-bar) neighbors actually exist?" — the
+  #     signal that separates a real recall incident from a genuinely-sparse region
+  #     (AC-27.6b.6).
+  #
+  # Runs on the SAME dedicated heavy-read pool, ONLY on the `returned < limit` path (one
+  # bounded extra ANN-class read; the full-result path issues none), and carries NO vector
+  # / body data. Returns `:error` (NOT raising) on a DB connectivity / timeout fault so the
+  # caller can fail-soft — a genuine query bug still surfaces (we re-raise non-cancel
+  # Postgrex errors).
+  defp under_fill_probe(tenant_id, article_id, embedding, threshold, vis, pool) do
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
+
+    probe =
+      from(c in subquery(candidates),
+        select: %{
+          ann_candidates: count(c.id),
+          above_threshold:
+            fragment("COUNT(*) FILTER (WHERE ? > ?)", c.similarity_score, ^threshold)
+        }
+      )
+
+    case HeavyRead.one(tenant_id, probe, heavy_read_opts(:suggested_links)) do
+      %{ann_candidates: a, above_threshold: t} -> {a || 0, t || 0}
+      nil -> {0, 0}
+    end
+  rescue
+    e in DBConnection.ConnectionError ->
+      Logger.warning(
+        "knowledge.vector_search under_fill probe degraded (connection); suggestions returned: " <>
+          Exception.message(e)
+      )
+
+      :error
+
+    e in Postgrex.Error ->
+      # Degrade ONLY on a server-side cancel (statement_timeout); re-raise anything else
+      # (e.g. a malformed query) so genuine bugs surface in tests instead of silently
+      # becoming a missing signal.
+      if match?(%{postgres: %{code: :query_canceled}}, e) do
+        Logger.warning(
+          "knowledge.vector_search under_fill probe degraded (timeout); suggestions returned: " <>
+            Exception.message(e)
+        )
+
+        :error
+      else
+        reraise(e, __STACKTRACE__)
+      end
   end
 
   @doc false
@@ -3199,24 +3461,8 @@ defmodule Loopctl.Knowledge do
   # target exists / is published / is embedded / is visible.
   @doc false
   def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
-    target = to_embedding_list(embedding)
     pool = suggestion_candidate_pool(limit)
-
-    candidates =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published,
-        where: not is_nil(a.embedding),
-        where: a.id != ^article_id,
-        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
-        limit: ^pool,
-        select: %{
-          id: a.id,
-          title: a.title,
-          category: a.category,
-          similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
-        }
-      )
-      |> maybe_filter_by_visibility(vis)
+    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
 
     from(c in subquery(candidates),
       # Exclude any article already linked to the target (either direction, any type).
@@ -3238,16 +3484,46 @@ defmodule Loopctl.Knowledge do
     )
   end
 
+  # The inner ANN top-`pool` subquery, SHARED by the main suggestion query and the
+  # under-fill probe so their candidate set is identical BY CONSTRUCTION (no drift). It
+  # is the pure top-`pool` nearest-by-cosine with only index-safe filters (tenant /
+  # status / not-null / not-self / visibility) and the computed `similarity_score`. The
+  # anti-join + threshold + final `limit` are applied by the OUTER query (see the SHAPE
+  # IS LOAD-BEARING note above); the probe reuses this same inner set to count pool
+  # fullness and above-threshold neighbors without re-running the ANN scan twice with
+  # divergent predicates.
+  defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool) do
+    target = to_embedding_list(embedding)
+
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id and a.status == :published,
+      where: not is_nil(a.embedding),
+      where: a.id != ^article_id,
+      order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
+      limit: ^pool,
+      select: %{
+        id: a.id,
+        title: a.title,
+        category: a.category,
+        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
+      }
+    )
+    |> maybe_filter_by_visibility(vis)
+  end
+
   # Over-fetch factor for the inner ANN subquery: pull this many nearest candidates from
   # the HNSW index before the outer query applies the anti-join + threshold and trims to
   # `limit`. Scales with `limit` (headroom for exclusions), floored for the common small
   # `limit`, and capped so the index scan stays cheap.
+  #
+  # The factor/floor/cap are the SAME config constants the shared `VectorSearch` helper
+  # reads (US-27.6b AC-27.6b.1), so the live `suggested_links` path and the shared kNN
+  # helper never size their pools differently. `:max_suggestion_candidate_pool` is still
+  # honored as a back-compat alias for the cap when set.
   defp suggestion_candidate_pool(limit) do
-    max(limit * 5, 100)
-    |> min(Application.get_env(:loopctl, :max_suggestion_candidate_pool, 500))
-    # Never let a misconfigured cap drop the pool below `limit` — that would truncate the
-    # candidate set before the outer exclusions even run.
-    |> max(limit)
+    VectorSearch.pool_size(limit,
+      cap: Application.get_env(:loopctl, :max_suggestion_candidate_pool)
+    )
   end
 
   # The HNSW-indexable cosine form binds the target as a plain `[float()]` list (the

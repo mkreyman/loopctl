@@ -26,13 +26,19 @@ defmodule Loopctl.DbCapacity do
   # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s reads + a reserve for long-held
   # streamed-export checkouts (US-27.16). fast + reserve == the pool size.
   #
-  # The fast-reads budget (K≈6) serves the heavy-read consumers: 5 ONE-SHOT heavy reads
+  # The fast-reads budget (K≈6) serves the heavy-read consumers: 5 fast heavy reads
   # (suggested_links, semantic_search, distant_pairs, novelty, enumeration) PLUS one
-  # rate-limited POLLING feed — the US-27.9b change feed (`:change_feed`). The K
-  # rationale still holds with the polling addition because the change-feed read is a
-  # CHEAP, fast-releasing bounded keyset page (one read per request, connection RELEASED
-  # immediately) AND its QPS is capped by the api pipeline's rate limiter, so even a poll
-  # storm cannot saturate the fast slots — it adds at most a brief transient checkout.
+  # rate-limited POLLING feed — the US-27.9b change feed (`:change_feed`). Each is a
+  # bounded, fast-releasing read whose connection is released before the next checkout;
+  # `suggested_links` additionally issues a SECOND bounded read on the under-fill path
+  # (US-27.6b) — the under-fill probe, an ANN-class read bounded by `LIMIT pool` — but the
+  # two reads are STRICTLY SEQUENTIAL (the probe runs only after the main read's connection
+  # is released), so peak CONCURRENT checkouts per request stays 1 and the K budget is
+  # unaffected; it only adds throughput demand on the truncated path, itself capped by the
+  # api rate limiter. The K rationale
+  # likewise holds for the change-feed poll (one bounded keyset page, rate-limited), so
+  # even a poll storm cannot saturate the fast slots — it adds at most a brief transient
+  # checkout.
   @heavy_read_fast_reads 6
   @heavy_read_export_reserve 2
 

@@ -171,6 +171,17 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
 
       assert is_list(results)
       assert length(results) <= VectorSearch.max_k()
+
+      # US-27.6b AC-27.6b.7: re-verify the worst-case cost bound against the FINAL,
+      # NOW-CONFIG-DRIVEN pool cap. 6b moved the cap to the `:max_vector_pool` config
+      # constant; pin that the worst-case (k = max_k) pool is exactly that cap so a
+      # future cap change can't silently invalidate this cost proof. The scale gate
+      # runs with the prod defaults (config/test.exs leaves them untouched under
+      # SCALE_NIGHTLY), so this is the real 500-row cap, read from the same constant.
+      assert VectorSearch.pool_size(VectorSearch.max_k()) == VectorSearch.max_pool(),
+             "worst-case pool must equal the configured :max_vector_pool cap " <>
+               "(pool_size(max_k)=#{VectorSearch.pool_size(VectorSearch.max_k())}, " <>
+               "max_pool=#{VectorSearch.max_pool()})"
     end)
   end
 end
