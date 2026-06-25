@@ -207,11 +207,17 @@ defmodule Loopctl.Knowledge.VectorSearch do
     # INNER: pure index-ordered ANN. ONLY filters that are verified (at 80k scale,
     # vector_search_scale_test) to keep the HNSW Index Scan: tenant/status/not-null
     # equalities, the single-row self-exclusion, and the visibility metadata->>
-    # Filter (no supporting index, so Filter-after-index — same as the prod-verified
-    # suggested_links inner query). `tags`/`category` are DELIBERATELY NOT here: they
-    # have GIN/btree indexes, so a selective tags&&/category= predicate makes the
-    # planner BitmapAnd-then-Sort and ABANDON the HNSW index (the #170/#172 failure
-    # mode — proven by EXPLAIN at scale). They are applied on the OUTER pool instead.
+    # Filter. Visibility is index-safe by OPERATOR CLASS, not by selectivity: the
+    # `metadata->>'key' = ...` / COALESCE form cannot be served by the articles
+    # `jsonb_ops` GIN (it only answers @>/?), and there is no btree expression index on
+    # it — so the planner can ONLY apply it as a Filter-after-HNSW-index, at ANY
+    # selectivity (same as the prod-verified suggested_links inner query). DO NOT add a
+    # btree/expression index on the visibility/agent_id metadata path or rewrite this to
+    # a GIN-servable `metadata @> ...` form — that would let a selective scope flip the
+    # planner off HNSW. `tags`/`category` are DELIBERATELY NOT here: they HAVE GIN/btree
+    # indexes, so a selective tags&&/category= predicate makes the planner
+    # BitmapAnd-then-Sort and ABANDON the HNSW index (the #170/#172 failure mode —
+    # proven by EXPLAIN at scale). They are applied on the OUTER pool instead.
     candidates =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.status == :published,

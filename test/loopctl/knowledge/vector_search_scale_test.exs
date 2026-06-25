@@ -97,7 +97,7 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
     end)
   end
 
-  test "the INNER-query residual filters (tags/category/visibility) stay HNSW-index-backed at scale (AC-27.6a.3)",
+  test "all residual filters (incl. selective tags/category) stay HNSW-index-backed at scale (AC-27.6a.3)",
        %{tenant: tenant} do
     unboxed(fn ->
       target =
@@ -109,12 +109,15 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
           )
         )
 
-      # These residuals live INSIDE the index-ordered ANN subquery (tags &&,
-      # category =, metadata->>'visibility') — the ONLY filter class that can flip
-      # the planner off the HNSW path. ScaleSeed makes them selective (~2% tag,
-      # ~20% category, ~10% private). The planner's NATURAL choice at 80k must STILL
-      # reach `articles` via exactly one HNSW Index Scan (Filter-after-index), never
-      # a Bitmap/Seq full-corpus read — the core promise of US-27.6a.
+      # This is the regression guard for the index-defeat fix. `tags`/`category` are
+      # applied on the OUTER pool (NOT the index-ordered subquery) precisely BECAUSE a
+      # selective `tags &&`/`category =` on the inner ANN query made the planner
+      # BitmapAnd GIN(tags)+btree(category) → Sort, defeating HNSW (verified at 80k).
+      # Only `visibility` (metadata->>, no servable index) remains an inner Filter.
+      # ScaleSeed makes all three selective (~2% tag, ~20% category, ~10% private). The
+      # planner's NATURAL choice at 80k must STILL reach `articles` via exactly one HNSW
+      # Index Scan — never a Bitmap/Seq full-corpus read. DO NOT move tags/category back
+      # inside the candidate subquery (re-run this test at scale if you do).
       query =
         VectorSearch.candidate_query(tenant.id, target.embedding, 5,
           exclude_id: target.id,

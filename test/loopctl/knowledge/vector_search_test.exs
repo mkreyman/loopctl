@@ -353,6 +353,29 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
       %Ecto.Query{from: %{source: %Ecto.SubQuery{query: inner_k}}} = known
       refute Enum.any?(inner_k.wheres, &(&1.expr |> inspect() =~ "category"))
     end
+
+    test "the OUTER category/tags filters EXECUTE end-to-end (enum/array dump through the subquery)" do
+      # Proves in the FAST suite (not just :scale_nightly) that c.category == ^:decision
+      # and c.tags && ^[...] actually dump+run through the subquery and return the right
+      # rows — guarding the Ecto.Enum/array type-propagation through the subquery select.
+      tenant = fixture(:tenant)
+
+      decision =
+        article_with_embedding(tenant.id, near_embedding(1), %{
+          category: :decision,
+          tags: ["alpha"]
+        })
+
+      _pattern =
+        article_with_embedding(tenant.id, near_embedding(2), %{category: :pattern, tags: ["beta"]})
+
+      assert [%{id: id, category: :decision}] =
+               VectorSearch.nearest(tenant.id, base_embedding(), 5, category: :decision)
+
+      assert id == decision.id
+
+      assert [%{id: ^id}] = VectorSearch.nearest(tenant.id, base_embedding(), 5, tags: ["alpha"])
+    end
   end
 
   # Resolve a `LIMIT $n` expression to its bound integer value.
