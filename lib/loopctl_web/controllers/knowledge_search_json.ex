@@ -38,6 +38,14 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   - `limit` — the effective per-page limit that actually ran.
   - `count` — the number of rows in THIS page (`length(data)`).
   - `include_body` — whether each row carries the article `body` (US-27.10).
+  - `byte_truncated` — whether the page was shortened by the serialized-body byte
+    budget (US-27.10). Only ever `true` when `include_body` is `true`.
+
+  When `include_body: true`, the CONTEXT (`Loopctl.Knowledge.list_keyset/2`) has
+  already trimmed the page to `full_content_byte_budget/0` and recomputed
+  `next_cursor`/`has_more` from the LAST KEPT row, so the walk resumes over the
+  dropped rows with no gap. This view does NOT trim — it renders exactly what the
+  context returns and surfaces `byte_truncated` from the context.
 
   `next_cursor` is encoded by the controller (it needs the tenant key), so this
   view receives it as a ready string or `nil`.
@@ -47,7 +55,8 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
         next_cursor: next_cursor,
         has_more: has_more,
         limit: limit,
-        include_body: include_body
+        include_body: include_body,
+        byte_truncated: byte_truncated
       }) do
     %{
       data: Enum.map(results, &render_list_row(&1, include_body)),
@@ -59,6 +68,7 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
         limit: limit,
         count: length(results),
         include_body: include_body,
+        byte_truncated: byte_truncated,
         search_mode: "list_keyset"
       }
     }

@@ -79,6 +79,32 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
     end
   end
 
+  # Walk the keyset list to exhaustion, returning the FULL decoded response of every
+  # page (in order). Used to assert per-page meta invariants across an include_body
+  # walk (US-27.10 BA-F2).
+  defp walk_pages(conn, raw_key, base_params) do
+    do_walk_pages(conn, raw_key, base_params, "", [], 0)
+  end
+
+  defp do_walk_pages(_conn, _key, _params, _cursor, _acc, n) when n > 1_000 do
+    flunk("walk_pages did not terminate")
+  end
+
+  defp do_walk_pages(conn, raw_key, base_params, cursor, acc, n) do
+    resp =
+      conn
+      |> auth_conn(raw_key)
+      |> get(~p"/api/v1/knowledge/search", Map.put(base_params, "cursor", cursor))
+      |> json_response(200)
+
+    acc = acc ++ [resp]
+
+    case resp["meta"]["next_cursor"] do
+      nil -> acc
+      next -> do_walk_pages(conn, raw_key, base_params, next, acc, n + 1)
+    end
+  end
+
   describe "cursor walk (AC-27.9a.1 / TC-27.9a.1)" do
     test "walks the full list exactly once, ending with next_cursor null", %{conn: conn} do
       tenant = fixture(:tenant)
@@ -545,6 +571,171 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
       bodies = Enum.map(resp["data"], & &1["body"])
       refute "PRIVATE — do not leak" in bodies
       assert "shared body" in bodies
+    end
+  end
+
+  describe "include_body is keyset-only (US-27.10 / AC-27.10.2 / REVIEW-3)" do
+    test "include_body=true with NO cursor param returns 400 (offset path unsupported)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["ko"]})
+
+      # No `cursor` param at all → offset path. include_body is meaningless there.
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{"tags" => "ko", "include_body" => "true"})
+
+      assert resp.status == 400
+      assert json_response(resp, 400)["error"]["message"] =~ "cursor"
+    end
+
+    test "include_body=true with a relevance q (and no cursor) returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: "needle"})
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{"q" => "needle", "include_body" => "true"})
+
+      assert resp.status == 400
+    end
+  end
+
+  describe "include_body default page is within the bound (US-27.10 / BA-F1)" do
+    test "include_body=true + cursor + NO limit → 200, meta.limit=10 (controller default), body present",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        tags: ["def"],
+        body: "default-page body"
+      })
+
+      resp =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "def",
+          "include_body" => "true",
+          "cursor" => ""
+        })
+        |> json_response(200)
+
+      # The controller default limit (10) is within max_include_body_page (25), so
+      # omitting `limit` with include_body is allowed (no 400).
+      assert resp["meta"]["limit"] == 10
+      assert resp["meta"]["include_body"] == true
+      [row] = resp["data"]
+      assert row["body"] == "default-page body"
+    end
+  end
+
+  describe "multi-page include_body walk (US-27.10 / BA-F2)" do
+    test "every page has include_body=true, count <= 25, bodies present on each row",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      for i <- 1..12 do
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          tags: ["mp"],
+          title: "mp#{i}",
+          body: "body #{i}"
+        })
+      end
+
+      pages =
+        walk_pages(conn, raw_key, %{"tags" => "mp", "limit" => "5", "include_body" => "true"})
+
+      # 12 rows at page size 5 → 3 pages (5, 5, 2). Bodies present and bounded on each.
+      assert length(pages) >= 2
+      total = Enum.sum(Enum.map(pages, fn p -> length(p["data"]) end))
+      assert total == 12
+
+      for page <- pages do
+        assert page["meta"]["include_body"] == true
+        assert page["meta"]["count"] <= 25
+        assert page["meta"]["count"] == length(page["data"])
+        assert Enum.all?(page["data"], &Map.has_key?(&1, "body"))
+      end
+    end
+  end
+
+  describe "byte-budget trim stops mid-page (US-27.10 / AC-27.10.2 / TC-byte-trim)" do
+    # The test budget is 100_000 bytes (config/test.exs :full_content_byte_budget).
+    # Three 40 KB bodies (120 KB) exceed it, so the first include_body page returns
+    # 2 rows (80 KB) and signals byte_truncated; the 3rd is reachable by continuing
+    # at next_cursor — a drift-free walk (next_cursor recomputed from the last KEPT
+    # row in Knowledge.list_keyset/2, NOT the un-trimmed peek). Mirrors the offset
+    # path's byte-truncation test.
+    test "first page truncates by byte budget; following next_cursor returns the dropped row",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      big = String.duplicate("x", 40_000)
+
+      ids =
+        for i <- 1..3 do
+          a =
+            fixture(:article, %{
+              tenant_id: tenant.id,
+              status: :published,
+              tags: ["bt"],
+              title: "bt#{i}",
+              body: big
+            })
+
+          a.id
+        end
+
+      page1 =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "bt",
+          "limit" => "25",
+          "include_body" => "true",
+          "cursor" => ""
+        })
+        |> json_response(200)
+
+      # 2 × 40 KB = 80 KB fits; the 3rd would push to 120 KB > 100 KB budget → trimmed.
+      assert page1["meta"]["byte_truncated"] == true
+      assert page1["meta"]["count"] == 2
+      assert length(page1["data"]) == 2
+      # Truncation forces continuation regardless of the limit+1 peek.
+      assert page1["meta"]["has_more"] == true
+      assert page1["meta"]["next_cursor"]
+
+      page2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          "tags" => "bt",
+          "limit" => "25",
+          "include_body" => "true",
+          "cursor" => page1["meta"]["next_cursor"]
+        })
+        |> json_response(200)
+
+      # The dropped 3rd row is reachable on the next page — no gap.
+      assert page2["meta"]["count"] == 1
+      assert page2["meta"]["byte_truncated"] == false
+      refute page2["meta"]["next_cursor"]
+
+      seen = Enum.map(page1["data"] ++ page2["data"], & &1["id"])
+      assert Enum.sort(seen) == Enum.sort(ids)
+      assert length(seen) == length(Enum.uniq(seen)), "no duplicate rows across the trim boundary"
     end
   end
 

@@ -307,6 +307,79 @@ defmodule Loopctl.Knowledge.ListKeysetTest do
       refute last_has_more
       assert is_nil(last_cursor)
     end
+
+    test "body-less default is never byte_truncated" do
+      tenant = fixture(:tenant)
+      fixture(:article, %{tenant_id: tenant.id, status: :published, body: "x"})
+
+      {:ok, %{byte_truncated: byte_truncated}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 20)
+
+      refute byte_truncated
+    end
+
+    # The test budget is 100_000 bytes (config/test.exs). Two 40 KB bodies fit
+    # (80 KB); the 3rd would exceed it, so the page trims to 2, sets byte_truncated,
+    # and recomputes next_cursor from the LAST KEPT row so the walk resumes over the
+    # dropped row with no gap.
+    test "include_body trims the page by the byte budget and resumes drift-free" do
+      tenant = fixture(:tenant)
+      big = String.duplicate("x", 40_000)
+
+      ids =
+        for i <- 1..3 do
+          a =
+            fixture(:article, %{
+              tenant_id: tenant.id,
+              status: :published,
+              title: "bt#{i}",
+              body: big
+            })
+
+          a.id
+        end
+
+      {:ok, %{results: page1, next_cursor: cursor1, has_more: more1, byte_truncated: trunc1}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 25, include_body: true)
+
+      assert trunc1
+      assert length(page1) == 2
+      assert more1
+      refute is_nil(cursor1)
+
+      {:ok, %{results: page2, next_cursor: cursor2, byte_truncated: trunc2}} =
+        Knowledge.list_keyset(tenant.id,
+          status: :published,
+          limit: 25,
+          include_body: true,
+          cursor: cursor1
+        )
+
+      assert length(page2) == 1
+      refute trunc2
+      assert is_nil(cursor2)
+
+      seen = Enum.map(page1 ++ page2, & &1.id)
+      assert Enum.sort(seen) == Enum.sort(ids)
+      assert length(seen) == length(Enum.uniq(seen)), "no duplicate across the trim boundary"
+    end
+
+    test "always keeps ≥1 row even if a single body alone exceeds the budget" do
+      tenant = fixture(:tenant)
+      # One body alone (120 KB) exceeds the 100 KB test budget; progress requires
+      # keeping it anyway (the always-take-≥1 rule).
+      huge = String.duplicate("y", 120_000)
+
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, body: huge})
+
+      {:ok, %{results: results, byte_truncated: byte_truncated}} =
+        Knowledge.list_keyset(tenant.id, status: :published, limit: 25, include_body: true)
+
+      assert length(results) == 1
+      assert hd(results).id == a.id
+      # A single over-budget row is not a truncation of OTHER rows — nothing was dropped.
+      refute byte_truncated
+    end
   end
 
   describe "list_keyset/2 — include_body respects visibility scope (AC-27.10.5)" do

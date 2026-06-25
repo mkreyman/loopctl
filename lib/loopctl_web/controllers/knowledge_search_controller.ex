@@ -129,11 +129,15 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         in: :query,
         type: :boolean,
         description:
-          "Opt into article `body` on each keyset (`cursor`) list row (default false). " <>
-            "Body-less is the default to keep payloads small and avoid large chunked " <>
-            "responses. Honored ONLY for an effective `limit <= 25`; a request with " <>
-            "`include_body=true` AND a requested `limit > 25` is rejected with 400 (never " <>
-            "a silent oversized response). Only `true` enables it; any other value is false.",
+          "Opt into article `body` on each keyset (`cursor`) list row (default false, " <>
+            "**keyset-path-only** — not supported on offset paths). Body-less is the " <>
+            "default to keep payloads small and avoid large chunked responses. When " <>
+            "`include_body=true`, the response is trimmed by a 5MB serialized-body " <>
+            "budget (same as offset full-content pages), so `count` may be less than " <>
+            "`limit` if bodies are large. Honored ONLY for an effective `limit <= 25`; " <>
+            "a request with `include_body=true` AND a requested `limit > 25` is rejected " <>
+            "with 400 (never a silent oversized response). Only `true` enables it; any " <>
+            "other value is false.",
         required: false
       ]
     ],
@@ -204,6 +208,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    description:
                      "Keyset path: whether each row carries the article body (honored only " <>
                        "for limit <= 25; see the include_body parameter)"
+                 },
+                 byte_truncated: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Keyset path (include_body only): true when the page was shortened by " <>
+                       "the serialized-body byte budget. next_cursor is then recomputed from " <>
+                       "the last kept row, so following it returns the dropped rows (no gap)."
                  }
                }
              }
@@ -457,37 +468,62 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     end
   end
 
-  # US-27.10: `include_body=true` opts the keyset list page into full bodies, but
-  # ONLY for a requested `limit <= max_include_body_page/0`. A larger requested
-  # limit with `include_body=true` is rejected with 400 here (in the `with`,
-  # BEFORE the query runs) so a caller can never trigger a 100KB+ chunked response
-  # by accidentally requesting bodies for a large page. The bound is on the
-  # REQUESTED limit (the raw param), not the rows actually returned — so
-  # `limit=26 + include_body=true` is a 400 even if the page would return fewer.
-  # `include_body=false`/absent is unbounded (body-less default, #166).
+  # US-27.10: `include_body=true` is a KEYSET-path-only opt-in to full bodies, and
+  # only for a requested `limit <= max_include_body_page/0`. Two 400s are enforced
+  # here in the `with`, BEFORE the query runs (`include_body=false`/absent is the
+  # unbounded body-less default, #166):
+  #
+  #   1. NO cursor param (offset/relevance path) → `include_body` is meaningless
+  #      there (it's silently ignored, undermining the self-describing contract),
+  #      so reject — mirroring the existing cursor+`q` rejection.
+  #   2. requested `limit > max` → reject so a caller can never trigger an oversized
+  #      chunked response by requesting bodies for a large page. The bound is on the
+  #      REQUESTED limit (raw param), not the rows returned — so `limit=26 +
+  #      include_body=true` is a 400 even if the page would return fewer.
   defp validate_include_body(params) do
     if parse_include_body(params["include_body"]) do
-      max = Knowledge.max_include_body_page()
-
-      case requested_limit(params["limit"]) do
-        {:ok, limit} when limit > max ->
-          {:error, :bad_request,
-           "include_body=true is only honored for limit <= #{max} (to avoid oversized " <>
-             "responses); requested limit #{limit} exceeds it. Drop include_body for a " <>
-             "body-less page, or lower the limit."}
-
-        _ ->
-          :ok
-      end
+      validate_include_body_context(params)
     else
       :ok
     end
+  end
+
+  defp validate_include_body_context(params) do
+    max = Knowledge.max_include_body_page()
+
+    cond do
+      keyset_cursor(params) == :none ->
+        {:error, :bad_request,
+         "include_body is only available for the cursor enumeration path; supply an " <>
+           "empty 'cursor' to start a keyset walk (offset and relevance paths don't " <>
+           "support bodies)."}
+
+      over_include_body_limit?(params, max) ->
+        {:ok, limit} = requested_limit(params["limit"])
+
+        {:error, :bad_request,
+         "include_body=true is only honored for limit <= #{max} (to avoid oversized " <>
+           "responses); requested limit #{limit} exceeds it. Drop include_body for a " <>
+           "body-less page, or lower the limit."}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp over_include_body_limit?(params, max) do
+    match?({:ok, limit} when limit > max, requested_limit(params["limit"]))
   end
 
   # Parses the requested `limit` param for the include_body bound check. Returns
   # `{:ok, int}` only for a clean non-negative integer; anything else is `:none`
   # (no requested limit to bound — the default page size applies and is within the
   # include_body cap).
+  #
+  # KEEP IN SYNC with `maybe_add_limit/2`: both parse the same raw `limit` param
+  # independently (this for the ≤25 include_body bound, that for the opt fed to the
+  # query). A future change to how `limit` is parsed must touch both, or the bound
+  # could be bypassed (e.g. accepting "26abc" here as :none while the query clamps).
   defp requested_limit(value) when is_binary(value) do
     case Integer.parse(value) do
       {int, ""} when int >= 0 -> {:ok, int}
@@ -508,6 +544,10 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   # `limit` is honored up to the relevant cap; over-cap requests are rejected
   # with 400 by `validate_search_limit/2` (in `search/2`) rather than silently
   # clamped here. The `min/2` is a safety net for direct/list callers.
+  #
+  # KEEP IN SYNC with `requested_limit/1`, which parses this same raw `limit` param
+  # to enforce the ≤25 include_body bound (`validate_include_body/1`). If the two
+  # diverge on what counts as a valid limit, the bound could be bypassed.
   defp maybe_add_limit(opts, nil), do: [{:limit, 10} | opts]
 
   defp maybe_add_limit(opts, value) when is_binary(value) do
