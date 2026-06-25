@@ -24,8 +24,20 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
   @impl true
   def article_entries(article, ctx) do
     category = to_string(article.category)
-    path = "#{category}/#{Knowledge.slugify(article.title)}.md"
-    [{path, build_markdown(article, Map.get(ctx, :links, []))}]
+    # Id-suffixed path (`{category}/{slug}-{short_id}.md`): without the suffix, two
+    # published articles sharing a category+slug would map to the SAME tar entry and
+    # the second would overwrite the first on extraction — silent whole-article data
+    # loss on a backup. The suffix makes every article's path unique with no global
+    # state. Related articles use `[[title]]` wikilinks (Obsidian resolves those by
+    # note title, independent of filename), so suffixing doesn't break links.
+    path = "#{category}/#{Knowledge.slugify(article.title)}-#{short_id(article.id)}.md"
+    links = Map.get(ctx, :links, [])
+    truncated? = Map.get(ctx, :links_truncated, false)
+    [{path, build_markdown(article, links, truncated?)}]
+  end
+
+  defp short_id(id) when is_binary(id) do
+    id |> String.downcase() |> String.replace("-", "") |> String.slice(0, 8)
   end
 
   @impl true
@@ -35,8 +47,8 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
 
   # --- per-article markdown ---
 
-  defp build_markdown(article, links) do
-    frontmatter = build_frontmatter(article)
+  defp build_markdown(article, links, truncated?) do
+    frontmatter = build_frontmatter(article, truncated?)
     body = article.body || ""
     related = build_related_section(links)
 
@@ -49,7 +61,7 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
     end
   end
 
-  defp build_frontmatter(article) do
+  defp build_frontmatter(article, truncated?) do
     tags_yaml =
       case article.tags do
         [] -> ""
@@ -63,11 +75,15 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
         st -> "\nsource_type: #{st}"
       end
 
+    # #7: mark a capped link list so the truncation is DETECTABLE in the vault, not
+    # silent — a consumer can tell this note's `## Related Articles` is incomplete.
+    truncated_yaml = if truncated?, do: "\nlinks_truncated: true", else: ""
+
     """
     ---
     title: "#{escape_yaml_string(article.title)}"
     category: #{article.category}#{tags_yaml}
-    status: #{article.status}#{source_type_yaml}
+    status: #{article.status}#{source_type_yaml}#{truncated_yaml}
     created_at: "#{DateTime.to_iso8601(article.inserted_at)}"
     updated_at: "#{DateTime.to_iso8601(article.updated_at)}"
     ---

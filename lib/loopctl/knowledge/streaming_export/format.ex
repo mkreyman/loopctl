@@ -20,13 +20,18 @@ defmodule Loopctl.Knowledge.StreamingExport.Format do
   @type entry :: {path :: String.t(), content :: iodata()}
 
   @typedoc """
-  Per-article render context the core threads in. `:links` is the BOUNDED list of
-  this article's links (already capped by the core so a dense hub can't fan out
-  into one giant entry — AC-27.16.3), each `%{direction, relationship_type, title,
-  status, path}` describing one neighbor.
+  Per-article render context the core threads in.
+
+  - `:links` is the BOUNDED list of this article's links (already capped + trimmed
+    by the core so a dense hub can't fan out into one giant entry — AC-27.16.3),
+    each `%{direction, relationship_type, title, category, status, neighbor_id}`.
+  - `:links_truncated` is `true` when that list was CAPPED (the real fan-out
+    exceeded `max_links_per_article/0`); an impl SHOULD surface this as a per-
+    article marker so the truncation is detectable, not silent (#7).
   """
   @type render_ctx :: %{
           optional(:links) => [map()],
+          optional(:links_truncated) => boolean(),
           optional(:project_id) => Ecto.UUID.t() | nil,
           optional(atom()) => term()
         }

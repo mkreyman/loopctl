@@ -103,7 +103,13 @@ defmodule Loopctl.HeavyRead do
   Like `Repo.stream/2`, with the same tenant-scoping guard. Must run inside a
   `transaction/2` — Ecto streams require an enclosing transaction (enumerating the
   returned stream outside one raises), which is also what scopes a per-transaction
-  `SET LOCAL statement_timeout`. Used by the US-27.16 streamed export.
+  `SET LOCAL statement_timeout`.
+
+  NOTE: the US-27.16 streamed EXPORT does NOT use this — it pages with the US-27.9a
+  keyset cursor via `all/3` (short read per page, connection RELEASED between pages)
+  precisely to AVOID holding one transaction (and `xmin`) for the whole client-paced
+  download. `stream/3` + `transaction/2` are reserved for a future async/Oban export
+  job that builds to object storage off the request path.
   """
   @spec stream(binary(), Ecto.Queryable.t(), keyword()) :: Enumerable.t()
   def stream(tenant_id, queryable, opts \\ []) do

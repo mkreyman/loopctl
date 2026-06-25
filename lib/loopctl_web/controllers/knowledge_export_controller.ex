@@ -36,11 +36,14 @@ defmodule LoopctlWeb.KnowledgeExportController do
     summary: "Export knowledge as a streamed Obsidian .tar.gz",
     description:
       "Streams published articles as an Obsidian-compatible gzipped tar archive. " <>
-        "Files are organized as `{category}/{slug}.md` with YAML frontmatter, " <>
-        "[[wikilinks]], and a root `_index.md`. Only published articles are included. " <>
-        "When called via GET /projects/:project_id/knowledge/export, includes both " <>
-        "tenant-wide and project-specific articles. Bounded memory, no article-count " <>
-        "cap, fail-closed on mid-stream error. Role: user+.",
+        "Files are organized as `{category}/{slug}-{short_id}.md` (the id suffix " <>
+        "guarantees collision-free paths) with YAML frontmatter, [[wikilinks]], and " <>
+        "a root `_index.md`. Only published articles are included. When called via " <>
+        "GET /projects/:project_id/knowledge/export, includes both tenant-wide and " <>
+        "project-specific articles. Bounded memory, no article-count cap, fail-closed " <>
+        "on mid-stream error. Each article's related-link list is capped at " <>
+        "export_max_links_per_article (default 100) per direction; a capped article " <>
+        "carries `links_truncated: true` in its frontmatter. Role: user+.",
     parameters: [
       project_id: [
         in: :path,

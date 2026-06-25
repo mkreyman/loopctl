@@ -72,9 +72,15 @@ defmodule Loopctl.Knowledge.StreamingExport do
       Application.get_env(:loopctl, :export_max_links_per_article, @default_max_links_per_article)
 
   @doc """
-  Hard ceiling (ms) on a single streamed export's wall-clock (AC-27.16.2/.6): a
+  Soft ceiling (ms) on a single streamed export's wall-clock (AC-27.16.2/.6): a
   documented TIME budget, not an article-count cap. Exceeding it aborts the stream
-  fail-closed. Tunable; defaults to 10 minutes.
+  fail-closed.
+
+  NOTE: the budget is checked at PAGE BOUNDARIES (between keyset pages), not
+  mid-page — so the effective wall-clock can overshoot by at most ONE page's
+  processing time (≤ `chunk_size` articles). Per-statement runaway is bounded
+  separately by the heavy-read pool's `statement_timeout`. Tunable; defaults to 10
+  minutes.
   """
   @spec max_stream_duration_ms() :: pos_integer()
   def max_stream_duration_ms,
@@ -142,12 +148,17 @@ defmodule Loopctl.Knowledge.StreamingExport do
       {:ok, conn}
     else
       {:error, reason, writer} ->
-        # Mid-stream failure with a live writer: ABORT without a valid
-        # end-of-archive so the consumer detects truncation (fail-closed).
+        # Mid-stream failure with a live writer (from index/page emission): ABORT
+        # without a valid end-of-archive so the consumer detects truncation
+        # (fail-closed). abort/1 frees the zlib + ETS resources.
         TarGz.abort(writer)
         {:error, reason}
 
       {:error, reason} ->
+        # 2-tuple error from TarGz.finish/1 (a transport error during the FINAL
+        # flush): finish/1 already freed its resources on the error path (#9), so we
+        # just propagate. The bytes already sent lack a valid end-of-archive →
+        # fail-closed by construction (we never wrote one).
         {:error, reason}
     end
   end
@@ -291,7 +302,14 @@ defmodule Loopctl.Knowledge.StreamingExport do
 
     Enum.reduce_while(page, {:ok, writer}, fn row, {:ok, writer} ->
       article = to_article(row)
-      ctx = %{links: Map.get(links_by_article, row.id, []), project_id: row.project_id}
+      {links, truncated?} = Map.get(links_by_article, row.id, {[], false})
+
+      ctx = %{
+        links: links,
+        links_truncated: truncated?,
+        project_id: row.project_id
+      }
+
       entries = format.article_entries(article, ctx)
 
       case emit_entries(writer, entries) do
@@ -303,12 +321,15 @@ defmodule Loopctl.Knowledge.StreamingExport do
     e -> {:error, e, writer}
   end
 
-  # --- bounded per-page link preload (AC-27.16.3/.5) ---
+  # --- bounded per-page link preload (AC-27.16.3/.5, #7 truncation marker) ---
 
   # Load BOTH directions of links for the page's articles in ONE tenant-scoped
   # query, capped to `max_links_per_article/0` PER (article, direction) via a window
   # function so a dense hub's fan-out is bounded in SQL — never fetched, never
-  # materialized into one entry. Returns %{article_id => [neighbor_map]}.
+  # materialized into one entry. To make truncation DETECTABLE (#7), fetch `cap + 1`
+  # rows per (article, direction): if `cap + 1` came back, the list was truncated —
+  # the extra row is dropped and the article is flagged. Returns
+  # `%{article_id => {links_trimmed_to_cap, truncated?}}`.
   defp load_bounded_links(tenant_id, page) do
     ids = Enum.map(page, & &1.id)
     cap = max_links_per_article()
@@ -318,9 +339,22 @@ defmodule Loopctl.Knowledge.StreamingExport do
 
     (outgoing ++ incoming)
     |> Enum.group_by(& &1.owner_id)
-    |> Map.new(fn {owner_id, links} ->
-      {owner_id, Enum.map(links, &Map.delete(&1, :owner_id))}
-    end)
+    |> Map.new(fn {owner_id, links} -> {owner_id, trim_and_flag(links, cap)} end)
+  end
+
+  # Per article: across BOTH directions, trim each direction back to `cap` and flag
+  # truncation if EITHER direction returned more than `cap` (we fetched cap+1).
+  defp trim_and_flag(links, cap) do
+    {kept, truncated?} =
+      links
+      |> Enum.group_by(& &1.direction)
+      |> Enum.reduce({[], false}, fn {_dir, dir_links}, {acc, trunc?} ->
+        over? = length(dir_links) > cap
+        kept_dir = dir_links |> Enum.take(cap) |> Enum.map(&Map.delete(&1, :owner_id))
+        {acc ++ kept_dir, trunc? or over?}
+      end)
+
+    {kept, truncated?}
   end
 
   # Per-direction, ranked-and-capped link rows joined to the neighbor article (for
@@ -366,14 +400,21 @@ defmodule Loopctl.Knowledge.StreamingExport do
     capped_links(tenant_id, ranked, cap, :incoming)
   end
 
+  # Fetch cap+1 (the "peek") so the caller can DETECT truncation (#7): if cap+1 rows
+  # came back for a direction, the real fan-out exceeded the cap. `trim_and_flag/2`
+  # drops the extra and flags the article. Peak fetch is still bounded (cap+1 per
+  # direction × page_size articles).
   defp capped_links(tenant_id, ranked, cap, direction) do
+    peek = cap + 1
+
     query =
       from(r in subquery(ranked),
         join: a in Article,
         on: a.id == r.neighbor_id and a.tenant_id == ^tenant_id,
-        where: r.rn <= ^cap,
+        where: r.rn <= ^peek,
         select: %{
           owner_id: r.owner_id,
+          neighbor_id: r.neighbor_id,
           relationship_type: r.relationship_type,
           title: a.title,
           category: a.category,

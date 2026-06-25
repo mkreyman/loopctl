@@ -3,22 +3,22 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
   OKF (Open Knowledge Format) v0.1 format for the streaming export (US-27.16).
 
   Renders the same per-article concept files the legacy `OKF.build_bundle/2`
-  produced — `{type}/{slug}.md` with `loopctl_*` producer-key frontmatter, the
-  article body, and a marked `# Related` section encoding the `relates_to`/
-  `derived_from` graph — but one article at a time so the streaming core never
-  materializes the whole bundle.
+  produced — `{type}/{slug}.md`-style concept files with `loopctl_*` producer-key
+  frontmatter, the article body, and a marked `# Related` section encoding the
+  `relates_to`/`derived_from` graph — but one article at a time so the streaming
+  core never materializes the whole bundle.
 
-  ## Differences from the legacy bundle (bounded-memory)
+  ## Collision-free paths (no data loss)
 
-  The legacy exporter assigned globally-deduped bundle paths (`assign_paths/1`)
-  across ALL articles in memory, then linked related concepts by that exact path.
-  Streaming can't hold a global path map, so each `# Related` link points to the
-  neighbor's DETERMINISTIC `{category}/{slug}.md` path (the un-deduped form). On a
-  rare slug collision the path may not match a deduped sibling; the importer
-  already treats an unresolved related-path as a best-effort skip
-  (`is_nil(target_id) -> acc`), so this degrades a few links at most, never the
-  content. The dominant matcher on re-import is `loopctl_id`/title, not the related
-  path.
+  The legacy exporter held a global path map (`assign_paths/1`) and DEDUPED
+  same-slug articles (`foo`, `foo-2`, …). Streaming can't hold a global map, so
+  instead each concept is written to an ID-SUFFIXED path
+  `{category}/{slug}-{short_id}.md` (the first 8 hex of the article UUID). This
+  guarantees EVERY article gets a distinct path with zero global state — two
+  published articles sharing a category+slug can no longer map to the same tar
+  entry and overwrite each other (that would be silent whole-article data loss on a
+  backup). Each `# Related` link is built with the SAME function applied to the
+  neighbor's id, so inter-article links still resolve after suffixing.
 
   The root `index.md` is built from a CHEAP per-category COUNT aggregate (no
   bodies). The legacy `log.md` and per-category `index.md` listings required
@@ -40,8 +40,29 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
 
   @impl true
   def article_entries(article, ctx) do
-    path = "#{article.category}/#{Knowledge.slugify(article.title)}.md"
-    [{path, render_concept(article, Map.get(ctx, :links, []))}]
+    path = concept_path(article.category, article.title, article.id)
+    links = Map.get(ctx, :links, [])
+    truncated? = Map.get(ctx, :links_truncated, false)
+    [{path, render_concept(article, links, truncated?)}]
+  end
+
+  # Deterministic, COLLISION-FREE concept path: `{category}/{slug}-{short_id}.md`.
+  # The id suffix (first 8 hex chars of the article's UUID) guarantees two articles
+  # with the same category+slug get DISTINCT paths — without it, the second would
+  # overwrite the first on tar extraction (whole-article data loss). The same
+  # function builds the `# Related` link target (via the neighbor's id), so links
+  # still resolve after the suffixing.
+  defp concept_path(category, title, id) do
+    "#{category}/#{Knowledge.slugify(title)}-#{short_id(id)}.md"
+  end
+
+  # First 8 hex chars of the canonical UUID (the chars before the first `-`),
+  # lowercased — stable, URL-safe, and collision-resistant enough at the per-
+  # category+slug granularity (a 32-bit suffix). A bundle is never rejected for a
+  # suffix collision; it would just (astronomically rarely) reuse a path, which is
+  # the SAME failure mode as today's slug-only path but ~4-billion× less likely.
+  defp short_id(id) when is_binary(id) do
+    id |> String.downcase() |> String.replace("-", "") |> String.slice(0, 8)
   end
 
   @impl true
@@ -51,13 +72,13 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
 
   # --- per-article concept ---
 
-  defp render_concept(article, links) do
-    frontmatter = OKF.encode_frontmatter(concept_frontmatter(article))
+  defp render_concept(article, links, truncated?) do
+    frontmatter = OKF.encode_frontmatter(concept_frontmatter(article, truncated?))
     body = concept_body(article, links)
     "---\n#{frontmatter}---\n\n#{body}"
   end
 
-  defp concept_frontmatter(article) do
+  defp concept_frontmatter(article, truncated?) do
     okf = Map.get(article.metadata || %{}, "okf", %{})
     extra = Map.get(okf, "extra", %{})
 
@@ -75,8 +96,15 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
 
     extra
     |> Map.merge(base)
+    |> maybe_mark_truncated(truncated?)
     |> reject_empty()
   end
+
+  # #7: when the per-article link list was capped, mark it so a consumer can tell
+  # the relationship graph in this bundle is INCOMPLETE for this concept (not a
+  # genuine leaf). Fail-closed-consistent: truncation is detectable, not silent.
+  defp maybe_mark_truncated(map, true), do: Map.put(map, "loopctl_links_truncated", true)
+  defp maybe_mark_truncated(map, false), do: map
 
   defp concept_body(article, links) do
     body = String.trim_trailing(article.body || "")
@@ -103,7 +131,10 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
         link.relationship_type in [:relates_to, :derived_from]
     end)
     |> Enum.map(fn link ->
-      path = "#{link.category}/#{Knowledge.slugify(link.title)}.md"
+      # Resolve to the neighbor's id-suffixed concept path (same scheme as
+      # article_entries/2) so the link points at the right file even when two
+      # articles share a category+slug.
+      path = concept_path(link.category, link.title, link.neighbor_id)
       "- [#{escape_link_text(link.title)}](/#{path}) — #{link.relationship_type}"
     end)
   end

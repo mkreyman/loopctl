@@ -95,6 +95,12 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
   """
   @spec add_entry(t(), String.t(), iodata()) :: {:ok, t()} | {:error, term()}
   def add_entry(%TarGz{tar: tar} = w, path, content) when is_binary(path) do
+    # This is the ONE place a full entry body is materialized in memory. It is
+    # bounded UPSTREAM: the only large field is the article `body`, byte-validated
+    # at write time to `Loopctl.Knowledge.Article` `@max_body_bytes` (500 KB), plus
+    # bounded frontmatter and a per-article link list capped at
+    # `StreamingExport.max_links_per_article/0`. So one entry is O(max_body_bytes),
+    # not O(KB-size) — the per-entry memory bound (AC-27.16.3) holds.
     bin = IO.iodata_to_binary(content)
 
     case :erl_tar.add(tar, bin, String.to_charlist(path), []) do
@@ -116,15 +122,27 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
   def finish(%TarGz{tar: tar, z: z, state: state} = w) do
     # :erl_tar.close writes the two zero blocks (end-of-archive) THROUGH our writer
     # fun, which deflates them into the buffer.
-    with :ok <- close_tar(tar),
-         {:ok, w} <- flush_buffer(w) do
-      # Finish the gzip stream: final deflate block + gzip CRC/ISIZE trailer.
-      trailer = :zlib.deflate(z, <<>>, :finish)
-      safe_zlib_end(z)
-      safe_zlib_close(z)
-      result = emit(w, trailer)
-      :ets.delete(state)
-      result
+    case close_and_flush(tar, w) do
+      {:ok, w} ->
+        # Finish the gzip stream: final deflate block + gzip CRC/ISIZE trailer.
+        trailer = :zlib.deflate(z, <<>>, :finish)
+        result = emit(w, trailer)
+        # Always free the zlib + ETS resources, even if the trailer flush failed
+        # (a client disconnect mid-finalize) — otherwise the zstream + ETS table leak.
+        cleanup(z, state)
+        result
+
+      {:error, reason} ->
+        # close_tar/flush_buffer failed mid-finalize (e.g. transport closed): free
+        # resources and report — never leak the zlib stream / ETS table (#9).
+        cleanup(z, state)
+        {:error, reason}
+    end
+  end
+
+  defp close_and_flush(tar, w) do
+    with :ok <- close_tar(tar) do
+      flush_buffer(w)
     end
   end
 
@@ -171,14 +189,34 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGz do
     end
   end
 
-  # Pull the deflate-buffered compressed bytes and hand them to `emit`.
+  # Pull the deflate-buffered compressed bytes and hand them to `emit`, emitting
+  # a telemetry event that includes the current process's memory (for scale testing).
   defp flush_buffer(%TarGz{state: state} = w) do
     rev = :ets.lookup_element(state, :buf, 2)
     :ets.insert(state, {:buf, []})
 
     case rev do
-      [] -> {:ok, w}
-      iolist -> emit_threaded(w, :lists.reverse(iolist))
+      [] ->
+        {:ok, w}
+
+      iolist ->
+        # US-27.16 bounded-memory instrumentation (#3): emit THIS (producer) process's
+        # LIVE memory per flush as a telemetry MEASUREMENT, so a scale test can prove
+        # the PRODUCER's footprint is sub-linear in N — distinct from a VM-wide /
+        # client-buffer measurement that would be linear in bundle size. `flush_buffer`
+        # runs in the producer process (the Bandit handler over HTTP, or the test
+        # process via the helper), so `self()` IS the producer. GC first so the sample
+        # reflects retained memory, not the just-built chunk's garbage.
+        :erlang.garbage_collect()
+        {:memory, bytes} = :erlang.process_info(self(), :memory)
+
+        :telemetry.execute(
+          [:loopctl, :streaming_export, :chunk_emitted],
+          %{process_memory: bytes},
+          %{}
+        )
+
+        emit_threaded(w, :lists.reverse(iolist))
     end
   end
 

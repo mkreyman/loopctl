@@ -83,6 +83,9 @@ defmodule LoopctlWeb.StreamingExport do
     emit = fn iodata ->
       current = Process.get(pd_key)
 
+      # Producer-memory telemetry is emitted by the TarGz writer (the true producer),
+      # so it fires on EVERY export path (HTTP + the in-memory test helper), not just
+      # here. This emit fun only flushes the compressed chunk to the wire.
       case chunk(current, iodata) do
         {:ok, next} ->
           Process.put(pd_key, next)

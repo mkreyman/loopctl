@@ -37,9 +37,10 @@ defmodule LoopctlWeb.OKFControllerTest do
       assert cd =~ ".tar.gz"
 
       # The chunked tar.gz extracts to a valid OKF bundle (root index + concept).
+      # Concept paths are id-suffixed (`pattern/zip-article-<short_id>.md`).
       assert {:ok, files} = Loopctl.StreamingExportHelper.extract(conn.resp_body)
       assert Map.has_key?(files, "index.md")
-      assert Map.has_key?(files, "pattern/zip-article.md")
+      assert Enum.any?(Map.keys(files), &String.starts_with?(&1, "pattern/zip-article-"))
     end
 
     test "format=json returns the files map and meta", %{conn: conn} do
@@ -57,6 +58,55 @@ defmodule LoopctlWeb.OKFControllerTest do
       assert body["data"]["meta"]["article_count"] == 1
       assert Map.has_key?(body["data"]["files"], "index.md")
       assert Map.has_key?(body["data"]["files"], "reference/json-article.md")
+    end
+
+    test "format=json over the buffered-export cap returns 413 (no OOM regression)", %{conn: conn} do
+      # The buffered json path materializes the whole bundle, so it is capped (test
+      # cap is 2). A KB above it must 413 and point to the streamed .tar.gz, NOT
+      # OOM by materializing everything.
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      for i <- 1..3 do
+        published(tenant.id, %{title: "Big #{i}", category: :reference})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get(~p"/api/v1/knowledge/okf/export?format=json")
+
+      body = json_response(conn, 413)
+      assert body["error"]["code"] == "payload_too_large"
+      assert body["error"]["message"] =~ ".tar.gz"
+    end
+
+    test "the streamed .tar.gz default has NO count cap (exports above the json cap)", %{
+      conn: conn
+    } do
+      # The same over-cap corpus streams fine as tar.gz (the backup path is
+      # bounded-memory, not count-capped).
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      for i <- 1..3 do
+        published(tenant.id, %{title: "Streamed #{i}", category: :reference})
+      end
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get(~p"/api/v1/knowledge/okf/export")
+
+      assert conn.status == 200
+      assert {:ok, files} = Loopctl.StreamingExportHelper.extract(conn.resp_body)
+
+      concept_count =
+        files
+        |> Map.keys()
+        |> Enum.count(&(String.ends_with?(&1, ".md") and not String.ends_with?(&1, "index.md")))
+
+      assert concept_count == 3
     end
 
     test "requires user role (agent is forbidden)", %{conn: conn} do

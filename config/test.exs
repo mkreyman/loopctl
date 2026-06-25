@@ -171,6 +171,12 @@ config :loopctl, :bulk_delete_frozen_max, 3
 config :loopctl, :export_chunk_size, 3
 config :loopctl, :export_max_links_per_article, 5
 
+# US-27.16: small cap so the `?format=json` buffered-export 413 (over-cap) is
+# testable cheaply. Set to 2 so a 3-article corpus trips it. The OKF round-trip /
+# export CONTEXT tests that legitimately build larger bundles pass an explicit
+# `build_bundle(t, max_articles: ...)` override, so they are unaffected.
+config :loopctl, :okf_max_buffered_export_articles, 2
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",

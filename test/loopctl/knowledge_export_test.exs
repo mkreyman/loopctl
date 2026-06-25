@@ -16,6 +16,20 @@ defmodule Loopctl.KnowledgeExportTest do
     files
   end
 
+  # US-27.16: concept paths are id-suffixed (`{category}/{slug}-{short_id}.md`) so
+  # two same-slug articles can't overwrite each other. The suffix is non-
+  # deterministic per run, so tests match on the `{category}/{slug}-` PREFIX.
+  defp has_slug?(file_map, "" <> category_slug) do
+    Enum.any?(Map.keys(file_map), &String.starts_with?(&1, category_slug <> "-"))
+  end
+
+  defp fetch_slug(file_map, "" <> category_slug) do
+    {_path, content} =
+      Enum.find(file_map, fn {path, _} -> String.starts_with?(path, category_slug <> "-") end)
+
+    content
+  end
+
   describe "streamed Obsidian export" do
     test "returns archive with published articles organized by category" do
       tenant = fixture(:tenant)
@@ -41,8 +55,8 @@ defmodule Loopctl.KnowledgeExportTest do
 
       assert map_size(file_map) == 3
       assert Map.has_key?(file_map, "_index.md")
-      assert Map.has_key?(file_map, "pattern/pattern-one.md")
-      assert Map.has_key?(file_map, "decision/decision-alpha.md")
+      assert has_slug?(file_map, "pattern/pattern-one")
+      assert has_slug?(file_map, "decision/decision-alpha")
     end
 
     test "excludes non-published articles" do
@@ -75,9 +89,9 @@ defmodule Loopctl.KnowledgeExportTest do
       filenames = tenant.id |> export_obsidian() |> Map.keys()
 
       assert "_index.md" in filenames
-      assert "pattern/published.md" in filenames
-      refute "pattern/draft.md" in filenames
-      refute "convention/archived.md" in filenames
+      assert Enum.any?(filenames, &String.starts_with?(&1, "pattern/published-"))
+      refute Enum.any?(filenames, &String.starts_with?(&1, "pattern/draft-"))
+      refute Enum.any?(filenames, &String.starts_with?(&1, "convention/archived-"))
     end
 
     test "scopes by project_id when provided (incl. the project_id IS NULL disjunction)" do
@@ -116,9 +130,9 @@ defmodule Loopctl.KnowledgeExportTest do
 
       filenames = tenant.id |> export_obsidian(project_id: project.id) |> Map.keys()
 
-      assert "pattern/global.md" in filenames
-      assert "convention/in-project.md" in filenames
-      refute "finding/other-project.md" in filenames
+      assert Enum.any?(filenames, &String.starts_with?(&1, "pattern/global-"))
+      assert Enum.any?(filenames, &String.starts_with?(&1, "convention/in-project-"))
+      refute Enum.any?(filenames, &String.starts_with?(&1, "finding/other-project-"))
     end
 
     test "returns archive with only _index.md when no published articles" do
@@ -154,8 +168,8 @@ defmodule Loopctl.KnowledgeExportTest do
       file_map = export_obsidian(tenant_a.id)
       filenames = Map.keys(file_map)
 
-      assert "pattern/a-article.md" in filenames
-      refute "pattern/b-article.md" in filenames
+      assert Enum.any?(filenames, &String.starts_with?(&1, "pattern/a-article-"))
+      refute Enum.any?(filenames, &String.starts_with?(&1, "pattern/b-article-"))
 
       # No tenant B content in any entry (BYPASSRLS scope proof).
       all = file_map |> Map.values() |> Enum.join("\n")
@@ -175,7 +189,7 @@ defmodule Loopctl.KnowledgeExportTest do
         source_type: "manual"
       })
 
-      content = export_obsidian(tenant.id)["finding/full-article.md"]
+      content = fetch_slug(export_obsidian(tenant.id), "finding/full-article")
 
       assert content =~ ~s(title: "Full Article")
       assert content =~ "category: finding"
@@ -217,11 +231,11 @@ defmodule Loopctl.KnowledgeExportTest do
 
       file_map = export_obsidian(tenant.id)
 
-      source_md = file_map["pattern/source.md"]
+      source_md = fetch_slug(file_map, "pattern/source")
       assert source_md =~ "## Related Articles"
       assert source_md =~ "[[Target]] (contradicts)"
 
-      target_md = file_map["decision/target.md"]
+      target_md = fetch_slug(file_map, "decision/target")
       assert target_md =~ "## Related Articles"
       assert target_md =~ "[[Source]] (contradicts)"
     end

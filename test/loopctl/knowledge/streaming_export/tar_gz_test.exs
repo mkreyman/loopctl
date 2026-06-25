@@ -86,4 +86,39 @@ defmodule Loopctl.Knowledge.StreamingExport.TarGzTest do
 
     assert {:error, :closed} = result
   end
+
+  test "finish/1 frees the zlib + ETS resources even when the final flush errors (#9)" do
+    # An emit fun that succeeds until finish/1's trailer flush, then errors —
+    # simulating a client disconnect during finalization. finish/1 must still free
+    # the zlib stream + the per-writer ETS table (no leak).
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    emit = fn _iodata ->
+      # Fail only once we've emitted a couple of flushes (the header + entry), so the
+      # failure lands at/around the finish trailer flush.
+      n = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+      if n >= 3, do: {:error, :closed}, else: {:ok, :collected}
+    end
+
+    {:ok, w} = TarGz.init(emit, :collected)
+    {:ok, w} = TarGz.add_entry(w, "a.md", "a")
+
+    state_tid = w.state
+    assert :ets.info(state_tid) != :undefined
+
+    # finish errors mid-finalize; resources must STILL be freed.
+    assert {:error, :closed} = TarGz.finish(w)
+    assert :ets.info(state_tid) == :undefined
+  end
+
+  test "finish/1 frees the ETS table on the success path too" do
+    {agent, emit} = collector()
+    {:ok, w} = TarGz.init(emit, :collected)
+    {:ok, w} = TarGz.add_entry(w, "a.md", "a")
+    state_tid = w.state
+    {:ok, :collected} = TarGz.finish(w)
+    assert :ets.info(state_tid) == :undefined
+    # Sanity: success path produced a valid archive.
+    assert {:ok, _} = :erl_tar.extract({:binary, bytes(agent)}, [:memory, :compressed])
+  end
 end

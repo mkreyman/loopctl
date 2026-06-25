@@ -40,9 +40,12 @@ defmodule LoopctlWeb.OKFController do
       "Exports published articles as an OKF v0.1 bundle. Defaults to a streamed " <>
         "gzipped tar archive (bounded memory, no article-count cap, fail-closed on " <>
         "mid-stream error); pass format=json for a `{files, meta}` JSON payload " <>
-        "(buffered in memory — for tooling that writes the files itself). When called " <>
-        "via GET /projects/:project_id/knowledge/okf/export, includes tenant-wide + " <>
-        "project articles. Role: user+.",
+        "(buffered in memory — for tooling that writes the files itself — and so " <>
+        "capped at export_max_buffered_export_articles, 413 over it). Each concept's " <>
+        "`# Related` list is capped at export_max_links_per_article (default 100) per " <>
+        "direction; a capped concept carries `loopctl_links_truncated: true` in " <>
+        "frontmatter. When called via GET /projects/:project_id/knowledge/okf/export, " <>
+        "includes tenant-wide + project articles. Role: user+.",
     parameters: [
       project_id: [in: :path, type: :string, required: false],
       format: [
@@ -56,18 +59,40 @@ defmodule LoopctlWeb.OKFController do
       200 =>
         {"OKF bundle (.tar.gz, chunked)", "application/gzip",
          %OpenApiSpex.Schema{type: :string, format: :binary}},
+      413 =>
+        {"format=json bundle exceeds the buffered-export cap (use the streamed .tar.gz)",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Too many concurrent exports", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/okf/export"
   def export(conn, %{"format" => "json"} = params) do
-    # The JSON convenience path is an explicit, in-memory opt-in for tooling that
-    # writes the files out itself; it builds the whole bundle as a map. The 5,000
-    # article-count 413 cap is GONE (US-27.16) — there is no count limit anywhere.
+    # The JSON convenience path is a BUFFERED, in-memory opt-in for tooling that
+    # writes the files out itself. Because it materializes the whole bundle, it
+    # keeps an article-count cap so a large KB can't OOM the node; over the cap it
+    # 413s and points callers to the bounded-memory streamed `.tar.gz` (the backup
+    # path, which has NO count cap).
     tenant_id = conn.assigns.current_api_key.tenant_id
-    {:ok, %{files: files, meta: meta}} = OKF.build_bundle(tenant_id, export_opts(params))
-    json(conn, %{data: %{files: files, meta: meta}})
+
+    case OKF.build_bundle(tenant_id, export_opts(params)) do
+      {:ok, %{files: files, meta: meta}} ->
+        json(conn, %{data: %{files: files, meta: meta}})
+
+      {:error, :payload_too_large} ->
+        conn
+        |> put_status(413)
+        |> json(%{
+          error: %{
+            status: 413,
+            code: "payload_too_large",
+            message:
+              "format=json buffers the whole bundle in memory and is capped. " <>
+                "Drop format=json to stream the full export as a bounded-memory " <>
+                ".tar.gz (no article-count cap), or scope with a project_id."
+          }
+        })
+    end
   end
 
   def export(conn, params) do

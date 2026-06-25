@@ -30,12 +30,31 @@ defmodule Loopctl.Knowledge.StreamingExportTest do
     )
   end
 
-  # The canonical id-set the legacy exporter would have produced: the EXACT WHERE
-  # of StreamingExport.base_query/2 (tenant + status=:published + project
-  # disjunction), via the tenant-guarded heavy-read path.
+  # INDEPENDENT oracle (NOT StreamingExport.base_query/2 — that would be circular):
+  # the export contract spelled out inline as a raw query, so any future drift in
+  # base_query/2 (e.g. dropping the project_id-IS-NULL disjunction) is actually
+  # caught by the id-set comparison. Run through plain AdminRepo, bypassing the
+  # production code path entirely.
+  defp canonical_ids(tenant_id, nil) do
+    Loopctl.AdminRepo.all(
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.status == :published,
+        select: a.id
+      )
+    )
+    |> MapSet.new()
+  end
+
   defp canonical_ids(tenant_id, project_id) do
-    query = StreamingExport.base_query(tenant_id, project_id) |> select([a], a.id)
-    tenant_id |> HeavyRead.all(query) |> MapSet.new()
+    Loopctl.AdminRepo.all(
+      from(a in Article,
+        where:
+          a.tenant_id == ^tenant_id and a.status == :published and
+            (is_nil(a.project_id) or a.project_id == ^project_id),
+        select: a.id
+      )
+    )
+    |> MapSet.new()
   end
 
   # Resolve the streamed bundle back to the set of article ids it contains. The
@@ -213,7 +232,9 @@ defmodule Loopctl.Knowledge.StreamingExportTest do
 
       {:ok, targz} = StreamingExportHelper.to_targz_binary(tenant.id, ObsidianFormat)
       {:ok, files} = StreamingExportHelper.extract(targz)
-      hub_md = files["pattern/hub.md"]
+      # Concept paths are id-suffixed (`pattern/hub-<short_id>.md`); find by prefix.
+      {_path, hub_md} =
+        Enum.find(files, fn {p, _} -> String.starts_with?(p, "pattern/hub-") end)
 
       related_lines =
         hub_md
@@ -223,6 +244,64 @@ defmodule Loopctl.Knowledge.StreamingExportTest do
       # Bounded by max_links_per_article/0 (5 in test config), NOT the 12 created.
       assert length(related_lines) <= StreamingExport.max_links_per_article()
       assert length(related_lines) == 5
+
+      # #7: the truncation is DETECTABLE — the hub note carries the marker, and a
+      # non-truncated article does NOT.
+      assert hub_md =~ "links_truncated: true"
+    end
+
+    test "a hub article's OKF concept marks loopctl_links_truncated when capped (#7)" do
+      tenant = fixture(:tenant)
+      hub = published(tenant.id, %{title: "OKFHub", body: "hub", category: :pattern})
+
+      for i <- 1..12 do
+        target = published(tenant.id, %{title: "OKFN #{i}", body: "n", category: :reference})
+
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: hub.id,
+          target_article_id: target.id,
+          relationship_type: :relates_to
+        })
+      end
+
+      {:ok, targz} =
+        StreamingExportHelper.to_targz_binary(
+          tenant.id,
+          Loopctl.Knowledge.StreamingExport.OKFFormat
+        )
+
+      {:ok, files} = StreamingExportHelper.extract(targz)
+
+      {_path, hub_md} =
+        Enum.find(files, fn {p, _} -> String.starts_with?(p, "pattern/okfhub-") end)
+
+      assert hub_md =~ "loopctl_links_truncated: true"
+
+      # A non-hub neighbor (≤5 links) is NOT marked.
+      {_p, leaf_md} =
+        Enum.find(files, fn {p, _} -> String.starts_with?(p, "reference/okfn-1-") end)
+
+      refute leaf_md =~ "loopctl_links_truncated"
+    end
+
+    test "an article UNDER the link cap is not marked truncated (#7)" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, %{title: "Few Links", body: "b", category: :pattern})
+      t = published(tenant.id, %{title: "One Target", body: "b", category: :reference})
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: a.id,
+        target_article_id: t.id,
+        relationship_type: :relates_to
+      })
+
+      {:ok, targz} = StreamingExportHelper.to_targz_binary(tenant.id, ObsidianFormat)
+      {:ok, files} = StreamingExportHelper.extract(targz)
+
+      {_p, md} = Enum.find(files, fn {p, _} -> String.starts_with?(p, "pattern/few-links-") end)
+      refute md =~ "links_truncated"
     end
   end
 

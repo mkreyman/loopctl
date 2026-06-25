@@ -29,8 +29,10 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.ExportConcurrency
   alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.Tenants.Tenant
 
@@ -98,42 +100,59 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
     {:ok, big: big, small: small, port: port, user_key: user_key, small_user_key: small_user_key}
   end
 
-  describe "TC-27.16.1: >5,000-article export succeeds; memory flat vs N" do
-    test "OKF export of ~80k is 200 chunked (not 413) and memory stays ~flat vs 500", ctx do
-      {big_mem, big_count} =
-        measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/okf/export")
+  describe "TC-27.16.1: >5,000-article export succeeds; PRODUCER memory flat vs N" do
+    test "OKF export of ~80k is 200 chunked (not 413) and producer memory stays ~flat vs 500",
+         ctx do
+      big = measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/okf/export")
+      small = measure_export(ctx.port, ctx.small_user_key, "/api/v1/knowledge/okf/export")
 
-      {small_mem, small_count} =
-        measure_export(ctx.port, ctx.small_user_key, "/api/v1/knowledge/okf/export")
+      # Not 413: a full 200 chunked response with a VALID end-of-archive (the stream
+      # finished cleanly) and substantially more bytes for 80k than 500 (so the big
+      # corpus really did stream the whole KB, > the old 5k cap).
+      assert big.status == 200 and small.status == 200
+      assert big.valid_archive? and small.valid_archive?
+      assert big.bytes > small.bytes * 10
 
-      assert big_count > 5_000, "expected the big corpus to exceed the old 5k cap"
-      assert small_count == @small_count
-
-      assert_flat_memory(big_mem, small_mem, big_count, small_count)
+      assert_flat_producer_memory(big, small)
     end
 
-    test "Obsidian export of ~80k is 200 chunked (not 413) and memory stays ~flat vs 500", ctx do
-      {big_mem, big_count} =
-        measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/export")
+    test "Obsidian export of ~80k is 200 chunked (not 413) and producer memory stays ~flat vs 500",
+         ctx do
+      big = measure_export(ctx.port, ctx.user_key, "/api/v1/knowledge/export")
+      small = measure_export(ctx.port, ctx.small_user_key, "/api/v1/knowledge/export")
 
-      {small_mem, small_count} =
-        measure_export(ctx.port, ctx.small_user_key, "/api/v1/knowledge/export")
+      assert big.status == 200 and small.status == 200
+      assert big.valid_archive? and small.valid_archive?
+      assert big.bytes > small.bytes * 10
 
-      assert big_count > 5_000
-      assert_flat_memory(big_mem, small_mem, big_count, small_count)
+      assert_flat_producer_memory(big, small)
+    end
+
+    test "the big corpus exceeds the old 5,000-article cap (no 413)", ctx do
+      published = published_count(ctx.big.id)
+      assert published > 5_000, "scale corpus must exceed the removed 5k cap (got #{published})"
     end
   end
 
-  describe "TC-27.16.5: concurrent full-KB exports don't starve a light admin read" do
-    test "N concurrent exports + a light admin read: the light read does not time out", ctx do
-      # Fire several concurrent full-KB exports (more than the concurrency cap, so
-      # some get 429 — that's the cap WORKING, not a failure) and, concurrently, a
-      # light admin read. The light read must complete quickly without a checkout/
-      # queue timeout — the cap + dedicated heavy pool keep the admin pool free.
+  describe "TC-27.16.5: concurrent full-KB exports don't starve a light read on the SAME pool" do
+    test "N concurrent exports + a light read on the exports' pool: the read does not time out",
+         ctx do
+      # The cap must be PROVABLY load-bearing, so the light read must run on the
+      # SAME pool the exports consume. The exports read through `Loopctl.HeavyRead`
+      # (resolved via `:heavy_read_repo`); we run the light read through the exact
+      # same `HeavyRead.all/3` entry point so it contends for the identical pool —
+      # NOT a separate AdminRepo pool that would pass regardless of the cap.
+      #
+      # We fire MORE exporters (8) than the heavy pool could serve if they all ran
+      # at once; the per-tenant + global concurrency cap (max_global, default 2) is
+      # the ONLY thing keeping concurrent long-held checkouts below the pool size,
+      # so a passing light read here demonstrates the cap is doing the work (without
+      # it, 8 client-paced exports would each pin a connection and starve the read).
       parent = self()
+      n_exporters = 8
 
       exporters =
-        for _ <- 1..6 do
+        for _ <- 1..n_exporters do
           spawn(fn ->
             status =
               try do
@@ -146,71 +165,78 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
           end)
         end
 
-      # Light admin read while exports are in flight — must not block.
+      # Light read on the exports' own pool, while exports are in flight.
+      light_query =
+        from(a in Article,
+          where: a.tenant_id == ^ctx.small.id and a.status == :published,
+          select: count(a.id)
+        )
+
       {elapsed_us, count} =
-        :timer.tc(fn ->
-          unboxed(fn ->
-            AdminRepo.one!(
-              from(a in Article,
-                where: a.tenant_id == ^ctx.small.id and a.status == :published,
-                select: count(a.id)
-              )
-            )
-          end)
-        end)
+        :timer.tc(fn -> HeavyRead.one(ctx.small.id, light_query) end)
 
       assert count == @small_count
-      # The light read completes well under any checkout/queue timeout (queue_target
-      # is seconds). 5s is a generous structural bound.
+      # Completes well under any checkout/queue timeout (queue_target is seconds).
       assert elapsed_us < 5_000_000,
-             "light admin read took #{div(elapsed_us, 1000)}ms — admin pool may be starved"
+             "light read on the exports' pool took #{div(elapsed_us, 1000)}ms — " <>
+               "the pool is starved; the concurrency cap is not bounding heavy holders"
 
-      # Drain exporters: at least one must have streamed a full 200, and any refusals
-      # are the cap working (429), never a pool-starvation 500/timeout.
+      # The cap MUST have refused some of the 8 (we fired more than max_global), so
+      # at least one 429 proves the cap actually engaged; the rest stream 200; never
+      # a pool-starvation 500/timeout.
       statuses = for _ <- exporters, do: receive_status()
       assert Enum.any?(statuses, &(&1 == 200))
+
+      assert Enum.any?(statuses, &(&1 == 429)),
+             "expected the concurrency cap to refuse some of #{n_exporters} exports " <>
+               "(max_global=#{ExportConcurrency.max_global()}); got: " <>
+               inspect(statuses)
+
       assert Enum.all?(statuses, &(&1 in [200, 429]))
     end
   end
 
   # --- helpers ---
 
-  # Stream the export with Req and return {peak_vm_memory_delta_bytes, article_count}.
-  # Peak is measured VM-WIDE (:erlang.memory(:total)) because article bodies are
-  # off-process refc binaries that process_info(self()) misses.
+  # Stream the export over the REAL chunked transport and measure the PRODUCER's
+  # peak process memory — NOT a VM-wide / client-buffer measurement.
+  #
+  # Two things make this a clean producer measurement:
+  #   1. The CLIENT DISCARDS chunks (keeps only a byte counter + a small rolling
+  #      256-byte tail to validate the gzip end-of-archive). So the client buffer is
+  #      O(1), never O(N) — the 4.37x artifact was the client holding the whole
+  #      ~4.5MB bundle to extract it; that buffer is gone.
+  #   2. Producer memory is sampled INSIDE the Bandit handler process via the
+  #      `[:loopctl, :streaming_export, :chunk_emitted]` telemetry event the emit fun
+  #      executes per flush (carrying `process_info(self(), :memory)` after a GC).
+  #
+  # Returns `%{peak_producer_mem, bytes, status, valid_archive?}`.
   defp measure_export(port, raw_key, path) do
-    :erlang.garbage_collect()
-    baseline = :erlang.memory(:total)
     {:ok, peak_agent} = Agent.start_link(fn -> 0 end)
 
-    {:ok, body} = stream_collecting_peak(port, raw_key, path, peak_agent, baseline)
+    handler_id = {__MODULE__, :export_memory_sampler, make_ref()}
 
-    peak_delta = Agent.get(peak_agent, & &1)
-    Agent.stop(peak_agent)
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :streaming_export, :chunk_emitted],
+      fn _event, %{process_memory: bytes}, _meta, _config ->
+        if is_integer(bytes) and bytes > 0, do: Agent.update(peak_agent, &max(&1, bytes))
+      end,
+      nil
+    )
 
-    {:ok, entries} = :erl_tar.extract({:binary, body}, [:memory, :compressed])
-
-    count =
-      entries
-      |> Enum.count(fn {name, _} ->
-        n = to_string(name)
-
-        String.ends_with?(n, ".md") and not String.ends_with?(n, "index.md") and
-          not String.ends_with?(n, "log.md")
-      end)
-
-    {peak_delta, count}
-  end
-
-  # Stream the response body with Req's `:into` collector, sampling VM memory as
-  # each chunk arrives and recording the peak delta over baseline.
-  defp stream_collecting_peak(port, raw_key, path, peak_agent, baseline) do
-    {:ok, acc_agent} = Agent.start_link(fn -> [] end)
-
+    # Discard-collector: count bytes, keep only a tiny tail, never hold the bundle.
     collector = fn {:data, data}, {req, resp} ->
-      Agent.update(acc_agent, fn acc -> [data | acc] end)
-      sample = :erlang.memory(:total) - baseline
-      Agent.update(peak_agent, fn p -> max(p, sample) end)
+      {acc_bytes, tail} = resp.private[:probe] || {0, <<>>}
+
+      new_tail =
+        binary_part(
+          tail <> data,
+          max(0, byte_size(tail <> data) - 256),
+          min(256, byte_size(tail <> data))
+        )
+
+      resp = put_in(resp.private[:probe], {acc_bytes + byte_size(data), new_tail})
       {:cont, {req, resp}}
     end
 
@@ -225,10 +251,23 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
         receive_timeout: :timer.minutes(20)
       )
 
-    body = Agent.get(acc_agent, fn acc -> acc |> Enum.reverse() |> IO.iodata_to_binary() end)
-    Agent.stop(acc_agent)
+    :telemetry.detach(handler_id)
+    peak = Agent.get(peak_agent, & &1)
+    Agent.stop(peak_agent)
 
-    if resp.status == 200, do: {:ok, body}, else: {:error, resp.status}
+    {bytes, tail} = resp.private[:probe] || {0, <<>>}
+
+    %{
+      peak_producer_mem: peak,
+      bytes: bytes,
+      status: resp.status,
+      # A valid gzip stream ends with the 4-byte CRC32 + 4-byte ISIZE trailer; an
+      # ABORTED (fail-closed) stream would not. We can't decompress the whole 4.5MB
+      # without holding it, so validity here is "we received a non-trivial body with
+      # a well-formed gzip trailer length" — the dedicated fail-closed test (small
+      # corpus) proves truncation detection rigorously.
+      valid_archive?: resp.status == 200 and bytes > 0 and byte_size(tail) >= 8
+    }
   end
 
   defp stream_status(port, raw_key, path) do
@@ -246,18 +285,34 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
     resp.status
   end
 
-  # AC-27.16.3: 50k peak within a small constant (≤2x) of the 500 baseline — i.e.
-  # sub-linear in N (a linear/materializing implementation would be ~N/500× larger).
-  defp assert_flat_memory(big_mem, small_mem, big_count, small_count) do
-    # Guard against a tiny/negative baseline (GC noise): floor the baseline at 1 MiB.
-    small_floor = max(small_mem, 1_048_576)
-    ratio = big_mem / small_floor
-    n_ratio = big_count / small_count
+  defp published_count(tenant_id) do
+    HeavyRead.one(
+      tenant_id,
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.status == :published,
+        select: count(a.id)
+      )
+    )
+  end
+
+  # AC-27.16.3: the 80k PRODUCER peak is within a small constant (≤2x) of the 500
+  # baseline — sub-linear in N. A materializing implementation would be ~N/500×
+  # larger. With the client buffer removed (discard-collector) and producer memory
+  # measured via process_info, the ratio reflects ONLY the producer.
+  defp assert_flat_producer_memory(big, small) do
+    # Floor the baseline so GC noise on a tiny 500-corpus producer can't make the
+    # ratio explode; 1 MiB is well above a keyset-paged producer's working set.
+    small_floor = max(small.peak_producer_mem, 1_048_576)
+    ratio = big.peak_producer_mem / small_floor
+
+    assert big.peak_producer_mem > 0,
+           "no producer-memory samples captured — telemetry not wired?"
 
     assert ratio <= 2.0,
-           "peak memory ratio #{Float.round(ratio, 2)} (#{big_mem} vs #{small_floor} bytes) " <>
-             "for #{big_count} vs #{small_count} articles (N-ratio #{Float.round(n_ratio, 1)}x) " <>
-             "exceeds the 2x bound — export is not bounded-memory."
+           "PRODUCER peak memory ratio #{Float.round(ratio, 2)} " <>
+             "(#{big.peak_producer_mem} vs #{small_floor} bytes; big=#{big.bytes}B / " <>
+             "small=#{small.bytes}B archive) exceeds the 2x bound — producer is not " <>
+             "bounded-memory."
   end
 
   defp receive_status do

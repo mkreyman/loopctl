@@ -92,9 +92,11 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
       :ets.update_counter(@table, @global_key, {2, -1}, {@global_key, 0})
       {:error, :too_many_exports}
     else
-      # Register for crash-safe release: if the caller dies without release/1, the
-      # GenServer decrements the slot it reserved.
-      GenServer.cast(__MODULE__, {:track, self(), tenant_id})
+      # Register for crash-safe release SYNCHRONOUSLY: the monitor is guaranteed
+      # established before acquire/1 returns, so there is no window where the slot
+      # is reserved (counters incremented) but unmonitored — a caller that crashes
+      # the instant after acquire/1 returns is still reclaimed by the :DOWN handler.
+      GenServer.call(__MODULE__, {:track, self(), tenant_id})
       :ok
     end
   end
@@ -103,15 +105,20 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   Releases the streaming-export slot previously reserved by `acquire/1` for
   `tenant_id` on the calling process.
 
-  Decrements both counters (never below zero) and stops monitoring the caller.
-  Safe to call at most once per successful `acquire/1`; calling it without a prior
-  successful acquire is a no-op at the floor.
+  The decrement is performed EXACTLY ONCE per acquisition by the GenServer, gated
+  on the caller still being tracked: a synchronous `call` (not a `cast` + a
+  separate ETS write) ensures that an in-flight `:DOWN` for the same pid can't
+  ALSO decrement (the GenServer demonitors with `[:flush]`, purging a queued
+  `:DOWN`, and removes the pid from tracking before returning). This is what keeps
+  the SHARED GLOBAL counter from being decremented twice — a double-decrement would
+  under-count in-flight exports and admit MORE than `max_global/0`.
+
+  Idempotent: calling it again (or without a prior successful acquire) is a no-op,
+  because the pid is no longer tracked.
   """
   @spec release(binary()) :: :ok
   def release(tenant_id) when is_binary(tenant_id) do
-    GenServer.cast(__MODULE__, {:release, self(), tenant_id})
-    decrement(tenant_id)
-    :ok
+    GenServer.call(__MODULE__, {:release, self(), tenant_id})
   end
 
   @doc "Current global in-flight export count (for tests/telemetry)."
@@ -159,13 +166,13 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   end
 
   @impl true
-  def handle_cast({:track, pid, tenant_id}, state) do
+  def handle_call({:track, pid, tenant_id}, _from, state) do
     # Monitor once per pid (a pid runs one export at a time on the request path).
     case Map.get(state.pids, pid) do
       nil ->
         ref = Process.monitor(pid)
 
-        {:noreply,
+        {:reply, :ok,
          %{
            state
            | monitors: Map.put(state.monitors, ref, {pid, tenant_id}),
@@ -173,26 +180,39 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
          }}
 
       _ref ->
-        {:noreply, state}
+        {:reply, :ok, state}
     end
   end
 
   @impl true
-  def handle_cast({:release, pid, _tenant_id}, state) do
-    {:noreply, demonitor_pid(state, pid)}
+  def handle_call({:release, pid, tenant_id}, _from, state) do
+    # EXACTLY-ONCE decrement, gated on the pid still being tracked. If it is, this
+    # release owns the decrement; we demonitor with [:flush] to purge any already-
+    # queued :DOWN for this pid so the :DOWN handler can't ALSO decrement. If the
+    # pid is NOT tracked (a :DOWN already reclaimed it, or a double-release), this
+    # is a no-op — the global counter is never decremented twice.
+    case Map.get(state.pids, pid) do
+      nil ->
+        {:reply, :ok, state}
+
+      ref ->
+        Process.demonitor(ref, [:flush])
+        decrement(tenant_id)
+        {:reply, :ok, untrack(state, ref, pid)}
+    end
   end
 
   @impl true
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     # An acquirer crashed without releasing — reclaim its leaked slot so the cap
-    # doesn't drift down permanently.
+    # doesn't drift up permanently. Gated on still being tracked (a concurrent
+    # release/1 may have already demonitored+decremented), so the decrement is
+    # exactly-once with release.
     case Map.get(state.monitors, ref) do
       {^pid, tenant_id} ->
         decrement(tenant_id)
         Logger.warning("export concurrency: reclaimed leaked slot for crashed exporter")
-
-        {:noreply,
-         %{state | monitors: Map.delete(state.monitors, ref), pids: Map.delete(state.pids, pid)}}
+        {:noreply, untrack(state, ref, pid)}
 
       _ ->
         {:noreply, state}
@@ -201,20 +221,15 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
 
   # --- Private ---
 
-  defp demonitor_pid(state, pid) do
-    case Map.get(state.pids, pid) do
-      nil ->
-        state
-
-      ref ->
-        Process.demonitor(ref, [:flush])
-        %{state | monitors: Map.delete(state.monitors, ref), pids: Map.delete(state.pids, pid)}
-    end
+  defp untrack(state, ref, pid) do
+    %{state | monitors: Map.delete(state.monitors, ref), pids: Map.delete(state.pids, pid)}
   end
 
-  # Decrement both counters, clamped at zero so a double-release or a
-  # release-after-crash-reclaim can't drive a counter negative (which would inflate
-  # the effective cap).
+  # Decrement both counters, clamped at zero. With the exactly-once gating in the
+  # GenServer the clamp should never actually fire, but it's kept as defense-in-depth
+  # so a stray decrement can never drive a counter negative (which would inflate the
+  # effective cap). Called ONLY from the GenServer process (release/DOWN), so the
+  # two decrements are serialized — never a concurrent double-decrement.
   defp decrement(tenant_id) do
     dec_floor(@global_key)
     dec_floor(tenant_key(tenant_id))

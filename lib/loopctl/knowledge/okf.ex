@@ -59,6 +59,25 @@ defmodule Loopctl.Knowledge.OKF do
   # a synchronous, per-file mutation, so it keeps an explicit ceiling.
   @max_import_concepts 5_000
 
+  # BUFFERED-EXPORT cap (`?format=json` ONLY): the JSON convenience path materializes
+  # the WHOLE bundle in memory (it returns a `%{files: ...}` map), so it MUST keep a
+  # count cap or a 76k-article KB would OOM the node. The BACKUP path — the default
+  # streamed `.tar.gz` — has NO count cap (it is bounded-memory by construction);
+  # callers above this bound are pointed there. Over the cap, `build_bundle/2`
+  # returns `{:error, :payload_too_large}`. Runtime-configurable (so the over-cap
+  # 413 is testable cheaply); defaults to 5,000.
+  @max_buffered_export_articles 5_000
+
+  @doc "The `?format=json` buffered-export article-count cap (config-tunable)."
+  @spec max_buffered_export_articles() :: pos_integer()
+  def max_buffered_export_articles,
+    do:
+      Application.get_env(
+        :loopctl,
+        :okf_max_buffered_export_articles,
+        @max_buffered_export_articles
+      )
+
   @categories Ecto.Enum.values(Article, :category)
   @category_strings Enum.map(@categories, &to_string/1)
 
@@ -79,38 +98,62 @@ defmodule Loopctl.Knowledge.OKF do
   Builds an OKF bundle (files map) from a tenant's published articles, fully in
   memory.
 
-  This is the buffered convenience used by the `?format=json` export path (tooling
-  that writes the files itself). The DEFAULT export path streams a `.tar.gz` with
-  bounded memory via `Loopctl.Knowledge.StreamingExport` and does NOT call this.
-  There is no article-count cap (US-27.16 removed it); a caller choosing the JSON
-  path is explicitly opting into an in-memory bundle.
+  This is the BUFFERED convenience used by the `?format=json` export path (tooling
+  that writes the files itself). It materializes the whole bundle, so it is bounded
+  by an article-count cap (#{@max_buffered_export_articles}) to avoid OOMing on a
+  large KB. The DEFAULT/backup export path streams a `.tar.gz` with bounded memory
+  via `Loopctl.Knowledge.StreamingExport` and has NO count cap; callers above the
+  cap should use it.
 
   ## Options
 
   - `:project_id` — when set, includes tenant-wide (nil project) + project articles.
+  - `:max_articles` — override the buffered-export count cap for THIS call (defaults
+    to `max_buffered_export_articles/0`). The HTTP `?format=json` path uses the
+    default; callers that legitimately need a different bound (e.g. re-export of an
+    imported multi-article bundle in tests) pass it explicitly.
 
   ## Returns
 
   - `{:ok, %{files: files, meta: map}}`
+  - `{:error, :payload_too_large}` when the published-article count exceeds the cap
+    (use the streamed `.tar.gz` export instead).
   """
-  @spec build_bundle(Ecto.UUID.t(), keyword()) :: {:ok, %{files: files(), meta: map()}}
+  @spec build_bundle(Ecto.UUID.t(), keyword()) ::
+          {:ok, %{files: files(), meta: map()}} | {:error, :payload_too_large}
   def build_bundle(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
+    cap = Keyword.get(opts, :max_articles, max_buffered_export_articles())
 
-    articles = fetch_published(tenant_id, project_id)
-    paths = assign_paths(articles)
-    files = build_files(articles, paths)
+    # Cheap COUNT first (no body load) so an over-cap KB is rejected BEFORE
+    # materializing megabytes of rows — the buffered path must never OOM.
+    if count_published(tenant_id, project_id) > cap do
+      {:error, :payload_too_large}
+    else
+      articles = fetch_published(tenant_id, project_id)
+      paths = assign_paths(articles)
+      files = build_files(articles, paths)
 
-    {:ok,
-     %{
-       files: files,
-       meta: %{
-         okf_version: @okf_version,
-         article_count: length(articles)
-       }
-     }}
+      {:ok,
+       %{
+         files: files,
+         meta: %{
+           okf_version: @okf_version,
+           article_count: length(articles)
+         }
+       }}
+    end
   end
 
+  defp count_published(tenant_id, project_id) do
+    tenant_id |> export_query(project_id) |> AdminRepo.aggregate(:count, :id)
+  end
+
+  # NB: build_bundle/2 reads via AdminRepo (NOT the HeavyRead structural tenant
+  # guard). The tenant scope is enforced by `export_query/2`'s explicit
+  # `a.tenant_id == ^tenant_id` predicate (and the count cap bounds the row set).
+  # The streamed backup path DOES go through HeavyRead's guard; this buffered
+  # convenience path is bounded + explicitly tenant-scoped here.
   defp fetch_published(tenant_id, project_id) do
     tenant_id
     |> export_query(project_id)
