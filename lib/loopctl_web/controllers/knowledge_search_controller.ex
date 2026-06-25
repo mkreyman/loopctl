@@ -186,6 +186,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    type: :integer,
                    description: "Offset path only; absent on the keyset (`cursor`) path"
                  },
+                 pool_capped: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Semantic relevance mode only: true when the ranked corpus exceeds the " <>
+                       "relevance pool cap, so results beyond the cap are NOT reachable by a " <>
+                       "deeper `offset` — switch to list mode for full enumeration."
+                 },
                  next_cursor: %OpenApiSpex.Schema{
                    type: :string,
                    nullable: true,

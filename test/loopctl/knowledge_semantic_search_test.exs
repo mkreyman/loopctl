@@ -726,4 +726,56 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
                Knowledge.search_combined(tenant.id, "fallback")
     end
   end
+
+  describe "search_semantic/3 - relevance-pool meta + truncation signal (US-27.7a, TC-27.7a.2)" do
+    test "small corpus: ranked results + full meta shape, pool_capped false" do
+      %{tenant: tenant} = setup_tenant()
+
+      a = create_article_with_embedding(tenant.id, %{title: "Aligned"}, :query)
+      _b = create_article_with_embedding(tenant.id, %{title: "Medium"}, :medium)
+      _c = create_article_with_embedding(tenant.id, %{title: "Far"}, :far)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query))
+
+      # Ranked by similarity desc — the :query-aligned article is most similar.
+      assert length(results) == 3
+      assert hd(results).id == a.id
+
+      # Full meta contract preserved (TC-27.7a.2) + the additive truncation signal.
+      assert meta.total_count == 3
+      assert meta.limit == 10
+      assert meta.offset == 0
+      assert meta.search_mode == "semantic_only"
+      assert meta.total_count_scope == "ranked_corpus"
+      # 3 ranked rows <= the (test) relevance-pool cap of 5 → fully reachable, not capped.
+      assert meta.pool_capped == false
+    end
+
+    test "corpus larger than the relevance-pool cap: pool_capped true + deep offset truncates" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Seed cap+2 near-identical embedded articles (test cap = 5, see config/test.exs).
+      for i <- 1..7, do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
+
+      {:ok, %{results: results, meta: meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: 10)
+
+      # total_count is the FULL ranked corpus (a SEPARATE count, NOT pool-bounded) ...
+      assert meta.total_count == 7
+      # ... but the relevance pool only surfaces up to the cap, so the tail is unreachable
+      # by a deeper offset — and the signal flags it (not silent).
+      assert length(results) == 5
+      assert meta.pool_capped == true
+
+      # A page past the cap returns empty (documented relevance tradeoff); the signal
+      # still flags it so the consumer knows to switch to list mode for full enumeration.
+      {:ok, %{results: deep, meta: deep_meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: 10, offset: 5)
+
+      assert deep == []
+      assert deep_meta.total_count == 7
+      assert deep_meta.pool_capped == true
+    end
+  end
 end

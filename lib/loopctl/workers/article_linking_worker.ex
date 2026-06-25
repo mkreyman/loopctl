@@ -34,7 +34,11 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
   Configurable max comparisons via
   `Application.get_env(:loopctl, :article_link_max_comparisons, 50)`.
-  Logs a warning when candidate count exceeds the limit.
+  Logs a warning when candidate count exceeds the limit. Since US-27.7a the lookup
+  runs through `VectorSearch.nearest/4`, whose `k` is clamped to
+  `VectorSearch.max_k/0` (default 100), so a configured value above that ceiling is
+  capped (a documented kNN cost bound); the default 50 is unaffected, and a clamp is
+  logged once per job.
 
   ## Threshold (AC-21.2.4)
 
@@ -79,8 +83,27 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
       {:ok, %Article{} = article} ->
         threshold = Application.get_env(:loopctl, :article_link_threshold, 0.6)
-        max_comparisons = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
+        max_comparisons = clamped_max_comparisons()
         find_and_link_similar(article, tenant_id, threshold, max_comparisons)
+    end
+  end
+
+  # `max_comparisons` flows to the kNN helper as `k`, which is clamped to
+  # `VectorSearch.max_k/0` (US-27.7a cost bound). Surface that clamp once so an operator
+  # who configured a higher value isn't silently capped (default 50 is well under it).
+  defp clamped_max_comparisons do
+    configured = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
+    max_k = VectorSearch.max_k()
+
+    if configured > max_k do
+      Logger.warning(
+        "article_link_max_comparisons=#{configured} exceeds VectorSearch.max_k=#{max_k}; " <>
+          "capping similarity comparisons at #{max_k}"
+      )
+
+      max_k
+    else
+      configured
     end
   end
 
@@ -129,11 +152,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # BEHAVIOR PRESERVED: self exclusion, published-only, and the project scope
   # ("same-project OR tenant-wide" for a project-scoped source; no project filter for a
   # tenant-wide one) are unchanged — the latter via the helper's `:project_or_global` opt,
-  # which mirrors the old `scope_by_project/2` exactly. The threshold boundary is also
-  # preserved EXACTLY: we ask the helper for `threshold: 0.0` (no floor in the indexed
-  # query) and keep the INCLUSIVE `sim >= threshold` filter in memory here — the helper's
-  # own floor is strict `>`, so leaving the boundary check here is what keeps a candidate
-  # whose similarity equals the threshold linkable, identical to the pre-migration code.
+  # which mirrors the old `scope_by_project/2` exactly. The threshold boundary is
+  # preserved for any POSITIVE `threshold`: we ask the helper for `threshold: 0.0` (no
+  # floor in the indexed query) and keep the INCLUSIVE `sim >= threshold` filter in memory
+  # here — the helper's own floor is strict `>`, so leaving the boundary check here keeps a
+  # candidate whose similarity equals the (positive) threshold linkable, identical to the
+  # pre-migration code. (Edge: at `threshold == 0.0` the helper's `> 0.0` floor — over the
+  # `GREATEST(0, 1 - distance)` score — additionally drops exactly-orthogonal candidates
+  # the old in-memory `>= 0.0` kept. This is a deliberate, harmless tightening for
+  # auto-linking: a 0.0-similarity "relates_to" link is noise; the default threshold is 0.6.)
   #
   # RECALL NOTE (post-ANN-filter tradeoff): because the project scope now runs on the
   # OUTER pool (it must, to keep HNSW), the worker links among the GLOBAL-nearest `pool`

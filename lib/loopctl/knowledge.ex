@@ -4656,7 +4656,15 @@ defmodule Loopctl.Knowledge do
          # set — NOT a match count, and <= the total published count (articles
          # without an embedding are excluded). Use knowledge_stats for the
          # full wiki size.
-         total_count_scope: "ranked_corpus"
+         total_count_scope: "ranked_corpus",
+         # US-27.7a relevance-pool truncation signal (NOT silent — mirrors the
+         # `recall_truncated` / keyset `next_cursor: null` exhaustion conventions).
+         # Results are drawn from the top-`cap` relevance pool, so when the ranked
+         # corpus is larger than the cap, the tail beyond it is NOT reachable by a
+         # deeper `offset` (a page past the cap returns empty). `pool_capped: true`
+         # tells the consumer "there are more ranked results than relevance
+         # pagination can surface — switch to list mode for full enumeration."
+         pool_capped: total_count > semantic_result_pool_cap()
        }
      }}
   end
@@ -4763,13 +4771,18 @@ defmodule Loopctl.Knowledge do
         @default_semantic_result_pool_floor
       )
 
-    cap =
-      Application.get_env(:loopctl, :semantic_result_pool_cap, @default_semantic_result_pool_cap)
-
     needed
     |> max(floor)
-    |> min(cap)
+    |> min(semantic_result_pool_cap())
   end
+
+  # The hard reachability ceiling for relevance-search pagination (US-27.7a): results come
+  # from the top-`cap` relevance pool, so a consumer can page through at most `cap` ranked
+  # rows regardless of `offset`. Drives both the results pool's hard cap and the
+  # `meta.pool_capped` truncation signal. Config `:semantic_result_pool_cap`.
+  defp semantic_result_pool_cap,
+    do:
+      Application.get_env(:loopctl, :semantic_result_pool_cap, @default_semantic_result_pool_cap)
 
   @doc """
   Combined keyword + semantic search with configurable weighting.
