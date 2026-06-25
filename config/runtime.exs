@@ -85,13 +85,20 @@ if config_env() == :prod do
 
   # HeavyReadRepo (US-27.11) — dedicated BYPASSRLS pool for heavy vector/enumeration
   # reads, isolated from the small AdminRepo pool so a slow read can't starve light
-  # admin ops (and vice-versa). Its `:parameters` carry a pool-level, server-side
-  # `statement_timeout` (a CORE GUC, settable via the startup packet) — the clean
-  # fast-fail lever US-27.4 builds on, with no per-request transaction. A long-held
-  # US-27.16 export overrides it per-transaction via SET LOCAL (see Loopctl.HeavyRead
-  # `transaction/2` `:statement_timeout`). `ef_search` is NOT set here (pgvector custom
-  # GUC, rejected via :parameters on managed PG); see docs/runbooks/knowledge-scale.md
-  # for the ALTER ROLE mechanism if it must be raised.
+  # admin ops (and vice-versa).
+  #
+  # The server-side `statement_timeout` is applied PER-READ via `SET LOCAL` inside the
+  # HeavyRead transaction path (Loopctl.HeavyRead.opts/1 → all/one → transaction/2),
+  # NOT as a connection startup `:parameter`. This is load-bearing: Fly MPG fronts
+  # Postgres with pgbouncer, which allows only an allowlisted set of startup parameters
+  # and REJECTS a `statement_timeout` startup parameter with
+  # `FATAL 08P01 unsupported startup parameter: statement_timeout`. Setting it via
+  # `:parameters` crash-loops EVERY HeavyReadRepo connection (the pool never establishes
+  # one) and 503/504s every heavy endpoint (suggested_links, semantic search,
+  # distant_pairs, novelty, heavy enumeration). `SET LOCAL` inside a transaction is the
+  # pgbouncer-safe path and is verified to enforce against the live pool. Likewise
+  # `ef_search` is NOT settable via :parameters on managed PG (a pgvector custom GUC);
+  # see docs/runbooks/knowledge-scale.md for the ALTER ROLE mechanism if it must change.
   #
   # Pool sizes here MUST stay in lockstep with `Loopctl.DbCapacity` (which models the
   # connection budget and is asserted in db_capacity_test.exs). Sizing (AC-27.11.1/.5),
@@ -106,6 +113,11 @@ if config_env() == :prod do
   # matching the `_MS` env name; re-stringified for the startup packet.
   heavy_read_statement_timeout_ms =
     String.to_integer(System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000")
+
+  # Consumed by Loopctl.HeavyRead.opts/1 as the DEFAULT server-side statement_timeout
+  # for any heavy endpoint without a per-endpoint override — applied via SET LOCAL on
+  # the read path (pgbouncer-safe), replacing the rejected startup `:parameters` lever.
+  config :loopctl, :heavy_read_statement_timeout_ms, heavy_read_statement_timeout_ms
 
   # Slow-query logging threshold (US-27.4). Parse to integer for the same reason —
   # garbage values fail loudly at boot. Default 1000ms.
@@ -160,8 +172,11 @@ if config_env() == :prod do
     socket_options: maybe_ipv6,
     connect_timeout: 15_000,
     queue_target: 5_000,
-    queue_interval: 10_000,
-    parameters: [statement_timeout: "#{heavy_read_statement_timeout_ms}"]
+    queue_interval: 10_000
+
+  # NOTE: no `parameters: [statement_timeout: ...]` here — pgbouncer rejects it (08P01).
+  # The timeout is enforced per-read via SET LOCAL (HeavyRead.opts/1). See the comment
+  # above and config_pgbouncer_safe_parameters_test.exs (the regression guard).
 
   # OpenAI embedding provider for semantic search (Knowledge Wiki)
   if openai_key = System.get_env("OPENAI_API_KEY") do

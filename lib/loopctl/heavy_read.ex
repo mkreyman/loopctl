@@ -58,11 +58,17 @@ defmodule Loopctl.HeavyRead do
 
   @doc """
   Per-read options for a heavy endpoint (US-27.4): the 15s CLIENT timeout backstop plus
-  an optional per-endpoint SERVER-SIDE `:statement_timeout` override (config
-  `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`). When no
-  override is configured the read uses the pool-level statement_timeout (the default
-  path, no per-request transaction). Also passes the endpoint key via
-  `telemetry_options` so slow-query logs can trace which endpoint triggered the query.
+  the SERVER-SIDE `:statement_timeout` — the per-endpoint override (config
+  `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`) if set,
+  ELSE the pool-wide default (`:heavy_read_statement_timeout_ms`, 10s). It is ALWAYS
+  present, so every heavy read is wrapped in a `SET LOCAL statement_timeout` transaction.
+
+  This replaced a connection-startup `parameters: [statement_timeout: ...]` lever
+  (US-27.11) that Fly MPG's pgbouncer rejected with `08P01 unsupported startup
+  parameter`, crash-looping the whole HeavyReadRepo pool and 503ing every heavy endpoint
+  (US-27.13). `SET LOCAL` inside a transaction is the pgbouncer-safe way to set a
+  server-side statement_timeout. Also passes the endpoint key via `telemetry_options` so
+  slow-query logs can trace which endpoint triggered the query.
 
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
@@ -73,11 +79,21 @@ defmodule Loopctl.HeavyRead do
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
     base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
+    Keyword.put(base, :statement_timeout, statement_timeout_for(endpoint))
+  end
 
+  # The per-endpoint override if a positive int, else the pool-wide default. Always a
+  # positive int → every heavy read runs under a SET LOCAL statement_timeout (the
+  # pgbouncer-safe replacement for the rejected startup `:parameters`).
+  defp statement_timeout_for(endpoint) do
     case statement_timeout_override(endpoint) do
-      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
-      _ -> base
+      ms when is_integer(ms) and ms > 0 -> ms
+      _ -> default_statement_timeout()
     end
+  end
+
+  defp default_statement_timeout do
+    Application.get_env(:loopctl, :heavy_read_statement_timeout_ms, 10_000)
   end
 
   defp statement_timeout_override(endpoint) do
@@ -90,16 +106,17 @@ defmodule Loopctl.HeavyRead do
   Like `Repo.all/2`, but requires a `tenant_id` and a query whose every base-table
   source is scoped to it. Raises `ArgumentError` otherwise.
 
-  A per-endpoint `:statement_timeout` (positive ms) option overrides the pool-level
-  default for THIS read only, via a `SET LOCAL` inside a transaction (US-27.4). Omit
-  it to use the pool default (no per-request transaction — the common, preferred
-  path).
+  A `:statement_timeout` (positive ms) option sets the server-side timeout for THIS read
+  via a `SET LOCAL` inside a transaction (US-27.4). When omitted it defaults to the
+  pool-wide `:heavy_read_statement_timeout_ms` (10s) — so EVERY heavy read is protected
+  (there is no un-timed "pool default" path: pgbouncer rejects a startup-`:parameters`
+  statement_timeout, so the timeout MUST be applied per-read via SET LOCAL — US-27.13).
   """
   @spec all(binary(), Ecto.Queryable.t(), keyword()) :: [term()]
   def all(tenant_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout)
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st, fn -> repo().all(query, opts) end)
+    with_statement_timeout(st || default_statement_timeout(), fn -> repo().all(query, opts) end)
   end
 
   @doc "Like `Repo.one/2`, with the same tenant-scoping guard and `:statement_timeout` as `all/3`."
@@ -107,7 +124,7 @@ defmodule Loopctl.HeavyRead do
   def one(tenant_id, queryable, opts \\ []) do
     {st, opts} = Keyword.pop(opts, :statement_timeout)
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st, fn -> repo().one(query, opts) end)
+    with_statement_timeout(st || default_statement_timeout(), fn -> repo().one(query, opts) end)
   end
 
   # Run `fun` under a per-read SET LOCAL statement_timeout (when given) or directly
