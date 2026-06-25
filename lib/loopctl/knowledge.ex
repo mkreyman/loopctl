@@ -114,6 +114,18 @@ defmodule Loopctl.Knowledge do
   @spec max_relevance_page_size() :: pos_integer()
   def max_relevance_page_size, do: @max_relevance_page_size
 
+  # US-27.7a `search_semantic` relevance-pool sizing. The results path over-fetches the
+  # top-`pool` ANN nearest, then post-filters + paginates within the pool (the inner ANN
+  # is the shared HNSW-index-safe `VectorSearch.candidate_pool_query/4`). The pool covers
+  # `offset + limit` floored/capped: the FLOOR keeps the common shallow page cheap-but-not
+  # under-fetched, the CAP keeps the inner HNSW scan bounded. The cap is well above the
+  # in-contract deepest page (`offset + limit` with `limit ≤ max_relevance_page_size`), so
+  # every valid page is fully served; only an unusually-deep offset beyond it is truncated
+  # (the documented post-ANN-filter recall tradeoff). Overridable via config
+  # `:semantic_result_pool_floor` / `:semantic_result_pool_cap`.
+  @default_semantic_result_pool_floor 200
+  @default_semantic_result_pool_cap 1_000
+
   # Default/maximum number of facet rows (distinct tags) returned by `tag_facets/2`.
   # An omitted `:limit` is bounded by this (not "all"), so a tenant with tens of
   # thousands of distinct tags can't force an unbounded response; `distinct_count`
@@ -3441,74 +3453,41 @@ defmodule Loopctl.Knowledge do
   # Builds the suggested-links candidate query (returned, not executed) so a test can
   # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.
   #
-  # SHAPE IS LOAD-BEARING (verified with EXPLAIN against the ~76k-row prod corpus):
-  # pgvector's HNSW index (cosine) only accelerates a PURE `ORDER BY embedding <=> $const
-  # LIMIT k`. Adding the already-linked anti-join (a JOIN) OR a distance filter
-  # (`... <=> ... > threshold`) to that same query makes the planner abandon the index and
-  # Seq-Scan the entire corpus + Sort — the #172 / #170 production 500 (cost ~57k vs ~880).
-  #
-  # So this is split in two:
-  #   * INNER subquery — the pure top-`pool` nearest by cosine. Only index-safe filters
-  #     here (tenant, status, not-null, not-self, visibility — all verified to keep the
-  #     index). The target is a BOUND `^param` LIST of floats (`to_embedding_list/1`),
-  #     never the stored `%Pgvector{}` struct (that re-interpolation was the #168 500).
-  #   * OUTER query — applies the already-linked anti-join + the `similarity_score >
-  #     threshold` floor + the final `limit`, over just `pool` rows (cheap).
-  #
-  # `pool` over-fetches well beyond `limit` so the outer exclusions rarely starve the
-  # result; effective recall is additionally bounded by `hnsw.ef_search` (default 40),
-  # consistent with the `search_semantic` path. The caller has already confirmed the
-  # target exists / is published / is embedded / is visible.
+  # US-27.7a: this now routes through the shared, scale-tested kNN helper
+  # `Loopctl.Knowledge.VectorSearch.candidate_query/4` instead of a bespoke cosine query,
+  # so the index-correct shape is enforced in ONE place and a future edit here can't
+  # reintroduce the #170/#172 full scan. The verified shape is unchanged: the INNER pure
+  # ANN (`ORDER BY embedding <=> $const LIMIT pool`, only index-safe residual filters) is
+  # `VectorSearch.candidate_pool_query/4`, wrapped by an OUTER over-the-pool query carrying
+  # the already-linked anti-join (both directions), the `similarity_score > threshold`
+  # floor, the `order_by similarity desc`, and the final `limit`. The target is bound as a
+  # `[float()]` LIST param (never the stored `%Pgvector{}` struct — the #168 500). `pool` is
+  # the SAME `suggestion_candidate_pool/1` value as before (passed as `:pool`), so the
+  # over-fetch is byte-identical to the pre-migration sizing.
   @doc false
   def suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis) do
-    pool = suggestion_candidate_pool(limit)
-    candidates = suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool)
-
-    from(c in subquery(candidates),
-      # Exclude any article already linked to the target (either direction, any type).
-      left_join: l in ArticleLink,
-      on:
-        l.tenant_id == ^tenant_id and
-          ((l.source_article_id == ^article_id and l.target_article_id == c.id) or
-             (l.target_article_id == ^article_id and l.source_article_id == c.id)),
-      where: is_nil(l.id),
-      where: c.similarity_score > ^threshold,
-      order_by: [desc: c.similarity_score],
-      limit: ^limit,
-      select: %{
-        id: c.id,
-        title: c.title,
-        category: c.category,
-        similarity_score: c.similarity_score
-      }
+    VectorSearch.candidate_query(tenant_id, embedding, limit,
+      exclude_id: article_id,
+      exclude_linked: true,
+      threshold: threshold,
+      visibility_agent_id: vis,
+      pool: suggestion_candidate_pool(limit)
     )
   end
 
   # The inner ANN top-`pool` subquery, SHARED by the main suggestion query and the
   # under-fill probe so their candidate set is identical BY CONSTRUCTION (no drift). It
-  # is the pure top-`pool` nearest-by-cosine with only index-safe filters (tenant /
-  # status / not-null / not-self / visibility) and the computed `similarity_score`. The
-  # anti-join + threshold + final `limit` are applied by the OUTER query (see the SHAPE
-  # IS LOAD-BEARING note above); the probe reuses this same inner set to count pool
-  # fullness and above-threshold neighbors without re-running the ANN scan twice with
-  # divergent predicates.
+  # delegates to the helper's `VectorSearch.candidate_pool_query/4` — the SAME inner
+  # `candidate_query/4` builds — so the probe counts over EXACTLY the rows the main
+  # suggestion query drew from (the US-27.6b under-fill invariant). It is the pure
+  # top-`pool` nearest-by-cosine with only index-safe filters (tenant / status /
+  # not-null / not-self / visibility) and the computed `similarity_score`. The
+  # anti-join + threshold + final `limit` are applied by the OUTER query.
   defp suggestion_candidates_inner(tenant_id, article_id, embedding, vis, pool) do
-    target = to_embedding_list(embedding)
-
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id and a.status == :published,
-      where: not is_nil(a.embedding),
-      where: a.id != ^article_id,
-      order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
-      limit: ^pool,
-      select: %{
-        id: a.id,
-        title: a.title,
-        category: a.category,
-        similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
-      }
+    VectorSearch.candidate_pool_query(tenant_id, embedding, pool,
+      exclude_id: article_id,
+      visibility_agent_id: vis
     )
-    |> maybe_filter_by_visibility(vis)
   end
 
   # Over-fetch factor for the inner ANN subquery: pull this many nearest candidates from
@@ -4630,38 +4609,37 @@ defmodule Loopctl.Knowledge do
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
     status = Keyword.get(opts, :status, :published)
 
-    base_query =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: not is_nil(a.embedding),
-        select: %{
-          id: a.id,
-          tenant_id: a.tenant_id,
-          project_id: a.project_id,
-          title: a.title,
-          category: a.category,
-          status: a.status,
-          tags: a.tags,
-          inserted_at: a.inserted_at,
-          updated_at: a.updated_at,
-          similarity_score: fragment("1 - (embedding <=> ?)", ^query_embedding)
-        },
-        order_by: fragment("embedding <=> ?", ^query_embedding)
-      )
-
-    filtered_query = apply_search_filters(base_query, status, opts)
-
-    # Heavy vector reads via Loopctl.HeavyRead (US-27.11): dedicated pool, pool-level
-    # statement_timeout, isolated from the small AdminRepo pool. `filtered_query`
-    # filters `a.tenant_id`; the count's tenant predicate lives in its inner subquery.
-    count_query = from(q in subquery(filtered_query), select: count())
-    total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:semantic_search))
-
+    # RESULTS — relevance-pool model (US-27.7a, EXPLAIN-driven). The inner ANN is the
+    # shared, index-safe `VectorSearch.candidate_pool_query/4` (pure
+    # `ORDER BY embedding <=> $const LIMIT pool` on the HNSW index), and ALL selective
+    # filters (project/category/tags/memory-types/agents/conversation) are applied on the
+    # OUTER over-the-pool subquery, paginated within the pool. This is required because the
+    # pre-27.7a query applied those filters on the index-ordered scan itself, which at prod
+    # scale flipped the planner to a BitmapAnd + Sort over the corpus and ABANDONED HNSW
+    # (the #170/#172 shape — verified by EXPLAIN at 80k). status + visibility stay in the
+    # inner (both index-safe). The result shape/score (`1 - cosine_distance`) and field set
+    # are byte-for-byte the pre-27.7a contract (the `:semantic` pool select).
+    #
+    # RECALL/PAGINATION NOTE: results now come from the top-`pool` ANN that match the
+    # filters, not a full-corpus rank, so a page DEEPER than the pool returns empty. The
+    # pool is sized to comfortably cover `offset + limit` (and a config floor), so every
+    # in-contract page (limit ≤ #{@max_relevance_page_size}) is served; only an
+    # unusually-deep offset beyond the pool cap is affected — the documented post-ANN-filter
+    # tradeoff `VectorSearch` already carries (see its moduledoc).
     results =
-      filtered_query
-      |> limit(^limit)
-      |> offset(^offset)
+      tenant_id
+      |> semantic_results_query(query_embedding, opts)
       |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:semantic_search)))
+
+    # COUNT — kept as a SEPARATE full-corpus filtered `count(*)` so `total_count` PRESERVES
+    # its pre-27.7a meaning (the size of the whole embedded+filtered ranked corpus, NOT the
+    # pool). It carries NO `ORDER BY embedding <=> …`: a count needs no ordering, and the
+    # old subquery's ORDER BY forced a pointless full-corpus Seq Scan + Sort (~153ms at
+    # 80k). Without it the count is index-served by the filter indexes (a selective
+    # category+tags count is a BitmapAnd bounded by selectivity; the unfiltered count is a
+    # bounded tenant scan — inherently O(tenant rows) for a true `count(*)`).
+    count_query = semantic_count_query(tenant_id, query_embedding, status, opts)
+    total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:semantic_search))
 
     maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
 
@@ -4681,6 +4659,116 @@ defmodule Loopctl.Knowledge do
          total_count_scope: "ranked_corpus"
        }
      }}
+  end
+
+  # Builds `search_semantic`'s paginated RESULTS query (returned, not executed) — the
+  # relevance-pool shape. Public-but-`@doc false` so the US-27.7a scale plan-assertion can
+  # assert the REAL request-path query (AC-27.2.4): the inner ANN is the shared,
+  # HNSW-index-safe `VectorSearch.candidate_pool_query/4` (`:semantic` projection), the
+  # selective filters live on the OUTER over-the-pool subquery, and the page is taken
+  # within the pool. See `search_semantic/3` for the full rationale + recall note.
+  @doc false
+  def semantic_results_query(tenant_id, query_embedding, opts) do
+    limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    status = Keyword.get(opts, :status, :published)
+    pool = semantic_result_pool(offset + limit)
+
+    inner_pool =
+      VectorSearch.candidate_pool_query(tenant_id, query_embedding, pool,
+        select: :semantic,
+        status: status,
+        visibility_agent_id: Keyword.get(opts, :visibility_agent_id)
+      )
+
+    from(c in subquery(inner_pool),
+      order_by: [desc: c.similarity_score],
+      select: %{
+        id: c.id,
+        tenant_id: c.tenant_id,
+        project_id: c.project_id,
+        title: c.title,
+        category: c.category,
+        status: c.status,
+        tags: c.tags,
+        inserted_at: c.inserted_at,
+        updated_at: c.updated_at,
+        similarity_score: c.similarity_score
+      }
+    )
+    |> apply_semantic_pool_filters(opts)
+    |> limit(^limit)
+    |> offset(^offset)
+  end
+
+  # The full-corpus filtered `count(*)` for `search_semantic`'s `total_count` — NO
+  # `embedding <=> …` ordering (a count is order-independent; the ordering only forced a
+  # full-corpus Seq Scan + Sort pre-27.7a). The filter set is IDENTICAL to the results
+  # path (status + visibility + project/category/tags/memory-types/agents/conversation),
+  # so the count is the true size of the embedded+filtered ranked corpus. The tenant
+  # predicate on the base `articles` source satisfies the `HeavyRead` guard directly.
+  # Public-but-`@doc false` so the scale plan-assertion can assert the real count query.
+  @doc false
+  def semantic_count_query(tenant_id, query_embedding, status, opts) do
+    _ = query_embedding
+
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: not is_nil(a.embedding)
+      )
+
+    base
+    |> apply_search_filters(status, opts)
+    |> select([_a], count())
+  end
+
+  # Selective post-ANN filters for the semantic results pool, applied on the OUTER
+  # subquery (`c` binding) over the ≤`pool` rows — NEVER the inner index-ordered ANN
+  # (project/category/tags/`metadata @>` all have GIN/btree indexes and would defeat HNSW
+  # there). status + visibility are already applied in the inner pool (index-safe), so they
+  # are intentionally NOT re-applied here. Reuses the same equality/overlap/containment
+  # predicate helpers as the keyword/list path against the `[c]` binding (whose subquery
+  # select carries `project_id`/`category`/`tags`/`metadata`).
+  defp apply_semantic_pool_filters(query, opts) do
+    query
+    |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
+    |> maybe_filter_by_category(Keyword.get(opts, :category))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+    |> maybe_filter_by_memory_types(Keyword.get(opts, :memory_types))
+    |> maybe_filter_by_agents(Keyword.get(opts, :agents))
+    |> maybe_filter_by_conversation_id(Keyword.get(opts, :conversation_id))
+  end
+
+  # Over-fetch pool for the semantic relevance results (US-27.7a). Sized to cover the
+  # requested `offset + limit` page, floored for the common shallow page and HARD-capped so
+  # the inner HNSW scan cost is BOUNDED regardless of caller input. Config:
+  #   * `:semantic_result_pool_floor` (default #{@default_semantic_result_pool_floor})
+  #   * `:semantic_result_pool_cap`   (default #{@default_semantic_result_pool_cap})
+  #
+  # The cap is a HARD ceiling — it is the last clamp, so it ALWAYS binds (AC-27.6a.4: every
+  # caller-tunable cost parameter has an enforced upper bound). `offset` is NOT bounded by
+  # the caller/controller (only floored at 0), so a final `max(needed)` would let a large
+  # `offset` drive the inner `ORDER BY <=> LIMIT pool` to an arbitrary size — an unbounded
+  # scan. We deliberately do NOT do that: a page whose `offset + limit` exceeds the cap is
+  # served from the top-`cap` relevance pool and truncates (empty/partial) beyond it — the
+  # documented post-ANN relevance tradeoff (deep enumeration is the keyset list path's job,
+  # US-27.9a, not relevance search). The floor (≥ the `max_relevance_page_size` limit) keeps
+  # every in-cap page fully served under the default config.
+  defp semantic_result_pool(needed) when is_integer(needed) and needed > 0 do
+    floor =
+      Application.get_env(
+        :loopctl,
+        :semantic_result_pool_floor,
+        @default_semantic_result_pool_floor
+      )
+
+    cap =
+      Application.get_env(:loopctl, :semantic_result_pool_cap, @default_semantic_result_pool_cap)
+
+    needed
+    |> max(floor)
+    |> min(cap)
   end
 
   @doc """
