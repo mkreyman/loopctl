@@ -22,11 +22,23 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     tenant-wide articles (project_id IS NULL).
   - Tenant-wide articles compare against all articles in the tenant.
 
+  Since US-27.7a the similarity lookup runs through the shared
+  `Loopctl.Knowledge.VectorSearch.nearest/4` (the index-correct HNSW kNN path on
+  the HeavyRead pool), with the project scope applied as a post-ANN filter over the
+  over-fetch pool. The worker therefore links among the GLOBAL-nearest pool that
+  match the project, not the nearest-WITHIN-project — the documented post-ANN-filter
+  tradeoff (see `find_similar_articles/4`). For the worker's small `max_comparisons`
+  (default 50) against a generously sized pool the two are equivalent.
+
   ## Limits (AC-21.2.8 / AC-21.2.15)
 
   Configurable max comparisons via
   `Application.get_env(:loopctl, :article_link_max_comparisons, 50)`.
-  Logs a warning when candidate count exceeds the limit.
+  Logs a warning when candidate count exceeds the limit. Since US-27.7a the lookup
+  runs through `VectorSearch.nearest/4`, whose `k` is clamped to
+  `VectorSearch.max_k/0` (default 100), so a configured value above that ceiling is
+  capped (a documented kNN cost bound); the default 50 is unaffected, and a clamp is
+  logged once per job.
 
   ## Threshold (AC-21.2.4)
 
@@ -56,6 +68,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.VectorSearch
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
@@ -70,8 +83,27 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
 
       {:ok, %Article{} = article} ->
         threshold = Application.get_env(:loopctl, :article_link_threshold, 0.6)
-        max_comparisons = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
+        max_comparisons = clamped_max_comparisons()
         find_and_link_similar(article, tenant_id, threshold, max_comparisons)
+    end
+  end
+
+  # `max_comparisons` flows to the kNN helper as `k`, which is clamped to
+  # `VectorSearch.max_k/0` (US-27.7a cost bound). Surface that clamp once so an operator
+  # who configured a higher value isn't silently capped (default 50 is well under it).
+  defp clamped_max_comparisons do
+    configured = Application.get_env(:loopctl, :article_link_max_comparisons, 50)
+    max_k = VectorSearch.max_k()
+
+    if configured > max_k do
+      Logger.warning(
+        "article_link_max_comparisons=#{configured} exceeds VectorSearch.max_k=#{max_k}; " <>
+          "capping similarity comparisons at #{max_k}"
+      )
+
+      max_k
+    else
+      configured
     end
   end
 
@@ -108,38 +140,48 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     :ok
   end
 
+  # US-27.7a: route the similarity lookup through the shared, scale-tested kNN helper
+  # (`Loopctl.Knowledge.VectorSearch.nearest/4`) on the dedicated HeavyRead pool instead
+  # of a bespoke `AdminRepo` cosine query. The helper's index-correct shape guarantees a
+  # background link pass can never silently full-scan the corpus at prod scale (the rot
+  # this epic targets) — the inner ANN is the pure `ORDER BY <=> LIMIT pool` HNSW path,
+  # and the project scope is applied on the OUTER pool (`project_id` is in the
+  # `articles(tenant_id, project_id, category)` btree, so an inner predicate would defeat
+  # HNSW).
+  #
+  # BEHAVIOR PRESERVED: self exclusion, published-only, and the project scope
+  # ("same-project OR tenant-wide" for a project-scoped source; no project filter for a
+  # tenant-wide one) are unchanged — the latter via the helper's `:project_or_global` opt,
+  # which mirrors the old `scope_by_project/2` exactly. The threshold boundary is
+  # preserved for any POSITIVE `threshold`: we ask the helper for `threshold: 0.0` (no
+  # floor in the indexed query) and keep the INCLUSIVE `sim >= threshold` filter in memory
+  # here — the helper's own floor is strict `>`, so leaving the boundary check here keeps a
+  # candidate whose similarity equals the (positive) threshold linkable, identical to the
+  # pre-migration code. (Edge: at `threshold == 0.0` the helper's `> 0.0` floor — over the
+  # `GREATEST(0, 1 - distance)` score — additionally drops exactly-orthogonal candidates
+  # the old in-memory `>= 0.0` kept. This is a deliberate, harmless tightening for
+  # auto-linking: a 0.0-similarity "relates_to" link is noise; the default threshold is 0.6.)
+  #
+  # RECALL NOTE (post-ANN-filter tradeoff): because the project scope now runs on the
+  # OUTER pool (it must, to keep HNSW), the worker links among the GLOBAL-nearest `pool`
+  # rows that THEN match the project — not the nearest-WITHIN-project. With a generously
+  # sized pool (`pool_size(max_comparisons)`) this is equivalent for the small
+  # `max_comparisons` (default 50) the worker uses; in a pathological corpus where a
+  # project's matches all fall outside the global top-pool it could under-fill, the same
+  # documented post-ANN-filter limitation `VectorSearch` carries for `tags`/`category`.
   defp find_similar_articles(article, tenant_id, threshold, max_comparisons) do
-    embedding = article.embedding
-
-    base_query =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.id != ^article.id,
-        where: not is_nil(a.embedding),
-        where: a.status == :published,
-        select: %{
-          id: a.id,
-          similarity: fragment("1 - (? <=> ?)", a.embedding, ^embedding)
-        },
-        order_by: [asc: fragment("? <=> ?", a.embedding, ^embedding)],
-        limit: ^max_comparisons
-      )
-
-    query = scope_by_project(base_query, article.project_id)
-
-    query
-    |> AdminRepo.all()
+    tenant_id
+    |> VectorSearch.nearest(article.embedding, max_comparisons,
+      exclude_id: article.id,
+      project_or_global: article.project_id,
+      threshold: 0.0,
+      pool: VectorSearch.pool_size(max_comparisons)
+    )
+    # The helper returns `%{id, title, category, similarity_score}`; the linking path
+    # keys on `:id` + `:similarity`, so map the score across and keep the inclusive
+    # `>= threshold` boundary in memory (see the threshold note above).
+    |> Enum.map(fn %{id: id, similarity_score: score} -> %{id: id, similarity: score} end)
     |> Enum.filter(fn %{similarity: sim} -> sim >= threshold end)
-  end
-
-  defp scope_by_project(query, nil) do
-    # Tenant-wide article: compare against all articles in the tenant
-    query
-  end
-
-  defp scope_by_project(query, project_id) do
-    # Project-scoped article: compare against same project + tenant-wide
-    where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
   end
 
   defp log_if_exceeds_limit(article, tenant_id, max_comparisons) do
@@ -159,6 +201,16 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
           "for article #{article.id}"
       )
     end
+  end
+
+  # Candidate-COUNT scoping for the over-limit warning only (a plain `count(*)`, NOT the
+  # vector scan — the kNN lookup itself routes through `VectorSearch.nearest/4`). Mirrors
+  # the historical scope: a tenant-wide article counts against the whole tenant; a
+  # project-scoped one against same-project plus tenant-wide (`project_id IS NULL`).
+  defp scope_by_project(query, nil), do: query
+
+  defp scope_by_project(query, project_id) do
+    where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
   end
 
   defp get_existing_link_pairs(article_id, tenant_id) do

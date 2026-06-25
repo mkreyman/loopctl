@@ -186,6 +186,16 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    type: :integer,
                    description: "Offset path only; absent on the keyset (`cursor`) path"
                  },
+                 pool_capped: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Relevance modes (semantic / combined): true when the ranked+filtered " <>
+                       "results may be INCOMPLETE — either the corpus exceeds the relevance " <>
+                       "pool cap, or a selective filter starved the pool below the cap. " <>
+                       "`false` means this query's results are complete; `total_count` can " <>
+                       "exceed what relevance pagination reaches, so on `pool_capped: true` " <>
+                       "switch to list mode (`cursor`) for full enumeration."
+                 },
                  next_cursor: %OpenApiSpex.Schema{
                    type: :string,
                    nullable: true,
@@ -563,20 +573,27 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   defp maybe_add_limit(opts, _), do: [{:limit, 10} | opts]
 
+  # Upper bound on `offset` so an absurd value (e.g. `offset=99999999999999999999`) is
+  # clamped rather than reaching the DB and raising a Postgres bigint-range error as a 500.
+  # Well above any legitimate offset page; deep enumeration uses the keyset (`cursor`) path.
+  @max_offset 1_000_000
+
   defp maybe_add_offset(opts, nil), do: [{:offset, 0} | opts]
 
   defp maybe_add_offset(opts, value) when is_binary(value) do
     case Integer.parse(value) do
-      {int, ""} -> [{:offset, max(int, 0)} | opts]
+      {int, ""} -> [{:offset, clamp_offset(int)} | opts]
       _ -> [{:offset, 0} | opts]
     end
   end
 
   defp maybe_add_offset(opts, value) when is_integer(value) do
-    [{:offset, max(value, 0)} | opts]
+    [{:offset, clamp_offset(value)} | opts]
   end
 
   defp maybe_add_offset(opts, _), do: [{:offset, 0} | opts]
+
+  defp clamp_offset(value), do: value |> max(0) |> min(@max_offset)
 
   # List mode: query-less enumeration of the filtered set, regardless of `mode`.
   defp execute_search(tenant_id, :list, _mode, opts) do

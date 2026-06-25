@@ -150,6 +150,10 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # surfaced only when combined mode degraded to keyword-only.
     |> maybe_put(:total_count_scope, meta[:total_count_scope])
     |> maybe_put(:search_mode, meta[:search_mode])
+    # `pool_capped` (semantic relevance mode, US-27.7a): true when the ranked corpus
+    # exceeds the relevance pool cap, so the tail is unreachable by deeper `offset` —
+    # the consumer should switch to list mode for full enumeration.
+    |> maybe_put(:pool_capped, meta[:pool_capped])
     |> maybe_put_fallback(meta[:fallback])
   end
 

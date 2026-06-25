@@ -68,6 +68,13 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
   config :loopctl, :vector_pool_factor, 5
   config :loopctl, :vector_pool_floor, 6
   config :loopctl, :max_vector_pool, 6
+
+  # US-27.7a `search_semantic` relevance-pool knobs, shrunk so the deep-offset /
+  # `pool_capped` truncation signal is exercisable with a handful of seeded rows (prod
+  # floor/cap are 200/1000). Existing semantic tests seed ≤ cap rows, so they are
+  # unaffected. The SCALE gate keeps the prod defaults. Config-based DI — no put_env.
+  config :loopctl, :semantic_result_pool_floor, 2
+  config :loopctl, :semantic_result_pool_cap, 5
 end
 
 # We don't run a server during test. If one is required,

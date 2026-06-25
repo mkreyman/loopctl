@@ -219,6 +219,30 @@ defmodule Loopctl.PlanAssertions do
     end
   end
 
+  @doc """
+  Asserts the plan contains NO `Sort` or `Incremental Sort` node anywhere (US-27.7a).
+
+  This is the regression guard for `search_semantic`'s `total_count` query: pre-27.7a it
+  wrapped the results subquery (carrying `ORDER BY embedding <=> $vec`) in a `count(*)`,
+  so the planner did a pointless full-corpus **Sort** (~153ms / 405k buffers at 80k) just
+  to discard the order. A `count(*)` is order-independent, so the corrected query carries
+  NO ordering and the plan must be sort-free. A regression that re-introduces the ORDER BY
+  (or any sort) into the count trips this. (Bounding the scan itself is the job of
+  `refute_seq_scan/1` / `assert_scan_rows_below/2` on the same query.)
+  """
+  def refute_sort(queryable_or_sql) do
+    {root, raw} = explain_json(queryable_or_sql)
+
+    if node_type_present?(root, "Sort") or node_type_present?(root, "Incremental Sort") do
+      raise ExUnit.AssertionError,
+        message:
+          "Expected NO Sort node (a count is order-independent), but the plan contains one — " <>
+            "the pre-US-27.7a ORDER BY-in-the-count regression. Plan:\n#{elide(raw)}"
+    else
+      :ok
+    end
+  end
+
   # True if any node anywhere in the plan tree has the given Node Type.
   defp node_type_present?(node, type) when is_map(node) do
     here = node["Node Type"] == type

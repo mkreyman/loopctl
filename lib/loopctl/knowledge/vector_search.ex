@@ -281,6 +281,15 @@ defmodule Loopctl.Knowledge.VectorSearch do
       * `:category` — category equality (`=`) filter applied **AFTER the ANN fetch**
         over the pool. This is a post-ANN filter, not a tag-scoped kNN; recall
         depends on whether matching articles are in the top-`pool` nearest.
+      * `:project_id` — project equality (`=`) filter applied **AFTER the ANN
+        fetch** over the pool (the `articles(tenant_id, project_id, category)`
+        btree means a selective `project_id =` on the INNER ANN would defeat HNSW,
+        so it lives on the outer pool like `:category`). `nil` is ignored. This is
+        the strict-equality form `search_semantic` uses.
+      * `:project_or_global` — like `:project_id` but matches the given project
+        UUID **OR** tenant-wide (`project_id IS NULL`) rows — the auto-link
+        worker's "same-project plus tenant-wide" scope. Also a post-ANN outer
+        filter; `nil` is ignored.
       * `:visibility_agent_id` — the agent visibility scope (same metadata
         predicate as the other knowledge reads).
       * `:pool` — override the over-fetch pool (still clamped by `max_pool/0` and
@@ -294,7 +303,6 @@ defmodule Loopctl.Knowledge.VectorSearch do
   @spec candidate_query(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
           Ecto.Query.t()
   def candidate_query(tenant_id, target_embedding, k, opts \\ []) when is_binary(tenant_id) do
-    target = to_embedding_list(target_embedding)
     k = clamp_k(k)
     pool = candidate_pool(k, Keyword.get(opts, :pool))
     threshold = clamp_threshold(Keyword.get(opts, :threshold, 0.0))
@@ -303,49 +311,137 @@ defmodule Loopctl.Knowledge.VectorSearch do
     exclude_linked? = Keyword.get(opts, :exclude_linked, false) and is_binary(exclude_id)
     tags = clamp_tags(Keyword.get(opts, :tags))
     category = Keyword.get(opts, :category)
-    vis = Keyword.get(opts, :visibility_agent_id)
+    project_id = Keyword.get(opts, :project_id)
+    project_or_global = Keyword.get(opts, :project_or_global)
 
-    # INNER: pure index-ordered ANN. ONLY filters that are verified (at 80k scale,
-    # vector_search_scale_test) to keep the HNSW Index Scan: tenant/status/not-null
-    # equalities, the single-row self-exclusion, and the visibility metadata->>
-    # Filter. Visibility is index-safe by OPERATOR CLASS, not by selectivity: the
-    # `metadata->>'key' = ...` / COALESCE form cannot be served by the articles
-    # `jsonb_ops` GIN (it only answers @>/?), and there is no btree expression index on
-    # it — so the planner can ONLY apply it as a Filter-after-HNSW-index, at ANY
-    # selectivity (same as the prod-verified suggested_links inner query). DO NOT add a
-    # btree/expression index on the visibility/agent_id metadata path or rewrite this to
-    # a GIN-servable `metadata @> ...` form — that would let a selective scope flip the
-    # planner off HNSW. `tags`/`category` are DELIBERATELY NOT here: they HAVE GIN/btree
-    # indexes, so a selective tags&&/category= predicate makes the planner
-    # BitmapAnd-then-Sort and ABANDON the HNSW index (the #170/#172 failure mode —
-    # proven by EXPLAIN at scale). They are applied on the OUTER pool instead.
-    candidates =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.status == :published,
-        where: not is_nil(a.embedding),
-        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
-        limit: ^pool,
-        select: %{
-          id: a.id,
-          title: a.title,
-          category: a.category,
-          tags: a.tags,
-          similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
-        }
-      )
-      |> maybe_exclude_self(exclude_id)
-      |> maybe_filter_by_visibility(vis)
+    # INNER: the pure index-ordered ANN top-`pool` (shared with the suggested_links
+    # under-fill probe via candidate_pool_query/4 so their candidate set is identical
+    # by construction — no drift). It carries ONLY index-safe residual filters; see
+    # candidate_pool_query/4 for the load-bearing rationale.
+    candidates = candidate_pool_query(tenant_id, target_embedding, pool, opts)
 
-    # OUTER: over the materialized ≤pool rows — tags/category here are trivial filters
-    # on a tiny result set (no corpus scan), so they cannot defeat the index.
+    # OUTER: over the materialized ≤pool rows — tags/category/project here are trivial
+    # filters on a tiny result set (no corpus scan), so they cannot defeat the index.
     candidates
     |> outer_query()
     |> maybe_exclude_linked(tenant_id, exclude_id, exclude_linked?)
     |> maybe_filter_by_tags(tags)
     |> maybe_filter_by_category(category)
+    |> maybe_filter_by_project(project_id)
+    |> maybe_filter_by_project_or_global(project_or_global)
     |> where([c], c.similarity_score > ^threshold)
     |> order_by([c], desc: c.similarity_score)
     |> limit(^k)
+  end
+
+  # Builds the INNER index-ordered ANN top-`pool` subquery (returned, NOT executed).
+  #
+  # This is the pure `ORDER BY embedding <=> $const LIMIT pool` with ONLY index-safe
+  # residual filters, exposed as its own (@doc false) public function so the live
+  # `suggested_links` path's under-fill probe (`Loopctl.Knowledge.under_fill_probe/6`)
+  # and the main `candidate_query/4` build the EXACT SAME inner by construction — the
+  # probe's `ann_candidates`/`above_threshold` counts are then over the identical
+  # candidate set the main query drew from, with zero risk of drift. `search_semantic`
+  # shares this same inner too (US-27.7a), so a future edit there can't reintroduce a
+  # full scan.
+  #
+  # WHAT MAY LIVE HERE (LOAD-BEARING — verified with EXPLAIN at 80k scale): ONLY filters
+  # verified to keep the HNSW Index Scan — tenant/status/not-null equalities, the
+  # single-row self-exclusion (`:exclude_id`), and the visibility `metadata->>` Filter
+  # (`:visibility_agent_id`). Visibility is index-safe by OPERATOR CLASS, not selectivity:
+  # the `metadata->>'key' = ...` / COALESCE form cannot be served by the articles
+  # `jsonb_ops` GIN (it only answers @>/?), and there is no btree expression index on it —
+  # so the planner can ONLY apply it as a Filter-after-HNSW-index, at ANY selectivity. DO
+  # NOT add a btree/expression index on the visibility/agent_id metadata path or rewrite
+  # this to a GIN-servable `metadata @> ...` form — that would let a selective scope flip
+  # the planner off HNSW. `tags`/`category`/`project_id` are DELIBERATELY NOT here: they
+  # HAVE GIN/btree indexes, so a selective `tags &&` / `category =` / `project_id =`
+  # predicate makes the planner BitmapAnd-then-Sort and ABANDON the HNSW index (the
+  # #170/#172 failure mode — proven by EXPLAIN at scale). They are applied on the OUTER
+  # pool instead (see `candidate_query/4`).
+  #
+  # SELECT SHAPE: chosen by the `:select` opt (the SELECT list does NOT affect HNSW usage
+  # — only the WHERE/ORDER BY/LIMIT do — so the two shapes share the SAME index-safe core):
+  #   * `:knn` (default) — `%{id, title, category, tags, project_id, similarity_score}` with
+  #     `similarity_score = GREATEST(0, 1 - cosine_distance)` (the suggested_links / worker
+  #     shape). `tags`/`project_id` are carried so the outer over-the-pool query can
+  #     post-filter on them without a second `articles` reference.
+  #   * `:semantic` — `search_semantic`'s richer projection: adds `tenant_id`, `status`,
+  #     `inserted_at`, `updated_at`, and `metadata` (so the outer pool can apply the
+  #     GIN-servable `metadata @>` memory-type/agent/conversation filters — which CANNOT
+  #     go in the inner without defeating HNSW), and uses the RAW
+  #     `similarity_score = 1 - cosine_distance` (not GREATEST-clamped) to preserve the
+  #     pre-US-27.7a semantic-search contract exactly.
+  #
+  # RECOGNIZED opts: `:exclude_id` (single-row index-safe self-exclusion),
+  # `:visibility_agent_id` (index-safe metadata scope), `:status` (index-safe status
+  # equality, default `:published`), `:select` (`:knn` | `:semantic`, default `:knn`).
+  # Cost-affecting opts (`:tags`/`:category`/`:project_id`/`:threshold`/`:pool`) are
+  # IGNORED here — they belong on the outer query in `candidate_query/4` (or the
+  # search_semantic outer pool).
+  @doc false
+  @spec candidate_pool_query(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
+          Ecto.Query.t()
+  def candidate_pool_query(tenant_id, target_embedding, pool, opts \\ [])
+      when is_binary(tenant_id) and is_integer(pool) do
+    target = to_embedding_list(target_embedding)
+    exclude_id = Keyword.get(opts, :exclude_id)
+    vis = Keyword.get(opts, :visibility_agent_id)
+    status = Keyword.get(opts, :status, :published)
+
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: not is_nil(a.embedding),
+        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
+        limit: ^pool
+      )
+      |> maybe_filter_by_status(status)
+      |> maybe_exclude_self(exclude_id)
+      |> maybe_filter_by_visibility(vis)
+
+    pool_select(base, Keyword.get(opts, :select, :knn), target)
+  end
+
+  # Status equality on the inner ANN (index-safe, like the tenant/not-null filters).
+  # NIL-SKIPPING to match `Loopctl.Knowledge.maybe_filter_by_status/2` and the
+  # search_semantic COUNT path: `status: nil` means "all statuses" (no filter), so the
+  # inner pool and the separate full-corpus count stay over the SAME population — without
+  # this, `status == ^nil` would match nothing and a `status: nil` semantic search would
+  # return empty results against a non-zero total_count. Suggested-links / the worker pass
+  # no `:status`, so they keep the default `:published`.
+  defp maybe_filter_by_status(query, nil), do: query
+
+  defp maybe_filter_by_status(query, status),
+    do: where(query, [a], a.status == ^status)
+
+  # The index-safe inner's SELECT list. Varies by consumer but NEVER touches the
+  # HNSW-load-bearing WHERE/ORDER BY/LIMIT above.
+  defp pool_select(base, :knn, target) do
+    select(base, [a], %{
+      id: a.id,
+      title: a.title,
+      category: a.category,
+      tags: a.tags,
+      project_id: a.project_id,
+      similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
+    })
+  end
+
+  defp pool_select(base, :semantic, target) do
+    select(base, [a], %{
+      id: a.id,
+      tenant_id: a.tenant_id,
+      project_id: a.project_id,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      tags: a.tags,
+      metadata: a.metadata,
+      inserted_at: a.inserted_at,
+      updated_at: a.updated_at,
+      similarity_score: fragment("1 - (? <=> ?)", a.embedding, ^target)
+    })
   end
 
   # The outer query over the over-fetched pool. Kept as its own clause so the
@@ -387,6 +483,27 @@ defmodule Loopctl.Knowledge.VectorSearch do
       query
     end
   end
+
+  # Strict project equality on the OUTER pool (the `search_semantic` form, mirroring
+  # Loopctl.Knowledge.maybe_filter_by_project_id/2). On the over-the-pool `c` binding,
+  # never the inner ANN — `project_id` is part of the
+  # `articles(tenant_id, project_id, category)` btree, so a selective `project_id =` on
+  # the index-ordered subquery would defeat HNSW (same class as tags/category).
+  defp maybe_filter_by_project(query, nil), do: query
+
+  defp maybe_filter_by_project(query, project_id) when is_binary(project_id),
+    do: where(query, [c], c.project_id == ^project_id)
+
+  # "Same-project OR tenant-wide" project scope on the OUTER pool — the auto-link
+  # worker's `scope_by_project/2` semantics (US-21.2.3): a project-scoped source
+  # compares against same-project AND tenant-wide (`project_id IS NULL`) rows. `nil`
+  # (a tenant-wide source) is a no-op (compare against everything), matching the
+  # worker's nil clause exactly. Applied over the pool for the same btree reason as
+  # `maybe_filter_by_project/2`.
+  defp maybe_filter_by_project_or_global(query, nil), do: query
+
+  defp maybe_filter_by_project_or_global(query, project_id) when is_binary(project_id),
+    do: where(query, [c], c.project_id == ^project_id or is_nil(c.project_id))
 
   # Same agent-visibility metadata predicate as the other knowledge reads
   # (Loopctl.Knowledge.maybe_filter_by_visibility/2), on the `[a]` binding.
