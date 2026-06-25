@@ -27,7 +27,10 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
   @moduletag timeout: :timer.minutes(30)
 
   # The pool-level heavy-read statement_timeout backstop (worst-case must beat it).
-  @heavy_read_statement_timeout_ms 30_000
+  # This is the PRODUCTION default (HEAVY_READ_STATEMENT_TIMEOUT_MS, runtime.exs) —
+  # NOT a loose local literal. A worst-case kNN that beats 30s but not the real 10s
+  # prod backstop would be killed in production, so the gate must use the real value.
+  @heavy_read_statement_timeout_ms 10_000
 
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
@@ -89,6 +92,39 @@ defmodule Loopctl.Knowledge.VectorSearchScaleTest do
       # `articles` via exactly one HNSW Index Scan — never a Seq/Bitmap full-corpus
       # read. assert_hnsw_index/1 implies refute_full_scan/1; we assert both for the
       # explicit AC-27.6a.3 mapping.
+      assert :ok = PlanAssertions.refute_full_scan(query)
+      assert :ok = PlanAssertions.assert_hnsw_index(query)
+    end)
+  end
+
+  test "the INNER-query residual filters (tags/category/visibility) stay HNSW-index-backed at scale (AC-27.6a.3)",
+       %{tenant: tenant} do
+    unboxed(fn ->
+      target =
+        AdminRepo.one(
+          from(a in Article,
+            where: a.tenant_id == ^tenant.id,
+            limit: 1,
+            select: %{id: a.id, embedding: a.embedding}
+          )
+        )
+
+      # These residuals live INSIDE the index-ordered ANN subquery (tags &&,
+      # category =, metadata->>'visibility') — the ONLY filter class that can flip
+      # the planner off the HNSW path. ScaleSeed makes them selective (~2% tag,
+      # ~20% category, ~10% private). The planner's NATURAL choice at 80k must STILL
+      # reach `articles` via exactly one HNSW Index Scan (Filter-after-index), never
+      # a Bitmap/Seq full-corpus read — the core promise of US-27.6a.
+      query =
+        VectorSearch.candidate_query(tenant.id, target.embedding, 5,
+          exclude_id: target.id,
+          exclude_linked: true,
+          threshold: 0.5,
+          tags: ["scale-tag-3"],
+          category: :decision,
+          visibility_agent_id: "scale-agent-0"
+        )
+
       assert :ok = PlanAssertions.refute_full_scan(query)
       assert :ok = PlanAssertions.assert_hnsw_index(query)
     end)

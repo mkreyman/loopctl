@@ -54,6 +54,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
     * `:threshold` — clamped into `[0.0, 1.0]`.
     * `:tags` — truncated to `max_tags/0` (default 50) entries; an empty/`nil`
       list is ignored.
+    * `:category` — a single index-safe equality (no cost amplification); an
+      unknown value is ignored (validated against the `Article` category enum).
 
   ## Tenant isolation (AC-27.6a.5)
 
@@ -193,6 +195,14 @@ defmodule Loopctl.Knowledge.VectorSearch do
     category = Keyword.get(opts, :category)
     vis = Keyword.get(opts, :visibility_agent_id)
 
+    # INNER: pure index-ordered ANN. ONLY filters that are verified (at 80k scale,
+    # vector_search_scale_test) to keep the HNSW Index Scan: tenant/status/not-null
+    # equalities, the single-row self-exclusion, and the visibility metadata->>
+    # Filter (no supporting index, so Filter-after-index — same as the prod-verified
+    # suggested_links inner query). `tags`/`category` are DELIBERATELY NOT here: they
+    # have GIN/btree indexes, so a selective tags&&/category= predicate makes the
+    # planner BitmapAnd-then-Sort and ABANDON the HNSW index (the #170/#172 failure
+    # mode — proven by EXPLAIN at scale). They are applied on the OUTER pool instead.
     candidates =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.status == :published,
@@ -203,30 +213,34 @@ defmodule Loopctl.Knowledge.VectorSearch do
           id: a.id,
           title: a.title,
           category: a.category,
+          tags: a.tags,
           similarity_score: fragment("GREATEST(0, 1 - (? <=> ?))", a.embedding, ^target)
         }
       )
       |> maybe_exclude_self(exclude_id)
-      |> maybe_filter_by_tags(tags)
-      |> maybe_filter_by_category(category)
       |> maybe_filter_by_visibility(vis)
 
+    # OUTER: over the materialized ≤pool rows — tags/category here are trivial filters
+    # on a tiny result set (no corpus scan), so they cannot defeat the index.
     candidates
     |> outer_query()
     |> maybe_exclude_linked(tenant_id, exclude_id, exclude_linked?)
+    |> maybe_filter_by_tags(tags)
+    |> maybe_filter_by_category(category)
     |> where([c], c.similarity_score > ^threshold)
     |> order_by([c], desc: c.similarity_score)
     |> limit(^k)
   end
 
   # The outer query over the over-fetched pool. Kept as its own clause so the
-  # anti-join can be conditionally added against the `c` binding.
+  # anti-join + tag/category post-filters can be added against the `c` binding.
   defp outer_query(candidates) do
     from(c in subquery(candidates),
       select: %{
         id: c.id,
         title: c.title,
         category: c.category,
+        tags: c.tags,
         similarity_score: c.similarity_score
       }
     )
@@ -246,7 +260,18 @@ defmodule Loopctl.Knowledge.VectorSearch do
     do: where(query, [a], fragment("? && ?", a.tags, ^tags))
 
   defp maybe_filter_by_category(query, nil), do: query
-  defp maybe_filter_by_category(query, category), do: where(query, [a], a.category == ^category)
+
+  defp maybe_filter_by_category(query, category) do
+    # `category` is a single index-safe equality (no cost amplification), but an
+    # unknown atom would make Ecto.Enum raise on dump. Validate against the Article
+    # enum and IGNORE an unknown value (consistent with clamping other bad caller
+    # input) rather than 500 — only the 5 real categories ever reach the query.
+    if category in Ecto.Enum.values(Article, :category) do
+      where(query, [a], a.category == ^category)
+    else
+      query
+    end
+  end
 
   # Same agent-visibility metadata predicate as the other knowledge reads
   # (Loopctl.Knowledge.maybe_filter_by_visibility/2), on the `[a]` binding.

@@ -315,11 +315,11 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
 
       query = VectorSearch.candidate_query(tenant.id, base_embedding(), 5, tags: tags)
 
-      # The bound tags param on the inner subquery is truncated to max_tags.
-      %Ecto.Query{from: %{source: %Ecto.SubQuery{query: inner}}} = query
-
+      # tags filter is on the OUTER query (over the pool) — NOT the inner ANN subquery
+      # (a tags && on the index-ordered query defeats the HNSW index at scale). The
+      # bound tags param is truncated to max_tags.
       bound_tags =
-        Enum.find_value(inner.wheres, fn %{params: params} ->
+        Enum.find_value(query.wheres, fn %{params: params} ->
           Enum.find_value(params, fn
             {value, :any} when is_list(value) -> value
             _ -> nil
@@ -328,6 +328,30 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
 
       assert is_list(bound_tags)
       assert length(bound_tags) == VectorSearch.max_tags()
+
+      # And the inner ANN subquery must NOT carry the tags filter.
+      %Ecto.Query{from: %{source: %Ecto.SubQuery{query: inner}}} = query
+
+      refute Enum.any?(inner.wheres, fn %{params: params} ->
+               Enum.any?(params, &match?({v, :any} when is_list(v), &1))
+             end)
+    end
+
+    test "an unknown category is ignored (not a 500), a known one filters on the OUTER pool" do
+      tenant = fixture(:tenant)
+
+      # category lives on the OUTER query (a category= on the index-ordered subquery
+      # defeats the HNSW index at scale). Unknown → no predicate anywhere; query runs.
+      unknown = VectorSearch.candidate_query(tenant.id, base_embedding(), 5, category: :bogus)
+      refute Enum.any?(unknown.wheres, &(&1.expr |> inspect() =~ "category"))
+      assert [] = VectorSearch.nearest(tenant.id, base_embedding(), 5, category: :bogus)
+
+      # Known category → the equality predicate is present on the OUTER query, and the
+      # inner ANN subquery stays pure (no category predicate).
+      known = VectorSearch.candidate_query(tenant.id, base_embedding(), 5, category: :decision)
+      assert Enum.any?(known.wheres, &(&1.expr |> inspect() =~ "category"))
+      %Ecto.Query{from: %{source: %Ecto.SubQuery{query: inner_k}}} = known
+      refute Enum.any?(inner_k.wheres, &(&1.expr |> inspect() =~ "category"))
     end
   end
 
