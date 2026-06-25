@@ -321,6 +321,64 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Asserts every scan on `articles` is DOMINATED by a `Limit` node whose `Plan Rows`
+  is `<= max_rows` (US-27.7b distant_pairs: the SAMPLED candidate subquery
+  `... ORDER BY id LIMIT max_pair_candidates()`).
+
+  This is the right bound for a sample-capped shape where `assert_scan_rows_below/2` does
+  NOT apply: the candidate `Index Scan` legitimately reports the pre-LIMIT estimate
+  (`Plan Rows ≈ corpus`) on the scan node itself, while the enclosing `Limit` caps how many
+  rows are actually consumed (verified at 80k: `Limit rows=25` over the scan, ~1.7ms /
+  ~1657 buffers — NOT an O(n²) corpus read). A regression that dropped the sample LIMIT
+  (reintroducing the unbounded self-join) leaves the scan with no dominating `Limit ≤ max`,
+  tripping this.
+  """
+  def assert_article_scans_capped_by_limit(queryable_or_sql, max_rows)
+      when is_integer(max_rows) do
+    assert_fresh_stats!()
+    {root, raw} = explain_json(queryable_or_sql)
+    # `capped_limit?` (current node sits under a Limit whose Plan Rows ≤ max) starts false:
+    # the root itself has no ancestor Limit.
+    uncapped = uncapped_article_scans(root, false, max_rows)
+
+    cond do
+      article_scan_nodes(root) == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches `articles` — cannot judge the sample cap. Plan:\n#{elide(raw)}"
+
+      uncapped != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected every `articles` scan to be capped by a `Limit ≤ #{max_rows}` (the " <>
+              "max_pair_candidates() sample), but #{length(uncapped)} scan(s) are NOT — an " <>
+              "unbounded self-join over the corpus. Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  # Walk the tree tracking whether we are under a `Limit` node whose Plan Rows ≤ max.
+  # Returns the `articles` scan nodes that are NOT so dominated.
+  defp uncapped_article_scans(node, capped?, max) when is_map(node) do
+    capped_here? =
+      capped? or
+        (node["Node Type"] == "Limit" and is_number(node["Plan Rows"]) and
+           node["Plan Rows"] <= max)
+
+    here =
+      if node["Relation Name"] == "articles" and not capped_here?, do: [node], else: []
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&uncapped_article_scans(&1, capped_here?, max))
+
+    here ++ children
+  end
+
+  @doc """
   Asserts `articles` is reached by EXACTLY ONE scan node, which is an `Index Scan`
   (or `Index Only Scan`) on an HNSW index (`pg_am.amname='hnsw'`, verified via catalog,
   not a name match). A sibling/outer full-scan on `articles` therefore cannot hide

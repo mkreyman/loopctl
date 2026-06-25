@@ -322,6 +322,7 @@ jobs:
           - test/loopctl/knowledge/keyset_plan_scale_test.exs
           - test/loopctl/knowledge/by_source_change_feed_plan_scale_test.exs
           - test/loopctl/knowledge/streaming_export_scale_test.exs
+          - test/loopctl/knowledge/distant_pairs_novelty_scale_test.exs
     services:
       postgres:
         image: pgvector/pgvector:pg16
