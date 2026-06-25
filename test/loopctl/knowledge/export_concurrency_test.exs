@@ -1,0 +1,169 @@
+defmodule Loopctl.Knowledge.ExportConcurrencyTest do
+  @moduledoc """
+  US-27.16 (AC-27.16.6): the streaming-export concurrency cap.
+
+  These tests don't touch the DB (the counter is pure ETS), so they're fully
+  async-safe. They use distinct, random tenant ids per test so the shared ETS
+  counters never collide across concurrent tests.
+  """
+  use ExUnit.Case, async: true
+
+  alias Loopctl.Knowledge.ExportConcurrency, as: EC
+
+  defp tid, do: Ecto.UUID.generate()
+
+  describe "acquire/1 + release/1" do
+    test "allows up to the per-tenant cap, then refuses" do
+      # Default per-tenant cap is 1 (config). The first acquire on a tenant
+      # succeeds; a second concurrent one (from another process) is refused.
+      t = tid()
+      assert :ok = EC.acquire(t)
+      assert EC.tenant_count(t) == 1
+
+      # A second acquirer for the SAME tenant, from another process, is over the
+      # per-tenant cap of 1.
+      assert {:error, :too_many_exports} = from_other_process(fn -> EC.acquire(t) end)
+
+      assert :ok = EC.release(t)
+      assert EC.tenant_count(t) == 0
+    end
+
+    test "release/1 frees the slot so a later acquire succeeds" do
+      t = tid()
+      assert :ok = EC.acquire(t)
+      assert :ok = EC.release(t)
+      # After release, another process can acquire again.
+      assert :ok = from_other_process(fn -> EC.acquire(t) end)
+      from_other_process(fn -> EC.release(t) end)
+    end
+
+    test "global cap bounds total in-flight exports across tenants" do
+      # Global cap default is 2. Hold the global cap with two DIFFERENT tenants
+      # (each within its per-tenant cap of 1), then a third tenant is refused on
+      # the GLOBAL cap even though its per-tenant count is 0.
+      base = EC.global_count()
+
+      t1 = tid()
+      t2 = tid()
+      t3 = tid()
+
+      # Run each acquire in its own (kept-alive) process so per-process monitoring
+      # and the global counter reflect concurrent holders.
+      {p1, :ok} = acquire_in_held_process(t1)
+      {p2, :ok} = acquire_in_held_process(t2)
+
+      assert EC.global_count() >= base + 2
+
+      # Third tenant: per-tenant count 0 but global cap met → refused.
+      assert {:error, :too_many_exports} = from_other_process(fn -> EC.acquire(t3) end)
+      assert EC.tenant_count(t3) == 0
+
+      release_held_process(p1, t1)
+      release_held_process(p2, t2)
+    end
+
+    test "a refused acquire leaves NO counter incremented (no partial reservation)" do
+      t = tid()
+      assert :ok = EC.acquire(t)
+      g_before = EC.global_count()
+
+      assert {:error, :too_many_exports} = from_other_process(fn -> EC.acquire(t) end)
+
+      # The refused (per-tenant) acquire must have undone its global increment too.
+      assert EC.global_count() == g_before
+      assert EC.tenant_count(t) == 1
+
+      EC.release(t)
+    end
+
+    @tag :capture_log
+    test "a crashed acquirer's slot is reclaimed by the monitor (no permanent leak)" do
+      t = tid()
+
+      # Acquire in a process that then dies WITHOUT releasing.
+      {:ok, pid} =
+        Task.start(fn ->
+          :ok = EC.acquire(t)
+          # Signal acquired, then block until killed.
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      # Wait until the acquire is visible.
+      wait_until(fn -> EC.tenant_count(t) == 1 end)
+      assert EC.tenant_count(t) == 1
+
+      # Kill it without releasing.
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
+
+      # The GenServer's monitor must reclaim the leaked slot.
+      wait_until(fn -> EC.tenant_count(t) == 0 end)
+      assert EC.tenant_count(t) == 0
+    end
+  end
+
+  # --- helpers ---
+
+  # Run `fun` in a short-lived separate process and return its result. Used so an
+  # "acquire" is charged to a DIFFERENT process than the caller (the per-process
+  # monitor would otherwise treat two acquires from one pid as one).
+  defp from_other_process(fun) do
+    parent = self()
+    spawn(fn -> send(parent, {:result, fun.()}) end)
+
+    receive do
+      {:result, r} -> r
+    after
+      1_000 -> flunk("from_other_process timed out")
+    end
+  end
+
+  # Acquire in a process that stays alive holding the slot until released. Returns
+  # {pid, acquire_result}.
+  defp acquire_in_held_process(t) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        r = EC.acquire(t)
+        send(parent, {:acquired, self(), r})
+
+        receive do
+          :release ->
+            EC.release(t)
+            send(parent, {:released, self()})
+        end
+      end)
+
+    receive do
+      {:acquired, ^pid, r} -> {pid, r}
+    after
+      1_000 -> flunk("acquire_in_held_process timed out")
+    end
+  end
+
+  defp release_held_process(pid, _t) do
+    send(pid, :release)
+
+    receive do
+      {:released, ^pid} -> :ok
+    after
+      1_000 -> :ok
+    end
+  end
+
+  defp wait_until(fun, attempts \\ 100)
+  defp wait_until(_fun, 0), do: :ok
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(fun, attempts - 1)
+    end
+  end
+end

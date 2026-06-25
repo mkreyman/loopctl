@@ -17,7 +17,7 @@ defmodule LoopctlWeb.OKFControllerTest do
   end
 
   describe "GET /api/v1/knowledge/okf/export" do
-    test "returns a zip archive by default", %{conn: conn} do
+    test "returns a streamed .tar.gz archive by default", %{conn: conn} do
       tenant = fixture(:tenant)
       raw = user_key(tenant)
       published(tenant.id, %{title: "Zip Article", category: :pattern})
@@ -27,13 +27,19 @@ defmodule LoopctlWeb.OKFControllerTest do
         |> auth_conn(raw)
         |> get(~p"/api/v1/knowledge/okf/export")
 
-      assert response_content_type(conn, :zip) =~ "application/zip"
+      assert [content_type] = get_resp_header(conn, "content-type")
+      assert content_type =~ "application/gzip"
 
       assert {"content-disposition", cd} =
                List.keyfind(conn.resp_headers, "content-disposition", 0)
 
       assert cd =~ "okf-bundle-"
-      assert byte_size(conn.resp_body) > 0
+      assert cd =~ ".tar.gz"
+
+      # The chunked tar.gz extracts to a valid OKF bundle (root index + concept).
+      assert {:ok, files} = Loopctl.StreamingExportHelper.extract(conn.resp_body)
+      assert Map.has_key?(files, "index.md")
+      assert Map.has_key?(files, "pattern/zip-article.md")
     end
 
     test "format=json returns the files map and meta", %{conn: conn} do

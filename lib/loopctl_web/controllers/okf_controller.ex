@@ -21,6 +21,7 @@ defmodule LoopctlWeb.OKFController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge.OKF
+  alias Loopctl.Knowledge.StreamingExport.OKFFormat
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -34,50 +35,51 @@ defmodule LoopctlWeb.OKFController do
   @max_import_bytes 50 * 1024 * 1024
 
   operation(:export,
-    summary: "Export knowledge as an OKF bundle",
+    summary: "Export knowledge as an OKF bundle (streamed .tar.gz)",
     description:
-      "Exports published articles as an OKF v0.1 bundle. Defaults to a zip archive; " <>
-        "pass format=json for a `{files, meta}` JSON payload. When called via " <>
-        "GET /projects/:project_id/knowledge/okf/export, includes tenant-wide + " <>
+      "Exports published articles as an OKF v0.1 bundle. Defaults to a streamed " <>
+        "gzipped tar archive (bounded memory, no article-count cap, fail-closed on " <>
+        "mid-stream error); pass format=json for a `{files, meta}` JSON payload " <>
+        "(buffered in memory — for tooling that writes the files itself). When called " <>
+        "via GET /projects/:project_id/knowledge/okf/export, includes tenant-wide + " <>
         "project articles. Role: user+.",
     parameters: [
       project_id: [in: :path, type: :string, required: false],
       format: [
         in: :query,
         type: :string,
-        description: "zip (default) or json",
+        description: "tar.gz (default) or json",
         required: false
       ]
     ],
     responses: %{
       200 =>
-        {"OKF bundle", "application/zip", %OpenApiSpex.Schema{type: :string, format: :binary}},
-      413 => {"Payload too large", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+        {"OKF bundle (.tar.gz, chunked)", "application/gzip",
+         %OpenApiSpex.Schema{type: :string, format: :binary}},
+      429 => {"Too many concurrent exports", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/okf/export"
+  def export(conn, %{"format" => "json"} = params) do
+    # The JSON convenience path is an explicit, in-memory opt-in for tooling that
+    # writes the files out itself; it builds the whole bundle as a map. The 5,000
+    # article-count 413 cap is GONE (US-27.16) — there is no count limit anywhere.
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    {:ok, %{files: files, meta: meta}} = OKF.build_bundle(tenant_id, export_opts(params))
+    json(conn, %{data: %{files: files, meta: meta}})
+  end
+
   def export(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = export_opts(params)
 
-    case OKF.build_bundle(tenant_id, opts) do
-      {:ok, %{files: files, meta: meta}} ->
-        render_export(conn, files, meta, params["format"])
-
-      {:error, :payload_too_large} ->
-        conn
-        |> put_status(413)
-        |> json(%{
-          error: %{
-            status: 413,
-            message:
-              "Bundle exceeds 5,000 articles. Use the project-scoped export " <>
-                "(GET /projects/:id/knowledge/okf/export) to narrow scope."
-          }
-        })
-    end
+    LoopctlWeb.StreamingExport.stream(
+      conn,
+      tenant_id,
+      OKFFormat,
+      "okf-bundle",
+      export_opts(params)
+    )
   end
 
   operation(:import,
@@ -145,22 +147,6 @@ defmodule LoopctlWeb.OKFController do
       nil -> []
       project_id -> [project_id: project_id]
     end
-  end
-
-  defp render_export(conn, files, meta, "json") do
-    json(conn, %{data: %{files: files, meta: meta}})
-  end
-
-  defp render_export(conn, files, _meta, _zip) do
-    date = Date.utc_today() |> Date.to_iso8601()
-
-    conn
-    |> put_resp_content_type("application/zip")
-    |> put_resp_header(
-      "content-disposition",
-      "attachment; filename=\"okf-bundle-#{date}.zip\""
-    )
-    |> send_resp(200, OKF.to_zip(files))
   end
 
   defp fetch_files(%{"files" => files}) when is_map(files) do

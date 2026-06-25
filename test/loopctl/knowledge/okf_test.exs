@@ -135,22 +135,49 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
-  describe "to_zip/1 + import_zip/3 round-trip" do
-    test "a zipped bundle imports back into articles" do
+  describe "streamed .tar.gz + import_zip/3 round-trip (US-27.16)" do
+    test "a streamed tar.gz bundle imports back into articles" do
       source = fixture(:tenant)
 
       published(source.id, %{title: "Zip Me", category: :decision, body: "decided x", tags: ["t"]})
 
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
-      zip = OKF.to_zip(files)
+      # US-27.16: the exporter now emits a streamed `.tar.gz`; the importer reads it
+      # (and still reads legacy `.zip`). Round-trip via the new format.
+      {:ok, targz} =
+        Loopctl.StreamingExportHelper.to_targz_binary(
+          source.id,
+          Loopctl.Knowledge.StreamingExport.OKFFormat
+        )
 
       dest = fixture(:tenant)
-      assert {:ok, report} = OKF.import_zip(dest.id, zip)
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
       assert report.created == 1
       assert report.errors == []
 
       %{data: [a]} = Knowledge.list_articles(dest.id, category: :decision)
       assert a.title == "Zip Me"
+    end
+
+    test "import_zip/3 still reads a legacy .zip bundle (back-compat)" do
+      source = fixture(:tenant)
+      published(source.id, %{title: "Legacy Zip", category: :pattern, body: "old", tags: []})
+
+      # Build a legacy-style zip the OLD exporter would have produced, in-memory.
+      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+
+      entries =
+        files
+        |> Enum.sort_by(fn {path, _} -> path end)
+        |> Enum.map(fn {path, content} -> {String.to_charlist(path), content} end)
+
+      {:ok, {_name, zip}} = :zip.create(~c"okf-bundle.zip", entries, [:memory])
+
+      dest = fixture(:tenant)
+      assert {:ok, report} = OKF.import_zip(dest.id, zip)
+      assert report.created == 1
+
+      %{data: [a]} = Knowledge.list_articles(dest.id, category: :pattern)
+      assert a.title == "Legacy Zip"
     end
   end
 

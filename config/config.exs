@@ -39,6 +39,20 @@ config :loopctl,
   # over that bound the caller uses re-confirm-on-drift. Tokens expire after
   # `bulk_delete_token_ttl_seconds`.
   bulk_op_statement_timeout_ms: 10_000,
+  # US-27.16: streaming knowledge export (bounded-memory `.tar.gz`).
+  # - export_chunk_size: articles read per keyset page (peak in-memory articles).
+  # - export_max_links_per_article: per-article neighbor cap so a dense hub's link
+  #   fan-out can't materialize an unbounded entry (applied in SQL).
+  # - export_max_concurrent_global / _per_tenant: hard caps on in-flight streaming
+  #   exports; over the cap → 429 (off the admin pool). The global default (2)
+  #   matches the heavy-read pool's export reservation (see runtime.exs).
+  # - export_max_stream_duration_ms: documented TIME budget per export (not a count
+  #   cap); exceeding it aborts the stream fail-closed.
+  export_chunk_size: 200,
+  export_max_links_per_article: 100,
+  export_max_concurrent_global: 2,
+  export_max_concurrent_per_tenant: 1,
+  export_max_stream_duration_ms: 600_000,
   # Transaction-level timeout (ms) handed to `AdminRepo.transaction/2` — set a bit
   # above the per-statement timeout so the connection is RECLAIMED even if several
   # statements chain (links_src + links_tgt + articles + audit), instead of holding
