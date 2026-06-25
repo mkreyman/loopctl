@@ -12,6 +12,10 @@ defmodule Loopctl.IndexHealthTest do
       assert IndexHealth.index_validity("articles_tenant_inserted_id_idx") == :valid
     end
 
+    test "reports :valid for the US-27.9b by-source keyset index (migration-created, valid)" do
+      assert IndexHealth.index_validity("articles_tenant_source_inserted_id_idx") == :valid
+    end
+
     test "reports :missing for an index that does not exist" do
       assert IndexHealth.index_validity(
                "definitely_not_an_index_#{System.unique_integer([:positive])}"
@@ -21,9 +25,10 @@ defmodule Loopctl.IndexHealthTest do
   end
 
   describe "which/0" do
-    test "includes the keyset index in the critical list" do
+    test "includes both keyset indexes in the critical list" do
       names = Enum.map(IndexHealth.which(), fn {name, _purpose} -> name end)
       assert "articles_tenant_inserted_id_idx" in names
+      assert "articles_tenant_source_inserted_id_idx" in names
     end
   end
 

@@ -42,6 +42,8 @@ defmodule Loopctl.Audit do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.HeavyRead
+  alias Loopctl.KeysetSeek
 
   @doc """
   Creates a new audit log entry within a tenant-scoped transaction.
@@ -219,7 +221,12 @@ defmodule Loopctl.Audit do
     # Fetch one extra to determine has_more (keyset peek, no COUNT — nothing to drift).
     query = changes_keyset_query(tenant_id, since, Keyword.put(opts, :limit, limit + 1))
 
-    results = AdminRepo.all(query)
+    # US-27.9b: route through Loopctl.HeavyRead so the change-feed keyset read gets the
+    # same dedicated-pool statement_timeout backstop (US-27.4) the index keyset path
+    # uses, instead of a bare AdminRepo.all. The HeavyRead structural tenant guard
+    # accepts the query because `changes_keyset_query/3` carries an explicit
+    # `a.tenant_id == ^tenant_id` equality on the only base source.
+    results = HeavyRead.all(tenant_id, query, change_feed_heavy_read_opts())
 
     has_more = length(results) > limit
     entries = Enum.take(results, limit)
@@ -260,6 +267,25 @@ defmodule Loopctl.Audit do
     |> limit(^limit)
   end
 
+  # Per-read options for the change-feed keyset (US-27.9b), mirroring
+  # Knowledge.heavy_read_opts/1: the 15s CLIENT timeout backstop plus an optional
+  # per-endpoint SERVER-SIDE statement_timeout override (config key `:change_feed`).
+  # Kept local to avoid an Audit→Knowledge module coupling for one opts helper.
+  defp change_feed_heavy_read_opts do
+    base = [timeout: 15_000, telemetry_options: [endpoint: :change_feed]]
+
+    case heavy_read_statement_timeout(:change_feed) do
+      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
+      _ -> base
+    end
+  end
+
+  defp heavy_read_statement_timeout(endpoint) do
+    :loopctl
+    |> Application.get_env(:heavy_read_statement_timeout_overrides, %{})
+    |> Map.get(endpoint)
+  end
+
   # First page (no cursor): seek by the `since` timestamp (back-compat). Subsequent
   # pages: seek by the `(inserted_at, id)` keyset tuple, which steps PAST a specific
   # row regardless of how many share its timestamp (US-27.9b tie-safety). The cursor
@@ -268,22 +294,10 @@ defmodule Loopctl.Audit do
     where(query, [a], a.inserted_at > ^since)
   end
 
-  defp apply_changes_seek(query, _since, {%DateTime{} = inserted_at, id})
-       when is_binary(id) do
-    # `type/2` tells Ecto the bound params' DB types so the row-value comparison
-    # binds `id` as uuid (binary_id) and `inserted_at` as the column's type — the
-    # same shape Loopctl.Knowledge.apply_keyset_seek/2 uses for the article list.
-    where(
-      query,
-      [a],
-      fragment(
-        "(?, ?) > (?, ?)",
-        a.inserted_at,
-        a.id,
-        type(^inserted_at, a.inserted_at),
-        type(^id, a.id)
-      )
-    )
+  defp apply_changes_seek(query, _since, {%DateTime{}, id} = cursor) when is_binary(id) do
+    # The `(inserted_at, id)` row-value seek, shared with the article/index/export
+    # keysets via Loopctl.KeysetSeek (the load-bearing type/2 annotations live there).
+    KeysetSeek.after_position(query, cursor)
   end
 
   @doc """

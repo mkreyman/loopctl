@@ -154,6 +154,57 @@ defmodule Loopctl.Knowledge.BySourceChangeFeedPlanScaleTest do
     end)
   end
 
+  # AC-27.9b.2 / review item-3: the BY-TAG deep page is the literal #175 incident path
+  # this story fixes, and `index_keyset_query` is a DISTINCT query from 27.9a's
+  # keyset_query (it forces `status = :published` + the project OR-clause), so we pin its
+  # tag-filtered plan HERE on the actual request-path query. Same honest tags-shape
+  # profile as 27.9a: the tags GIN bounds the scan (no btree can serve both array
+  # containment AND the (inserted_at, id) order), so we assert no unbounded Seq Scan, the
+  # selective tags GIN drives it, and the scan stays bounded by tag selectivity.
+  test "by-tag deep page on index_keyset_query is bounded by the tags GIN at prod scale",
+       %{tenant: tenant} do
+    unboxed(fn ->
+      published_count =
+        AdminRepo.one(
+          from(a in Article,
+            where: a.tenant_id == ^tenant.id and a.status == :published,
+            select: count(a.id)
+          )
+        )
+
+      deep_offset = trunc(published_count * 0.9)
+
+      deep =
+        AdminRepo.one(
+          from(a in Article,
+            where: a.tenant_id == ^tenant.id and a.status == :published,
+            order_by: [asc: a.inserted_at, asc: a.id],
+            offset: ^deep_offset,
+            limit: 1,
+            select: %{id: a.id, inserted_at: a.inserted_at}
+          )
+        )
+
+      assert deep, "expected a deep published row at offset #{deep_offset}"
+
+      cursor = {deep.inserted_at, deep.id}
+
+      query =
+        Knowledge.index_keyset_query(tenant.id, tags: ["scale-tag-7"], cursor: cursor, limit: 21)
+
+      assert :ok = PlanAssertions.refute_seq_scan(query),
+             "by-tag index_keyset_query must not Seq-Scan the corpus at prod scale"
+
+      assert :ok = PlanAssertions.assert_index_used(query, "articles_tags_index"),
+             "by-tag index_keyset_query must be bounded by the selective tags GIN"
+
+      max_bounded = div(ScaleSeed.prod_article_floor(), 8)
+
+      assert :ok = PlanAssertions.assert_scan_rows_below(query, max_bounded),
+             "by-tag index_keyset_query must stay bounded by tag selectivity, not scan the corpus"
+    end)
+  end
+
   test "change-feed keyset deep page is index-backed (no Seq Scan over audit_log)",
        %{tenant: tenant} do
     unboxed(fn ->
@@ -186,8 +237,12 @@ defmodule Loopctl.Knowledge.BySourceChangeFeedPlanScaleTest do
           limit: 1001
         )
 
-      assert :ok = PlanAssertions.refute_seq_scan_audit(query),
-             "change-feed keyset deep page must not Seq-Scan audit_log at prod scale"
+      # Tightened (review item-4): audit.ex claims the feed "walks it in order — index-
+      # backed", so we forbid a Bitmap Heap Scan too (refute_full_scan_audit), proving an
+      # ordered Index/Index-Only Scan — not just "no Seq Scan".
+      assert :ok = PlanAssertions.refute_full_scan_audit(query),
+             "change-feed keyset deep page must be an ordered index scan over audit_log " <>
+               "(no Seq Scan, no Bitmap) at prod scale"
 
       {elapsed_us, _rows} = :timer.tc(fn -> AdminRepo.all(query) end)
       elapsed_ms = div(elapsed_us, 1000)

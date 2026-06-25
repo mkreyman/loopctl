@@ -44,6 +44,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.HeavyRead
+  alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -1879,28 +1880,12 @@ defmodule Loopctl.Knowledge do
     })
   end
 
-  # No cursor: enumerate from the start.
-  defp apply_keyset_seek(query, nil), do: query
-
-  # Row-value comparison `(inserted_at, id) > (^ins, ^id)`: the standard keyset
-  # seek that the composite (tenant_id, inserted_at, id) btree serves directly.
-  defp apply_keyset_seek(query, {%DateTime{} = inserted_at, id})
-       when is_binary(id) do
-    # `type/2` tells Ecto the bound params' DB types: the raw `fragment` row-value
-    # comparison would otherwise send `id` as text and `inserted_at` without the
-    # column's type, which Postgrex rejects (id is binary_id / uuid).
-    where(
-      query,
-      [a],
-      fragment(
-        "(?, ?) > (?, ?)",
-        a.inserted_at,
-        a.id,
-        type(^inserted_at, a.inserted_at),
-        type(^id, a.id)
-      )
-    )
-  end
+  # Row-value comparison `(inserted_at, id) > (^ins, ^id)`: the standard keyset seek
+  # that the composite (tenant_id, inserted_at, id) btree serves directly. Shared with
+  # the index / change-feed / streaming-export keysets via Loopctl.KeysetSeek (the
+  # load-bearing type/2 annotations live there, in ONE place). `nil` cursor →
+  # enumerate from the start.
+  defp apply_keyset_seek(query, cursor), do: KeysetSeek.after_position(query, cursor)
 
   # Split limit+1 peek rows into the page (≤ limit) and whether more remain.
   defp split_peek(rows, limit) do

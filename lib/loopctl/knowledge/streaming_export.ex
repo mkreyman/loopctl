@@ -50,6 +50,7 @@ defmodule Loopctl.Knowledge.StreamingExport do
   require Logger
 
   alias Loopctl.HeavyRead
+  alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.StreamingExport.TarGz
@@ -471,21 +472,9 @@ defmodule Loopctl.Knowledge.StreamingExport do
     end
   end
 
-  defp apply_keyset_seek(query, nil), do: query
-
-  defp apply_keyset_seek(query, {%DateTime{} = inserted_at, id}) when is_binary(id) do
-    where(
-      query,
-      [a],
-      fragment(
-        "(?, ?) > (?, ?)",
-        a.inserted_at,
-        a.id,
-        type(^inserted_at, a.inserted_at),
-        type(^id, a.id)
-      )
-    )
-  end
+  # The `(inserted_at, id)` keyset seek, shared with the article/index/change-feed
+  # keysets via Loopctl.KeysetSeek (the load-bearing type/2 annotations live there).
+  defp apply_keyset_seek(query, cursor), do: KeysetSeek.after_position(query, cursor)
 
   defp emit_entries(writer, entries) do
     Enum.reduce_while(entries, {:ok, writer}, fn {path, content}, {:ok, writer} ->

@@ -23,7 +23,8 @@ defmodule Loopctl.IndexHealth do
   # Indexes whose absence/invalidity silently degrades a hot path to a Seq Scan.
   # Add to this list whenever a new CONCURRENTLY-built index becomes load-bearing.
   @critical_indexes [
-    {"articles_tenant_inserted_id_idx", "US-27.9a article keyset pagination"}
+    {"articles_tenant_inserted_id_idx", "US-27.9a article keyset pagination"},
+    {"articles_tenant_source_inserted_id_idx", "US-27.9b by-source keyset pagination"}
   ]
 
   @doc """
