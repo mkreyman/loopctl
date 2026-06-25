@@ -301,6 +301,51 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Like `assert_scan_rows_below/2` but bounds on **ACTUAL** rows, not the planner's
+  estimate — it runs `EXPLAIN (ANALYZE, FORMAT JSON)` (which EXECUTES the query) and
+  asserts every `articles` scan node produced fewer than `max_rows` rows in reality
+  (`Actual Rows × Actual Loops`, so a nested-loop inner scan's per-loop figure is
+  totalled correctly).
+
+  Why a separate, ANALYZE-based variant (US-27.7b novelty MIN guard): the estimate-based
+  `assert_scan_rows_below/2` reads `Plan Rows`, which a #168/#172-class regression can keep
+  artificially LOW while heap-rechecking the whole corpus at runtime (low-estimate /
+  high-actual). For the novelty `MIN(<=>)` aggregate — bounded by prior-tag selectivity via
+  EITHER an HNSW `ORDER BY <=> LIMIT 1` rewrite OR a `tags &&` GIN bitmap — both legitimate
+  bounded plans read few ACTUAL rows (~1.6k at the ~2% tag), so a generous `max_rows` ceiling
+  (e.g. corpus/8) passes both while a genuine full-corpus scan (~80k actual) trips it.
+
+  EXPLAIN ANALYZE executes the query, so this is for `:scale_nightly` tests against the
+  committed corpus only (the bounded plans are sub-millisecond there). `assert_scan_rows_below/2`
+  is deliberately left untouched (US-27.9a's keyset tags-shape scale assertion depends on the
+  estimate-based form).
+  """
+  def assert_actual_scan_rows_below(queryable_or_sql, max_rows) when is_integer(max_rows) do
+    assert_fresh_stats!()
+    {root, raw} = explain_analyze_json(queryable_or_sql)
+    actuals = article_actual_scan_rows(root)
+
+    over = Enum.filter(actuals, &(is_number(&1) and &1 >= max_rows))
+
+    cond do
+      actuals == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches `articles` — cannot judge ACTUAL scan rows. Plan:\n#{elide(raw)}"
+
+      over != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected every `articles` scan to produce < #{max_rows} ACTUAL rows (bounded by " <>
+              "residual selectivity), but got #{inspect(over)} — a runtime full-corpus scan " <>
+              "(the low-estimate/high-actual #168/#172 shape). Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
   Asserts the plan reaches `articles` via the given index `name` somewhere (an
   `Index Scan`, `Index Only Scan`, or `Bitmap Index Scan` naming it). Proves a
   selective index actually drives the scan (e.g. the `tags` GIN bounds a tag-filtered
@@ -318,6 +363,64 @@ defmodule Loopctl.PlanAssertions do
           "Expected the plan to use index #{inspect(name)}, but it does not appear. " <>
             "Plan:\n#{elide(raw)}"
     end
+  end
+
+  @doc """
+  Asserts every scan on `articles` is DOMINATED by a `Limit` node whose `Plan Rows`
+  is `<= max_rows` (US-27.7b distant_pairs: the SAMPLED candidate subquery
+  `... ORDER BY id LIMIT max_pair_candidates()`).
+
+  This is the right bound for a sample-capped shape where `assert_scan_rows_below/2` does
+  NOT apply: the candidate `Index Scan` legitimately reports the pre-LIMIT estimate
+  (`Plan Rows ≈ corpus`) on the scan node itself, while the enclosing `Limit` caps how many
+  rows are actually consumed (verified at 80k: `Limit rows=25` over the scan, ~1.7ms /
+  ~1657 buffers — NOT an O(n²) corpus read). A regression that dropped the sample LIMIT
+  (reintroducing the unbounded self-join) leaves the scan with no dominating `Limit ≤ max`,
+  tripping this.
+  """
+  def assert_article_scans_capped_by_limit(queryable_or_sql, max_rows)
+      when is_integer(max_rows) do
+    assert_fresh_stats!()
+    {root, raw} = explain_json(queryable_or_sql)
+    # `capped_limit?` (current node sits under a Limit whose Plan Rows ≤ max) starts false:
+    # the root itself has no ancestor Limit.
+    uncapped = uncapped_article_scans(root, false, max_rows)
+
+    cond do
+      article_scan_nodes(root) == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches `articles` — cannot judge the sample cap. Plan:\n#{elide(raw)}"
+
+      uncapped != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected every `articles` scan to be capped by a `Limit ≤ #{max_rows}` (the " <>
+              "max_pair_candidates() sample), but #{length(uncapped)} scan(s) are NOT — an " <>
+              "unbounded self-join over the corpus. Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  # Walk the tree tracking whether we are under a `Limit` node whose Plan Rows ≤ max.
+  # Returns the `articles` scan nodes that are NOT so dominated.
+  defp uncapped_article_scans(node, capped?, max) when is_map(node) do
+    capped_here? =
+      capped? or
+        (node["Node Type"] == "Limit" and is_number(node["Plan Rows"]) and
+           node["Plan Rows"] <= max)
+
+    here =
+      if node["Relation Name"] == "articles" and not capped_here?, do: [node], else: []
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&uncapped_article_scans(&1, capped_here?, max))
+
+    here ++ children
   end
 
   @doc """
@@ -486,6 +589,47 @@ defmodule Loopctl.PlanAssertions do
   defp explain_json(queryable) do
     {sql, params} = SQL.to_sql(:all, AdminRepo, queryable)
     explain_json({sql, params})
+  end
+
+  # Like `explain_json/1` but with ANALYZE — EXECUTES the query and returns the plan with
+  # per-node `Actual Rows`/`Actual Loops`. :scale_nightly-only (it runs the query for real).
+  defp explain_analyze_json({sql, params}) when is_binary(sql) and is_list(params) do
+    %{rows: rows} = AdminRepo.query!("EXPLAIN (ANALYZE, FORMAT JSON) " <> sql, params)
+
+    decoded =
+      rows
+      |> List.first()
+      |> List.first()
+      |> decode_json()
+
+    root = decoded |> List.first() |> Map.fetch!("Plan")
+    {root, Jason.encode!(decoded)}
+  end
+
+  defp explain_analyze_json(queryable) do
+    {sql, params} = SQL.to_sql(:all, AdminRepo, queryable)
+    explain_analyze_json({sql, params})
+  end
+
+  # Walk an ANALYZEd plan; for every `articles` scan node return the TOTAL actual rows it
+  # produced = `Actual Rows` × `Actual Loops` (Postgres reports `Actual Rows` per loop, so a
+  # nested-loop inner scan's true total is the product). nil-safe.
+  defp article_actual_scan_rows(node) when is_map(node) do
+    here =
+      if node["Relation Name"] == "articles" do
+        rows = node["Actual Rows"]
+        loops = node["Actual Loops"] || 1
+        if is_number(rows) and is_number(loops), do: [rows * loops], else: []
+      else
+        []
+      end
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&article_actual_scan_rows/1)
+
+    here ++ children
   end
 
   defp decode_json(v) when is_binary(v), do: Jason.decode!(v)

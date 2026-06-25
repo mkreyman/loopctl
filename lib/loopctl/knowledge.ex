@@ -3511,6 +3511,13 @@ defmodule Loopctl.Knowledge do
     Application.get_env(:loopctl, :max_pair_candidates, @max_pair_candidates)
   end
 
+  # Column-to-column self-join: `(a.embedding <=> b.embedding) BETWEEN $min AND $max` over
+  # a `LIMIT max_pair_candidates()` SAMPLED subquery. There is NO `$const` target vector
+  # here (both operands are stored columns), so pgvector's HNSW index cannot apply BY
+  # NATURE — this is NOT (and must not become) a `VectorSearch.nearest/4` call (US-27.7b —
+  # registered in `Loopctl.Knowledge.CosineLintExceptions`). It is bounded by the
+  # `max_pair_candidates()` sample LIMIT (NOT an O(n²) scan over the whole 80k corpus) and
+  # stays tenant-scoped (`a.tenant_id`/`b.tenant_id` filtered) via HeavyRead's structural guard.
   defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?, vis) do
     candidates =
       from(a in Article,
@@ -3850,16 +3857,50 @@ defmodule Loopctl.Knowledge do
 
   # Min cosine distance from the idea embedding to any prior proposal; nil when there
   # are no embedded priors (distinguishable from a genuine high score).
+  #
+  # This is a `MIN(? <=> $const::vector)` AGGREGATE over the prior-tag-scoped set, NOT a
+  # top-k `ORDER BY <=> LIMIT k`, so it is NOT (and must not become) a `VectorSearch.nearest/4`
+  # call: top-k-then-min ≠ the true MIN over the set (US-27.7b — registered in
+  # `Loopctl.Knowledge.CosineLintExceptions`). The only helper it shares with `nearest/4`
+  # is `to_embedding_list/1`, which normalizes the const to a plain `[float()]` param —
+  # the SAME value shape `nearest/4` binds — so the `::vector` cast never re-interpolates a
+  # stored `%Pgvector{}` struct (the #168 production 500). The query stays tenant-scoped
+  # (`a.tenant_id == ^tenant_id`) and is bounded by prior-tag selectivity — NEVER a
+  # full-corpus read (the verified plan shape is documented on novelty_distance_query/4).
   defp nearest_prior_distance(tenant_id, embedding, prior_tag, vis) do
+    tenant_id
+    |> novelty_distance_query(embedding, prior_tag, vis)
+    # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
+    |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:novelty)))
+  end
+
+  # The `MIN(embedding <=> $const::vector)` aggregate query, scoped to the prior-tag set.
+  # Extracted so the US-27.7b scale gate can EXPLAIN the EXACT query the request path runs
+  # (it executes inside a `Task.async_stream`, off the test process, so it can't be captured
+  # in-process). The const is normalized to a plain `[float()]` via `to_embedding_list/1`
+  # — the SAME value shape `nearest/4` binds — so the `::vector` cast never re-interpolates
+  # a stored `%Pgvector{}` (the #168 prod 500). NOT a top-k helper (registered in
+  # `Loopctl.Knowledge.CosineLintExceptions` — this function holds the `<=>` literal).
+  #
+  # BOUND (verified at 80k via EXPLAIN ANALYZE): tenant-scoped and bounded by prior-tag
+  # selectivity, NEVER a full-corpus read. Postgres rewrites `MIN(embedding <=> $const)` into
+  # `ORDER BY (embedding <=> $const) LIMIT 1` and serves it from the HNSW index
+  # (`articles_embedding_hnsw_idx`) with `tags &&` as a Filter (~0.3ms / 676 buffers); for a
+  # less-HNSW-friendly target/stats it may instead intersect the `tags &&` GIN
+  # (`articles_tags_index`) bitmap. The planner picks by cost — both are bounded; the
+  # invariant the scale test asserts is "bounded by prior-tag selectivity, not Seq Scan",
+  # accepting EITHER plan (it does NOT pin the node type).
+  @doc false
+  def novelty_distance_query(tenant_id, embedding, prior_tag, vis) do
+    target = to_embedding_list(embedding)
+
     from(a in Article,
       where:
         a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
           fragment("? && ?", a.tags, ^[prior_tag]),
-      select: fragment("MIN(? <=> ?::vector)", a.embedding, ^embedding)
+      select: fragment("MIN(? <=> ?::vector)", a.embedding, ^target)
     )
     |> maybe_filter_by_visibility(vis)
-    # Heavy vector aggregate — dedicated pool via Loopctl.HeavyRead (US-27.11).
-    |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:novelty)))
   end
 
   # --- Embeddings ---
