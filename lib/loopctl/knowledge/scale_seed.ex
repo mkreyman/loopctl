@@ -236,12 +236,16 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   Like `seed/2`, this MUST run UNBOXED (committed) so ANALYZE sees the rows. It
   raises the same sandbox guard.
 
-  Timestamps are spread over the LAST 25 days (within the current monthly partition
-  that `mix ecto.reset` creates relative to today) and TIED per batch — a batch of
-  rows shares one `inserted_at` — so the deep change-feed page exercises the
-  `(inserted_at, id)` tuple tie-break the keyset (US-27.9b) relies on. All entries
-  are `entity_type: "story"` (NOT "article"/"article_link") so the controller's
-  visibility filter is a no-op and the plan/walk reflect the raw keyset.
+  Timestamps are spread across **TWO adjacent monthly partitions** (the current month
+  and the next, both created by `mix ecto.reset` / `AuditPartitionWorker` — current +
+  3-ahead), so the deep change-feed page produces the SAME multi-partition **Merge
+  Append** the planner uses in prod (where rows span months), not a single-partition
+  shortcut. The seed pre-creates the next-month partition defensively in case the
+  worker hasn't run. Within the window timestamps are TIED per batch — a batch of rows
+  shares one `inserted_at` — so the deep page also exercises the `(inserted_at, id)`
+  tuple tie-break the keyset (US-27.9b) relies on. All entries are `entity_type:
+  "story"` (NOT "article"/"article_link") so the controller's visibility filter is a
+  no-op and the plan/walk reflect the raw keyset.
   """
   @spec seed_changes(binary(), keyword()) :: {:ok, %{changes: non_neg_integer()}}
   def seed_changes(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -257,15 +261,26 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     count = Keyword.get(opts, :count, 1_000)
     batch_size = Keyword.get(opts, :batch_size, 1_000)
 
-    # Spread inserted_at WITHIN the current month so every row lands in the current
-    # monthly partition (audit_log is RANGE-partitioned by inserted_at; the migration
-    # / AuditPartitionWorker create the current-month + 3-ahead partitions, so a
-    # timestamp in a prior month has no partition and the insert would fail). The
-    # window is `[month_start + 1h, now - 1h]`, split into `num_batches` TIED-timestamp
-    # batches ascending so the deep page exercises the (inserted_at, id) tie-break.
+    # Span TWO partitions: spread from the current month's start into the NEXT month so
+    # a deep cursor page crosses the partition boundary → a real multi-partition Merge
+    # Append (the prod shape). Both partitions exist (reset/worker create current + 3
+    # ahead); ensure_audit_partitions!/2 pre-creates them defensively. The window is
+    # `[current_month_start + 1h, next_month_start + 10d]`, split into `num_batches`
+    # TIED-timestamp batches ascending so the deep page also exercises the
+    # (inserted_at, id) tie-break.
     now = DateTime.utc_now()
     {:ok, month_start} = DateTime.new(Date.new!(now.year, now.month, 1), ~T[01:00:00], "Etc/UTC")
-    window_end = DateTime.add(now, -3600, :second)
+    {next_year, next_month} = next_month(now.year, now.month)
+
+    {:ok, next_month_start} =
+      DateTime.new(Date.new!(next_year, next_month, 1), ~T[00:00:00], "Etc/UTC")
+
+    ensure_audit_partitions!(now, next_year, next_month)
+
+    # End the window ~10 days into the next month, so a healthy fraction of rows land in
+    # the next-month partition (the deepest, newest rows) regardless of where in the
+    # current month "now" is — guaranteeing the boundary is genuinely straddled.
+    window_end = DateTime.add(next_month_start, 10 * 86_400, :second)
     span_seconds = max(DateTime.diff(window_end, month_start, :second), 1)
     num_batches = div(count + batch_size - 1, batch_size)
 
@@ -273,8 +288,8 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       0..(num_batches - 1)
       |> Enum.reduce(0, fn batch_idx, acc ->
         # One shared timestamp per batch (ties), stepping FORWARD from month_start so
-        # batches are time-ordered ascending with the LAST batch newest. Guaranteed
-        # within [month_start, window_end] ⊂ the current partition.
+        # batches are time-ordered ascending with the LAST batch newest. Spans
+        # [month_start, window_end] ⊂ current ∪ next partition.
         offset_seconds = div(span_seconds * batch_idx, max(num_batches, 1))
 
         # `:utc_datetime_usec` requires explicit microsecond precision; a whole-second
@@ -314,6 +329,34 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     AdminRepo.query!("ANALYZE audit_log")
 
     {:ok, %{changes: committed}}
+  end
+
+  # Next (year, month) after the given one.
+  defp next_month(year, 12), do: {year + 1, 1}
+  defp next_month(year, month), do: {year, month + 1}
+
+  # Defensively ensure the audit_log partitions for the current and next month exist
+  # (idempotent `CREATE TABLE IF NOT EXISTS PARTITION OF`), so seed_changes/2 can span
+  # the boundary even if AuditPartitionWorker hasn't run since reset. Mirrors the
+  # worker's naming/bounds. AdminRepo is the table owner in test.
+  defp ensure_audit_partitions!(
+         %DateTime{year: cur_year, month: cur_month},
+         next_year,
+         next_month
+       ) do
+    for {year, month} <- [{cur_year, cur_month}, {next_year, next_month}] do
+      {to_year, to_month} = next_month(year, month)
+      name = "audit_log_y#{year}m#{pad(month)}"
+      from_date = "#{year}-#{pad(month)}-01"
+      to_date = "#{to_year}-#{pad(to_month)}-01"
+
+      AdminRepo.query!("""
+      CREATE TABLE IF NOT EXISTS #{name} PARTITION OF audit_log
+        FOR VALUES FROM ('#{from_date}') TO ('#{to_date}')
+      """)
+    end
+
+    :ok
   end
 
   @doc """
@@ -748,4 +791,9 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       Enum.map(floats, &(&1 / norm))
     end
   end
+
+  # Zero-pad a 1-2 digit month for the audit_log partition name/bounds (mirrors the
+  # AuditPartitionWorker / migration naming).
+  defp pad(n) when n < 10, do: "0#{n}"
+  defp pad(n), do: "#{n}"
 end

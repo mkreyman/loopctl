@@ -225,8 +225,9 @@ defmodule Loopctl.Audit do
     # same dedicated-pool statement_timeout backstop (US-27.4) the index keyset path
     # uses, instead of a bare AdminRepo.all. The HeavyRead structural tenant guard
     # accepts the query because `changes_keyset_query/3` carries an explicit
-    # `a.tenant_id == ^tenant_id` equality on the only base source.
-    results = HeavyRead.all(tenant_id, query, change_feed_heavy_read_opts())
+    # `a.tenant_id == ^tenant_id` equality on the only base source. Opts come from the
+    # single source of truth, `HeavyRead.opts/1` (shared with Knowledge — no drift).
+    results = HeavyRead.all(tenant_id, query, HeavyRead.opts(:change_feed))
 
     has_more = length(results) > limit
     entries = Enum.take(results, limit)
@@ -249,11 +250,16 @@ defmodule Loopctl.Audit do
   This is the EXACT query `list_changes/3` runs (so the plan assertion guards the
   request path). `:limit` is applied as-is here (the caller adds the `+1` peek).
 
-  Plan note (AC-27.9b.2): with `tenant_id =` plus the `(inserted_at, id)` row-value
-  seek and `ORDER BY inserted_at ASC, id ASC`, the planner reaches `audit_log` (a
-  RANGE-partitioned table) via the existing `(tenant_id, inserted_at)` btree and
-  walks it in order — index-backed, no Seq Scan over the corpus. The `id` is the
-  tie-break recheck within the bounded equal-timestamp run.
+  Plan note (AC-27.9b.2): `audit_log` is RANGE-partitioned by month, so with
+  `tenant_id =` plus the `(inserted_at, id)` row-value seek and
+  `ORDER BY inserted_at ASC, id ASC`, the planner does PER-PARTITION Index Scans on the
+  existing `(tenant_id, inserted_at)` btree, combined under either an **Append + a
+  top-level Incremental Sort** (the empirical choice at 80k — each partition is
+  presorted on `inserted_at`, the incremental sort finishes the `id` tie-break) or a
+  **Merge Append** (cost-equivalent; the index lacks `id`). No Seq Scan, no Bitmap over
+  the corpus — bounded by the keyset seek, cost ~O(page). The `:scale_nightly` plan test
+  seeds across ≥2 monthly partitions and asserts both an ordered multi-partition scan and
+  `refute_full_scan_audit` on the deep page.
   """
   @spec changes_keyset_query(Ecto.UUID.t(), DateTime.t(), keyword()) :: Ecto.Query.t()
   def changes_keyset_query(tenant_id, since, opts \\ []) do
@@ -265,25 +271,6 @@ defmodule Loopctl.Audit do
     |> apply_filters(opts)
     |> order_by([a], asc: a.inserted_at, asc: a.id)
     |> limit(^limit)
-  end
-
-  # Per-read options for the change-feed keyset (US-27.9b), mirroring
-  # Knowledge.heavy_read_opts/1: the 15s CLIENT timeout backstop plus an optional
-  # per-endpoint SERVER-SIDE statement_timeout override (config key `:change_feed`).
-  # Kept local to avoid an Audit→Knowledge module coupling for one opts helper.
-  defp change_feed_heavy_read_opts do
-    base = [timeout: 15_000, telemetry_options: [endpoint: :change_feed]]
-
-    case heavy_read_statement_timeout(:change_feed) do
-      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
-      _ -> base
-    end
-  end
-
-  defp heavy_read_statement_timeout(endpoint) do
-    :loopctl
-    |> Application.get_env(:heavy_read_statement_timeout_overrides, %{})
-    |> Map.get(endpoint)
   end
 
   # First page (no cursor): seek by the `since` timestamp (back-compat). Subsequent

@@ -3170,28 +3170,11 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc false
-  # Per-read options for a heavy endpoint (US-27.4): the 15s CLIENT timeout backstop
-  # plus an optional per-endpoint SERVER-SIDE statement_timeout override (config
-  # `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`). When
-  # no override is configured the read uses the pool-level statement_timeout (the
-  # default path, no per-request transaction). Also passes the endpoint key via
-  # telemetry_options so slow-query logs can trace which endpoint triggered the query.
-  # Public-but-`@doc false` so the slow-query telemetry test can exercise the real
-  # opts-building path (incl. the override branch).
-  def heavy_read_opts(endpoint) do
-    base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
-
-    case heavy_read_statement_timeout(endpoint) do
-      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
-      _ -> base
-    end
-  end
-
-  defp heavy_read_statement_timeout(endpoint) do
-    :loopctl
-    |> Application.get_env(:heavy_read_statement_timeout_overrides, %{})
-    |> Map.get(endpoint)
-  end
+  # Per-read options for a heavy endpoint (US-27.4). Delegates to the single source of
+  # truth, `Loopctl.HeavyRead.opts/1`, so the opts shape can't drift between callers
+  # (Knowledge / Audit). Public-but-`@doc false` so the slow-query telemetry test can
+  # exercise the real opts-building path (incl. the override branch) through this name.
+  def heavy_read_opts(endpoint), do: HeavyRead.opts(endpoint)
 
   # Builds the suggested-links candidate query (returned, not executed) so a test can
   # assert its SQL shape. Public-but-`@doc false` for that structural regression guard.

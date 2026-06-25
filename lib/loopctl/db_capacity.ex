@@ -23,8 +23,16 @@ defmodule Loopctl.DbCapacity do
   # Production default pool sizes = the env-var defaults in config/runtime.exs.
   @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
 
-  # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s vector reads + a reserve for
-  # long-held streamed-export checkouts (US-27.16). fast + reserve == the pool size.
+  # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s reads + a reserve for long-held
+  # streamed-export checkouts (US-27.16). fast + reserve == the pool size.
+  #
+  # The fast-reads budget (K≈6) serves the heavy-read consumers: 5 ONE-SHOT heavy reads
+  # (suggested_links, semantic_search, distant_pairs, novelty, enumeration) PLUS one
+  # rate-limited POLLING feed — the US-27.9b change feed (`:change_feed`). The K
+  # rationale still holds with the polling addition because the change-feed read is a
+  # CHEAP, fast-releasing bounded keyset page (one read per request, connection RELEASED
+  # immediately) AND its QPS is capped by the api pipeline's rate limiter, so even a poll
+  # storm cannot saturate the fast slots — it adds at most a brief transient checkout.
   @heavy_read_fast_reads 6
   @heavy_read_export_reserve 2
 

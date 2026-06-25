@@ -73,13 +73,20 @@ defmodule Loopctl.IndexHealth do
   # :valid | :invalid | :missing — via pg_index.indisvalid (the catalog truth).
   @spec index_validity(String.t()) :: :valid | :invalid | :missing
   def index_validity(name) when is_binary(name) do
+    # Scope to ACTUAL indexes (`relkind = 'i'`) in the `public` schema so an unrelated
+    # object (a table/view/sequence, or a same-named index in another schema) can't
+    # produce a >1-row result → MatchError → "boot check skipped" masking the real
+    # probe. An index name is unique within a schema, so this returns exactly 0 or 1 row.
     %{rows: rows} =
       AdminRepo.query!(
         """
         SELECT i.indisvalid
         FROM pg_class c
         JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relname = $1
+          AND c.relkind = 'i'
+          AND n.nspname = 'public'
         """,
         [name]
       )

@@ -21,11 +21,20 @@ removes that coupling and gives US-27.4/27.6b a clean pool-level lever.
 
 ### `HEAVY_READ_POOL_SIZE` (K) — sizing rationale (AC-27.11.1)
 
-Default **8** supports **K ≈ 6** concurrent sub-2s heavy vector reads while
+Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while
 **reserving ~2 connections** for long-held **streamed-export** checkouts
 (US-27.16), which hold a connection for *minutes* — a different profile than fast
 reads. Raise it if export concurrency or heavy-read QPS grows, but only after
 re-checking the connection budget below.
+
+The fast-reads (K≈6) now serve **six** HeavyRead consumers: five ONE-SHOT heavy reads
+(`suggested_links`, `semantic_search`, `distant_pairs`, `novelty`, `enumeration`) plus
+one **rate-limited polling feed** — the US-27.9b change feed (`:change_feed`,
+`GET /changes`). The K budget is unchanged by the addition: the change-feed read is a
+single CHEAP, fast-releasing bounded keyset page (connection released immediately), and
+its poll QPS is bounded by the api pipeline's `LoopctlWeb.Plugs.RateLimiter`, so even an
+orchestrator poll storm adds only brief transient checkouts — it cannot saturate the
+fast slots or change the connection-count budget below.
 
 ### Connection budget vs. `max_connections` (AC-27.11.5)
 
@@ -225,16 +234,27 @@ regardless of ties. `next_since` is retained in the response for back-compat onl
 callers MUST follow `next_cursor`.** `since` is still accepted for the first page; the
 cursor takes precedence when both are present.
 
-**No new index for the change feed.** `audit_log` is **RANGE-partitioned by
-`inserted_at`** with an existing `(tenant_id, inserted_at)` btree; the keyset seek with
-`tenant_id =` walks that index in order, with the `id` as the bounded tie-break recheck
-inside an equal-timestamp run. `CREATE INDEX CONCURRENTLY` is **not supported on a
-partitioned parent**, so a `(tenant_id, inserted_at, id)` parent index is intentionally
-NOT added — the existing index already keeps the deep page index-backed. The scale test
-asserts `refute_full_scan_audit` (no Seq Scan **and** no Bitmap Heap Scan → an ordered
-Index Scan) on the request-path `Audit.changes_keyset_query/3` at 80k. The change-feed
-read is routed through `Loopctl.HeavyRead` so it inherits the dedicated-pool
-`statement_timeout` backstop (US-27.4), same as the index keyset path.
+**No new index for the change feed.** `audit_log` is **RANGE-partitioned by month** with
+an existing `(tenant_id, inserted_at)` btree. The keyset seek (`tenant_id =` + the
+`(inserted_at, id)` row-value comparison, `ORDER BY inserted_at, id`) plans as
+**per-partition Index Scans** (one scan per month the cursor range touches) combined
+under an ordered node. Because the index lacks `id`, the planner finishes the global
+`(inserted_at, id)` order one of two cost-equivalent ways: **Append + a top-level
+Incremental Sort** (the empirical choice at 80k — each partition is presorted on
+`inserted_at`, the incremental sort resolves the `id` tie-break within each
+equal-timestamp run) or a **Merge Append**. Either way: no Seq Scan, no Bitmap over the
+corpus — bounded by the keyset seek (~O(page)). `CREATE INDEX CONCURRENTLY` is **not
+supported on a partitioned parent**, so a `(tenant_id, inserted_at, id)` parent index is
+intentionally NOT added — the existing index already keeps the deep page index-backed
+(the `id` tie-break is a cheap incremental sort, not a corpus scan). The scale test seeds
+across **≥2 monthly partitions** (so the deep page produces a real multi-partition
+ordered scan, matching prod — not a single-partition shortcut) and asserts BOTH
+`assert_ordered_multi_partition_scan` (≥2 partitions via Index Scan under Merge
+Append/Append+Incremental-Sort) AND `refute_full_scan_audit` (no Seq Scan **and** no
+Bitmap Heap Scan) on the request-path `Audit.changes_keyset_query/3`. The change-feed read
+is routed through `Loopctl.HeavyRead` so it inherits the dedicated-pool `statement_timeout`
+backstop (US-27.4), same as the index keyset path; it is the **sixth** HeavyRead consumer
+(the rate-limited polling feed — see the HEAVY_READ_POOL_SIZE sizing note above).
 
 ### Tenant safety on every surface
 

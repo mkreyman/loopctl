@@ -205,7 +205,7 @@ defmodule Loopctl.Knowledge.BySourceChangeFeedPlanScaleTest do
     end)
   end
 
-  test "change-feed keyset deep page is index-backed (no Seq Scan over audit_log)",
+  test "change-feed keyset deep page is a multi-partition Merge Append, no Seq/Bitmap",
        %{tenant: tenant} do
     unboxed(fn ->
       total =
@@ -213,35 +213,70 @@ defmodule Loopctl.Knowledge.BySourceChangeFeedPlanScaleTest do
 
       assert total > 0, "expected seeded audit_log rows"
 
-      deep_offset = trunc(total * 0.9)
-
-      deep =
+      # Confirm the seed actually straddles ≥2 monthly partitions (the prod shape). The
+      # rows span the current month and the next (ScaleSeed.seed_changes/2), so distinct
+      # year-months > 1.
+      distinct_months =
         AdminRepo.one(
           from(a in AuditLog,
             where: a.tenant_id == ^tenant.id,
-            order_by: [asc: a.inserted_at, asc: a.id],
-            offset: ^deep_offset,
+            select: count(fragment("DISTINCT date_trunc('month', ?)", a.inserted_at))
+          )
+        )
+
+      assert distinct_months >= 2,
+             "seed must span ≥2 monthly partitions for a real Merge Append (got #{distinct_months})"
+
+      # Pick a cursor at the LAST row of the FIRST (current) month, so the forward keyset
+      # seek `(inserted_at, id) > cursor` includes the current-month tail AND all of the
+      # next month — forcing a deep page whose Merge Append spans BOTH partitions (the
+      # prod multi-partition shape), not a single-partition shortcut.
+      {:ok, month_start} =
+        DateTime.new(
+          Date.new!(DateTime.utc_now().year, DateTime.utc_now().month, 1),
+          ~T[00:00:00]
+        )
+
+      {next_year, next_month} =
+        if month_start.month == 12,
+          do: {month_start.year + 1, 1},
+          else: {month_start.year, month_start.month + 1}
+
+      {:ok, next_month_start} = DateTime.new(Date.new!(next_year, next_month, 1), ~T[00:00:00])
+
+      boundary =
+        AdminRepo.one(
+          from(a in AuditLog,
+            where: a.tenant_id == ^tenant.id and a.inserted_at < ^next_month_start,
+            order_by: [desc: a.inserted_at, desc: a.id],
             limit: 1,
             select: %{id: a.id, inserted_at: a.inserted_at}
           )
         )
 
-      assert deep, "expected a deep audit row at offset #{deep_offset}"
+      assert boundary, "expected a current-month row before the partition boundary"
 
-      cursor = {deep.inserted_at, deep.id}
+      cursor = {boundary.inserted_at, boundary.id}
 
-      # The EXACT request-path query, for a deep cursor.
+      # The EXACT request-path query, for a boundary-straddling deep cursor.
       query =
         Audit.changes_keyset_query(tenant.id, DateTime.from_unix!(0),
           cursor: cursor,
           limit: 1001
         )
 
-      # Tightened (review item-4): audit.ex claims the feed "walks it in order — index-
-      # backed", so we forbid a Bitmap Heap Scan too (refute_full_scan_audit), proving an
-      # ordered Index/Index-Only Scan — not just "no Seq Scan".
+      # Multi-partition guard (review item-2): the page must span ≥2 partitions via
+      # per-partition Index Scans under an ordered combiner (Merge Append, or Append +
+      # Incremental Sort — the planner's empirical choice here) — the prod shape, so
+      # refute_full_scan_audit isn't vacuous on a single-partition shortcut.
+      assert :ok = PlanAssertions.assert_ordered_multi_partition_scan(query, 2),
+             "deep change-feed page must be an ordered scan over ≥2 audit_log partitions"
+
+      # Tightened (review item-4): forbid Bitmap too (refute_full_scan_audit), proving
+      # per-partition ordered Index Scans (an incremental sort resolves the id tie-break)
+      # — no Seq Scan, no Bitmap over the corpus.
       assert :ok = PlanAssertions.refute_full_scan_audit(query),
-             "change-feed keyset deep page must be an ordered index scan over audit_log " <>
+             "change-feed keyset deep page must be per-partition index scans over audit_log " <>
                "(no Seq Scan, no Bitmap) at prod scale"
 
       {elapsed_us, _rows} = :timer.tc(fn -> AdminRepo.all(query) end)
