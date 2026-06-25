@@ -68,7 +68,23 @@ config :loopctl,
   # one of the small admin-pool connections for the sum of their runtimes.
   bulk_op_transaction_timeout_ms: 15_000,
   bulk_delete_frozen_max: 1_000,
-  bulk_delete_token_ttl_seconds: 300
+  bulk_delete_token_ttl_seconds: 300,
+  # US-27.15: scale telemetry metrics + Prometheus reporter (internal :9568/metrics,
+  # scraped by Fly's managed Prometheus over 6PN).
+  # - metrics_reporter_enabled: start the SUPERVISED Prometheus reporter child. OFF by
+  #   default (so :test never binds the port); turned ON in prod (runtime.exs). Flip it
+  #   on in dev to inspect localhost:9568/metrics.
+  # - metrics_port: the internal port the reporter binds for /metrics (NEVER the public
+  #   8080 http_service). Matches the fly.toml [metrics] block.
+  # - metrics_tenant_label_cap: the documented tenant-count cap (AC-27.15.3). The
+  #   `tenant_id` COUNTER label is allowed only while total tenants <= this; above it the
+  #   label collapses to the `:_aggregated` sentinel (cardinality 1) and per-tenant
+  #   attribution falls back to logs. tenant_id is NEVER a histogram label. The gate is
+  #   cached in :persistent_term and refreshed by a telemetry_poller measurement — no
+  #   per-emit DB hit.
+  metrics_reporter_enabled: false,
+  metrics_port: 9568,
+  metrics_tenant_label_cap: 1_000
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.

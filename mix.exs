@@ -68,6 +68,11 @@ defmodule Loopctl.MixProject do
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
+      # US-27.15: Prometheus reporter on an INTERNAL port (9568) scraped by Fly's
+      # managed Prometheus over the private 6PN network. Bundles a standalone
+      # Plug.Cowboy server so the /metrics endpoint is isolated from the public
+      # 8080 http_service. Started only when :metrics_reporter_enabled (prod), not test.
+      {:telemetry_metrics_prometheus, "~> 1.1"},
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},

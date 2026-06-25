@@ -42,6 +42,17 @@ primary_region = "lax"
     method = "GET"
     path = "/health"
 
+# US-27.15: Fly's managed Prometheus scrapes app metrics from this INTERNAL port over
+# the private 6PN network. Port 9568 is NOT published in `http_service` above (only
+# 8080 is public), so `/metrics` is never reachable from the internet — only by the
+# Fly scraper. The metrics carry safe, bounded dimensions only (endpoint, mapped_code,
+# cap-gated tenant_id) — no vectors/bodies/params/article_ids. The port MUST match
+# `:metrics_port` (runtime.exs / METRICS_PORT). Series surface in fly-metrics.net Grafana;
+# alert rules are documented in docs/runbooks/knowledge-scale.md.
+[metrics]
+  port = 9568
+  path = "/metrics"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"

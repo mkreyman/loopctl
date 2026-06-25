@@ -39,7 +39,9 @@ defmodule LoopctlWeb.DBErrorLogger do
   alias LoopctlWeb.DBError
 
   @doc """
-  Logs a mapped DB error at `:error` level with sanitized structured fields.
+  Logs a mapped DB error at `:error` level with sanitized structured fields, then
+  emits a `[:loopctl, :db, :error]` telemetry event (US-27.15) so the mapped error
+  is aggregated into the metrics layer.
 
   `mapping` is the `LoopctlWeb.DBError.map/1` result; `error` is the original
   exception (used only for the bare PG message). `conn` supplies controller,
@@ -68,6 +70,53 @@ defmodule LoopctlWeb.DBErrorLogger do
       request_id: request_id,
       pg_message: safe_pg_message(error, mapping.mapped_code)
     )
+
+    emit_metric(conn, mapping, sqlstate, tenant_id)
+  end
+
+  # US-27.15: feed the metrics layer. The metadata is id-only — `mapped_code`
+  # (bounded class), `sqlstate` (a 5-char SQLSTATE), the BOUNDED controller.action
+  # `endpoint`, and `tenant_id` (an id, used only by the cap-gated counter tag,
+  # never on a histogram). NO raw SQL / bound params / vector literals / PG message
+  # body cross this boundary (AC-27.15.3). The metric DEFINITIONS in
+  # `Loopctl.Telemetry.ScaleMetrics` decide which of these become Prometheus labels.
+  defp emit_metric(conn, mapping, sqlstate, tenant_id) do
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.db_error(),
+      %{count: 1},
+      %{
+        mapped_code: mapping.mapped_code,
+        sqlstate: sqlstate,
+        endpoint: endpoint(conn),
+        tenant_id: tenant_id
+      }
+    )
+
+    :ok
+  end
+
+  # The BOUNDED endpoint dimension: the matched Phoenix `Controller.action` atom,
+  # NOT the raw request path (a raw path embeds ids → unbounded label cardinality).
+  # `phoenix_controller` (a module atom) and `phoenix_action` (an atom the router sets
+  # from a compile-time-known action name) ALREADY EXIST as atoms — we only look them
+  # up and combine via `Module.concat/2` (interns an existing-segment atom), NEVER
+  # `String.to_atom/1` on user input. Both come from the FINITE set of compiled
+  # controllers/actions, so the label is bounded by construction. Falls back to the
+  # controller alone (still bounded), then `:unknown`, if a stage is missing.
+  defp endpoint(conn) do
+    controller = Map.get(conn.private, :phoenix_controller)
+    action = Map.get(conn.private, :phoenix_action)
+
+    cond do
+      is_atom(controller) and is_atom(action) and not is_nil(controller) and not is_nil(action) ->
+        Module.concat(controller, action)
+
+      is_atom(controller) and not is_nil(controller) ->
+        controller
+
+      true ->
+        :unknown
+    end
   end
 
   # AC-27.3.8 (disclosure control): the bare PG message is value-free for the

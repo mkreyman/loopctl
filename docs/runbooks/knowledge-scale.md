@@ -27,14 +27,21 @@ Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while
 reads. Raise it if export concurrency or heavy-read QPS grows, but only after
 re-checking the connection budget below.
 
-The fast-reads (K≈6) now serve **six** HeavyRead consumers: five ONE-SHOT heavy reads
+The fast-reads (K≈6) now serve **six** HeavyRead consumers: five fast heavy reads
 (`suggested_links`, `semantic_search`, `distant_pairs`, `novelty`, `enumeration`) plus
 one **rate-limited polling feed** — the US-27.9b change feed (`:change_feed`,
-`GET /changes`). The K budget is unchanged by the addition: the change-feed read is a
-single CHEAP, fast-releasing bounded keyset page (connection released immediately), and
-its poll QPS is bounded by the api pipeline's `LoopctlWeb.Plugs.RateLimiter`, so even an
-orchestrator poll storm adds only brief transient checkouts — it cannot saturate the
-fast slots or change the connection-count budget below.
+`GET /changes`). Note `suggested_links` is no longer strictly one-shot: since US-27.6b it
+issues a **second bounded under-fill probe read** on the truncated (`returned < limit`)
+path (an ANN-class `COUNT(*)` over the same inner top-`pool` subquery). That second read
+is **strictly sequential** — it runs only after the main read's connection is released —
+so the **peak concurrent checkout per request stays 1** and the K budget is unchanged (it
+adds only throughput demand on the truncated path, itself capped by the api rate limiter;
+see `Loopctl.DbCapacity`). The K budget is likewise unchanged by the change feed: that
+read is a single CHEAP, fast-releasing bounded keyset page (connection released
+immediately), and its poll QPS is bounded by the api pipeline's
+`LoopctlWeb.Plugs.RateLimiter`, so even an orchestrator poll storm adds only brief
+transient checkouts — it cannot saturate the fast slots or change the connection-count
+budget below.
 
 ### Connection budget vs. `max_connections` (AC-27.11.5)
 
@@ -353,3 +360,112 @@ returned with no truncation signal rather than failing the request.
 per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
 the #172 small-pool starvation). Until ef_search is raised (and verified on fly mpg),
 recall stays at the default and is handled by over-fetch + this under-fill signal.
+
+## Metrics & alerting (US-27.15)
+
+US-27.3/27.4/27.6b emit structured **logs/events**, but "recurring slow queries are
+visible before they become incidents" is hard to satisfy by grepping a 7-day log. US-27.15
+aggregates those signals into **three `Telemetry.Metrics`** exported on an **internal
+`:9568/metrics`** endpoint that Fly's **managed Prometheus** scrapes over the private 6PN
+network (`fly.toml [metrics]`). The series appear in **`fly-metrics.net` Grafana**; alert
+rules below are the documented threshold path (AC-27.15.2).
+
+> **Scope (AC-27.15.4 — USER-signed-off):** metric emission + the Prometheus reporter +
+> the documented Grafana/Prometheus **alert rules** below SHIP in this story. Bespoke
+> Grafana **dashboard JSON** and an external **alertmanager** wiring (beyond these rules)
+> are a recorded **backlog follow-up**, not silently dropped. loopctl has no Sentry; this
+> is the durable-signal path the fly-logs "persisted signals" guidance prefers over 7-day
+> logs.
+
+### Surface & security
+
+- **Reporter:** `TelemetryMetricsPrometheus` (a supervised child of `LoopctlWeb.Telemetry`),
+  started only when `:metrics_reporter_enabled` is true (prod via `runtime.exs`; **off in
+  test** so the suite never binds the port; flip on in dev to read `localhost:9568/metrics`).
+- **Internal-only:** `/metrics` binds the SEPARATE internal port **9568** — it is NOT in
+  `fly.toml`'s `http_service` (only public **8080** is). Fly's scraper reaches 9568 over
+  6PN; the internet cannot. Port is tunable via `METRICS_PORT` but MUST match the
+  `[metrics]` block.
+- **No-leak (AC-27.15.3):** labels are safe dimensions ONLY — `endpoint` (a matched
+  `Controller.action` / heavy-read endpoint atom, never a raw path with ids), `mapped_code`
+  (a bounded DB-error class), and a **cap-gated** `tenant_id`. There is **no `article_id`
+  label**, and no raw vector / body / param ever reaches a tag.
+
+### The three metrics
+
+| Metric (Telemetry.Metrics name) | Type | Labels | Source event | Meaning |
+| --- | --- | --- | --- | --- |
+| `loopctl.db.error.count` | counter | `endpoint`, `mapped_code`, *(cap-gated)* `tenant_id` | `[:loopctl, :db, :error]` (`DBErrorLogger`) | Mapped DB errors by endpoint + class. `mapped_code="db_statement_timeout"` is the 57014 timeout counter; siblings are serialization / deadlock / catch-all. |
+| `loopctl.heavy_read_repo.query.duration` | distribution (histogram) | `endpoint` **only** | `[:loopctl, :heavy_read_repo, :query]` | Heavy vector/enumeration read latency by endpoint. **No `tenant_id`** — endpoint × tenant × buckets is the multi-tenant cardinality bomb. |
+| `loopctl.knowledge.vector_search.under_fill.count` | counter | `endpoint`, *(cap-gated)* `tenant_id` | `[:loopctl, :knowledge, :vector_search, :under_fill]` (US-27.6b) | Recall under-fill events by endpoint (a densely-linked hub hiding above-threshold neighbors). |
+
+### Prometheus metric names (dot→underscore + histogram suffixes)
+
+`Telemetry.Metrics` → Prometheus munges `.` to `_`; a `distribution` becomes a histogram
+with `_bucket` / `_sum` / `_count` series. So the scraped names are:
+
+- `loopctl_db_error_count` (labels: `endpoint`, `mapped_code`, `tenant_id`)
+- `loopctl_heavy_read_repo_query_duration_bucket` / `_sum` / `_count` (label: `endpoint`,
+  plus `le` on the `_bucket` series)
+- `loopctl_knowledge_vector_search_under_fill_count` (labels: `endpoint`, `tenant_id`)
+
+Histogram buckets (ms): `10, 50, 100, 250, 500, 1000, 2500, 5000, 10000`.
+
+### Tenant-label cardinality gate (AC-27.15.3)
+
+`tenant_id` is a **counter** label ONLY while total tenants ≤ `:metrics_tenant_label_cap`
+(default **1000**, env `METRICS_TENANT_LABEL_CAP`). Above the cap the label collapses to the
+fixed sentinel **`_aggregated`** (cardinality 1), and per-tenant attribution falls back to
+logs (which still carry `tenant_id`). It is **NEVER** a histogram label. The gate is a
+boolean cached in `:persistent_term`, recomputed by a `telemetry_poller` measurement
+(`Loopctl.Telemetry.ScaleMetrics.refresh_tenant_label_gate/0`, every 10s) — so there is **no
+per-emit DB hit**, and an un-warmed boot defaults to OFF (aggregate) so it can never emit an
+unbounded label. **Operational note:** raising the cap toward a very large fleet re-admits
+per-tenant series on the two counters — re-check Prometheus series budget before raising it.
+
+### Alert rules (PromQL — tune thresholds in Grafana)
+
+Configure these as Grafana/Prometheus alert rules over a 5-minute window. Thresholds are
+defaults — tune per environment in the Grafana alert rule (the `> THRESHOLD` literal).
+
+**1. db_statement_timeout rate (per endpoint)** — default `THRESHOLD = 0.1` (≈ 6 timeouts/min
+on one endpoint):
+
+```promql
+sum(rate(loopctl_db_error_count{mapped_code="db_statement_timeout"}[5m])) by (endpoint) > 0.1
+```
+
+**2. p95 heavy-read latency (per endpoint)** — default `THRESHOLD_MS = 2000` (the sub-2s
+heavy-read SLO the pool is sized for, US-27.11):
+
+```promql
+histogram_quantile(
+  0.95,
+  sum(rate(loopctl_heavy_read_repo_query_duration_bucket[5m])) by (le, endpoint)
+) > 2000
+```
+
+**3. recall under-fill rate (per endpoint)** — default `THRESHOLD = 0.5` (a sustained
+under-fill trend, not a one-off dense hub):
+
+```promql
+sum(rate(loopctl_knowledge_vector_search_under_fill_count[5m])) by (endpoint) > 0.5
+```
+
+> The `_bucket` unit is **milliseconds** (the metric's `unit: {:native, :millisecond}`), so
+> `histogram_quantile` returns ms directly — compare against a ms threshold.
+
+### Per-tenant drill-down fallback (when the tenant label is dropped)
+
+Above the tenant cap the metrics aggregate `tenant_id` to `_aggregated`, so a spike that
+needs per-tenant attribution drills down via the **7-day logs** in `fly-metrics.net`
+(LogsQL), which still carry `tenant_id` on the structured `db_error` / slow-query lines.
+Example (timeouts for one tenant over the last hour):
+
+```logsql
+_time:1h "mapped_code=db_statement_timeout" "tenant_id=<TENANT_UUID>"
+```
+
+For slow-read latency by tenant, query the US-27.4 `slow_query` lines
+(`"slow_query" "tenant_id=<TENANT_UUID>"`). Lower `:slow_query_threshold_ms` to widen what
+the logs capture if needed (see the slow-query section above).

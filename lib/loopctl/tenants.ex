@@ -394,6 +394,19 @@ defmodule Loopctl.Tenants do
   end
 
   @doc """
+  Counts all tenants (global, not RLS-scoped).
+
+  Used by the US-27.15 metrics cardinality gate: the `tenant_id` label is allowed on
+  the scale counters only while this stays at or below the documented cap
+  (`:metrics_tenant_label_cap`). Read by the `telemetry_poller` periodic measurement,
+  NOT on the per-emit hot path (the gate boolean is cached in `:persistent_term`).
+  """
+  @spec count() :: non_neg_integer()
+  def count do
+    AdminRepo.aggregate(Tenant, :count)
+  end
+
+  @doc """
   Gets a tenant by slug.
 
   Returns `{:ok, tenant}` or `{:error, :not_found}`.
