@@ -27,14 +27,21 @@ Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while
 reads. Raise it if export concurrency or heavy-read QPS grows, but only after
 re-checking the connection budget below.
 
-The fast-reads (K≈6) now serve **six** HeavyRead consumers: five ONE-SHOT heavy reads
+The fast-reads (K≈6) now serve **six** HeavyRead consumers: five fast heavy reads
 (`suggested_links`, `semantic_search`, `distant_pairs`, `novelty`, `enumeration`) plus
 one **rate-limited polling feed** — the US-27.9b change feed (`:change_feed`,
-`GET /changes`). The K budget is unchanged by the addition: the change-feed read is a
-single CHEAP, fast-releasing bounded keyset page (connection released immediately), and
-its poll QPS is bounded by the api pipeline's `LoopctlWeb.Plugs.RateLimiter`, so even an
-orchestrator poll storm adds only brief transient checkouts — it cannot saturate the
-fast slots or change the connection-count budget below.
+`GET /changes`). Note `suggested_links` is no longer strictly one-shot: since US-27.6b it
+issues a **second bounded under-fill probe read** on the truncated (`returned < limit`)
+path (an ANN-class `COUNT(*)` over the same inner top-`pool` subquery). That second read
+is **strictly sequential** — it runs only after the main read's connection is released —
+so the **peak concurrent checkout per request stays 1** and the K budget is unchanged (it
+adds only throughput demand on the truncated path, itself capped by the api rate limiter;
+see `Loopctl.DbCapacity`). The K budget is likewise unchanged by the change feed: that
+read is a single CHEAP, fast-releasing bounded keyset page (connection released
+immediately), and its poll QPS is bounded by the api pipeline's
+`LoopctlWeb.Plugs.RateLimiter`, so even an orchestrator poll storm adds only brief
+transient checkouts — it cannot saturate the fast slots or change the connection-count
+budget below.
 
 ### Connection budget vs. `max_connections` (AC-27.11.5)
 
@@ -353,3 +360,211 @@ returned with no truncation signal rather than failing the request.
 per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
 the #172 small-pool starvation). Until ef_search is raised (and verified on fly mpg),
 recall stays at the default and is handled by over-fetch + this under-fill signal.
+
+## Metrics & alerting (US-27.15)
+
+US-27.3/27.4/27.6b emit structured **logs/events**, but "recurring slow queries are
+visible before they become incidents" is hard to satisfy by grepping a 7-day log. US-27.15
+aggregates those signals into **three `Telemetry.Metrics`** exported on an **internal
+`:9568/metrics`** endpoint that Fly's **managed Prometheus** scrapes over the private 6PN
+network (`fly.toml [metrics]`). The series appear in **`fly-metrics.net` Grafana** for
+**visualization**.
+
+> **Alerting reality (corrected):** `fly-metrics.net`'s managed Grafana has **alerting
+> DISABLED** — per Fly's docs, *"Fly.io doesn't include built-in alerting on metrics, so
+> you'll need to set up alerting yourself against the Prometheus endpoint."* So the PromQL
+> expressions below VISUALIZE a trend but **nothing fires** from them on fly-metrics.net.
+> The **firing** path (AC-27.15.2) that ships is a **loopctl-owned threshold checker**,
+> [`Loopctl.Telemetry.ScaleAlerts`](#the-firing-alert-path-loopctltelemetryscalealerts),
+> which POSTs a webhook on breach — self-contained, no external Grafana/Alertmanager.
+
+> **Scope (AC-27.15.4 — USER-signed-off):** metric emission + the Prometheus reporter +
+> the **ScaleAlerts firing webhook** ship in this story. The PromQL expressions below are
+> **query bodies** for an **OPTIONAL self-hosted** Grafana/Alertmanager (they require your
+> own Grafana — fly-metrics.net cannot install or run them). Bespoke Grafana **dashboard
+> JSON** + an external **Alertmanager** wiring are a recorded **backlog follow-up** —
+> tracked in **GitHub issue #196**, not silently dropped. loopctl has no Sentry; the
+> ScaleAlerts webhook is the durable firing signal. To inspect `/metrics` locally, set
+> `config :loopctl, :metrics_reporter_enabled, true` in `config/dev.exs`.
+
+### Surface & security
+
+- **Reporter:** `TelemetryMetricsPrometheus`, started **through the fault-isolating
+  `Loopctl.Telemetry.MetricsReporter` wrapper** (a supervised child of `LoopctlWeb.Telemetry`),
+  only when `:metrics_reporter_enabled` is true (prod via `runtime.exs`; **off in test** so
+  the suite never binds the port; flip on in dev to read `localhost:9568/metrics`). The
+  wrapper's `init` always succeeds and it starts/retries the reporter out of band, so a bind
+  failure (`:eaddrinuse`), a **raise**, or an **exit** from the reporter start can never
+  crash the telemetry supervisor and cascade into the API — worst case is "no `/metrics`
+  until the port frees". A reporter adopted via `{:already_started, pid}` is **monitored**,
+  so its later death is detected and retried too.
+- **Bundled stack decision (architect F7):** the reporter is the bundled
+  `telemetry_metrics_prometheus` (which runs its OWN cowboy/ranch listener — a second HTTP
+  stack alongside the app's Bandit). This was chosen **deliberately** over
+  `telemetry_metrics_prometheus_core` + a hand-rolled Bandit scrape endpoint: the maintained
+  standard scrape server, isolated on the internal port and behind the fault-isolating
+  wrapper, beats bespoke scrape code we'd have to maintain. The extra cowboy/ranch footprint
+  (on an internal-only port) is **accepted**.
+- **Internal-only:** `/metrics` binds the SEPARATE internal port **9568** — it is NOT in
+  `fly.toml`'s `http_service` (only public **8080** is). Fly's scraper reaches 9568 over
+  6PN; the internet cannot. Port is tunable via `METRICS_PORT` but MUST match the
+  `[metrics]` block.
+- **No-leak (AC-27.15.3):** labels are safe dimensions ONLY — `endpoint` (a matched
+  `Controller.action` / heavy-read endpoint atom, never a raw path with ids), `mapped_code`
+  (a bounded DB-error class), and a **cap-gated** `tenant_id`. There is **no `article_id`
+  label**, and no raw vector / body / param ever reaches a tag.
+
+### The three metrics
+
+| Metric (Telemetry.Metrics name) | Type | Labels | Source event | Meaning |
+| --- | --- | --- | --- | --- |
+| `loopctl.db.error.count` | counter | `endpoint`, `mapped_code`, *(cap-gated)* `tenant_id` | `[:loopctl, :db, :error]` (`DBErrorLogger`) | Mapped DB errors by endpoint + class. `mapped_code="db_statement_timeout"` is the 57014 timeout counter; siblings are serialization / deadlock / catch-all. |
+| `loopctl.heavy_read_repo.query.duration` | distribution (histogram) | `endpoint` **only** | `[:loopctl, :heavy_read_repo, :query]` | Heavy vector/enumeration read latency by endpoint. **No `tenant_id`** — endpoint × tenant × buckets is the multi-tenant cardinality bomb. |
+| `loopctl.knowledge.vector_search.under_fill.count` | counter | `endpoint`, *(cap-gated)* `tenant_id` | `[:loopctl, :knowledge, :vector_search, :under_fill]` (US-27.6b) | Recall under-fill events by endpoint (a densely-linked hub hiding above-threshold neighbors). |
+
+> **Histogram excludes timeouts (architect F6):** the heavy-read latency **histogram**
+> measures **SUCCESSFUL** heavy-read latency — a query that statement-times-out raises and
+> never records a `total_time` sample, so it is **absent** from the histogram (and from the
+> p95). Timed-out queries are captured instead by the **`db_statement_timeout` COUNTER**
+> (and drive the ScaleAlerts timeout-rate alert). The two together cover the SLO: p95 for
+> "slow but completing", the timeout counter for "gave up". Don't be surprised the p95 looks
+> healthy while timeouts climb — that's the counter's job, not the histogram's.
+
+> **`endpoint=:unknown` triage (security AREA-10):** an `:unknown` `endpoint` label on the
+> `db_error` counter means the DB error surfaced **before dispatch** / on a **non-routed**
+> request (no `phoenix_controller`/`phoenix_action` in `conn.private`) — e.g. an error in a
+> plug ahead of the router, or a request to an unmatched path. When triaging a
+> `loopctl_db_error_count{endpoint="unknown"}` spike, look at pre-router plugs / health
+> probes / scanners, not a specific controller action.
+
+### Prometheus metric names (dot→underscore + histogram suffixes)
+
+`Telemetry.Metrics` → Prometheus munges `.` to `_`; a `distribution` becomes a histogram
+with `_bucket` / `_sum` / `_count` series. So the scraped names are:
+
+- `loopctl_db_error_count` (labels: `endpoint`, `mapped_code`, `tenant_id`)
+- `loopctl_heavy_read_repo_query_duration_bucket` / `_sum` / `_count` (label: `endpoint`,
+  plus `le` on the `_bucket` series)
+- `loopctl_knowledge_vector_search_under_fill_count` (labels: `endpoint`, `tenant_id`)
+
+Histogram buckets (ms): `10, 50, 100, 250, 500, 1000, 2500, 5000, 10000`.
+
+### Tenant-label cardinality gate (AC-27.15.3)
+
+`tenant_id` is a **counter** label ONLY while total tenants ≤ `:metrics_tenant_label_cap`
+(default **1000**, env `METRICS_TENANT_LABEL_CAP`). Above the cap the label collapses to the
+fixed sentinel **`_aggregated`** (cardinality 1), and per-tenant attribution falls back to
+logs (which still carry `tenant_id`). It is **NEVER** a histogram label. The gate is a
+boolean cached in `:persistent_term`, recomputed by a `telemetry_poller` measurement
+(`Loopctl.Telemetry.ScaleMetrics.refresh_tenant_label_gate/0`, every 10s) — so there is **no
+per-emit DB hit**, and an un-warmed boot defaults to OFF (aggregate) so it can never emit an
+unbounded label. **Operational note:** raising the cap toward a very large fleet re-admits
+per-tenant series on the two counters — re-check Prometheus series budget before raising it.
+
+### The firing alert path: `Loopctl.Telemetry.ScaleAlerts`
+
+Because fly-metrics.net Grafana **cannot alert** (above), the firing path (AC-27.15.2) is a
+supervised, loopctl-owned threshold checker. It windows the SAME three scale signals via
+**atomic ETS counters** (the request-path telemetry handlers write with
+`:ets.update_counter` — NO per-event GenServer call, so it is not a hot-path bottleneck),
+evaluates them on a timer, and **POSTs a webhook on breach**. No external Grafana or
+Alertmanager is required.
+
+**How it works:**
+
+- Three tumbling-window counters: `db_statement_timeout` count, under-fill count, and a
+  **bucketed** heavy-read latency histogram (the same buckets as the Prometheus histogram,
+  so its p95 is the same bucket-based approximation — bounded memory, no per-sample
+  reservoir). Each handler is self-rescuing: a handler fault can never break the request it
+  observes.
+- Every `:scale_alert_check_interval_ms` the window is read **and reset** (tumbling), and
+  per-window values are compared to thresholds:
+  - `timeout_rate` = timeouts / window-minutes (per-minute),
+  - `under_fill_rate` = under-fill events / window-minutes,
+  - `p95_latency_ms` = the bucket upper bound crossing 95% of samples (skipped below a small
+    sample floor to avoid noise).
+- **Edge-triggered debounce:** an alert fires on the **transition into** breach, NOT on
+  every interval while sustained; the metric **re-arms** (can fire again) once it clears back
+  below threshold. This is the anti-spam guarantee.
+- On breach it POSTs an **id-only JSON payload** to `:scale_alert_webhook_url` via the SAME
+  `:webhook_delivery` DI the webhook worker uses (operator/system-scoped — it does NOT use
+  the tenant-scoped `EventGenerator`). If the URL is `nil`, alerting is **OFF (opt-in)**: the
+  breach is logged at `:warning` and nothing is POSTed. A delivery error is logged, not
+  raised.
+
+**Payload shape** (no tenant content / vectors / params / SQL ever appears):
+
+```json
+{
+  "alert": "scale_degradation",
+  "metric": "db_statement_timeout_rate",   // | "heavy_read_p95_latency_ms" | "under_fill_rate"
+  "value": 6.0,
+  "threshold": 5,
+  "window_seconds": 60,
+  "at": "2026-06-25T12:00:00.000000Z"
+}
+```
+
+**Config knobs** (config.exs defaults; prod via env in runtime.exs):
+
+| Key | Env var | Default | Meaning |
+| --- | --- | --- | --- |
+| `:scale_alerts_enabled` | — | `false` (prod `true`) | Start the supervised checker. OFF in `:test` so the suite never runs its timers / owns its ETS table. |
+| `:scale_alert_webhook_url` | `SCALE_ALERT_WEBHOOK_URL` | `nil` | Operator webhook (Slack/PagerDuty/generic). `nil` = alerting off (log-only). |
+| `:scale_alert_check_interval_ms` | `SCALE_ALERT_CHECK_INTERVAL_MS` | `60000` | Window evaluate-and-reset cadence. |
+| `:scale_alert_window_ms` | — | = check interval | Window length for rate math / `window_seconds`. |
+| `:scale_alert_timeout_rate_per_min` | `SCALE_ALERT_TIMEOUT_RATE_PER_MIN` | `5` | Timeout-rate threshold (timeouts/min). |
+| `:scale_alert_p95_latency_ms` | `SCALE_ALERT_P95_LATENCY_MS` | `2000` | p95 heavy-read latency threshold (ms). |
+| `:scale_alert_under_fill_rate_per_min` | `SCALE_ALERT_UNDER_FILL_RATE_PER_MIN` | `30` | Under-fill rate threshold (events/min). |
+
+To enable alerting in prod: set `SCALE_ALERT_WEBHOOK_URL` to a Slack/PagerDuty/generic
+incoming webhook. Tune the three thresholds per environment via their env vars.
+
+### Optional self-hosted alert rules (PromQL — requires YOUR OWN Grafana/Alertmanager)
+
+These are **query bodies**, NOT a firing path on fly-metrics.net (its Grafana cannot install
+or run alert rules). They are provided for an **optional self-hosted** Grafana/Prometheus +
+Alertmanager that scrapes the same `/metrics`. Configure as alert rules over a 5-minute
+window; thresholds are defaults — tune per environment (the `> THRESHOLD` literal).
+
+**1. db_statement_timeout rate (per endpoint)** — default `THRESHOLD = 0.1` (≈ 6 timeouts/min
+on one endpoint):
+
+```promql
+sum(rate(loopctl_db_error_count{mapped_code="db_statement_timeout"}[5m])) by (endpoint) > 0.1
+```
+
+**2. p95 heavy-read latency (per endpoint)** — default `THRESHOLD_MS = 2000` (the sub-2s
+heavy-read SLO the pool is sized for, US-27.11):
+
+```promql
+histogram_quantile(
+  0.95,
+  sum(rate(loopctl_heavy_read_repo_query_duration_bucket[5m])) by (le, endpoint)
+) > 2000
+```
+
+**3. recall under-fill rate (per endpoint)** — default `THRESHOLD = 0.5` (a sustained
+under-fill trend, not a one-off dense hub):
+
+```promql
+sum(rate(loopctl_knowledge_vector_search_under_fill_count[5m])) by (endpoint) > 0.5
+```
+
+> The `_bucket` unit is **milliseconds** (the metric's `unit: {:native, :millisecond}`), so
+> `histogram_quantile` returns ms directly — compare against a ms threshold.
+
+### Per-tenant drill-down fallback (when the tenant label is dropped)
+
+Above the tenant cap the metrics aggregate `tenant_id` to `_aggregated`, so a spike that
+needs per-tenant attribution drills down via the **7-day logs** in `fly-metrics.net`
+(LogsQL), which still carry `tenant_id` on the structured `db_error` / slow-query lines.
+Example (timeouts for one tenant over the last hour):
+
+```logsql
+_time:1h "mapped_code=db_statement_timeout" "tenant_id=<TENANT_UUID>"
+```
+
+For slow-read latency by tenant, query the US-27.4 `slow_query` lines
+(`"slow_query" "tenant_id=<TENANT_UUID>"`). Lower `:slow_query_threshold_ms` to widen what
+the logs capture if needed (see the slow-query section above).

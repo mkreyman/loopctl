@@ -114,6 +114,46 @@ if config_env() == :prod do
 
   config :loopctl, :slow_query_threshold_ms, slow_query_threshold_ms
 
+  # US-27.15: enable the supervised Prometheus reporter in prod. It binds the
+  # INTERNAL `:9568/metrics` port (NEVER the public 8080 http_service) which Fly's
+  # managed Prometheus scrapes over the private 6PN network (see the fly.toml
+  # `[metrics]` block). The port is tunable via METRICS_PORT but MUST stay in lockstep
+  # with fly.toml. The tenant-label cap is tunable via METRICS_TENANT_LABEL_CAP — keep
+  # it bounded (the `tenant_id` counter label collapses to a sentinel above the cap to
+  # keep label cardinality from blowing up across a large tenant fleet).
+  config :loopctl, :metrics_reporter_enabled, true
+  config :loopctl, :metrics_port, String.to_integer(System.get_env("METRICS_PORT") || "9568")
+
+  config :loopctl,
+         :metrics_tenant_label_cap,
+         String.to_integer(System.get_env("METRICS_TENANT_LABEL_CAP") || "1000")
+
+  # US-27.15 (AC-27.15.2): the FIRING alert path. ScaleAlerts is cheap (it only POSTs
+  # when a webhook URL is set AND a threshold breaches), so start it in prod always; it
+  # is opt-in until SCALE_ALERT_WEBHOOK_URL is configured (no URL → breaches are logged,
+  # nothing is POSTed). Point SCALE_ALERT_WEBHOOK_URL at a Slack/PagerDuty/generic
+  # incoming webhook. Thresholds default to the documented values and are tunable per
+  # environment via env vars (per-minute rates / ms). The alert payload is id-only — no
+  # tenant content / vectors / SQL.
+  config :loopctl, :scale_alerts_enabled, true
+  config :loopctl, :scale_alert_webhook_url, System.get_env("SCALE_ALERT_WEBHOOK_URL")
+
+  config :loopctl,
+         :scale_alert_check_interval_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_CHECK_INTERVAL_MS") || "60000")
+
+  config :loopctl,
+         :scale_alert_timeout_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_TIMEOUT_RATE_PER_MIN") || "5")
+
+  config :loopctl,
+         :scale_alert_p95_latency_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_P95_LATENCY_MS") || "2000")
+
+  config :loopctl,
+         :scale_alert_under_fill_rate_per_min,
+         String.to_integer(System.get_env("SCALE_ALERT_UNDER_FILL_RATE_PER_MIN") || "30")
+
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),

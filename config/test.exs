@@ -237,6 +237,24 @@ config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestio
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 
+# US-27.15: webhook delivery DI → a Mox mock in tests. ScaleAlerts and the webhook
+# worker both resolve `:webhook_delivery`. The DataCase default stub delegates
+# `MockDelivery.deliver/3` to `Loopctl.Webhooks.ReqDelivery` (which honors the Req.Test
+# plug above), so the existing webhook-worker tests keep passing; the ScaleAlerts tests
+# override `deliver/3` with Mox.expect to assert the firing POST.
+config :loopctl, :webhook_delivery, Loopctl.MockDelivery
+
+# US-27.15: a deterministic webhook URL so the ScaleAlerts firing path is EXERCISED in
+# tests (a nil URL would short-circuit to log-only). Not a real endpoint — delivery is
+# intercepted by the MockDelivery mock.
+config :loopctl, :scale_alert_webhook_url, "https://alerts.test.invalid/scale"
+
+# US-27.15: a short window so per-minute rate math in tests is easy to reason about (a
+# 60s window = counts are already per-minute). scale_alerts_enabled stays false (config
+# default) so the suite never auto-starts ScaleAlerts; tests start it directly.
+config :loopctl, :scale_alert_check_interval_ms, 60_000
+config :loopctl, :scale_alert_window_ms, 60_000
+
 # DI: Use Req.Test plug for CLI HTTP client in tests
 config :loopctl, :cli_req_plug, {Req.Test, Loopctl.CLI.Client}
 

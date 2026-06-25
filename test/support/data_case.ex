@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Webhooks.ReqDelivery
 
   using do
     quote do
@@ -121,6 +122,16 @@ defmodule Loopctl.DataCase do
     # to process delivery jobs without test-specific HTTP stub setup.
     Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
       Req.Test.json(conn, %{"ok" => true})
+    end)
+
+    # US-27.15: webhook delivery DI (:webhook_delivery → Loopctl.MockDelivery in test).
+    # Both ScaleAlerts and the webhook worker resolve this key. The DEFAULT delegates to
+    # the real ReqDelivery (which honors the Req.Test plug above), so the existing
+    # webhook-worker tests — which Req.Test.stub(Loopctl.Webhooks.ReqDelivery) — keep
+    # working unchanged. ScaleAlerts tests override this with Mox.expect/3 to assert the
+    # firing POST.
+    Mox.stub(Loopctl.MockDelivery, :deliver, fn url, body, headers ->
+      ReqDelivery.deliver(url, body, headers)
     end)
 
     # Default Req.Test stub for CLI HTTP client

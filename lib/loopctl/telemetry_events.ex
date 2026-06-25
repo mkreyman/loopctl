@@ -75,6 +75,34 @@ defmodule Loopctl.TelemetryEvents do
   """
   def vector_search_under_fill, do: [:loopctl, :knowledge, :vector_search, :under_fill]
 
+  @doc """
+  A mapped DB error was surfaced to a client (US-27.15). Emitted by
+  `LoopctlWeb.DBErrorLogger.log/3` after it logs the sanitized structured line, so
+  EVERY controller (both the FallbackController rescue path and the uncaught
+  `DBErrorBackstop` path) feeds the same aggregate. This is the count source for the
+  `db_statement_timeout` (57014) counter and its sibling serialization/deadlock/
+  catch-all classes (separated by the `mapped_code` label).
+
+  ## Payload (id-only — NEVER raw SQL, bound params, vector literals, or a PG message body)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{mapped_code, sqlstate, endpoint}` where
+        - `mapped_code` is the `LoopctlWeb.DBError` class
+          (`"db_statement_timeout"` / `"db_serialization_failure"` / `"db_deadlock"`
+          / `"db_invalid_input"` / `"db_error"` / `"db_unavailable"`) — a BOUNDED set.
+        - `sqlstate` is the 5-char SQLSTATE string (e.g. `"57014"`) or `"unknown"`.
+        - `endpoint` is the matched Phoenix `Controller.action` atom (e.g.
+          `:"Elixir.LoopctlWeb.KnowledgeSearchController.suggested_links"`) or
+          `:unknown` — the BOUNDED controller/action dimension, NEVER the raw
+          request path (which would carry unbounded ids).
+
+  `sqlstate`/`endpoint` ride in metadata for log/trace correlation but the metric
+  definitions in `Loopctl.Telemetry.ScaleMetrics` only tag the counter by
+  `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`), keeping label
+  cardinality bounded (AC-27.15.3). Aggregated by US-27.15 metrics/alerting.
+  """
+  def db_error, do: [:loopctl, :db, :error]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -86,7 +114,8 @@ defmodule Loopctl.TelemetryEvents do
       webhook_delivery_stop(),
       webhook_delivery_exception(),
       audit_log_write(),
-      vector_search_under_fill()
+      vector_search_under_fill(),
+      db_error()
     ]
   end
 end
