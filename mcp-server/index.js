@@ -1183,12 +1183,18 @@ async function knowledgeExport({ project_id }) {
     ? `/api/v1/projects/${project_id}/knowledge/export`
     : "/api/v1/knowledge/export";
   const baseUrl = getBaseUrl();
-  const downloadCmd = `curl -H "Authorization: Bearer $LOOPCTL_ORCH_KEY" "${baseUrl}${basePath}" -o knowledge-export.zip`;
+  // The export endpoint is role:user — use LOOPCTL_USER_KEY. (LOOPCTL_ORCH_KEY is
+  // orchestrator role, which is BELOW user in the hierarchy and would 403.) The
+  // endpoint streams a gzipped tar (`application/gzip`), so save it as `.tar.gz`.
+  const downloadCmd = `curl -H "Authorization: Bearer $LOOPCTL_USER_KEY" "${baseUrl}${basePath}" -o knowledge-export.tar.gz`;
   return {
     content: [{
       type: "text",
       text: JSON.stringify({
-        message: "Knowledge export produces a ZIP file. Use the curl command below to download it directly.",
+        message:
+          "Knowledge export streams a bounded-memory gzipped tar (.tar.gz). Use the curl " +
+          "command below to download it directly. Requires a user-role key " +
+          "(LOOPCTL_USER_KEY); extract with `tar -xzf knowledge-export.tar.gz`.",
         command: downloadCmd,
         endpoint: `${baseUrl}${basePath}`,
       }, null, 2),
@@ -2857,14 +2863,20 @@ const TOOLS = [
   {
     name: "knowledge_export",
     description:
-      "Export all knowledge articles as a ZIP archive. Because ZIP binary cannot be returned as MCP content, " +
-      "this tool returns a curl command you can run directly to download the archive.",
+      "Export all knowledge articles as an OKF v0.1 bundle — gzipped tar archive, unbounded, bounded-memory streaming, " +
+      "fail-closed (no partial bundles). Because binary cannot be returned as MCP content, this tool returns a curl command. " +
+      "Optional: ?format=json for buffered in-memory JSON (capped at export_max_buffered_export_articles, 413 over cap).",
     inputSchema: {
       type: "object",
       properties: {
         project_id: {
           type: "string",
           description: "Optional: scope export to a specific project UUID.",
+        },
+        format: {
+          type: "string",
+          enum: ["tar.gz", "json"],
+          description: "Optional: tar.gz (default, unbounded streaming) or json (buffered, capped).",
         },
       },
       required: [],

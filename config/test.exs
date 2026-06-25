@@ -159,6 +159,29 @@ config :loopctl, :max_pair_candidates, 25
 # is 1000). Config-based DI — no Application.put_env in tests.
 config :loopctl, :bulk_delete_frozen_max, 3
 
+# US-27.16: small streaming-export tunables so tests exercise the multi-page keyset
+# walk, the per-article link cap, and the concurrency cap cheaply. Config-based DI
+# (no Application.put_env in tests).
+# - chunk_size 3: a handful of articles spans several keyset pages (proves the walk
+#   releases the connection between pages and that max in-flight ≤ chunk_size).
+# - max_links_per_article 5: a "dense hub" of >5 links is bounded with ~6 neighbors
+#   instead of 100+.
+# - concurrency caps default to prod values (global 2, per-tenant 1) — the cap test
+#   asserts against those.
+config :loopctl, :export_chunk_size, 3
+config :loopctl, :export_max_links_per_article, 5
+
+# US-27.16 (#3): small decompression-bomb caps so the bomb-defense test runs cheaply
+# — a ~1KB gzip that inflates past these is rejected without materializing it.
+config :loopctl, :import_export_max_compressed_bytes, 1_000_000
+config :loopctl, :import_export_max_decompressed_bytes, 5_000_000
+
+# US-27.16: small cap so the `?format=json` buffered-export 413 (over-cap) is
+# testable cheaply. Set to 2 so a 3-article corpus trips it. The OKF round-trip /
+# export CONTEXT tests that legitimately build larger bundles pass an explicit
+# `build_bundle(t, max_articles: ...)` override, so they are unaffected.
+config :loopctl, :okf_max_buffered_export_articles, 2
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",

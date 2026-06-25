@@ -59,6 +59,28 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
+  describe "build_bundle/2 cap (#2 TOCTOU: enforced on the MATERIALIZED set)" do
+    test "exactly at the cap succeeds; one over rejects (peek-and-reject, no silent truncation)" do
+      tenant = fixture(:tenant)
+      for i <- 1..3, do: published(tenant.id, %{title: "Cap #{i}", category: :pattern})
+
+      # cap=3 → the materialized set (fetch is LIMIT cap+1=4) has 3 ≤ 3 → ok.
+      assert {:ok, %{meta: %{article_count: 3}}} = OKF.build_bundle(tenant.id, max_articles: 3)
+
+      # cap=2 → fetch LIMIT 3 returns 3 rows > 2 → REJECT (never silently return 2).
+      assert {:error, :payload_too_large} = OKF.build_bundle(tenant.id, max_articles: 2)
+    end
+
+    test "the fetch never materializes more than cap+1 rows (bounded under TOCTOU)" do
+      tenant = fixture(:tenant)
+      # 50 articles, cap 5 → even if a COUNT undercounted, the LIMIT cap+1 caps the
+      # materialized set; the result is a rejection, not 50 loaded rows.
+      for i <- 1..50, do: published(tenant.id, %{title: "Many #{i}", category: :reference})
+
+      assert {:error, :payload_too_large} = OKF.build_bundle(tenant.id, max_articles: 5)
+    end
+  end
+
   describe "build_bundle/2 (export)" do
     test "produces a conformant bundle with reserved files and concept docs" do
       tenant = fixture(:tenant)
@@ -66,7 +88,8 @@ defmodule Loopctl.Knowledge.OKFTest do
       published(tenant.id, %{title: "Alpha Pattern", category: :pattern, tags: ["a"]})
       published(tenant.id, %{title: "Beta Reference", category: :reference, tags: ["b", "hub"]})
 
-      assert {:ok, %{files: files, meta: meta}} = OKF.build_bundle(tenant.id)
+      assert {:ok, %{files: files, meta: meta}} =
+               OKF.build_bundle(tenant.id, max_articles: 10_000)
 
       assert meta.okf_version == "0.1"
       assert meta.article_count == 2
@@ -108,7 +131,9 @@ defmodule Loopctl.Knowledge.OKFTest do
         status: :draft
       })
 
-      assert {:ok, %{files: files, meta: meta}} = OKF.build_bundle(tenant_a.id)
+      assert {:ok, %{files: files, meta: meta}} =
+               OKF.build_bundle(tenant_a.id, max_articles: 10_000)
+
       assert meta.article_count == 1
       assert Map.has_key?(files, "pattern/a-visible.md")
       refute Map.has_key?(files, "pattern/b-hidden.md")
@@ -127,7 +152,7 @@ defmodule Loopctl.Knowledge.OKFTest do
           relationship_type: :relates_to
         })
 
-      assert {:ok, %{files: files}} = OKF.build_bundle(tenant.id)
+      assert {:ok, %{files: files}} = OKF.build_bundle(tenant.id, max_articles: 10_000)
       concept = files["finding/source-note.md"]
       assert concept =~ "# Related"
       assert concept =~ "(/finding/target-note.md)"
@@ -135,22 +160,134 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
-  describe "to_zip/1 + import_zip/3 round-trip" do
-    test "a zipped bundle imports back into articles" do
+  describe "streamed .tar.gz + import_zip/3 round-trip (US-27.16)" do
+    test "a streamed tar.gz bundle imports back into articles" do
       source = fixture(:tenant)
 
       published(source.id, %{title: "Zip Me", category: :decision, body: "decided x", tags: ["t"]})
 
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
-      zip = OKF.to_zip(files)
+      # US-27.16: the exporter now emits a streamed `.tar.gz`; the importer reads it
+      # (and still reads legacy `.zip`). Round-trip via the new format.
+      {:ok, targz} =
+        Loopctl.StreamingExportHelper.to_targz_binary(
+          source.id,
+          Loopctl.Knowledge.StreamingExport.OKFFormat
+        )
 
       dest = fixture(:tenant)
-      assert {:ok, report} = OKF.import_zip(dest.id, zip)
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
       assert report.created == 1
       assert report.errors == []
 
       %{data: [a]} = Knowledge.list_articles(dest.id, category: :decision)
       assert a.title == "Zip Me"
+    end
+
+    test "two same-slug articles both survive the streamed round-trip (no data loss) + link resolves" do
+      source = fixture(:tenant)
+
+      # Distinct titles that slugify to the SAME slug ("cache-strategy"): the active
+      # (tenant_id, title) unique index allows distinct titles, but the slug collides.
+      # Pre-fix, the second concept's tar entry overwrote the first → an entire
+      # article body lost on backup. The id-suffixed path keeps both.
+      a =
+        published(source.id, %{
+          title: "Cache Strategy",
+          category: :pattern,
+          body: "body of A — keep me"
+        })
+
+      b =
+        published(source.id, %{
+          title: "Cache: Strategy",
+          category: :pattern,
+          body: "body of B — keep me too"
+        })
+
+      # An inter-article link so we can assert it still resolves after suffixing.
+      fixture(:article_link, %{
+        tenant_id: source.id,
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :relates_to
+      })
+
+      assert Knowledge.slugify("Cache Strategy") == Knowledge.slugify("Cache: Strategy")
+
+      {:ok, targz} =
+        Loopctl.StreamingExportHelper.to_targz_binary(
+          source.id,
+          Loopctl.Knowledge.StreamingExport.OKFFormat
+        )
+
+      # The archive contains TWO distinct concept files (not one overwriting the
+      # other), and BOTH bodies are present.
+      {:ok, files} = Loopctl.StreamingExportHelper.extract(targz)
+
+      concept_files =
+        files
+        |> Map.keys()
+        |> Enum.filter(&(String.starts_with?(&1, "pattern/") and String.ends_with?(&1, ".md")))
+
+      assert length(concept_files) == 2
+      all_bodies = files |> Map.values() |> Enum.join("\n")
+      assert all_bodies =~ "body of A — keep me"
+      assert all_bodies =~ "body of B — keep me too"
+
+      # Re-import into a fresh tenant: both articles AND the link round-trip.
+      dest = fixture(:tenant)
+      assert {:ok, report} = OKF.import_zip(dest.id, targz)
+      assert report.created == 2
+      assert report.links_created == 1
+      assert report.errors == []
+
+      %{data: imported} = Knowledge.list_articles(dest.id, category: :pattern)
+      assert length(imported) == 2
+    end
+
+    test "import_zip/3 still reads a legacy .zip bundle (back-compat)" do
+      source = fixture(:tenant)
+      published(source.id, %{title: "Legacy Zip", category: :pattern, body: "old", tags: []})
+
+      # Build a legacy-style zip the OLD exporter would have produced, in-memory.
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
+
+      entries =
+        files
+        |> Enum.sort_by(fn {path, _} -> path end)
+        |> Enum.map(fn {path, content} -> {String.to_charlist(path), content} end)
+
+      {:ok, {_name, zip}} = :zip.create(~c"okf-bundle.zip", entries, [:memory])
+
+      dest = fixture(:tenant)
+      assert {:ok, report} = OKF.import_zip(dest.id, zip)
+      assert report.created == 1
+
+      %{data: [a]} = Knowledge.list_articles(dest.id, category: :pattern)
+      assert a.title == "Legacy Zip"
+    end
+  end
+
+  describe "#7: loopctl_links_truncated is a reserved key (no metadata drift)" do
+    test "the truncation marker is stripped on import, not stashed as foreign extra" do
+      tenant = fixture(:tenant)
+
+      # A concept whose frontmatter carries the marker (as the exporter would emit
+      # for a capped hub). On import it must be CONSUMED (reserved), not preserved
+      # under metadata["okf"]["extra"] where it would re-export forever.
+      files = %{
+        "pattern/x.md" =>
+          "---\ntype: pattern\ntitle: X\nloopctl_links_truncated: true\n---\n\nbody\n"
+      }
+
+      assert {:ok, report} = OKF.import_files(tenant.id, files)
+      assert report.created == 1
+
+      %{data: [a]} = Knowledge.list_articles(tenant.id, category: :pattern)
+      okf_meta = a.metadata["okf"] || %{}
+      extra = okf_meta["extra"] || %{}
+      refute Map.has_key?(extra, "loopctl_links_truncated")
+      refute Map.has_key?(okf_meta, "loopctl_links_truncated")
     end
   end
 
@@ -175,7 +312,7 @@ defmodule Loopctl.Knowledge.OKFTest do
           relationship_type: :relates_to
         })
 
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
 
       dest = fixture(:tenant)
       assert {:ok, report} = OKF.import_files(dest.id, files)
@@ -202,7 +339,7 @@ defmodule Loopctl.Knowledge.OKFTest do
     test "merge updates existing articles instead of duplicating them" do
       source = fixture(:tenant)
       published(source.id, %{title: "Idempotent", category: :pattern, body: "v1"})
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
 
       dest = fixture(:tenant)
       {:ok, first} = OKF.import_files(dest.id, files)
@@ -219,7 +356,7 @@ defmodule Loopctl.Knowledge.OKFTest do
     test "merge:false skips existing articles" do
       source = fixture(:tenant)
       published(source.id, %{title: "Keep Me", category: :pattern, body: "v1"})
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
 
       dest = fixture(:tenant)
       {:ok, _} = OKF.import_files(dest.id, files)
@@ -231,7 +368,7 @@ defmodule Loopctl.Knowledge.OKFTest do
     test "dry_run writes nothing" do
       source = fixture(:tenant)
       published(source.id, %{title: "Ghost", category: :pattern})
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
 
       dest = fixture(:tenant)
       {:ok, report} = OKF.import_files(dest.id, files, dry_run: true)
@@ -242,7 +379,7 @@ defmodule Loopctl.Knowledge.OKFTest do
     test "tenant isolation — import lands only in the target tenant" do
       source = fixture(:tenant)
       published(source.id, %{title: "Scoped", category: :pattern})
-      {:ok, %{files: files}} = OKF.build_bundle(source.id)
+      {:ok, %{files: files}} = OKF.build_bundle(source.id, max_articles: 10_000)
 
       dest = fixture(:tenant)
       other = fixture(:tenant)
@@ -295,7 +432,7 @@ defmodule Loopctl.Knowledge.OKFTest do
         {:ok, _} = Knowledge.publish_article(tenant.id, a.id)
       end
 
-      assert {:ok, %{files: out}} = OKF.build_bundle(tenant.id)
+      assert {:ok, %{files: out}} = OKF.build_bundle(tenant.id, max_articles: 10_000)
       assert %{conformant: true, errors: []} = OKF.validate_files(out)
     end
   end

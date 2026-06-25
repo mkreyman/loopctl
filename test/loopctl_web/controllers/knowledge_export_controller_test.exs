@@ -1,10 +1,32 @@
 defmodule LoopctlWeb.KnowledgeExportControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Knowledge.ExportConcurrency
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # US-27.16: the export is now a streamed `.tar.gz`. Under the inline ConnTest
+  # transport `send_chunked` buffers chunks into `resp_body`, so the full archive is
+  # `conn.resp_body`; unpack it as tar.gz.
+  defp export_files(conn) do
+    {:ok, files} = Loopctl.StreamingExportHelper.extract(conn.resp_body)
+    files
+  end
+
+  # US-27.16: concept paths are id-suffixed (`{category}/{slug}-{short_id}.md`), so
+  # match on the `{category}/{slug}-` PREFIX (the suffix varies per run).
+  defp has_slug?(file_map, "" <> category_slug),
+    do: Enum.any?(Map.keys(file_map), &String.starts_with?(&1, category_slug <> "-"))
+
+  defp fetch_slug(file_map, "" <> category_slug) do
+    {_path, content} =
+      Enum.find(file_map, fn {path, _} -> String.starts_with?(path, category_slug <> "-") end)
+
+    content
   end
 
   describe "GET /api/v1/knowledge/export" do
@@ -40,23 +62,22 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
       assert [content_type] = get_resp_header(conn, "content-type")
-      assert content_type =~ "application/zip"
+      assert content_type =~ "application/gzip"
 
       [disposition] = get_resp_header(conn, "content-disposition")
       assert disposition =~ "attachment; filename=\"knowledge-export-"
-      assert disposition =~ ".zip\""
+      assert disposition =~ ".tar.gz\""
 
       # Unzip and verify contents
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       # Verify directory structure
       assert Map.has_key?(file_map, "_index.md")
-      assert Map.has_key?(file_map, "pattern/ecto-multi-pattern.md")
-      assert Map.has_key?(file_map, "convention/naming-convention.md")
+      assert has_slug?(file_map, "pattern/ecto-multi-pattern")
+      assert has_slug?(file_map, "convention/naming-convention")
 
       # Verify YAML frontmatter in pattern article
-      pattern_content = file_map["pattern/ecto-multi-pattern.md"]
+      pattern_content = fetch_slug(file_map, "pattern/ecto-multi-pattern")
       assert pattern_content =~ "---\n"
       assert pattern_content =~ ~s(title: "Ecto Multi Pattern")
       assert pattern_content =~ "category: pattern"
@@ -72,12 +93,13 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
       assert pattern_content =~ "Use Ecto.Multi for atomic operations."
 
       # Verify index file
+      # US-27.16: `_index.md` is built from a CHEAP per-category COUNT aggregate
+      # (no bodies loaded), so it lists categories with counts, not every title.
       index_content = file_map["_index.md"]
       assert index_content =~ "# Knowledge Base Index"
       assert index_content =~ "## Convention"
       assert index_content =~ "## Pattern"
-      assert index_content =~ "[[Ecto Multi Pattern]]"
-      assert index_content =~ "[[Naming Convention]]"
+      assert index_content =~ "1 article(s)"
     end
 
     test "includes related articles as wikilinks", %{conn: conn} do
@@ -116,16 +138,15 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       # Source article should have outgoing link
-      source_content = file_map["pattern/source-article.md"]
+      source_content = fetch_slug(file_map, "pattern/source-article")
       assert source_content =~ "## Related Articles"
       assert source_content =~ "[[Target Article]] (relates_to)"
 
       # Target article should have incoming link
-      target_content = file_map["decision/target-article.md"]
+      target_content = fetch_slug(file_map, "decision/target-article")
       assert target_content =~ "## Related Articles"
       assert target_content =~ "[[Source Article]] (relates_to)"
     end
@@ -165,15 +186,14 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       # Only published article + index
       assert map_size(file_map) == 2
       assert Map.has_key?(file_map, "_index.md")
-      assert Map.has_key?(file_map, "pattern/published-one.md")
-      refute Map.has_key?(file_map, "pattern/draft-article.md")
-      refute Map.has_key?(file_map, "decision/archived-article.md")
+      assert has_slug?(file_map, "pattern/published-one")
+      refute has_slug?(file_map, "pattern/draft-article")
+      refute has_slug?(file_map, "decision/archived-article")
     end
 
     test "returns ZIP with only _index.md when no published articles exist", %{conn: conn} do
@@ -196,10 +216,9 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
       assert [content_type] = get_resp_header(conn, "content-type")
-      assert content_type =~ "application/zip"
+      assert content_type =~ "application/gzip"
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       assert map_size(file_map) == 1
       assert Map.has_key?(file_map, "_index.md")
@@ -222,6 +241,71 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert json_response(conn, 403)
     end
+  end
+
+  describe "concurrency cap (AC-27.16.6)" do
+    test "returns 429 when the REQUEST tenant's in-flight export cap is already met", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      # Saturate the PER-TENANT cap for THIS tenant (default 1) by holding a slot for
+      # `tenant.id` in a kept-alive process. The export request below is for the same
+      # tenant, so it trips the per-tenant cap and is refused 429 BEFORE streaming —
+      # deterministically, and WITHOUT depending on the shared global counter's exact
+      # value (which other async tests transiently touch). This proves the cap path
+      # rejects with 429 + Retry-After off the admin pool.
+      holder = hold_tenant_slot(tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/export")
+
+      body = json_response(conn, 429)
+      assert body["error"]["code"] == "too_many_exports"
+      assert [_] = get_resp_header(conn, "retry-after")
+
+      release_slot(holder)
+    end
+
+    # Hold a slot for a SPECIFIC tenant (to saturate its per-tenant cap). Retries on
+    # transient global contention from concurrent async tests.
+    defp hold_tenant_slot(tenant_id) do
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = acquire_with_retry(tenant_id, 200)
+          send(parent, {:held, self()})
+
+          receive do
+            :release -> ExportConcurrency.release(tenant_id)
+          end
+        end)
+
+      receive do
+        {:held, ^pid} -> pid
+      after
+        5_000 -> raise "failed to hold per-tenant export slot"
+      end
+    end
+
+    defp acquire_with_retry(_t, 0), do: raise("could not acquire an export slot")
+
+    defp acquire_with_retry(t, attempts) do
+      case ExportConcurrency.acquire(t) do
+        :ok ->
+          :ok
+
+        {:error, :too_many_exports} ->
+          Process.sleep(10)
+          acquire_with_retry(t, attempts - 1)
+      end
+    end
+
+    defp release_slot(pid), do: send(pid, :release)
   end
 
   describe "GET /api/v1/projects/:project_id/knowledge/export" do
@@ -267,15 +351,14 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       # Should have 2 articles + index = 3 files
       assert map_size(file_map) == 3
       assert Map.has_key?(file_map, "_index.md")
-      assert Map.has_key?(file_map, "pattern/tenant-wide-pattern.md")
-      assert Map.has_key?(file_map, "convention/project-convention.md")
-      refute Map.has_key?(file_map, "finding/other-project-finding.md")
+      assert has_slug?(file_map, "pattern/tenant-wide-pattern")
+      assert has_slug?(file_map, "convention/project-convention")
+      refute has_slug?(file_map, "finding/other-project-finding")
     end
   end
 
@@ -308,18 +391,18 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      file_map = Map.new(files, fn {name, content} -> {to_string(name), content} end)
+      file_map = export_files(conn)
 
       # Should only contain tenant A's article
       assert map_size(file_map) == 2
-      assert Map.has_key?(file_map, "pattern/tenant-a-article.md")
-      refute Map.has_key?(file_map, "pattern/tenant-b-article.md")
+      assert has_slug?(file_map, "pattern/tenant-a-article")
+      refute has_slug?(file_map, "pattern/tenant-b-article")
 
-      # Verify index only shows tenant A's article
-      index = file_map["_index.md"]
-      assert index =~ "[[Tenant A Article]]"
-      refute index =~ "[[Tenant B Article]]"
+      # No tenant B content leaks into ANY archive entry (BYPASSRLS scope proof).
+      all_content = file_map |> Map.values() |> Enum.join("\n")
+      assert all_content =~ "A content."
+      refute all_content =~ "Tenant B Article"
+      refute all_content =~ "B content."
     end
   end
 
@@ -343,11 +426,13 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
 
       assert conn.status == 200
 
-      {:ok, files} = :zip.unzip(conn.resp_body, [:memory])
-      filenames = Enum.map(files, fn {name, _} -> to_string(name) end)
+      filenames = conn |> export_files() |> Map.keys()
 
       # Should have sanitized filename
-      assert "decision/whats-new-v20-breaking-changes.md" in filenames
+      assert Enum.any?(
+               filenames,
+               &String.starts_with?(&1, "decision/whats-new-v20-breaking-changes-")
+             )
     end
   end
 end

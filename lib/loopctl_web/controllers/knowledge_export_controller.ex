@@ -1,19 +1,30 @@
 defmodule LoopctlWeb.KnowledgeExportController do
   @moduledoc """
-  Controller for exporting knowledge articles as Obsidian-compatible ZIP files.
+  Controller for exporting knowledge articles as an Obsidian-compatible
+  `.tar.gz` archive (US-27.16).
 
-  - `GET /api/v1/knowledge/export` -- ZIP of all tenant articles, role: user+
-  - `GET /api/v1/projects/:project_id/knowledge/export` -- ZIP of project articles, role: user+
+  - `GET /api/v1/knowledge/export` -- tenant articles, role: user+
+  - `GET /api/v1/projects/:project_id/knowledge/export` -- project articles, role: user+
 
-  Only published articles are included. The ZIP contains Markdown files with
-  YAML frontmatter, [[wikilinks]] for related articles, and a `_index.md` root file.
+  Only published articles are included. The archive contains one
+  `{category}/{slug}.md` per article with YAML frontmatter, `[[wikilinks]]` for
+  related articles, and a root `_index.md`.
+
+  The export is STREAMED as a chunked `.tar.gz` with bounded server memory and NO
+  article-count cap (the former 5,000-article 413 is gone): articles are read in
+  short keyset pages that release the BYPASSRLS connection between pages, and the
+  archive is built incrementally so peak memory holds at most one page. A mid-stream
+  error fails CLOSED — the chunked response ends WITHOUT a valid tar end-of-archive,
+  so a restore pipeline detects truncation. Concurrent exports are capped
+  (per-tenant + global) and refused with `429` over the cap, never starving the
+  admin pool. See `Loopctl.Knowledge.StreamingExport`.
   """
 
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
-  alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.StreamingExport.ObsidianFormat
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -22,13 +33,17 @@ defmodule LoopctlWeb.KnowledgeExportController do
   tags(["Knowledge Wiki"])
 
   operation(:export,
-    summary: "Export knowledge as Obsidian ZIP",
+    summary: "Export knowledge as a streamed Obsidian .tar.gz",
     description:
-      "Exports published articles as an Obsidian-compatible ZIP archive. " <>
-        "Files are organized as `{category}/{slug}.md` with YAML frontmatter, " <>
-        "[[wikilinks]], and a root `_index.md`. Only published articles are included. " <>
-        "When called via GET /projects/:project_id/knowledge/export, includes both " <>
-        "tenant-wide and project-specific articles. Role: user+.",
+      "Streams published articles as an Obsidian-compatible gzipped tar archive. " <>
+        "Files are organized as `{category}/{slug}-{short_id}.md` (the id suffix " <>
+        "guarantees collision-free paths) with YAML frontmatter, [[wikilinks]], and " <>
+        "a root `_index.md`. Only published articles are included. When called via " <>
+        "GET /projects/:project_id/knowledge/export, includes both tenant-wide and " <>
+        "project-specific articles. Bounded memory, no article-count cap, fail-closed " <>
+        "on mid-stream error. Each article's related-link list is capped at " <>
+        "export_max_links_per_article (default 100) per direction; a capped article " <>
+        "carries `links_truncated: true` in its frontmatter. Role: user+.",
     parameters: [
       project_id: [
         in: :path,
@@ -39,9 +54,9 @@ defmodule LoopctlWeb.KnowledgeExportController do
     ],
     responses: %{
       200 =>
-        {"Obsidian ZIP archive", "application/zip",
+        {"Obsidian .tar.gz archive (chunked)", "application/gzip",
          %OpenApiSpex.Schema{type: :string, format: :binary}},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Too many concurrent exports", "application/json", Schemas.RateLimitError}
     }
   )
 
@@ -55,29 +70,12 @@ defmodule LoopctlWeb.KnowledgeExportController do
         project_id -> [project_id: project_id]
       end
 
-    case Knowledge.export_obsidian(tenant_id, opts) do
-      {:ok, zip_binary} ->
-        date = Date.utc_today() |> Date.to_iso8601()
-
-        conn
-        |> put_resp_content_type("application/zip")
-        |> put_resp_header(
-          "content-disposition",
-          "attachment; filename=\"knowledge-export-#{date}.zip\""
-        )
-        |> send_resp(200, zip_binary)
-
-      {:error, :payload_too_large} ->
-        conn
-        |> put_status(413)
-        |> json(%{
-          error: %{
-            status: 413,
-            message:
-              "Export exceeds 5,000 articles. Use project-scoped export " <>
-                "(GET /projects/:id/knowledge/export) to reduce scope."
-          }
-        })
-    end
+    LoopctlWeb.StreamingExport.stream(
+      conn,
+      tenant_id,
+      ObsidianFormat,
+      "knowledge-export",
+      opts
+    )
   end
 end

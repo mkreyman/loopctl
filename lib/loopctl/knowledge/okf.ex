@@ -47,21 +47,50 @@ defmodule Loopctl.Knowledge.OKF do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ImportExport.DecompressionLimit
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
 
   @okf_version "0.1"
 
-  # Mirror knowledge/export's egress guard so a bundle can't balloon unbounded.
-  @max_articles 5_000
+  # IMPORT-side concept cap: a hostile/huge bundle can't create an unbounded number
+  # of articles in one request. This is independent of EXPORT (US-27.16 removed the
+  # export's article-count cap in favor of bounded-memory streaming); import is still
+  # a synchronous, per-file mutation, so it keeps an explicit ceiling.
+  @max_import_concepts 5_000
+
+  # BUFFERED-EXPORT cap (`?format=json` ONLY): the JSON convenience path materializes
+  # the WHOLE bundle in memory (it returns a `%{files: ...}` map), so it MUST keep a
+  # count cap or a 76k-article KB would OOM the node. The BACKUP path — the default
+  # streamed `.tar.gz` — has NO count cap (it is bounded-memory by construction);
+  # callers above this bound are pointed there. Over the cap, `build_bundle/2`
+  # returns `{:error, :payload_too_large}`. Runtime-configurable (so the over-cap
+  # 413 is testable cheaply); defaults to 5,000.
+  @max_buffered_export_articles 5_000
+
+  @doc "The `?format=json` buffered-export article-count cap (config-tunable)."
+  @spec max_buffered_export_articles() :: pos_integer()
+  def max_buffered_export_articles,
+    do:
+      Application.get_env(
+        :loopctl,
+        :okf_max_buffered_export_articles,
+        @max_buffered_export_articles
+      )
 
   @categories Ecto.Enum.values(Article, :category)
   @category_strings Enum.map(@categories, &to_string/1)
 
   # Frontmatter keys this module owns; everything else is preserved verbatim.
+  # Frontmatter keys THIS module owns (set on export, stripped from `extra` on
+  # import so they don't survive as foreign metadata). `loopctl_links_truncated` is
+  # the #7 marker the exporter emits on a capped link list; without it here, a
+  # re-import would stash it under `metadata["okf"]["extra"]` and re-export it as
+  # foreign frontmatter forever. The dead `loopctl_links` key (never produced) is
+  # dropped.
   @reserved_fm_keys ~w(type title description resource tags timestamp
-                       loopctl_id loopctl_category loopctl_status loopctl_links)
+                       loopctl_id loopctl_category loopctl_status loopctl_links_truncated)
 
   @related_marker "<!-- okf:related -->"
 
@@ -73,26 +102,48 @@ defmodule Loopctl.Knowledge.OKF do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Builds an OKF bundle (files map) from a tenant's published articles.
+  Builds an OKF bundle (files map) from a tenant's published articles, fully in
+  memory.
+
+  This is the BUFFERED convenience used by the `?format=json` export path (tooling
+  that writes the files itself). It materializes the whole bundle, so it is bounded
+  by an article-count cap (#{@max_buffered_export_articles}) to avoid OOMing on a
+  large KB. The DEFAULT/backup export path streams a `.tar.gz` with bounded memory
+  via `Loopctl.Knowledge.StreamingExport` and has NO count cap; callers above the
+  cap should use it.
 
   ## Options
 
   - `:project_id` — when set, includes tenant-wide (nil project) + project articles.
+  - `:max_articles` — override the buffered-export count cap for THIS call (defaults
+    to `max_buffered_export_articles/0`). The HTTP `?format=json` path uses the
+    default; callers that legitimately need a different bound (e.g. re-export of an
+    imported multi-article bundle in tests) pass it explicitly.
 
   ## Returns
 
   - `{:ok, %{files: files, meta: map}}`
-  - `{:error, :payload_too_large}` when the article count exceeds #{@max_articles}.
+  - `{:error, :payload_too_large}` when the published-article count exceeds the cap
+    (use the streamed `.tar.gz` export instead).
   """
   @spec build_bundle(Ecto.UUID.t(), keyword()) ::
           {:ok, %{files: files(), meta: map()}} | {:error, :payload_too_large}
   def build_bundle(tenant_id, opts \\ []) do
     project_id = Keyword.get(opts, :project_id)
+    cap = Keyword.get(opts, :max_articles, max_buffered_export_articles())
 
-    if count_published(tenant_id, project_id) > @max_articles do
+    # (#2) The cap is enforced on the ACTUAL MATERIALIZED set, not a separate COUNT.
+    # Fetch `cap + 1` (peek): if we got more than `cap`, the bundle is over-cap →
+    # reject (never silently TRUNCATE to `cap`, which would drop articles from the
+    # json bundle). This closes the TOCTOU where rows published between a COUNT and
+    # the fetch would otherwise materialize unbounded — the SQL LIMIT hard-bounds the
+    # materialized rows at `cap + 1` regardless. The COUNT is gone; the LIMIT is the
+    # gate.
+    articles = fetch_published(tenant_id, project_id, cap + 1)
+
+    if length(articles) > cap do
       {:error, :payload_too_large}
     else
-      articles = fetch_published(tenant_id, project_id)
       paths = assign_paths(articles)
       files = build_files(articles, paths)
 
@@ -107,37 +158,18 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
-  @doc """
-  Convenience wrapper: build a bundle and return it as a zip binary.
-  """
-  @spec export_zip(Ecto.UUID.t(), keyword()) :: {:ok, binary()} | {:error, :payload_too_large}
-  def export_zip(tenant_id, opts \\ []) do
-    with {:ok, %{files: files}} <- build_bundle(tenant_id, opts) do
-      {:ok, to_zip(files)}
-    end
-  end
-
-  @doc "Encodes a files map as an in-memory zip archive."
-  @spec to_zip(files()) :: binary()
-  def to_zip(files) do
-    entries =
-      files
-      |> Enum.sort_by(fn {path, _} -> path end)
-      |> Enum.map(fn {path, content} -> {String.to_charlist(path), content} end)
-
-    {:ok, {_name, zip}} = :zip.create(~c"okf-bundle.zip", entries, [:memory])
-    zip
-  end
-
-  defp count_published(tenant_id, project_id) do
-    tenant_id |> export_query(project_id) |> AdminRepo.aggregate(:count, :id)
-  end
-
-  defp fetch_published(tenant_id, project_id) do
+  # NB: build_bundle/2 reads via AdminRepo (NOT the HeavyRead structural tenant
+  # guard). The tenant scope is enforced by `export_query/2`'s explicit
+  # `a.tenant_id == ^tenant_id` predicate, and the SQL LIMIT (`limit_with_peek`)
+  # hard-bounds the materialized row set so the buffered path can never OOM. The
+  # streamed backup path DOES go through HeavyRead's guard; this buffered convenience
+  # path is bounded + explicitly tenant-scoped here.
+  defp fetch_published(tenant_id, project_id, limit_with_peek) do
     tenant_id
     |> export_query(project_id)
     |> preload(outgoing_links: :target_article)
     |> order_by([a], asc: a.category, asc: a.title, asc: a.id)
+    |> limit(^limit_with_peek)
     |> AdminRepo.all()
   end
 
@@ -358,7 +390,7 @@ defmodule Loopctl.Knowledge.OKF do
   `{:ok, report}` where report is a map with `:created`, `:updated`, `:skipped`,
   `:links_created`, `:partial?`, `:errors` (list of `%{path, reason}`), and
   `:conformance`. Returns `{:error, :too_many_concepts}` when the bundle exceeds
-  #{@max_articles} concepts (the same bound the exporter enforces).
+  #{@max_import_concepts} concepts (an import-side ceiling).
 
   The import is non-atomic (per-file) and runs synchronously; it is bounded by
   the concept cap above. Concurrent imports of the same bundle are serialized by
@@ -382,7 +414,7 @@ defmodule Loopctl.Knowledge.OKF do
       |> Enum.reject(fn {path, _} -> reserved?(path) end)
       |> Enum.sort_by(fn {path, _} -> path end)
 
-    if length(concepts) > @max_articles do
+    if length(concepts) > @max_import_concepts do
       {:error, :too_many_concepts}
     else
       do_import(tenant_id, concepts, conformance, merge?, dry_run?, project_id, audit_opts)
@@ -421,13 +453,18 @@ defmodule Loopctl.Knowledge.OKF do
   end
 
   @doc """
-  Imports an OKF bundle delivered as a zip binary. Unzips in memory, then
-  delegates to `import_files/3`.
+  Imports an OKF bundle delivered as an archive binary. Detects the archive
+  format from its magic bytes — a streamed `.tar.gz` (gzip magic `1F 8B`, the
+  US-27.16 export format) is extracted via `:erl_tar`; a legacy `.zip` (PK magic
+  `50 4B`) via `:zip` — unpacks it in memory, then delegates to `import_files/3`.
+
+  Keeping the `.zip` reader means a bundle produced by the OLD exporter (or any
+  third-party OKF zip) still round-trips even though the exporter now emits tar.gz.
   """
   @spec import_zip(Ecto.UUID.t(), binary(), keyword()) ::
           {:ok, map()} | {:error, :invalid_zip | :too_many_concepts}
-  def import_zip(tenant_id, zip_binary, opts \\ []) when is_binary(zip_binary) do
-    case unzip(zip_binary) do
+  def import_zip(tenant_id, archive_binary, opts \\ []) when is_binary(archive_binary) do
+    case unpack_archive(archive_binary) do
       {:ok, files} -> import_files(tenant_id, files, opts)
       {:error, _} -> {:error, :invalid_zip}
     end
@@ -1031,21 +1068,62 @@ defmodule Loopctl.Knowledge.OKF do
     |> Map.new()
   end
 
-  # Defense-in-depth caps so `import_zip/3` can't be used as a zip bomb.
+  # Defense-in-depth caps for `import_zip/3`. These BOUND a decompression bomb (#3):
+  # the tar.gz path stream-inflates with a running byte budget (aborts mid-bomb,
+  # never materializing it), and BOTH paths reject an over-large COMPRESSED input up
+  # front and enforce a total uncompressed-entry cap. So a 1KB→10GB bomb is rejected
+  # before it can OOM the node — not "fully inflated then checked".
   @max_zip_entries 20_000
   @max_zip_bytes 50 * 1024 * 1024
 
-  defp unzip(zip_binary) do
-    case :zip.extract(zip_binary, [:memory]) do
-      {:ok, entries} -> collect_zip_entries(entries)
-      {:error, reason} -> {:error, reason}
+  # Dispatch on the archive's magic bytes: gzip (`1F 8B`, the US-27.16 streamed
+  # `.tar.gz`) → bounded streaming inflate; PK (`50 4B`, a legacy `.zip`) → `:zip`
+  # behind a compressed-input cap. Both feed the same entry-collector (size/count caps).
+  defp unpack_archive(<<0x1F, 0x8B, _rest::binary>> = bin), do: untar_gz(bin)
+  defp unpack_archive(<<0x50, 0x4B, _rest::binary>> = bin), do: unzip(bin)
+  # Unknown magic: try zip first (back-compat), then tar.gz, before giving up.
+  defp unpack_archive(bin) do
+    case unzip(bin) do
+      {:ok, _} = ok -> ok
+      {:error, _} -> untar_gz(bin)
     end
   end
 
-  defp collect_zip_entries(entries) when length(entries) > @max_zip_entries,
+  defp untar_gz(bin) do
+    # AC-27.16.3 (#3): decompression-limited extraction — compressed-input cap +
+    # streaming inflate with an uncompressed byte budget — so a gzip bomb aborts
+    # mid-decompression instead of fully inflating to gigabytes.
+    case DecompressionLimit.extract_tar_gz(bin) do
+      {:ok, entries} -> collect_archive_entries(entries)
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _ -> {:error, :invalid_archive}
+  end
+
+  defp unzip(zip_binary) do
+    # `:zip.extract([:memory])` has no streaming budget (it inflates fully), so the
+    # bomb defense for the zip path is the COMPRESSED-input cap up front (#3) plus the
+    # per-entry total-uncompressed cap in collect_archive_entries/1.
+    with :ok <- DecompressionLimit.guard_compressed_size(zip_binary),
+         {:ok, entries} <- safe_zip_extract(zip_binary) do
+      collect_archive_entries(entries)
+    end
+  end
+
+  defp safe_zip_extract(zip_binary) do
+    case :zip.extract(zip_binary, [:memory]) do
+      {:ok, entries} -> {:ok, entries}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _ -> {:error, :invalid_archive}
+  end
+
+  defp collect_archive_entries(entries) when length(entries) > @max_zip_entries,
     do: {:error, :too_many_entries}
 
-  defp collect_zip_entries(entries) do
+  defp collect_archive_entries(entries) do
     total = Enum.reduce(entries, 0, fn {_name, content}, acc -> acc + byte_size(content) end)
 
     if total > @max_zip_bytes do

@@ -25,6 +25,9 @@ defmodule Loopctl.Application do
       {Task.Supervisor, name: Loopctl.TaskSupervisor},
       {Oban, Application.fetch_env!(:loopctl, Oban)},
       Loopctl.RateLimiter.Server,
+      # US-27.16: owns the ETS table tracking in-flight streaming-export slots so a
+      # crashed exporter's slot is reclaimed (concurrency cap, AC-27.16.6).
+      Loopctl.Knowledge.ExportConcurrency,
       LoopctlWeb.Endpoint
     ]
 
