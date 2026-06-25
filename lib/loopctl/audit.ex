@@ -167,12 +167,28 @@ defmodule Loopctl.Audit do
   @doc """
   Returns audit log entries for the change feed polling endpoint.
 
-  Entries are returned in ascending order by inserted_at, capped at `limit`.
-  When more entries exist beyond the cap, `has_more` is true and `next_since`
-  contains the `inserted_at` of the last returned entry.
+  US-27.9b: this is a KEYSET enumeration on the stable unique tuple
+  `(inserted_at, id)`, ordered `inserted_at ASC, id ASC`, capped at `limit`. The
+  `id` tie-break is mandatory — audit `inserted_at` is `utc_datetime_usec` and a
+  bulk operation (an `Ecto.Multi` writing several entries) commits MULTIPLE rows at
+  the SAME microsecond, so a timestamp-only `since` token either SKIPS the tied rows
+  after a page boundary (silent gap) or RE-EMITS them (duplicate). Seeking on the
+  tuple steps PAST a specific row regardless of timestamp ties.
+
+  Two seek inputs (mutually exclusive in practice — the cursor wins when present):
+
+  - `since` — a `DateTime` start position (`inserted_at > since`). Kept for
+    back-compat with the original `?since=ISO8601` token, and used for the FIRST
+    page (the caller has no cursor yet).
+  - `:cursor` — the decoded `{inserted_at, id}` keyset position to seek AFTER
+    (`(inserted_at, id) > (^c_inserted, ^c_id)`). Supplied on subsequent pages from
+    the prior page's `next_cursor`. Drift-free across timestamp ties.
+
+  When `:cursor` is present it takes precedence over `since`.
 
   ## Options
 
+  - `:cursor` — decoded `{inserted_at, id}` keyset position (US-27.9b)
   - `:project_id` — filter by project ID
   - `:entity_type` — filter by entity type
   - `:action` — filter by action
@@ -180,36 +196,94 @@ defmodule Loopctl.Audit do
 
   ## Returns
 
-  `{:ok, %{data: [%AuditLog{}], has_more: boolean, next_since: DateTime.t() | nil}}`
+  `{:ok, %{data: [%AuditLog{}], has_more: boolean, next_since: DateTime.t() | nil,
+    next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil}}`
+
+  `next_cursor` is the `(inserted_at, id)` of the last returned entry when more
+  remain, else `nil` — the drift-free continuation token. `next_since` (the last
+  entry's `inserted_at`) is retained for back-compat but is NOT tie-safe; new
+  callers should follow `next_cursor`.
   """
   @spec list_changes(Ecto.UUID.t(), DateTime.t(), keyword()) ::
-          {:ok, %{data: [AuditLog.t()], has_more: boolean(), next_since: DateTime.t() | nil}}
+          {:ok,
+           %{
+             data: [AuditLog.t()],
+             has_more: boolean(),
+             next_since: DateTime.t() | nil,
+             next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil
+           }}
   def list_changes(tenant_id, since, opts \\ []) do
     default_limit = Application.get_env(:loopctl, :change_feed_limit, 1000)
     limit = opts |> Keyword.get(:limit, default_limit) |> max(1) |> min(1000)
 
-    query =
-      AuditLog
-      |> where([a], a.tenant_id == ^tenant_id)
-      |> where([a], a.inserted_at > ^since)
-      |> apply_filters(opts)
-      |> order_by([a], asc: a.inserted_at)
-      # Fetch one extra to determine has_more
-      |> limit(^(limit + 1))
+    # Fetch one extra to determine has_more (keyset peek, no COUNT — nothing to drift).
+    query = changes_keyset_query(tenant_id, since, Keyword.put(opts, :limit, limit + 1))
 
     results = AdminRepo.all(query)
 
     has_more = length(results) > limit
     entries = Enum.take(results, limit)
 
-    next_since =
+    {next_since, next_cursor} =
       if has_more do
-        entries |> List.last() |> Map.get(:inserted_at)
+        last = List.last(entries)
+        {last.inserted_at, {last.inserted_at, last.id}}
       else
-        nil
+        {nil, nil}
       end
 
-    {:ok, %{data: entries, has_more: has_more, next_since: next_since}}
+    {:ok, %{data: entries, has_more: has_more, next_since: next_since, next_cursor: next_cursor}}
+  end
+
+  @doc """
+  Builds the change-feed KEYSET seek QUERYABLE (US-27.9b), returned (not executed)
+  so the `:scale_nightly` plan test can assert it is index-backed via `EXPLAIN`.
+
+  This is the EXACT query `list_changes/3` runs (so the plan assertion guards the
+  request path). `:limit` is applied as-is here (the caller adds the `+1` peek).
+
+  Plan note (AC-27.9b.2): with `tenant_id =` plus the `(inserted_at, id)` row-value
+  seek and `ORDER BY inserted_at ASC, id ASC`, the planner reaches `audit_log` (a
+  RANGE-partitioned table) via the existing `(tenant_id, inserted_at)` btree and
+  walks it in order — index-backed, no Seq Scan over the corpus. The `id` is the
+  tie-break recheck within the bounded equal-timestamp run.
+  """
+  @spec changes_keyset_query(Ecto.UUID.t(), DateTime.t(), keyword()) :: Ecto.Query.t()
+  def changes_keyset_query(tenant_id, since, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 1000) |> max(1)
+
+    AuditLog
+    |> where([a], a.tenant_id == ^tenant_id)
+    |> apply_changes_seek(since, Keyword.get(opts, :cursor))
+    |> apply_filters(opts)
+    |> order_by([a], asc: a.inserted_at, asc: a.id)
+    |> limit(^limit)
+  end
+
+  # First page (no cursor): seek by the `since` timestamp (back-compat). Subsequent
+  # pages: seek by the `(inserted_at, id)` keyset tuple, which steps PAST a specific
+  # row regardless of how many share its timestamp (US-27.9b tie-safety). The cursor
+  # takes precedence over `since` when both are present.
+  defp apply_changes_seek(query, since, nil) do
+    where(query, [a], a.inserted_at > ^since)
+  end
+
+  defp apply_changes_seek(query, _since, {%DateTime{} = inserted_at, id})
+       when is_binary(id) do
+    # `type/2` tells Ecto the bound params' DB types so the row-value comparison
+    # binds `id` as uuid (binary_id) and `inserted_at` as the column's type — the
+    # same shape Loopctl.Knowledge.apply_keyset_seek/2 uses for the article list.
+    where(
+      query,
+      [a],
+      fragment(
+        "(?, ?) > (?, ?)",
+        a.inserted_at,
+        a.id,
+        type(^inserted_at, a.inserted_at),
+        type(^id, a.id)
+      )
+    )
   end
 
   @doc """

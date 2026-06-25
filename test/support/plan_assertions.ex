@@ -44,17 +44,66 @@ defmodule Loopctl.PlanAssertions do
 
     bad = Enum.filter(scans, &(&1.node_type in @full_scan_types))
 
+    refute_full_scan_result(scans, bad, raw)
+  end
+
+  @doc """
+  Like `refute_full_scan/1` but targets the `audit_log` relation (US-27.9b change
+  feed). `audit_log` is RANGE-partitioned, so EXPLAIN reaches it via CHILD partition
+  relations (e.g. `audit_log_y2026m06`); this matches any relation whose name starts
+  with `audit_log` (parent or partition). Does NOT call `assert_fresh_stats!/0` (that
+  guard is `articles`-specific); the caller seeds + ANALYZEs `audit_log` itself.
+  """
+  def refute_full_scan_audit(queryable_or_sql) do
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = relation_scan_nodes(root, "audit_log")
+    bad = Enum.filter(scans, &(&1.node_type in @full_scan_types))
+
+    refute_full_scan_result(scans, bad, raw)
+  end
+
+  defp refute_full_scan_result(scans, bad, raw) do
     cond do
       scans == [] ->
         raise ExUnit.AssertionError,
           message:
-            "Plan never reaches the `articles` relation — cannot judge full-scan vs index. Plan:\n#{elide(raw)}"
+            "Plan never reaches the target relation — cannot judge full-scan vs index. Plan:\n#{elide(raw)}"
 
       bad != [] ->
         raise ExUnit.AssertionError,
           message:
-            "Expected `articles` reached via an index, but a full-corpus scan node is present: " <>
-              "#{inspect(Enum.map(bad, & &1.node_type))} (the #170/#172 prod-500 shape). Plan:\n#{elide(raw)}"
+            "Expected the target relation reached via an index, but a full-corpus scan node is " <>
+              "present: #{inspect(Enum.map(bad, & &1.node_type))} (the #170/#172 prod-500 " <>
+              "shape). Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Like `refute_seq_scan/1` but targets the `audit_log` relation (US-27.9b change
+  feed). Allows a Bitmap Heap Scan driven by a selective index but forbids an
+  unbounded Seq Scan over the (partitioned) `audit_log`. Matches any relation whose
+  name starts with `audit_log` (parent or partition). Does NOT call
+  `assert_fresh_stats!/0` (that guard is `articles`-specific).
+  """
+  def refute_seq_scan_audit(queryable_or_sql) do
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = relation_scan_nodes(root, "audit_log")
+    bad = Enum.filter(scans, &(&1.node_type == "Seq Scan"))
+
+    cond do
+      scans == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches the `audit_log` relation — cannot judge scan shape. Plan:\n#{elide(raw)}"
+
+      bad != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected no Seq Scan on `audit_log` (unbounded full read), but one is present. " <>
+              "Plan:\n#{elide(raw)}"
 
       true ->
         :ok
@@ -343,6 +392,28 @@ defmodule Loopctl.PlanAssertions do
       node
       |> Map.get("Plans", [])
       |> Enum.flat_map(&article_scan_nodes/1)
+
+    here ++ children
+  end
+
+  # Like `article_scan_nodes/1` but matches any relation whose name STARTS WITH
+  # `prefix` (for partitioned tables: the parent `audit_log` plus child partitions
+  # `audit_log_y2026m06`, all of which EXPLAIN names as the Relation Name on the scan
+  # node). Returns the same `%{node_type, index_name, rows}` shape.
+  defp relation_scan_nodes(node, prefix) when is_map(node) do
+    name = node["Relation Name"]
+
+    here =
+      if is_binary(name) and String.starts_with?(name, prefix) do
+        [%{node_type: node["Node Type"], index_name: node["Index Name"], rows: node["Plan Rows"]}]
+      else
+        []
+      end
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&relation_scan_nodes(&1, prefix))
 
     here ++ children
   end

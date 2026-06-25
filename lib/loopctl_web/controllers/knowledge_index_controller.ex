@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleCursor
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
@@ -83,6 +84,20 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         description: "Tag match mode: any (default, OR) or all (AND — carries every listed tag)",
         required: false
       ],
+      source_type: [
+        in: :query,
+        type: :string,
+        description: "Filter to articles with this source_type (by-source enumeration)",
+        required: false
+      ],
+      source_id: [
+        in: :query,
+        type: :string,
+        description:
+          "Filter to articles with this source_id UUID (by-source enumeration). " <>
+            "A malformed id matches nothing.",
+        required: false
+      ],
       limit: [
         in: :query,
         type: :integer,
@@ -102,6 +117,23 @@ defmodule LoopctlWeb.KnowledgeIndexController do
           "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
             "Default id,title,category. `id` and `category` are always included " <>
             "(category is the grouping key). Returns 400 for unknown fields.",
+        required: false
+      ],
+      cursor: [
+        in: :query,
+        type: :string,
+        description:
+          "Opaque KEYSET cursor for drift-free enumeration of the index (US-27.9b). " <>
+            "To use cursor pagination, pass an empty string (`cursor=`) on the FIRST " <>
+            "request to opt into the keyset path (which orders by `inserted_at ASC, " <>
+            "id ASC`); then follow `meta.next_cursor` verbatim on subsequent requests. " <>
+            "Omitting the `cursor` parameter entirely uses the legacy offset path " <>
+            "(orders by `category, updated_at DESC, id`), which does not emit " <>
+            "`next_cursor`. Do not mix the two paths mid-enumeration, as the sort order " <>
+            "differs. The keyset path honors the same category/tags/source filters and " <>
+            "is the drift-free way to walk a tag or a source to exhaustion under " <>
+            "concurrent writes. The cursor is integrity-protected and tenant-bound — a " <>
+            "tampered/forged cursor is rejected with 400.",
         required: false
       ]
     ],
@@ -145,8 +177,69 @@ defmodule LoopctlWeb.KnowledgeIndexController do
          {:ok, fields} <- parse_fields(params["fields"]),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.merge(base_opts, Visibility.scope_opts(conn))
-      {:ok, result} = Knowledge.list_index(tenant_id, opts)
-      json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
+
+      # US-27.9b: the presence of a `cursor` query param (even empty) opts the index
+      # into drift-free keyset pagination — the same dual path the search list uses.
+      # Tenant scope is ALWAYS the principal's (`tenant_id`), never the cursor; the
+      # cursor is decoded+verified with the caller's tenant key (AC-27.9b.4).
+      #
+      #   - param ABSENT    → legacy offset path (back-compat, grouped + total_count)
+      #   - param EMPTY     → keyset walk FROM THE START (first page, no seek)
+      #   - param a token   → keyset seek AFTER the decoded position
+      #   - param malformed → 400 (not a string)
+      run_index(conn, tenant_id, opts, fields, keyset_cursor(params))
+    end
+  end
+
+  # Dispatches the offset vs keyset path (extracted so the cursor-decode branch stays
+  # within the credo nesting limit). `:none` → legacy offset; the rest → keyset.
+  defp run_index(conn, tenant_id, opts, fields, :none) do
+    {:ok, result} = Knowledge.list_index(tenant_id, opts)
+    json(conn, LoopctlWeb.KnowledgeIndexJSON.index(result, fields))
+  end
+
+  defp run_index(_conn, _tenant_id, _opts, _fields, :invalid) do
+    {:error, :bad_request, "cursor parameter must be a string"}
+  end
+
+  defp run_index(conn, tenant_id, opts, fields, :start) do
+    render_keyset(conn, tenant_id, opts, fields, nil)
+  end
+
+  defp run_index(conn, tenant_id, opts, fields, {:cursor, raw}) do
+    case ArticleCursor.decode(tenant_id, raw) do
+      {:ok, position} ->
+        render_keyset(conn, tenant_id, opts, fields, position)
+
+      {:error, :invalid} ->
+        {:error, :bad_request,
+         "Invalid or tampered cursor. Send an empty 'cursor' to start from the " <>
+           "beginning, then follow 'meta.next_cursor' verbatim to paginate."}
+    end
+  end
+
+  defp render_keyset(conn, tenant_id, opts, fields, position) do
+    {:ok, result} = Knowledge.list_index_keyset(tenant_id, Keyword.put(opts, :cursor, position))
+
+    encoded =
+      case result.next_cursor do
+        nil -> nil
+        cursor -> ArticleCursor.encode(tenant_id, cursor)
+      end
+
+    json(conn, LoopctlWeb.KnowledgeIndexJSON.keyset(%{result | next_cursor: encoded}, fields))
+  end
+
+  # Classifies the `cursor` query param: ABSENT → `:none` (legacy offset path);
+  # PRESENT-but-empty → `:start` (keyset from the beginning); a non-empty string →
+  # `{:cursor, raw}` (keyset seek); a non-string `cursor[]=` form → `:invalid` (400,
+  # not a 500 and not a silent page-1 reset). Mirrors the search controller verbatim.
+  defp keyset_cursor(params) when is_map(params) do
+    case Map.fetch(params, "cursor") do
+      :error -> :none
+      {:ok, ""} -> :start
+      {:ok, raw} when is_binary(raw) -> {:cursor, raw}
+      {:ok, _non_string} -> :invalid
     end
   end
 
@@ -190,12 +283,23 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         |> maybe_put(:category, category)
         |> maybe_put(:tags, parse_tags(params["tags"]))
         |> Keyword.put(:match, match)
+        |> maybe_put(:source_type, parse_source_type(params["source_type"]))
+        |> maybe_put(:source_id, parse_source_id(params["source_id"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
         |> maybe_put(:offset, parse_int(params["offset"]))
 
       {:ok, opts}
     end
   end
+
+  defp parse_source_type(value) when is_binary(value) and value != "", do: value
+  defp parse_source_type(_), do: nil
+
+  # `source_id` is matched as a binary_id by the context filter, which maps a
+  # malformed (non-UUID) value to "matches nothing" rather than raising. We pass a
+  # non-empty string straight through; the context guards the cast.
+  defp parse_source_id(value) when is_binary(value) and value != "", do: value
+  defp parse_source_id(_), do: nil
 
   # Best-effort project filter: a malformed (non-UUID) project_id yields
   # tenant-wide results rather than crashing on an Ecto.Query.CastError (a

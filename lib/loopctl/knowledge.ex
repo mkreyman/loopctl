@@ -813,6 +813,8 @@ defmodule Loopctl.Knowledge do
       base
       |> maybe_filter_by_category(Keyword.get(opts, :category))
       |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+      |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
+      |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
       |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
@@ -861,6 +863,148 @@ defmodule Loopctl.Knowledge do
          truncated: truncated
        }
      }}
+  end
+
+  @doc """
+  KEYSET (cursor) enumeration of the knowledge index (US-27.9b).
+
+  The drift-free companion to `list_index/2`, applying the SAME index filters
+  (`:project_id`, `:category`, `:tags` + `:match`, `:source_type`, `:source_id`,
+  visibility) but seeking on the stable unique tuple `(inserted_at, id)` instead
+  of `OFFSET`. The live offset-drift incident (#175) was a by-TAG walk on this
+  surface (a tag count swung 9,881 → 4,981 mid-enumeration), so this rolls the
+  proven US-27.9a keyset mechanic onto the index's by-tag/by-source enumerations:
+
+      WHERE tenant_id = ^tenant_id
+        AND status = :published
+        AND (project_id IS NULL OR project_id = ^project_id)   -- when project-scoped
+        AND <category/tags/source_type/source_id/visibility residuals>
+        AND (cursor? -> (inserted_at, id) > (^c_inserted, ^c_id))
+      ORDER BY inserted_at ASC, id ASC
+      LIMIT ^(limit + 1)
+
+  The `id` tie-break is mandatory (`inserted_at` is `utc_datetime_usec` and bulk
+  `insert_all` ties timestamps per batch). The `limit + 1` peek tells us whether a
+  next page exists WITHOUT a `COUNT` — so there is no count to drift either.
+
+  Tenant scope comes from `tenant_id` (the caller's authenticated principal),
+  NEVER from the cursor. The cursor (the same `Loopctl.Knowledge.ArticleCursor`
+  the article-list keyset uses, verbatim) encodes only the intra-tenant ordering
+  position and is decoded/verified at the HTTP layer.
+
+  Unlike `list_keyset/2` (the search-list keyset), this path:
+
+  - forces `status = :published` (the index is published-only) and supports the
+    `(project_id IS NULL OR = project)` tenant-wide-plus-project visibility, and
+  - APPLIES the `:source_type`/`:source_id` filters (the by-source enumeration —
+    the search-list keyset did not need them). by-source is a selective scalar
+    equality, served index-backed at scale by `articles_tenant_source_inserted_id_idx`
+    (see the `:scale_nightly` plan test), with the `(tenant_id, inserted_at, id)`
+    btree as the residual-free fallback.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID (from the auth principal)
+  - `opts` -- keyword list:
+    - `:cursor` -- the decoded `{inserted_at, id}` position to seek AFTER, or
+      `nil`/absent to start from the beginning
+    - `:limit` -- max results per page (default 20, max #{@max_page_size}, min 1);
+      clamped here as a safety net, the HTTP layer 400s an over-large request
+    - `:project_id`, `:category`, `:tags`, `:match`, `:source_type`, `:source_id`,
+      `:visibility_agent_id` -- same filters as `list_index/2`
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], next_cursor: position_or_nil, has_more: bool,
+    limit: effective_limit}}` where `next_cursor` is the `(inserted_at, id)` tuple
+    of the LAST returned row when another page exists, else `nil`. `has_more` is
+    exactly `next_cursor != nil`, never a COUNT.
+  """
+  @spec list_index_keyset(Ecto.UUID.t(), keyword()) ::
+          {:ok,
+           %{
+             results: [map()],
+             next_cursor: {DateTime.t(), Ecto.UUID.t()} | nil,
+             has_more: boolean(),
+             limit: pos_integer()
+           }}
+  def list_index_keyset(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, @default_page_size) |> max(1) |> min(@max_page_size)
+
+    # Fetch limit+1 to detect a next page without a COUNT (AC-27.9b.1).
+    rows =
+      tenant_id
+      |> index_keyset_query(Keyword.put(opts, :limit, limit + 1))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:enumeration)))
+
+    {page, has_more?} = split_peek(rows, limit)
+    next_cursor = keyset_next_cursor(page, has_more?)
+
+    {:ok,
+     %{
+       results: page,
+       next_cursor: next_cursor,
+       has_more: has_more?,
+       limit: limit
+     }}
+  end
+
+  @doc """
+  Builds the index KEYSET seek QUERYABLE (US-27.9b), returned (not executed) so
+  the `:scale_nightly` plan test can assert it is index-backed via `EXPLAIN`.
+
+  This is the EXACT query `list_index_keyset/2` runs (so the plan assertion guards
+  the request path, not a stunt double). Same `opts` as `list_index_keyset/2`;
+  `:limit` is applied as-is (the caller adds the `+1` peek).
+
+  Plan note (AC-27.9b.2):
+
+  - With no filter or a scalar `:category` residual the planner walks the
+    `(tenant_id, inserted_at, id)` btree in order — true keyset, no Sort.
+  - With `:source_id` (selective scalar equality) the planner uses the
+    `(tenant_id, source_id, inserted_at, id)` composite btree, walking it in
+    `(inserted_at, id)` order for that source — strictly index-ordered, no Sort.
+  - With a `:tags` (array `&&`) residual the planner BitmapAnds the tags GIN with
+    the keyset btree and Sorts — bounded by tag selectivity, NOT the corpus (the
+    same bounded path US-27.9a already proved; no single index can serve both array
+    containment and the order key).
+  """
+  @spec index_keyset_query(Ecto.UUID.t(), keyword()) :: Ecto.Query.t()
+  def index_keyset_query(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, @default_page_size + 1) |> max(1)
+    project_id = Keyword.get(opts, :project_id)
+
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published
+      )
+
+    base =
+      if project_id do
+        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+      else
+        base
+      end
+
+    base
+    |> maybe_filter_by_category(Keyword.get(opts, :category))
+    |> maybe_filter_by_tags(Keyword.get(opts, :tags), Keyword.get(opts, :match, :any))
+    |> maybe_filter_by_source_type(Keyword.get(opts, :source_type))
+    |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
+    |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+    |> apply_keyset_seek(Keyword.get(opts, :cursor))
+    |> select([a], %{
+      id: a.id,
+      title: a.title,
+      category: a.category,
+      tags: a.tags,
+      status: a.status,
+      updated_at: a.updated_at,
+      inserted_at: a.inserted_at
+    })
+    |> order_by([a], asc: a.inserted_at, asc: a.id)
+    |> limit(^limit)
   end
 
   @doc """

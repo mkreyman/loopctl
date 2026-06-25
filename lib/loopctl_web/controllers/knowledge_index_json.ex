@@ -36,6 +36,49 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
     }
   end
 
+  @doc """
+  Renders a KEYSET (cursor) index page (US-27.9b).
+
+  Like `index/2`, articles are grouped by category and projected to `fields`. But
+  the `meta` documents the cursor contract instead of offset/total_count, so an
+  agent walking a tag or a source can drive pagination purely from the response:
+
+  - `next_cursor` — the opaque, already-encoded cursor for the next page, or `null`
+    when the walk is exhausted (the only exhaustion signal — there is no
+    total_count to drift).
+  - `has_more` — boolean, derived from the keyset peek (exactly `next_cursor != null`),
+    never a COUNT.
+  - `limit` — the effective per-page limit that actually ran.
+  - `count` — the number of rows in THIS page (across all categories).
+
+  `next_cursor` is encoded by the controller (it needs the tenant key), so this
+  view receives it as a ready string or `nil`.
+  """
+  def keyset(
+        %{results: results, next_cursor: next_cursor, has_more: has_more, limit: limit},
+        fields
+      ) do
+    grouped =
+      Enum.group_by(results, fn article -> to_string(article.category) end)
+
+    %{
+      data:
+        Map.new(grouped, fn {category, articles} ->
+          {category, Enum.map(articles, &project(&1, fields))}
+        end),
+      meta: %{
+        # The cursor walk is drift-free precisely BECAUSE it carries no total_count
+        # to drift; `next_cursor: null` is the exhaustion signal.
+        next_cursor: next_cursor,
+        has_more: has_more,
+        limit: limit,
+        count: length(results),
+        fields: fields,
+        search_mode: "index_keyset"
+      }
+    }
+  end
+
   defp project(article, fields) do
     Map.new(fields, fn field -> {field, field_value(article, field)} end)
   end
