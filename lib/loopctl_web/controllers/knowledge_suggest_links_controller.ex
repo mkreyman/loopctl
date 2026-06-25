@@ -37,7 +37,12 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
         "over the embedding index: exclusions (already-linked / below-threshold) are " <>
         "applied to the nearest candidate pool, so a densely-linked article may return " <>
         "fewer than `limit` (or none) even if more-distant unlinked articles exist. " <>
-        "Role: agent+.",
+        "When that happens the response `meta` carries `recall_truncated: true` " <>
+        "(alias `pool_exhausted: true`) so you can tell an INCOMPLETE result " <>
+        "(nearest pool was full but filters cut it below `limit`) apart from a " <>
+        "genuinely-empty one (no eligible neighbors). Recall is bounded by " <>
+        "`hnsw.ef_search` (pgvector default ~40) plus the over-fetch pool; " <>
+        "under-fill is expected for densely-linked hubs. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Article UUID"],
       limit: [in: :query, type: :integer, description: "Max candidates (default 5)"],
@@ -52,7 +57,30 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
         {"Suggested links", "application/json",
          %OpenApiSpex.Schema{
            type: :object,
-           properties: %{data: %OpenApiSpex.Schema{type: :array}}
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array},
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               description:
+                 "Recall-completeness signal (US-27.6b). `recall_truncated`/" <>
+                   "`pool_exhausted` are the same flag: true ⇒ the nearest candidate " <>
+                   "pool was filled but the already-linked/threshold filters cut the " <>
+                   "result below `requested`, so more (more-distant) neighbors may " <>
+                   "exist — distinct from a genuinely-empty result.",
+               properties: %{
+                 requested: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "The requested limit"
+                 },
+                 returned: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description: "How many candidates were returned"
+                 },
+                 recall_truncated: %OpenApiSpex.Schema{type: :boolean},
+                 pool_exhausted: %OpenApiSpex.Schema{type: :boolean}
+               }
+             }
+           }
          }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
       404 => {"Article not found", "application/json", Schemas.ErrorResponse},
@@ -73,13 +101,17 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
 
     with {:ok, threshold} <- parse_threshold(params["threshold"]),
          {:ok, limit} <- parse_limit(params["limit"]),
-         {:ok, suggestions} <-
+         {:ok, suggestions, meta} <-
            suggest_links_guarded(
              tenant_id,
              article_id,
              [threshold: threshold, limit: limit] ++ Visibility.scope_opts(conn)
            ) do
-      json(conn, %{data: suggestions})
+      # US-27.6b: `meta` lets the agent distinguish an INCOMPLETE result (a
+      # densely-linked hub whose nearest pool was filled but cut below `limit` by
+      # the already-linked anti-join / threshold — `recall_truncated: true`) from a
+      # genuinely-empty one. `recall_truncated`/`pool_exhausted` are the same flag.
+      json(conn, %{data: suggestions, meta: render_meta(meta)})
     else
       {:error, :invalid_threshold} ->
         {:error, :bad_request, "threshold must be a number between 0 and 1"}
@@ -113,13 +145,25 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   # hard to reproduce). Production resolves to `Loopctl.Knowledge` itself, which
   # implements `Loopctl.Knowledge.SuggestLinksBehaviour`.
   defp suggest_links_guarded(tenant_id, article_id, opts) do
-    knowledge().suggest_links(tenant_id, article_id, opts)
+    knowledge().suggest_links_with_meta(tenant_id, article_id, opts)
   rescue
     e in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, e}
   end
 
   defp knowledge do
     Application.get_env(:loopctl, :knowledge_suggest_links, Knowledge)
+  end
+
+  # Render the recall-completeness meta (US-27.6b AC-27.6b.6). Both
+  # `recall_truncated` (the consumer-facing name) and `pool_exhausted` (the
+  # operator/telemetry name) carry the SAME flag so a caller can key on either.
+  defp render_meta(meta) do
+    %{
+      requested: meta.requested,
+      returned: meta.returned,
+      recall_truncated: meta.recall_truncated,
+      pool_exhausted: meta.pool_exhausted
+    }
   end
 
   # Absent → nil (context applies the default). A present value must parse to a

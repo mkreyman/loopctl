@@ -43,6 +43,17 @@ defmodule Loopctl.TelemetryEvents do
   @doc "Audit log entry written"
   def audit_log_write, do: [:loopctl, :audit, :write]
 
+  @doc """
+  A vector-search read under-filled (US-27.6b): it returned fewer than the
+  requested `k` candidates DESPITE the inner ANN pool being filled to its cap —
+  i.e. the post-ANN filters (already-linked anti-join / similarity threshold)
+  cut the full pool below `k`, not a genuinely-small corpus. Emitted at most
+  ONCE per request. Carries an id-only payload (tenant_id, endpoint, requested,
+  pool, returned, available, excluded_by_filters) — NEVER a vector literal or
+  article body (AC-27.6b.5). Aggregated by US-27.15 metrics/alerting.
+  """
+  def vector_search_under_fill, do: [:loopctl, :knowledge, :vector_search, :under_fill]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -53,7 +64,8 @@ defmodule Loopctl.TelemetryEvents do
       webhook_delivery_start(),
       webhook_delivery_stop(),
       webhook_delivery_exception(),
-      audit_log_write()
+      audit_log_write(),
+      vector_search_under_fill()
     ]
   end
 end

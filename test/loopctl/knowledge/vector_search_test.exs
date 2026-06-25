@@ -378,6 +378,39 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
     end
   end
 
+  describe "pool_size/2 — config-driven over-fetch, always floored at k (TC-27.6b.1, AC-27.6b.1)" do
+    test "PROD-default sizing is k*factor floored/capped (explicit knobs, env-independent)" do
+      # Pin the documented prod defaults explicitly so this is independent of the test
+      # config's shrunken pool (config/test.exs lowers the async-suite floor/cap to 6).
+      prod = [factor: 5, floor: 100, cap: 500]
+      # k=5 → 5*5=25 → max(floor 100)=100 → min(cap 500)=100 → max(k)=100
+      assert VectorSearch.pool_size(5, prod) == 100
+      # k=40 → 200 → max(100)=200 → min(500)=200 → max(40)=200
+      assert VectorSearch.pool_size(40, prod) == 200
+      # k=200 → 1000 → max(100)=1000 → min(500)=500 → max(200)=500 (cap wins)
+      assert VectorSearch.pool_size(200, prod) == 500
+    end
+
+    test "a misconfigured cap BELOW k can never drop the pool below k (the floor-at-k invariant)" do
+      # The crux of AC-27.6b.1: k=50 with a configured cap of 10 → the final |> max(k)
+      # overrides the too-small cap, so the pool is >= 50, NOT 10. We pass the cap as an
+      # explicit arg (no Application.put_env) so the invariant is proven on the pure
+      # sizing function directly.
+      assert VectorSearch.pool_size(50, cap: 10) == 50
+      assert VectorSearch.pool_size(50, cap: 10) >= 50
+
+      # Even with floor + cap both below k, k wins.
+      assert VectorSearch.pool_size(50, floor: 5, cap: 10) == 50
+    end
+
+    test "explicit factor/floor knobs compose, then k floors" do
+      # k=2, factor=3, floor=4, cap=1000 → 6 → max(4)=6 → min(1000)=6 → max(2)=6
+      assert VectorSearch.pool_size(2, factor: 3, floor: 4, cap: 1000) == 6
+      # k=10, factor=1, floor=1, cap=3 → 10 → max(1)=10 → min(3)=3 → max(10)=10 (k wins)
+      assert VectorSearch.pool_size(10, factor: 1, floor: 1, cap: 3) == 10
+    end
+  end
+
   # Resolve a `LIMIT $n` expression to its bound integer value.
   defp limit_value({:^, _, [idx]}, params), do: elem(Enum.at(params, idx), 0)
   defp limit_value(value, _params) when is_integer(value), do: value

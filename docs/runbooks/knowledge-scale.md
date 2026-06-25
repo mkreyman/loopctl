@@ -310,3 +310,34 @@ Then confirm through the pool:
 ```sh
 fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyReadRepo.query!(\"SHOW hnsw.ef_search\").rows)'"
 ```
+
+### Recall ceiling + the under-fill signal (US-27.6b)
+
+Recall on every kNN/`suggested_links` read is bounded by **two** things: `hnsw.ef_search`
+(default ~40 — the breadth above) AND the over-fetch `pool` (`pool_size/2`:
+`k * :vector_pool_factor |> max(:vector_pool_floor) |> min(:max_vector_pool) |> max(k)`,
+defaults 5 / 100 / 500). For a **densely-linked hub**, the nearest pool can be almost
+entirely already-linked or below threshold, so `suggested_links` legitimately returns
+**fewer than the requested limit** even though more-distant unlinked neighbors exist.
+**This is expected, not a bug** — it is the price of the index-correct path. The hazard
+is that it looks identical to "no neighbors exist", so it is made **observable**:
+
+- **Operator signal:** `Loopctl.Knowledge.suggest_links_with_meta/3` emits a
+  `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event (id-only payload:
+  `tenant_id`, `endpoint`, `requested`, `returned`, `pool`, `available`,
+  `excluded_by_filters` — NO vector literals/bodies) **once per request**, ONLY when the
+  pool was filled to cap but the post-ANN filters cut the result below the limit. It does
+  NOT fire for a genuinely-small corpus (`available < pool`). Aggregated by US-27.15.
+- **Consumer signal:** the `suggested_links` response `meta` carries
+  `recall_truncated`/`pool_exhausted` (same flag) so an agent distinguishes an INCOMPLETE
+  result from an empty one.
+
+Detecting "pool was full" costs **one bounded extra read** (a `SELECT count(*)` over the
+candidate subquery, `LIMIT pool` — so it touches at most `:max_vector_pool` rows, ≤500),
+issued ONLY on the `returned < limit` path (zero added cost on the common full-result
+path), on the same dedicated heavy-read pool.
+
+**Raising recall** is the `ALTER ROLE … SET hnsw.ef_search` lever above (US-27.11), never a
+per-request `:parameters` or `SET LOCAL` (the latter needs a transaction and re-introduces
+the #172 small-pool starvation). Until ef_search is raised (and verified on fly mpg),
+recall stays at the default and is handled by over-fetch + this under-fill signal.

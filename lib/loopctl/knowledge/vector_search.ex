@@ -42,10 +42,39 @@ defmodule Loopctl.Knowledge.VectorSearch do
   are post-ANN filters applied to the ≤500-row pool** and can severely under-fill:
   a selective tag matching <1% of the corpus will rarely survive the pool's
   top-`pool`-by-cosine approximation, returning 0 results even when k matching
-  articles exist corpus-wide. This is a known limitation of post-ANN filters;
-  recall-tuning (e.g., raising pool for selective filters) is handled in US-27.6b
-  telemetry + response meta. This module is the index-correct core + caller-cost
-  bounds + tenant isolation.
+  articles exist corpus-wide. This is a known limitation of post-ANN filters.
+  This module is the index-correct core + caller-cost bounds + tenant isolation.
+
+  ## Recall ceiling + the under-fill signal (US-27.6b)
+
+  Recall is bounded by **two** things, not one:
+
+    1. `hnsw.ef_search` — pgvector's per-query search breadth, **default ~40**. The
+       inner ANN only inspects ~`ef_search` graph nodes, so even before any filter
+       the "nearest pool" is an *approximation* of the true top-`pool`.
+    2. the over-fetch `pool` itself — the post-ANN filters (anti-join / threshold /
+       tags / category) run over only those `pool` rows.
+
+  **Under-fill is EXPECTED for a densely-linked hub:** when a hub's nearest pool is
+  almost entirely already-linked (or below threshold), the result legitimately
+  returns fewer than `k` even though more-distant unlinked candidates exist. That is
+  the price of the indexed path — NOT a bug. The danger is that this looks
+  *identical* to "no neighbors exist" (a genuinely-empty corpus). So under-fill is
+  made **observable, not silent**: `Loopctl.Knowledge.suggest_links_with_meta/3`
+  emits a `[:loopctl, :knowledge, :vector_search, :under_fill]` telemetry event and
+  a response-`meta` flag when the pool was filled to cap but filters cut it below
+  `k` (see that function + `Loopctl.TelemetryEvents.vector_search_under_fill/0`).
+
+  **Raising recall is deliberately NOT done per-request here.** `hnsw.ef_search` is
+  a pgvector **custom GUC** that does not exist until the extension loads per
+  session, so it **cannot** be set via a Postgrex startup `:parameters` entry
+  (managed PG rejects it: *"unrecognized configuration parameter"* — see
+  `docs/runbooks/knowledge-scale.md`). Setting it per-request would require a
+  `SET LOCAL` inside a transaction, re-introducing the #172 pool-starvation
+  anti-pattern on the small heavy-read pool. The only safe non-transaction lever is
+  `ALTER ROLE <heavy_read_role> SET hnsw.ef_search = N` (US-27.11), and only if
+  verified to apply on fly mpg. Until then recall stays at the default and is
+  handled by **over-fetch + the under-fill signal**.
 
   ## Caller-cost bounds (AC-27.6a.4 — OWASP A06, insecure design)
 
@@ -54,8 +83,11 @@ defmodule Loopctl.Knowledge.VectorSearch do
   backstop, NOT the primary bound:
 
     * `k` / limit — clamped to `[1, max_k/0]` (default 100).
-    * the over-fetch `pool` — `max(k*5, 100) |> min(max_pool/0) |> max(k)`
-      (default cap 500), so the index scan stays cheap regardless of `k`.
+    * the over-fetch `pool` — `pool_size/2`:
+      `k * pool_factor/0 |> max(pool_floor/0) |> min(max_pool/0) |> max(k)`
+      (default factor 5, floor 100, cap 500), so the index scan stays cheap
+      regardless of `k`, and a misconfigured `cap < k` can never starve the pool
+      below `k` (US-27.6b AC-27.6b.1).
     * `:threshold` — clamped into `[0.0, 1.0]`.
     * `:tags` — truncated to `max_tags/0` (default 50) entries; an empty/`nil`
       list is ignored.
@@ -112,6 +144,15 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # before the outer exclusions trim to `k`. Mirrors `:max_suggestion_candidate_pool`.
   @default_max_pool 500
 
+  # Over-fetch pool sizing (US-27.6b AC-27.6b.1). The inner pool is
+  # `k * factor |> max(floor) |> min(cap) |> max(k)`. Each knob is a config
+  # constant with a documented default; the FINAL `|> max(k)` is load-bearing —
+  # it guarantees a misconfigured `cap < k` can NEVER drop the pool below the
+  # requested `k`, so the cap can only ever ENLARGE the over-fetch, never starve
+  # the result before the outer post-ANN filters run.
+  @default_pool_factor 5
+  @default_pool_floor 100
+
   # Maximum number of tag values accepted in a `:tags` overlap filter, so a caller
   # can't pass an unbounded array literal into the index-residual `&&` predicate.
   @default_max_tags 50
@@ -125,13 +166,66 @@ defmodule Loopctl.Knowledge.VectorSearch do
   @spec max_k() :: pos_integer()
   def max_k, do: Application.get_env(:loopctl, :vector_search_max_k, @default_max_k)
 
-  @doc "Maximum over-fetch pool (config `:vector_search_max_pool`, default #{@default_max_pool})."
+  @doc """
+  Maximum over-fetch pool (config `:max_vector_pool`, default #{@default_max_pool}).
+
+  `:max_vector_pool` is the canonical key (US-27.6b AC-27.6b.1). The pre-27.6b
+  `:vector_search_max_pool` key is still honored as a fallback so an existing
+  override keeps working.
+  """
   @spec max_pool() :: pos_integer()
-  def max_pool, do: Application.get_env(:loopctl, :vector_search_max_pool, @default_max_pool)
+  def max_pool do
+    Application.get_env(
+      :loopctl,
+      :max_vector_pool,
+      Application.get_env(:loopctl, :vector_search_max_pool, @default_max_pool)
+    )
+  end
 
   @doc "Maximum number of `:tags` accepted (config `:vector_search_max_tags`, default #{@default_max_tags})."
   @spec max_tags() :: pos_integer()
   def max_tags, do: Application.get_env(:loopctl, :vector_search_max_tags, @default_max_tags)
+
+  @doc "Over-fetch pool multiplier on `k` (config `:vector_pool_factor`, default #{@default_pool_factor})."
+  @spec pool_factor() :: pos_integer()
+  def pool_factor, do: Application.get_env(:loopctl, :vector_pool_factor, @default_pool_factor)
+
+  @doc "Minimum over-fetch pool for small `k` (config `:vector_pool_floor`, default #{@default_pool_floor})."
+  @spec pool_floor() :: pos_integer()
+  def pool_floor, do: Application.get_env(:loopctl, :vector_pool_floor, @default_pool_floor)
+
+  @doc """
+  Computes the over-fetch pool for a requested `k` (US-27.6b AC-27.6b.1):
+
+      pool = k * factor |> max(floor) |> min(cap) |> max(k)
+
+  The factor/floor/cap default to the `:vector_pool_factor` / `:vector_pool_floor`
+  / `:max_vector_pool` config (defaults #{@default_pool_factor} / #{@default_pool_floor}
+  / #{@default_max_pool}). The final `|> max(k)` is the AC-27.6b.1 invariant: a
+  misconfigured `cap < k` can never truncate the pool below `k`.
+
+  `opts` lets a caller pass explicit knob values (used by the unit test to assert
+  the floor-at-`k` wins without mutating global config, and by the live
+  `suggested_links` path's back-compat `:max_suggestion_candidate_pool` cap alias).
+  A `nil` opt falls back to the configured/default value.
+
+    * `:factor` — multiplier (default `pool_factor/0`)
+    * `:floor` — small-`k` floor (default `pool_floor/0`)
+    * `:cap` — upper bound (default `max_pool/0`)
+  """
+  @spec pool_size(pos_integer(), keyword()) :: pos_integer()
+  def pool_size(k, opts \\ []) when is_integer(k) and k > 0 do
+    factor = Keyword.get(opts, :factor) || pool_factor()
+    floor = Keyword.get(opts, :floor) || pool_floor()
+    cap = Keyword.get(opts, :cap) || max_pool()
+
+    (k * factor)
+    |> max(floor)
+    |> min(cap)
+    # LOAD-BEARING: the cap can only ever ENLARGE the over-fetch, never drop the
+    # pool below the requested k (a misconfigured cap < k is overridden here).
+    |> max(k)
+  end
 
   @doc """
   Executes the index-correct kNN query and returns up to `k` candidate maps,
@@ -320,21 +414,21 @@ defmodule Loopctl.Knowledge.VectorSearch do
   defp clamp_k(k) when is_integer(k), do: k |> max(1) |> min(max_k())
   defp clamp_k(_), do: 1
 
-  # Over-fetch factor for the inner ANN subquery (mirrors Knowledge.suggestion_candidate_pool/1):
-  # scale with `k`, floor for the common small `k`, cap so the index scan stays cheap,
-  # and never below `k` (a misconfigured cap must not truncate before the outer filters).
-  defp candidate_pool(k, override) do
-    base = override_pool(override, k)
-
-    base
-    |> max(100)
+  # Over-fetch pool for the inner ANN subquery. A `:pool` override (when a positive
+  # integer) replaces the `k * factor` base but is STILL clamped by the floor/cap and
+  # floored at `k` (so an override can't bust the cap or starve below `k`). With no
+  # override it is the config-driven `pool_size/2` (k*factor |> max(floor) |> min(cap)
+  # |> max(k)) — the SAME sizing as the live `suggested_links` path.
+  defp candidate_pool(k, override) when is_integer(override) and override > 0 do
+    # An explicit override acts as the base (in place of k*factor): floor it for the
+    # small-k case, cap it, and never let it drop below k.
+    override
+    |> max(pool_floor())
     |> min(max_pool())
     |> max(k)
   end
 
-  defp override_pool(nil, k), do: k * 5
-  defp override_pool(p, _k) when is_integer(p) and p > 0, do: p
-  defp override_pool(_p, k), do: k * 5
+  defp candidate_pool(k, _override), do: pool_size(k)
 
   defp clamp_threshold(t) when is_number(t), do: t |> max(0.0) |> min(1.0) |> :erlang.float()
   defp clamp_threshold(_), do: 0.0

@@ -167,6 +167,13 @@ defmodule Loopctl.DataCase do
       Loopctl.Knowledge.suggest_links(tenant_id, article_id, opts)
     end)
 
+    # US-27.6b: the controller calls the meta-bearing variant. Default stub
+    # delegates to the real context so the endpoint exercises the genuine
+    # under-fill detection unless a test overrides it with Mox.expect/3.
+    Mox.stub(Loopctl.MockSuggestLinks, :suggest_links_with_meta, fn tenant_id, article_id, opts ->
+      Loopctl.Knowledge.suggest_links_with_meta(tenant_id, article_id, opts)
+    end)
+
     # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header
