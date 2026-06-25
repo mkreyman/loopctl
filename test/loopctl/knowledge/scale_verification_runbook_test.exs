@@ -104,13 +104,14 @@ defmodule Loopctl.Knowledge.ScaleVerificationRunbookTest do
     test "every :scale_nightly test file is wired into the CI matrix (no silent gaps)" do
       ci = File.read!(@ci)
 
+      # Scan the WHOLE test tree, not one dir — a :scale_nightly test added anywhere
+      # must be wired into the matrix or it silently never runs in CI.
+      # Full relative paths (the matrix lists full paths, so a scale test anywhere in
+      # the tree is wireable without a dir assumption).
       tagged_files =
-        "test/loopctl/knowledge"
-        |> File.ls!()
-        |> Enum.filter(fn f ->
-          String.ends_with?(f, "_test.exs") and
-            File.read!("test/loopctl/knowledge/#{f}") =~ ~r/@moduletag\s+:scale_nightly/
-        end)
+        "test/**/*_test.exs"
+        |> Path.wildcard()
+        |> Enum.filter(&(File.read!(&1) =~ ~r/@moduletag\s+:scale_nightly/))
 
       assert tagged_files != [], "expected to find :scale_nightly-tagged test files"
 

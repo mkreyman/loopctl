@@ -308,10 +308,10 @@ jobs:
       fail-fast: false
       matrix:
         scale_file:
-          - scale_seed_nightly_test.exs
-          - vector_search_scale_test.exs
-          - plan_assertions_scale_test.exs
-          - keyset_plan_scale_test.exs
+          - test/loopctl/knowledge/scale_seed_nightly_test.exs
+          - test/loopctl/knowledge/vector_search_scale_test.exs
+          - test/loopctl/knowledge/plan_assertions_scale_test.exs
+          - test/loopctl/knowledge/keyset_plan_scale_test.exs
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -394,7 +394,7 @@ jobs:
       # (scale_verification_runbook_test.exs) guards that every :scale_nightly file is
       # listed there, so gate coverage cannot silently erode.
       - name: Run nightly scale gate (US-27.1 prod-floor + US-27.2 plan assertions at scale)
-        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly test/loopctl/knowledge/${{ matrix.scale_file }}
+        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly ${{ matrix.scale_file }}
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
         timeout-minutes: 35
