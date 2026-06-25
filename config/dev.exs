@@ -103,7 +103,8 @@ config :logger, :default_formatter,
     :pg_message,
     :duration_ms,
     :repo,
-    :source
+    :source,
+    :endpoint
   ]
 
 # Set a higher stacktrace during development. Avoid configuring such

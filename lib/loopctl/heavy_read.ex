@@ -89,6 +89,11 @@ defmodule Loopctl.HeavyRead do
     result
   end
 
+  defp with_statement_timeout(ms, _fun) do
+    raise ArgumentError,
+          ":statement_timeout (got #{inspect(ms)}) must be a positive integer (ms)"
+  end
+
   @doc """
   Like `Repo.stream/2`, with the same tenant-scoping guard. Must run inside a
   `transaction/2` — Ecto streams require an enclosing transaction (enumerating the

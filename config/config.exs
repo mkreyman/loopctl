@@ -26,7 +26,9 @@ config :loopctl,
   # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the
   # pool-level statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s) with
   # no per-request transaction. Keys: :suggested_links, :semantic_search,
-  # :distant_pairs, :novelty.
+  # :distant_pairs, :novelty. NOTE: :distant_pairs and :semantic_search each issue
+  # TWO reads (count + data); setting an override for either wraps EACH read in its
+  # own separate transaction, doubling the brief checkout count on the heavy pool.
   heavy_read_statement_timeout_overrides: %{}
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
@@ -79,10 +81,11 @@ config :logger, :default_handler,
        :controller,
        :action,
        :pg_message,
-       # US-27.4: slow-query log fields.
+       # US-27.4: slow-query log fields (duration_ms, repo, source, endpoint).
        :duration_ms,
        :repo,
-       :source
+       :source,
+       :endpoint
      ]}
 
 # Configure esbuild (the version is required)

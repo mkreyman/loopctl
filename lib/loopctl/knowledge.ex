@@ -2891,9 +2891,10 @@ defmodule Loopctl.Knowledge do
   # plus an optional per-endpoint SERVER-SIDE statement_timeout override (config
   # `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`). When
   # no override is configured the read uses the pool-level statement_timeout (the
-  # default path, no per-request transaction).
+  # default path, no per-request transaction). Also passes the endpoint key via
+  # telemetry_options so slow-query logs can trace which endpoint triggered the query.
   defp heavy_read_opts(endpoint) do
-    base = [timeout: 15_000]
+    base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
 
     case heavy_read_statement_timeout(endpoint) do
       ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)

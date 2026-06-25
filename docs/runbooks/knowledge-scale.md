@@ -95,6 +95,12 @@ An override applies via `SET LOCAL` inside a transaction on the dedicated heavy 
 (justified by the 8-conn sizing); endpoints with no override use the pool default (no
 transaction). Leave it empty unless an endpoint needs a different bound.
 
+**Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
+`:semantic_search`, `:distant_pairs`, `:novelty`. Keyword enumeration (`:knowledge_search_controller`
+list mode) intentionally stays on the RLS `Repo` — it's bounded by `limit: 25` and paginated
+(not a vector scan), so it doesn't benefit from heavy-pool isolation. If enumeration throughput
+becomes an issue, route it to HeavyRead as a separate initiative.
+
 **Slow-query logging:** `Loopctl.Telemetry.SlowQueryLogger` (attached at boot) logs any
 query slower than `:slow_query_threshold_ms` (default **1000**, tunable in config/env)
 at `:warning` with `duration_ms`, `repo`, `source`, and the request `tenant_id` /

@@ -65,21 +65,29 @@ defmodule Loopctl.Telemetry.SlowQueryLogger do
     end
 
     :ok
+  rescue
+    e ->
+      # Never let a logging/formatting fault permanently detach this boot-attached handler
+      Logger.error("SlowQueryLogger handler error: #{Exception.message(e)}")
+      :ok
   end
 
   defp log_slow(duration_ms, metadata) do
     repo = metadata[:repo]
-    source = metadata[:source]
+    source = to_string(metadata[:source] || "")
+    options = metadata[:options] || []
+    endpoint = options[:endpoint]
     meta = Logger.metadata()
     tenant_id = meta[:tenant_id]
     request_id = meta[:request_id]
 
     Logger.warning(
       "slow_query duration_ms=#{duration_ms} repo=#{inspect(repo)} source=#{source} " <>
-        "tenant_id=#{tenant_id} request_id=#{request_id}",
+        "endpoint=#{endpoint} tenant_id=#{tenant_id} request_id=#{request_id}",
       duration_ms: duration_ms,
       repo: inspect(repo),
       source: source,
+      endpoint: endpoint,
       tenant_id: tenant_id,
       request_id: request_id
     )

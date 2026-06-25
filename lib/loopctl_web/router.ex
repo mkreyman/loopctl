@@ -21,6 +21,7 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.ExtractApiKey
     plug LoopctlWeb.Plugs.ResolveApiKey
     plug LoopctlWeb.Plugs.SetTenant
+    plug LoopctlWeb.Plugs.SeedTenantMetadata
     plug LoopctlWeb.Plugs.RequireAuth
     plug LoopctlWeb.Plugs.Impersonate
     plug LoopctlWeb.Plugs.RateLimiter

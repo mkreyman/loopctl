@@ -80,7 +80,8 @@ config :logger, :default_formatter,
     :pg_message,
     :duration_ms,
     :repo,
-    :source
+    :source,
+    :endpoint
   ]
 
 # Oban: inline testing mode (jobs execute synchronously in tests)
