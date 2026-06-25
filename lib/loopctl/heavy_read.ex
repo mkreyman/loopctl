@@ -57,6 +57,36 @@ defmodule Loopctl.HeavyRead do
   def repo, do: Application.get_env(:loopctl, :heavy_read_repo, Loopctl.HeavyReadRepo)
 
   @doc """
+  Per-read options for a heavy endpoint (US-27.4): the 15s CLIENT timeout backstop plus
+  an optional per-endpoint SERVER-SIDE `:statement_timeout` override (config
+  `:heavy_read_statement_timeout_overrides`, e.g. `%{suggested_links: 5_000}`). When no
+  override is configured the read uses the pool-level statement_timeout (the default
+  path, no per-request transaction). Also passes the endpoint key via
+  `telemetry_options` so slow-query logs can trace which endpoint triggered the query.
+
+  This is the SINGLE source of truth for heavy-read opts — every consumer
+  (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
+  `[timeout, telemetry_options, statement_timeout]` shape can't drift between callers.
+  Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`,
+  `:enumeration`, `:change_feed`.
+  """
+  @spec opts(atom()) :: keyword()
+  def opts(endpoint) when is_atom(endpoint) do
+    base = [timeout: 15_000, telemetry_options: [endpoint: endpoint]]
+
+    case statement_timeout_override(endpoint) do
+      ms when is_integer(ms) and ms > 0 -> Keyword.put(base, :statement_timeout, ms)
+      _ -> base
+    end
+  end
+
+  defp statement_timeout_override(endpoint) do
+    :loopctl
+    |> Application.get_env(:heavy_read_statement_timeout_overrides, %{})
+    |> Map.get(endpoint)
+  end
+
+  @doc """
   Like `Repo.all/2`, but requires a `tenant_id` and a query whose every base-table
   source is scoped to it. Raises `ArgumentError` otherwise.
 

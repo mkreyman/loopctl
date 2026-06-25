@@ -26,10 +26,13 @@ config :loopctl,
   # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the
   # pool-level statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s) with
   # no per-request transaction. Keys: :suggested_links, :semantic_search,
-  # :distant_pairs, :novelty, :enumeration. NOTE: :distant_pairs, :semantic_search,
-  # and :enumeration each issue TWO reads (count + data); setting an override for any
-  # of them wraps EACH read in its own separate transaction, doubling the brief
-  # checkout count on the heavy pool.
+  # :distant_pairs, :novelty, :enumeration, :change_feed. NOTE: :distant_pairs,
+  # :semantic_search, and :enumeration each issue TWO reads (count + data); setting an
+  # override for any of them wraps EACH read in its own separate transaction, doubling
+  # the brief checkout count on the heavy pool. :change_feed (US-27.9b) is the
+  # rate-limited orchestrator polling feed — a SINGLE cheap keyset read per request;
+  # its QPS is bounded by the api pipeline's rate limiter, so it adds at most a brief,
+  # fast-releasing checkout and does not erode the K≈6 one-shot fast-read budget.
   heavy_read_statement_timeout_overrides: %{},
   # US-27.12: set-based bulk archive/unpublish/delete. Each op runs in one
   # transaction that first issues `SET LOCAL statement_timeout = <ms>` so a single

@@ -15,6 +15,7 @@ defmodule LoopctlWeb.ChangeController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias Loopctl.Audit.ChangesCursor
   alias Loopctl.Knowledge
   alias LoopctlWeb.Helpers.Visibility
 
@@ -30,8 +31,23 @@ defmodule LoopctlWeb.ChangeController do
       since: [
         in: :query,
         type: :string,
-        required: true,
-        description: "ISO8601 timestamp (required)"
+        required: false,
+        description:
+          "ISO8601 timestamp. Required UNLESS a `cursor` is supplied. Used for the " <>
+            "FIRST page (`inserted_at > since`); follow `next_cursor` thereafter."
+      ],
+      cursor: [
+        in: :query,
+        type: :string,
+        required: false,
+        description:
+          "Opaque KEYSET cursor (US-27.9b) — the drift-free continuation token. " <>
+            "Follow `meta.next_cursor`/`next_cursor` verbatim. Unlike `since` (a " <>
+            "timestamp, which can skip or duplicate rows that share a microsecond " <>
+            "under bulk writes), the cursor seeks the stable `(inserted_at, id)` tuple " <>
+            "and never drifts across ties. Takes precedence over `since` when both are " <>
+            "given. Integrity-protected and tenant-bound; a tampered/forged cursor is " <>
+            "rejected with 400."
       ],
       project_id: [in: :query, type: :string, description: "Filter by project"],
       entity_type: [in: :query, type: :string, description: "Filter by entity type"],
@@ -49,7 +65,20 @@ defmodule LoopctlWeb.ChangeController do
                items: %OpenApiSpex.Schema{type: :object, additionalProperties: true}
              },
              has_more: %OpenApiSpex.Schema{type: :boolean},
-             next_since: %OpenApiSpex.Schema{type: :string, format: :"date-time", nullable: true}
+             next_since: %OpenApiSpex.Schema{
+               type: :string,
+               format: :"date-time",
+               nullable: true,
+               description:
+                 "Back-compat timestamp token (NOT tie-safe under bulk writes). New " <>
+                   "callers should follow `next_cursor`."
+             },
+             next_cursor: %OpenApiSpex.Schema{
+               type: :string,
+               nullable: true,
+               description:
+                 "Drift-free keyset continuation token (US-27.9b); null when exhausted."
+             }
            }
          }},
       400 => {"Bad request", "application/json", Schemas.ErrorResponse},
@@ -68,12 +97,13 @@ defmodule LoopctlWeb.ChangeController do
   Optional: `project_id`, `entity_type`, `action`
   """
   def index(conn, params) do
-    with {:ok, since} <- parse_since(params["since"]),
-         {:ok, tenant_id} <- require_tenant(conn) do
+    with {:ok, tenant_id} <- require_tenant(conn),
+         {:ok, since, cursor_opt} <- resolve_seek(tenant_id, params) do
       limit = parse_limit(params["limit"])
 
       opts =
         []
+        |> maybe_put(:cursor, cursor_opt)
         |> maybe_put(:project_id, params["project_id"])
         |> maybe_put(:entity_type, params["entity_type"])
         |> maybe_put(:action, params["action"])
@@ -90,10 +120,53 @@ defmodule LoopctlWeb.ChangeController do
       json(conn, %{
         data: Enum.map(visible, &change_json/1),
         has_more: result.has_more,
-        next_since: format_datetime(result.next_since)
+        next_since: format_datetime(result.next_since),
+        next_cursor: encode_cursor(tenant_id, result.next_cursor)
       })
     end
   end
+
+  # Resolves the seek position into a `{since_datetime, cursor_position_or_nil}`.
+  #
+  # US-27.9b: the `cursor` query param (when present) is the drift-free keyset token
+  # and takes PRECEDENCE over `since`. Tenant scope is ALWAYS the principal's
+  # `tenant_id`; the cursor is decoded+verified with the caller's tenant key, so a
+  # forged/tampered/cross-tenant cursor is rejected with 400 (AC-27.9b.4), never a
+  # silent reset to the beginning.
+  #
+  #   - cursor ABSENT      → require `since` (back-compat: the timestamp first page)
+  #   - cursor EMPTY ""    → no cursor seek; require `since` (treats `cursor=` like
+  #                          "start", deferring to `since` for the first position)
+  #   - cursor a token     → decode → keyset seek (since is ignored / defaults to epoch)
+  #   - cursor non-string  → 400
+  defp resolve_seek(tenant_id, params) do
+    case Map.fetch(params, "cursor") do
+      :error -> with {:ok, since} <- parse_since(params["since"]), do: {:ok, since, nil}
+      {:ok, ""} -> with {:ok, since} <- parse_since(params["since"]), do: {:ok, since, nil}
+      {:ok, raw} when is_binary(raw) -> decode_cursor(tenant_id, raw)
+      {:ok, _non_string} -> {:error, :bad_request, "cursor parameter must be a string"}
+    end
+  end
+
+  defp decode_cursor(tenant_id, raw) do
+    case ChangesCursor.decode(tenant_id, raw) do
+      {:ok, position} ->
+        # `since` is unused on the keyset path; the cursor carries the full position.
+        # Pass the unix epoch so the (cursor-present) seek branch is taken with a
+        # harmless `since` value.
+        {:ok, DateTime.from_unix!(0), position}
+
+      {:error, :invalid} ->
+        {:error, :bad_request,
+         "Invalid or tampered cursor. Send `since` to start from a timestamp, then " <>
+           "follow `next_cursor` verbatim to paginate."}
+    end
+  end
+
+  defp encode_cursor(_tenant_id, nil), do: nil
+
+  defp encode_cursor(tenant_id, {%DateTime{}, _id} = position),
+    do: ChangesCursor.encode(tenant_id, position)
 
   defp filter_visible_changes(entries, [], _tenant_id), do: entries
 

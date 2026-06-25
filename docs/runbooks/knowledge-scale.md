@@ -21,11 +21,20 @@ removes that coupling and gives US-27.4/27.6b a clean pool-level lever.
 
 ### `HEAVY_READ_POOL_SIZE` (K) — sizing rationale (AC-27.11.1)
 
-Default **8** supports **K ≈ 6** concurrent sub-2s heavy vector reads while
+Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while
 **reserving ~2 connections** for long-held **streamed-export** checkouts
 (US-27.16), which hold a connection for *minutes* — a different profile than fast
 reads. Raise it if export concurrency or heavy-read QPS grows, but only after
 re-checking the connection budget below.
+
+The fast-reads (K≈6) now serve **six** HeavyRead consumers: five ONE-SHOT heavy reads
+(`suggested_links`, `semantic_search`, `distant_pairs`, `novelty`, `enumeration`) plus
+one **rate-limited polling feed** — the US-27.9b change feed (`:change_feed`,
+`GET /changes`). The K budget is unchanged by the addition: the change-feed read is a
+single CHEAP, fast-releasing bounded keyset page (connection released immediately), and
+its poll QPS is bounded by the api pipeline's `LoopctlWeb.Plugs.RateLimiter`, so even an
+orchestrator poll storm adds only brief transient checkouts — it cannot saturate the
+fast slots or change the connection-count budget below.
 
 ### Connection budget vs. `max_connections` (AC-27.11.5)
 
@@ -155,6 +164,106 @@ re-run the migration. Verify validity after deploy:
 SELECT indexrelid::regclass, indisvalid
 FROM pg_index WHERE indexrelid = 'articles_tenant_inserted_id_idx'::regclass;
 ```
+
+## Keyset pagination rolled onto by-tag / by-source / change-feed (US-27.9b)
+
+US-27.9b applies the **same** US-27.9a keyset cursor (verbatim — one HMAC codec,
+`Loopctl.KeysetCursor`, with a per-surface namespace) to the remaining enumeration
+surfaces an agent uses to walk the KB. The original offset-drift incident (#175) was a
+**by-TAG** walk (a tag count swung 9,881 → 4,981 mid-enumeration), so the cursor had to
+reach these, not just the bare article list.
+
+### Index dual-path ordering + the no-mixing rule
+
+Both `GET /knowledge/index` and `GET /knowledge/search` (list mode) are **dual-path**:
+
+- **`cursor` param ABSENT** → the legacy **offset** path, unchanged. Index orders by
+  `category, updated_at DESC, id`; search-list by `updated_at DESC, id`. Emits
+  `total_count`/`offset`, NOT `next_cursor`.
+- **`cursor` param PRESENT** (even empty `cursor=`) → the **keyset** path, ordered
+  `inserted_at ASC, id ASC`. Emits `next_cursor`/`has_more`/`count`, NOT `total_count`.
+
+**Do NOT mix the two mid-enumeration** — the sort orders differ, so switching paths
+between pages skips/repeats rows. Start with an empty `cursor=` and follow
+`meta.next_cursor` verbatim to the end (`next_cursor: null`). The keyset path is the
+drift-free way to walk a tag or a source to exhaustion under concurrent writes; the
+offset path is retained only for back-compat.
+
+### by-source index (`articles_tenant_source_inserted_id_idx`)
+
+by-source (`?source_id=`) is a **selective scalar equality**. Unlike `category=` (which
+the `(tenant_id, inserted_at, id)` btree already serves index-ordered with a cheap
+recheck), a deep by-source page over the general keyset btree would heap-recheck
+`source_id=` across the whole tenant corpus. So US-27.9b adds a dedicated **partial
+composite** index:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS articles_tenant_source_inserted_id_idx
+ON articles (tenant_id, source_id, inserted_at, id)
+WHERE source_id IS NOT NULL;
+```
+
+Leading with `(tenant_id, source_id)` lets the planner seek straight to the source's
+rows and walk them in `(inserted_at, id)` order — strictly index-ordered, no Sort. Built
+`CREATE INDEX CONCURRENTLY` + `@disable_ddl_transaction` (online build), `WHERE source_id
+IS NOT NULL` (only source-attributed rows pay for it). It is registered in
+`Loopctl.IndexHealth` (boot probe + recovery identical to the 27.9a index).
+
+**Plan profile by index-enumeration shape (verified at 80k,
+`by_source_change_feed_plan_scale_test.exs`):**
+
+| Index query shape | Plan at prod scale | Cost profile |
+| ----------------- | ------------------ | ------------ |
+| `source_id=` (scalar) | Index Scan on `articles_tenant_source_inserted_id_idx`, walked in order, **no Sort** | true keyset, bounded by source selectivity (`refute_full_scan` + `assert_scan_rows_below`) |
+| `tags=` (array `&&`) | tags GIN drives the scan, bounded by tag selectivity | same bounded GIN path 27.9a proved — NOT a full Seq Scan (`refute_seq_scan` + `assert_index_used` on the tags GIN) |
+
+**by-tag stays the bounded GIN+btree path 27.9a already solved.** Because
+`index_keyset_query` is a DISTINCT query from 27.9a's `keyset_query` (it forces
+`status = :published` + the project OR-clause), the by-tag plan is pinned separately
+**on `index_keyset_query`** in the same scale test (the literal #175 incident path).
+
+### change feed (`GET /changes`) over the partitioned `audit_log`
+
+The change feed is now a `(inserted_at, id)` **keyset**, ordered `inserted_at ASC, id
+ASC`. The old `next_since` (timestamp-only) token is NOT tie-safe: audit `inserted_at`
+is `utc_datetime_usec` and a bulk `Ecto.Multi` commits multiple rows at the SAME
+microsecond, so a `since`-only follow-up (`inserted_at > next_since`) **skips** the tied
+tail (silent gap) — exactly the drift the `id` tie-break fixes. The cursor
+(`Loopctl.Audit.ChangesCursor`, `"changes_cursor"` namespace) steps PAST a specific row
+regardless of ties. `next_since` is retained in the response for back-compat only; **new
+callers MUST follow `next_cursor`.** `since` is still accepted for the first page; the
+cursor takes precedence when both are present.
+
+**No new index for the change feed.** `audit_log` is **RANGE-partitioned by month** with
+an existing `(tenant_id, inserted_at)` btree. The keyset seek (`tenant_id =` + the
+`(inserted_at, id)` row-value comparison, `ORDER BY inserted_at, id`) plans as
+**per-partition Index Scans** (one scan per month the cursor range touches) combined
+under an ordered node. Because the index lacks `id`, the planner finishes the global
+`(inserted_at, id)` order one of two cost-equivalent ways: **Append + a top-level
+Incremental Sort** (the empirical choice at 80k — each partition is presorted on
+`inserted_at`, the incremental sort resolves the `id` tie-break within each
+equal-timestamp run) or a **Merge Append**. Either way: no Seq Scan, no Bitmap over the
+corpus — bounded by the keyset seek (~O(page)). `CREATE INDEX CONCURRENTLY` is **not
+supported on a partitioned parent**, so a `(tenant_id, inserted_at, id)` parent index is
+intentionally NOT added — the existing index already keeps the deep page index-backed
+(the `id` tie-break is a cheap incremental sort, not a corpus scan). The scale test seeds
+across **≥2 monthly partitions** (so the deep page produces a real multi-partition
+ordered scan, matching prod — not a single-partition shortcut) and asserts BOTH
+`assert_ordered_multi_partition_scan` (≥2 partitions via Index Scan under Merge
+Append/Append+Incremental-Sort) AND `refute_full_scan_audit` (no Seq Scan **and** no
+Bitmap Heap Scan) on the request-path `Audit.changes_keyset_query/3`. The change-feed read
+is routed through `Loopctl.HeavyRead` so it inherits the dedicated-pool `statement_timeout`
+backstop (US-27.4), same as the index keyset path; it is the **sixth** HeavyRead consumer
+(the rate-limited polling feed — see the HEAVY_READ_POOL_SIZE sizing note above).
+
+### Tenant safety on every surface
+
+The cursor is decoded/verified with the **caller's** tenant key (from the auth
+principal, never the cursor) under its surface namespace, so a forged/tampered/
+cross-tenant/cross-surface cursor is rejected with **400** — proven by the forged-cursor
+tests on each surface (`knowledge_index_keyset_controller_test.exs`,
+`change_keyset_controller_test.exs`) and the namespace-separation test
+(`keyset_cursor_test.exs`).
 
 ## Bulk write path — set-based archive/delete (US-27.12)
 

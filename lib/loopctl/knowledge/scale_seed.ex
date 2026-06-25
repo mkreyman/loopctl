@@ -79,6 +79,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   import Ecto.Query, only: [from: 2]
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
 
@@ -98,9 +99,43 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   # `category =` residual filter is ~20%-selective at scale (US-27.6a plan tests).
   @scale_categories [:pattern, :convention, :decision, :finding, :reference]
 
+  # Distinct `source_id` count for the by-source enumeration (US-27.9b). At the
+  # 80k floor this is ~100 rows per source (~0.125% selective) — selective enough
+  # that a deep by-source page MUST be served by the (tenant_id, source_id,
+  # inserted_at, id) composite index, not a heap-filter over the corpus. The
+  # `source_type` is a single value ("scale_source") so a `source_type =` residual
+  # is non-selective (covers the whole seed) while `source_id =` is the selective key.
+  @scale_source_count 800
+  @scale_source_type "scale_source"
+
   @doc "Returns the production article floor constant (as of 2026-06-24)."
   @spec prod_article_floor() :: pos_integer()
   def prod_article_floor, do: @prod_article_floor
+
+  @doc """
+  Returns the `source_type` every scale-seeded article carries (US-27.9b by-source).
+  """
+  @spec scale_source_type() :: String.t()
+  def scale_source_type, do: @scale_source_type
+
+  @doc """
+  Returns the deterministic `source_id` UUID for seeded row `index` (US-27.9b).
+
+  Round-robins over `@scale_source_count` distinct UUIDs derived deterministically
+  from the tenant_id + bucket, so a by-source plan test can pick a real seeded
+  `source_id` and walk it. Selective (~0.125% of the corpus) so the deep by-source
+  page must use the composite index.
+  """
+  @spec source_id_for(binary(), non_neg_integer()) :: Ecto.UUID.t()
+  def source_id_for(tenant_id, index) when is_binary(tenant_id) do
+    bucket = rem(index, @scale_source_count)
+
+    # Deterministic, valid v4-shaped UUID from a SHA over {tenant, bucket}. Stable
+    # across runs so a test can recompute the exact source_id for a given bucket.
+    <<a::binary-16, _::binary>> = :crypto.hash(:sha256, "#{tenant_id}:source:#{bucket}")
+    {:ok, uuid} = Ecto.UUID.load(a)
+    uuid
+  end
 
   # ~10% of seeded rows are private agent-memory (a selective `metadata->>'visibility'`
   # residual); the rest are shared. agent_id round-robined over 7 so a single agent's
@@ -191,6 +226,137 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       {:ok, result} -> result
       {:error, reason} -> raise "ScaleSeed failed: #{inspect(reason)}"
     end
+  end
+
+  @doc """
+  Seeds `count` audit_log entries for `tenant_id` for the change-feed scale gate
+  (US-27.9b / TC-27.9b.2), runs ANALYZE on `audit_log`, and returns
+  `{:ok, %{changes: committed}}`.
+
+  Like `seed/2`, this MUST run UNBOXED (committed) so ANALYZE sees the rows. It
+  raises the same sandbox guard.
+
+  Timestamps are spread across **TWO adjacent monthly partitions** (the current month
+  and the next, both created by `mix ecto.reset` / `AuditPartitionWorker` — current +
+  3-ahead), so the deep change-feed page produces the SAME multi-partition **Merge
+  Append** the planner uses in prod (where rows span months), not a single-partition
+  shortcut. The seed pre-creates the next-month partition defensively in case the
+  worker hasn't run. Within the window timestamps are TIED per batch — a batch of rows
+  shares one `inserted_at` — so the deep page also exercises the `(inserted_at, id)`
+  tuple tie-break the keyset (US-27.9b) relies on. All entries are `entity_type:
+  "story"` (NOT "article"/"article_link") so the controller's visibility filter is a
+  no-op and the plan/walk reflect the raw keyset.
+  """
+  @spec seed_changes(binary(), keyword()) :: {:ok, %{changes: non_neg_integer()}}
+  def seed_changes(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    if AdminRepo.in_transaction?() do
+      raise """
+      ScaleSeed.seed_changes/2 was called inside an open transaction (e.g. the
+      DataCase async SQL sandbox). Rows inserted in a sandbox transaction are rolled
+      back, so ANALYZE sees n≈0. Call it from a @tag :scale_nightly test that uses
+      ExUnit.Case directly and wraps DB ops in Sandbox.unboxed_run/2.
+      """
+    end
+
+    count = Keyword.get(opts, :count, 1_000)
+    batch_size = Keyword.get(opts, :batch_size, 1_000)
+
+    # Span TWO partitions: spread from the current month's start into the NEXT month so
+    # a deep cursor page crosses the partition boundary → a real multi-partition Merge
+    # Append (the prod shape). Both partitions exist (reset/worker create current + 3
+    # ahead); ensure_audit_partitions!/2 pre-creates them defensively. The window is
+    # `[current_month_start + 1h, next_month_start + 10d]`, split into `num_batches`
+    # TIED-timestamp batches ascending so the deep page also exercises the
+    # (inserted_at, id) tie-break.
+    now = DateTime.utc_now()
+    {:ok, month_start} = DateTime.new(Date.new!(now.year, now.month, 1), ~T[01:00:00], "Etc/UTC")
+    {next_year, next_month} = next_month(now.year, now.month)
+
+    {:ok, next_month_start} =
+      DateTime.new(Date.new!(next_year, next_month, 1), ~T[00:00:00], "Etc/UTC")
+
+    ensure_audit_partitions!(now, next_year, next_month)
+
+    # End the window ~10 days into the next month, so a healthy fraction of rows land in
+    # the next-month partition (the deepest, newest rows) regardless of where in the
+    # current month "now" is — guaranteeing the boundary is genuinely straddled.
+    window_end = DateTime.add(next_month_start, 10 * 86_400, :second)
+    span_seconds = max(DateTime.diff(window_end, month_start, :second), 1)
+    num_batches = div(count + batch_size - 1, batch_size)
+
+    committed =
+      0..(num_batches - 1)
+      |> Enum.reduce(0, fn batch_idx, acc ->
+        # One shared timestamp per batch (ties), stepping FORWARD from month_start so
+        # batches are time-ordered ascending with the LAST batch newest. Spans
+        # [month_start, window_end] ⊂ current ∪ next partition.
+        offset_seconds = div(span_seconds * batch_idx, max(num_batches, 1))
+
+        # `:utc_datetime_usec` requires explicit microsecond precision; a whole-second
+        # DateTime carries `{0, 0}` (precision 0) which Ecto rejects on insert_all. Pin
+        # precision to 6 so every tied batch timestamp is a valid usec value.
+        ts =
+          month_start
+          |> DateTime.add(offset_seconds, :second)
+          |> Map.put(:microsecond, {0, 6})
+
+        lo = batch_idx * batch_size
+        hi = min(lo + batch_size, count) - 1
+
+        rows =
+          for i <- lo..hi do
+            %{
+              id: Ecto.UUID.generate(),
+              tenant_id: tenant_id,
+              project_id: nil,
+              entity_type: "story",
+              entity_id: Ecto.UUID.generate(),
+              action: "story.updated",
+              actor_type: "api_key",
+              actor_id: Ecto.UUID.generate(),
+              actor_label: "scale-actor-#{rem(i, 7)}",
+              old_state: %{},
+              new_state: %{"n" => i},
+              metadata: %{},
+              inserted_at: ts
+            }
+          end
+
+        {n, _} = AdminRepo.insert_all(AuditLog, rows, on_conflict: :nothing)
+        acc + n
+      end)
+
+    AdminRepo.query!("ANALYZE audit_log")
+
+    {:ok, %{changes: committed}}
+  end
+
+  # Next (year, month) after the given one.
+  defp next_month(year, 12), do: {year + 1, 1}
+  defp next_month(year, month), do: {year, month + 1}
+
+  # Defensively ensure the audit_log partitions for the current and next month exist
+  # (idempotent `CREATE TABLE IF NOT EXISTS PARTITION OF`), so seed_changes/2 can span
+  # the boundary even if AuditPartitionWorker hasn't run since reset. Mirrors the
+  # worker's naming/bounds. AdminRepo is the table owner in test.
+  defp ensure_audit_partitions!(
+         %DateTime{year: cur_year, month: cur_month},
+         next_year,
+         next_month
+       ) do
+    for {year, month} <- [{cur_year, cur_month}, {next_year, next_month}] do
+      {to_year, to_month} = next_month(year, month)
+      name = "audit_log_y#{year}m#{pad(month)}"
+      from_date = "#{year}-#{pad(month)}-01"
+      to_date = "#{to_year}-#{pad(to_month)}-01"
+
+      AdminRepo.query!("""
+      CREATE TABLE IF NOT EXISTS #{name} PARTITION OF audit_log
+        FOR VALUES FROM ('#{from_date}') TO ('#{to_date}')
+      """)
+    end
+
+    :ok
   end
 
   @doc """
@@ -356,6 +522,11 @@ defmodule Loopctl.Knowledge.ScaleSeed do
               slug: slug,
               tags: ["scale-tag-#{rem(i, 50)}"],
               metadata: visibility_metadata(i),
+              # by-source selectivity (US-27.9b): one non-selective source_type and a
+              # round-robined selective source_id, so a deep by-source keyset page must
+              # use the (tenant_id, source_id, inserted_at, id) composite index.
+              source_type: @scale_source_type,
+              source_id: source_id_for(tenant_id, i),
               embedding: embedding,
               inserted_at: now,
               updated_at: now
@@ -620,4 +791,9 @@ defmodule Loopctl.Knowledge.ScaleSeed do
       Enum.map(floats, &(&1 / norm))
     end
   end
+
+  # Zero-pad a 1-2 digit month for the audit_log partition name/bounds (mirrors the
+  # AuditPartitionWorker / migration naming).
+  defp pad(n) when n < 10, do: "0#{n}"
+  defp pad(n), do: "#{n}"
 end

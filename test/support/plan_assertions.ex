@@ -44,21 +44,189 @@ defmodule Loopctl.PlanAssertions do
 
     bad = Enum.filter(scans, &(&1.node_type in @full_scan_types))
 
-    cond do
-      scans == [] ->
-        raise ExUnit.AssertionError,
-          message:
-            "Plan never reaches the `articles` relation — cannot judge full-scan vs index. Plan:\n#{elide(raw)}"
+    refute_full_scan_result(scans, bad, raw)
+  end
 
-      bad != [] ->
+  @doc """
+  Like `refute_full_scan/1` but targets the `audit_log` relation (US-27.9b change
+  feed). `audit_log` is RANGE-partitioned, so EXPLAIN reaches it via CHILD partition
+  relations (e.g. `audit_log_y2026m06`); this matches any relation whose name starts
+  with `audit_log` (parent or partition). Guards on an audit-flavored fresh-stats check
+  (`assert_fresh_stats_audit!/0`) instead of the `articles`-specific `assert_fresh_stats!/0`,
+  so a future seed that drops the ANALYZE can't silently false-green.
+  """
+  def refute_full_scan_audit(queryable_or_sql) do
+    assert_fresh_stats_audit!()
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = relation_scan_nodes(root, "audit_log")
+    bad = Enum.filter(scans, &(&1.node_type in @full_scan_types))
+
+    refute_full_scan_result(scans, bad, raw)
+  end
+
+  @doc """
+  Audit-flavored sibling of `assert_fresh_stats!/0` (US-27.9b): raises unless
+  `audit_log` holds real rows AND at least one `audit_log*` partition has been ANALYZEd
+  (non-null `last_analyze`/`last_autoanalyze` in `pg_stat_user_tables`). Prevents a
+  change-feed plan assertion from running against an unseeded/unanalyzed corpus — a seed
+  that drops the `ANALYZE audit_log` would otherwise false-green (toy stats → the
+  planner picks a Seq Scan but the assertion can't tell, or the EXPLAIN row estimates
+  are meaningless).
+  """
+  def assert_fresh_stats_audit! do
+    %{rows: [[real_count]]} = AdminRepo.query!("SELECT count(*) FROM audit_log")
+
+    # Any audit_log partition with a non-null analyze timestamp counts as "analyzed".
+    %{rows: rows} =
+      AdminRepo.query!("""
+      SELECT count(*) FILTER (WHERE last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL)
+      FROM pg_stat_user_tables
+      WHERE relname LIKE 'audit_log_y%'
+      """)
+
+    analyzed_partitions =
+      case rows do
+        [[n]] when is_integer(n) -> n
+        _ -> 0
+      end
+
+    cond do
+      is_nil(real_count) or real_count <= 0 ->
         raise ExUnit.AssertionError,
           message:
-            "Expected `articles` reached via an index, but a full-corpus scan node is present: " <>
-              "#{inspect(Enum.map(bad, & &1.node_type))} (the #170/#172 prod-500 shape). Plan:\n#{elide(raw)}"
+            "Change-feed plan assertion ran against an EMPTY `audit_log` (count=#{inspect(real_count)}). " <>
+              "Seed via Loopctl.Knowledge.ScaleSeed.seed_changes/2 (unboxed, committed) first."
+
+      analyzed_partitions == 0 ->
+        raise ExUnit.AssertionError,
+          message:
+            "Change-feed plan assertion ran against an UNANALYZED `audit_log` (no partition has " <>
+              "last_analyze/last_autoanalyze). ScaleSeed.seed_changes/2 runs `ANALYZE audit_log`; " <>
+              "ensure it isn't dropped before asserting."
 
       true ->
         :ok
     end
+  end
+
+  defp refute_full_scan_result(scans, bad, raw) do
+    cond do
+      scans == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches the target relation — cannot judge full-scan vs index. Plan:\n#{elide(raw)}"
+
+      bad != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected the target relation reached via an index, but a full-corpus scan node is " <>
+              "present: #{inspect(Enum.map(bad, & &1.node_type))} (the #170/#172 prod-500 " <>
+              "shape). Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Like `refute_seq_scan/1` but targets the `audit_log` relation (US-27.9b change
+  feed). Allows a Bitmap Heap Scan driven by a selective index but forbids an
+  unbounded Seq Scan over the (partitioned) `audit_log`. Matches any relation whose
+  name starts with `audit_log` (parent or partition). Guards on the audit-flavored
+  `assert_fresh_stats_audit!/0` (not the `articles`-specific `assert_fresh_stats!/0`).
+  """
+  def refute_seq_scan_audit(queryable_or_sql) do
+    assert_fresh_stats_audit!()
+    {root, raw} = explain_json(queryable_or_sql)
+    scans = relation_scan_nodes(root, "audit_log")
+    bad = Enum.filter(scans, &(&1.node_type == "Seq Scan"))
+
+    cond do
+      scans == [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Plan never reaches the `audit_log` relation — cannot judge scan shape. Plan:\n#{elide(raw)}"
+
+      bad != [] ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected no Seq Scan on `audit_log` (unbounded full read), but one is present. " <>
+              "Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  Asserts the `audit_log` plan reaches **at least `min_partitions` distinct partition
+  relations** (`audit_log_yYYYYmMM`) via per-partition INDEX SCANS combined under an
+  ordered multi-partition node (US-27.9b). This is the prod shape for a deep
+  change-feed page whose cursor range spans months.
+
+  Postgres has TWO valid plans for `ORDER BY inserted_at, id` across partitions whose
+  index is `(tenant_id, inserted_at)` (no `id`):
+
+  - a **Merge Append** of per-partition Index Scans (when an index fully provides the
+    sort key), OR
+  - an **Append** of per-partition Index Scans + a top-level **Incremental Sort** /
+    **Sort** (presorted on `inserted_at`, finishing the `id` tie-break).
+
+  Both are correct, ordered, and bounded (no Seq/Bitmap over the corpus); the planner
+  picks by cost. We accept EITHER, and require that ≥`min_partitions` partitions are
+  reached by Index Scans (so the seed genuinely straddled the boundary and the plan is
+  not a single-partition shortcut that would make `refute_full_scan_audit` vacuous).
+  Pair with `refute_full_scan_audit/1` (forbids Seq/Bitmap on every partition).
+  """
+  def assert_ordered_multi_partition_scan(queryable_or_sql, min_partitions)
+      when is_integer(min_partitions) do
+    {root, raw} = explain_json(queryable_or_sql)
+
+    # Per-partition Index Scans (the bounded ordered access on each partition).
+    index_partitions =
+      root
+      |> relation_scan_nodes("audit_log_y")
+      |> Enum.filter(&(&1.node_type in ["Index Scan", "Index Only Scan"]))
+      |> Enum.map(& &1.relation)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    # A multi-partition combiner: Merge Append (index-merged), OR Append paired with a
+    # top-level Sort/Incremental Sort that finishes the global order.
+    ordered_combiner? =
+      node_type_present?(root, "Merge Append") or
+        (node_type_present?(root, "Append") and
+           (node_type_present?(root, "Incremental Sort") or node_type_present?(root, "Sort")))
+
+    cond do
+      length(index_partitions) < min_partitions ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected ≥ #{min_partitions} distinct audit_log partitions reached by Index Scan " <>
+              "(a real boundary-straddling page), got #{length(index_partitions)}: " <>
+              "#{inspect(index_partitions)}. The seed must span ≥2 monthly partitions. " <>
+              "Plan:\n#{elide(raw)}"
+
+      not ordered_combiner? ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected an ordered multi-partition combiner (Merge Append, or Append + " <>
+              "Incremental Sort/Sort) over the audit_log partitions, but none is present. " <>
+              "Plan:\n#{elide(raw)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  # True if any node anywhere in the plan tree has the given Node Type.
+  defp node_type_present?(node, type) when is_map(node) do
+    here = node["Node Type"] == type
+
+    here or
+      node
+      |> Map.get("Plans", [])
+      |> Enum.any?(&node_type_present?(&1, type))
   end
 
   @doc """
@@ -343,6 +511,35 @@ defmodule Loopctl.PlanAssertions do
       node
       |> Map.get("Plans", [])
       |> Enum.flat_map(&article_scan_nodes/1)
+
+    here ++ children
+  end
+
+  # Like `article_scan_nodes/1` but matches any relation whose name STARTS WITH
+  # `prefix` (for partitioned tables: the parent `audit_log` plus child partitions
+  # `audit_log_y2026m06`, all of which EXPLAIN names as the Relation Name on the scan
+  # node). Returns the same `%{node_type, index_name, rows}` shape.
+  defp relation_scan_nodes(node, prefix) when is_map(node) do
+    name = node["Relation Name"]
+
+    here =
+      if is_binary(name) and String.starts_with?(name, prefix) do
+        [
+          %{
+            node_type: node["Node Type"],
+            index_name: node["Index Name"],
+            rows: node["Plan Rows"],
+            relation: name
+          }
+        ]
+      else
+        []
+      end
+
+    children =
+      node
+      |> Map.get("Plans", [])
+      |> Enum.flat_map(&relation_scan_nodes(&1, prefix))
 
     here ++ children
   end
