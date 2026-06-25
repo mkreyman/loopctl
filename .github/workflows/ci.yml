@@ -292,6 +292,86 @@ jobs:
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
+  pgbouncer-e2e:
+    name: Pgbouncer e2e (US-27.13)
+    # The default Test job connects to DIRECT Postgres, which ACCEPTS a statement_timeout
+    # startup parameter — so the US-27.13 outage (pgbouncer rejecting it with 08P01 and
+    # crash-looping the HeavyReadRepo pool) was invisible in CI. This job stands up a REAL
+    # pgbouncer (transaction pooling) in front of Postgres and runs the :pgbouncer e2e, which
+    # reproduces the rejection and proves the SET LOCAL fix enforces through the proxy.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile
+
+      - name: Create the loopctl_test database (the e2e only needs the DB to exist)
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE loopctl_test;"
+
+      - name: Install and start pgbouncer (transaction pooling) in front of Postgres
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pgbouncer
+          printf '"postgres" "postgres"\n' > /tmp/userlist.txt
+          cat > /tmp/pgbouncer.ini <<'INI'
+          [databases]
+          loopctl_test = host=localhost port=5432 dbname=loopctl_test user=postgres password=postgres
+
+          [pgbouncer]
+          listen_addr = 127.0.0.1
+          listen_port = 6432
+          auth_type = trust
+          auth_file = /tmp/userlist.txt
+          pool_mode = transaction
+          max_client_conn = 50
+          default_pool_size = 10
+          INI
+          pgbouncer -d /tmp/pgbouncer.ini
+          # Wait for pgbouncer to accept connections through to Postgres.
+          for i in $(seq 1 15); do
+            if PGPASSWORD=postgres psql "host=127.0.0.1 port=6432 dbname=loopctl_test user=postgres" -tAc "SELECT 1" >/dev/null 2>&1; then
+              echo "pgbouncer up"; break
+            fi
+            echo "waiting for pgbouncer ($i)"; sleep 1
+          done
+
+      - name: Run the pgbouncer e2e (reproduces 08P01 + proves the SET LOCAL fix)
+        run: mix test --include pgbouncer test/loopctl/pgbouncer_startup_params_test.exs
+        env:
+          PGBOUNCER_URL: postgres://postgres:postgres@127.0.0.1:6432/loopctl_test
+
   scale-nightly:
     name: Scale Nightly (${{ matrix.scale_file }})
     # Runs nightly to assert every heavy endpoint's planner path at PROD_ARTICLE_FLOOR

@@ -26,12 +26,18 @@ config :loopctl, Loopctl.AdminRepo,
   # Allow the unboxed connection to be held long enough for the prod-floor seed.
   ownership_timeout: :timer.minutes(30)
 
-# HeavyReadRepo (US-27.11) — sandbox mode for tests, with a deliberately LOW
-# pool-level statement_timeout (250ms) so the mechanism tests (SHOW + fast-fire)
-# are fast and deterministic. Nothing in the default suite routes heavy DATA reads
-# here — `:heavy_read_repo` below points heavy reads at AdminRepo so they share the
-# sandbox connection fixtures insert through; only the dedicated HeavyReadRepo pool
-# tests touch this repo directly.
+# HeavyReadRepo (US-27.11) — sandbox mode for tests. Nothing in the default suite routes
+# heavy DATA reads here — `:heavy_read_repo` below points heavy reads at AdminRepo so they
+# share the sandbox connection fixtures insert through; only the dedicated HeavyReadRepo
+# pool tests touch this repo directly.
+#
+# NO `parameters: [statement_timeout: ...]` here — the test config must MIRROR prod, which
+# CANNOT carry that startup parameter: Fly MPG fronts Postgres with pgbouncer, which rejects
+# a `statement_timeout` startup parameter with `08P01 unsupported startup parameter` and
+# crash-loops the whole pool (the US-27.13 outage). The original param "passed" in CI only
+# because the suite connects to DIRECT Postgres (which accepts it) — the exact false
+# confidence that hid the bug. The server-side timeout is now applied per-read via SET LOCAL;
+# config_pgbouncer_safe_parameters_test.exs blocks any repo from re-adding an incompatible key.
 config :loopctl, Loopctl.HeavyReadRepo,
   username: "postgres",
   password: "postgres",
@@ -39,11 +45,12 @@ config :loopctl, Loopctl.HeavyReadRepo,
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2,
-  ownership_timeout: :timer.minutes(30),
-  # Bare-integer ms (the format the prod path ships, validated in runtime.exs); a low
-  # 250ms so the fast-fire mechanism tests are sub-second. Postgres normalizes the
-  # display to "250ms" (asserted in heavy_read_repo_test).
-  parameters: [statement_timeout: "250"]
+  ownership_timeout: :timer.minutes(30)
+
+# The pool-wide DEFAULT server-side statement_timeout (US-27.13), applied via SET LOCAL on
+# the heavy-read path (HeavyRead.opts/1). Low (250ms) in test so the fast-fire mechanism
+# tests stay sub-second.
+config :loopctl, :heavy_read_statement_timeout_ms, 250
 
 # DI (US-27.11): route Loopctl.HeavyRead's heavy reads to AdminRepo in tests, so
 # they see the same sandbox transaction that fixtures write to. Prod/dev default to
