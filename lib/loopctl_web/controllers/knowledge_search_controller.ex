@@ -115,10 +115,14 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         type: :string,
         description:
           "Opaque KEYSET cursor for drift-free list enumeration (list mode only). " <>
-            "Omit to start from the beginning, then follow `meta.next_cursor` " <>
-            "verbatim until it is null. The cursor is integrity-protected and " <>
-            "tenant-bound — a tampered/forged cursor is rejected with 400. Not " <>
-            "valid with `q` (relevance modes return a ranked top-N, not a walk).",
+            "To use cursor pagination, pass an empty string (`cursor=`) on the FIRST request " <>
+            "to opt into the keyset path (which orders by `inserted_at ASC, id ASC`); then " <>
+            "follow `meta.next_cursor` verbatim on subsequent requests. Omitting the `cursor` " <>
+            "parameter entirely uses the legacy offset path (orders by `updated_at DESC`), " <>
+            "which does not emit `next_cursor`. Do not mix the two paths mid-enumeration, " <>
+            "as the sort order differs. The cursor is integrity-protected and tenant-bound — " <>
+            "a tampered/forged cursor is rejected with 400. Not valid with `q` (relevance " <>
+            "modes return a ranked top-N, not a walk).",
         required: false
       ]
     ],
@@ -191,12 +195,16 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       # principal's (`tenant_id`), never the cursor; the cursor is
       # decoded+verified with the caller's tenant key.
       #
-      #   - param ABSENT  → legacy offset list path (back-compat, unchanged)
-      #   - param EMPTY   → keyset walk FROM THE START (first page, no seek)
-      #   - param a token → keyset seek AFTER the decoded position
+      #   - param ABSENT      → legacy offset list path (back-compat, unchanged)
+      #   - param EMPTY       → keyset walk FROM THE START (first page, no seek)
+      #   - param a token     → keyset seek AFTER the decoded position
+      #   - param malformed   → 400 (not a string)
       case keyset_cursor(params) do
         :none ->
           run_search(conn, tenant_id, query_spec, mode, opts)
+
+        :invalid ->
+          {:error, :bad_request, "cursor parameter must be a string"}
 
         cursor_mode ->
           run_keyset(conn, tenant_id, query_spec, cursor_mode, opts)
@@ -265,14 +273,14 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   # Classifies the `cursor` query param: ABSENT → `:none` (legacy offset path);
   # PRESENT-but-empty → `:start` (keyset from the beginning); a non-empty string →
-  # `{:cursor, raw}` (keyset seek). A non-string `cursor[]=` form is `:start`
-  # (opt into keyset, start position) rather than a 500.
+  # `{:cursor, raw}` (keyset seek); a non-string `cursor[]=` form → `:invalid` (400,
+  # not a 500 and not a silent page-1 reset).
   defp keyset_cursor(params) when is_map(params) do
     case Map.fetch(params, "cursor") do
       :error -> :none
       {:ok, ""} -> :start
       {:ok, raw} when is_binary(raw) -> {:cursor, raw}
-      {:ok, _non_string} -> :start
+      {:ok, _non_string} -> :invalid
     end
   end
 

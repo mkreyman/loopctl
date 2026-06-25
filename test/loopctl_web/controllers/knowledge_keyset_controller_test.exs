@@ -23,8 +23,8 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
   end
 
   # Walk the keyset list endpoint to exhaustion, collecting ids. `mutate` runs
-  # between pages. Returns the ids seen in order.
-  defp walk_http(conn, raw_key, base_params, mutate \\ fn -> :ok end) do
+  # between pages with the current page data. Returns the ids seen in order.
+  defp walk_http(conn, raw_key, base_params, mutate \\ fn _data -> :ok end) do
     # Seed the walk with an EMPTY cursor → keyset path from the start.
     do_walk_http(conn, raw_key, base_params, mutate, "", [], 0)
   end
@@ -49,7 +49,7 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
     next = resp["meta"]["next_cursor"]
 
     if next do
-      mutate.()
+      mutate.(resp["data"])
       do_walk_http(conn, raw_key, base_params, mutate, next, acc, n + 1)
     else
       acc
@@ -85,7 +85,7 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-      original =
+      original_ids =
         for i <- 1..16 do
           a =
             fixture(:article, %{
@@ -98,46 +98,49 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
           a.id
         end
 
-      # Between pages: archive the earliest still-published row (already seen) and
-      # insert a new published row. Neither should cause a dup or a skipped row.
-      counter = :counters.new(1, [])
+      # Between pages: archive an already-seen row and insert a new published row.
+      # (The context-level test `list_keyset_test.exs` thoroughly exercises the
+      # gap-free invariant; here we exercise it at the HTTP layer to verify the
+      # keyset cursor walk returns no duplicates under concurrent mutations.)
+      {:ok, seen_tracker} = Agent.start_link(fn -> [] end)
 
-      mutate = fn ->
-        :counters.add(counter, 1, 1)
-        n = :counters.get(counter, 1)
+      mutate = fn data ->
+        # Archive the first row of this page (already returned in previous pages).
+        first_id = List.first(data)["id"]
 
-        earliest =
-          Article
-          |> where([a], a.tenant_id == ^tenant.id and a.status == :published)
-          |> order_by([a], asc: a.inserted_at, asc: a.id)
-          |> limit(1)
-          |> AdminRepo.one()
+        Article
+        |> where([a], a.id == ^first_id)
+        |> AdminRepo.update_all(set: [status: :archived])
 
-        if earliest do
-          earliest
-          |> Ecto.Changeset.change(status: :archived)
-          |> AdminRepo.update!()
-        end
+        # Track which rows have been returned so far.
+        Agent.update(seen_tracker, fn seen_list -> seen_list ++ [first_id] end)
 
+        # Insert a new published row (appears later in the order than the cursor).
         fixture(:article, %{
           tenant_id: tenant.id,
           status: :published,
           tags: ["mix"],
-          title: "new-#{n}"
+          title: "new-#{System.unique_integer([:positive])}"
         })
       end
 
       seen = walk_http(conn, raw_key, %{"tags" => "mix", "limit" => "4"}, mutate)
 
-      # Rows present BEFORE the cursor passed them are returned exactly once.
-      # (A row archived before the walk reached it may legitimately not appear;
-      # the invariant is: never twice, and never skip a row that was still ahead.)
+      # No duplicates in the whole walk (the headline invariant at the HTTP layer).
       assert length(seen) == length(Enum.uniq(seen)), "no duplicates"
-      # At minimum every original id seen is unique and from the original set or new inserts.
-      assert Enum.all?(seen, &is_binary/1)
+
+      # Rows that were returned and then archived don't reappear later.
+      seen_and_returned = Agent.get(seen_tracker, fn state -> state end)
+
+      for returned_id <- seen_and_returned do
+        count = Enum.count(seen, &(&1 == returned_id))
+        assert count == 1, "row #{returned_id} returned then archived appeared #{count} times"
+      end
+
       # Sanity: we saw a meaningful chunk of the originals.
-      assert seen != []
-      assert Enum.any?(original, fn id -> id in seen end)
+      assert Enum.any?(original_ids, fn id -> id in seen end)
+
+      Agent.stop(seen_tracker)
     end
   end
 
@@ -217,6 +220,23 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/search", %{"tags" => "g", "cursor" => tampered})
+
+      assert resp.status == 400
+      assert json_response(resp, 400)["error"]["message"] =~ "cursor"
+    end
+
+    test "non-string cursor (e.g., array form) returns 400", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["g"]})
+
+      # Simulate a malformed ?cursor[]=value param (which decodes to a list).
+      # The controller should 400, not silently reset to page 1.
+      conn = conn |> auth_conn(raw_key)
+
+      resp =
+        conn
+        |> get(~p"/api/v1/knowledge/search?tags=g&cursor[]=malformed", %{})
 
       assert resp.status == 400
       assert json_response(resp, 400)["error"]["message"] =~ "cursor"

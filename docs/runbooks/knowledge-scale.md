@@ -113,6 +113,22 @@ and `request_id=` empty. Lower the threshold to surface a trend before it become
 config :loopctl, :slow_query_threshold_ms, 500
 ```
 
+## Keyset pagination index (US-27.9a)
+
+The article keyset cursor seeks on `(tenant_id, inserted_at, id)`, backed by
+`articles_tenant_inserted_id_idx` (built `CREATE INDEX CONCURRENTLY`,
+`@disable_ddl_transaction`). **Operational note:** if the concurrent build is
+interrupted, Postgres can leave an **INVALID** index behind, and the migration's
+`IF NOT EXISTS` re-run will NOT rebuild it (it sees the name and no-ops). The query
+still returns correct rows (it degrades to a Seq Scan — slower, not wrong). Recovery
+is manual: `DROP INDEX CONCURRENTLY IF EXISTS articles_tenant_inserted_id_idx;` then
+re-run the migration. Verify validity after deploy:
+
+```sql
+SELECT indexrelid::regclass, indisvalid
+FROM pg_index WHERE indexrelid = 'articles_tenant_inserted_id_idx'::regclass;
+```
+
 ## Bulk write path — set-based archive/delete (US-27.12)
 
 `Loopctl.Knowledge.BulkOps` mutates a whole selected set (by ids/tag/source) in
