@@ -154,6 +154,11 @@ config :loopctl, :max_graph_nodes, 10
 # 1000). Keep comfortably above the article count of any non-truncation test.
 config :loopctl, :max_pair_candidates, 25
 
+# US-27.12: low frozen-set bound so the oversized re-confirm-on-drift bulk-delete
+# path is exercisable with a handful of rows instead of 1001 (production default
+# is 1000). Config-based DI — no Application.put_env in tests.
+config :loopctl, :bulk_delete_frozen_max, 3
+
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",

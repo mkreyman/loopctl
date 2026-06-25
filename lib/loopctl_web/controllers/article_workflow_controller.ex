@@ -15,6 +15,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.BulkOps
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
@@ -123,21 +124,24 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   )
 
   operation(:bulk_delete,
-    summary: "Bulk delete (archive) articles",
+    summary: "Bulk archive / hard-delete articles (set-based, US-27.12)",
     description:
-      "Soft-deletes (archives) articles **partial-success** style. Provide **exactly one** " <>
-        "selector (supplying more than one is a 400): `article_ids` (explicit list), " <>
-        "`source_type` + `source_id` (every active article from that source — clean dedup " <>
-        "cleanup; not confirm-gated, can be large), or `tag` + `confirm: true` (every active " <>
-        "article carrying the tag — high blast radius, so `confirm: true` is required). " <>
-        "Honors soft-delete: rows move to `archived`, not dropped. Each id gets a per-id " <>
-        "`outcome` (`archived`; `skipped` with `already_archived`/`not_archivable_from_superseded`; " <>
-        "`not_found`; `errored`). `meta.count` = number archived; `meta.counts`/`meta.results` " <>
-        "give the breakdown. A 200 does not imply everything archived — inspect `meta.counts`. " <>
-        "Bounded to 5000 per call; a `source_type`/`tag` selector matching more than 5000 active " <>
-        "articles returns 400 (narrow the selector). An `article_ids` request with zero matches " <>
-        "still returns 200 (per-id `not_found`); a `source`/`tag` selector matching nothing " <>
-        "returns 400. Role: user+.",
+      "SET-BASED bulk cleanup. Provide **exactly one** selector (supplying more than one is a " <>
+        "400): `article_ids` (explicit list), `source_type` + `source_id` (every active article " <>
+        "from that source), or `tag` + `confirm: true` (every active article carrying the tag — " <>
+        "high blast radius, so `confirm: true` is required). All selectors are bounded to 5000 " <>
+        "active matches (over that → 400). Tenant-scoped: foreign ids never match.\n\n" <>
+        "**Default (soft) path** — archives the matched active set in ONE `update_all` + one " <>
+        "audit event. Idempotent (re-archiving is a no-op). Returns `{data: {affected: N}, " <>
+        "meta: {op: \"archive\", set_based: true, affected: N}}`.\n\n" <>
+        "**`dry_run: true`** — previews `{would_affect: N}` and mutates nothing. For the " <>
+        "irreversible delete path it also returns `meta.token` (a single-use, TTL-bounded " <>
+        "frozen-set token) when N is within the bound, or `meta.oversized: true` + " <>
+        "`meta.confirm_hash` for the re-confirm-on-drift path over the bound.\n\n" <>
+        "**`hard: true`** — irreversible HARD delete (FK-correct: article_links pre-deleted both " <>
+        "directions, access-events cascade). Requires a `token` from a prior dry-run, OR (for an " <>
+        "oversized selector) the original selector plus the dry-run `confirm_hash` (refused on " <>
+        "drift). Role: user+ (all destructive ops).",
     request_body:
       {"Bulk delete selector", "application/json",
        %OpenApiSpex.Schema{
@@ -153,6 +157,23 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            confirm: %OpenApiSpex.Schema{
              type: :boolean,
              description: "Required (true) when deleting by tag."
+           },
+           dry_run: %OpenApiSpex.Schema{
+             type: :boolean,
+             description: "Preview only; mutates nothing. Mints a delete token for the hard path."
+           },
+           hard: %OpenApiSpex.Schema{
+             type: :boolean,
+             description: "Irreversible HARD delete (requires a token or confirm_hash)."
+           },
+           token: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             description: "Frozen-set token from a prior dry_run; required for hard delete."
+           },
+           confirm_hash: %OpenApiSpex.Schema{
+             type: :string,
+             description: "Echoed from an oversized dry_run; re-confirm-on-drift for hard delete."
            }
          }
        }},
@@ -330,36 +351,177 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
-    with {:ok, ids} <- resolve_bulk_delete_ids(tenant_id, params),
-         {:ok, result} <- Knowledge.bulk_archive(tenant_id, ids, audit_opts) do
-      json(conn, %{
-        # Body-less summaries (consistent with bulk-unpublish, #158); per-id detail
-        # is in meta.results.
-        data: Enum.map(result.archived, &ArticleJSON.article_summary/1),
-        meta: %{
-          # `count` = number actually archived.
-          count: result.counts.archived,
-          counts: result.counts,
-          results: result.results
-        }
-      })
+    cond do
+      truthy?(params["dry_run"]) ->
+        bulk_delete_dry_run(conn, tenant_id, params, audit_opts)
+
+      truthy?(params["hard"]) ->
+        bulk_delete_hard(conn, tenant_id, params, audit_opts)
+
+      true ->
+        bulk_delete_soft(conn, tenant_id, params, audit_opts)
     end
   end
 
-  # Resolve the bulk-delete selector to a concrete id list. EXACTLY ONE selector
-  # must be supplied (enforced — not first-match-wins — so a stray second
-  # selector can't silently win and, e.g., bypass the by-tag confirm gate):
-  #   - article_ids: [..]                  (explicit list)
-  #   - source_type + source_id            (every active article from that source)
-  #   - tag + confirm: true                (every active article carrying the tag;
-  #                                         confirm required — high blast radius)
-  defp resolve_bulk_delete_ids(tenant_id, params) do
-    # `source_type`/`source_id` count as one selector ("source"); supplying only
-    # one half still selects "source" so the pairing error fires (not the generic
-    # one).
+  # Soft path (default, backward-compatible): set-based ARCHIVE (US-27.12), not the
+  # per-row bulk_archive — one update_all + one audit event so AC-27.12.1/.8 hold
+  # for the by-tag/source/ids archive. Idempotent (re-archiving is a no-op).
+  defp bulk_delete_soft(conn, tenant_id, params, audit_opts) do
+    with {:ok, selector} <- bulk_delete_selector(params),
+         {:ok, %{affected: affected, resolved_count: resolved}} <-
+           BulkOps.archive(tenant_id, selector, audit_opts) do
+      json(conn, %{
+        data: %{affected: affected},
+        # Backward-compatible SUPERSET: the original shipped MCP client reads
+        # meta.counts.{requested,archived,skipped,not_found,errored} and
+        # meta.results — keep those populated so existing consumers keep working,
+        # while ADDING the new set-based affected/set_based/op fields. archived =
+        # affected; skipped = resolved - affected (rows already archived/inactive);
+        # not_found/errored are 0 for a set-based archive (foreign/inactive ids
+        # simply don't resolve, they aren't a per-id failure). results is [] —
+        # the set-based op has no per-id breakdown.
+        meta: %{
+          op: "archive",
+          set_based: true,
+          affected: affected,
+          count: affected,
+          counts: %{
+            requested: resolved,
+            archived: affected,
+            skipped: resolved - affected,
+            not_found: 0,
+            errored: 0
+          },
+          results: []
+        }
+      })
+    else
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
+
+      other ->
+        other
+    end
+  end
+
+  # Dry-run: previews would_affect and mutates nothing.
+  # If hard: true, also mints a frozen-set token (when within the bound) or a
+  # confirm_hash for the oversized re-confirm-on-drift path (AC-27.12.9).
+  # Otherwise (soft/archive path), returns only would_affect without a token.
+  defp bulk_delete_dry_run(conn, tenant_id, params, audit_opts) do
+    # Preview the op the caller actually intends: :delete (with a frozen-set token
+    # / confirm_hash) only when hard: true; otherwise the soft/archive path, which
+    # mints NO delete token. meta.op makes the response self-describing (BUG2).
+    op = if truthy?(params["hard"]), do: :delete, else: :archive
+
+    with {:ok, selector} <- bulk_delete_selector(params),
+         {:ok, preview} <- BulkOps.preview(tenant_id, op, selector, audit_opts) do
+      meta =
+        %{dry_run: true, op: to_string(op)}
+        |> maybe_put(:token, preview[:token])
+        |> maybe_put(:oversized, preview[:oversized])
+        |> maybe_put(:confirm_hash, oversized_confirm_hash(tenant_id, preview))
+
+      json(conn, %{data: %{would_affect: preview.would_affect}, meta: meta})
+    else
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
+
+      other ->
+        other
+    end
+  end
+
+  # Hard delete (irreversible). Requires `hard: true` AND either a frozen `token`
+  # from a prior dry-run, OR (for an oversized selector that got no token) the
+  # original selector plus the `confirm_hash` echoed from the dry-run — re-resolved
+  # and refused on drift.
+  defp bulk_delete_hard(conn, tenant_id, params, audit_opts) do
+    case params["token"] do
+      token when is_binary(token) ->
+        bulk_delete_with_token(conn, tenant_id, token, audit_opts)
+
+      _ ->
+        bulk_delete_reconfirm(conn, tenant_id, params, audit_opts)
+    end
+  end
+
+  defp bulk_delete_with_token(conn, tenant_id, token, audit_opts) do
+    case BulkOps.delete_with_token(tenant_id, token, audit_opts) do
+      {:ok, %{affected: affected}} ->
+        json(conn, %{
+          data: %{affected: affected},
+          meta: %{op: "delete", set_based: true, affected: affected}
+        })
+
+      {:error, :invalid_token} ->
+        {:error, :bad_request,
+         "Invalid, expired, or already-used delete token. Re-run the dry-run to mint a fresh one."}
+
+      other ->
+        other
+    end
+  end
+
+  # Re-confirm-on-drift: oversized selector (no frozen token). This path is NOT
+  # single-use (an oversized selector mints no frozen-set token) — its safety comes
+  # entirely from a live drift check, not from token consumption:
+  #
+  #   1. The server RE-RESOLVES the selector right now (BulkOps.resolve_selector),
+  #      getting the CURRENT matching, tenant-scoped, active id-set.
+  #   2. It recomputes confirm_hash over that live set and compares it to the hash
+  #      the dry-run echoed to the client.
+  #   3. If the id-set GREW (a new row started matching the tag/source after the
+  #      dry-run) OR shrank, the hash differs → 400 "drift", nothing is deleted.
+  #
+  # This is exactly the harmful case a replay could otherwise cause: it is
+  # IMPOSSIBLE to sweep newly-matching rows the operator never previewed, because
+  # any such new row changes the hash and is refused. A byte-identical replay (same
+  # selector, same hash, set unchanged) re-deletes an already-gone set → affected 0,
+  # harmless. So "not single-use" does not mean "replayable into damage": the drift
+  # check, not a nonce, is the guarantee. (The minted reconfirm nonce is a
+  # belt-and-suspenders replay marker; the load-bearing protection is the hash.)
+  defp bulk_delete_reconfirm(conn, tenant_id, params, audit_opts) do
+    confirm_hash = params["confirm_hash"]
+
+    with true <- is_binary(confirm_hash) || :missing_confirm_hash,
+         {:ok, selector} <- bulk_delete_selector(params),
+         {:ok, ids} <- BulkOps.resolve_selector(tenant_id, selector),
+         ^confirm_hash <- BulkOps.confirm_hash(tenant_id, ids),
+         {:ok, %{affected: affected}} <- BulkOps.delete(tenant_id, ids, audit_opts) do
+      json(conn, %{
+        data: %{affected: affected},
+        meta: %{op: "delete", set_based: true, affected: affected}
+      })
+    else
+      :missing_confirm_hash ->
+        {:error, :bad_request,
+         "Hard delete requires a `token` (from a dry-run) or, for an oversized selector, " <>
+           "the original selector plus the `confirm_hash` echoed by the dry-run."}
+
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
+
+      {:error, :bad_request, _msg} = err ->
+        err
+
+      # Hash mismatch (drift): when ^confirm_hash fails, the computed hash is the mismatch value
+      mismatch when is_binary(mismatch) ->
+        {:error, :bad_request,
+         "Selector drifted since the dry-run (confirm_hash mismatch). Re-run the dry-run."}
+
+      # Any other error (unexpected shapes, not drift) surfaces as-is
+      other_error ->
+        other_error
+    end
+  end
+
+  # Translate the wire params into a BulkOps selector tuple. EXACTLY ONE selector
+  # (same enforcement as the soft per-row path); tag still requires confirm: true.
+  defp bulk_delete_selector(params) do
     present =
       [
-        {:article_ids, params["article_ids"]},
+        {:ids, params["article_ids"]},
         {:source, params["source_type"] || params["source_id"]},
         {:tag, params["tag"]}
       ]
@@ -367,14 +529,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       |> Enum.map(&elem(&1, 0))
 
     case present do
-      [:article_ids] ->
-        resolve_ids_selector(params["article_ids"])
+      [:ids] ->
+        ids_selector(params["article_ids"])
 
       [:source] ->
-        resolve_source_selector(tenant_id, params)
+        source_selector(params)
 
       [:tag] ->
-        resolve_tag_selector(tenant_id, params)
+        tag_selector(params)
 
       [] ->
         {:error, :bad_request, selector_help()}
@@ -384,46 +546,45 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
-  defp selector_help do
-    "Selectors: article_ids (list), source_type + source_id, or tag + confirm: true."
+  defp ids_selector(ids) when is_list(ids), do: {:ok, {:ids, ids}}
+  defp ids_selector(_), do: {:error, :bad_request, "article_ids must be a JSON array."}
+
+  # Thread BOTH source_type and source_id into the selector so the combined
+  # filter behaves as the shipped contract documents: a source_id whose
+  # source_type differs must NOT match. Both are required together (the pairing
+  # check below is what the half-specified test exercises).
+  defp source_selector(%{"source_id" => src, "source_type" => stype})
+       when is_binary(src) and is_binary(stype) do
+    {:ok, {:source, %{source_id: src, source_type: stype}}}
   end
 
-  defp resolve_ids_selector(ids) when is_list(ids), do: {:ok, ids}
-  defp resolve_ids_selector(_), do: {:error, :bad_request, "article_ids must be a JSON array."}
+  defp source_selector(_),
+    do: {:error, :bad_request, "source_type and source_id must be provided together."}
 
-  defp resolve_source_selector(tenant_id, %{"source_type" => type, "source_id" => src})
-       when is_binary(type) and is_binary(src) do
-    archivable_ids_or_error(tenant_id, source_type: type, source_id: src)
-  end
-
-  defp resolve_source_selector(_tenant_id, _params) do
-    {:error, :bad_request, "source_type and source_id must be provided together."}
-  end
-
-  defp resolve_tag_selector(tenant_id, %{"tag" => tag} = params) when is_binary(tag) do
+  defp tag_selector(%{"tag" => tag} = params) when is_binary(tag) do
     if truthy?(params["confirm"]) do
-      archivable_ids_or_error(tenant_id, tags: [tag])
+      {:ok, {:tag, tag}}
     else
       {:error, :bad_request,
-       "Deleting by tag archives every active article carrying it — pass confirm: true to proceed."}
+       "Deleting by tag affects every active article carrying it — pass confirm: true to proceed."}
     end
   end
 
-  defp resolve_tag_selector(_tenant_id, _params) do
-    {:error, :bad_request, "tag must be a string."}
+  defp tag_selector(_), do: {:error, :bad_request, "tag must be a string."}
+
+  defp oversized_confirm_hash(tenant_id, %{oversized: true, frozen_ids: ids}) when is_list(ids) do
+    # frozen_ids is internal to preview; recompute the hash the client echoes back
+    # on the oversized re-confirm path. (We expose only its hash, not the id-set.)
+    BulkOps.confirm_hash(tenant_id, ids)
   end
 
-  defp archivable_ids_or_error(tenant_id, filters) do
-    case Knowledge.list_archivable_ids(tenant_id, filters) do
-      {:ok, []} ->
-        {:error, :bad_request, "No active articles match the selector."}
+  defp oversized_confirm_hash(_tenant_id, _preview), do: nil
 
-      {:ok, ids} ->
-        {:ok, ids}
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-      {:error, :too_many} ->
-        {:error, :bad_request, "Selector matches too many articles; narrow it."}
-    end
+  defp selector_help do
+    "Selectors: article_ids (list), source_type + source_id, or tag + confirm: true."
   end
 
   defp truthy?(true), do: true
