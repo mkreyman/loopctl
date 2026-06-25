@@ -1,4 +1,5 @@
 defmodule LoopctlWeb.Endpoint do
+  require Logger
   use Phoenix.Endpoint, otp_app: :loopctl
 
   # The session will be stored in the cookie and signed,
@@ -38,6 +39,14 @@ defmodule LoopctlWeb.Endpoint do
   plug RemoteIp
 
   plug Plug.RequestId
+  # US-27.4: clear tenant_id on every request (before routing).
+  # Bandit reuses handler processes across keep-alive requests; if an
+  # authenticated request set tenant_id in the process dict and the next
+  # public/anonymous request on the same process hits the DB, the slow-query
+  # telemetry handler would log that public query with the stale tenant_id.
+  # Clearing here ensures every request path (authenticated, public, health)
+  # starts with fresh metadata, matching the RequestId pattern.
+  plug :clear_tenant_metadata
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
   plug Plug.Parsers,
@@ -57,4 +66,14 @@ defmodule LoopctlWeb.Endpoint do
   # (LoopctlWeb.Plugs.DBErrorHandler) still maps the status; this plug adds the
   # logging + sanitization the pure status hook cannot.
   plug LoopctlWeb.Plugs.DBErrorBackstop
+
+  # US-27.4: Clear tenant_id from Logger metadata on every request.
+  # Ensures a fresh start regardless of whether the previous request (on a
+  # keep-alive Bandit process) was authenticated or not. Prevents stale
+  # tenant_id from leaking into slow-query logs of public/anonymous queries.
+  @doc false
+  def clear_tenant_metadata(conn, _opts) do
+    Logger.metadata(tenant_id: nil)
+    conn
+  end
 end

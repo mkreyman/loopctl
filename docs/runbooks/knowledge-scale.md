@@ -96,16 +96,18 @@ An override applies via `SET LOCAL` inside a transaction on the dedicated heavy 
 transaction). Leave it empty unless an endpoint needs a different bound.
 
 **Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
-`:semantic_search`, `:distant_pairs`, `:novelty`. Keyword enumeration (`:knowledge_search_controller`
-list mode) intentionally stays on the RLS `Repo` — it's bounded by `limit: 25` and paginated
-(not a vector scan), so it doesn't benefit from heavy-pool isolation. If enumeration throughput
-becomes an issue, route it to HeavyRead as a separate initiative.
+`:semantic_search`, `:distant_pairs`, `:novelty`, `:enumeration`. The enumeration endpoint
+(`:knowledge_search_controller` list mode, `list_filtered/2`) now routes through HeavyRead to
+inherit the pool-level statement_timeout and optional per-endpoint override (matching the other
+four endpoints). Enumeration pages up to `limit: 1000` rows per request.
 
 **Slow-query logging:** `Loopctl.Telemetry.SlowQueryLogger` (attached at boot) logs any
 query slower than `:slow_query_threshold_ms` (default **1000**, tunable in config/env)
 at `:warning` with `duration_ms`, `repo`, `source`, and the request `tenant_id` /
-`request_id`. Raw SQL / params / vectors are never logged. Lower the threshold to surface
-a trend before it becomes an incident:
+`request_id`. Raw SQL / params / vectors are never logged. The `endpoint` field is populated
+only for the five `HeavyRead` endpoints (via `telemetry_options`); other repo queries log
+`endpoint=` empty. Off-request callers (Oban workers, background tasks) log `tenant_id=`
+and `request_id=` empty. Lower the threshold to surface a trend before it becomes an incident:
 
 ```elixir
 config :loopctl, :slow_query_threshold_ms, 500

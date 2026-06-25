@@ -26,9 +26,10 @@ config :loopctl,
   # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the
   # pool-level statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s) with
   # no per-request transaction. Keys: :suggested_links, :semantic_search,
-  # :distant_pairs, :novelty. NOTE: :distant_pairs and :semantic_search each issue
-  # TWO reads (count + data); setting an override for either wraps EACH read in its
-  # own separate transaction, doubling the brief checkout count on the heavy pool.
+  # :distant_pairs, :novelty, :enumeration. NOTE: :distant_pairs, :semantic_search,
+  # and :enumeration each issue TWO reads (count + data); setting an override for any
+  # of them wraps EACH read in its own separate transaction, doubling the brief
+  # checkout count on the heavy pool.
   heavy_read_statement_timeout_overrides: %{}
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.

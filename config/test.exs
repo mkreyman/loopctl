@@ -50,6 +50,11 @@ config :loopctl, Loopctl.HeavyReadRepo,
 # the dedicated Loopctl.HeavyReadRepo pool.
 config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 
+# US-27.4: TC-27.4.1 integration test — set a low statement_timeout override
+# for suggested_links to make timeout tests fast and deterministic. Harmless
+# for normal tests (the timeout is much longer than any real query).
+config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
+
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :loopctl, LoopctlWeb.Endpoint,

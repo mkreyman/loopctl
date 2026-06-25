@@ -13,6 +13,11 @@ defmodule LoopctlWeb.Plugs.SeedTenantMetadata do
   dict via `Repo.put_tenant_id/1`). A superadmin key (tenant_id nil) seeds nothing.
 
   Runs after `SetTenant` (so the api key is resolved).
+
+  **Note:** API key lookup itself (the `ResolveApiKey` plug) queries the DB *before*
+  this plug runs, so a slow API-key query logs with `tenant_id=` empty. This is
+  unavoidable — you cannot attribute a tenant until the key is resolved — and
+  mirrors the `request_id` pattern: correlation starts after the plug runs.
   """
 
   require Logger

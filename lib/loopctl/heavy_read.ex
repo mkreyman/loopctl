@@ -85,8 +85,13 @@ defmodule Loopctl.HeavyRead do
   defp with_statement_timeout(nil, fun), do: fun.()
 
   defp with_statement_timeout(ms, fun) when is_integer(ms) and ms > 0 do
-    {:ok, result} = transaction(fun, statement_timeout: ms)
-    result
+    case transaction(fun, statement_timeout: ms) do
+      {:ok, result} ->
+        result
+
+      {:error, reason} ->
+        raise "heavy read aborted: #{inspect(reason)}"
+    end
   end
 
   defp with_statement_timeout(ms, _fun) do

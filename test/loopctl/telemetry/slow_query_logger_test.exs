@@ -8,8 +8,10 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
   use Loopctl.DataCase, async: false
 
   import ExUnit.CaptureLog
+  import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
   alias Loopctl.Repo
   alias Loopctl.Telemetry.SlowQueryLogger
 
@@ -65,5 +67,44 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
     assert log =~ "slow_query"
     assert log =~ "tenant_id=#{tenant_id}"
     assert log =~ "duration_ms="
+  end
+
+  test "telemetry_options with endpoint are preserved and logged through Repo.all" do
+    # US-27.4: Ecto :telemetry_options containing [endpoint: :atom] are picked up
+    # by the slow-query handler and logged. This is the real code path when
+    # heavy_read_opts/1 builds these options and passes them to heavy-read queries.
+
+    slow =
+      from(x in fragment("generate_series(1, 1)"),
+        where: fragment("pg_sleep(1.1) IS NULL"),
+        select: fragment("1")
+      )
+
+    log =
+      capture_log(fn ->
+        # Repo.all with :telemetry_options (not through HeavyRead — direct repo call).
+        Repo.all(slow, telemetry_options: [endpoint: :test_endpoint])
+      end)
+
+    assert log =~ "slow_query"
+    assert log =~ "endpoint=test_endpoint"
+    assert log =~ "duration_ms="
+  end
+
+  test "heavy_read_opts/1 (the real builder) tags the endpoint and applies a configured override" do
+    # The generate_series test above proves the handler LOGS endpoint from
+    # telemetry_options; this proves Knowledge.heavy_read_opts/1 — the builder every
+    # routed heavy read uses — actually produces that telemetry_options[:endpoint] tag,
+    # AND threads a configured per-endpoint statement_timeout override. Together they
+    # cover the full endpoint-attribution chain deterministically (no flaky sleeps).
+    semantic = Knowledge.heavy_read_opts(:semantic_search)
+    assert semantic[:telemetry_options] == [endpoint: :semantic_search]
+    assert semantic[:timeout] == 15_000
+    refute Keyword.has_key?(semantic, :statement_timeout)
+
+    # :suggested_links has an override in test config → the SET LOCAL transaction path.
+    suggested = Knowledge.heavy_read_opts(:suggested_links)
+    assert suggested[:telemetry_options] == [endpoint: :suggested_links]
+    assert suggested[:statement_timeout] == 5_000
   end
 end
