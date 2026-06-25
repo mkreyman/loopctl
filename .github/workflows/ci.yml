@@ -289,10 +289,11 @@ jobs:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
   scale-nightly:
-    name: Scale Nightly (TC-27.1.5 — prod-floor + HNSW plan)
-    # Runs nightly to assert the HNSW planner path is chosen at PROD_ARTICLE_FLOOR.
-    # This is the core deliverable of US-27.1 — reproducing the cost-based planner
-    # choices that only appear at production scale (~80k articles).
+    name: Scale Nightly (prod-floor plan gate — US-27.1/27.2/27.5)
+    # Runs nightly to assert every heavy endpoint's planner path at PROD_ARTICLE_FLOOR
+    # (~80k articles) — the cost-based choices that only appear at production scale.
+    # US-27.5 (AC-27.5.3): this is the scale GATE — it runs ALL :scale_nightly tests
+    # (HNSW ANN, keyset enumeration, shared plan assertions), not just scale_seed.
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     services:
@@ -369,11 +370,16 @@ jobs:
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
 
-      - name: Run nightly prod-floor scale test (TC-27.1.5)
-        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly test/loopctl/knowledge/scale_seed_nightly_test.exs
+      # US-27.5 (AC-27.5.3): the scale GATE runs EVERY :scale_nightly test against the
+      # ~80k prod-floor corpus — not just scale_seed_nightly. This is what makes the
+      # vector ANN, enumeration/keyset, and shared plan assertions actually execute at
+      # scale (they were tagged :scale_nightly but no CI job ran them before this). No
+      # path filter: `--only scale_nightly` picks them all up across the suite.
+      - name: Run nightly scale gate (US-27.1 prod-floor + US-27.2 plan assertions at scale)
+        run: SCALE_TESTS=true SCALE_NIGHTLY=true mix test --only scale_nightly
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
-        timeout-minutes: 30
+        timeout-minutes: 45
 
   deploy:
     name: Deploy
