@@ -30,7 +30,17 @@ config :loopctl,
   # and :enumeration each issue TWO reads (count + data); setting an override for any
   # of them wraps EACH read in its own separate transaction, doubling the brief
   # checkout count on the heavy pool.
-  heavy_read_statement_timeout_overrides: %{}
+  heavy_read_statement_timeout_overrides: %{},
+  # US-27.12: set-based bulk archive/unpublish/delete. Each op runs in one
+  # transaction that first issues `SET LOCAL statement_timeout = <ms>` so a single
+  # large statement can't hold an admin-pool connection indefinitely (blast-radius
+  # bound, AC-27.12.5). The frozen-set delete token (TOCTOU-safe dry-run, AC-27.12.9)
+  # is minted only when the previewed id-set is within `bulk_delete_frozen_max`;
+  # over that bound the caller uses re-confirm-on-drift. Tokens expire after
+  # `bulk_delete_token_ttl_seconds`.
+  bulk_op_statement_timeout_ms: 30_000,
+  bulk_delete_frozen_max: 1_000,
+  bulk_delete_token_ttl_seconds: 300
 
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
