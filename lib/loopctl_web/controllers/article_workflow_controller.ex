@@ -368,10 +368,32 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # for the by-tag/source/ids archive. Idempotent (re-archiving is a no-op).
   defp bulk_delete_soft(conn, tenant_id, params, audit_opts) do
     with {:ok, selector} <- bulk_delete_selector(params),
-         {:ok, %{affected: affected}} <- BulkOps.archive(tenant_id, selector, audit_opts) do
+         {:ok, %{affected: affected, resolved_count: resolved}} <-
+           BulkOps.archive(tenant_id, selector, audit_opts) do
       json(conn, %{
         data: %{affected: affected},
-        meta: %{op: "archive", set_based: true, affected: affected}
+        # Backward-compatible SUPERSET: the original shipped MCP client reads
+        # meta.counts.{requested,archived,skipped,not_found,errored} and
+        # meta.results — keep those populated so existing consumers keep working,
+        # while ADDING the new set-based affected/set_based/op fields. archived =
+        # affected; skipped = resolved - affected (rows already archived/inactive);
+        # not_found/errored are 0 for a set-based archive (foreign/inactive ids
+        # simply don't resolve, they aren't a per-id failure). results is [] —
+        # the set-based op has no per-id breakdown.
+        meta: %{
+          op: "archive",
+          set_based: true,
+          affected: affected,
+          count: affected,
+          counts: %{
+            requested: resolved,
+            archived: affected,
+            skipped: resolved - affected,
+            not_found: 0,
+            errored: 0
+          },
+          results: []
+        }
       })
     else
       {:error, :too_many} ->
@@ -382,14 +404,21 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
-  # Dry-run: previews would_affect and mutates nothing. For the delete path it
-  # also mints a frozen-set token (when within the bound) or a confirm_hash for
-  # the oversized re-confirm-on-drift path (AC-27.12.9).
+  # Dry-run: previews would_affect and mutates nothing.
+  # If hard: true, also mints a frozen-set token (when within the bound) or a
+  # confirm_hash for the oversized re-confirm-on-drift path (AC-27.12.9).
+  # Otherwise (soft/archive path), returns only would_affect without a token.
   defp bulk_delete_dry_run(conn, tenant_id, params, audit_opts) do
+    # Preview the op the caller actually intends: :delete (with a frozen-set token
+    # / confirm_hash) only when hard: true; otherwise the soft/archive path, which
+    # mints NO delete token. meta.op makes the response self-describing (BUG2).
+    op = if truthy?(params["hard"]), do: :delete, else: :archive
+
     with {:ok, selector} <- bulk_delete_selector(params),
-         {:ok, preview} <- BulkOps.preview(tenant_id, :delete, selector, audit_opts) do
+         {:ok, preview} <- BulkOps.preview(tenant_id, op, selector, audit_opts) do
       meta =
-        %{dry_run: true, token: preview[:token]}
+        %{dry_run: true, op: to_string(op)}
+        |> maybe_put(:token, preview[:token])
         |> maybe_put(:oversized, preview[:oversized])
         |> maybe_put(:confirm_hash, oversized_confirm_hash(tenant_id, preview))
 
@@ -460,9 +489,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       {:error, :bad_request, _msg} = err ->
         err
 
-      _drift ->
+      # Hash mismatch (drift): when ^confirm_hash fails, the computed hash is the mismatch value
+      mismatch when is_binary(mismatch) ->
         {:error, :bad_request,
          "Selector drifted since the dry-run (confirm_hash mismatch). Re-run the dry-run."}
+
+      # Any other error (unexpected shapes, not drift) surfaces as-is
+      other_error ->
+        other_error
     end
   end
 
@@ -499,7 +533,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   defp ids_selector(ids) when is_list(ids), do: {:ok, {:ids, ids}}
   defp ids_selector(_), do: {:error, :bad_request, "article_ids must be a JSON array."}
 
-  defp source_selector(%{"source_id" => src}) when is_binary(src), do: {:ok, {:source, src}}
+  # Thread BOTH source_type and source_id into the selector so the combined
+  # filter behaves as the shipped contract documents: a source_id whose
+  # source_type differs must NOT match. Both are required together (the pairing
+  # check below is what the half-specified test exercises).
+  defp source_selector(%{"source_id" => src, "source_type" => stype})
+       when is_binary(src) and is_binary(stype) do
+    {:ok, {:source, %{source_id: src, source_type: stype}}}
+  end
 
   defp source_selector(_),
     do: {:error, :bad_request, "source_type and source_id must be provided together."}

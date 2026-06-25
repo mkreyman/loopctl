@@ -38,7 +38,12 @@ config :loopctl,
   # is minted only when the previewed id-set is within `bulk_delete_frozen_max`;
   # over that bound the caller uses re-confirm-on-drift. Tokens expire after
   # `bulk_delete_token_ttl_seconds`.
-  bulk_op_statement_timeout_ms: 30_000,
+  bulk_op_statement_timeout_ms: 10_000,
+  # Transaction-level timeout (ms) handed to `AdminRepo.transaction/2` — set a bit
+  # above the per-statement timeout so the connection is RECLAIMED even if several
+  # statements chain (links_src + links_tgt + articles + audit), instead of holding
+  # one of the small admin-pool connections for the sum of their runtimes.
+  bulk_op_transaction_timeout_ms: 15_000,
   bulk_delete_frozen_max: 1_000,
   bulk_delete_token_ttl_seconds: 300
 

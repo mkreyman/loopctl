@@ -6,6 +6,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.BulkDeleteToken
 
   import Ecto.Query
 
@@ -550,6 +552,19 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["meta"]["op"] == "archive"
       assert body["meta"]["set_based"] == true
 
+      # Backward-compatible SUPERSET (#7): the original shipped MCP client reads
+      # meta.counts.{requested,archived,skipped,not_found,errored} + meta.results.
+      # The 5 ids resolve to 2 ACTIVE (draft+published); the archived/superseded/
+      # foreign-missing never resolve, so requested == 2 (resolved), archived == 2,
+      # skipped == 0, not_found/errored == 0, results == [].
+      assert body["meta"]["count"] == 2
+      assert body["meta"]["counts"]["requested"] == 2
+      assert body["meta"]["counts"]["archived"] == 2
+      assert body["meta"]["counts"]["skipped"] == 0
+      assert body["meta"]["counts"]["not_found"] == 0
+      assert body["meta"]["counts"]["errored"] == 0
+      assert body["meta"]["results"] == []
+
       assert AdminRepo.get!(Article, draft.id).status == :archived
       assert AdminRepo.get!(Article, published.id).status == :archived
       # archived/superseded/foreign-missing are left as-is.
@@ -641,6 +656,36 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, other.id).status == :published
     end
 
+    test "source selector ANDs source_type: a mismatched source_type matches nothing (#6)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      src = Ecto.UUID.generate()
+
+      # Article exists under source_id=src with source_type "web_article".
+      web =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      # Same source_id but a DIFFERENT source_type → must match nothing (affected 0).
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "source_type" => "manual",
+          "source_id" => src
+        })
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 0
+      assert AdminRepo.get!(Article, web.id).status == :published
+    end
+
     test "archive by tag requires confirm: true", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -723,17 +768,50 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd",
           "confirm" => true,
-          "dry_run" => true
+          "dry_run" => true,
+          "hard" => true
         })
         |> json_response(200)
 
       assert body["data"]["would_affect"] == 2
       assert body["meta"]["dry_run"] == true
+      assert body["meta"]["op"] == "delete"
       assert is_binary(body["meta"]["token"])
 
       # nothing mutated
       assert AdminRepo.get!(Article, a1.id).status == :published
       assert AdminRepo.get!(Article, a2.id).status == :published
+    end
+
+    test "soft (non-hard) dry_run previews would_affect, mints NO token, op=archive (#BUG2)", %{
+      conn: conn
+    } do
+      # A dry-run of the DEFAULT soft/archive call (no hard: true) must NOT mint a
+      # delete-scoped token the archive will never use, and must be self-describing
+      # via meta.op. (Previously dry_run unconditionally previewed :delete.)
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a1 = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["softdry"]})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "softdry",
+          "confirm" => true,
+          "dry_run" => true
+        })
+        |> json_response(200)
+
+      assert body["data"]["would_affect"] == 1
+      assert body["meta"]["dry_run"] == true
+      assert body["meta"]["op"] == "archive"
+      # No delete token minted for the soft path.
+      assert body["meta"]["token"] == nil
+      assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
+
+      # Nothing mutated.
+      assert AdminRepo.get!(Article, a1.id).status == :published
     end
 
     test "hard delete with a token permanently removes the frozen set", %{conn: conn} do
@@ -748,7 +826,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd2",
           "confirm" => true,
-          "dry_run" => true
+          "dry_run" => true,
+          "hard" => true
         })
         |> json_response(200)
         |> get_in(["meta", "token"])
@@ -782,7 +861,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd3",
           "confirm" => true,
-          "dry_run" => true
+          "dry_run" => true,
+          "hard" => true
         })
         |> json_response(200)
         |> get_in(["meta", "token"])
@@ -853,7 +933,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "over",
           "confirm" => true,
-          "dry_run" => true
+          "dry_run" => true,
+          "hard" => true
         })
         |> json_response(200)
 
@@ -893,7 +974,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "drift",
           "confirm" => true,
-          "dry_run" => true
+          "dry_run" => true,
+          "hard" => true
         })
         |> json_response(200)
 
@@ -914,6 +996,73 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["error"]["message"] =~ "drift"
       # nothing deleted
       Enum.each([new_id | survivors], fn id -> assert AdminRepo.get(Article, id) end)
+    end
+
+    @tag :capture_log
+    test "reconfirm path: a DB abort surfaces as a structured DB error, NOT a 400 'drift' (M5/BUG1)",
+         %{conn: conn} do
+      # BUG 1: a real {:error, %Postgrex.Error{}} (FK abort / statement-timeout)
+      # from the delete must NOT fall through to the drift clause and be mislabeled
+      # a 400. It must route through US-27.3's DBError/FallbackController. We force
+      # a deterministic FK abort with a cross-tenant stray link the tenant-scoped
+      # link cleanup can't pre-delete, so the :restrict FK aborts the article delete.
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+
+      # 4 matching articles → oversized (frozen_max is 3 in test config) → reconfirm path.
+      victims =
+        for _ <- 1..4 do
+          fixture(:article, %{tenant_id: tenant_a.id, status: :published, tags: ["abort"]}).id
+        end
+
+      partner = fixture(:article, %{tenant_id: tenant_a.id, status: :published})
+      [v1 | _] = victims
+
+      # A link owned by tenant_b pointing at tenant_a's victim. The tenant_a-scoped
+      # link cleanup does NOT remove it, so the :restrict FK aborts the delete.
+      %ArticleLink{tenant_id: tenant_b.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: partner.id,
+        target_article_id: v1,
+        relationship_type: :relates_to
+      })
+      |> Ecto.Changeset.put_change(:tenant_id, tenant_b.id)
+      |> AdminRepo.insert!()
+
+      dry =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "abort",
+          "confirm" => true,
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+
+      assert dry["meta"]["oversized"] == true
+      confirm_hash = dry["meta"]["confirm_hash"]
+
+      # Re-confirm (hash matches, no drift) → the delete fires and FK-aborts. The
+      # response must be a DB-error status (>= 500), NOT a 400 "drift" mislabel.
+      conn =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "abort",
+          "confirm" => true,
+          "confirm_hash" => confirm_hash
+        })
+
+      assert conn.status >= 500
+      body = json_response(conn, conn.status)
+      # The message is NOT the drift message — a real DB error was surfaced.
+      refute body["error"]["message"] =~ "drift"
+
+      # Atomic: the victim is still present (the whole delete rolled back).
+      assert AdminRepo.get(Article, v1)
     end
   end
 

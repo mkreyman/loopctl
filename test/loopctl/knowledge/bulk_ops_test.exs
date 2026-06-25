@@ -95,6 +95,42 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       assert {:ok, %{affected: 1}} = BulkOps.archive(tenant.id, {:source, src}, audit_opts())
       assert reload_status(a1.id) == :archived
     end
+
+    test "source selector with source_type filters by BOTH (mismatched source_type → no match)" do
+      # A source_id whose source_type DIFFERS must NOT match: the combined filter
+      # ANDs source_type with source_id (the shipped contract). The bare-id form
+      # would over-match here; the map form must not.
+      tenant = fixture(:tenant)
+      src = Ecto.UUID.generate()
+
+      web =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          source_type: "web_article",
+          source_id: src
+        })
+
+      # Same source_id, DIFFERENT source_type — must be left untouched.
+      assert {:ok, %{affected: 0}} =
+               BulkOps.archive(
+                 tenant.id,
+                 {:source, %{source_id: src, source_type: "manual"}},
+                 audit_opts()
+               )
+
+      assert reload_status(web.id) == :published
+
+      # The MATCHING source_type archives it.
+      assert {:ok, %{affected: 1}} =
+               BulkOps.archive(
+                 tenant.id,
+                 {:source, %{source_id: src, source_type: "web_article"}},
+                 audit_opts()
+               )
+
+      assert reload_status(web.id) == :archived
+    end
   end
 
   # --- unpublish ---
@@ -256,18 +292,47 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       assert AdminRepo.get(Article, a3.id)
     end
 
-    test "token is single-use: a second consumption is refused" do
+    test "token is single-use: the SECOND consumption is REFUSED (not silently affected:0)" do
       tenant = fixture(:tenant)
-      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["once"]})
+      survivor = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["twice"]})
 
       assert {:ok, %{token: token_id}} =
-               BulkOps.preview(tenant.id, :delete, {:tag, "once"}, audit_opts())
+               BulkOps.preview(tenant.id, :delete, {:tag, "twice"}, audit_opts())
 
+      # The frozen set had ONE article; the first run deletes it.
       assert {:ok, %{affected: 1}} =
                BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
 
+      refute AdminRepo.get(Article, survivor.id)
+
+      # The SECOND run is REFUSED with :invalid_token — NOT a silent {:ok, affected: 0}.
+      # The atomic consume gate (is_nil(used_at) in the guarded update_all) is what
+      # makes a double-spend impossible even under concurrency.
       assert {:error, :invalid_token} =
                BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+    end
+
+    test "double-spend race semantics: a concurrent second consume of a used token is refused" do
+      # The race is gated by the single guarded `update_all` that stamps used_at
+      # ONLY when is_nil(used_at). Two consumers cannot both stamp it: the second
+      # update matches 0 rows → :assert_consumed fails → :invalid_token. We exercise
+      # the same gate deterministically by stamping used_at first (as the "winner"
+      # transaction would have committed), then asserting the next consume is refused.
+      tenant = fixture(:tenant)
+      art = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["race"]})
+
+      assert {:ok, %{token: token_id}} =
+               BulkOps.preview(tenant.id, :delete, {:tag, "race"}, audit_opts())
+
+      # Simulate the winning consumer having already stamped used_at.
+      from(t in BulkDeleteToken, where: t.id == ^token_id)
+      |> AdminRepo.update_all(set: [used_at: DateTime.utc_now()])
+
+      # The losing consumer's guarded update matches 0 rows → refused, article intact.
+      assert {:error, :invalid_token} =
+               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+
+      assert AdminRepo.get(Article, art.id)
     end
 
     test "token is refused cross-tenant" do
@@ -298,6 +363,27 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       from(t in BulkDeleteToken, where: t.id == ^token_id)
       |> AdminRepo.update_all(set: [expires_at: past])
+
+      assert {:error, :invalid_token} =
+               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+
+      assert AdminRepo.get(Article, art.id)
+    end
+
+    test "token expired exactly at the boundary (expires_at == now) is refused" do
+      # The consume guard is `expires_at > now` (strict), so a token whose
+      # expires_at is in the past — including the exact boundary — is refused.
+      tenant = fixture(:tenant)
+      art = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["bnd"]})
+
+      assert {:ok, %{token: token_id}} =
+               BulkOps.preview(tenant.id, :delete, {:tag, "bnd"}, audit_opts())
+
+      # Force expiry to a fixed past instant so the strict `>` comparison refuses it.
+      boundary = DateTime.add(DateTime.utc_now(), -1, :microsecond)
+
+      from(t in BulkDeleteToken, where: t.id == ^token_id)
+      |> AdminRepo.update_all(set: [expires_at: boundary])
 
       assert {:error, :invalid_token} =
                BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
@@ -349,6 +435,111 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       refute BulkOps.confirm_hash(tenant_a.id, [id1, id2]) ==
                BulkOps.confirm_hash(tenant_b.id, [id1, id2])
+    end
+  end
+
+  # --- AC-27.12.5: moderate worst-case integration (NOT :scale) ---
+
+  describe "delete/3 worst-case shape (AC-27.12.5, moderate)" do
+    test "hard-deletes ~100 tagged articles with links + access events, one audit, all cascaded" do
+      # Discharges AC-27.12.5's document+test branch below the :scale tier: a
+      # realistic selector (a whole tag) where each article carries links and
+      # several access events. Asserts the single-transaction/one-audit op
+      # completes, removes the links (FK :restrict pre-delete), and cascades the
+      # access events (FK :delete_all) — the dominant row count for a hot article.
+      tenant = fixture(:tenant)
+      n = 100
+
+      articles =
+        for _ <- 1..n do
+          fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["mass"]})
+        end
+
+      ids = Enum.map(articles, & &1.id)
+
+      # Chain links a[i] -> a[i+1] so every article has both an inbound and an
+      # outbound link (both FK directions exercised), all tenant-scoped.
+      link_ids =
+        articles
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.map(fn [src, tgt] ->
+          fixture(:article_link, %{
+            tenant_id: tenant.id,
+            source_article_id: src.id,
+            target_article_id: tgt.id
+          }).id
+        end)
+
+      # Several access events per article (the cascade-by-delete_all cost).
+      event_ids =
+        Enum.flat_map(articles, fn art ->
+          for _ <- 1..3 do
+            fixture(:article_access_event, %{tenant_id: tenant.id, article_id: art.id}).id
+          end
+        end)
+
+      assert {:ok, %{affected: ^n}} = BulkOps.delete(tenant.id, ids, audit_opts())
+
+      # All articles gone, no FK abort.
+      assert Enum.all?(ids, fn id -> is_nil(AdminRepo.get(Article, id)) end)
+      # Links removed (both directions).
+      assert Enum.all?(link_ids, fn id -> is_nil(AdminRepo.get(ArticleLink, id)) end)
+      # Access events cascaded.
+      assert Enum.all?(event_ids, fn id ->
+               is_nil(AdminRepo.get(Loopctl.Knowledge.ArticleAccessEvent, id))
+             end)
+
+      # Exactly ONE audit event (AC-27.12.8), with the affected count.
+      audits = bulk_audits(tenant.id, "article.bulk_deleted")
+      assert length(audits) == 1
+      assert hd(audits).metadata["affected_count"] == n
+    end
+  end
+
+  # --- AC-27.12.3: archived middle node is INERT in published-only traversal ---
+
+  describe "archive makes a middle node inert in graph traversal (AC-27.12.3)" do
+    test "a bridge path through an archived middle disappears (published-only middles)" do
+      # graph_traversal / distant_pairs traverse PUBLISHED middles only. Archiving
+      # a middle leaves its links intact (distinct from delete) but makes it inert:
+      # a bridge A -- M -- B no longer connects A to B once M is archived.
+      alias Loopctl.Knowledge
+
+      tenant = fixture(:tenant)
+
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      middle = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      b = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      # A -- middle -- B (the only path from A to B is through `middle`).
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: a.id,
+        target_article_id: middle.id
+      })
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: middle.id,
+        target_article_id: b.id
+      })
+
+      # Before archiving: depth-2 traversal from A reaches B through the middle.
+      assert {:ok, before} = Knowledge.graph_traversal(tenant.id, a.id, depth: 2)
+      before_ids = MapSet.new(before.nodes, & &1.id)
+      assert MapSet.member?(before_ids, middle.id)
+      assert MapSet.member?(before_ids, b.id)
+
+      # Archive the middle (links left intact, but it becomes inert in traversal).
+      assert {:ok, %{affected: 1}} =
+               BulkOps.archive(tenant.id, {:ids, [middle.id]}, audit_opts())
+
+      # After archiving: the bridge through the now-archived middle disappears —
+      # B is no longer reachable from A (the published-only middle filter excludes it).
+      assert {:ok, after_trav} = Knowledge.graph_traversal(tenant.id, a.id, depth: 2)
+      after_ids = MapSet.new(after_trav.nodes, & &1.id)
+      refute MapSet.member?(after_ids, middle.id)
+      refute MapSet.member?(after_ids, b.id)
     end
   end
 

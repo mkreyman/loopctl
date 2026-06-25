@@ -118,13 +118,27 @@ async function knowledgeStats({ project_id }) {
   return toContent(result);
 }
 
-async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, confirm }) {
+async function knowledgeBulkDelete({
+  article_ids,
+  source_type,
+  source_id,
+  tag,
+  confirm,
+  dry_run,
+  hard,
+  token,
+  confirm_hash,
+}) {
   const payload = {};
   if (article_ids) payload.article_ids = article_ids;
   if (source_type) payload.source_type = source_type;
   if (source_id) payload.source_id = source_id;
   if (tag) payload.tag = tag;
   if (confirm) payload.confirm = confirm;
+  if (dry_run) payload.dry_run = true;
+  if (hard) payload.hard = true;
+  if (token) payload.token = token;
+  if (confirm_hash) payload.confirm_hash = confirm_hash;
   const result = await apiCall(
     "POST",
     "/api/v1/knowledge/bulk-delete",
@@ -1049,5 +1063,36 @@ describe("knowledge_bulk_delete (#136)", () => {
 
     const result = await knowledgeBulkDelete({ article_ids: ["x"] });
     assert.match(result.content[0].text, /WARNING/);
+  });
+
+  test("forwards the dry_run / hard / token / confirm_hash flow (US-27.12)", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    const calls = mockFetch({ data: { would_affect: 2 }, meta: { would_affect: 2, token: "tok-1" } });
+
+    await knowledgeBulkDelete({
+      tag: "cleanup",
+      confirm: true,
+      dry_run: true,
+      hard: true,
+      token: "tok-1",
+      confirm_hash: "abc",
+    });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.equal(sent.dry_run, true);
+    assert.equal(sent.hard, true);
+    assert.equal(sent.token, "tok-1");
+    assert.equal(sent.confirm_hash, "abc");
+    assert.equal(sent.tag, "cleanup");
+  });
+
+  test("does NOT warn on a dry-run / hard response (no meta.counts)", async () => {
+    setupEnv();
+    process.env.LOOPCTL_USER_KEY = "lc_test_user_key";
+    mockFetch({ data: { affected: 2 }, meta: { affected: 2, op: "delete" } });
+
+    const result = await knowledgeBulkDelete({ hard: true, token: "tok-1" });
+    assert.doesNotMatch(result.content[0].text, /WARNING/);
   });
 });

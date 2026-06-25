@@ -953,13 +953,32 @@ async function knowledgeDelete({ article_id }) {
   return toContent(result);
 }
 
-async function knowledgeBulkDelete({ article_ids, source_type, source_id, tag, confirm }) {
+async function knowledgeBulkDelete({
+  article_ids,
+  source_type,
+  source_id,
+  tag,
+  confirm,
+  dry_run,
+  hard,
+  token,
+  confirm_hash,
+}) {
   const payload = {};
   if (article_ids) payload.article_ids = article_ids;
   if (source_type) payload.source_type = source_type;
   if (source_id) payload.source_id = source_id;
   if (tag) payload.tag = tag;
   if (confirm) payload.confirm = confirm;
+  // US-27.12: dry-run preview + irreversible hard delete via a single-use frozen
+  // token. dry_run=true mutates nothing (returns meta.would_affect; for the hard
+  // path a single-use meta.token); hard=true + token performs the FK-correct
+  // IRREVERSIBLE delete over the frozen id-set. Oversized selectors echo
+  // meta.confirm_hash for re-confirm-on-drift instead of a token.
+  if (dry_run) payload.dry_run = true;
+  if (hard) payload.hard = true;
+  if (token) payload.token = token;
+  if (confirm_hash) payload.confirm_hash = confirm_hash;
 
   const result = await apiCall(
     "POST",
@@ -2701,25 +2720,29 @@ const TOOLS = [
   {
     name: "knowledge_bulk_delete",
     description:
-      "Bulk soft-delete (archive) articles, partial-success style. REQUIRES LOOPCTL_USER_KEY " +
-      "(user role — orchestrator is NOT sufficient). Provide EXACTLY ONE selector: " +
-      "article_ids (explicit list), source_type + source_id (every active article from that " +
-      "source — clean dedup cleanup), or tag + confirm:true (every active article carrying the " +
-      "tag — high blast radius, so confirm:true is required). Honors soft-delete (rows move to " +
-      "archived, never dropped). Each id gets a per-id outcome (archived / skipped / not_found / " +
-      "errored); meta.count = archived, meta.counts/meta.results give the breakdown. Already-" +
-      "archived ids are skipped (idempotent). Bounded to 5000 per call. Safe to retry.",
+      "Bulk archive (default, reversible) or IRREVERSIBLE hard-delete of articles by selector. " +
+      "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator is NOT sufficient). Provide EXACTLY ONE " +
+      "selector: article_ids (explicit list), source_type + source_id (every active article from " +
+      "that source), or tag + confirm:true (every active article carrying the tag — high blast " +
+      "radius, so confirm:true is required). " +
+      "DEFAULT (soft archive): rows move to archived, never dropped; set-based + idempotent; " +
+      "meta.count = archived, meta.counts/meta.results give the breakdown. " +
+      "DRY-RUN: dry_run:true mutates NOTHING and returns meta.would_affect (and, for hard, a " +
+      "single-use meta.token / for oversized selectors a meta.confirm_hash). " +
+      "HARD DELETE (irreversible): first dry_run with hard:true to get a token, then call again " +
+      "with hard:true + that token to FK-correctly delete the FROZEN id-set (links removed first, " +
+      "access events cascade). The token is single-use and TTL-bounded. Bounded to 5000 per call.",
     inputSchema: {
       type: "object",
       properties: {
         article_ids: {
           type: "array",
           items: { type: "string" },
-          description: "Explicit article UUIDs to archive (selector 1).",
+          description: "Explicit article UUIDs (selector 1).",
         },
         source_type: {
           type: "string",
-          description: "With source_id: archive every active article from this source (selector 2).",
+          description: "With source_id: every active article from this source (selector 2).",
         },
         source_id: {
           type: "string",
@@ -2728,11 +2751,35 @@ const TOOLS = [
         tag: {
           type: "string",
           description:
-            "Archive every active article carrying this tag (selector 3). Requires confirm:true.",
+            "Every active article carrying this tag (selector 3). Requires confirm:true.",
         },
         confirm: {
           type: "boolean",
-          description: "Required (true) when deleting by tag — guards the high blast radius.",
+          description: "Required (true) when selecting by tag — guards the high blast radius.",
+        },
+        dry_run: {
+          type: "boolean",
+          description:
+            "Preview only — mutate nothing. Returns meta.would_affect; with hard:true also a " +
+            "single-use meta.token (or meta.confirm_hash for oversized selectors).",
+        },
+        hard: {
+          type: "boolean",
+          description:
+            "IRREVERSIBLE hard delete (vs default reversible archive). Run dry_run first to get a " +
+            "token, then pass hard:true + token.",
+        },
+        token: {
+          type: "string",
+          description:
+            "The single-use frozen-set token from a `dry_run:true, hard:true` preview. Required " +
+            "for the hard delete.",
+        },
+        confirm_hash: {
+          type: "string",
+          description:
+            "For an oversized hard-delete selector (no token): the meta.confirm_hash from the " +
+            "dry-run, echoed back to re-confirm the id-set hasn't drifted.",
         },
       },
       required: [],
