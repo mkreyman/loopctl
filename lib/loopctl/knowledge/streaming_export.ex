@@ -15,7 +15,9 @@ defmodule Loopctl.Knowledge.StreamingExport do
   download — pinning one of the few BYPASSRLS heavy-read connections AND `xmin`
   (blocking vacuum on a churning 76k-row table) for minutes. Instead we page with
   the keyset cursor on `(inserted_at, id)`: each page is a SHORT
-  `Loopctl.HeavyRead.all/3` read that RELEASES the connection between pages. The
+  `Loopctl.HeavyRead.all/3` read — a brief per-read `SET LOCAL statement_timeout`
+  transaction (US-27.13) that COMMITS and RELEASES the connection + `xmin` between
+  pages, NOT one long-held transaction across the whole download. The
   walk is drift-free (seeks the stable unique tuple, never an OFFSET).
 
   ## Tenant scoping under BYPASSRLS (AC-27.16.5)
@@ -186,7 +188,8 @@ defmodule Loopctl.Knowledge.StreamingExport do
       |> group_by([a], a.category)
       |> select([a], %{category: a.category, count: count(a.id)})
 
-    HeavyRead.all(tenant_id, query)
+    # Export aggregations use the same extended 60s timeout as export pages.
+    HeavyRead.all(tenant_id, query, statement_timeout: 60_000)
   end
 
   # --- article pages (keyset walk) ---
@@ -285,7 +288,11 @@ defmodule Loopctl.Knowledge.StreamingExport do
       })
       |> limit(^(page_size + 1))
 
-    rows = HeavyRead.all(tenant_id, query)
+    # Export pages have a longer per-page timeout than fast reads: 60s instead of the
+    # 10s fast-read default. A single page read (even with `export_max_links_per_article: 100`
+    # and dense graph) should complete in well under 60s at realistic prod scale; this
+    # prevents a legitimate slow page from timing out mid-export.
+    rows = HeavyRead.all(tenant_id, query, statement_timeout: 60_000)
 
     if length(rows) > page_size do
       page = Enum.take(rows, page_size)
@@ -448,8 +455,9 @@ defmodule Loopctl.Knowledge.StreamingExport do
         }
       )
 
+    # Export link queries use the same extended 60s timeout as export pages.
     tenant_id
-    |> HeavyRead.all(query)
+    |> HeavyRead.all(query, statement_timeout: 60_000)
     |> Enum.map(&Map.put(&1, :direction, direction))
   end
 

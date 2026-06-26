@@ -1,48 +1,77 @@
 defmodule Loopctl.HeavyReadRepoTest do
   @moduledoc """
-  Pool-level mechanism tests for the dedicated heavy-read pool (US-27.11):
-  the server-side `statement_timeout` carried by the repo `:parameters`
-  (AC-27.11.3/.6) and the `hnsw.ef_search` GUC reachability (AC-27.11.3).
+  Mechanism tests for the dedicated heavy-read pool (US-27.11/US-27.13): the server-side
+  `statement_timeout` applied PER-READ via `SET LOCAL` inside a transaction (AC-27.11.3/.6),
+  and the `hnsw.ef_search` GUC reachability (AC-27.11.3).
 
-  In the test env the pool's `statement_timeout` is set to a deliberately low
-  250ms (config/test.exs) so the fast-fire assertion is sub-second and
-  deterministic.
+  US-27.13: the timeout is NO LONGER carried by a connection-startup `:parameters` — Fly
+  MPG's pgbouncer rejects a `statement_timeout` startup parameter (`08P01`), which
+  crash-loops the whole pool in prod. The old `:parameters` tests "passed" only because the
+  test suite connects to DIRECT Postgres (which accepts the param) — the false confidence
+  that hid the outage. These tests now exercise the `SET LOCAL`-in-transaction path that is
+  pgbouncer-safe and is what the prod read path (`Loopctl.HeavyRead.opts/1` → all/one) uses.
+  In test the SET-LOCAL default is a low 250ms (config/test.exs) so the fast-fire assertion
+  is sub-second.
   """
   use Loopctl.DataCase, async: true
 
   alias Loopctl.HeavyReadRepo
-  alias Loopctl.Knowledge.Article
 
   import Ecto.Query
 
-  describe "pool-level statement_timeout via :parameters" do
-    test "SHOW statement_timeout reflects the configured pool parameter (AC-27.11.3)" do
-      %{rows: [[value]]} = HeavyReadRepo.query!("SHOW statement_timeout")
-      assert value == "250ms"
+  describe "per-read statement_timeout via SET LOCAL (pgbouncer-safe — US-27.13)" do
+    test "SET LOCAL statement_timeout inside a transaction takes effect (SHOW reflects it)" do
+      {:ok, shown} =
+        HeavyReadRepo.transaction(fn ->
+          HeavyReadRepo.query!("SET LOCAL statement_timeout = 250")
+          %{rows: [[value]]} = HeavyReadRepo.query!("SHOW statement_timeout")
+          value
+        end)
+
+      assert shown == "250ms"
     end
 
-    test "a query exceeding statement_timeout fast-fails with 57014 query_canceled (AC-27.11.6)" do
-      # The server cancels at 250ms, well before the client/pool timeout — proof the
-      # pool-level mechanism US-27.4 relies on actually fires and releases the conn.
-      assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
-               HeavyReadRepo.query("SELECT pg_sleep(1)")
+    test "a query exceeding the SET LOCAL statement_timeout fast-fails with 57014 query_canceled (AC-27.11.6)" do
+      # The server cancels at 250ms via the SET LOCAL applied inside the transaction —
+      # proof the timeout mechanism the read path relies on actually fires through the
+      # dedicated pool (the pgbouncer-safe replacement for the rejected startup param).
+      result =
+        HeavyReadRepo.transaction(fn ->
+          HeavyReadRepo.query!("SET LOCAL statement_timeout = 250")
+
+          case HeavyReadRepo.query("SELECT pg_sleep(1)") do
+            {:error, error} -> HeavyReadRepo.rollback(error)
+            ok -> ok
+          end
+        end)
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
     end
 
-    test "the pool statement_timeout cancels a real Ecto query, not just raw SQL" do
-      # Closes the DI-seam gap: routed reads run on AdminRepo in test, so prove the
-      # dedicated pool's timeout applies to an actual Ecto.Query (built → SQL → run),
-      # not only a raw HeavyReadRepo.query/1.
-      _ = Article
+    test "the SET LOCAL statement_timeout cancels a real Ecto query, not just raw SQL" do
+      # Prove the dedicated pool's SET-LOCAL timeout applies to an actual Ecto.Query
+      # (built → SQL → run), not only a raw HeavyReadRepo.query/1.
       slow = from(s in fragment("generate_series(1, 100000000)"), select: count())
-      err = assert_raise Postgrex.Error, fn -> HeavyReadRepo.all(slow) end
-      assert err.postgres.code == :query_canceled
+
+      result =
+        HeavyReadRepo.transaction(fn ->
+          HeavyReadRepo.query!("SET LOCAL statement_timeout = 250")
+
+          try do
+            HeavyReadRepo.all(slow)
+            :no_cancel
+          rescue
+            e in Postgrex.Error -> HeavyReadRepo.rollback(e)
+          end
+        end)
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
     end
 
-    test "SET LOCAL statement_timeout lifts the pool default within a transaction (export lever)" do
-      # US-27.16 streamed exports hold a connection for minutes — longer than the fast-
-      # read pool default. SET LOCAL inside the export's transaction scopes the override
-      # to that transaction only. A 400ms query (> 250ms pool default) survives under a
-      # 5s local override.
+    test "a higher SET LOCAL statement_timeout lifts the default within its transaction (export lever)" do
+      # US-27.16 streamed exports hold a connection for minutes — longer than the fast-read
+      # default. SET LOCAL inside the export's transaction scopes the override to that
+      # transaction only. A 400ms query (> the 250ms test default) survives under a 5s local.
       result =
         HeavyReadRepo.transaction(fn ->
           HeavyReadRepo.query!("SET LOCAL statement_timeout = 5000")

@@ -68,20 +68,33 @@ headroom). If you raise any pool size or node count, re-run the above and confir
 `Loopctl.DbCapacity.fits?(live_max, nodes)` stays true (the boot check logs a warning
 otherwise).
 
-## Server-side `statement_timeout` (US-27.11 → US-27.4)
+## Server-side `statement_timeout` (US-27.11 → US-27.4 → US-27.13)
 
-`Loopctl.HeavyReadRepo` carries a **pool-level** `statement_timeout` via the repo
-`:parameters` (a CORE GUC, settable in the startup packet — verified). Default
-**10s**, override with `HEAVY_READ_STATEMENT_TIMEOUT_MS`. Every query on the heavy
-pool fast-fails at this timeout (Postgres `57014`, surfaced as
-`db_statement_timeout` by US-27.3) and releases the connection promptly — no
-per-request transaction needed. So even a fully-saturated heavy pool self-drains
-within `statement_timeout`.
+Every heavy read gets a server-side `statement_timeout`, applied **per-read via
+`SET LOCAL` inside a short transaction** by `Loopctl.HeavyRead` (`opts/1` → `all/one` →
+`transaction/2`). Default **10s**, set with `HEAVY_READ_STATEMENT_TIMEOUT_MS`. A query that
+exceeds it fast-fails (Postgres `57014`, surfaced as `db_statement_timeout` by US-27.3) and
+the transaction commits/releases the connection promptly — so even a fully-saturated heavy
+pool self-drains within `statement_timeout`.
 
-Verify live:
+> **⚠ Do NOT set this as a connection startup `:parameters` value (US-27.13 outage).** Fly
+> MPG fronts Postgres with **pgbouncer**, which rejects a `statement_timeout` startup
+> parameter with `FATAL 08P01 unsupported startup parameter` and **crash-loops the entire
+> HeavyReadRepo pool** — every heavy endpoint then 503/504s. (It "works" against direct
+> Postgres, which is why CI didn't catch it; `config_pgbouncer_safe_parameters_test.exs` +
+> the `pgbouncer-e2e` CI job now guard this.) `SET LOCAL` inside a transaction is the only
+> pgbouncer-safe way to set a server GUC; a GUC that must persist at connect goes via
+> `ALTER ROLE` (the `hnsw.ef_search` lever), never `:parameters`.
+
+Verify the per-read timeout live (it is NOT a session/pool GUC, so a bare `SHOW` reads the
+server default — read it INSIDE the SET LOCAL transaction):
 
 ```sh
-fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyReadRepo.query!(\"SHOW statement_timeout\").rows)'"
+fly ssh console -a loopctl -C "/app/bin/loopctl rpc '
+  {:ok, v} = Loopctl.HeavyReadRepo.transaction(fn ->
+    Loopctl.HeavyReadRepo.query!(\"SET LOCAL statement_timeout = 10000\")
+    Loopctl.HeavyReadRepo.query!(\"SHOW statement_timeout\").rows
+  end); IO.inspect(v)'"
 ```
 
 > **Note for US-27.16 (streamed export):** a minutes-long export must NOT inherit
@@ -93,29 +106,28 @@ fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyRea
 
 ## Per-endpoint `statement_timeout` + slow-query logging (US-27.4)
 
-**Default heavy-read timeout:** every heavy read runs under the pool-level
+**Default heavy-read timeout:** every heavy read runs under the per-read `SET LOCAL`
 `statement_timeout` (`HEAVY_READ_STATEMENT_TIMEOUT_MS`, default 10s — see above). When
 it fires, the request fast-fails as the structured **504 `db_statement_timeout`**
-(US-27.3) and the connection is released promptly — no 30s hang, no per-request
-transaction.
+(US-27.3) and the connection is released promptly — no 30s hang.
 
 **Per-endpoint override (optional):** to give one endpoint a tighter (or looser) bound,
 set `:heavy_read_statement_timeout_overrides` (ms) in config — keys
-`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`:
+`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`, `:vector_search`:
 
 ```elixir
 config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
 ```
 
-An override applies via `SET LOCAL` inside a transaction on the dedicated heavy pool
-(justified by the 8-conn sizing); endpoints with no override use the pool default (no
-transaction). Leave it empty unless an endpoint needs a different bound.
+An override (or the default) applies via `SET LOCAL` inside a short transaction on the
+dedicated heavy pool (justified by the 8-conn sizing). Leave the map empty unless an
+endpoint needs a bound different from the `HEAVY_READ_STATEMENT_TIMEOUT_MS` default.
 
 **Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
 `:semantic_search`, `:distant_pairs`, `:novelty`, `:enumeration`. The enumeration endpoint
 (`:knowledge_search_controller` list mode, `list_filtered/2`) now routes through HeavyRead to
-inherit the pool-level statement_timeout and optional per-endpoint override (matching the other
-four endpoints). Enumeration pages up to `limit: 1000` rows per request.
+inherit the per-read SET LOCAL statement_timeout and optional per-endpoint override (matching
+the other endpoints). Enumeration pages up to `limit: 1000` rows per request.
 
 **Slow-query logging:** `Loopctl.Telemetry.SlowQueryLogger` (attached at boot) logs any
 query slower than `:slow_query_threshold_ms` (default **1000**, tunable in config/env)
@@ -128,6 +140,48 @@ and `request_id=` empty. Lower the threshold to surface a trend before it become
 ```elixir
 config :loopctl, :slow_query_threshold_ms, 500
 ```
+
+## pgbouncer compatibility (US-27.13 — the heavy-read outage)
+
+Fly Managed Postgres fronts Postgres with **pgbouncer**. The US-27.13 outage was a
+`statement_timeout` connection STARTUP parameter on `HeavyReadRepo` that pgbouncer rejected
+(`FATAL 08P01 unsupported startup parameter`), crash-looping the pool so every heavy endpoint
+503/504'd. It was invisible to CI because CI uses **direct Postgres** (which accepts the
+param). Hard-won rules for anything touching the DB layer behind pgbouncer:
+
+- **No GUC via connection `:parameters`.** A server GUC is applied per-read via `SET LOCAL`
+  inside a transaction (`Loopctl.HeavyRead`); a GUC that must persist at connect goes via
+  `ALTER ROLE` (the `hnsw.ef_search` lever). The config-lint
+  (`config_pgbouncer_safe_parameters_test.exs`) blocks a re-added startup `:parameters` GUC —
+  but that is ONLY the startup-parameter member of the class. It does NOT guard the other
+  pgbouncer-sensitive paths below; those depend on the **pool mode**.
+- **`prepare: :unnamed` on all three repos.** Under pgbouncer **transaction** pooling, named
+  prepared statements cached on one server connection break when the next transaction lands on
+  another (`26000`/`42P05`). All repos set `prepare: :unnamed`; the `pgbouncer-e2e` job proves
+  a query reused across `pool_size: 2` transactions succeeds.
+- **Pool-mode-sensitive paths NOT covered by the config-lint:** Oban's Postgres notifier
+  (LISTEN/NOTIFY) and any `Repo.stream` without an enclosing transaction silently misbehave
+  under transaction pooling. Keep them in mind for any new feature.
+- **VERIFY the live pgbouncer config** (the single most important setting for this whole
+  design, currently NOT pinned in-repo): run `SHOW CONFIG` via the pgbouncer admin console (or
+  Fly support) and record `pool_mode` and `ignore_startup_parameters` here with a "last
+  verified" date — same discipline as `max_connections`. Fly MPG documents **session mode** as
+  the default; the CI `pgbouncer-e2e` deliberately runs the STRICTER **transaction** mode (the
+  08P01 rejection is pool-mode-independent, and transaction mode is the harder case for
+  prepared statements), so a green e2e is a conservative superset, not an exact prod mirror.
+
+### Per-read transaction hold-time (re-verify under load — M1)
+
+US-27.13 changed each heavy read from a single autocommit `SELECT` to a short
+`BEGIN; SET LOCAL statement_timeout; SELECT; COMMIT` (~3 server round-trips, connection held
+BEGIN→COMMIT). `Loopctl.DbCapacity` models connection **count**, not hold-time, so the K≈6
+fast-read budget is now slightly more contended per the same concurrency. The per-read
+`statement_timeout` makes the pool **self-drain** (a runaway read is canceled), so this is a
+latency/throughput risk, not a deadlock — but per the "verify against prod scale" practice,
+re-check heavy-read p95 + pool queue-wait under load after deploy (the #172 incident proves
+this pool is the real contention point). Measured prod baselines at ~77k (deployed fix):
+`suggested_links` ~59ms, semantic ~45ms, novelty ~1.4s, distant_pairs ~7.9s (the slowest —
+within the 10s cap but worth watching as the corpus grows).
 
 ## Keyset pagination index (US-27.9a)
 

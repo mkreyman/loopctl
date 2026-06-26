@@ -6,8 +6,12 @@ defmodule Loopctl.Knowledge do
   are the core knowledge units — reusable patterns, conventions,
   decisions, findings, and references within a tenant's knowledge base.
 
-  All operations use AdminRepo (BYPASSRLS) with explicit `tenant_id`
-  scoping, following the same pattern as other loopctl contexts.
+  Most operations use AdminRepo (BYPASSRLS) with explicit `tenant_id`
+  scoping, following the same pattern as other loopctl contexts. The heavy
+  vector/enumeration reads (suggested_links, semantic search, distant_pairs,
+  novelty, enumeration) route through `Loopctl.HeavyRead` → the dedicated
+  `Loopctl.HeavyReadRepo` pool (also BYPASSRLS, same explicit `tenant_id`
+  scoping), isolated so a slow read can't starve light admin ops.
 
   ## Usage
 
@@ -1604,7 +1608,7 @@ defmodule Loopctl.Knowledge do
     filtered = apply_search_filters(base, status, opts)
 
     # US-27.4: Count and results both route through HeavyRead to inherit the
-    # pool-level statement_timeout and optional per-endpoint override.
+    # per-read SET LOCAL statement_timeout and optional per-endpoint override.
     count_query = from(a in filtered, select: count(a.id))
     total_count = HeavyRead.one(tenant_id, count_query, heavy_read_opts(:enumeration))
 
@@ -3243,9 +3247,9 @@ defmodule Loopctl.Knowledge do
 
   defp suggestion_candidates(tenant_id, article_id, embedding, threshold, limit, vis) do
     # Routed through Loopctl.HeavyRead (US-27.11): the dedicated heavy-read pool,
-    # isolated from the small AdminRepo pool and carrying a pool-level
-    # statement_timeout — no per-request transaction (the constraint that shaped the
-    # #172 fix). The wrapper structurally requires a tenant_id-filtered query; the
+    # isolated from the small AdminRepo pool, with a per-read SET LOCAL
+    # statement_timeout (US-27.13 — a short transaction, the connection released at
+    # commit). The wrapper structurally requires a tenant_id-filtered query; the
     # tenant predicate lives in this query's inner subquery. The 15s client timeout
     # is a backstop above the server-side statement_timeout.
     query = suggestion_candidates_query(tenant_id, article_id, embedding, threshold, limit, vis)
@@ -3815,9 +3819,10 @@ defmodule Loopctl.Knowledge do
       )
 
     # Fetch count and paginated pairs through Loopctl.HeavyRead (US-27.11): the
-    # dedicated heavy-read pool with a pool-level statement_timeout, isolated from the
-    # small AdminRepo pool so this O(n²) self-join can't starve light admin ops. No
-    # transaction hold (count may shift between queries — acceptable, by design). Both
+    # dedicated heavy-read pool with a per-read SET LOCAL statement_timeout (US-27.13),
+    # isolated from the small AdminRepo pool so this O(n²) self-join can't starve light
+    # admin ops. No SHARED transaction across the two reads — each is its own short
+    # SET LOCAL transaction, so the count may shift between them (acceptable, by design). Both
     # queries filter `a.tenant_id`/`b.tenant_id`, satisfying the wrapper's guard.
     total_count =
       count_query

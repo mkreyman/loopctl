@@ -22,4 +22,11 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 # Plain `mix test` always excludes both :scale and :scale_nightly.
 scale_excluded = if System.get_env("SCALE_TESTS"), do: [], else: [:scale]
 nightly_excluded = if System.get_env("SCALE_NIGHTLY"), do: [], else: [:scale_nightly]
-ExUnit.configure(exclude: scale_excluded ++ nightly_excluded)
+
+# :pgbouncer e2e (US-27.13) needs a real pgbouncer in front of Postgres (no pgbouncer
+# locally / in the default CI Test job). It runs only when PGBOUNCER_URL is set — the
+# dedicated CI pgbouncer-e2e job, or locally against a transaction-mode pgbouncer:
+#   PGBOUNCER_URL=postgres://postgres:postgres@127.0.0.1:6432/loopctl_test \
+#     mix test --include pgbouncer test/loopctl/pgbouncer_startup_params_test.exs
+pgbouncer_excluded = if System.get_env("PGBOUNCER_URL"), do: [], else: [:pgbouncer]
+ExUnit.configure(exclude: scale_excluded ++ nightly_excluded ++ pgbouncer_excluded)

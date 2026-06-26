@@ -7,23 +7,29 @@ defmodule Loopctl.HeavyReadRepo do
   Heavy vector/enumeration reads (semantic search, suggested-links candidates,
   distant-pairs, novelty) previously shared the tiny 3-connection `AdminRepo`
   pool with every other cross-tenant admin op. Three concurrent heavy reads
-  could monopolize all admin capacity — this already distorted the #172 fix,
-  which had to avoid a per-request transaction precisely to dodge starvation on
-  that pool.
+  could monopolize all admin capacity.
 
   Isolating heavy reads on their own pool (Theme 4):
 
   - removes that hidden coupling (a slow vector read can't starve light admin
     ops, and vice-versa — they are on physically separate pools), and
-  - gives US-27.4 (statement_timeout) and US-27.6b (recall) a clean, pool-level
-    lever via `:parameters`, with no per-request transaction.
+  - gives US-27.4 (statement_timeout) and US-27.6b (recall) a dedicated, bounded
+    pool whose per-read timeout self-drains it under load.
 
-  ## Pool-level server-side parameters
+  ## Server-side statement_timeout — per-read `SET LOCAL`, NOT `:parameters` (US-27.13)
 
-  This repo's `:parameters` (set in `config/runtime.exs`) carry a server-side
-  `statement_timeout` (a CORE GUC, settable via the startup packet — verified).
-  So every query on this pool fast-fails at the configured timeout and releases
-  the connection, instead of holding it for the full client/pool timeout.
+  The server-side `statement_timeout` is applied PER-READ via `SET LOCAL` inside the
+  `Loopctl.HeavyRead` transaction path (`opts/1` → `all/one` → `transaction/2`), so every
+  heavy read fast-fails at the configured timeout and releases the connection.
+
+  It is **deliberately NOT** carried as a connection startup `:parameters` value. Fly MPG
+  (and managed Postgres generally) fronts the database with **pgbouncer**, which rejects a
+  `statement_timeout` startup parameter with `FATAL 08P01 unsupported startup parameter` —
+  this crash-loops the whole pool so it never establishes a connection (the US-27.13
+  production outage). `SET LOCAL` inside a transaction is the pgbouncer-safe mechanism and is
+  verified to enforce against the live pool. A regression guard
+  (`config_pgbouncer_safe_parameters_test.exs`) blocks any repo from re-adding such a
+  startup parameter.
 
   `hnsw.ef_search` is a pgvector CUSTOM GUC that does not exist until the
   extension loads per-session, so it is NOT settable via `:parameters` on
@@ -48,5 +54,6 @@ defmodule Loopctl.HeavyReadRepo do
 
   use Ecto.Repo,
     otp_app: :loopctl,
-    adapter: Ecto.Adapters.Postgres
+    adapter: Ecto.Adapters.Postgres,
+    prepare: :unnamed
 end
