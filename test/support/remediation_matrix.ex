@@ -350,7 +350,16 @@ defmodule Loopctl.RemediationMatrix do
             limit: 21
           )
 
-        PlanAssertions.refute_full_scan(query)
+        # A selective `source_id =` equality (~1 of 800 buckets) on the FIRST page has TWO
+        # legitimate BOUNDED plans the cost-based planner picks between (a stats shift flips
+        # it — observed across local PG vs CI pg16): the composite source index walked as an
+        # Index Scan, OR a Bitmap Heap Scan over the ~24 matching rows + a Sort. Both are
+        # bounded and correct — pinning `refute_full_scan` false-REDs the bitmap branch
+        # (US-27.17 terminal-pass remediation). Assert the planner-agnostic invariant the
+        # by_tag residual uses: no unbounded Seq Scan AND the scan stays bounded well below
+        # the corpus (the ~24-row source bucket is ≪ corpus/8).
+        PlanAssertions.refute_seq_scan(query)
+        PlanAssertions.assert_scan_rows_below(query, div(prod_floor, 8))
       end),
       asserted("by_tag_keyset", :enumeration, fn ->
         query =
