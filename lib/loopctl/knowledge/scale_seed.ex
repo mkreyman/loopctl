@@ -674,10 +674,14 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     # Tenant-scoped committed row count gives an exact assertion that THIS
     # seed's rows reached the planner — table-wide n_live_tup can pass
     # spuriously on shared/re-used DBs where other tenants have rows.
+    # Count ALL statuses: `inserted_count` is every seeded row, so under
+    # `status_mix: true` (~20% draft/archived) a published-only count would be
+    # below inserted_count and spuriously trip the safety-net (defeating it). For an
+    # all-published corpus this is identical to the old published-only count.
     actual_count =
       AdminRepo.one!(
         from a in Article,
-          where: a.tenant_id == ^tenant_id and a.status == :published,
+          where: a.tenant_id == ^tenant_id,
           select: count(a.id)
       )
 
