@@ -31,10 +31,11 @@ config :loopctl,
   # handler. Tunable in config/env without a code change.
   slow_query_threshold_ms: 1_000,
   # US-27.4: optional per-endpoint SERVER-SIDE statement_timeout overrides (ms) for
-  # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the
-  # pool-level statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s) with
-  # no per-request transaction. Keys: :suggested_links, :semantic_search,
-  # :distant_pairs, :novelty, :enumeration, :change_feed. NOTE: :distant_pairs,
+  # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the default
+  # per-read SET LOCAL statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s;
+  # US-27.13 — NOT a startup :parameters value, which pgbouncer rejects). Keys:
+  # :suggested_links, :semantic_search, :distant_pairs, :novelty, :enumeration,
+  # :change_feed, :vector_search. NOTE: :distant_pairs,
   # :semantic_search, and :enumeration each issue TWO reads (count + data); setting an
   # override for any of them wraps EACH read in its own separate transaction, doubling
   # the brief checkout count on the heavy pool. :change_feed (US-27.9b) is the

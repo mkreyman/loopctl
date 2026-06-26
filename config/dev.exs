@@ -21,8 +21,10 @@ config :loopctl, Loopctl.AdminRepo,
   pool_size: 3
 
 # HeavyReadRepo — same credentials/database in dev (BYPASSRLS role in production).
-# Small pool in dev; a real statement_timeout :parameters is configured in prod
-# (runtime.exs). See Loopctl.HeavyReadRepo.
+# Small pool in dev. The server-side statement_timeout is applied per-read via SET LOCAL
+# (Loopctl.HeavyRead.opts/1), defaulting to 10s in dev since `:heavy_read_statement_timeout_ms`
+# is unset here. It is NOT a startup `:parameters` value (pgbouncer rejects that — 08P01,
+# US-27.13). See Loopctl.HeavyReadRepo.
 config :loopctl, Loopctl.HeavyReadRepo,
   username: "postgres",
   password: "postgres",

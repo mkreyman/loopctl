@@ -109,12 +109,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
   — and `HeavyRead.all/3`'s structural guard rejects any query whose base-table
   sources aren't all bound to the passed tenant.
 
-  ## No per-request transaction (AC-27.6a.6)
+  ## Per-read SET LOCAL transaction (US-27.13; supersedes the AC-27.6a.6 "no transaction" note)
 
-  `nearest/4` is a bare `HeavyRead.all/3` (no `:statement_timeout` override), i.e.
-  a bare pool read with no enclosing transaction — matching
-  `search_semantic`/`distant_pairs`, and avoiding the #172 round-1 pool-starvation
-  anti-pattern on the small admin pool.
+  `nearest/4` runs through `HeavyRead.all/3`, which now wraps every heavy read in a SHORT
+  `SET LOCAL statement_timeout` transaction (`BEGIN; SET LOCAL; SELECT; COMMIT`). This is the
+  pgbouncer-safe way to apply a server-side timeout (a startup-`:parameters` statement_timeout
+  is rejected by pgbouncer — the US-27.13 outage). The transaction is per-read and short — the
+  connection is released at COMMIT — so it does NOT reintroduce the #172 round-1 long-held
+  pool-starvation anti-pattern; it is the opposite (a bounded, self-draining hold). The
+  earlier AC-27.6a.6 "bare pool read, no per-request transaction" guarantee is obsolete: a
+  per-read transaction is now unavoidable behind pgbouncer.
   """
 
   import Ecto.Query
@@ -163,11 +167,6 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # Maximum number of tag values accepted in a `:tags` overlap filter, so a caller
   # can't pass an unbounded array literal into the index-residual `&&` predicate.
   @default_max_tags 50
-
-  # Client-side timeout backstop for the heavy read (US-27.4 pattern). The
-  # server-side statement_timeout (pool-level) is the real cap; this is a ceiling
-  # above it so a hung connection can't pin a process forever.
-  @client_timeout_ms 15_000
 
   @doc "Maximum permitted `k`/limit (config `:vector_search_max_k`, default #{@default_max_k})."
   @spec max_k() :: pos_integer()
@@ -238,8 +237,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
   Executes the index-correct kNN query and returns up to `k` candidate maps,
   highest similarity first.
 
-  A bare `HeavyRead.all/3` (no `:statement_timeout` override) — a pool read with
-  NO per-request transaction (AC-27.6a.6).
+  Runs via `HeavyRead.all/3`, which applies the `:vector_search` server-side
+  statement_timeout per-read via a short `SET LOCAL` transaction (US-27.13).
 
   See `candidate_query/4` for the parameters and `opts`. All cost-affecting params
   are clamped to their documented bounds before the query is built (AC-27.6a.4).
@@ -569,10 +568,12 @@ defmodule Loopctl.Knowledge.VectorSearch do
   def to_embedding_list(%Pgvector{} = vector), do: Pgvector.to_list(vector)
   def to_embedding_list(vector) when is_list(vector), do: vector
 
-  # Per-read heavy-read options: the 15s CLIENT timeout backstop + the endpoint key
-  # for slow-query telemetry (US-27.4). NO `:statement_timeout` override → bare pool
-  # read, no per-request transaction (AC-27.6a.6).
+  # Per-read heavy-read options. Delegates to the SINGLE source of truth, `HeavyRead.opts/1`
+  # (US-27.13), so this read carries the `:vector_search` server-side statement_timeout
+  # (per-endpoint override else the pool default, applied via SET LOCAL) AND the endpoint key
+  # for slow-query telemetry — rather than hand-rolling a list that drifts from every other
+  # heavy consumer. `HeavyRead.opts/1` carries the 15s client-timeout backstop itself.
   defp heavy_read_opts do
-    [timeout: @client_timeout_ms, telemetry_options: [endpoint: :vector_search]]
+    HeavyRead.opts(:vector_search)
   end
 end

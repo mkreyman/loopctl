@@ -15,7 +15,9 @@ defmodule Loopctl.Knowledge.StreamingExport do
   download — pinning one of the few BYPASSRLS heavy-read connections AND `xmin`
   (blocking vacuum on a churning 76k-row table) for minutes. Instead we page with
   the keyset cursor on `(inserted_at, id)`: each page is a SHORT
-  `Loopctl.HeavyRead.all/3` read that RELEASES the connection between pages. The
+  `Loopctl.HeavyRead.all/3` read — a brief per-read `SET LOCAL statement_timeout`
+  transaction (US-27.13) that COMMITS and RELEASES the connection + `xmin` between
+  pages, NOT one long-held transaction across the whole download. The
   walk is drift-free (seeks the stable unique tuple, never an OFFSET).
 
   ## Tenant scoping under BYPASSRLS (AC-27.16.5)

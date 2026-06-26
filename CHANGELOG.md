@@ -2,6 +2,36 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-25 — heavy-read pgbouncer outage fix (US-27.13)
+
+### Fixed
+
+- **HeavyReadRepo pgbouncer `08P01` outage (US-27.13):** the dedicated heavy-read pool
+  carried a `statement_timeout` connection STARTUP parameter (`parameters:` in
+  `config/runtime.exs`), which Fly MPG's pgbouncer rejects with
+  `FATAL 08P01 unsupported startup parameter`, crash-looping the pool so it never
+  established a connection — every heavy vector/enumeration endpoint (`suggested_links`,
+  semantic search, `distant_pairs`, `novelty`, heavy enumeration) hung then `503/504`'d.
+  It was invisible to CI because the suite connects to direct Postgres (which accepts the
+  startup param) and aliases heavy reads to `AdminRepo`. The server-side `statement_timeout`
+  is now applied per-read via `SET LOCAL` inside a transaction (the pgbouncer-safe mechanism).
+
+### Changed
+
+- **Heavy-read `statement_timeout` configuration:** set via `HEAVY_READ_STATEMENT_TIMEOUT_MS`
+  (default 10s) and the per-endpoint `:heavy_read_statement_timeout_overrides` map, applied
+  per-read via `SET LOCAL` — **NOT** a connection startup `:parameters` value
+  (pgbouncer-incompatible). A server GUC that must persist at connect is set via `ALTER ROLE`
+  (the documented `hnsw.ef_search` lever), never a startup parameter.
+
+### Added
+
+- **Recurrence guards:** `config_pgbouncer_safe_parameters_test.exs` (scans the config
+  source — incl. `runtime.exs` — and fails on any pgbouncer-incompatible repo `:parameters`)
+  and a pgbouncer-layer e2e (`pgbouncer_startup_params_test.exs` + a CI `pgbouncer-e2e` job
+  that gates deploy) which reproduces the `08P01` rejection and proves `SET LOCAL` enforces
+  through the proxy.
+
 ## [Unreleased] — 2026-06-22 — knowledge wiki harvest-hardening (#132–#138)
 
 A batch of Knowledge Wiki API changes for reliable agent/harvest workflows.

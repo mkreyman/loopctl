@@ -44,9 +44,11 @@ defmodule Loopctl.HeavyRead do
   The test env points it at `Loopctl.AdminRepo` (config/test.exs) so heavy reads
   share the sandbox connection that fixtures insert through. The guard and tenant
   isolation are repo-agnostic and fully exercised regardless of which repo backs
-  it; the dedicated pool's `:parameters` (statement_timeout) are exercised directly
-  by `heavy_read_repo_test.exs` / `heavy_read_pool_isolation_test.exs` (incl. a real
-  Ecto query canceled by the pool timeout). True OS-level pool starvation is not
+  it; the per-read `SET LOCAL statement_timeout` mechanism is exercised directly on the
+  dedicated pool by `heavy_read_repo_test.exs` / `heavy_read_pool_isolation_test.exs` (incl.
+  a real Ecto query canceled by the timeout). (US-27.13: the timeout is applied per-read via
+  SET LOCAL, NOT a startup `:parameters` — pgbouncer rejects the latter with 08P01.) True
+  OS-level pool starvation is not
   reproducible under Sandbox, so TC-27.11.1's concurrency guarantee is structural
   (separate pools + bounded hold) and is re-verified under load per
   docs/runbooks/knowledge-scale.md.
@@ -74,7 +76,7 @@ defmodule Loopctl.HeavyRead do
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
   `[timeout, telemetry_options, statement_timeout]` shape can't drift between callers.
   Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`,
-  `:enumeration`, `:change_feed`.
+  `:enumeration`, `:change_feed`, `:vector_search` (the shared kNN helper path).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
@@ -92,8 +94,14 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
+  # The pool-wide default server-side statement_timeout (ms). Defensive: a missing or
+  # mis-typed (`nil`/0/negative) `:heavy_read_statement_timeout_ms` falls back to 10s rather
+  # than yielding a non-positive value that would defeat the always-timed invariant.
   defp default_statement_timeout do
-    Application.get_env(:loopctl, :heavy_read_statement_timeout_ms, 10_000)
+    case Application.get_env(:loopctl, :heavy_read_statement_timeout_ms, 10_000) do
+      ms when is_integer(ms) and ms > 0 -> ms
+      _ -> 10_000
+    end
   end
 
   defp statement_timeout_override(endpoint) do
@@ -114,30 +122,38 @@ defmodule Loopctl.HeavyRead do
   """
   @spec all(binary(), Ecto.Queryable.t(), keyword()) :: [term()]
   def all(tenant_id, queryable, opts \\ []) do
-    {st, opts} = Keyword.pop(opts, :statement_timeout)
+    # `Keyword.pop/3` with a default cleanly distinguishes "absent → pool default" from a
+    # PRESENT value (which is validated as a positive int below) — unlike `st || default`,
+    # which would silently treat an explicit `0` as truthy and an explicit `nil` as "use
+    # default", muddying the always-timed contract.
+    {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st || default_statement_timeout(), fn -> repo().all(query, opts) end)
+    with_statement_timeout(st, fn -> repo().all(query, opts) end)
   end
 
   @doc "Like `Repo.one/2`, with the same tenant-scoping guard and `:statement_timeout` as `all/3`."
   @spec one(binary(), Ecto.Queryable.t(), keyword()) :: term() | nil
   def one(tenant_id, queryable, opts \\ []) do
-    {st, opts} = Keyword.pop(opts, :statement_timeout)
+    {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     query = guard!(tenant_id, queryable)
-    with_statement_timeout(st || default_statement_timeout(), fn -> repo().one(query, opts) end)
+    with_statement_timeout(st, fn -> repo().one(query, opts) end)
   end
 
-  # Run `fun` under a per-read SET LOCAL statement_timeout (when given) or directly
-  # (pool default). `nil` means "no override" — the common path, no transaction.
-  defp with_statement_timeout(nil, fun), do: fun.()
-
+  # Run `fun` under a per-read SET LOCAL statement_timeout. There is NO un-timed path:
+  # `all/one` always resolve a positive default, and a non-positive/`nil` value (an explicit
+  # mis-call) raises rather than silently running un-timed (US-27.13: every heavy read MUST
+  # carry a server-side timeout since the pgbouncer-rejected startup `:parameters` lever is gone).
   defp with_statement_timeout(ms, fun) when is_integer(ms) and ms > 0 do
     case transaction(fun, statement_timeout: ms) do
       {:ok, result} ->
         result
 
-      {:error, reason} ->
-        raise "heavy read aborted: #{inspect(reason)}"
+      # A heavy read aborts only via an explicit Repo.rollback (the timeout CANCEL itself is
+      # a raised Postgrex.Error that propagates as-is to the DBErrorBackstop). Keep the
+      # message opaque — never interpolate the rollback reason, which could carry raw SQL /
+      # vector text and defeat the US-27.3 sanitization contract.
+      {:error, _reason} ->
+        raise "heavy read aborted (transaction rolled back)"
     end
   end
 

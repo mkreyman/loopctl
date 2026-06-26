@@ -68,20 +68,33 @@ headroom). If you raise any pool size or node count, re-run the above and confir
 `Loopctl.DbCapacity.fits?(live_max, nodes)` stays true (the boot check logs a warning
 otherwise).
 
-## Server-side `statement_timeout` (US-27.11 → US-27.4)
+## Server-side `statement_timeout` (US-27.11 → US-27.4 → US-27.13)
 
-`Loopctl.HeavyReadRepo` carries a **pool-level** `statement_timeout` via the repo
-`:parameters` (a CORE GUC, settable in the startup packet — verified). Default
-**10s**, override with `HEAVY_READ_STATEMENT_TIMEOUT_MS`. Every query on the heavy
-pool fast-fails at this timeout (Postgres `57014`, surfaced as
-`db_statement_timeout` by US-27.3) and releases the connection promptly — no
-per-request transaction needed. So even a fully-saturated heavy pool self-drains
-within `statement_timeout`.
+Every heavy read gets a server-side `statement_timeout`, applied **per-read via
+`SET LOCAL` inside a short transaction** by `Loopctl.HeavyRead` (`opts/1` → `all/one` →
+`transaction/2`). Default **10s**, set with `HEAVY_READ_STATEMENT_TIMEOUT_MS`. A query that
+exceeds it fast-fails (Postgres `57014`, surfaced as `db_statement_timeout` by US-27.3) and
+the transaction commits/releases the connection promptly — so even a fully-saturated heavy
+pool self-drains within `statement_timeout`.
 
-Verify live:
+> **⚠ Do NOT set this as a connection startup `:parameters` value (US-27.13 outage).** Fly
+> MPG fronts Postgres with **pgbouncer**, which rejects a `statement_timeout` startup
+> parameter with `FATAL 08P01 unsupported startup parameter` and **crash-loops the entire
+> HeavyReadRepo pool** — every heavy endpoint then 503/504s. (It "works" against direct
+> Postgres, which is why CI didn't catch it; `config_pgbouncer_safe_parameters_test.exs` +
+> the `pgbouncer-e2e` CI job now guard this.) `SET LOCAL` inside a transaction is the only
+> pgbouncer-safe way to set a server GUC; a GUC that must persist at connect goes via
+> `ALTER ROLE` (the `hnsw.ef_search` lever), never `:parameters`.
+
+Verify the per-read timeout live (it is NOT a session/pool GUC, so a bare `SHOW` reads the
+server default — read it INSIDE the SET LOCAL transaction):
 
 ```sh
-fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyReadRepo.query!(\"SHOW statement_timeout\").rows)'"
+fly ssh console -a loopctl -C "/app/bin/loopctl rpc '
+  {:ok, v} = Loopctl.HeavyReadRepo.transaction(fn ->
+    Loopctl.HeavyReadRepo.query!(\"SET LOCAL statement_timeout = 10000\")
+    Loopctl.HeavyReadRepo.query!(\"SHOW statement_timeout\").rows
+  end); IO.inspect(v)'"
 ```
 
 > **Note for US-27.16 (streamed export):** a minutes-long export must NOT inherit
@@ -93,29 +106,28 @@ fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.HeavyRea
 
 ## Per-endpoint `statement_timeout` + slow-query logging (US-27.4)
 
-**Default heavy-read timeout:** every heavy read runs under the pool-level
+**Default heavy-read timeout:** every heavy read runs under the per-read `SET LOCAL`
 `statement_timeout` (`HEAVY_READ_STATEMENT_TIMEOUT_MS`, default 10s — see above). When
 it fires, the request fast-fails as the structured **504 `db_statement_timeout`**
-(US-27.3) and the connection is released promptly — no 30s hang, no per-request
-transaction.
+(US-27.3) and the connection is released promptly — no 30s hang.
 
 **Per-endpoint override (optional):** to give one endpoint a tighter (or looser) bound,
 set `:heavy_read_statement_timeout_overrides` (ms) in config — keys
-`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`:
+`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`, `:vector_search`:
 
 ```elixir
 config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
 ```
 
-An override applies via `SET LOCAL` inside a transaction on the dedicated heavy pool
-(justified by the 8-conn sizing); endpoints with no override use the pool default (no
-transaction). Leave it empty unless an endpoint needs a different bound.
+An override (or the default) applies via `SET LOCAL` inside a short transaction on the
+dedicated heavy pool (justified by the 8-conn sizing). Leave the map empty unless an
+endpoint needs a bound different from the `HEAVY_READ_STATEMENT_TIMEOUT_MS` default.
 
 **Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
 `:semantic_search`, `:distant_pairs`, `:novelty`, `:enumeration`. The enumeration endpoint
 (`:knowledge_search_controller` list mode, `list_filtered/2`) now routes through HeavyRead to
-inherit the pool-level statement_timeout and optional per-endpoint override (matching the other
-four endpoints). Enumeration pages up to `limit: 1000` rows per request.
+inherit the per-read SET LOCAL statement_timeout and optional per-endpoint override (matching
+the other endpoints). Enumeration pages up to `limit: 1000` rows per request.
 
 **Slow-query logging:** `Loopctl.Telemetry.SlowQueryLogger` (attached at boot) logs any
 query slower than `:slow_query_threshold_ms` (default **1000**, tunable in config/env)

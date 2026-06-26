@@ -18,26 +18,31 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
   This guard scans the config SOURCE (so it covers `config/runtime.exs`, the PROD-only file
   that `Application.get_env` never reflects during `mix test` — i.e. the exact file the bug
   lived in) and fails the build if any `parameters: [...]` list carries a key outside the
-  pgbouncer-safe allowlist. A server-side `statement_timeout` must instead be applied
-  per-read via `SET LOCAL` inside a transaction (`Loopctl.HeavyRead`), the pgbouncer-safe
-  path. The pgbouncer-safe escape hatch for a server GUC at connect is the `options` startup
-  parameter (allowlisted), not a bare GUC key.
+  pgbouncer-safe allowlist. A server-side `statement_timeout` (or any GUC) must instead be
+  applied per-read via `SET LOCAL` inside a transaction (`Loopctl.HeavyRead`), the
+  pgbouncer-safe path; a connect-time GUC that must persist is set via `ALTER ROLE` (the
+  documented `hnsw.ef_search` lever), NOT a startup parameter.
+
+  NB: there is NO startup-parameter escape hatch for a GUC behind pgbouncer. In particular
+  `options` (`-c statement_timeout=...`) is NOT safe — Fly MPG's pgbouncer rejects a
+  `statement_timeout` smuggled via `options` too (pgbouncer #907), and a GUC set via the
+  startup `options` packet leaks across clients under transaction pooling. So `options` is
+  deliberately NOT allowlisted.
   """
   use ExUnit.Case, async: true
 
-  # Startup parameters pgbouncer forwards/accepts (its default tracked set + the `options`
-  # escape hatch). Everything else — `statement_timeout`, `lock_timeout`,
-  # `idle_in_transaction_session_timeout`, any pgvector custom GUC like `hnsw.ef_search` —
-  # is rejected with 08P01 and MUST NOT appear in an Ecto repo `:parameters` list.
+  # Startup parameters pgbouncer forwards/accepts by DEFAULT (no pgbouncer-side config —
+  # which loopctl does not control on Fly MPG). This is the minimal libpq-negotiated set.
+  # Everything else — `statement_timeout`, `lock_timeout`,
+  # `idle_in_transaction_session_timeout`, any pgvector custom GUC like `hnsw.ef_search`,
+  # AND `options` (which can smuggle a GUC and is itself rejected) — is rejected with 08P01
+  # and MUST NOT appear in an Ecto repo `:parameters` list.
   @pgbouncer_safe_startup_params ~w(
     application_name
     client_encoding
     datestyle
     timezone
     standard_conforming_strings
-    extra_float_digits
-    search_path
-    options
   )
 
   @config_files Path.wildcard("config/*.exs")
@@ -73,11 +78,24 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
       assert "statement_timeout" not in @pgbouncer_safe_startup_params
     end
 
-    test "the scanner IGNORES comment lines (no false positive on documentation)" do
+    test "the `options` GUC-smuggle is flagged — `options: \"-c statement_timeout=...\"` is NOT a safe escape hatch" do
+      # pgbouncer rejects statement_timeout via `options` too (pgbouncer #907), and a GUC set
+      # via the startup `options` packet leaks across clients under transaction pooling. The
+      # allowlist must NOT bless `options`, or it re-opens the US-27.13 outage class.
+      smuggle = ~s(  parameters: [options: "-c statement_timeout=10000"])
+      assert [{_inner, keys}] = scan_parameter_lists(smuggle)
+      assert "options" in keys
+      assert "options" not in @pgbouncer_safe_startup_params
+    end
+
+    test "the scanner IGNORES comment lines AND inline trailing comments (no false positive on docs)" do
       # The config files DOCUMENT the forbidden shape in comments (e.g. "no
-      # `parameters: [statement_timeout: ...]` here"). Those must not trip the guard.
-      commented = ~s(  # NO parameters: [statement_timeout: ...] here — pgbouncer rejects it)
-      assert scan_parameter_lists(commented) == []
+      # `parameters: [statement_timeout: ...]` here"). Neither a whole-line comment nor an
+      # inline trailing comment that mentions the shape must trip the guard.
+      whole_line = ~s(  # NO parameters: [statement_timeout: ...] here — pgbouncer rejects it)
+      inline = ~s(  pool_size: 8  # legacy note: parameters: [statement_timeout: "10000"])
+      assert scan_parameter_lists(whole_line) == []
+      assert scan_parameter_lists(inline) == []
     end
   end
 
@@ -97,13 +115,16 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
     end)
   end
 
-  # Drop whole-line comments so documentation that mentions the forbidden shape can't
-  # false-positive. Inline trailing comments after real code are harmless: the `parameters`
-  # list closes before any `#`.
+  # Drop comments so documentation that mentions the forbidden shape can't false-positive:
+  # whole-line comments (`^\s*#`) are removed entirely, and an inline trailing comment is
+  # stripped from a whitespace-preceded `#` to end of line. The `#(?!\{)` negative lookahead
+  # preserves `#{...}` interpolation (e.g. the `statement_timeout = #{ms}` body is real code,
+  # not a comment). A false positive here merely fails the build loudly for a human — far
+  # safer than a false negative — so this conservative strip is sufficient.
   defp strip_comment_lines(source) do
     source
     |> String.split("\n")
     |> Enum.reject(&(&1 =~ ~r/^\s*#/))
-    |> Enum.join("\n")
+    |> Enum.map_join("\n", &Regex.replace(~r/\s#(?!\{).*$/, &1, ""))
   end
 end

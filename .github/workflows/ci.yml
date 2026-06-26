@@ -365,13 +365,17 @@ jobs:
           INI
           # `-d` (daemonize) REQUIRES a pidfile (FATAL otherwise).
           pgbouncer -d /tmp/pgbouncer.ini
-          # Wait for pgbouncer to accept connections through to Postgres.
+          # Wait for pgbouncer to accept connections through to Postgres. Fail LOUDLY if it
+          # never comes up, so the job reports "pgbouncer never started" rather than a
+          # confusing downstream Postgrex error from the test.
+          up=""
           for i in $(seq 1 15); do
             if PGPASSWORD=postgres psql "host=127.0.0.1 port=6432 dbname=loopctl_test user=postgres" -tAc "SELECT 1" >/dev/null 2>&1; then
-              echo "pgbouncer up"; break
+              echo "pgbouncer up"; up=1; break
             fi
             echo "waiting for pgbouncer ($i)"; sleep 1
           done
+          if [ -z "$up" ]; then echo "pgbouncer failed to come up"; cat /tmp/pgbouncer.log || true; exit 1; fi
 
       - name: Run the pgbouncer e2e (reproduces 08P01 + proves the SET LOCAL fix)
         run: mix test --include pgbouncer test/loopctl/pgbouncer_startup_params_test.exs
@@ -513,7 +517,10 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
-    needs: [lint, test, security, dialyzer]
+    # pgbouncer-e2e gates deploy (US-27.13): it is the only check that exercises the pgbouncer
+    # layer, so a reintroduced pgbouncer-incompatible config must block the deploy, not just
+    # go red advisorily.
+    needs: [lint, test, security, dialyzer, pgbouncer-e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
