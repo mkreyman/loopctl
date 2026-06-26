@@ -41,10 +41,16 @@ certify an uncalibrated run (AC-27.13.4a).
 | `streaming_export_scale_test.exs` (US-27.16 memory bound) | ✅ pass |
 | `remediation_matrix_scale_test.exs` (US-27.13 census) | ✅ pass *(after the AC-27.17.2 fix below)* |
 
-The bulk blast-radius (US-27.12) and the keyset deep-page assertions (US-27.9a/9b) are
-exercised within the above files. Every per-endpoint plan gate is index-backed at 80k under
-the planner's NATURAL choice (no `enable_seqscan=off`) — the distinction that produced the
-#172 false-green.
+The keyset deep-page assertions (US-27.9a/9b) are exercised within the keyset/by-source/
+change-feed files above. Every per-endpoint plan gate is index-backed at 80k under the
+planner's NATURAL choice (no `enable_seqscan=off`) — the distinction that produced the #172
+false-green.
+
+**Scope note (honest):** the bulk archive/delete blast-radius (US-27.12) is NOT a
+`:scale_nightly` gate — it is a SET-BASED query-correctness concern (one bounded
+`UPDATE/DELETE … WHERE`, tenant-scoped, no row-by-row N+1), fully verified by
+`bulk_ops_test.exs` in the DEFAULT suite (every `mix precommit` + per-PR CI), so it does not
+need an 80k corpus. It is recorded here for completeness, not run in the scale matrix.
 
 ---
 
@@ -104,7 +110,7 @@ slowest heavy endpoint — worth watching as the corpus grows).
 |---|---|---|
 | Per-endpoint plan @ 80k (US-27.2/27.8) | scale matrix (topk, distant_pairs, vector_search) | ✅ |
 | Keyset deep-page (US-27.9a/9b) | keyset + by_source/change-feed gates | ✅ |
-| Bulk blast-radius (US-27.12) | plan_assertions / bulk-path gates | ✅ |
+| Bulk blast-radius (US-27.12) | `bulk_ops_test.exs` (default suite — set-based correctness, not a scale gate) | ✅ |
 | Export memory bound (US-27.16) | streaming_export gate | ✅ |
 | Calibration fail-loud (US-27.8) | scale_calibration_mismatch | ✅ |
 | Remediation census (US-27.13) | remediation_matrix (+ AC-27.17.2 fix) | ✅ |
