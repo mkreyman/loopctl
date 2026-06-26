@@ -56,13 +56,16 @@ config :loopctl, :heavy_read_statement_timeout_ms, 250
 # they see the same sandbox transaction that fixtures write to. Prod/dev default to
 # the dedicated Loopctl.HeavyReadRepo pool.
 #
-# CAUTION (US-27.13): do NOT assert statement_timeout CANCELLATION via the AdminRepo-routed
-# path (`HeavyRead.all/one`). Under Sandbox, the routed `transaction/2` opens a SAVEPOINT
-# inside the test's outer transaction, and Postgres `SET LOCAL` is scoped to the TOP-LEVEL
-# transaction (not the savepoint) — so a low SET LOCAL would escape to the whole sandbox
-# transaction and spuriously cancel later queries (flaky). Assert cancellation only against
-# the dedicated `Loopctl.HeavyReadRepo` pool directly (top-level transaction), as
-# heavy_read_repo_test.exs / heavy_read_pool_isolation_test.exs do.
+# CAUTION (US-27.13 — SET LOCAL scoping under Sandbox): prefer asserting statement_timeout
+# behavior against the dedicated `Loopctl.HeavyReadRepo` pool directly (as
+# heavy_read_repo_test.exs / heavy_read_pool_isolation_test.exs do), NOT the AdminRepo-routed
+# `HeavyRead.all/one` path. Under Sandbox the routed `transaction/2` runs as a SAVEPOINT
+# inside the test's outer transaction, and `SET LOCAL` is scoped to the TOP-LEVEL
+# transaction. A CANCELLATION is self-cleaning (the query raises, the savepoint rolls back,
+# and the SET LOCAL is undone — so `heavy_read_statement_timeout_test.exs` is stable). The
+# real hazard is a SUCCESSFUL low-timeout routed read: its savepoint COMMITS, so the SET
+# LOCAL persists to the enclosing sandbox transaction and could spuriously cancel a later
+# query in the SAME test. Keep timeout assertions on the dedicated pool to avoid that.
 config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 
 # US-27.4: TC-27.4.1 integration test — set a low statement_timeout override

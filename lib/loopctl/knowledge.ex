@@ -6,8 +6,12 @@ defmodule Loopctl.Knowledge do
   are the core knowledge units — reusable patterns, conventions,
   decisions, findings, and references within a tenant's knowledge base.
 
-  All operations use AdminRepo (BYPASSRLS) with explicit `tenant_id`
-  scoping, following the same pattern as other loopctl contexts.
+  Most operations use AdminRepo (BYPASSRLS) with explicit `tenant_id`
+  scoping, following the same pattern as other loopctl contexts. The heavy
+  vector/enumeration reads (suggested_links, semantic search, distant_pairs,
+  novelty, enumeration) route through `Loopctl.HeavyRead` → the dedicated
+  `Loopctl.HeavyReadRepo` pool (also BYPASSRLS, same explicit `tenant_id`
+  scoping), isolated so a slow read can't starve light admin ops.
 
   ## Usage
 

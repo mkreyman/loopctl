@@ -89,6 +89,45 @@ defmodule Loopctl.PgbouncerStartupParamsTest do
            "SET LOCAL statement_timeout must cancel an over-budget query through pgbouncer; got #{inspect(outcome)}"
   end
 
+  test "prepared statements work correctly under transaction pooling with pool_size > 1 (no 26000/42P05 prepared-statement errors)",
+       %{base: base} do
+    # H1 guard: Under transaction pooling (pool_mode = transaction), prepared statements
+    # named on one server connection are invisible when the next transaction routes to a
+    # different server connection, causing a `26000 (prepared statement does not exist)` or
+    # `42P05 (already exists)` error. This test uses `pool_size: 2` so multiple transactions
+    # can route to different server connections, and proves that executing the same query
+    # twice across two separate transactions does NOT fail with prepared-statement errors.
+    #
+    # `prepare: :unnamed` mirrors the loopctl repos (repo.ex / admin_repo.ex /
+    # heavy_read_repo.ex). This proves the CONFIGURED fix is transaction-pooling-safe: the
+    # same prepared query reused across separate transactions (which may route to different
+    # server connections at pool_size: 2) must NOT raise 26000/42P05.
+    {:ok, conn} =
+      Postgrex.start_link(
+        base ++
+          [
+            parameters: [],
+            prepare: :unnamed,
+            pool_size: 2,
+            queue_target: 300,
+            queue_interval: 600
+          ]
+      )
+
+    # Execute the same query several times in separate transactions to maximize the chance
+    # of landing on different pooled server connections.
+    results =
+      for _ <- 1..6 do
+        Postgrex.transaction(conn, fn c -> Postgrex.query(c, "SELECT 1 AS test_val", []) end)
+      end
+
+    for {result, i} <- Enum.with_index(results, 1) do
+      assert {:ok, {:ok, %Postgrex.Result{rows: [[1]]}}} = result,
+             "transaction #{i} should succeed with no prepared-statement (26000/42P05) error " <>
+               "across pooled connections; got #{inspect(result)}"
+    end
+  end
+
   # Parse a postgres:// URL into Postgrex start_link opts (fail-fast pool so a rejected
   # connection errors quickly instead of queueing).
   defp parse_url(url) do

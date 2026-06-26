@@ -168,6 +168,11 @@ defmodule Loopctl.HeavyRead do
   returned stream outside one raises), which is also what scopes a per-transaction
   `SET LOCAL statement_timeout`.
 
+  NB: the "every heavy read is timed" invariant applies to `all/3` / `one/3` (which
+  default the timeout). `stream/3` and a bare `transaction/2` do NOT auto-apply one — a
+  caller MUST pass `:statement_timeout` to `transaction/2` (this is the export lever) so the
+  enclosed `stream/3` reads run timed. Don't add an un-timed `transaction/2` heavy read.
+
   NOTE: the US-27.16 streamed EXPORT does NOT use this — it pages with the US-27.9a
   keyset cursor via `all/3` (short read per page, connection RELEASED between pages)
   precisely to AVOID holding one transaction (and `xmin`) for the whole client-paced

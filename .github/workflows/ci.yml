@@ -299,7 +299,14 @@ jobs:
     # crash-looping the HeavyReadRepo pool) was invisible in CI. This job stands up a REAL
     # pgbouncer (transaction pooling) in front of Postgres and runs the :pgbouncer e2e, which
     # reproduces the rejection and proves the SET LOCAL fix enforces through the proxy.
+    #
+    # This job GATES deploy (deploy `needs:` it). To keep a transient apt/infra hiccup from
+    # blocking emergency deploys, the install step retries and the whole job is time-bounded;
+    # a genuine RED here (a real pgbouncer-incompatible regression) still blocks deploy. If an
+    # apt outage ever blocks an urgent deploy, re-run the job or temporarily detach the gate
+    # with sign-off — a test failure and an infra failure are different signals.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -342,8 +349,12 @@ jobs:
 
       - name: Install and start pgbouncer (transaction pooling) in front of Postgres
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pgbouncer
+          # Retry the install so a transient apt-mirror hiccup doesn't block a deploy.
+          for attempt in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y pgbouncer && break
+            echo "apt install attempt $attempt failed; retrying"; sleep 5
+          done
+          command -v pgbouncer >/dev/null || { echo "pgbouncer install failed after retries"; exit 1; }
           # The apt package enables/starts a default pgbouncer (own /etc/pgbouncer.ini on
           # :6432 with no loopctl_test db). Stop it so OUR instance owns the port.
           sudo systemctl stop pgbouncer 2>/dev/null || true

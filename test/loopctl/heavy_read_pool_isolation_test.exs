@@ -57,4 +57,38 @@ defmodule Loopctl.HeavyReadPoolIsolationTest do
 
     assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result
   end
+
+  test "SET LOCAL statement_timeout does NOT carry over between consecutive transactions" do
+    # Regression guard for F1: SET LOCAL is transaction-scoped, not connection-scoped. A
+    # statement_timeout set in one transaction must not affect the next transaction on the
+    # same reused connection. This test proves `SET LOCAL` ends at COMMIT and doesn't leak.
+    # If it leaked, the second transaction would also be subject to the 250ms timeout and
+    # would fail. Instead, it succeeds (the 1-second sleep completes).
+
+    # First transaction: set a short timeout and run pg_sleep(1), which gets canceled.
+    result1 =
+      HeavyReadRepo.transaction(fn ->
+        HeavyReadRepo.query!("SET LOCAL statement_timeout = 250")
+
+        case HeavyReadRepo.query("SELECT pg_sleep(1)") do
+          {:error, error} -> HeavyReadRepo.rollback(error)
+          ok -> ok
+        end
+      end)
+
+    assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} = result1
+
+    # Second transaction on the same connection: NO SET LOCAL. The 1-second sleep should
+    # complete without timing out, proving the first transaction's SET LOCAL didn't carry over.
+    result2 =
+      HeavyReadRepo.transaction(fn ->
+        # No SET LOCAL here — we're relying on the fact that the timeout from transaction 1
+        # should have been reset.
+        HeavyReadRepo.query!("SELECT pg_sleep(0.5)") |> Map.get(:rows)
+      end)
+
+    # pg_sleep returns the `void` type, which Postgrex decodes to the atom `:void`.
+    assert {:ok, [[:void]]} = result2,
+           "expected second transaction to complete without inheriting the 250ms timeout from the first"
+  end
 end

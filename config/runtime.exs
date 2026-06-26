@@ -107,10 +107,12 @@ if config_env() == :prod do
   #   deploy at 2 nodes = 42 + 21 (overlap node) + 4 ops = 67 < 100 (max ~3 nodes).
   # K (HeavyReadRepo, default 8): ~6 concurrent sub-2s heavy vector reads + ~2 reserved
   # for long-held streamed-export checkouts (US-27.16), a different profile than fast reads.
-  # Parse to an integer so a garbage/typo value (e.g. "10s", "10,000") fails LOUDLY at
-  # boot rather than being sent verbatim and rejected by Postgres per-connection (which
-  # would fail the whole pool's startup). Postgres reads a bare integer as milliseconds,
-  # matching the `_MS` env name; re-stringified for the startup packet.
+  # Parse to an integer so a garbage/typo value (e.g. "10s", "10,000") fails LOUDLY at boot
+  # (a deploy-time misconfiguration guard) rather than silently degrading. Postgres reads a
+  # bare integer as milliseconds, matching the `_MS` env name. NB: this value is now applied
+  # per-read via `SET LOCAL` (US-27.13), NOT a startup packet — `HeavyRead.opts/1` reads it
+  # and `HeavyRead.default_statement_timeout/0` additionally fails SOFT (falls back to 10s) on
+  # a bad app-env value, so the boot-raise here is the strict outer guard.
   heavy_read_statement_timeout_ms =
     String.to_integer(System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS") || "10000")
 

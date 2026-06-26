@@ -15,13 +15,18 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
   the suite connects to DIRECT Postgres (which ACCEPTS the startup param) and aliases heavy
   reads to AdminRepo — the false confidence that hid it.
 
-  This guard scans the config SOURCE (so it covers `config/runtime.exs`, the PROD-only file
-  that `Application.get_env` never reflects during `mix test` — i.e. the exact file the bug
-  lived in) and fails the build if any `parameters: [...]` list carries a key outside the
-  pgbouncer-safe allowlist. A server-side `statement_timeout` (or any GUC) must instead be
-  applied per-read via `SET LOCAL` inside a transaction (`Loopctl.HeavyRead`), the
+  This guard parses the config SOURCE as an AST (so it covers `config/runtime.exs`, the
+  PROD-only file that `Application.get_env` never reflects during `mix test` — i.e. the exact
+  file the bug lived in) and fails the build if any `parameters: [...]` list carries a key
+  outside the pgbouncer-safe allowlist. A server-side `statement_timeout` (or any GUC) must
+  instead be applied per-read via `SET LOCAL` inside a transaction (`Loopctl.HeavyRead`), the
   pgbouncer-safe path; a connect-time GUC that must persist is set via `ALTER ROLE` (the
   documented `hnsw.ef_search` lever), NOT a startup parameter.
+
+  AST (not regex) parsing is deliberate: it extracts EVERY top-level key of a `:parameters`
+  list — including keys that follow a nested list value (e.g.
+  `parameters: [socket_options: [...], statement_timeout: ...]`), which a non-greedy
+  `parameters: [(.*?)\]` regex would miss by stopping at the first `]`.
 
   NB: there is NO startup-parameter escape hatch for a GUC behind pgbouncer. In particular
   `options` (`-c statement_timeout=...`) is NOT safe — Fly MPG's pgbouncer rejects a
@@ -72,7 +77,7 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
     test "the scanner is NON-VACUOUS — it flags a synthetic forbidden parameter" do
       # Guard the guard: prove the parser actually extracts keys and would catch the exact
       # US-27.11 regression, so a future refactor can't silently neuter it into a no-op.
-      synthetic = ~s(  parameters: [statement_timeout: "10000"])
+      synthetic = ~S|config :loopctl, Foo, parameters: [statement_timeout: "10000"]|
       assert [{_inner, keys}] = scan_parameter_lists(synthetic)
       assert "statement_timeout" in keys
       assert "statement_timeout" not in @pgbouncer_safe_startup_params
@@ -82,49 +87,80 @@ defmodule Loopctl.ConfigPgbouncerSafeParametersTest do
       # pgbouncer rejects statement_timeout via `options` too (pgbouncer #907), and a GUC set
       # via the startup `options` packet leaks across clients under transaction pooling. The
       # allowlist must NOT bless `options`, or it re-opens the US-27.13 outage class.
-      smuggle = ~s(  parameters: [options: "-c statement_timeout=10000"])
+      smuggle = ~S|config :loopctl, Foo, parameters: [options: "-c statement_timeout=10000"]|
       assert [{_inner, keys}] = scan_parameter_lists(smuggle)
       assert "options" in keys
       assert "options" not in @pgbouncer_safe_startup_params
     end
 
-    test "the scanner IGNORES comment lines AND inline trailing comments (no false positive on docs)" do
-      # The config files DOCUMENT the forbidden shape in comments (e.g. "no
-      # `parameters: [statement_timeout: ...]` here"). Neither a whole-line comment nor an
-      # inline trailing comment that mentions the shape must trip the guard.
-      whole_line = ~s(  # NO parameters: [statement_timeout: ...] here — pgbouncer rejects it)
-      inline = ~s(  pool_size: 8  # legacy note: parameters: [statement_timeout: "10000"])
+    test "the scanner catches a forbidden parameter AFTER a nested list (no `socket_options: [...]` false-negative)" do
+      # Regression: a non-greedy `parameters: [(.*?)\]` regex would stop at the first `]`
+      # (end of the socket_options list) and MISS statement_timeout. AST parsing extracts
+      # every top-level key of the :parameters list regardless of nested-list values.
+      nested =
+        ~S|config :loopctl, Foo, parameters: [socket_options: [keepalive: true], statement_timeout: "10000"]|
+
+      assert [{_inner, keys}] = scan_parameter_lists(nested)
+
+      assert "statement_timeout" in keys,
+             "expected to find statement_timeout even after a nested list value"
+
+      assert "statement_timeout" not in @pgbouncer_safe_startup_params
+    end
+
+    test "the scanner IGNORES comments (no false positive on documentation)" do
+      # The config files DOCUMENT the forbidden shape in comments. AST parsing drops comments
+      # natively, so neither a whole-line nor an inline comment mentioning the shape can trip
+      # the guard.
+      whole_line = ~S|# NO parameters: [statement_timeout: ...] here — pgbouncer rejects it|
+
+      inline =
+        ~S|config :loopctl, Foo, pool_size: 8 # note: parameters: [statement_timeout: "10000"]|
+
       assert scan_parameter_lists(whole_line) == []
       assert scan_parameter_lists(inline) == []
     end
   end
 
-  # Extract every `parameters: [ ... ]` list from a config file (comments stripped) as
-  # `{inner_text, [key_strings]}`.
+  # Extract every `parameters: [...]` keyword list from config source. Returns
+  # `{rendered_keys, [key_strings]}` per `:parameters` declaration.
   defp parameter_lists(file) do
     file |> File.read!() |> scan_parameter_lists()
   end
 
+  # Parse the source to an AST and walk the WHOLE tree (Macro.prewalk) for any
+  # `{:parameters, list}` node — finding `:parameters` whether it sits inside a `config(...)`
+  # call (real files) or a bare snippet (the synthetic tests), and extracting ALL top-level
+  # keys including those after a nested-list value. config/*.exs is always valid Elixir; on a
+  # parse error there is simply nothing to scan (another check owns the syntax error).
   defp scan_parameter_lists(source) do
-    source
-    |> strip_comment_lines()
-    |> then(&Regex.scan(~r/parameters:\s*\[(.*?)\]/s, &1))
-    |> Enum.map(fn [_full, inner] ->
-      keys = ~r/(\w+):/ |> Regex.scan(inner) |> Enum.map(fn [_, key] -> key end)
-      {String.trim(inner), keys}
-    end)
+    case Code.string_to_quoted(source) do
+      {:ok, ast} ->
+        {_ast, found} =
+          Macro.prewalk(ast, [], fn
+            {:parameters, value} = node, acc when is_list(value) ->
+              {node, [{render_params(value), param_keys(value)} | acc]}
+
+            node, acc ->
+              {node, acc}
+          end)
+
+        Enum.reverse(found)
+
+      {:error, _reason} ->
+        []
+    end
   end
 
-  # Drop comments so documentation that mentions the forbidden shape can't false-positive:
-  # whole-line comments (`^\s*#`) are removed entirely, and an inline trailing comment is
-  # stripped from a whitespace-preceded `#` to end of line. The `#(?!\{)` negative lookahead
-  # preserves `#{...}` interpolation (e.g. the `statement_timeout = #{ms}` body is real code,
-  # not a comment). A false positive here merely fails the build loudly for a human — far
-  # safer than a false negative — so this conservative strip is sufficient.
-  defp strip_comment_lines(source) do
-    source
-    |> String.split("\n")
-    |> Enum.reject(&(&1 =~ ~r/^\s*#/))
-    |> Enum.map_join("\n", &Regex.replace(~r/\s#(?!\{).*$/, &1, ""))
+  # The TOP-LEVEL keyword keys of a `:parameters` list, as strings. Only the keys of THIS
+  # list — a nested-list value (e.g. `socket_options: [keepalive: true]`) contributes its own
+  # key (`socket_options`), never the inner `keepalive`: prewalk visits the inner
+  # `{:socket_options, [...]}` node separately, and it is not a `:parameters` node.
+  defp param_keys(value) do
+    for {k, _v} <- value, is_atom(k), do: Atom.to_string(k)
+  end
+
+  defp render_params(value) do
+    value |> param_keys() |> Enum.map_join(", ", &"#{&1}: ...")
   end
 end

@@ -54,5 +54,6 @@ defmodule Loopctl.HeavyReadRepo do
 
   use Ecto.Repo,
     otp_app: :loopctl,
-    adapter: Ecto.Adapters.Postgres
+    adapter: Ecto.Adapters.Postgres,
+    prepare: :unnamed
 end

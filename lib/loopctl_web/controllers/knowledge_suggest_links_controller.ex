@@ -134,8 +134,9 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   # Run the (possibly slow) vector-similarity query, translating a raised DB
   # exception into an `{:error, %Postgrex.Error{}}` / `{:error,
   # %DBConnection.ConnectionError{}}` tuple. Only DB exceptions are caught;
-  # anything else is re-raised (let-it-crash). The suggest_links query runs on
-  # AdminRepo — rescuing here does NOT change which tenant's data is touched.
+  # anything else is re-raised (let-it-crash). The suggest_links query runs on the
+  # dedicated HeavyReadRepo pool (via Loopctl.HeavyRead) — rescuing here does NOT
+  # change which tenant's data is touched.
   #
   # The executor is resolved via config-based DI (CLAUDE.md convention:
   # behaviour + Application.get_env, mock wired in config/test.exs) so a test can

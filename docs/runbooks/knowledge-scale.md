@@ -141,6 +141,48 @@ and `request_id=` empty. Lower the threshold to surface a trend before it become
 config :loopctl, :slow_query_threshold_ms, 500
 ```
 
+## pgbouncer compatibility (US-27.13 — the heavy-read outage)
+
+Fly Managed Postgres fronts Postgres with **pgbouncer**. The US-27.13 outage was a
+`statement_timeout` connection STARTUP parameter on `HeavyReadRepo` that pgbouncer rejected
+(`FATAL 08P01 unsupported startup parameter`), crash-looping the pool so every heavy endpoint
+503/504'd. It was invisible to CI because CI uses **direct Postgres** (which accepts the
+param). Hard-won rules for anything touching the DB layer behind pgbouncer:
+
+- **No GUC via connection `:parameters`.** A server GUC is applied per-read via `SET LOCAL`
+  inside a transaction (`Loopctl.HeavyRead`); a GUC that must persist at connect goes via
+  `ALTER ROLE` (the `hnsw.ef_search` lever). The config-lint
+  (`config_pgbouncer_safe_parameters_test.exs`) blocks a re-added startup `:parameters` GUC —
+  but that is ONLY the startup-parameter member of the class. It does NOT guard the other
+  pgbouncer-sensitive paths below; those depend on the **pool mode**.
+- **`prepare: :unnamed` on all three repos.** Under pgbouncer **transaction** pooling, named
+  prepared statements cached on one server connection break when the next transaction lands on
+  another (`26000`/`42P05`). All repos set `prepare: :unnamed`; the `pgbouncer-e2e` job proves
+  a query reused across `pool_size: 2` transactions succeeds.
+- **Pool-mode-sensitive paths NOT covered by the config-lint:** Oban's Postgres notifier
+  (LISTEN/NOTIFY) and any `Repo.stream` without an enclosing transaction silently misbehave
+  under transaction pooling. Keep them in mind for any new feature.
+- **VERIFY the live pgbouncer config** (the single most important setting for this whole
+  design, currently NOT pinned in-repo): run `SHOW CONFIG` via the pgbouncer admin console (or
+  Fly support) and record `pool_mode` and `ignore_startup_parameters` here with a "last
+  verified" date — same discipline as `max_connections`. Fly MPG documents **session mode** as
+  the default; the CI `pgbouncer-e2e` deliberately runs the STRICTER **transaction** mode (the
+  08P01 rejection is pool-mode-independent, and transaction mode is the harder case for
+  prepared statements), so a green e2e is a conservative superset, not an exact prod mirror.
+
+### Per-read transaction hold-time (re-verify under load — M1)
+
+US-27.13 changed each heavy read from a single autocommit `SELECT` to a short
+`BEGIN; SET LOCAL statement_timeout; SELECT; COMMIT` (~3 server round-trips, connection held
+BEGIN→COMMIT). `Loopctl.DbCapacity` models connection **count**, not hold-time, so the K≈6
+fast-read budget is now slightly more contended per the same concurrency. The per-read
+`statement_timeout` makes the pool **self-drain** (a runaway read is canceled), so this is a
+latency/throughput risk, not a deadlock — but per the "verify against prod scale" practice,
+re-check heavy-read p95 + pool queue-wait under load after deploy (the #172 incident proves
+this pool is the real contention point). Measured prod baselines at ~77k (deployed fix):
+`suggested_links` ~59ms, semantic ~45ms, novelty ~1.4s, distant_pairs ~7.9s (the slowest —
+within the 10s cap but worth watching as the corpus grows).
+
 ## Keyset pagination index (US-27.9a)
 
 The article keyset cursor seeks on `(tenant_id, inserted_at, id)`, backed by
