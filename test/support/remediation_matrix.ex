@@ -350,16 +350,23 @@ defmodule Loopctl.RemediationMatrix do
             limit: 21
           )
 
-        # A selective `source_id =` equality (~1 of 800 buckets) on the FIRST page has TWO
-        # legitimate BOUNDED plans the cost-based planner picks between (a stats shift flips
-        # it — observed across local PG vs CI pg16): the composite source index walked as an
-        # Index Scan, OR a Bitmap Heap Scan over the ~24 matching rows + a Sort. Both are
-        # bounded and correct — pinning `refute_full_scan` false-REDs the bitmap branch
-        # (US-27.17 terminal-pass remediation). Assert the planner-agnostic invariant the
-        # by_tag residual uses: no unbounded Seq Scan AND the scan stays bounded well below
-        # the corpus (the ~24-row source bucket is ≪ corpus/8).
+        # A selective `source_id =` equality (~1 of 800 buckets → ~80 published rows at 80k:
+        # 100/source × ~80% published). On the FIRST page (cursor: nil) the cost-based planner
+        # has TWO legitimate BOUNDED plans — the composite source index as an Index Scan, OR a
+        # Bitmap Heap Scan over the matching rows + a Sort (local PG picked the former, CI pg16
+        # the latter). Both are correct; `refute_full_scan` false-REDs the bitmap branch
+        # (US-27.17 terminal-pass remediation). NB: the dedicated by-source gate
+        # (by_source_change_feed_plan_scale_test.exs) keeps `refute_full_scan` legitimately —
+        # it uses a DEEP cursor, whose `(inserted_at,id) > cursor` range predicate steers the
+        # planner to the index-ordered walk and forecloses the bitmap. The difference is the
+        # CURSOR (first-page vs deep), NOT a stats shift, so that gate is not at risk.
+        #
+        # Assert the planner-agnostic invariant: no unbounded Seq Scan, AND every `articles`
+        # scan touches fewer than corpus/8 ACTUAL rows (EXPLAIN ANALYZE, not the planner
+        # estimate — a Bitmap Heap Scan is the canonical low-estimate/high-actual shape, so the
+        # estimate-based bound has a #168/#172 blind spot here; review MEDIUM-1).
         PlanAssertions.refute_seq_scan(query)
-        PlanAssertions.assert_scan_rows_below(query, div(prod_floor, 8))
+        PlanAssertions.assert_actual_scan_rows_below(query, div(prod_floor, 8))
       end),
       asserted("by_tag_keyset", :enumeration, fn ->
         query =
@@ -374,10 +381,12 @@ defmodule Loopctl.RemediationMatrix do
         # Pinning EITHER index would false-RED the other (the matrix runs on every fresh
         # seed, so it WILL hit both branches). The honest, planner-agnostic invariant is the
         # one that actually matters: no unbounded Seq Scan over the corpus, AND every
-        # `articles` scan stays BOUNDED (well below corpus/8) — which both bounded plans
-        # satisfy and a heap-filter-over-corpus regression trips.
+        # `articles` scan touches fewer than corpus/8 ACTUAL rows — via EXPLAIN ANALYZE, NOT
+        # the planner estimate, so the GIN-bitmap branch (a low-estimate/high-actual shape)
+        # can't slip a corpus-wide heap recheck past the bound (review MEDIUM-1; matches
+        # novelty's actual-rows assertion).
         PlanAssertions.refute_seq_scan(query)
-        PlanAssertions.assert_scan_rows_below(query, div(prod_floor, 8))
+        PlanAssertions.assert_actual_scan_rows_below(query, div(prod_floor, 8))
       end),
 
       # ---- delegated endpoints (covered by dedicated gates, not re-run here) ----

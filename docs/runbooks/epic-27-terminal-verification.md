@@ -9,6 +9,13 @@ every quality gate is still honored.
 **Verdict: GREEN on both the scale gate and prod.** One scale failure was found and
 remediated in this pass (no deferral, AC-27.17.2).
 
+**Evidence:** the `:scale_nightly` matrix ran at 80k in CI `workflow_dispatch` — the master
+run (`28211756602`) was green on all legs EXCEPT `remediation_matrix` (the by_source failure
+below), and the fix's re-run on commit `d561ad4` (`workflow_dispatch` run `28212651418`)
+turned the `remediation_matrix` leg green with every other leg green (incl. `streaming_export`,
+confirmed green on the master run). So every leg is green across the two runs, with the one
+failing leg re-run green on the fix.
+
 Run date: 2026-06-26. Deployed prod build: loopctl `v159+` (US-27.13 fix, `prepare: :unnamed`,
 per-read `SET LOCAL` heavy-read timeout).
 
@@ -61,13 +68,17 @@ The terminal pass caught the ONE failure the per-PR CI structurally cannot (the
 without ever running in per-PR CI):
 
 - **`remediation_matrix`'s `by_source_keyset` endpoint** failed in CI's planner while passing
-  locally. `refute_full_scan` rejected a **bounded** Bitmap Heap Scan (24 rows via the
-  selective `source_id` index + a Sort) that CI's pg16 chose on the first page, where local PG
-  chose an Index Scan — a cost-marginal planner difference, both plans correct for a ~1-of-800
-  `source_id =` equality.
-- **Fix (commit `d561ad4`):** assert the planner-agnostic invariant `by_tag_keyset` already
-  uses (and that passes in CI) — `refute_seq_scan` + `assert_scan_rows_below(div(floor, 8))` —
-  instead of `refute_full_scan`. No deferral; remediated in this pass and re-run to green.
+  locally. `refute_full_scan` rejected a **bounded** Bitmap Heap Scan (~80 published rows via
+  the selective `source_id` index + a Sort; CI's `Plan Rows` under-estimated this at 24) that
+  CI's pg16 chose on the FIRST page (`cursor: nil`), where local PG chose an Index Scan — a
+  cost-marginal planner difference, both plans correct for a ~1-of-800 `source_id =` equality.
+  (The dedicated by-source gate keeps `refute_full_scan` correctly — its DEEP cursor predicate
+  forecloses the bitmap; the difference is the cursor, not stats, so that gate is not at risk.)
+- **Fix (commit `d561ad4`, hardened in review):** assert the planner-agnostic invariant —
+  `refute_seq_scan` (no unbounded scan; covers Parallel Seq Scan) + `assert_actual_scan_rows_below(div(floor, 8))`
+  (ACTUAL rows via EXPLAIN ANALYZE, not the planner estimate — closing the bitmap
+  low-estimate/high-actual blind spot) — instead of `refute_full_scan`. The same hardening was
+  applied to `by_tag_keyset` for parity. No deferral; remediated in this pass and re-run green.
 
 ---
 
