@@ -11,7 +11,9 @@ defmodule Loopctl.RemediationMatrix do
   when (AC-27.13.4a):
 
     * the seed is AT OR ABOVE `ScaleSeed.prod_article_floor/0`, AND
-    * the effective `hnsw.ef_search` was actually read (a calibrated GUC), AND
+    * the effective `hnsw.ef_search` is READABLE (non-nil) on the heavy-read connection —
+      a calibration-provenance signal, not a parity-with-prod claim (parity is owned by the
+      under-fill gate's `assert_ef_search_parity!`), AND
     * the work-list (asserted endpoints whose plan assertion RAISED) is empty.
 
   An UNCALIBRATED matrix (sub-floor seed, or no readable ef_search) is rejected as
@@ -88,6 +90,12 @@ defmodule Loopctl.RemediationMatrix do
   # and the keyset tests ("scale-tag-7") use.
   @prior_tag "scale-tag-3"
   @keyset_tag "scale-tag-7"
+
+  # The sampled-candidate LIMIT that bounds the distant_pairs self-join (SAME source as
+  # distant_pairs_novelty_scale_test.exs `@max_pair_candidates`). The genuine bound is this
+  # `Limit ≤ cap` on the candidate subquery — `refute_seq_scan` alone does NOT prove the
+  # O(n²) self-join is sample-bounded (the scan node's pre-LIMIT estimate ≈ corpus).
+  @max_pair_candidates Application.compile_env(:loopctl, :max_pair_candidates, 1_000)
 
   # The canonical, COMPLETE set of endpoint names this census must cover. The gate
   # asserts the built matrix's endpoint names equal this set, so a silently-dropped
@@ -256,9 +264,15 @@ defmodule Loopctl.RemediationMatrix do
         PlanAssertions.assert_hnsw_index(query)
       end),
       asserted("search_semantic_results", :vector, fn ->
-        query = Knowledge.semantic_results_query(tenant_id, qemb, [])
-        PlanAssertions.refute_full_scan(query)
-        PlanAssertions.assert_hnsw_index(query)
+        # No-filter baseline AND the selective category+tags regression case — pre-27.7a a
+        # selective filter flipped the index-ordered scan to BitmapAnd+Sort, abandoning HNSW.
+        # Same scenarios the owning topk gate covers, so the census row means the same thing
+        # (BA review LOW-2). The inner ANN must STILL be a single HNSW Index Scan under both.
+        for opts <- [[], [category: :decision, tags: [@prior_tag]]] do
+          query = Knowledge.semantic_results_query(tenant_id, qemb, opts)
+          PlanAssertions.refute_full_scan(query)
+          PlanAssertions.assert_hnsw_index(query)
+        end
       end),
       asserted("search_semantic_count", :vector, fn ->
         query = Knowledge.semantic_count_query(tenant_id, qemb, :published, [])
@@ -285,13 +299,20 @@ defmodule Loopctl.RemediationMatrix do
         between =
           Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
 
-        if between == [] do
+        # BOTH emitted band queries (count + paginated pairs) must be present and bounded —
+        # matching the owning gate exactly so the census row's `:pass` means the same thing.
+        if length(between) != 2 do
           raise ExUnit.AssertionError,
-            message: "distant_pairs emitted no BETWEEN (band) query to assert on"
+            message:
+              "distant_pairs expected 2 BETWEEN (band) queries (count + pairs), got #{length(between)}"
         end
 
         for {sql, params} <- between do
+          # No unbounded corpus read AND the genuine sample bound: the candidate subquery is
+          # dominated by a `Limit ≤ max_pair_candidates` (refute_seq_scan alone wouldn't prove
+          # the O(n²) self-join stays sampled — architect review F2 / BA LOW-1).
           PlanAssertions.refute_seq_scan({sql, params})
+          PlanAssertions.assert_article_scans_capped_by_limit({sql, params}, @max_pair_candidates)
         end
       end),
       asserted("novelty", :vector, fn ->

@@ -64,8 +64,17 @@ defmodule Loopctl.Knowledge.RemediationMatrixScaleTest do
           |> AdminRepo.insert()
 
         # link_density: 5 (the prod-floor default) — enough links for the suggested_links
-        # anti-join + distant_pairs to be real, the same seed shape topk_endpoints uses.
-        ScaleSeed.seed(t.id, count: ScaleSeed.prod_article_floor(), link_density: 5)
+        # anti-join + distant_pairs to be real. `status_mix: true` interleaves ~20%
+        # non-published rows so the enumeration endpoints' `status = :published` residual has
+        # REAL selectivity (matching keyset_plan_scale_test.exs's corpus, not an all-published
+        # no-op — architect review F1); the vector endpoints still see ~64k published embedded
+        # rows, ample for the HNSW path. More prod-representative for the whole census.
+        ScaleSeed.seed(t.id,
+          count: ScaleSeed.prod_article_floor(),
+          link_density: 5,
+          status_mix: true
+        )
+
         t
       end)
 
@@ -89,7 +98,14 @@ defmodule Loopctl.Knowledge.RemediationMatrixScaleTest do
 
     # CI records the census as the AC-27.13.1 remediation work-list (the matrix IS the
     # work-list). Print BEFORE asserting so a RED endpoint's reason is in the log.
-    IO.puts("\n=== US-27.13 remediation matrix ===\n" <> RemediationMatrix.to_json(matrix))
+    json = RemediationMatrix.to_json(matrix)
+    IO.puts("\n=== US-27.13 remediation matrix ===\n" <> json)
+
+    # The rendered census is valid JSON that round-trips to the recorded shape (exercises the
+    # pretty-printer across every result/coverage variant — engineer review LOW-2).
+    decoded = JSON.decode!(json)
+    assert is_map(decoded["calibration"]) and is_list(decoded["endpoints"])
+    assert decoded["certified"] == true and decoded["work_list"] == []
 
     # AC-27.13.4a: calibration provenance — seed >= prod floor AND a readable ef_search.
     assert matrix.calibration.calibrated? == true,
