@@ -138,7 +138,7 @@ defmodule Loopctl.RemediationMatrix do
     # OR crash on a too-small corpus, e.g. no row at offset 100 for `a_target`). So an
     # UNCALIBRATED run does NOT run the census: it records each endpoint as `:uncalibrated`
     # (a not-run marker, NEVER `:pass`) and stays un-certified. This is the AC-27.13.4a
-    # INVALID outcome — honest coverage with no rubber-stamp — and keeps `build/2` safe to
+    # INVALID outcome — honest coverage with no rubber-stamp — and keeps `build/1` safe to
     # call on a sub-floor tenant (the isolation test).
     endpoints =
       if calibration.calibrated? do
