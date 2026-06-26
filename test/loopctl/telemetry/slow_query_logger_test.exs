@@ -97,12 +97,18 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
     # routed heavy read uses — actually produces that telemetry_options[:endpoint] tag,
     # AND threads a configured per-endpoint statement_timeout override. Together they
     # cover the full endpoint-attribution chain deterministically (no flaky sleeps).
+    # An endpoint WITHOUT a per-endpoint override gets the pool-wide DEFAULT
+    # statement_timeout (US-27.13: every heavy read is timed via SET LOCAL, since the
+    # pgbouncer-rejected startup `:parameters` lever was removed — there is no un-timed
+    # "pool default" path). In :test `:heavy_read_statement_timeout_ms` is set to a low
+    # 250ms (config/test.exs) so the fast-fire mechanism tests stay sub-second.
     semantic = Knowledge.heavy_read_opts(:semantic_search)
     assert semantic[:telemetry_options] == [endpoint: :semantic_search]
     assert semantic[:timeout] == 15_000
-    refute Keyword.has_key?(semantic, :statement_timeout)
+    assert semantic[:statement_timeout] == 250
 
-    # :suggested_links has an override in test config → the SET LOCAL transaction path.
+    # :suggested_links has an override in test config → the SET LOCAL transaction path
+    # uses the override value rather than the default.
     suggested = Knowledge.heavy_read_opts(:suggested_links)
     assert suggested[:telemetry_options] == [endpoint: :suggested_links]
     assert suggested[:statement_timeout] == 5_000
