@@ -88,6 +88,13 @@ defmodule Loopctl.RemediationMatrix do
   # prior_tag and the by-tag keyset residual so the `tags &&` GIN is selective at
   # prod scale. SAME value `distant_pairs_novelty_scale_test.exs` (`@prior_tag`)
   # and the keyset tests ("scale-tag-7") use.
+  #
+  # INVARIANT under `status_mix: true` (review LOW): `index_keyset_query` forces
+  # `status = :published`, and ScaleSeed marks row i archived/draft when `i mod 10 ∈ {0, 5}`.
+  # The by-tag/by-source selective index MUST land on published rows or the deep-page
+  # assertion runs against an EMPTY set and passes vacuously. Both 3 and 7 are safe: a tag
+  # index t selects rows `i ≡ t (mod 50)`, so `i mod 10 = t mod 10`; the source bucket b
+  # (of 800, also ÷10) selects `i mod 10 = b mod 10`. Keep tag/bucket indices ≢ 0,5 (mod 10).
   @prior_tag "scale-tag-3"
   @keyset_tag "scale-tag-7"
 
@@ -212,8 +219,14 @@ defmodule Loopctl.RemediationMatrix do
       seed_count: seed_count,
       prod_floor: prod_floor,
       effective_ef_search: effective_ef_search,
-      calibrated?: seed_count >= prod_floor and is_binary(effective_ef_search)
+      calibrated?: calibrated_from_values?(seed_count, prod_floor, effective_ef_search)
     }
+  end
+
+  # Pure derivation of the calibration boolean — extracted for unit testability (all four corners).
+  @spec calibrated_from_values?(non_neg_integer(), non_neg_integer(), binary() | nil) :: boolean()
+  def calibrated_from_values?(seed_count, prod_floor, effective_ef_search) do
+    seed_count >= prod_floor and is_binary(effective_ef_search)
   end
 
   # Committed count of THIS tenant's articles (an actual count(*), like
@@ -228,10 +241,8 @@ defmodule Loopctl.RemediationMatrix do
     n || 0
   end
 
-  # The effective `hnsw.ef_search` GUC on the gate connection. Touch a vector op first
-  # (pgvector lazily registers the GUC on first vector use in a session), THEN `SHOW`.
+  # The effective `hnsw.ef_search` GUC on the gate connection.
   defp effective_ef_search do
-    AdminRepo.query!("SELECT '[1,2,3]'::vector")
     %{rows: [[v]]} = AdminRepo.query!("SHOW hnsw.ef_search")
     v
   end

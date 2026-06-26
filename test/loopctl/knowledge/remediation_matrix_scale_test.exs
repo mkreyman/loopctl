@@ -107,6 +107,36 @@ defmodule Loopctl.Knowledge.RemediationMatrixScaleTest do
     assert is_map(decoded["calibration"]) and is_list(decoded["endpoints"])
     assert decoded["certified"] == true and decoded["work_list"] == []
 
+    # Unit assertion: the pretty-printer handles all result variants, including :fail with
+    # tricky reason strings (newlines, quotes, braces). Synthetic matrix needed since the
+    # real gate only produces green/delegated.
+    synthetic_fail_reason =
+      "plan rejected: EXPLAIN { plan:\n  \"node\": \"Seq Scan\",\n  \"rows\": 80000 }\n quote: \""
+
+    synthetic_matrix = %{
+      calibration: matrix.calibration,
+      endpoints: [
+        %{
+          name: "test_endpoint",
+          dimension: :vector,
+          coverage: :asserted,
+          result: {:fail, synthetic_fail_reason}
+        }
+      ],
+      certified?: false,
+      work_list: ["test_endpoint"]
+    }
+
+    synthetic_json = RemediationMatrix.to_json(synthetic_matrix)
+    synthetic_decoded = JSON.decode!(synthetic_json)
+    assert is_map(synthetic_decoded["calibration"])
+    assert is_list(synthetic_decoded["endpoints"])
+
+    assert Enum.any?(synthetic_decoded["endpoints"], fn ep ->
+             ep["name"] == "test_endpoint" and ep["result"]["status"] == "fail" and
+               ep["result"]["reason"] =~ "Seq Scan"
+           end)
+
     # AC-27.13.4a: calibration provenance — seed >= prod floor AND a readable ef_search.
     assert matrix.calibration.calibrated? == true,
            "matrix must be calibrated (seed >= prod_floor AND ef_search read): " <>
@@ -239,5 +269,26 @@ defmodule Loopctl.Knowledge.RemediationMatrixScaleTest do
     # would refuse to rubber-stamp a run against that tenant.
     assert secondary.calibration.calibrated? == false
     assert secondary.certified? == false
+  end
+
+  test "calibration derivation logic covers all four corners (F3 / no-deferrals)" do
+    # F3: the nil-ef case must be testable independently. Unit test the extracted
+    # pure function `calibrated_from_values?/3` for all four corners.
+    floor = ScaleSeed.prod_article_floor()
+    sub_floor = floor - 1
+    ef_readable = "40"
+    ef_nil = nil
+
+    # Corner 1: floor + readable ef → calibrated
+    assert RemediationMatrix.calibrated_from_values?(floor, floor, ef_readable) == true
+
+    # Corner 2: floor + nil ef → NOT calibrated (ef check fails)
+    assert RemediationMatrix.calibrated_from_values?(floor, floor, ef_nil) == false
+
+    # Corner 3: sub-floor + readable ef → NOT calibrated (count check fails)
+    assert RemediationMatrix.calibrated_from_values?(sub_floor, floor, ef_readable) == false
+
+    # Corner 4: sub-floor + nil ef → NOT calibrated (both checks fail)
+    assert RemediationMatrix.calibrated_from_values?(sub_floor, floor, ef_nil) == false
   end
 end
