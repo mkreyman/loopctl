@@ -258,6 +258,17 @@ config :loopctl, Loopctl.Vault,
 # DI: Content extractor for knowledge ingestion
 config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
 
+# DI: Article category classifier for the reclassification backfill
+# (KnowledgeReclassifyWorker). Overridden in test env.
+config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifier
+
+# Reclassification backfill tunables (KnowledgeReclassifyWorker). Query-shaped,
+# so they can also be passed per-kick in the job args.
+config :loopctl,
+  knowledge_reclassify_batch_size: 100,
+  knowledge_reclassify_max_per_run: 1_000,
+  knowledge_reclassify_min_confidence: 0.75
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 
