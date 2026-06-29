@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.KnowledgeStatsControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Knowledge.Categories
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -27,14 +29,15 @@ defmodule LoopctlWeb.KnowledgeStatsControllerTest do
 
       assert body["total"] == 5
 
-      # Dense maps: every category/status present, 0 when none match.
-      assert body["by_category"] == %{
-               "pattern" => 2,
-               "convention" => 2,
-               "decision" => 0,
-               "finding" => 1,
-               "reference" => 0
-             }
+      # Dense maps: every category (canonical taxonomy) / status present, 0 when
+      # none match. Derived from Categories so a taxonomy change can't silently
+      # break this expectation.
+      expected_by_category =
+        Categories.all_strings()
+        |> Map.new(&{&1, 0})
+        |> Map.merge(%{"pattern" => 2, "convention" => 2, "finding" => 1})
+
+      assert body["by_category"] == expected_by_category
 
       assert body["by_status"] == %{
                "draft" => 1,
@@ -56,13 +59,7 @@ defmodule LoopctlWeb.KnowledgeStatsControllerTest do
       body = json_response(conn, 200)
       assert body["total"] == 0
       # Keys are still present (0), so a client never gets nil for a known key.
-      assert body["by_category"] == %{
-               "pattern" => 0,
-               "convention" => 0,
-               "decision" => 0,
-               "finding" => 0,
-               "reference" => 0
-             }
+      assert body["by_category"] == Map.new(Categories.all_strings(), &{&1, 0})
 
       assert body["by_status"] == %{
                "draft" => 0,

@@ -20,14 +20,18 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
 
   require Logger
 
+  alias Loopctl.Knowledge.Categories
+
   @system_prompt """
   You are a knowledge extraction assistant. Given raw content (web article, \
   newsletter, skill template, etc.), extract reusable knowledge articles. \
   Return a JSON array of articles, each with: title (string), body (string, \
-  markdown), category (one of: pattern, convention, decision, finding, reference), \
-  tags (array of short lowercase strings). Extract only genuinely reusable \
-  knowledge -- skip promotional content, navigation, boilerplate. Max 10 articles \
-  per input. Return ONLY the JSON array, no surrounding text or markdown fences.\
+  markdown), category, and tags (array of short lowercase strings). The category \
+  must be one of: #{Enum.join(Categories.active_strings(), ", ")}. Choose it by \
+  these definitions -- #{Categories.prompt_fragment()}. Extract only genuinely \
+  reusable knowledge -- skip promotional content, navigation, boilerplate. Max 10 \
+  articles per input. Return ONLY the JSON array, no surrounding text or markdown \
+  fences.\
   """
 
   @impl true
@@ -123,7 +127,9 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
     end
   end
 
-  @valid_categories ~w(pattern convention decision finding reference)
+  # Accept any DB-valid category (active + retired) so a stray `convention` from
+  # the model isn't dropped; the prompt only offers active categories.
+  @valid_categories Categories.all_strings()
 
   defp normalize_article(article) when is_map(article) do
     title = article["title"]

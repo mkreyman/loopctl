@@ -2,15 +2,16 @@ defmodule Loopctl.Knowledge.Article do
   @moduledoc """
   Schema for the `articles` table.
 
-  Articles are the core knowledge units in the Knowledge Wiki. Each article
-  represents a reusable pattern, convention, decision, finding, or reference
-  within a tenant's knowledge base.
+  Articles are the core knowledge units in the Knowledge Wiki. Each article is
+  classified by `category` (pattern, decision, finding, reference, playbook,
+  insight, entity, idea, quote, question — plus the retired `convention`). The
+  canonical taxonomy lives in `Loopctl.Knowledge.Categories`.
 
   ## Fields
 
   - `title` -- article title, unique per tenant among non-archived/superseded
   - `body` -- full article content (text, max 100KB)
-  - `category` -- knowledge type: pattern, convention, decision, finding, reference
+  - `category` -- knowledge type; see `Loopctl.Knowledge.Categories`
   - `status` -- lifecycle state: draft, published, archived, superseded
   - `tags` -- array of alphanumeric tag strings for categorization
   - `source_type` -- advisory origin type: "review_finding", "manual", "agent", "session_log"
@@ -28,7 +29,10 @@ defmodule Loopctl.Knowledge.Article do
 
   @type t :: %__MODULE__{}
 
-  @category_values [:pattern, :convention, :decision, :finding, :reference]
+  # Canonical taxonomy lives in Loopctl.Knowledge.Categories (single source of
+  # truth). `all/0` includes the retired `convention` value so existing rows
+  # still load during the reclassification backfill.
+  @category_values Loopctl.Knowledge.Categories.all()
   @status_values [:draft, :published, :archived, :superseded]
   @scope_values [:tenant, :system]
   @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion)
