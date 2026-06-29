@@ -1,0 +1,70 @@
+name: Auto-publish MCP Server on version bump
+
+# Why this exists: the MCP server publish was tag-triggered only (see
+# npm-publish.yml). Twenty version bumps (2.3 -> 2.22) were committed without a
+# matching `mcp-v*` tag ever being pushed, so npm sat 20 versions behind the repo
+# and agents couldn't see new tools. This closes that gap: whenever
+# mcp-server/package.json's version changes on master, publish it (if not already
+# on npm) and create the record tag automatically. npm-publish.yml remains as a
+# manual escape hatch (push a tag to force a publish).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'mcp-server/package.json'
+
+jobs:
+  autopublish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create + push the record tag
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Read package version
+        id: ver
+        working-directory: mcp-server
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Is this version already on npm?
+        id: pub
+        run: |
+          if npm view "loopctl-mcp-server@${{ steps.ver.outputs.version }}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "loopctl-mcp-server@${{ steps.ver.outputs.version }} already published; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.pub.outputs.exists == 'false'
+        working-directory: mcp-server
+        run: npm install
+
+      - name: Publish to npm
+        if: steps.pub.outputs.exists == 'false'
+        working-directory: mcp-server
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create + push record tag
+        if: steps.pub.outputs.exists == 'false'
+        run: |
+          TAG="mcp-v${{ steps.ver.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists; skipping."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "tagged $TAG"
+          fi
