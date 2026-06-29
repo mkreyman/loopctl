@@ -16,7 +16,12 @@ on:
 env:
   MIX_ENV: test
   ELIXIR_VERSION: "1.19.5"
-  OTP_VERSION: "28.0"
+  # OTP 28.5.0.2 (latest 28.x). Hex 2.5.0 calls :re.import/2, which only exists on
+  # OTP >= 28.1; on the previous pin (28.0) `mix deps.get` crashed with an :undef
+  # the moment Hex 2.5.0 shipped (2026-06-29). Elixir 1.19 requires OTP 28.1+, so
+  # 28.0 was below its own floor. Keep Elixir at 1.19.5 (current 1.19, satisfies
+  # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
+  OTP_VERSION: "28.5.0.2"
 
 jobs:
   lint:
