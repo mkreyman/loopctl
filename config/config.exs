@@ -237,6 +237,7 @@ config :loopctl, Oban,
        {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
        {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
        {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
+       {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}},
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
        {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker}
