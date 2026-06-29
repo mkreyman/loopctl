@@ -26,9 +26,25 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/mcp-v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - run: npm install
+      # Idempotency guard: the auto-publish-on-version-bump workflow may have
+      # already published this version. Skip rather than hard-fail on a duplicate
+      # so re-tagging an existing release is a no-op.
+      - name: Is this version already on npm?
+        id: pub
+        run: |
+          if npm view "loopctl-mcp-server@${VERSION}" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "loopctl-mcp-server@${VERSION} already published; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - run: npm publish --provenance --access public
+      - if: steps.pub.outputs.exists == 'false'
+        run: npm install
+
+      - if: steps.pub.outputs.exists == 'false'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
