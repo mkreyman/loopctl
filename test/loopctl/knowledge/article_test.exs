@@ -4,6 +4,7 @@ defmodule Loopctl.Knowledge.ArticleTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.Categories
 
   describe "agent-memory metadata conventions (#151)" do
     defp memory_changeset(metadata) do
@@ -178,6 +179,33 @@ defmodule Loopctl.Knowledge.ArticleTest do
 
       refute changeset.valid?
       assert errors_on(changeset)[:category]
+    end
+
+    test "accepts every category in the canonical taxonomy (active + retired)" do
+      for category <- Categories.all() do
+        changeset =
+          Article.create_changeset(%Article{}, %{
+            title: "Title for #{category}",
+            body: "Valid body",
+            category: category
+          })
+
+        assert changeset.valid?, "expected category #{inspect(category)} to be valid"
+      end
+    end
+
+    test "accepts the expanded taxonomy values (playbook/insight/entity/idea/quote/question)" do
+      for category <- [:playbook, :insight, :entity, :idea, :quote, :question] do
+        changeset =
+          Article.create_changeset(%Article{}, %{
+            title: "Title for #{category}",
+            body: "Valid body",
+            category: category
+          })
+
+        assert changeset.valid?, "expected expanded category #{inspect(category)} to be valid"
+        assert get_field(changeset, :category) == category
+      end
     end
 
     test "defaults status to :draft when not provided" do

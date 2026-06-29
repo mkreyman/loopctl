@@ -25,15 +25,18 @@ defmodule Loopctl.Knowledge.LlmExtractor do
 
   require Logger
 
+  alias Loopctl.Knowledge.Categories
+
   @system_prompt """
   You are a code review knowledge extractor. Given a code review context \
   (review type, findings count, fixes count, summary), extract reusable \
-  knowledge articles about patterns, conventions, or decisions that would \
-  help future code reviews. Return a JSON array of articles, each with: \
-  title (string), body (string, markdown), category (one of: pattern, \
-  convention, decision, finding, reference), tags (array of short lowercase \
-  strings). Extract only genuinely reusable knowledge. Max 5 articles per \
-  review. Return ONLY the JSON array, no surrounding text or markdown fences.\
+  knowledge articles that would help future code reviews. Return a JSON array \
+  of articles, each with: title (string), body (string, markdown), category, \
+  and tags (array of short lowercase strings). The category must be one of: \
+  #{Enum.join(Categories.active_strings(), ", ")}. Choose it by these \
+  definitions -- #{Categories.prompt_fragment()}. Extract only genuinely \
+  reusable knowledge. Max 5 articles per review. Return ONLY the JSON array, \
+  no surrounding text or markdown fences.\
   """
 
   @impl true
@@ -128,7 +131,8 @@ defmodule Loopctl.Knowledge.LlmExtractor do
     end
   end
 
-  @valid_categories ~w(pattern convention decision finding reference)
+  # Accept any DB-valid category (active + retired); the prompt only offers active.
+  @valid_categories Categories.all_strings()
 
   defp normalize_article(article) when is_map(article) do
     title = article["title"]

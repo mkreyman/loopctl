@@ -47,7 +47,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   @max_articles 10
   @max_body_length 100_000
-  @valid_categories ~w(pattern convention decision finding reference)a
+  # Single source of truth: the canonical taxonomy (avoids drift).
+  @valid_categories Loopctl.Knowledge.Categories.all()
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
   # Single source of truth: the Article schema's tag cap (avoids drift).
   @max_tags Loopctl.Knowledge.Article.max_tags()

@@ -8,6 +8,7 @@ defmodule Loopctl.KnowledgeTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.Categories
 
   defp setup_tenant do
     tenant = fixture(:tenant)
@@ -986,14 +987,15 @@ defmodule Loopctl.KnowledgeTest do
 
       assert stats.total == 3
 
-      # Dense maps: all 5 categories and all 4 statuses present, 0 when none.
-      assert stats.by_category == %{
-               "pattern" => 2,
-               "convention" => 0,
-               "decision" => 0,
-               "finding" => 0,
-               "reference" => 1
-             }
+      # Dense maps: every category (canonical taxonomy) and all 4 statuses
+      # present, 0 when none. Derived from Categories so adding a category can't
+      # silently break this expectation.
+      expected_by_category =
+        Categories.all_strings()
+        |> Map.new(&{&1, 0})
+        |> Map.merge(%{"pattern" => 2, "reference" => 1})
+
+      assert stats.by_category == expected_by_category
 
       assert stats.by_status == %{
                "draft" => 1,
@@ -1008,13 +1010,7 @@ defmodule Loopctl.KnowledgeTest do
 
       assert Knowledge.stats(tenant.id) == %{
                total: 0,
-               by_category: %{
-                 "pattern" => 0,
-                 "convention" => 0,
-                 "decision" => 0,
-                 "finding" => 0,
-                 "reference" => 0
-               },
+               by_category: Map.new(Categories.all_strings(), &{&1, 0}),
                by_status: %{
                  "draft" => 0,
                  "published" => 0,
