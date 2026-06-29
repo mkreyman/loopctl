@@ -71,7 +71,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.VectorSearch
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id} = args}) do
     case Knowledge.get_article_with_embedding(tenant_id, article_id) do
       {:error, :not_found} ->
         # Article deleted -- no-op
@@ -82,9 +82,20 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         :ok
 
       {:ok, %Article{} = article} ->
-        threshold = Application.get_env(:loopctl, :article_link_threshold, 0.6)
+        threshold = resolve_threshold(args)
         max_comparisons = clamped_max_comparisons()
         find_and_link_similar(article, tenant_id, threshold, max_comparisons)
+    end
+  end
+
+  # Optional per-job threshold override (query-shaped, so it lives in args, not
+  # config DI). KnowledgeLintWorker uses a LOWER threshold when re-linking orphans
+  # so a totally-isolated article connects to its nearest neighbor instead of
+  # near-missing the default cutoff forever. Falls back to the global config.
+  defp resolve_threshold(args) do
+    case Map.get(args, "threshold") do
+      t when is_number(t) and t >= 0 -> t / 1
+      _ -> Application.get_env(:loopctl, :article_link_threshold, 0.6)
     end
   end
 

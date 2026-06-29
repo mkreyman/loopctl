@@ -57,13 +57,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Ask lint for the ceiling so we act on as many orphans per run as the engine
   # will return; the true (pre-cap) totals still come back in the summary.
   @lint_max_per_category 500
   @default_max_orphan_relink 500
+  # Orphans are, by definition, totally unlinked. Their nearest neighbor often
+  # sits just UNDER the global 0.6 link threshold (a near-miss), so re-linking at
+  # 0.6 leaves them isolated forever. Re-link orphans at a LOWER threshold so an
+  # isolated article connects to its closest relative rather than dangling.
+  @default_orphan_link_threshold 0.5
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -83,12 +90,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id}}) do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
-    relinked = enqueue_orphan_relinks(tenant_id, report)
-    log_audit_event(tenant_id, report, relinked)
+    action = act_on_orphans(tenant_id, report)
+    log_audit_event(tenant_id, report, action)
 
     Logger.info(
-      "KnowledgeLintWorker: tenant=#{tenant_id} " <>
-        "issues=#{report.summary.total_issues} orphans_relinked=#{relinked}"
+      "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
+        "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued}"
     )
 
     :ok
@@ -96,30 +103,67 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
   # --- Private ---
 
-  defp enqueue_orphan_relinks(tenant_id, report) do
+  # Orphans split two ways:
+  #   * has an embedding -> re-link at the lenient orphan threshold (its nearest
+  #     neighbor is usually a near-miss of the default 0.6 cutoff).
+  #   * no embedding -> it can NEVER link until it has one, so enqueue the
+  #     embedding worker (which chains to linking on success). These are the
+  #     articles a plain re-link silently no-ops on.
+  defp act_on_orphans(tenant_id, report) do
     max_relink =
       Application.get_env(:loopctl, :knowledge_lint_max_orphan_relink, @default_max_orphan_relink)
 
-    orphans = Enum.take(report.orphan_articles, max_relink)
+    threshold =
+      Application.get_env(
+        :loopctl,
+        :knowledge_lint_orphan_link_threshold,
+        @default_orphan_link_threshold
+      )
+
+    orphan_ids = report.orphan_articles |> Enum.take(max_relink) |> Enum.map(& &1.article_id)
     true_total = report.summary.total_per_category.orphan_articles
 
-    if true_total > length(orphans) do
+    if true_total > length(orphan_ids) do
       Logger.warning(
         "KnowledgeLintWorker: tenant=#{tenant_id} has #{true_total} orphan articles; " <>
-          "re-linking #{length(orphans)} this run (cap=#{max_relink}). Remainder retried next run."
+          "acting on #{length(orphan_ids)} this run (cap=#{max_relink}). Remainder retried next run."
       )
     end
 
-    Enum.each(orphans, fn %{article_id: article_id} ->
-      %{"article_id" => article_id, "tenant_id" => tenant_id}
+    embedded = embedded_ids(tenant_id, orphan_ids)
+
+    {with_embedding, without_embedding} =
+      Enum.split_with(orphan_ids, &MapSet.member?(embedded, &1))
+
+    Enum.each(with_embedding, fn id ->
+      %{"article_id" => id, "tenant_id" => tenant_id, "threshold" => threshold}
       |> ArticleLinkingWorker.new()
       |> Oban.insert()
     end)
 
-    length(orphans)
+    Enum.each(without_embedding, fn id ->
+      %{"article_id" => id, "tenant_id" => tenant_id}
+      |> ArticleEmbeddingWorker.new()
+      |> Oban.insert()
+    end)
+
+    %{relinked: length(with_embedding), embedding_enqueued: length(without_embedding)}
   end
 
-  defp log_audit_event(tenant_id, report, relinked) do
+  defp embedded_ids(_tenant_id, []), do: MapSet.new()
+
+  defp embedded_ids(tenant_id, orphan_ids) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.id in ^orphan_ids,
+      where: not is_nil(a.embedding),
+      select: a.id
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  defp log_audit_event(tenant_id, report, action) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -129,7 +173,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       actor_label: "worker:knowledge_lint",
       new_state: %{
         "summary" => report.summary,
-        "orphans_relinked" => relinked
+        "orphans_relinked" => action.relinked,
+        "orphans_embedding_enqueued" => action.embedding_enqueued
       }
     })
   end

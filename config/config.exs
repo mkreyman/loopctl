@@ -269,6 +269,14 @@ config :loopctl,
   knowledge_reclassify_max_per_run: 1_000,
   knowledge_reclassify_min_confidence: 0.75
 
+# KnowledgeLintWorker orphan self-heal. Orphans (zero links) re-link at a LOWER
+# threshold than the global 0.6: their nearest neighbor is typically a near-miss
+# of 0.6, so re-linking at 0.6 would leave them isolated forever.
+# max_orphan_relink caps how many orphans one nightly run acts on.
+config :loopctl,
+  knowledge_lint_orphan_link_threshold: 0.5,
+  knowledge_lint_max_orphan_relink: 500
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

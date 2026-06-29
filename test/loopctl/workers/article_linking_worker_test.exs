@@ -58,6 +58,12 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     |> Kernel.++(List.duplicate(0.01, 768))
   end
 
+  # cos(similar_embedding, near_miss_embedding) = 1/sqrt(1 + 1.518^2) ~= 0.55 —
+  # a deliberate near-miss of the default 0.6 cutoff but above a lenient 0.5.
+  defp near_miss_embedding do
+    List.duplicate(1.0, 768) ++ List.duplicate(1.518, 768)
+  end
+
   # --- TC-21.2.1: Creates relates_to links for similar articles ---
 
   describe "perform/1 creates links" do
@@ -113,6 +119,47 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
         |> AdminRepo.all()
 
       assert links == []
+    end
+
+    test "a per-job threshold override links a near-miss neighbor (orphan self-heal)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # cos(source, near_miss) ~= 0.55: under the default 0.6, over a lenient 0.5.
+      source = create_article_with_embedding(tenant.id, similar_embedding())
+      near_miss = create_article_with_embedding(tenant.id, near_miss_embedding())
+
+      # Default threshold: no link (this is why orphans stay orphaned).
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      assert [] ==
+               from(l in ArticleLink, where: l.source_article_id == ^source.id)
+               |> AdminRepo.all()
+
+      # Lenient threshold passed in args: the near-miss neighbor now links.
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{
+                   "article_id" => source.id,
+                   "tenant_id" => tenant.id,
+                   "threshold" => 0.5
+                 }
+               })
+
+      links =
+        from(l in ArticleLink,
+          where: l.tenant_id == ^tenant.id,
+          where:
+            (l.source_article_id == ^source.id and l.target_article_id == ^near_miss.id) or
+              (l.source_article_id == ^near_miss.id and l.target_article_id == ^source.id)
+        )
+        |> AdminRepo.all()
+
+      assert length(links) == 1
+      assert hd(links).metadata["similarity_score"] >= 0.5
+      assert hd(links).metadata["similarity_score"] < 0.6
     end
   end
 

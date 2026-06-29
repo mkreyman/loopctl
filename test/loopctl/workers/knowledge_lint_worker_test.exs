@@ -39,6 +39,19 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> Kernel.++(List.duplicate(0.01, 768))
   end
 
+  # A published orphan with NO embedding — the case a plain re-link no-ops on.
+  defp published_without_embedding(tenant_id) do
+    fixture(:article, %{
+      tenant_id: tenant_id,
+      title: "Article #{System.unique_integer([:positive])}",
+      body: "Test article body.",
+      category: :pattern,
+      tags: []
+    })
+    |> Ecto.Changeset.change(%{status: :published})
+    |> AdminRepo.update!()
+  end
+
   defp lint_audit_entries(tenant_id) do
     from(a in AuditLog,
       where: a.tenant_id == ^tenant_id,
@@ -62,6 +75,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert entry.new_state["summary"]["total_articles"] == 1
       assert is_integer(entry.new_state["summary"]["total_issues"])
       assert is_integer(entry.new_state["orphans_relinked"])
+      assert is_integer(entry.new_state["orphans_embedding_enqueued"])
     end
 
     test "re-links orphan articles against the current corpus" do
@@ -88,9 +102,28 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert length(links) == 1
 
       assert [entry] = lint_audit_entries(tenant.id)
-      # Both were orphans at lint time, so both were enqueued for re-link.
+      # Both were embedded orphans, so both were re-linked (not embedding-enqueued).
       assert entry.new_state["summary"]["total_per_category"]["orphan_articles"] == 2
       assert entry.new_state["orphans_relinked"] == 2
+      assert entry.new_state["orphans_embedding_enqueued"] == 0
+    end
+
+    test "embeds orphans that have no embedding (a plain re-link would no-op them)" do
+      tenant = fixture(:tenant)
+      orphan = published_without_embedding(tenant.id)
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # The embedding worker ran inline (default Mox stub yields a 1536-dim vector)
+      # and stored an embedding, so the orphan is no longer un-embeddable.
+      reloaded = Loopctl.Knowledge.get_article_with_embedding(tenant.id, orphan.id)
+      assert {:ok, %{embedding: embedding}} = reloaded
+      refute is_nil(embedding)
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["orphans_relinked"] == 0
+      assert entry.new_state["orphans_embedding_enqueued"] == 1
     end
 
     test "handles a tenant with no published articles" do
@@ -102,6 +135,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert [entry] = lint_audit_entries(tenant.id)
       assert entry.new_state["summary"]["total_articles"] == 0
       assert entry.new_state["orphans_relinked"] == 0
+      assert entry.new_state["orphans_embedding_enqueued"] == 0
     end
   end
 
