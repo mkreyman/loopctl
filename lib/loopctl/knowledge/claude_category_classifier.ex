@@ -19,12 +19,12 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   alias Loopctl.Knowledge.Categories
 
   @system_prompt """
-  You classify one knowledge-base article into exactly one category. The \
-  categories and their meanings are: #{Categories.prompt_fragment()}. Respond \
-  with ONLY a JSON object of the form \
-  {"category": "<one of: #{Enum.join(Categories.active_strings(), ", ")}>", \
-  "confidence": <number between 0 and 1>}. `confidence` is how sure you are of \
-  the category. No prose, no markdown fences.\
+  You classify one knowledge-base article into exactly one category. Allowed \
+  categories: #{Enum.join(Categories.active_strings(), ", ")}. Their meanings: \
+  #{Categories.prompt_fragment()}. Reply with a single compact JSON object that \
+  has exactly two keys: "category" (one of the allowed values above) and \
+  "confidence" (a number from 0 to 1 for how sure you are). Output nothing \
+  except that JSON object.\
   """
 
   @max_body_chars 16_000
@@ -61,21 +61,47 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
              {"anthropic-version", "2023-06-01"}
            ]
          ) do
-      {:ok, %{status: 200, body: resp}} -> parse_response(resp)
-      {:ok, %{status: status}} -> {:error, {:http_status, status}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{status: 200, body: resp}} ->
+        parse_text(get_in(resp, ["content", Access.at(0), "text"]))
+
+      {:ok, %{status: status}} ->
+        {:error, {:http_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp parse_response(resp) do
-    with text when is_binary(text) <- get_in(resp, ["content", Access.at(0), "text"]),
-         {:ok, decoded} <- Jason.decode(String.trim(text)),
-         %{"category" => category, "confidence" => confidence} <- decoded,
+  @doc """
+  Parses an LLM response into a validated classification.
+
+  Tolerant of the common ways a model wraps its JSON — markdown fences, a
+  preamble, or trailing prose — by extracting the first `{...}` object from the
+  text. Returns `{:error, :unparseable_classification}` for anything that isn't
+  a JSON object with a valid active `category` and a numeric `confidence`
+  (including the failure mode where the model echoes a `"<one of: ...>"`
+  template literally). Public so the validation is unit-testable without HTTP.
+  """
+  @spec parse_text(String.t() | nil) ::
+          {:ok, Loopctl.Knowledge.ClassifierBehaviour.result()}
+          | {:error, :unparseable_classification}
+  def parse_text(text) when is_binary(text) do
+    with {:ok, json} <- extract_json_object(text),
+         %{"category" => category, "confidence" => confidence} <- json,
          true <- category in Categories.active_strings(),
          true <- is_number(confidence) do
       {:ok, %{category: String.to_existing_atom(category), confidence: confidence / 1}}
     else
       _ -> {:error, :unparseable_classification}
+    end
+  end
+
+  def parse_text(_), do: {:error, :unparseable_classification}
+
+  defp extract_json_object(text) do
+    case Regex.run(~r/\{.*\}/s, String.trim(text)) do
+      [json] -> Jason.decode(json)
+      _ -> :error
     end
   end
 end
