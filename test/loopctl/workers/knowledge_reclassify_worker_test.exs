@@ -1,0 +1,195 @@
+defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
+  use Loopctl.DataCase, async: true
+  use Oban.Testing, repo: Loopctl.Repo
+
+  setup :verify_on_exit!
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
+  alias Loopctl.Knowledge.Article
+  alias Loopctl.Workers.KnowledgeReclassifyWorker
+
+  # Published article via the proven create-then-publish path (status transitions
+  # are applied after creation, mirroring the other knowledge-worker tests).
+  defp published(tenant_id, category) do
+    fixture(:article, %{
+      tenant_id: tenant_id,
+      category: category,
+      title: "Article #{System.unique_integer([:positive])}",
+      body: "Body content."
+    })
+    |> Ecto.Changeset.change(%{status: :published})
+    |> AdminRepo.update!()
+  end
+
+  defp reload(id), do: AdminRepo.get!(Article, id)
+
+  defp verdict(category, confidence) do
+    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _title, _body ->
+      {:ok, %{category: category, confidence: confidence}}
+    end)
+  end
+
+  defp reclassify_audits(tenant_id) do
+    from(a in AuditLog,
+      where: a.tenant_id == ^tenant_id,
+      where: a.action == "knowledge.reclassify_batch",
+      order_by: [asc: a.inserted_at]
+    )
+    |> AdminRepo.all()
+  end
+
+  defp run(tenant_id, extra_args) do
+    args = Map.merge(%{"tenant_id" => tenant_id}, extra_args)
+    KnowledgeReclassifyWorker.perform(%Oban.Job{args: args})
+  end
+
+  describe "dry_run mode" do
+    test "classifies but writes nothing; audit tallies what would change" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+      b = published(tenant.id, :pattern)
+      verdict(:playbook, 0.9)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "dry_run"})
+
+      # No writes in dry-run.
+      assert reload(a.id).category == :convention
+      assert reload(b.id).category == :pattern
+
+      assert [entry] = reclassify_audits(tenant.id)
+      assert entry.new_state["run_mode"] == "dry_run"
+      assert entry.new_state["batch"]["changed"] == 2
+      assert entry.new_state["batch"]["by_transition"]["convention->playbook"] == 1
+      assert entry.new_state["batch"]["by_transition"]["pattern->playbook"] == 1
+    end
+  end
+
+  describe "commit mode write-on-confident-change" do
+    test "rewrites category and records provenance when confident and different" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+      verdict(:playbook, 0.9)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+
+      reloaded = reload(a.id)
+      assert reloaded.category == :playbook
+      assert reloaded.metadata["reclassified_from"] == "convention"
+      assert reloaded.metadata["reclassify_confidence"] == 0.9
+    end
+
+    test "leaves the article alone when confidence is below threshold" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+      verdict(:playbook, 0.5)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit", "min_confidence" => 0.75})
+
+      assert reload(a.id).category == :convention
+      assert [entry] = reclassify_audits(tenant.id)
+      assert entry.new_state["batch"]["low_confidence"] == 1
+      assert entry.new_state["batch"]["changed"] == 0
+    end
+
+    test "no-op when the proposed category equals the current one" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :pattern)
+      verdict(:pattern, 0.99)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+
+      assert reload(a.id).category == :pattern
+      assert [entry] = reclassify_audits(tenant.id)
+      assert entry.new_state["batch"]["unchanged"] == 1
+      assert entry.new_state["batch"]["changed"] == 0
+    end
+
+    test "always moves a retired convention row off convention when confident" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+      verdict(:insight, 0.8)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+
+      assert reload(a.id).category == :insight
+    end
+
+    test "an unparseable/errored classification leaves the article alone" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _t, _b ->
+        {:error, :unparseable_classification}
+      end)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+
+      assert reload(a.id).category == :convention
+      assert [entry] = reclassify_audits(tenant.id)
+      assert entry.new_state["batch"]["errors"] == 1
+    end
+  end
+
+  describe "cost ceiling + batch chaining" do
+    test "stops after max_per_run, leaving the remainder for the next kick" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+      b = published(tenant.id, :convention)
+      c = published(tenant.id, :convention)
+      verdict(:playbook, 0.9)
+
+      # batch_size 1 forces chaining; max_per_run 2 stops after two articles.
+      assert :ok =
+               run(tenant.id, %{
+                 "run_mode" => "commit",
+                 "batch_size" => 1,
+                 "max_per_run" => 2
+               })
+
+      categories = Enum.map([a, b, c], &reload(&1.id).category)
+      assert Enum.count(categories, &(&1 == :playbook)) == 2
+      assert Enum.count(categories, &(&1 == :convention)) == 1
+    end
+  end
+
+  describe "all_tenants fan-out" do
+    test "reclassifies each active tenant, skipping suspended ones" do
+      active_a = fixture(:tenant)
+      active_b = fixture(:tenant)
+      suspended = fixture(:tenant, %{status: :suspended})
+
+      a = published(active_a.id, :convention)
+      b = published(active_b.id, :convention)
+      s = published(suspended.id, :convention)
+      verdict(:playbook, 0.9)
+
+      assert :ok =
+               KnowledgeReclassifyWorker.perform(%Oban.Job{
+                 args: %{"mode" => "all_tenants", "run_mode" => "commit"}
+               })
+
+      assert reload(a.id).category == :playbook
+      assert reload(b.id).category == :playbook
+      assert reload(s.id).category == :convention
+    end
+  end
+
+  describe "tenant isolation" do
+    test "only the caller tenant's articles are touched" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      a = published(tenant_a.id, :convention)
+      b = published(tenant_b.id, :convention)
+      verdict(:playbook, 0.9)
+
+      assert :ok = run(tenant_a.id, %{"run_mode" => "commit"})
+
+      assert reload(a.id).category == :playbook
+      assert reload(b.id).category == :convention
+      assert [] == reclassify_audits(tenant_b.id)
+    end
+  end
+end

@@ -177,6 +177,9 @@ config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 # DI: Use mock content extractor in tests
 config :loopctl, :content_extractor, Loopctl.MockContentExtractor
 
+# DI: Use mock category classifier in tests
+config :loopctl, :category_classifier, Loopctl.MockCategoryClassifier
+
 # DI: Use mock WebAuthn adapter in tests
 config :loopctl, :webauthn_adapter, Loopctl.MockWebAuthn
 

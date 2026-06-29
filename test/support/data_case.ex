@@ -113,6 +113,12 @@ defmodule Loopctl.DataCase do
       {:ok, []}
     end)
 
+    # Default stub for category classifier -- zero confidence, so the
+    # reclassification backfill is a no-op unless a test sets its own verdict.
+    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _title, _body ->
+      {:ok, %{category: :pattern, confidence: 0.0}}
+    end)
+
     # Default Req.Test stub for content ingestion URL fetching
     Req.Test.stub(Loopctl.Workers.ContentIngestionWorker, fn conn ->
       Req.Test.text(conn, "Default ingestion stub content")
