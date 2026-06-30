@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsJSON do
       meta: %{
         count: length(rows),
         limit: Keyword.get(opts, :limit),
+        offset: Keyword.get(opts, :offset, 0),
         since: encode_dt(Keyword.get(opts, :since)),
         access_type: Keyword.get(opts, :access_type),
         project_id: Keyword.get(opts, :project_id),
@@ -124,7 +125,8 @@ defmodule LoopctlWeb.KnowledgeAnalyticsJSON do
       meta: %{
         count: length(rows),
         days_unused: Keyword.get(opts, :days_unused),
-        limit: Keyword.get(opts, :limit)
+        limit: Keyword.get(opts, :limit),
+        offset: Keyword.get(opts, :offset, 0)
       }
     }
   end
