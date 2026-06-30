@@ -5,6 +5,24 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.26.0 — 2026-06-30 (route-the-findings: conflict review surface)
+
+### Added
+
+- **`knowledge_conflicts`** — list `:potential_conflict` article pairs (published
+  articles flagged "too similar to comfortably coexist" by the auto-linker / nightly
+  lint sweep), highest-overlap first. The KB only flags; the caller decides
+  redundancy-vs-contradiction. Paginated (default 50, max 1000, clamped). Agent role.
+- **`knowledge_get`** responses now include a `potential_conflicts` array on each
+  article (peer `article_id`, `title`, `similarity`) — so an agent reading an article
+  trips over its conflict pairs and can act, instead of digging through the link graph.
+
+### Fixed
+
+- `knowledge_drafts` description/comment corrected: an over-max `limit` is **clamped**
+  to the maximum (never rejected with 400) — the server has clamped since the
+  pagination work; the tool doc was stale.
+
 ## 2.25.0 — 2026-06-30 (novelty-gated write-back)
 
 ### Added

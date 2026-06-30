@@ -225,6 +225,37 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     }
   )
 
+  operation(:conflicts,
+    summary: "List potential-conflict article pairs",
+    description:
+      "Lists `:potential_conflict` pairs — published articles flagged 'too similar to " <>
+        "comfortably coexist' by the auto-linker / nightly lint sweep, highest-overlap " <>
+        "first. The KB only flags; the caller decides whether each is a redundancy to " <>
+        "merge or a real contradiction to reconcile. Role: agent+.",
+    parameters: [
+      limit: [
+        in: :query,
+        type: :integer,
+        description:
+          "Max results per page (default 50, max 1000). A limit above the max is " <>
+            "clamped to the maximum — never rejected — so pagination stays complete."
+      ],
+      offset: [in: :query, type: :integer, description: "Records to skip"]
+    ],
+    responses: %{
+      200 =>
+        {"Conflicts list", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array},
+             meta: %OpenApiSpex.Schema{type: :object}
+           }
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   operation(:bulk_unpublish,
     summary: "Bulk unpublish articles",
     description:
@@ -608,6 +639,22 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         data: Enum.map(result.data, &ArticleJSON.article_data/1),
         meta: result.meta
       })
+    end
+  end
+
+  @doc "GET /api/v1/knowledge/conflicts"
+  def conflicts(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    with {:ok, effective_limit} <- Pagination.validate_limit(params) do
+      opts =
+        []
+        |> maybe_add_opt(:limit, effective_limit)
+        |> maybe_add_opt(:offset, parse_int(params["offset"]))
+
+      result = Knowledge.list_potential_conflicts(tenant_id, opts)
+
+      json(conn, result)
     end
   end
 

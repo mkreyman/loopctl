@@ -294,6 +294,7 @@ defmodule LoopctlWeb.Router do
     post "/knowledge/bulk-unpublish", ArticleWorkflowController, :bulk_unpublish
     post "/knowledge/bulk-delete", ArticleWorkflowController, :bulk_delete
     get "/knowledge/drafts", ArticleWorkflowController, :drafts
+    get "/knowledge/conflicts", ArticleWorkflowController, :conflicts
 
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index

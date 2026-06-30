@@ -1263,4 +1263,30 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert hd(body["data"])["title"] == "A Draft"
     end
   end
+
+  describe "GET /api/v1/knowledge/conflicts" do
+    test "lists potential-conflict pairs (agent role), highest overlap first", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id, title: "A", status: :published})
+      b = fixture(:article, %{tenant_id: tenant.id, title: "B", status: :published})
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.97}
+      })
+      |> AdminRepo.insert!()
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/conflicts")
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      assert [pair] = body["data"]
+      assert pair["similarity"] == 0.97
+      assert length(pair["articles"]) == 2
+    end
+  end
 end
