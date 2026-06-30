@@ -267,7 +267,12 @@ config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifie
 config :loopctl,
   knowledge_reclassify_batch_size: 100,
   knowledge_reclassify_max_per_run: 1_000,
-  knowledge_reclassify_min_confidence: 0.75
+  knowledge_reclassify_min_confidence: 0.75,
+  knowledge_reclassify_max_concurrency: 10,
+  # Outage resilience: snooze (retry same cursor) when >= this fraction of a
+  # batch fails to classify, instead of advancing past unreclassified articles.
+  knowledge_reclassify_snooze_error_rate: 0.5,
+  knowledge_reclassify_snooze_seconds: 60
 
 # KnowledgeLintWorker orphan self-heal. Orphans (zero links) re-link at a LOWER
 # threshold than the global 0.6: their nearest neighbor is typically a near-miss

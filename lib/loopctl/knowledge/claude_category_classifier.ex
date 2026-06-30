@@ -21,10 +21,14 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   @system_prompt """
   You classify one knowledge-base article into exactly one category. Allowed \
   categories: #{Enum.join(Categories.active_strings(), ", ")}. Their meanings: \
-  #{Categories.prompt_fragment()}. Reply with a single compact JSON object that \
-  has exactly two keys: "category" (one of the allowed values above) and \
-  "confidence" (a number from 0 to 1 for how sure you are). Output nothing \
-  except that JSON object.\
+  #{Categories.prompt_fragment()}. Choose the MOST SPECIFIC fit, and do not \
+  over-use 'playbook': pick 'playbook' only when the article actually lays out \
+  explicit ordered steps. If it states a principle, realization, or mental model, \
+  use 'insight'; if it describes a reusable shape or recurring structure, use \
+  'pattern'; if it proposes something to build or try, use 'idea'. Reply with a \
+  single compact JSON object that has exactly two keys: "category" (one of the \
+  allowed values above) and "confidence" (a number from 0 to 1 for how sure you \
+  are). Output nothing except that JSON object.\
   """
 
   @max_body_chars 16_000
@@ -43,7 +47,14 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
 
   defp call_anthropic(title, body, config) do
     base_url = config[:base_url] || "https://api.anthropic.com/v1"
-    model = config[:model] || "claude-haiku-4-5-20251001"
+
+    # Classification can use a STRONGER model than content extraction without
+    # changing extraction: :knowledge_classifier_model wins, else the shared
+    # provider model, else Haiku. Set ANTHROPIC_CLASSIFIER_MODEL in prod to
+    # override (e.g. a Sonnet id) for the one-time 77k reclassification.
+    model =
+      Application.get_env(:loopctl, :knowledge_classifier_model) ||
+        config[:model] || "claude-haiku-4-5-20251001"
 
     user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
 

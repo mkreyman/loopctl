@@ -117,19 +117,46 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
       assert reload(a.id).category == :insight
     end
 
-    test "an unparseable/errored classification leaves the article alone" do
+    test "a few errored classifications (below the snooze rate) leave those articles alone but proceed" do
       tenant = fixture(:tenant)
-      a = published(tenant.id, :convention)
+      # 3 articles: one errors (33% < 50% snooze rate), two classify fine.
+      bad = published(tenant.id, :convention)
+      good_a = published(tenant.id, :convention)
+      good_b = published(tenant.id, :convention)
 
-      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _t, _b ->
-        {:error, :unparseable_classification}
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn title, _body ->
+        if title == bad.title,
+          do: {:error, :unparseable_classification},
+          else: {:ok, %{category: :playbook, confidence: 0.9}}
       end)
 
       assert :ok = run(tenant.id, %{"run_mode" => "commit"})
 
-      assert reload(a.id).category == :convention
+      assert reload(bad.id).category == :convention
+      assert reload(good_a.id).category == :playbook
+      assert reload(good_b.id).category == :playbook
       assert [entry] = reclassify_audits(tenant.id)
       assert entry.new_state["batch"]["errors"] == 1
+      assert entry.new_state["batch"]["changed"] == 2
+    end
+  end
+
+  describe "outage resilience" do
+    test "snoozes and retries the same cursor when the whole batch fails (upstream down)" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+
+      # Every classify errors -> 100% error rate -> upstream is unreachable.
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _t, _b ->
+        {:error, :econnrefused}
+      end)
+
+      assert {:snooze, seconds} = run(tenant.id, %{"run_mode" => "commit"})
+      assert is_integer(seconds) and seconds > 0
+
+      # Nothing written and NO audit/advance — it will retry the same cursor.
+      assert reload(a.id).category == :convention
+      assert [] == reclassify_audits(tenant.id)
     end
   end
 
