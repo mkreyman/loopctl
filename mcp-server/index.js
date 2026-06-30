@@ -1027,14 +1027,26 @@ async function knowledgeBulkDelete({
 
 async function knowledgeDrafts({ limit, offset, project_id }) {
   const params = new URLSearchParams();
-  // Pass `limit` through verbatim (like knowledge_list/index/search) so the
-  // server honors it up to its max page size and returns 400 above it — rather
-  // than silently clamping client-side, which would truncate draft enumeration.
+  // Pass `limit` through verbatim (like knowledge_list/index/search) so the server
+  // honors it up to its max page size, clamping above it server-side rather than
+  // silently clamping client-side (which would truncate draft enumeration).
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
   if (project_id) params.set("project_id", project_id);
   const path = `/api/v1/knowledge/drafts?${params.toString()}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
+async function knowledgeConflicts({ limit, offset }) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/conflicts?${qs}`
+    : "/api/v1/knowledge/conflicts";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
 
@@ -2852,8 +2864,8 @@ const TOOLS = [
     description:
       "List draft (unpublished) knowledge articles. Requires orchestrator role. " +
       "Returns paginated drafts with total_count in meta. Paginate via offset/limit " +
-      "(limit honored up to 1000; a limit above the max is rejected with 400, not " +
-      "silently clamped).",
+      "(limit honored up to 1000; a limit above the max is clamped to the maximum, " +
+      "never rejected, so pagination stays complete).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2861,7 +2873,7 @@ const TOOLS = [
           type: "integer",
           description:
             "Max drafts per page (default 20, max 1000). A limit above the max is " +
-            "rejected with 400 — not silently clamped — so offset pagination stays complete.",
+            "clamped to the maximum — never rejected — so offset pagination stays complete.",
           default: 20,
           minimum: 1,
           maximum: 1000,
@@ -2875,6 +2887,39 @@ const TOOLS = [
         project_id: {
           type: "string",
           description: "Optional: filter drafts to a specific project UUID.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_conflicts",
+    description:
+      "List potential-conflict article pairs — published articles flagged 'too similar " +
+      "to comfortably coexist' by the auto-linker / nightly lint sweep, highest-overlap " +
+      "first. The KB only FLAGS the pair (via a mechanical similarity threshold); it does " +
+      "NOT decide whether it's a redundancy to merge or a real contradiction — that's your " +
+      "call, with the live context. Each entry has the two articles (id/title/status/" +
+      "category) and their similarity. Read both, then merge (supersede one, knowledge_create " +
+      "the merged article, or PATCH) or, if they genuinely disagree, reconcile. Paginated " +
+      "with total_count in meta. Agent role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          description:
+            "Max pairs per page (default 50, max 1000). A limit above the max is clamped " +
+            "to the maximum — never rejected — so offset pagination stays complete.",
+          default: 50,
+          minimum: 1,
+          maximum: 1000,
+        },
+        offset: {
+          type: "integer",
+          description: "Pagination offset. Default 0.",
+          default: 0,
+          minimum: 0,
         },
       },
       required: [],
@@ -3499,6 +3544,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_drafts":
       return await knowledgeDrafts(args);
+
+    case "knowledge_conflicts":
+      return await knowledgeConflicts(args);
 
     case "knowledge_lint":
       return await knowledgeLint(args);

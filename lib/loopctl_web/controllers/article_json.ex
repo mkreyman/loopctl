@@ -78,6 +78,36 @@ defmodule LoopctlWeb.ArticleJSON do
     article_data(article)
     |> Map.put(:outgoing_links, Enum.map(loaded_links(article.outgoing_links), &link_data/1))
     |> Map.put(:incoming_links, Enum.map(loaded_links(article.incoming_links), &link_data/1))
+    |> Map.put(:potential_conflicts, potential_conflicts(article))
+  end
+
+  # Route-the-findings (#4): a flattened, actionable view of the article's
+  # `:potential_conflict` links (in either direction) — the PEER article + the
+  # similarity that flagged it. Empty list when none. These also appear in
+  # incoming/outgoing_links; this surfaces them so an agent reading the article trips
+  # over "too similar to coexist" pairs and can merge the redundancy or reconcile.
+  defp potential_conflicts(article) do
+    out =
+      article.outgoing_links
+      |> loaded_links()
+      |> Enum.filter(&(&1.relationship_type == :potential_conflict))
+      |> Enum.map(&conflict_peer(&1, &1.target_article, &1.target_article_id))
+
+    inc =
+      article.incoming_links
+      |> loaded_links()
+      |> Enum.filter(&(&1.relationship_type == :potential_conflict))
+      |> Enum.map(&conflict_peer(&1, &1.source_article, &1.source_article_id))
+
+    out ++ inc
+  end
+
+  defp conflict_peer(link, peer_article, peer_id) do
+    %{
+      article_id: peer_id,
+      title: loaded_title(peer_article),
+      similarity: get_in(link.metadata || %{}, ["similarity_score"])
+    }
   end
 
   defp link_data(link) do

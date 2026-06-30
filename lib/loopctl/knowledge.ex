@@ -3165,6 +3165,59 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
+  Route-the-findings (#4) review surface: every `:potential_conflict` pair in the
+  tenant — articles flagged "too similar to comfortably coexist" by the linker/lint
+  sweep, highest-overlap first (most likely a true duplicate). The KB does not decide
+  redundancy-vs-contradiction; this is the queue a consumer/human resolves.
+
+  Opts: `:limit` (default 50, clamped to the max page size), `:offset` (default 0).
+
+  Returns `%{data: [%{link_id, similarity, articles: [%{id, title, status, category},
+  ...]}], meta: %{limit, offset, total_count}}`.
+  """
+  @spec list_potential_conflicts(Ecto.UUID.t(), keyword()) :: %{data: [map()], meta: map()}
+  def list_potential_conflicts(tenant_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit, 50) |> max(1) |> min(@max_page_size)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+
+    base =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict
+      )
+
+    total_count = AdminRepo.aggregate(base, :count, :id)
+
+    rows =
+      from(l in base,
+        join: s in Article,
+        on: s.id == l.source_article_id,
+        join: t in Article,
+        on: t.id == l.target_article_id,
+        order_by: [
+          desc: fragment("(?->>'similarity_score')::float", l.metadata),
+          asc: l.id
+        ],
+        limit: ^limit,
+        offset: ^offset,
+        select: %{
+          link_id: l.id,
+          similarity: fragment("(?->>'similarity_score')::float", l.metadata),
+          source: %{id: s.id, title: s.title, status: s.status, category: s.category},
+          target: %{id: t.id, title: t.title, status: t.status, category: t.category}
+        }
+      )
+      |> AdminRepo.all()
+
+    data =
+      Enum.map(rows, fn r ->
+        %{link_id: r.link_id, similarity: r.similarity, articles: [r.source, r.target]}
+      end)
+
+    %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}
+  end
+
+  @doc """
   Lists all links for an article (both outgoing and incoming),
   with linked articles preloaded.
 

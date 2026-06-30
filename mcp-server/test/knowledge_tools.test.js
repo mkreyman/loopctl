@@ -1121,3 +1121,43 @@ describe("knowledge_create novelty gate (force passthrough)", () => {
     assert.equal(sent.force, true);
   });
 });
+
+async function knowledgeConflicts({ limit, offset } = {}) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/conflicts?${qs}`
+    : "/api/v1/knowledge/conflicts";
+  return await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+}
+
+describe("knowledge_conflicts (route-the-findings review surface)", () => {
+  test("GETs the conflicts endpoint with the agent key and forwards pagination", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeConflicts({ limit: 10, offset: 20 });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    const parsed = new URL(url);
+    assert.equal(parsed.pathname, "/api/v1/knowledge/conflicts");
+    assert.equal(parsed.searchParams.get("limit"), "10");
+    assert.equal(parsed.searchParams.get("offset"), "20");
+  });
+
+  test("omits the query string when no pagination is passed", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0 } });
+
+    await knowledgeConflicts();
+
+    const parsed = new URL(calls[0].url);
+    assert.equal(parsed.pathname, "/api/v1/knowledge/conflicts");
+    assert.equal(parsed.search, "");
+  });
+});
