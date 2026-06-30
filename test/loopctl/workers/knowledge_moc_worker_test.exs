@@ -108,6 +108,21 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       refute hub.body =~ "Index: topic — `"
     end
 
+    test "lists a content article tagged \"moc\" (Market-On-Close) in its topic hub" do
+      tenant = fixture(:tenant)
+      # `moc` is also a legit content tag — hub detection must key on "hub", not "moc",
+      # or these trading articles would be dropped from their real topic hub.
+      published(tenant.id, "MOC exit strategy", ["trading", "moc"])
+      published(tenant.id, "Ichimoku entry", ["trading"])
+
+      assert :ok = run(tenant.id)
+
+      hub = moc_hub(tenant.id, "trading")
+      assert hub
+      assert hub.body =~ "MOC exit strategy"
+      assert hub.body =~ "Ichimoku entry"
+    end
+
     test "indexes only topical tags — excludes structural/format and provenance-prefix tags" do
       tenant = fixture(:tenant)
 
