@@ -150,8 +150,11 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
         status: :published,
         limit: @max_members
       ).data
-      # Never list MOCs inside a MOC.
-      |> Enum.reject(fn a -> "moc" in (a.tags || []) end)
+      # Never list MOC hubs inside a MOC. Detect a hub by its `"hub"` marker tag,
+      # NOT by `"moc"` — `moc` is also a legit content tag (Market-On-Close in
+      # trading), and keying on it would wrongly drop those articles from their
+      # real topic hub.
+      |> Enum.reject(fn a -> "hub" in (a.tags || []) end)
 
     body = build_body(tag, count, members)
     moc_tags = ["hub", "moc", tag]
