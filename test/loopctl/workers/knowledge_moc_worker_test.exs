@@ -113,15 +113,20 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
 
       for n <- 1..3 do
         published(tenant.id, "Doc #{n}", ["pdf"])
+        published(tenant.id, "Readme #{n}", ["readme"])
         published(tenant.id, "Vid #{n}", ["yt-abc123"])
+        published(tenant.id, "Pages #{n}", ["pp-1-12"])
         published(tenant.id, "Rust #{n}", ["rust"])
       end
 
       assert :ok = run(tenant.id)
 
-      # `pdf` (structural) and `yt-abc123` (per-source provenance) get no MOC...
+      # Structural/format tags get no MOC...
       refute moc_hub(tenant.id, "pdf")
+      refute moc_hub(tenant.id, "readme")
+      # ...nor do per-source provenance / chunk-coordinate tags...
       refute moc_hub(tenant.id, "yt-abc123")
+      refute moc_hub(tenant.id, "pp-1-12")
       # ...but a genuine topic does.
       assert moc_hub(tenant.id, "rust")
     end
