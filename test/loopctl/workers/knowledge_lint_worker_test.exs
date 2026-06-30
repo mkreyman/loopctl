@@ -179,4 +179,69 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert [] == lint_audit_entries(tenant_b.id)
     end
   end
+
+  describe "conflict promotion (#4 existing-corpus backstop)" do
+    defp relates_link(tenant_id, src_id, tgt_id, score) do
+      %ArticleLink{tenant_id: tenant_id}
+      |> ArticleLink.changeset(%{
+        source_article_id: src_id,
+        target_article_id: tgt_id,
+        relationship_type: :relates_to,
+        metadata: %{"auto_generated" => true, "similarity_score" => score}
+      })
+      |> AdminRepo.insert!()
+    end
+
+    defp conflict_links(tenant_id, a_id, b_id) do
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where:
+          (l.source_article_id == ^a_id and l.target_article_id == ^b_id) or
+            (l.source_article_id == ^b_id and l.target_article_id == ^a_id)
+      )
+      |> AdminRepo.all()
+    end
+
+    test "promotes a high-similarity relates_to link to a :potential_conflict flag" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.95)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [conflict] = conflict_links(tenant.id, a.id, b.id)
+      assert conflict.metadata["promoted_from"] == "relates_to"
+      assert conflict.metadata["similarity_score"] == 0.95
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["conflicts_promoted"] == 1
+    end
+
+    test "leaves a below-threshold relates_to link alone" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.80)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [] == conflict_links(tenant.id, a.id, b.id)
+    end
+
+    test "is idempotent — a second run promotes nothing new" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.96)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [_only_one] = conflict_links(tenant.id, a.id, b.id)
+      assert [_, second] = lint_audit_entries(tenant.id) |> Enum.sort_by(& &1.inserted_at)
+      assert second.new_state["conflicts_promoted"] == 0
+    end
+  end
 end

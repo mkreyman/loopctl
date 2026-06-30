@@ -64,6 +64,56 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     List.duplicate(1.0, 768) ++ List.duplicate(1.518, 768)
   end
 
+  # cos(similar_embedding, this) = 768 / (sqrt(768) * sqrt(1536)) ~= 0.707 — related
+  # (>= 0.6) but below the 0.93 conflict threshold.
+  defp moderately_similar_embedding do
+    List.duplicate(1.0, 1536)
+  end
+
+  defp links_of_type(tenant_id, a_id, b_id, type) do
+    from(l in ArticleLink,
+      where: l.tenant_id == ^tenant_id,
+      where: l.relationship_type == ^type,
+      where:
+        (l.source_article_id == ^a_id and l.target_article_id == ^b_id) or
+          (l.source_article_id == ^b_id and l.target_article_id == ^a_id)
+    )
+    |> AdminRepo.all()
+  end
+
+  describe "potential conflict detection (#4)" do
+    test "flags a near-identical pair with a :potential_conflict link" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_with_embedding(tenant.id, similar_embedding())
+      dup = create_article_with_embedding(tenant.id, near_similar_embedding())
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      # Both an ambient relates_to AND the conflict flag.
+      assert [_] = links_of_type(tenant.id, source.id, dup.id, :relates_to)
+      assert [conflict] = links_of_type(tenant.id, source.id, dup.id, :potential_conflict)
+      assert conflict.metadata["similarity_score"] >= 0.93
+      assert conflict.metadata["auto_generated"] == true
+    end
+
+    test "a merely-related pair (below the conflict threshold) gets NO conflict flag" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_article_with_embedding(tenant.id, similar_embedding())
+      related = create_article_with_embedding(tenant.id, moderately_similar_embedding())
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      assert [_] = links_of_type(tenant.id, source.id, related.id, :relates_to)
+      assert [] == links_of_type(tenant.id, source.id, related.id, :potential_conflict)
+    end
+  end
+
   # --- TC-21.2.1: Creates relates_to links for similar articles ---
 
   describe "perform/1 creates links" do
@@ -226,13 +276,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       links =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :relates_to,
           where:
             (l.source_article_id == ^article_a.id and l.target_article_id == ^article_b.id) or
               (l.source_article_id == ^article_b.id and l.target_article_id == ^article_a.id)
         )
         |> AdminRepo.all()
 
-      # Only the manually created one should exist
+      # Only the manually created relates_to one should exist (a high-similarity pair
+      # also gets a separate :potential_conflict flag — that's #4, asserted elsewhere).
       assert length(links) == 1
     end
   end
@@ -301,10 +353,12 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # All 3 similar articles should be linked (within default limit of 50)
+      # All 3 similar articles should be linked (within default limit of 50). Scope to
+      # :relates_to — high-similarity pairs also get a :potential_conflict link (#4).
       link_count =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant.id,
+          where: l.relationship_type == :relates_to,
           where: l.source_article_id == ^source.id
         )
         |> AdminRepo.aggregate(:count)
@@ -419,7 +473,9 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert audit.actor_type == "system"
       assert audit.actor_label == "worker:article_linking"
       assert audit.new_state["article_id"] == source.id
-      assert audit.new_state["new_link_count"] == 1
+      # 2 links: a :relates_to and, since the pair is near-identical (>= conflict
+      # threshold), a :potential_conflict flag (#4) — both are auto-links created here.
+      assert audit.new_state["new_link_count"] == 2
     end
   end
 

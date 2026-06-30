@@ -13,7 +13,11 @@ defmodule Loopctl.Knowledge.ArticleLink do
   - `tenant_id`         -- FK to tenants (set programmatically, never cast)
   - `source_article_id` -- FK to articles (the origin of the link)
   - `target_article_id` -- FK to articles (the destination of the link)
-  - `relationship_type` -- enum: relates_to, derived_from, contradicts, supersedes
+  - `relationship_type` -- enum: relates_to, derived_from, contradicts, supersedes,
+    potential_conflict (a MECHANICAL "too similar to comfortably coexist" flag —
+    NOT an assertion that the two disagree; the consuming agent judges whether it's a
+    redundancy to merge or a real contradiction. Distinct from `contradicts`, which
+    asserts a known disagreement.)
   - `metadata`          -- extensible JSONB, defaults to `%{}`
   - `inserted_at`       -- creation timestamp (no updated_at)
 
@@ -29,7 +33,13 @@ defmodule Loopctl.Knowledge.ArticleLink do
 
   @type t :: %__MODULE__{}
 
-  @relationship_type_values [:relates_to, :derived_from, :contradicts, :supersedes]
+  @relationship_type_values [
+    :relates_to,
+    :derived_from,
+    :contradicts,
+    :supersedes,
+    :potential_conflict
+  ]
 
   schema "article_links" do
     tenant_field()
