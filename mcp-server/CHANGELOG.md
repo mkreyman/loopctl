@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.24.0 — 2026-06-30 (pagination: analytics rankings offset)
+
+### Added
+
+- `offset` on the analytics ranking tools, now that the server endpoints support
+  it — page the ranking past the first page:
+  - **`knowledge_analytics_top`** — `offset`
+  - **`knowledge_unused_articles`** — `offset`
+
+  (`knowledge_agent_usage` / project-usage are bounded summary widgets server-side,
+  not enumeration endpoints, so they intentionally take no `offset`.)
+
 ## 2.23.0 — 2026-06-30 (pagination: no imposed limits on list tools)
 
 ### Fixed

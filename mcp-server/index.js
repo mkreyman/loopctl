@@ -1097,9 +1097,10 @@ async function knowledgeIngestionJobs({ limit, offset, since_days } = {}) {
 
 // --- Knowledge Analytics Tools (orch key) ---
 
-async function knowledgeAnalyticsTop({ limit, since_days, access_type } = {}) {
+async function knowledgeAnalyticsTop({ limit, offset, since_days, access_type } = {}) {
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
   if (since_days != null) params.set("since_days", String(since_days));
   if (access_type) params.set("access_type", access_type);
   const qs = params.toString();
@@ -1187,10 +1188,11 @@ async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } =
   return toContent(result);
 }
 
-async function knowledgeUnusedArticles({ days_unused, limit } = {}) {
+async function knowledgeUnusedArticles({ days_unused, limit, offset } = {}) {
   const params = new URLSearchParams();
   if (days_unused != null) params.set("days_unused", String(days_unused));
   if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
   const qs = params.toString();
   const path = qs
     ? `/api/v1/knowledge/analytics/unused-articles?${qs}`
@@ -3102,9 +3104,14 @@ const TOOLS = [
       properties: {
         limit: {
           type: "integer",
-          description: "Max rows to return. Default 20, max 100.",
+          description: "Max rows per page. Default 20, max 100.",
           minimum: 1,
           maximum: 100,
+        },
+        offset: {
+          type: "integer",
+          description: "Rows to skip — page the ranking past the first page. Default 0.",
+          minimum: 0,
         },
         since_days: {
           type: "integer",
@@ -3188,9 +3195,14 @@ const TOOLS = [
         },
         limit: {
           type: "integer",
-          description: "Max rows to return. Default 50, max 200.",
+          description: "Max rows per page. Default 50, max 200.",
           minimum: 1,
           maximum: 200,
+        },
+        offset: {
+          type: "integer",
+          description: "Rows to skip — page the full unused set to completeness. Default 0.",
+          minimum: 0,
         },
       },
       required: [],
