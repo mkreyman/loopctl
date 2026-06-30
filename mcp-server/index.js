@@ -178,8 +178,12 @@ async function getTenant() {
   return toContent(result);
 }
 
-async function listProjects() {
-  const result = await apiCall("GET", "/api/v1/projects");
+async function listProjects({ page, page_size } = {}) {
+  const params = new URLSearchParams();
+  if (page != null) params.set("page", String(page));
+  if (page_size != null) params.set("page_size", String(page_size));
+  const query = params.toString() ? `?${params}` : "";
+  const result = await apiCall("GET", `/api/v1/projects${query}`);
   return toContent(result);
 }
 
@@ -381,12 +385,13 @@ async function listStories({ project_id, agent_status, verified_status, epic_id,
   return toContentCompact(result);
 }
 
-async function listReadyStories({ project_id, limit }) {
+async function listReadyStories({ project_id, page, page_size }) {
+  // /stories/ready paginates by page/page_size — the old `limit` param was
+  // silently ignored by the server, capping callers at the first page.
   const params = new URLSearchParams({ project_id });
-  params.set(
-    "limit",
-    String(Math.min(limit ?? DEFAULT_STORY_PAGE_SIZE, SERVER_MAX_STORY_PAGE_SIZE)),
-  );
+  if (page != null) params.set("page", String(page));
+  if (page_size != null)
+    params.set("page_size", String(Math.min(page_size, SERVER_MAX_STORY_PAGE_SIZE)));
 
   const result = await apiCall("GET", `/api/v1/stories/ready?${params}`);
   return toContentCompact(result);
@@ -559,14 +564,20 @@ async function getCostSummary({ project_id, breakdown }) {
   return toContent(result);
 }
 
-async function getStoryTokenUsage({ story_id }) {
-  const result = await apiCall("GET", `/api/v1/stories/${story_id}/token-usage`);
+async function getStoryTokenUsage({ story_id, page, page_size }) {
+  const params = new URLSearchParams();
+  if (page != null) params.set("page", String(page));
+  if (page_size != null) params.set("page_size", String(page_size));
+  const query = params.toString() ? `?${params}` : "";
+  const result = await apiCall("GET", `/api/v1/stories/${story_id}/token-usage${query}`);
   return toContent(result);
 }
 
-async function getCostAnomalies({ project_id }) {
+async function getCostAnomalies({ project_id, page, page_size }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
+  if (page != null) params.set("page", String(page));
+  if (page_size != null) params.set("page_size", String(page_size));
 
   const query = params.toString() ? `?${params}` : "";
   const result = await apiCall("GET", `/api/v1/cost-anomalies${query}`);
@@ -1069,8 +1080,18 @@ async function knowledgeIngestBatch({ items, project_id, publish }) {
   return toContent(result);
 }
 
-async function knowledgeIngestionJobs() {
-  const result = await apiCall("GET", "/api/v1/knowledge/ingestion-jobs", null, process.env.LOOPCTL_ORCH_KEY);
+async function knowledgeIngestionJobs({ limit, offset, since_days } = {}) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  if (since_days != null) params.set("since_days", String(since_days));
+  const query = params.toString() ? `?${params}` : "";
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/ingestion-jobs${query}`,
+    null,
+    process.env.LOOPCTL_ORCH_KEY,
+  );
   return toContent(result);
 }
 
@@ -1401,10 +1422,15 @@ const TOOLS = [
   },
   {
     name: "list_projects",
-    description: "List all projects in the current tenant.",
+    description:
+      "List projects in the current tenant. Paginated (page/page_size); advance " +
+      "`page` to enumerate all projects. Response includes pagination meta.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Items per page (default 20)." },
+      },
       required: [],
     },
   },
@@ -1608,7 +1634,8 @@ const TOOLS = [
     description:
       "List stories that are ready to be worked on (contracted, dependencies met). " +
       "Returns compact results — use get_story for full details. " +
-      "Defaults to 20 per page; pass `limit` up to 500 to page larger. Response includes total_count.",
+      "Paginated (page/page_size); advance `page` to enumerate all ready stories. " +
+      "Response includes total_count.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1616,9 +1643,10 @@ const TOOLS = [
           type: "string",
           description: "The UUID of the project.",
         },
-        limit: {
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: {
           type: "integer",
-          description: "Maximum number of stories to return (default 20, max 500).",
+          description: "Stories per page (default 100, max 500).",
         },
       },
       required: ["project_id"],
@@ -1963,7 +1991,9 @@ const TOOLS = [
   },
   {
     name: "get_story_token_usage",
-    description: "Get token usage records for a single story.",
+    description:
+      "Get token usage records for a single story. Paginated (page/page_size); " +
+      "advance `page` to enumerate all records.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1971,6 +2001,8 @@ const TOOLS = [
           type: "string",
           description: "The UUID of the story.",
         },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Records per page (default 20)." },
       },
       required: ["story_id"],
     },
@@ -1979,7 +2011,8 @@ const TOOLS = [
     name: "get_cost_anomalies",
     description:
       "Get cost anomaly alerts — stories or agents that exceed expected token budgets. " +
-      "Optionally filter by project.",
+      "Optionally filter by project. Paginated (page/page_size); advance `page` to " +
+      "enumerate all anomalies.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1987,6 +2020,8 @@ const TOOLS = [
           type: "string",
           description: "Optional: filter anomalies to a specific project UUID.",
         },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Anomalies per page (default 20)." },
       },
       required: [],
     },
@@ -3038,11 +3073,20 @@ const TOOLS = [
   {
     name: "knowledge_ingestion_jobs",
     description:
-      "List recent content ingestion jobs for the current tenant. " +
-      "Returns jobs from the last 7 days, max 50 results. Requires orchestrator role.",
+      "List content ingestion jobs for the current tenant, newest first. " +
+      "Paginated (limit/offset over the full history; advance `offset` by `meta.limit` " +
+      "to enumerate to completeness). Optional `since_days` narrows to a recent window. " +
+      "Requires orchestrator role.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        limit: { type: "integer", description: "Jobs per page (default 20)." },
+        offset: { type: "integer", description: "Rows to skip (default 0)." },
+        since_days: {
+          type: "integer",
+          description: "Optional: only jobs from the last N days (default: all history).",
+        },
+      },
       required: [],
     },
   },
