@@ -59,3 +59,27 @@ describe("#155 story-list limit handling", () => {
     );
   });
 });
+
+describe("list_ready_stories pagination (page/page_size, not the ignored `limit`)", () => {
+  const indexPath = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "index.js",
+  );
+
+  // /stories/ready paginates by page/page_size; the old handler forwarded `limit`,
+  // which the server ignores — capping callers at the first page with no way past it.
+  test("listReadyStories forwards page/page_size and not a `limit` param", () => {
+    const src = readFileSync(indexPath, "utf8");
+    const start = src.indexOf("async function listReadyStories");
+    assert.ok(start !== -1, "listReadyStories handler must exist");
+    const body = src.slice(start, start + 500);
+
+    assert.ok(/page_size/.test(body), "listReadyStories must forward page_size");
+    assert.ok(/"page"/.test(body), "listReadyStories must forward page");
+    assert.ok(
+      !/params\.set\(\s*["']limit["']/.test(body),
+      "listReadyStories must NOT send the server-ignored `limit` param",
+    );
+  });
+});

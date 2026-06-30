@@ -5,6 +5,24 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.23.0 — 2026-06-30 (pagination: no imposed limits on list tools)
+
+### Fixed
+
+- **`list_ready_stories`** sent a `limit` param, but `GET /stories/ready`
+  paginates by `page`/`page_size` — so `limit` was silently ignored and callers
+  were stuck on the first page with no way past it. Now forwards `page`/`page_size`.
+
+### Added
+
+- Pagination params on list tools that previously exposed none (so an agent can
+  enumerate past the first page):
+  - **`list_projects`** — `page`/`page_size`
+  - **`get_cost_anomalies`** — `page`/`page_size`
+  - **`get_story_token_usage`** — `page`/`page_size`
+  - **`knowledge_ingestion_jobs`** — `limit`/`offset`/`since_days` (the server-side
+    endpoint is now paginated over full history instead of a hard 50-row / 7-day cap)
+
 ## 2.22.0 — 2026-06-24 (bulk-delete: set-based + irreversible hard delete)
 
 ### Added
