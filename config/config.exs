@@ -283,6 +283,11 @@ config :loopctl,
   knowledge_lint_orphan_link_threshold: 0.5,
   knowledge_lint_max_orphan_relink: 500
 
+# KnowledgeMocWorker: corpus-specific tags to exclude from Map-of-Content
+# generation (on top of the worker's generic structural/format/provenance list).
+# These are source COLLECTIONS, not topics, so a per-tag MOC for them is noise.
+config :loopctl, :knowledge_moc_excluded_tags, ~w(synology-docs synology-netbackup)
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

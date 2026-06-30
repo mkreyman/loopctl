@@ -107,6 +107,24 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       refute hub.body =~ "Index: topic\n- "
       refute hub.body =~ "Index: topic — `"
     end
+
+    test "indexes only topical tags — excludes structural/format and provenance-prefix tags" do
+      tenant = fixture(:tenant)
+
+      for n <- 1..3 do
+        published(tenant.id, "Doc #{n}", ["pdf"])
+        published(tenant.id, "Vid #{n}", ["yt-abc123"])
+        published(tenant.id, "Rust #{n}", ["rust"])
+      end
+
+      assert :ok = run(tenant.id)
+
+      # `pdf` (structural) and `yt-abc123` (per-source provenance) get no MOC...
+      refute moc_hub(tenant.id, "pdf")
+      refute moc_hub(tenant.id, "yt-abc123")
+      # ...but a genuine topic does.
+      assert moc_hub(tenant.id, "rust")
+    end
   end
 
   describe "all_tenants fan-out" do
