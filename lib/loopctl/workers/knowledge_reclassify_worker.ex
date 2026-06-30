@@ -77,6 +77,10 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   @default_batch_size 100
   @default_max_per_run 1_000
   @default_min_confidence 0.75
+  # Concurrent LLM classify calls per batch (backpressure). Conservative vs the
+  # provider rate limit; tune via :knowledge_reclassify_max_concurrency.
+  @default_max_concurrency 10
+  @classify_timeout_ms 30_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"} = args}) do
@@ -150,27 +154,48 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
 
   # --- per-batch processing ---
 
+  # Classification is an LLM HTTP call per article — the batch bottleneck. Run
+  # those concurrently with backpressure (Task.async_stream) so a 100-article
+  # batch isn't 100 serial round-trips. Writes stay SERIAL (in the reduce, on the
+  # worker process) so the small BYPASSRLS admin pool is never hit by N
+  # concurrent updates.
   defp process_batch(batch, run_mode, min_confidence) do
-    empty = %{
-      processed: 0,
-      changed: 0,
-      unchanged: 0,
-      low_confidence: 0,
-      errors: 0,
-      by_transition: %{}
-    }
+    max_concurrency =
+      Application.get_env(
+        :loopctl,
+        :knowledge_reclassify_max_concurrency,
+        @default_max_concurrency
+      )
 
-    Enum.reduce(batch, empty, fn article, acc ->
-      acc = %{acc | processed: acc.processed + 1}
+    batch
+    |> Task.async_stream(
+      fn article -> {article, @classifier.classify(article.title, article.body)} end,
+      max_concurrency: max_concurrency,
+      timeout: @classify_timeout_ms,
+      on_timeout: :kill_task,
+      ordered: false
+    )
+    |> Enum.reduce(empty_tally(), &reduce_outcome(&1, &2, min_confidence, run_mode))
+  end
 
-      case @classifier.classify(article.title, article.body) do
-        {:ok, %{category: proposed, confidence: confidence}} ->
-          classify_outcome(acc, article, proposed, confidence, min_confidence, run_mode)
+  defp empty_tally do
+    %{processed: 0, changed: 0, unchanged: 0, low_confidence: 0, errors: 0, by_transition: %{}}
+  end
 
-        {:error, _reason} ->
-          %{acc | errors: acc.errors + 1}
-      end
-    end)
+  defp reduce_outcome({:ok, {article, {:ok, verdict}}}, acc, min_confidence, run_mode) do
+    %{category: proposed, confidence: confidence} = verdict
+    acc = %{acc | processed: acc.processed + 1}
+    classify_outcome(acc, article, proposed, confidence, min_confidence, run_mode)
+  end
+
+  defp reduce_outcome({:ok, {_article, {:error, _reason}}}, acc, _min_confidence, _run_mode) do
+    %{acc | processed: acc.processed + 1, errors: acc.errors + 1}
+  end
+
+  # A classification task that timed out or crashed -- count it processed+errored;
+  # its article is simply left for a later run (commit writes are idempotent).
+  defp reduce_outcome({:exit, _reason}, acc, _min_confidence, _run_mode) do
+    %{acc | processed: acc.processed + 1, errors: acc.errors + 1}
   end
 
   defp classify_outcome(acc, article, proposed, confidence, min_confidence, run_mode) do

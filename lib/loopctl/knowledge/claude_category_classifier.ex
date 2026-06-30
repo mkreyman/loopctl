@@ -43,7 +43,14 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
 
   defp call_anthropic(title, body, config) do
     base_url = config[:base_url] || "https://api.anthropic.com/v1"
-    model = config[:model] || "claude-haiku-4-5-20251001"
+
+    # Classification can use a STRONGER model than content extraction without
+    # changing extraction: :knowledge_classifier_model wins, else the shared
+    # provider model, else Haiku. Set ANTHROPIC_CLASSIFIER_MODEL in prod to
+    # override (e.g. a Sonnet id) for the one-time 77k reclassification.
+    model =
+      Application.get_env(:loopctl, :knowledge_classifier_model) ||
+        config[:model] || "claude-haiku-4-5-20251001"
 
     user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
 
