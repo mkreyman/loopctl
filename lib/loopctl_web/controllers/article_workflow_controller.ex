@@ -207,7 +207,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         type: :integer,
         description:
           "Max results per page (default 20, max 1000). A limit above the max is " <>
-            "rejected with 400 — not silently clamped."
+            "clamped to the maximum — never rejected — so pagination stays complete."
       ],
       offset: [in: :query, type: :integer, description: "Records to skip"]
     ],
@@ -595,11 +595,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   def drafts(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with :ok <- Pagination.validate_limit(params) do
+    with {:ok, effective_limit} <- Pagination.validate_limit(params) do
       opts =
         []
         |> maybe_add_opt(:project_id, params["project_id"])
-        |> maybe_add_opt(:limit, parse_int(params["limit"]))
+        |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
       result = Knowledge.list_drafts(tenant_id, opts)

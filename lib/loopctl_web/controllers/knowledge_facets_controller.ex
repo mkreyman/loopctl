@@ -109,7 +109,8 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
         in: :query,
         type: :integer,
         description:
-          "Max distinct tags in the facet result (default all, max 1000; values above 1000 rejected with 400)"
+          "Max distinct tags in the facet result (default all, max 1000). A limit above the max is " <>
+            "clamped to the maximum — never rejected — so pagination stays complete."
       ]
     ],
     responses: %{
@@ -149,7 +150,7 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
          :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
          :ok <- validate_project_id(params),
-         :ok <- Pagination.validate_limit(params),
+         {:ok, _effective_limit} <- Pagination.validate_limit(params),
          {:ok, match} <- TagMatch.parse(params) do
       opts =
         params

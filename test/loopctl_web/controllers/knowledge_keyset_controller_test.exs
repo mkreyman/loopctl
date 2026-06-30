@@ -375,7 +375,7 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
     # the LEGACY offset path, not only the keyset path. `validate_search_limit` runs
     # before cursor branching, but pin it on the no-cursor path so a future refactor
     # can't reintroduce a silent clamp there.
-    test "offset path (no cursor) rejects over-max limit with 400, never clamps", %{conn: conn} do
+    test "offset path (no cursor) clamps an over-max limit (never rejects)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
       fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["bc"]})
@@ -385,7 +385,8 @@ defmodule LoopctlWeb.KnowledgeKeysetControllerTest do
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/search", %{"tags" => "bc", "limit" => "5000"})
 
-      assert resp.status == 400
+      assert resp.status == 200
+      assert json_response(resp, 200)["meta"]["limit"] == 1000
     end
   end
 
