@@ -286,3 +286,6 @@ config :loopctl, :analytics_recording_mode, :sync
 # RLS: Switch to non-superuser role within transactions so RLS is enforced
 # The loopctl_app role must exist and have access to all tables.
 config :loopctl, :rls_role, "loopctl_app"
+
+# KnowledgeMocWorker: low tag threshold so tests need only a few tagged articles.
+config :loopctl, knowledge_moc_min_tag_count: 2
