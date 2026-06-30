@@ -249,6 +249,10 @@ defmodule LoopctlWeb.ArticleController do
     scope = params["scope"] || "tenant"
     api_key = conn.assigns.current_api_key
     draft? = draft_requested?(params)
+    # Novelty-gated write-back is ON by default; `force: true` bypasses it (e.g. the
+    # caller has already searched and knows the proposal is intentionally near an
+    # existing article).
+    gate? = not truthy?(params["force"])
 
     # System articles require superadmin role; everything else is agent+.
     if scope == "system" and api_key.role != :superadmin do
@@ -280,7 +284,7 @@ defmodule LoopctlWeb.ArticleController do
       # no key identity can't attribute a memory → 403.
       case bind_agent_identity(api_key, attrs) do
         {:ok, bound_attrs} ->
-          create_article(conn, tenant_id, bound_attrs, audit_opts, draft?)
+          create_article(conn, tenant_id, bound_attrs, audit_opts, draft?, gate?)
 
         {:error, :no_agent_identity} ->
           conn
@@ -328,43 +332,118 @@ defmodule LoopctlWeb.ArticleController do
       Enum.any?(@agent_memory_marker_atoms, &Map.has_key?(metadata, &1))
   end
 
-  defp create_article(conn, tenant_id, attrs, audit_opts, draft?) do
+  defp create_article(conn, tenant_id, attrs, audit_opts, draft?, gate?) do
     # Pass the caller's visibility scope so idempotency dedup can't echo a private
     # memory the agent can't see (#163).
     opts = audit_opts ++ Visibility.scope_opts(conn)
 
-    case Knowledge.create_article(tenant_id, attrs, opts) do
-      {:ok, article} ->
-        conn
-        |> put_status(:created)
-        |> json(create_response(article))
-
-      # Idempotent dedup (no-op), 200 with `deduplicated: true` so clients that
-      # only see a 2xx (e.g. the MCP layer) can tell a dedup from a real create.
-      {:ok, :deduplicated, existing} ->
-        conn
-        |> put_status(:ok)
-        |> json(dedup_response(existing, attrs, draft?))
-
-      {:error, :duplicate_title, existing} ->
-        conn
-        |> put_status(:conflict)
-        |> json(%{
-          error: %{
-            status: 409,
-            code: "title_conflict",
-            message:
-              "An article titled \"#{existing.title}\" already exists in this tenant " <>
-                "with different content. Choose a different (more specific) title. " <>
-                "(Editing the existing article requires role :user via PATCH /articles/:id.)",
-            details: %{existing_article_id: existing.id}
-          }
-        })
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+    if gate? do
+      render_proposal(conn, Knowledge.propose_article(tenant_id, attrs, opts), attrs, draft?)
+    else
+      render_create(conn, Knowledge.create_article(tenant_id, attrs, opts), attrs, draft?)
     end
   end
+
+  # Novelty-gated path: render by verdict. A near-duplicate is NOT created — the
+  # caller is pointed at the canonical article. A low-novelty proposal is created as
+  # a draft with the near-neighbors surfaced so a reviewer/consumer can merge.
+  defp render_proposal(conn, {:ok, %{verdict: :duplicate} = result}, _attrs, _draft?) do
+    %{article: existing, assessment: assessment} = result
+
+    conn
+    |> put_status(:ok)
+    |> json(%{
+      data: %{id: existing.id, title: existing.title, status: to_string(existing.status)},
+      deduplicated: true,
+      gate: gate_meta(:duplicate, assessment),
+      note:
+        "A near-duplicate already exists (id #{existing.id}, similarity " <>
+          "#{format_score(assessment.score)}). Nothing was created — read or update " <>
+          "the existing article instead, or pass `force: true` to create anyway."
+    })
+  end
+
+  defp render_proposal(conn, {:ok, %{verdict: :gated_to_draft} = result}, _attrs, _draft?) do
+    %{article: article, assessment: assessment} = result
+
+    conn
+    |> put_status(:created)
+    |> json(
+      article
+      |> create_response()
+      |> Map.put(:gate, gate_meta(:gated_to_draft, assessment))
+      |> Map.put(
+        :note,
+        "High overlap with existing knowledge (similarity " <>
+          "#{format_score(assessment.score)}) — created as a DRAFT instead of " <>
+          "publishing, with near-neighbors in metadata.proposal_novelty for review. " <>
+          "Resolve via merge/publish, or pass `force: true` to publish on create."
+      )
+    )
+  end
+
+  defp render_proposal(conn, {:ok, %{verdict: :deduplicated, article: existing}}, attrs, draft?) do
+    conn
+    |> put_status(:ok)
+    |> json(dedup_response(existing, attrs, draft?))
+  end
+
+  # :created (novel, or gate fell open) — normal create response.
+  defp render_proposal(conn, {:ok, %{article: article}}, _attrs, _draft?) do
+    conn
+    |> put_status(:created)
+    |> json(create_response(article))
+  end
+
+  defp render_proposal(conn, error, attrs, draft?),
+    do: render_create(conn, error, attrs, draft?)
+
+  # Ungated path (force: true) — the original create semantics.
+  defp render_create(conn, {:ok, article}, _attrs, _draft?) do
+    conn
+    |> put_status(:created)
+    |> json(create_response(article))
+  end
+
+  defp render_create(conn, {:ok, :deduplicated, existing}, attrs, draft?) do
+    conn
+    |> put_status(:ok)
+    |> json(dedup_response(existing, attrs, draft?))
+  end
+
+  defp render_create(conn, {:error, :duplicate_title, existing}, _attrs, _draft?) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "title_conflict",
+        message:
+          "An article titled \"#{existing.title}\" already exists in this tenant " <>
+            "with different content. Choose a different (more specific) title. " <>
+            "(Editing the existing article requires role :user via PATCH /articles/:id.)",
+        details: %{existing_article_id: existing.id}
+      }
+    })
+  end
+
+  defp render_create(_conn, {:error, %Ecto.Changeset{} = changeset}, _attrs, _draft?),
+    do: {:error, changeset}
+
+  defp gate_meta(verdict, assessment) do
+    %{
+      verdict: to_string(verdict),
+      similarity: assessment.score,
+      nearest:
+        Enum.map(assessment.neighbors, fn n ->
+          %{id: n.id, title: n.title, similarity: n.similarity_score}
+        end)
+    }
+  end
+
+  defp format_score(nil), do: "n/a"
+  defp format_score(score) when is_float(score), do: :erlang.float_to_binary(score, decimals: 3)
+  defp format_score(score), do: to_string(score)
 
   @doc "GET /api/v1/articles or GET /api/v1/projects/:project_id/articles"
   def index(conn, params) do

@@ -240,6 +240,11 @@ config :loopctl, :secrets_adapter, Loopctl.MockSecrets
 # overrides it with Mox.expect/3 to inject a deterministic Postgrex.Error.
 config :loopctl, :knowledge_suggest_links, Loopctl.MockSuggestLinks
 
+# Novelty-gated write-back: swap the proposal assessor for a mock so propose_article
+# tests choose the verdict deterministically. DataCase default-stubs it to `:novel`
+# (gate is a no-op); ProposalGate's own tests call it directly with MockEmbeddingClient.
+config :loopctl, :proposal_assessor, Loopctl.MockProposalAssessor
+
 # DI (US-27.3): the router wrapped by LoopctlWeb.Plugs.DBErrorBackstop. A thin
 # REAL plug (Loopctl.Test.BackstopRouter) that delegates to LoopctlWeb.Router for
 # every request — so the production router stays on the hot path with no global
