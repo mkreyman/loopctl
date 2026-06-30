@@ -61,7 +61,8 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   # MOCs index TOPICAL domains. The highest-count tags are usually structural —
   # format/source-type descriptors (`pdf`, `document`, `youtube`, …) that say how
   # an article arrived, not what it's about — so a MOC for them is useless noise.
-  # Exclude them, plus the per-source provenance-id tags (`yt-…`, `doc-…`, …).
+  # Exclude them, plus the per-source provenance-id tags (`yt-…`, `doc-…`, …) and
+  # non-topical sentinels (`unknown`, `untagged`, `misc`, …).
   # Corpus-specific source collections are added via `:knowledge_moc_excluded_tags`.
   @structural_tags ~w(
     hub moc reference document documents doc book books code repo repository
@@ -69,6 +70,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
     epub csv json yaml image png jpg jpeg gif svg video audio youtube newsletter
     manual agent session_log session-log skill ingestion review_finding review-finding
     readme gdrive gdoc gsheet onedrive dropbox notion confluence chunk page
+    unknown untagged uncategorized misc miscellaneous general other none na tbd todo
   )
 
   # Provenance-id and chunk-coordinate prefixes (`yt-<id>`, `pp-1-12` = pages 1–12,

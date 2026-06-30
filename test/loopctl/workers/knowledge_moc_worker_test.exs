@@ -118,6 +118,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
         published(tenant.id, "Pages #{n}", ["pp-1-12"])
         published(tenant.id, "Byline #{n}", ["chris-mccord-bruce-tate-jos-valim"])
         published(tenant.id, "Source #{n}", ["medium-com"])
+        published(tenant.id, "Sentinel #{n}", ["unknown"])
         published(tenant.id, "Rust #{n}", ["rust"])
         published(tenant.id, "SoC #{n}", ["separation-of-concerns"])
       end
@@ -133,6 +134,8 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       # ...nor machine-derived slugs: over-long bylines or URL/domain-shaped tags...
       refute moc_hub(tenant.id, "chris-mccord-bruce-tate-jos-valim")
       refute moc_hub(tenant.id, "medium-com")
+      # ...nor non-topical sentinels...
+      refute moc_hub(tenant.id, "unknown")
       # ...but genuine topics do, including a legit 3-segment one.
       assert moc_hub(tenant.id, "rust")
       assert moc_hub(tenant.id, "separation-of-concerns")
