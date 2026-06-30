@@ -295,6 +295,15 @@ config :loopctl, :knowledge_moc_excluded_tags, ~w(synology-docs synology-netback
 config :loopctl, :knowledge_proposal_duplicate_threshold, 0.97
 config :loopctl, :knowledge_proposal_overlap_threshold, 0.88
 
+# Route-the-findings (#4): two published articles whose cosine similarity is at/above
+# this are "too similar to comfortably coexist" — flagged with a `:potential_conflict`
+# link for the consuming agent to resolve (merge a redundancy / reconcile a real
+# contradiction). The KB only flags; it never judges which it is.
+config :loopctl, :knowledge_conflict_threshold, 0.93
+# Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
+# tenant per run (bounds the existing-corpus backfill; it cycles over nights).
+config :loopctl, :knowledge_lint_max_conflict_promotions, 500
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

@@ -58,6 +58,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Workers.ArticleEmbeddingWorker
   alias Loopctl.Workers.ArticleLinkingWorker
@@ -71,6 +72,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # 0.6 leaves them isolated forever. Re-link orphans at a LOWER threshold so an
   # isolated article connects to its closest relative rather than dangling.
   @default_orphan_link_threshold 0.5
+  @default_max_conflict_promotions 500
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -91,11 +93,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)
-    log_audit_event(tenant_id, report, action)
+    promoted = promote_conflicts(tenant_id)
+    log_audit_event(tenant_id, report, action, promoted)
 
     Logger.info(
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
-        "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued}"
+        "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
+        "conflicts_promoted=#{promoted}"
     )
 
     :ok
@@ -150,6 +154,71 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     %{relinked: length(with_embedding), embedding_enqueued: length(without_embedding)}
   end
 
+  # Route-the-findings (#4), existing-corpus backstop: the auto-linker stored the
+  # cosine `similarity_score` on every ambient `:relates_to` link. Any such link at or
+  # above the conflict threshold is a "too similar to coexist" pair that predates the
+  # forward detection — promote it to also carry a `:potential_conflict` flag (no new
+  # embedding calls). Bounded per run; cycles the corpus over nights. Idempotent: a
+  # pair already flagged (either direction) is skipped.
+  defp promote_conflicts(tenant_id) do
+    threshold = Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93)
+
+    cap =
+      Application.get_env(
+        :loopctl,
+        :knowledge_lint_max_conflict_promotions,
+        @default_max_conflict_promotions
+      )
+
+    candidates =
+      from(l in ArticleLink,
+        as: :rel,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :relates_to,
+        where: fragment("(?->>'similarity_score')::float >= ?", l.metadata, ^threshold),
+        where:
+          not exists(
+            from(pc in ArticleLink,
+              where:
+                pc.tenant_id == parent_as(:rel).tenant_id and
+                  pc.relationship_type == :potential_conflict and
+                  ((pc.source_article_id == parent_as(:rel).source_article_id and
+                      pc.target_article_id == parent_as(:rel).target_article_id) or
+                     (pc.source_article_id == parent_as(:rel).target_article_id and
+                        pc.target_article_id == parent_as(:rel).source_article_id))
+            )
+          ),
+        select: %{
+          source_article_id: l.source_article_id,
+          target_article_id: l.target_article_id,
+          metadata: l.metadata
+        },
+        limit: ^cap
+      )
+      |> AdminRepo.all()
+
+    Enum.reduce(candidates, 0, fn c, count ->
+      attrs = %{
+        source_article_id: c.source_article_id,
+        target_article_id: c.target_article_id,
+        relationship_type: :potential_conflict,
+        metadata: %{
+          "auto_generated" => true,
+          "similarity_score" => c.metadata["similarity_score"],
+          "promoted_from" => "relates_to"
+        }
+      }
+
+      changeset = ArticleLink.changeset(%ArticleLink{tenant_id: tenant_id}, attrs)
+
+      case AdminRepo.insert(changeset) do
+        {:ok, _} -> count + 1
+        # Lost a race / already exists — skip, stay idempotent.
+        {:error, _} -> count
+      end
+    end)
+  end
+
   defp embedded_ids(_tenant_id, []), do: MapSet.new()
 
   defp embedded_ids(tenant_id, orphan_ids) do
@@ -163,7 +232,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> MapSet.new()
   end
 
-  defp log_audit_event(tenant_id, report, action) do
+  defp log_audit_event(tenant_id, report, action, promoted) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -174,7 +243,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       new_state: %{
         "summary" => report.summary,
         "orphans_relinked" => action.relinked,
-        "orphans_embedding_enqueued" => action.embedding_enqueued
+        "orphans_embedding_enqueued" => action.embedding_enqueued,
+        "conflicts_promoted" => promoted
       }
     })
   end

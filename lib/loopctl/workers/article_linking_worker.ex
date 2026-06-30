@@ -129,26 +129,45 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     log_if_exceeds_limit(article, tenant_id, max_comparisons)
 
     candidates = find_similar_articles(article, tenant_id, threshold, max_comparisons)
-    existing_pairs = get_existing_link_pairs(article.id, tenant_id)
+    conflict_threshold = conflict_threshold()
 
-    new_links =
-      candidates
-      |> Enum.reject(fn %{id: cid} ->
-        MapSet.member?(existing_pairs, {article.id, cid}) or
-          MapSet.member?(existing_pairs, {cid, article.id})
-      end)
-      |> Enum.map(fn %{id: target_id, similarity: score} ->
-        %{
-          source_article_id: article.id,
-          target_article_id: target_id,
-          relationship_type: :relates_to,
-          metadata: %{"auto_generated" => true, "similarity_score" => score}
-        }
+    # A `relates_to` ambient link for everything >= the link threshold, PLUS a
+    # `:potential_conflict` flag (route-the-findings #4) for pairs >= the conflict
+    # threshold — too similar to comfortably coexist, for the consumer to resolve.
+    # Dedup is type-aware so the two link types don't crowd each other out.
+    relates =
+      build_links(article.id, candidates, tenant_id, :relates_to, fn _sim -> true end)
+
+    conflicts =
+      build_links(article.id, candidates, tenant_id, :potential_conflict, fn sim ->
+        sim >= conflict_threshold
       end)
 
-    created_count = create_links(new_links, tenant_id)
+    created_count = create_links(relates ++ conflicts, tenant_id)
     log_audit_event(article.id, tenant_id, created_count)
     :ok
+  end
+
+  defp build_links(article_id, candidates, tenant_id, type, keep?) do
+    existing = get_existing_link_pairs(article_id, tenant_id, type)
+
+    candidates
+    |> Enum.filter(fn %{similarity: sim} -> keep?.(sim) end)
+    |> Enum.reject(fn %{id: cid} ->
+      MapSet.member?(existing, {article_id, cid}) or MapSet.member?(existing, {cid, article_id})
+    end)
+    |> Enum.map(fn %{id: target_id, similarity: score} ->
+      %{
+        source_article_id: article_id,
+        target_article_id: target_id,
+        relationship_type: type,
+        metadata: %{"auto_generated" => true, "similarity_score" => score}
+      }
+    end)
+  end
+
+  defp conflict_threshold do
+    Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93)
   end
 
   # US-27.7a: route the similarity lookup through the shared, scale-tested kNN helper
@@ -224,9 +243,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
   end
 
-  defp get_existing_link_pairs(article_id, tenant_id) do
+  defp get_existing_link_pairs(article_id, tenant_id, type) do
     from(l in ArticleLink,
       where: l.tenant_id == ^tenant_id,
+      where: l.relationship_type == ^type,
       where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
       select: {l.source_article_id, l.target_article_id}
     )
