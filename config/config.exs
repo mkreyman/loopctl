@@ -288,6 +288,13 @@ config :loopctl,
 # These are source COLLECTIONS, not topics, so a per-tag MOC for them is noise.
 config :loopctl, :knowledge_moc_excluded_tags, ~w(synology-docs synology-netbackup)
 
+# Novelty-gated write-back (ProposalGate): cosine-similarity bands for an agent's
+# proposed article vs. the published corpus. >= duplicate → reject in favour of the
+# canonical article; >= overlap → route to a draft for the consumer to resolve;
+# below → novel, created on the requested path.
+config :loopctl, :knowledge_proposal_duplicate_threshold, 0.97
+config :loopctl, :knowledge_proposal_overlap_threshold, 0.88
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

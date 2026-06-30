@@ -191,6 +191,13 @@ defmodule Loopctl.DataCase do
       Loopctl.Knowledge.suggest_links_with_meta(tenant_id, article_id, opts)
     end)
 
+    # Novelty-gated write-back: default to `:novel` so the gate is a no-op for the
+    # existing article-create tests (they assert the normal create path). Tests that
+    # exercise the gate override this with Mox.expect/3 to return a chosen verdict.
+    Mox.stub(Loopctl.MockProposalAssessor, :assess, fn _tenant_id, _attrs, _opts ->
+      %{verdict: :novel, score: nil, neighbors: []}
+    end)
+
     # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header

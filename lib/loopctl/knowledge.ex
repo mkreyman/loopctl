@@ -328,6 +328,121 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  @doc """
+  Novelty-gated write-back. Wraps `create_article/3` with a semantic dedup gate so
+  an agent proposing knowledge can't silently bloat the corpus with near-duplicates.
+
+  The proposal is assessed against the published corpus (see
+  `Loopctl.Knowledge.ProposalAssessorBehaviour`); then, by verdict:
+
+    * `:duplicate` — a near-identical article already exists. Nothing is created;
+      the canonical article is returned so the caller can read/update it instead.
+    * `:low_novelty` — high overlap with existing knowledge. The article is created
+      as a **draft** (downgraded from publish if needed) with the near-neighbors
+      stamped into `metadata.proposal_novelty`, so the smarter consuming agent (or a
+      human) resolves merge-vs-keep from the drafts review queue.
+    * `:novel` / `:unknown` (gate fell open) — created on the requested path.
+
+  The gate is mechanical and non-destructive: it never edits or deletes existing
+  articles, and it falls open (`:unknown`) rather than blocking a write when the
+  embedding backend is unavailable.
+
+  Returns `{:ok, result}` where `result` is a map:
+
+      %{
+        verdict: :created | :gated_to_draft | :duplicate | :deduplicated,
+        article: %Article{},        # the created article, or the canonical existing one
+        created: boolean(),         # false for :duplicate / :deduplicated
+        assessment: %{verdict:, score:, neighbors:}
+      }
+
+  or `{:error, :duplicate_title, %Article{}}` / `{:error, %Ecto.Changeset{}}`,
+  forwarded unchanged from `create_article/3`.
+  """
+  @spec propose_article(Ecto.UUID.t() | nil, map(), keyword()) ::
+          {:ok, map()}
+          | {:error, :duplicate_title, Article.t()}
+          | {:error, Ecto.Changeset.t()}
+  def propose_article(tenant_id, attrs, opts \\ []) do
+    attrs = stringify_top_keys(attrs)
+    assessment = proposal_assessor().assess(tenant_id, attrs, opts)
+    gate_proposal(tenant_id, attrs, assessment, opts)
+  end
+
+  defp proposal_assessor do
+    Application.get_env(:loopctl, :proposal_assessor, Loopctl.Knowledge.ProposalGate)
+  end
+
+  defp gate_proposal(tenant_id, attrs, %{verdict: :duplicate} = assessment, opts) do
+    case canonical_neighbor(tenant_id, assessment, opts) do
+      {:ok, existing} ->
+        {:ok, %{verdict: :duplicate, article: existing, created: false, assessment: assessment}}
+
+      # The canonical neighbor vanished (deleted/unpublished) between assess and now —
+      # there is nothing to dedup against, so create on the normal path.
+      :error ->
+        create_proposal(tenant_id, attrs, %{assessment | verdict: :novel}, opts, :created)
+    end
+  end
+
+  defp gate_proposal(tenant_id, attrs, %{verdict: :low_novelty} = assessment, opts) do
+    gated_attrs =
+      attrs
+      |> Map.put("status", "draft")
+      |> stamp_proposal_metadata(assessment)
+
+    create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
+  end
+
+  # :novel or :unknown (gate fell open) — proceed on the requested path.
+  defp gate_proposal(tenant_id, attrs, assessment, opts) do
+    create_proposal(tenant_id, attrs, assessment, opts, :created)
+  end
+
+  defp create_proposal(tenant_id, attrs, assessment, opts, verdict) do
+    case create_article(tenant_id, attrs, opts) do
+      {:ok, article} ->
+        {:ok, %{verdict: verdict, article: article, created: true, assessment: assessment}}
+
+      {:ok, :deduplicated, article} ->
+        {:ok, %{verdict: :deduplicated, article: article, created: false, assessment: assessment}}
+
+      {:error, :duplicate_title, existing} ->
+        {:error, :duplicate_title, existing}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  defp canonical_neighbor(tenant_id, %{neighbors: [%{id: id} | _]}, opts) do
+    case get_article(tenant_id, id, Keyword.take(opts, [:visibility_agent_id])) do
+      {:ok, article} -> {:ok, article}
+      _ -> :error
+    end
+  end
+
+  defp canonical_neighbor(_tenant_id, _assessment, _opts), do: :error
+
+  defp stamp_proposal_metadata(attrs, %{score: score, neighbors: neighbors}) do
+    existing = stringify_top_keys(attrs["metadata"] || %{})
+
+    novelty = %{
+      "verdict" => "low_novelty",
+      "score" => score,
+      "nearest" =>
+        Enum.map(neighbors, fn n ->
+          %{"id" => n.id, "title" => n.title, "score" => n.similarity_score}
+        end)
+    }
+
+    Map.put(attrs, "metadata", Map.put(existing, "proposal_novelty", novelty))
+  end
+
+  defp stringify_top_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), v} end)
+  end
+
   # Make concurrent/retried creates safe on the (tenant_id, title) active unique
   # index. By the time the insert fails the constraint, the winning transaction
   # has committed, so the existing row is visible (the recovery SELECT below

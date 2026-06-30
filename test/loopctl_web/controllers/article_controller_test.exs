@@ -344,6 +344,92 @@ defmodule LoopctlWeb.ArticleControllerTest do
     end
   end
 
+  describe "POST /api/v1/articles novelty gate" do
+    import Mox
+
+    defp gate_verdict(verdict, neighbors, score) do
+      stub(Loopctl.MockProposalAssessor, :assess, fn _t, _a, _o ->
+        %{verdict: verdict, score: score, neighbors: neighbors}
+      end)
+    end
+
+    test "near-duplicate returns 200, creates nothing, points to the canonical", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Canonical", status: :published})
+
+      gate_verdict(
+        :duplicate,
+        [%{id: existing.id, title: existing.title, similarity_score: 0.98}],
+        0.98
+      )
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Canonical reworded",
+          "body" => "Same idea.",
+          "category" => "finding"
+        })
+
+      body = json_response(conn, 200)
+      assert body["deduplicated"] == true
+      assert body["gate"]["verdict"] == "duplicate"
+      assert body["data"]["id"] == existing.id
+      assert body["note"] =~ "near-duplicate"
+    end
+
+    test "high-overlap proposal is created as a draft with gate metadata", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      existing = fixture(:article, %{tenant_id: tenant.id, title: "Adjacent", status: :published})
+
+      gate_verdict(
+        :low_novelty,
+        [%{id: existing.id, title: existing.title, similarity_score: 0.91}],
+        0.91
+      )
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Overlapping",
+          "body" => "Mostly covered already.",
+          "category" => "finding"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "draft"
+      assert body["gate"]["verdict"] == "gated_to_draft"
+      assert body["note"] =~ "DRAFT"
+    end
+
+    test "force: true bypasses the gate and publishes", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      # Even if the assessor would call it a duplicate, force skips assessment entirely.
+      gate_verdict(:duplicate, [], 0.99)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Forced through",
+          "body" => "Intentionally near an existing article.",
+          "category" => "finding",
+          "force" => true
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["status"] == "published"
+      assert body["data"]["title"] == "Forced through"
+    end
+  end
+
   describe "POST /api/v1/articles idempotency_key (#137)" do
     test "re-create with the same idempotency_key is a no-op (returns existing, even with a different body)",
          %{conn: conn} do
