@@ -56,9 +56,14 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
     web web-article webpage url file pdf md markdown html htm xml docx txt text
     epub csv json yaml image png jpg jpeg gif svg video audio youtube newsletter
     manual agent session_log session-log skill ingestion review_finding review-finding
+    readme gdrive gdoc gsheet onedrive dropbox notion confluence chunk page
   )
 
-  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk-)
+  # Provenance-id and chunk-coordinate prefixes (`yt-<id>`, `pp-1-12` = pages 1–12,
+  # `chunk-7`, …) — these identify WHERE in a source an article came from, never a
+  # topic. Kept to concrete observed patterns: a broad `p-` would wrongly drop real
+  # hyphenated topics (`p-value`, …).
+  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk- pp-)
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
