@@ -46,6 +46,20 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   @max_members 300
   @max_per_category 40
 
+  # MOCs index TOPICAL domains. The highest-count tags are usually structural —
+  # format/source-type descriptors (`pdf`, `document`, `youtube`, …) that say how
+  # an article arrived, not what it's about — so a MOC for them is useless noise.
+  # Exclude them, plus the per-source provenance-id tags (`yt-…`, `doc-…`, …).
+  # Corpus-specific source collections are added via `:knowledge_moc_excluded_tags`.
+  @structural_tags ~w(
+    hub moc reference document documents doc book books code repo repository
+    web web-article webpage url file pdf md markdown html htm xml docx txt text
+    epub csv json yaml image png jpg jpeg gif svg video audio youtube newsletter
+    manual agent session_log session-log skill ingestion review_finding review-finding
+  )
+
+  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk-)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
     from(t in Tenant, where: t.status == :active, select: t.id)
@@ -63,12 +77,17 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
 
     max_tags = Application.get_env(:loopctl, :knowledge_moc_max_tags, @default_max_tags)
 
-    %{facets: facets} = Knowledge.tag_facets(tenant_id, limit: 1000)
+    excluded =
+      (@structural_tags ++ Application.get_env(:loopctl, :knowledge_moc_excluded_tags, []))
+      |> MapSet.new()
+
+    %{facets: facets} = Knowledge.tag_facets(tenant_id, limit: 2000)
 
     tags =
       facets
-      |> Enum.reject(fn %{tag: tag} -> tag in ["hub", "moc"] end)
-      |> Enum.filter(fn %{count: count} -> count >= min_count end)
+      |> Enum.filter(fn %{tag: tag, count: count} ->
+        count >= min_count and topical_tag?(tag, excluded)
+      end)
       |> Enum.sort_by(fn %{count: count} -> count end, :desc)
       |> Enum.take(max_tags)
 
@@ -87,6 +106,13 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   end
 
   # --- Private ---
+
+  # A tag earns a MOC only if it's neither a structural/format/source tag nor a
+  # per-source provenance id (`yt-…`, `doc-…`, …) — i.e. it names a topic.
+  defp topical_tag?(tag, excluded) do
+    not MapSet.member?(excluded, tag) and
+      not Enum.any?(@excluded_prefixes, &String.starts_with?(tag, &1))
+  end
 
   defp upsert_moc(tenant_id, tag, count) do
     members =
