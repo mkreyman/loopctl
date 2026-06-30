@@ -163,7 +163,7 @@ defmodule LoopctlWeb.ArticleController do
         type: :integer,
         description:
           "Max results per page (default 20, max 1000). A limit above the max is " <>
-            "rejected with 400 — not silently clamped — so offset pagination stays complete."
+            "clamped to the maximum — never rejected — so offset pagination stays complete."
       ],
       offset: [in: :query, type: :integer, description: "Records to skip"],
       include_body: [
@@ -374,7 +374,7 @@ defmodule LoopctlWeb.ArticleController do
     # (400 with the allowed values), not a 404/500 from an Ecto.Enum cast failure.
     with :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
-         :ok <- Pagination.validate_limit(params),
+         {:ok, effective_limit} <- Pagination.validate_limit(params),
          {:ok, match} <- TagMatch.parse(params) do
       opts =
         []
@@ -386,7 +386,7 @@ defmodule LoopctlWeb.ArticleController do
         |> maybe_add_opt(:source_type, string_param(params["source_type"]))
         |> maybe_add_opt(:source_id, string_param(params["source_id"]))
         |> maybe_add_opt(:idempotency_key, string_param(params["idempotency_key"]))
-        |> maybe_add_opt(:limit, parse_int(params["limit"]))
+        |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
         # Body-less summary by default; opt into full bodies (byte-budget bounded)
         # with ?include_body=true.
@@ -396,10 +396,6 @@ defmodule LoopctlWeb.ArticleController do
       result = Knowledge.list_articles(tenant_id, opts)
       json(conn, ArticleJSON.index(%{articles: result.data, meta: result.meta}))
     else
-      # Over-large `limit` — delegate to the fallback controller's 400 renderer.
-      {:error, :bad_request, _message} = error ->
-        error
-
       {:error, field, allowed} ->
         conn
         |> put_status(:bad_request)

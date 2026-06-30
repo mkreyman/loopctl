@@ -11,6 +11,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Workers.ContentIngestionWorker
+  alias LoopctlWeb.Helpers.Pagination
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -189,10 +190,32 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   end
 
   operation(:index,
-    summary: "List recent ingestion jobs",
+    summary: "List ingestion jobs",
     description:
-      "Returns recent content ingestion jobs for the current tenant. " <>
-        "Limited to last 7 days, max 50 results. Role: orchestrator+.",
+      "Returns content ingestion jobs for the current tenant, newest first, with " <>
+        "offset/limit pagination over the full history (advance `offset` by " <>
+        "`meta.limit` to enumerate to completeness). Optional `since_days` narrows " <>
+        "to a recent window. Role: orchestrator+.",
+    parameters: [
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Max jobs per page (default 20). A larger value is clamped, never rejected.",
+        required: false
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Rows to skip (default 0)",
+        required: false
+      ],
+      since_days: [
+        in: :query,
+        type: :integer,
+        description: "Optional: only jobs from the last N days (default: all history)",
+        required: false
+      ]
+    ],
     responses: %{
       200 =>
         {"Ingestion jobs list", "application/json",
@@ -201,8 +224,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :array,
-               description: "List of recent ingestion jobs"
-             }
+               description: "Page of ingestion jobs"
+             },
+             meta: Schemas.PaginationMeta
            }
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
@@ -211,11 +235,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   )
 
   @doc "GET /api/v1/knowledge/ingestion-jobs"
-  def index(conn, _params) do
+  def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    jobs = list_ingestion_jobs(tenant_id)
+    {:ok, limit} = Pagination.validate_limit(params)
+    offset = parse_offset(params["offset"])
+    since = parse_since_days(params["since_days"])
 
-    json(conn, LoopctlWeb.KnowledgeIngestionJSON.index(jobs))
+    %{data: jobs, meta: meta} =
+      list_ingestion_jobs(tenant_id, limit: limit, offset: offset, since: since)
+
+    json(conn, LoopctlWeb.KnowledgeIngestionJSON.index(jobs, meta))
   end
 
   # --- Private ---
@@ -362,29 +391,71 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp list_ingestion_jobs(tenant_id) do
+  defp parse_offset(value) do
+    case parse_int_param(value) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> 0
+    end
+  end
+
+  defp parse_since_days(value) do
+    case parse_int_param(value) do
+      n when is_integer(n) and n > 0 ->
+        DateTime.add(DateTime.utc_now(), -n * 86_400, :second)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_int_param(value) when is_integer(value), do: value
+
+  defp parse_int_param(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {n, ""} -> n
+      _ -> nil
+    end
+  end
+
+  defp parse_int_param(_), do: nil
+
+  # Offset/limit pagination over the tenant's ingestion jobs (newest first), with
+  # an `id` tiebreaker so the page is stable across equal timestamps. No hard cap
+  # and no fixed time window: a caller paginates to completeness via offset.
+  defp list_ingestion_jobs(tenant_id, opts) do
     import Ecto.Query
 
-    tenant_id_str = tenant_id
+    limit = Keyword.fetch!(opts, :limit)
+    offset = Keyword.get(opts, :offset, 0)
+    since = Keyword.get(opts, :since)
 
-    seven_days_ago = DateTime.add(DateTime.utc_now(), -7 * 24 * 3600, :second)
+    base =
+      from(j in "oban_jobs",
+        where:
+          fragment("? = 'Loopctl.Workers.ContentIngestionWorker'", j.worker) and
+            fragment("?->>'tenant_id' = ?", j.args, ^tenant_id)
+      )
 
-    from(j in "oban_jobs",
-      where:
-        fragment("? = 'Loopctl.Workers.ContentIngestionWorker'", j.worker) and
-          fragment("?->>'tenant_id' = ?", j.args, ^tenant_id_str) and
-          j.inserted_at > ^seven_days_ago,
-      order_by: [desc: j.inserted_at],
-      limit: 50,
-      select: %{
+    base = if since, do: where(base, [j], j.inserted_at > ^since), else: base
+
+    total =
+      base |> select([j], count(j.id)) |> Loopctl.Repo.one()
+
+    rows =
+      base
+      |> order_by([j], desc: j.inserted_at, desc: j.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> select([j], %{
         id: j.id,
         state: j.state,
         args: j.args,
         inserted_at: j.inserted_at,
         completed_at: j.completed_at,
         errors: j.errors
-      }
-    )
-    |> Loopctl.Repo.all()
+      })
+      |> Loopctl.Repo.all()
+
+    %{data: rows, meta: %{limit: limit, offset: offset, total_count: total}}
   end
 end

@@ -101,7 +101,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
       limit: [
         in: :query,
         type: :integer,
-        description: "Max articles to return (default 1000, max 1000)",
+        description:
+          "Max articles to return (default 1000, max 1000). A limit above the max is " <>
+            "clamped to the maximum — never rejected — so pagination stays complete.",
         required: false
       ],
       offset: [
@@ -173,7 +175,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with :ok <- Pagination.validate_limit(params),
+    with {:ok, _effective_limit} <- Pagination.validate_limit(params),
          {:ok, fields} <- parse_fields(params["fields"]),
          {:ok, base_opts} <- build_opts(params) do
       opts = Keyword.merge(base_opts, Visibility.scope_opts(conn))

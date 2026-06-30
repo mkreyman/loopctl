@@ -311,26 +311,23 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert length(body["data"]) <= 2
     end
 
-    test "rejects a relevance-mode limit above the relevance cap with 400, not a silent clamp (#148 A1)",
+    test "clamps a relevance-mode limit above the relevance cap (never rejects) (#148 A1)",
          %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-      # Relevance modes (here keyword) cap well below the 1000 enumeration cap.
-      # A limit between the relevance cap and the enumeration cap must 400 —
-      # otherwise it would be silently clamped to the ranked-pool size and
-      # meta.limit would under-report what was requested.
+      # Relevance modes (here keyword) return a ranked top-N. An over-large limit
+      # is clamped to the ranked-pool cap and surfaced in meta.limit — never
+      # rejected. Full enumeration is reached by dropping `q` (list mode).
       over = Loopctl.Knowledge.max_relevance_page_size() + 1
 
       resp =
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/search", %{q: "anything", mode: "keyword", limit: "#{over}"})
-        |> json_response(400)
+        |> json_response(200)
 
-      assert resp["error"]["status"] == 400
-      assert resp["error"]["message"] =~ "relevance-mode maximum"
-      assert resp["error"]["message"] =~ "exhaustive enumeration"
+      assert resp["meta"]["limit"] <= Loopctl.Knowledge.max_relevance_page_size()
     end
 
     test "honors a within-cap relevance limit (combined/default mode) (#148 A1)", %{conn: conn} do
@@ -477,7 +474,7 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert length(body["data"]) == total
     end
 
-    test "rejects a limit above the maximum page size with 400 (no silent clamp) (#148 A1)",
+    test "clamps a list-mode limit above the maximum page size (never rejects) (#148 A1)",
          %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -486,10 +483,9 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/search", %{tags: "anything", limit: "1001"})
-        |> json_response(400)
+        |> json_response(200)
 
-      assert resp["error"]["status"] == 400
-      assert resp["error"]["message"] =~ "maximum page size"
+      assert resp["meta"]["limit"] == 1000
     end
 
     test "category filter without q enumerates the category", %{conn: conn} do

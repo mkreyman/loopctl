@@ -27,10 +27,11 @@ defmodule LoopctlWeb.KnowledgeIngestionJSON do
     }
   end
 
-  @doc "Renders the ingestion jobs index."
-  def index(jobs) do
+  @doc "Renders the ingestion jobs index with pagination meta."
+  def index(jobs, meta) do
     %{
-      data: Enum.map(jobs, &render_job/1)
+      data: Enum.map(jobs, &render_job/1),
+      meta: meta
     }
   end
 

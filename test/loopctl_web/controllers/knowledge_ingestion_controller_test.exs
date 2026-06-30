@@ -395,6 +395,57 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # In inline mode, the job may have already completed, but it should still be in the list
     end
 
+    test "paginates with limit/offset + meta, and never caps or rejects (no hard 50)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Insert ingestion-job rows directly (deterministic — no inline-cascade or
+      # timing dependence) with distinct inserted_at so paging order is stable.
+      now = DateTime.utc_now()
+
+      for n <- 1..3 do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "source_type" => "newsletter", "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.Repo.insert!()
+      end
+
+      page1 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs?limit=2")
+        |> json_response(200)
+
+      assert page1["meta"]["limit"] == 2
+      assert page1["meta"]["offset"] == 0
+      assert page1["meta"]["total_count"] == 3
+      assert length(page1["data"]) == 2
+
+      # Offset reaches the remainder — completeness, no hard cap.
+      page2 =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs?limit=2&offset=2")
+        |> json_response(200)
+
+      assert length(page2["data"]) == 1
+
+      # A huge limit is clamped to the max page size, never rejected (no hard
+      # 50-row cap, no 400).
+      big =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs?limit=5000")
+        |> json_response(200)
+
+      assert big["meta"]["limit"] <= 1000
+    end
+
     test "agent role is rejected", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

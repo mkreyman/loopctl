@@ -8,7 +8,7 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
   end
 
   describe "GET /api/v1/knowledge/index" do
-    test "rejects a limit above the maximum page size with 400 (no silent clamp) (#148 A1)",
+    test "clamps a limit above the maximum page size (never rejects), reporting effective meta.limit (#148 A1)",
          %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -17,10 +17,9 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/knowledge/index?limit=1001")
-        |> json_response(400)
+        |> json_response(200)
 
-      assert resp["error"]["status"] == 400
-      assert resp["error"]["message"] =~ "maximum page size"
+      assert resp["meta"]["limit"] == 1000
     end
 
     test "returns lightweight catalog grouped by category, drafts excluded", %{conn: conn} do

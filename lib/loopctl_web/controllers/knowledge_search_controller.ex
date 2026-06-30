@@ -20,7 +20,6 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
-  alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -97,11 +96,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         in: :query,
         type: :integer,
         description:
-          "Max results to return (default 10). The cap is mode-dependent and a limit " <>
-            "above it is rejected with 400 — never silently clamped. **List mode** (no " <>
-            "`q`, just `tags`/`category`) is exhaustive enumeration: max 1000, paginate " <>
-            "the complete filtered set via `offset`. **Relevance modes** (keyword / " <>
-            "semantic / combined) return a ranked top-N: max 100.",
+          "Max results to return (default 10). The cap is mode-dependent; a limit " <>
+            "above it is clamped (never rejected) and the effective value is returned " <>
+            "in `meta.limit`. **List mode** (no `q`, just `tags`/`category`) is " <>
+            "exhaustive enumeration: max 1000, paginate the complete filtered set via " <>
+            "`offset`. **Relevance modes** (keyword / semantic / combined) return a " <>
+            "ranked top-N: max 100 (drop `q` for full enumeration).",
         required: false
       ],
       offset: [
@@ -458,25 +458,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     if tags == [], do: opts, else: [{:tags, tags} | opts]
   end
 
-  # List mode is exhaustive enumeration (cap: the shared max page size); the
-  # relevance modes return a ranked top-N (a much smaller cap). Validating the
-  # requested `limit` against the mode-appropriate cap — and 400-ing over it —
-  # keeps `meta.limit` honest in every mode (a relevance request for limit=200
-  # is rejected, never silently clamped to the ranked-pool size).
-  defp validate_search_limit(params, :list),
-    do: Pagination.validate_limit(params, Knowledge.max_page_size())
-
-  defp validate_search_limit(params, {:search, _q}) do
-    case Pagination.validate_limit(params, Knowledge.max_relevance_page_size()) do
-      :ok ->
-        :ok
-
-      {:error, :bad_request, _} ->
-        {:error, :bad_request,
-         "limit exceeds the relevance-mode maximum of #{Knowledge.max_relevance_page_size()}; " <>
-           "for exhaustive enumeration drop 'q' to use list mode (max #{Knowledge.max_page_size()})"}
-    end
-  end
+  # A requested `limit` is never rejected — it is CLAMPED downstream and the
+  # effective value is reported in `meta.limit`, so a caller is never blocked.
+  # List mode clamps to the shared max page size (via `maybe_add_limit/2`);
+  # relevance modes clamp to the ranked-pool cap in the context. Full enumeration
+  # of a relevance query is reached by dropping `q` (list mode + keyset cursor).
+  defp validate_search_limit(_params, _query_spec), do: :ok
 
   # US-27.10: `include_body=true` is a KEYSET-path-only opt-in to full bodies, and
   # only for a requested `limit <= max_include_body_page/0`. Two 400s are enforced

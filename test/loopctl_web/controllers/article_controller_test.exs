@@ -794,7 +794,7 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert length(ids) == total
     end
 
-    test "rejects a limit above the maximum page size with 400 instead of silently clamping",
+    test "clamps a limit above the maximum page size (never rejects) and reports the effective limit",
          %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -803,10 +803,11 @@ defmodule LoopctlWeb.ArticleControllerTest do
         conn
         |> auth_conn(raw_key)
         |> get(~p"/api/v1/articles?limit=1001")
-        |> json_response(400)
+        |> json_response(200)
 
-      assert resp["error"]["status"] == 400
-      assert resp["error"]["message"] =~ "maximum page size"
+      # No 400 — clamped to the max page size, surfaced in meta.limit so the
+      # caller advances offset by the effective amount (no skipped rows).
+      assert resp["meta"]["limit"] == 1000
     end
 
     test "honors the maximum limit exactly (1000) without clamping", %{conn: conn} do
