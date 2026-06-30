@@ -105,6 +105,35 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       [row] = body["data"]
       assert row["access_count"] == 1
     end
+
+    test "offset pages the ranking to completeness (no imposed top-N cap)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      a = fixture(:article, %{tenant_id: tenant.id, title: "AAA", status: :published})
+      b = fixture(:article, %{tenant_id: tenant.id, title: "BBB", status: :published})
+      c = fixture(:article, %{tenant_id: tenant.id, title: "CCC", status: :published})
+      for _ <- 1..3, do: Knowledge.record_access(tenant.id, a.id, agent.id, "get")
+      for _ <- 1..2, do: Knowledge.record_access(tenant.id, b.id, agent.id, "get")
+      Knowledge.record_access(tenant.id, c.id, agent.id, "get")
+
+      titles =
+        for off <- 0..2 do
+          body =
+            build_conn()
+            |> auth_conn(orch_key)
+            |> get(~p"/api/v1/knowledge/analytics/top-articles?limit=1&offset=#{off}")
+            |> json_response(200)
+
+          assert body["meta"]["offset"] == off
+          assert length(body["data"]) == 1
+          hd(body["data"])["title"]
+        end
+
+      # Each page returns the next-ranked article — the full ranking is reachable.
+      assert titles == ["AAA", "BBB", "CCC"]
+    end
   end
 
   describe "GET /api/v1/knowledge/articles/:id/stats" do
@@ -194,6 +223,32 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       assert "Unused" in titles
       refute "Used" in titles
       assert body["meta"]["days_unused"] == 7
+    end
+
+    test "offset pages the full unused set to completeness (no imposed cap)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Three never-accessed published articles → all unused (ordered by inserted_at asc).
+      for n <- 1..3 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Unused #{n}", status: :published})
+      end
+
+      seen =
+        for off <- 0..2 do
+          body =
+            build_conn()
+            |> auth_conn(orch_key)
+            |> get(~p"/api/v1/knowledge/analytics/unused-articles?limit=1&offset=#{off}")
+            |> json_response(200)
+
+          assert body["meta"]["offset"] == off
+          assert length(body["data"]) == 1
+          hd(body["data"])["article_id"]
+        end
+
+      # Three distinct articles across the three offset pages — all reachable.
+      assert length(Enum.uniq(seen)) == 3
     end
   end
 

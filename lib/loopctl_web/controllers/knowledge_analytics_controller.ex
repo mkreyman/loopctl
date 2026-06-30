@@ -39,7 +39,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       limit: [
         in: :query,
         type: :integer,
-        description: "Max rows to return (default 20, max 100)",
+        description: "Max rows per page (default 20, max 100). Clamped, never rejected.",
+        required: false
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Rows to skip — page the ranking to completeness (default 0)",
         required: false
       ],
       since_days: [
@@ -85,6 +91,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     opts =
       []
       |> put_limit(params["limit"], 20, @max_limit)
+      |> put_offset(params["offset"])
       |> put_since(params["since_days"], 7)
       |> put_access_type(params["access_type"])
       |> put_project_id(params["project_id"])
@@ -241,7 +248,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       limit: [
         in: :query,
         type: :integer,
-        description: "Max rows to return (default 50, max 200)",
+        description: "Max rows per page (default 50, max 200). Clamped, never rejected.",
+        required: false
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Rows to skip — page the full unused set to completeness (default 0)",
         required: false
       ]
     ],
@@ -261,6 +274,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       []
       |> put_int(:days_unused, params["days_unused"], 30, 1, 365)
       |> put_limit(params["limit"], 50, @max_unused_limit)
+      |> put_offset(params["offset"])
 
     rows = Knowledge.list_unused_articles(tenant_id, opts)
     json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.unused_articles(rows, opts))
@@ -272,6 +286,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   defp put_limit(opts, value, default, max_value) do
     Keyword.put(opts, :limit, parse_int(value, default) |> max(1) |> min(max_value))
+  end
+
+  # Offset enables paging the ranking past the first page — never rejected, so a
+  # caller can enumerate to completeness (the rankings are access-count aggregates,
+  # not vector scans, so deep offset is cheap).
+  defp put_offset(opts, value) do
+    Keyword.put(opts, :offset, parse_int(value, 0) |> max(0))
   end
 
   defp put_since(opts, value, default_days) do

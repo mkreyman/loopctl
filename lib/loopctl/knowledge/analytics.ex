@@ -299,20 +299,24 @@ defmodule Loopctl.Knowledge.Analytics do
   @spec list_top_articles(Ecto.UUID.t(), keyword()) :: [map()]
   def list_top_articles(tenant_id, opts \\ []) do
     limit = opts |> Keyword.get(:limit, 20) |> max(1) |> min(100)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
     since = Keyword.get(opts, :since) || default_since()
     access_type = Keyword.get(opts, :access_type)
     project_id = Keyword.get(opts, :project_id)
     group_by = Keyword.get(opts, :group_by, :article)
 
     case group_by do
-      :project -> list_top_by_project(tenant_id, since, access_type, project_id, limit)
-      :agent -> list_top_by_agent(tenant_id, since, access_type, project_id, limit)
-      _ -> list_top_by_article(tenant_id, since, access_type, project_id, limit)
+      :project -> list_top_by_project(tenant_id, since, access_type, project_id, limit, offset)
+      :agent -> list_top_by_agent(tenant_id, since, access_type, project_id, limit, offset)
+      _ -> list_top_by_article(tenant_id, since, access_type, project_id, limit, offset)
     end
   end
 
-  # Default grouping — per article.
-  defp list_top_by_article(tenant_id, since, access_type, project_id, limit) do
+  # Default grouping — per article. `offset` enables paging the ranking to
+  # completeness (it is ranked by access count — a cheap btree aggregate, not a
+  # vector scan — so deep offset is safe). A secondary `a.id` order keeps paging
+  # stable across rows with equal counts.
+  defp list_top_by_article(tenant_id, since, access_type, project_id, limit, offset) do
     query =
       from(e in ArticleAccessEvent,
         as: :event,
@@ -321,8 +325,9 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id,
         where: e.accessed_at >= ^since,
         group_by: [a.id, a.title, a.category],
-        order_by: [desc: count(e.id)],
+        order_by: [desc: count(e.id), asc: a.id],
         limit: ^limit,
+        offset: ^offset,
         select: %{
           article_id: a.id,
           title: a.title,
@@ -342,7 +347,7 @@ defmodule Loopctl.Knowledge.Analytics do
   # Group by project — only events with a non-NULL project_id contribute
   # (the filter explicitly excludes NULL-tagged events so rollup totals
   # stay tied to actual projects).
-  defp list_top_by_project(tenant_id, since, access_type, project_id, limit) do
+  defp list_top_by_project(tenant_id, since, access_type, project_id, limit, offset) do
     query =
       from(e in ArticleAccessEvent,
         as: :event,
@@ -352,8 +357,9 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since,
         where: not is_nil(e.project_id),
         group_by: [p.id, p.name],
-        order_by: [desc: count(e.id)],
+        order_by: [desc: count(e.id), asc: p.id],
         limit: ^limit,
+        offset: ^offset,
         select: %{
           project_id: p.id,
           project_name: p.name,
@@ -373,7 +379,7 @@ defmodule Loopctl.Knowledge.Analytics do
   # agent link, then LEFT JOIN agents so keys without a linked agent
   # still appear (bucketed under `agent_id: nil`, `agent_name: "unassigned"`).
   # Revoked keys are handled in a separate sentinel rollup below.
-  defp list_top_by_agent(tenant_id, since, access_type, project_id, limit) do
+  defp list_top_by_agent(tenant_id, since, access_type, project_id, limit, offset) do
     # Live keys — keys that exist AND are not revoked.
     live_query =
       from(e in ArticleAccessEvent,
@@ -428,6 +434,7 @@ defmodule Loopctl.Knowledge.Analytics do
 
     (live_rows ++ List.wrap(revoked_row))
     |> Enum.sort_by(& &1.access_count, :desc)
+    |> Enum.drop(offset)
     |> Enum.take(limit)
   end
 
@@ -846,6 +853,7 @@ defmodule Loopctl.Knowledge.Analytics do
   def list_unused_articles(tenant_id, opts \\ []) do
     days_unused = opts |> Keyword.get(:days_unused, 30) |> max(1)
     limit = opts |> Keyword.get(:limit, 50) |> max(1) |> min(200)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0)
     cutoff = DateTime.add(DateTime.utc_now(), -days_unused * 86_400, :second)
 
     # Subquery: article ids that HAVE been accessed since the cutoff
@@ -862,8 +870,9 @@ defmodule Loopctl.Knowledge.Analytics do
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
         where: a.id not in subquery(accessed_ids),
-        order_by: [asc: a.inserted_at],
+        order_by: [asc: a.inserted_at, asc: a.id],
         limit: ^limit,
+        offset: ^offset,
         select: %{
           article_id: a.id,
           title: a.title,
