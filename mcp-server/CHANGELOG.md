@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.25.0 — 2026-06-30 (novelty-gated write-back)
+
+### Added
+
+- **`knowledge_create`** now documents the server-side **novelty gate** and exposes
+  a `force` param. The gate semantically dedups a proposal against the published
+  corpus and returns a `gate.verdict`:
+  - `duplicate` — a near-identical article exists; **nothing is created** (HTTP 200,
+    `deduplicated: true`). Read/update the article at `data.id` instead.
+  - `gated_to_draft` — high overlap; created as a **draft** (not published) with the
+    near-neighbors in `metadata.proposal_novelty` to merge or publish.
+  - `created` — novel, went through normally.
+  - `force: true` bypasses the gate. The gate was already enforced server-side; this
+    release just makes the tool describe it and adds the bypass knob.
+
 ## 2.24.0 — 2026-06-30 (pagination: analytics rankings offset)
 
 ### Added

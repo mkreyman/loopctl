@@ -218,7 +218,7 @@ async function knowledgeContext({ query, project_id, story_id, limit, recency_we
   return toContent(result);
 }
 
-async function knowledgeCreate({ title, body, category, tags, project_id, draft }) {
+async function knowledgeCreate({ title, body, category, tags, project_id, draft, force }) {
   const payload = { title, body };
   if (category) payload.category = category;
   if (tags) payload.tags = tags;
@@ -228,6 +228,9 @@ async function knowledgeCreate({ title, body, category, tags, project_id, draft 
   // plain create routes through the agent key and is immediately visible. Pass
   // draft:true to stage it for later review instead.
   if (draft) payload.draft = true;
+
+  // The server-side novelty gate dedups the proposal; force:true bypasses it.
+  if (force) payload.force = true;
 
   const result = await apiCall(
     "POST",
@@ -1094,5 +1097,27 @@ describe("knowledge_bulk_delete (#136)", () => {
 
     const result = await knowledgeBulkDelete({ hard: true, token: "tok-1" });
     assert.doesNotMatch(result.content[0].text, /WARNING/);
+  });
+});
+
+describe("knowledge_create novelty gate (force passthrough)", () => {
+  test("omits force by default so the gate stays on", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "x" } });
+
+    await knowledgeCreate({ title: "T", body: "B" });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.equal(sent.force, undefined);
+  });
+
+  test("forwards force: true to bypass the gate", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "x" } });
+
+    await knowledgeCreate({ title: "T", body: "B", force: true });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.equal(sent.force, true);
   });
 });

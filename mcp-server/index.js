@@ -848,6 +848,7 @@ async function knowledgeCreate({
   tags,
   project_id,
   draft,
+  force,
   source_type,
   source_id,
   idempotency_key,
@@ -867,6 +868,10 @@ async function knowledgeCreate({
   // draft:true to stage it for later review instead — publish it afterwards with
   // knowledge_publish.
   if (draft) payload.draft = true;
+
+  // The server-side novelty gate dedups the proposal against the corpus (verdict in
+  // the response `gate`). force:true bypasses it.
+  if (force) payload.force = true;
 
   const result = await apiCall(
     "POST",
@@ -2565,6 +2570,13 @@ const TOOLS = [
       "to agents (search/index/context) right away — no separate publish step is needed. Pass " +
       "draft: true to stage the article for later review instead; the response `note` says which " +
       "outcome occurred, and a draft can be published afterwards with knowledge_publish. " +
+      "NOVELTY GATE (default ON): the server semantically dedups your proposal against the published " +
+      "corpus and returns a `gate.verdict` — `duplicate` means a near-identical article already exists, " +
+      "so NOTHING was created (HTTP 200, `deduplicated: true`); read/update the article at `data.id` " +
+      "instead (its `gate.similarity` ~1.0). `gated_to_draft` means high overlap, so the article was " +
+      "created as a DRAFT (not published) with the near-neighbors in metadata.proposal_novelty for you " +
+      "to merge or publish. `created` means it was novel and went through normally. Pass force: true to " +
+      "bypass the gate when you intentionally want an article near an existing one. " +
       "Concurrency-safe: if a create races/retries against an " +
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
@@ -2599,6 +2611,13 @@ const TOOLS = [
           description:
             "Optional: stage as a draft instead of publishing on create (default false → " +
             "published immediately). Publish later with knowledge_publish.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "Optional: bypass the novelty gate (default false). When true, the server skips " +
+            "semantic dedup and creates on the requested path even if a near-duplicate exists. " +
+            "Use only when you've already checked and intend an article close to an existing one.",
         },
         idempotency_key: {
           type: "string",
