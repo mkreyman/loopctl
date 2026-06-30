@@ -46,6 +46,18 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   @max_members 300
   @max_per_category 40
 
+  # A curated topic tag is short (`elixir`, `api-design`, `separation-of-concerns`).
+  # Machine-derived tags — author bylines (`chris-mccord-bruce-tate-jos-valim`),
+  # company names (`datavideo-technologies-co-ltd`), truncated title-slugs
+  # (`2222-location-reporting-sometimes-goes-w`) — run long. Verified against the
+  # live corpus: every tag with more than this many hyphen-segments was junk.
+  @default_max_segments 3
+
+  # URL/domain-shaped tags (`medium-com`, `elixir-lang-org`, `www-erlang-solutions-com`)
+  # name a SOURCE, not a topic — same noise class as `gdrive`. Detected by a
+  # `www-` prefix (below) or a trailing TLD segment.
+  @url_suffixes ~w(com org net edu gov)
+
   # MOCs index TOPICAL domains. The highest-count tags are usually structural —
   # format/source-type descriptors (`pdf`, `document`, `youtube`, …) that say how
   # an article arrived, not what it's about — so a MOC for them is useless noise.
@@ -63,7 +75,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   # `chunk-7`, …) — these identify WHERE in a source an article came from, never a
   # topic. Kept to concrete observed patterns: a broad `p-` would wrongly drop real
   # hyphenated topics (`p-value`, …).
-  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk- pp-)
+  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk- pp- www-)
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -86,12 +98,15 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
       (@structural_tags ++ Application.get_env(:loopctl, :knowledge_moc_excluded_tags, []))
       |> MapSet.new()
 
+    max_segments =
+      Application.get_env(:loopctl, :knowledge_moc_max_tag_segments, @default_max_segments)
+
     %{facets: facets} = Knowledge.tag_facets(tenant_id, limit: 2000)
 
     tags =
       facets
       |> Enum.filter(fn %{tag: tag, count: count} ->
-        count >= min_count and topical_tag?(tag, excluded)
+        count >= min_count and topical_tag?(tag, excluded, max_segments)
       end)
       |> Enum.sort_by(fn %{count: count} -> count end, :desc)
       |> Enum.take(max_tags)
@@ -112,11 +127,17 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
 
   # --- Private ---
 
-  # A tag earns a MOC only if it's neither a structural/format/source tag nor a
-  # per-source provenance id (`yt-…`, `doc-…`, …) — i.e. it names a topic.
-  defp topical_tag?(tag, excluded) do
+  # A tag earns a MOC only if it names a topic: not a structural/format/source tag,
+  # not a per-source provenance id (`yt-…`, `doc-…`, …), and not a machine-derived
+  # slug — an over-long hyphenated string (author lists, title slugs) or a
+  # URL/domain-shaped tag (`medium-com`).
+  defp topical_tag?(tag, excluded, max_segments) do
+    segments = String.split(tag, "-")
+
     not MapSet.member?(excluded, tag) and
-      not Enum.any?(@excluded_prefixes, &String.starts_with?(tag, &1))
+      not Enum.any?(@excluded_prefixes, &String.starts_with?(tag, &1)) and
+      length(segments) <= max_segments and
+      List.last(segments) not in @url_suffixes
   end
 
   defp upsert_moc(tenant_id, tag, count) do

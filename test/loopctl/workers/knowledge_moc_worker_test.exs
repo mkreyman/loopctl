@@ -116,7 +116,10 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
         published(tenant.id, "Readme #{n}", ["readme"])
         published(tenant.id, "Vid #{n}", ["yt-abc123"])
         published(tenant.id, "Pages #{n}", ["pp-1-12"])
+        published(tenant.id, "Byline #{n}", ["chris-mccord-bruce-tate-jos-valim"])
+        published(tenant.id, "Source #{n}", ["medium-com"])
         published(tenant.id, "Rust #{n}", ["rust"])
+        published(tenant.id, "SoC #{n}", ["separation-of-concerns"])
       end
 
       assert :ok = run(tenant.id)
@@ -124,11 +127,15 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       # Structural/format tags get no MOC...
       refute moc_hub(tenant.id, "pdf")
       refute moc_hub(tenant.id, "readme")
-      # ...nor do per-source provenance / chunk-coordinate tags...
+      # ...nor per-source provenance / chunk-coordinate tags...
       refute moc_hub(tenant.id, "yt-abc123")
       refute moc_hub(tenant.id, "pp-1-12")
-      # ...but a genuine topic does.
+      # ...nor machine-derived slugs: over-long bylines or URL/domain-shaped tags...
+      refute moc_hub(tenant.id, "chris-mccord-bruce-tate-jos-valim")
+      refute moc_hub(tenant.id, "medium-com")
+      # ...but genuine topics do, including a legit 3-segment one.
       assert moc_hub(tenant.id, "rust")
+      assert moc_hub(tenant.id, "separation-of-concerns")
     end
   end
 
