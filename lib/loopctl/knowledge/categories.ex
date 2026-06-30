@@ -58,16 +58,19 @@ defmodule Loopctl.Knowledge.Categories do
   @retired [:convention]
 
   @definitions %{
-    pattern: "a reusable solution shape (how this kind of problem is generally solved)",
+    pattern:
+      "a reusable solution shape or recurring structure (the general approach), as opposed to a specific step-by-step procedure",
     decision: "a specific choice that was made and why (ADR-style: options, tradeoff, the call)",
     finding:
       "an empirical discovery — a gotcha, a measured result, the outcome of an investigation",
     reference:
       "factual lookup material — a spec, an API shape, a pointer to an external resource",
-    playbook: "a concrete, ordered procedure to accomplish a task (the steps, not the shape)",
-    insight: "a durable principle or mental model that generalizes beyond one situation",
+    playbook:
+      "a how-to with EXPLICIT, ORDERED STEPS to accomplish a task — not a one-line tip, a general principle, or a recurring shape",
+    insight:
+      "a durable principle, mental model, or realization that generalizes — the 'why' behind things, not a how-to",
     entity: "a person, company, tool, or product (the graph backbone other articles reference)",
-    idea: "a venture, opportunity, or thing to build or try",
+    idea: "a venture, opportunity, or concrete thing to build or try",
     quote: "a notable verbatim quote worth preserving, with attribution",
     question: "an open question or known-unknown to investigate later"
   }
