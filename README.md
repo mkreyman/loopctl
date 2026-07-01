@@ -150,8 +150,8 @@ elixir -e ':crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()'
 
 Once running, the API is self-documenting:
 
-- `GET /` -- Redirects to `/api/v1/`
-- `GET /api/v1/` -- Discovery endpoint with links
+- `GET /` -- HTML landing page (loopctl.com marketing site)
+- `GET /api/v1/` -- Discovery endpoint with links (JSON: discovery, routes, wiki, MCP server)
 - `GET /api/v1/openapi` -- Full OpenAPI 3.0 specification (machine-readable)
 - `GET /swaggerui` -- Interactive Swagger UI (human-readable)
 - `GET /health` -- Health check
@@ -207,6 +207,12 @@ loopctl uses role-based API keys. Each role has specific permissions in the two-
 > ```
 
 Now the agent key can contract, claim, start, and report stories. The orchestrator key (linked to its agent) can verify and reject stories.
+
+> **Chain of Custody v2 (dispatch pattern).** The long-lived, per-role env-var keys above still
+> work during the deprecation window, but the forward path is per-dispatch ephemeral keys: an
+> orchestrator mints a scoped, short-lived key (carrying its lineage) for each sub-agent via
+> `POST /api/v1/dispatches` (MCP tool `dispatch`), instead of sharing static keys. See
+> [`docs/chain-of-custody-v2.md`](docs/chain-of-custody-v2.md).
 
 ### Typical Agent Workflow
 
@@ -358,7 +364,7 @@ the full application works end-to-end after a batch of stories has been merged.
 **Start a UI test run:**
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/projects/:id/ui_test_runs \
+curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"notes": "Post-epic-37 QA pass"}'
@@ -368,7 +374,7 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/ui_test_runs \
 **Record findings** (one call per finding):
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/findings \
+curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/findings \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -383,7 +389,7 @@ curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/findings \
 **Complete a UI test run:**
 
 ```bash
-curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/complete \
+curl -X POST http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id/complete \
   -H "Authorization: Bearer lc_orch_key" \
   -H "Content-Type: application/json" \
   -d '{"summary": "3 bugs found, 1 enhancement suggestion"}'
@@ -392,14 +398,14 @@ curl -X POST http://localhost:4000/api/v1/ui_test_runs/:id/complete \
 **List runs for a project:**
 
 ```bash
-curl "http://localhost:4000/api/v1/projects/:id/ui_test_runs" \
+curl "http://localhost:4000/api/v1/projects/:project_id/ui-tests" \
   -H "Authorization: Bearer lc_orch_key"
 ```
 
 **Get a single run with its findings:**
 
 ```bash
-curl "http://localhost:4000/api/v1/ui_test_runs/:id" \
+curl "http://localhost:4000/api/v1/projects/:project_id/ui-tests/:id" \
   -H "Authorization: Bearer lc_orch_key"
 ```
 
@@ -775,7 +781,7 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (65)
+### Available Tools (69)
 
 Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summary:
 
@@ -821,6 +827,8 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_distant_pairs` | Distant-but-bridgeable article pairs in optimal-novelty band, sampled from agent's visible published articles. | agent |
 | `knowledge_novelty` | Score ideas (`texts:[string]` or `ideas:[string\|object]`) by cosine distance to the nearest visible prior proposal (0 = identical, higher = more novel up to 2.0; null if blank/no visible priors/embed fails). `meta.prior_count` = embedded visible priors compared against. | agent |
 | `knowledge_random_walk` | Random walk through link graph from start article, traversing only agent's visible published articles. | agent |
+| `knowledge_conflicts` | List potential-conflict article pairs the auto-linker/nightly lint flagged as "too similar to coexist" (you judge redundancy vs contradiction). | agent |
+| `knowledge_resolve_conflict` | Record a verdict on a conflict pair (`dismiss`/`supersede`/`merge`); the nightly executor acts on `supersede`/`merge` only at `confidence: high`. | agent |
 | `knowledge_create` | Create an article (published by default; `draft: true` to stage; `idempotency_key` for idempotent capture). Agent-authored articles are `visibility: owner` by default; use `metadata: {visibility: "shared"}` to make visible to other agents. | agent |
 | `knowledge_bulk_unpublish` | Bulk revert published articles to draft (archive), partial-success | user |
 | `knowledge_publish` | Publish an existing draft article | orchestrator |
@@ -841,6 +849,8 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_article_stats` | Per-article usage stats | orchestrator |
 | `knowledge_agent_usage` | Per-agent knowledge usage | orchestrator |
 | `knowledge_unused_articles` | Published articles with zero accesses | orchestrator |
+| `knowledge_curation_log` | Human-readable feed of KB curation adjustments (gate/supersede/merge/dismiss); recorded only while tenant `settings.kb_curation_log` is on | orchestrator |
+| `knowledge_retrieval_metrics` | Daily retrieval-precision time series (search → open follow-through) | orchestrator |
 | `get_system_articles` | List/fetch system-scoped wiki articles (public) | none |
 | `dispatch` | Mint an ephemeral key for a sub-agent dispatch (Chain of Custody v2) | orchestrator |
 | `recover_cap` | Re-mint a capability token after a session crash | agent |

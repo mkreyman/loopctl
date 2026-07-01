@@ -10,6 +10,17 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+// Single source of truth for the server version: the package.json this file
+// ships with (npm always includes package.json in the published tarball).
+// Keeping it derived prevents the handshake version from drifting from the
+// published package version.
+const SERVER_VERSION = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8")
+).version;
 
 // ---------------------------------------------------------------------------
 // HTTP helper — witness protocol state
@@ -1837,7 +1848,7 @@ const TOOLS = [
           properties: {
             input_tokens: { type: "integer", description: "Total input tokens consumed." },
             output_tokens: { type: "integer", description: "Total output tokens consumed." },
-            model_name: { type: "string", description: "Model name (e.g. claude-sonnet-4-5)." },
+            model_name: { type: "string", description: "Model name (e.g. claude-sonnet-5)." },
             cost_millicents: { type: "integer", description: "Total cost in millicents (1/1000 of a cent)." },
           },
         },
@@ -2013,7 +2024,7 @@ const TOOLS = [
         },
         model_name: {
           type: "string",
-          description: "Name of the model used (e.g. claude-sonnet-4-5, gpt-4o).",
+          description: "Name of the model used (e.g. claude-sonnet-5, gpt-4o).",
         },
         cost_millicents: {
           type: "integer",
@@ -3558,7 +3569,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.2.0",
+    version: SERVER_VERSION,
   },
   {
     capabilities: { tools: {} },

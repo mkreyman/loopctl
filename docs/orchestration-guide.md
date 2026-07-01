@@ -11,12 +11,12 @@ The orchestration loop repeats for every story until the project is complete:
 ```
 find ready → contract → claim → implement → request-review → [reviewer] report → review-complete → verify
                                                                                                     │
-                                                                                    pass ───────────┤
-                                                                                    fail ──▶ reject ──▶ (back to pending)
+                                                                                verified ───────────┤
+                                                                                rejected ──▶ reject ──▶ (back to pending)
 ```
 
 **find ready** — Query `/stories/ready?project_id=...` to get stories whose dependencies are all
-verified. A story is not ready if any predecessor has `verified_status != pass`.
+verified. A story is not ready if any predecessor has `verified_status != verified`.
 
 **contract** — The agent POSTs to `/stories/:id/contract` with the story title and acceptance
 criteria count. This proves the agent read the story before claiming it.
@@ -44,8 +44,10 @@ the review is finished and findings have been recorded. This fires a `story.revi
 webhook. The same identity gate applies: 409 if caller == implementer.
 
 **verify / reject** — Only the orchestrator can set `verified_status`. A passing verification
-unblocks dependent stories. A rejection resets the story to `pending` and increments the cycle
-count. If the orchestrator was also the implementer, verify returns `409 self_verify_blocked`.
+unblocks dependent stories. A rejection sets `verified_status = rejected`; when the tenant's
+`auto_reset_on_rejection` setting is enabled (the default), `agent_status` is also reset to
+`pending` so the story can be re-worked, and the cycle count increments. If the orchestrator was
+also the implementer, verify returns `409 self_verify_blocked`.
 
 ---
 
@@ -80,8 +82,8 @@ Every story carries two independent status fields:
 | `agent_status` | Implementation agent | Self-reported completion |
 | `verified_status` | Orchestrator only | Independently confirmed |
 
-These fields are never the same key. An agent reporting `completed` does not advance `verified_status`.
-Stories surface in dependency resolution only when `verified_status = pass`.
+These fields are never the same key. An agent reporting `reported_done` does not advance `verified_status`.
+Stories surface in dependency resolution only when `verified_status = verified`.
 
 **Why this matters:** Without separate fields, agents can and do fabricate review results. The trust
 model makes fabrication structurally impossible — an agent's API key cannot write to `verified_status`.
@@ -95,7 +97,7 @@ boundary: verification endpoints reject requests from agent-role keys.
 
 Stories carry a `depends_on` list of story IDs. The `/stories/ready` endpoint computes readiness by
 walking the dependency graph and returning only stories where every predecessor has
-`verified_status = pass`.
+`verified_status = verified`.
 
 This means:
 
@@ -180,11 +182,11 @@ When onboarding a project that already has completed work, three patterns are av
 ### Pattern 1: Import with initial status
 
 Set `initial_agent_status` and `initial_verified_status` on stories at import time. Stories
-imported as `pass` are immediately treated as verified and unblock their dependents:
+imported as `verified` are immediately treated as verified and unblock their dependents:
 
 ```bash
 curl -X POST http://localhost:4000/api/v1/projects/:id/import \
-  -H "Authorization: Bearer lc_user_key" \
+  -H "Authorization: Bearer lc_superadmin_key" \
   -H "Content-Type: application/json" \
   -d '{
     "epics": [{
@@ -195,11 +197,16 @@ curl -X POST http://localhost:4000/api/v1/projects/:id/import \
         "title": "Database schema",
         "acceptance_criteria": [{"criterion": "Migrations applied"}],
         "initial_agent_status": "reported_done",
-        "initial_verified_status": "pass"
+        "initial_verified_status": "verified"
       }]
     }]
   }'
 ```
+
+> **Note:** `initial_verified_status` is honored **only** for a **superadmin** caller (and the
+> only accepted value is `"verified"`); for orchestrator/user keys it is silently ignored — an
+> anti-RBAC-bypass guard. If you don't hold a superadmin key, use Pattern 2 or 3 below to mark
+> pre-existing work verified.
 
 Use this pattern when you know the status of work at import time.
 
