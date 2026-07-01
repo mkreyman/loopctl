@@ -14,13 +14,31 @@ defmodule LoopctlWeb.WikiIndexLive do
   def mount(_params, _session, socket) do
     grouped = Knowledge.list_system_articles_grouped()
 
+    # Order known categories first, then append any other category actually present
+    # so no article is ever silently hidden from the index.
+    preferred = [
+      :pattern,
+      :decision,
+      :finding,
+      :reference,
+      :playbook,
+      :insight,
+      :entity,
+      :idea,
+      :quote,
+      :question
+    ]
+
+    present = Map.keys(grouped)
+    category_order = Enum.filter(preferred, &(&1 in present)) ++ (present -- preferred)
+
     {:ok,
      socket
      |> assign(:page_title, "loopctl Wiki")
      |> assign(:grouped_articles, grouped)
      |> assign(:search_query, "")
      |> assign(:search_results, nil)
-     |> assign(:category_order, [:convention, :pattern, :decision, :finding, :reference])}
+     |> assign(:category_order, category_order)}
   end
 
   @impl true

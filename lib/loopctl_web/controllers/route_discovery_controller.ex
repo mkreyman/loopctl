@@ -1,10 +1,12 @@
 defmodule LoopctlWeb.RouteDiscoveryController do
   @moduledoc """
-  Returns a machine-readable list of all available API routes.
+  Returns a machine-readable index of commonly used API routes.
 
-  Agents can call GET /api/v1/routes to discover the full API surface
-  before probing endpoints blindly. Requires authentication so that
-  route enumeration is tied to a valid API key.
+  Agents can call GET /api/v1/routes to discover the main endpoints before
+  probing blindly. This is a curated index, not the exhaustive surface — the
+  authoritative, always-complete spec is the OpenAPI document at
+  `/api/v1/openapi` (pointed to in the response's `openapi` field). Requires
+  authentication so that route enumeration is tied to a valid API key.
   """
 
   use LoopctlWeb, :controller
@@ -46,6 +48,21 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{method: "POST", path: "/api/v1/api_keys", description: "Create API key"},
       %{method: "DELETE", path: "/api/v1/api_keys/:id", description: "Delete API key"},
       %{method: "POST", path: "/api/v1/api_keys/:id/rotate", description: "Rotate API key"},
+
+      # Dispatch & Chain of Custody v2 (per-dispatch ephemeral keys)
+      %{
+        method: "POST",
+        path: "/api/v1/dispatches",
+        description:
+          "Mint a per-dispatch ephemeral, scoped API key carrying its lineage path " <>
+            "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). MCP tool: dispatch"
+      },
+      %{method: "GET", path: "/api/v1/dispatches", description: "List dispatches for the tenant"},
+      %{
+        method: "GET",
+        path: "/api/v1/dispatches/:id",
+        description: "Get a dispatch and its lineage"
+      },
 
       # Audit & change feed
       %{
@@ -122,6 +139,11 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "Body must include epic_number plus the usual story fields."
       },
       %{method: "GET", path: "/api/v1/stories/:id", description: "Get story details"},
+      %{
+        method: "GET",
+        path: "/api/v1/stories/:story_id/acceptance_criteria",
+        description: "List a story's acceptance criteria with each one's verification status"
+      },
       %{method: "PATCH", path: "/api/v1/stories/:id", description: "Update story metadata"},
       %{method: "DELETE", path: "/api/v1/stories/:id", description: "Delete story"},
 
@@ -212,6 +234,13 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description: "Alias for /report"
       },
       %{method: "POST", path: "/api/v1/stories/:id/unclaim", description: "Unclaim story"},
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/recover-cap",
+        description:
+          "Re-mint a capability token for a story you're assigned to, after a session crash " <>
+            "lost your cap. MCP tool: recover_cap"
+      },
 
       # Review pipeline
       %{
@@ -507,6 +536,20 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/knowledge/drafts",
         description: "List draft articles awaiting review"
       },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/conflicts",
+        description:
+          "List potential-conflict article pairs (flagged too-similar-to-coexist; you judge " <>
+            "redundancy vs contradiction). MCP tool: knowledge_conflicts"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/knowledge/conflicts/resolve",
+        description:
+          "Record a verdict on a conflict pair (dismiss/supersede/merge); the nightly executor " <>
+            "acts on supersede/merge at high confidence. MCP tool: knowledge_resolve_conflict"
+      },
 
       # Knowledge Wiki — search, context, index, export
       %{
@@ -588,6 +631,21 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/knowledge/analytics/unused-articles",
         description:
           "Published articles with zero accesses. Params: days_unused, limit. Role: orchestrator+."
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/analytics/retrieval-metrics",
+        description:
+          "Daily retrieval-precision time series (search → open follow-through). " <>
+            "Role: orchestrator+. MCP tool: knowledge_retrieval_metrics"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/knowledge/curation-log",
+        description:
+          "Human-readable feed of KB curation adjustments (gate/supersede/merge/dismiss); " <>
+            "recorded only while tenant settings.kb_curation_log is on. Role: orchestrator+. " <>
+            "MCP tool: knowledge_curation_log"
       },
 
       # Knowledge Wiki — project-scoped
@@ -675,6 +733,12 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       }
     ]
 
-    json(conn, %{routes: routes, count: length(routes)})
+    json(conn, %{
+      routes: routes,
+      count: length(routes),
+      openapi: "/api/v1/openapi",
+      note:
+        "Curated index of common routes — the authoritative full API surface is the OpenAPI spec at /api/v1/openapi."
+    })
   end
 end

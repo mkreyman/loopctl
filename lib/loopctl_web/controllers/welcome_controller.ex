@@ -2,7 +2,9 @@ defmodule LoopctlWeb.WelcomeController do
   @moduledoc """
   API root welcome endpoint.
 
-  GET /api/v1/ -- returns discovery links to docs, health, and Swagger UI.
+  GET /api/v1/ -- returns discovery links to the OpenAPI spec, Swagger UI, health,
+  the RFC 8615 discovery document, the route index, the public wiki, and the MCP
+  server (the recommended interface for AI coding agents).
   Public endpoint, no authentication required.
   """
 
@@ -25,7 +27,21 @@ defmodule LoopctlWeb.WelcomeController do
              version: %OpenApiSpex.Schema{type: :string, example: "1.0.0"},
              docs: %OpenApiSpex.Schema{type: :string, example: "/api/v1/openapi"},
              swagger_ui: %OpenApiSpex.Schema{type: :string, example: "/swaggerui"},
-             health: %OpenApiSpex.Schema{type: :string, example: "/health"}
+             health: %OpenApiSpex.Schema{type: :string, example: "/health"},
+             discovery: %OpenApiSpex.Schema{type: :string, example: "/.well-known/loopctl"},
+             routes: %OpenApiSpex.Schema{type: :string, example: "/api/v1/routes"},
+             wiki: %OpenApiSpex.Schema{type: :string, example: "/wiki"},
+             mcp_server: %OpenApiSpex.Schema{
+               type: :object,
+               description: "Recommended interface for AI coding agents (no curl needed)",
+               properties: %{
+                 npm: %OpenApiSpex.Schema{type: :string, example: "loopctl-mcp-server"},
+                 registry: %OpenApiSpex.Schema{
+                   type: :string,
+                   example: "https://www.npmjs.com/package/loopctl-mcp-server"
+                 }
+               }
+             }
            }
          }}
     }
@@ -42,7 +58,14 @@ defmodule LoopctlWeb.WelcomeController do
       version: to_string(Application.spec(:loopctl, :vsn)),
       docs: "/api/v1/openapi",
       swagger_ui: "/swaggerui",
-      health: "/health"
+      health: "/health",
+      discovery: "/.well-known/loopctl",
+      routes: "/api/v1/routes",
+      wiki: "/wiki",
+      mcp_server: %{
+        npm: "loopctl-mcp-server",
+        registry: "https://www.npmjs.com/package/loopctl-mcp-server"
+      }
     })
   end
 end

@@ -2,6 +2,43 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-06-30 — docs sync + agents'-KB endpoints backfill
+
+### Added
+
+- **KB conflict resolution API** — `GET /api/v1/knowledge/conflicts` (list potential-conflict
+  article pairs the auto-linker/nightly lint flagged as too-similar-to-coexist) and
+  `POST /api/v1/knowledge/conflicts/resolve` (record a `dismiss`/`supersede`/`merge` verdict;
+  the nightly executor acts on `supersede`/`merge` only at `confidence: high`, and `merge`
+  LLM-synthesizes both sources into one new draft, never auto-published). Role: agent.
+  MCP tools `knowledge_conflicts`, `knowledge_resolve_conflict` (MCP 2.26–2.28).
+- **`GET /api/v1/knowledge/analytics/retrieval-metrics`** — daily retrieval-precision time
+  series (share of search results the agent then opened). Role: orchestrator. MCP tool
+  `knowledge_retrieval_metrics` (MCP 2.29).
+- **`GET /api/v1/knowledge/curation-log`** — human-readable feed of KB curation adjustments
+  (novelty-gate `gate_duplicate`/`gate_draft`; conflict `supersede`/`merge`/`dismiss`),
+  recorded only while a tenant has `settings.kb_curation_log` enabled (default off).
+  Role: orchestrator. MCP tool `knowledge_curation_log` (MCP 2.30).
+- **Creativity primitives** — `POST /api/v1/knowledge/novelty`, distant-pairs, random-walk,
+  and suggested-links endpoints (MCP `knowledge_novelty`, `knowledge_distant_pairs`,
+  `knowledge_random_walk`, `knowledge_suggest_links`).
+- **API root discovery links** — `GET /api/v1/` now also returns `discovery`, `routes`, `wiki`,
+  and `mcp_server` pointers so agents hitting the root have a path to the MCP server and
+  discovery documents instead of dead-ending.
+
+### Docs
+
+- Corrected the MCP tool count to **69** (was 57/65) across the README, `mcp-server/README.md`,
+  the landing/docs pages, and `CLAUDE.md`, and documented the 4 previously-undocumented tools.
+- Fixed drifted docs: UI-test endpoints are nested under `/projects/:project_id/ui-tests`
+  (README); `verified_status` values are `unverified`/`verified`/`rejected` (not `pass`/`fail`),
+  and `initial_verified_status` on import is honored only for a superadmin caller
+  (orchestration guide); `knowledge_export` has no `obsidian` format and its download needs a
+  user key (`mcp-server/README.md`); `GET /` serves the HTML landing page (it does not redirect).
+- `GET /api/v1/routes` is now described as a curated index (not the exhaustive surface), points
+  to the OpenAPI spec, and lists the CoC v2 dispatch routes, `recover-cap`, `acceptance_criteria`,
+  and the new knowledge endpoints.
+
 ## [Unreleased] — 2026-06-25 — heavy-read pgbouncer outage fix (US-27.13)
 
 ### Fixed
