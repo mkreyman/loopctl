@@ -4,6 +4,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.RetrievalMetrics
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -703,6 +704,37 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
         conn
         |> auth_conn(agent_key)
         |> get(~p"/api/v1/knowledge/analytics/projects/#{project.id}/usage")
+
+      assert json_response(conn, 403)
+    end
+  end
+
+  describe "GET /api/v1/knowledge/analytics/retrieval-metrics" do
+    test "orchestrator gets the precision time series", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      {:ok, _} = RetrievalMetrics.snapshot(tenant.id, ~D[2026-06-15], 1800)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/retrieval-metrics")
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      assert [row] = body["data"]
+      assert row["day"] == "2026-06-15"
+      assert Map.has_key?(row, "precision")
+    end
+
+    test "agent role is rejected (orchestrator+ required)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/retrieval-metrics")
 
       assert json_response(conn, 403)
     end

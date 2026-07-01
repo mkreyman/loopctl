@@ -1151,6 +1151,18 @@ async function knowledgeAnalyticsTop({ limit, offset, since_days, access_type } 
   return toContent(result);
 }
 
+async function knowledgeRetrievalMetrics({ limit, offset } = {}) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/analytics/retrieval-metrics?${qs}`
+    : "/api/v1/knowledge/analytics/retrieval-metrics";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeArticleStats({ article_id }) {
   const result = await apiCall(
     "GET",
@@ -3255,6 +3267,32 @@ const TOOLS = [
 
   // Knowledge Analytics Tools (orchestrator key)
   {
+    name: "knowledge_retrieval_metrics",
+    description:
+      "Return the daily retrieval-PRECISION time series (agents' KB #3): for each day, the " +
+      "share of search results the agent then opened (search → get/context within a window). " +
+      "A proxy for whether retrieval is improving — watch it trend up as the corpus is " +
+      "de-duplicated, better navigated (MOCs), and conflict-resolved. Most recent day first. " +
+      "Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          description: "Days per page (default 30, max 365). Clamped, never rejected.",
+          minimum: 1,
+          maximum: 365,
+        },
+        offset: {
+          type: "integer",
+          description: "Days to skip. Default 0.",
+          minimum: 0,
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_analytics_top",
     description:
       "Return the top accessed knowledge articles for the tenant. " +
@@ -3670,6 +3708,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await knowledgeIngestionJobs();
 
     // Knowledge Analytics Tools
+    case "knowledge_retrieval_metrics":
+      return await knowledgeRetrievalMetrics(args);
+
     case "knowledge_analytics_top":
       return await knowledgeAnalyticsTop(args);
 

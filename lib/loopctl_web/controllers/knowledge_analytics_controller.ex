@@ -17,6 +17,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.RetrievalMetrics
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -278,6 +279,47 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
     rows = Knowledge.list_unused_articles(tenant_id, opts)
     json(conn, LoopctlWeb.KnowledgeAnalyticsJSON.unused_articles(rows, opts))
+  end
+
+  operation(:retrieval_metrics,
+    summary: "Retrieval precision time series",
+    description:
+      "Daily retrieval PRECISION (agents' KB #3): the share of a day's search results the " <>
+        "agent then opened (search → get/context within a window). A proxy for retrieval " <>
+        "quality that trends up as the corpus is de-duplicated and better navigated. Most " <>
+        "recent day first. Role: orchestrator+.",
+    parameters: [
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Days per page (default 30, max 365). Clamped, never rejected.",
+        required: false
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Days to skip (default 0)",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Retrieval metrics", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/analytics/retrieval-metrics"
+  def retrieval_metrics(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts =
+      []
+      |> put_limit(params["limit"], 30, 365)
+      |> put_offset(params["offset"])
+
+    json(conn, RetrievalMetrics.list_snapshots(tenant_id, opts))
   end
 
   # ---------------------------------------------------------------------------

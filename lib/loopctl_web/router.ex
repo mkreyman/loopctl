@@ -348,6 +348,10 @@ defmodule LoopctlWeb.Router do
         KnowledgeAnalyticsController,
         :unused_articles
 
+    get "/knowledge/analytics/retrieval-metrics",
+        KnowledgeAnalyticsController,
+        :retrieval_metrics
+
     get "/knowledge/analytics/agents/:agent_id",
         KnowledgeAnalyticsController,
         :agent_usage

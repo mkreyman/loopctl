@@ -5,6 +5,16 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.29.0 — 2026-07-01 (retrieval precision metric)
+
+### Added
+
+- **`knowledge_retrieval_metrics`** — the daily retrieval-precision time series (agents'
+  KB #3): per day, the share of search results the agent then opened (search →
+  get/context within a window). A mechanical proxy for whether retrieval is improving;
+  trends up as the corpus is de-duplicated, better navigated, and conflict-resolved.
+  Orchestrator role.
+
 ## 2.28.0 — 2026-07-01 (route-the-findings: conflict merge)
 
 ### Changed
