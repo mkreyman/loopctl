@@ -29,6 +29,19 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     :ok
   end
 
+  @doc """
+  Idempotently ensure the audit_log partitions for the current month + lookahead exist.
+
+  Exposed so non-Oban contexts can guarantee partitions without the full worker run
+  (e.g. test-suite startup, where the DB only ran migrations — whose partition window
+  is frozen at migration time and elapses as the wall clock advances).
+  """
+  @spec ensure_partitions() :: :ok
+  def ensure_partitions do
+    create_future_partitions()
+    :ok
+  end
+
   defp create_future_partitions do
     now = DateTime.utc_now()
 
