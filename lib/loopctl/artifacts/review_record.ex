@@ -58,6 +58,14 @@ defmodule Loopctl.Artifacts.ReviewRecord do
 
   The `tenant_id`, `story_id`, and `reviewer_agent_id` are set
   programmatically, not via cast.
+
+  Validates that `completed_at` is not more than 60 seconds in the future (a
+  clock-skew allowance), so a client cannot forward-date a review to satisfy the
+  verify-time review-record check (`Loopctl.Progress.ensure_review_conducted/3`)
+  for a report that had not yet happened. NOTE: this bounds, but does not fully
+  eliminate, the stale-review-vs-re-report window — the structural closure
+  (binding a review record to the specific report generation it covers) is
+  tracked with the chain-of-custody invariant work.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(record \\ %__MODULE__{}, attrs) do
@@ -75,7 +83,34 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     |> validate_number(:findings_count, greater_than_or_equal_to: 0)
     |> validate_number(:fixes_count, greater_than_or_equal_to: 0)
     |> validate_number(:disproved_count, greater_than_or_equal_to: 0)
+    |> validate_completed_at_not_future()
     |> validate_findings_math()
+  end
+
+  # Validates that completed_at is not more than 60 seconds in the future
+  # (clock-skew allowance only — a review does not legitimately "complete" in
+  # the future).
+  @completed_at_future_skew_seconds 60
+
+  defp validate_completed_at_not_future(changeset) do
+    case Ecto.Changeset.get_field(changeset, :completed_at) do
+      nil ->
+        changeset
+
+      completed_at ->
+        max_future =
+          DateTime.utc_now() |> DateTime.add(@completed_at_future_skew_seconds, :second)
+
+        if DateTime.compare(completed_at, max_future) == :gt do
+          Ecto.Changeset.add_error(
+            changeset,
+            :completed_at,
+            "cannot be more than #{@completed_at_future_skew_seconds} seconds in the future"
+          )
+        else
+          changeset
+        end
+    end
   end
 
   defp validate_findings_math(changeset) do

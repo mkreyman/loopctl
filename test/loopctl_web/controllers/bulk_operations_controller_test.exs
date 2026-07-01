@@ -4,6 +4,7 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
@@ -400,6 +401,78 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
 
       assert AdminRepo.get!(Story, story.id).verified_status == :unverified
     end
+
+    test "bulk verify blocks re-verification after a first successful verify", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      implementer = fixture(:agent, %{tenant_id: tenant.id})
+      orchestrator = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: orchestrator.id
+        })
+
+      # Distinct implementer (self-verify guard passes) with a review record so the
+      # first bulk verify actually succeeds.
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :reported_done,
+          assigned_agent_id: implementer.id
+        })
+
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: story.id})
+
+      payload = %{
+        "stories" => [
+          %{
+            "story_id" => story.id,
+            "result" => "pass",
+            "summary" => "first",
+            "review_type" => "x"
+          }
+        ]
+      }
+
+      # First verify succeeds.
+      first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/bulk/verify", payload)
+      assert hd(json_response(first, 200)["results"])["status"] == "success"
+
+      verified_story = AdminRepo.get!(Story, story.id)
+      assert verified_story.verified_status == :verified
+      first_verified_at = verified_story.verified_at
+
+      results_after_first =
+        VerificationResult
+        |> where([v], v.tenant_id == ^tenant.id and v.story_id == ^story.id)
+        |> AdminRepo.all()
+
+      assert length(results_after_first) == 1
+
+      # Second verify of the SAME story is blocked as already-verified.
+      second = conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/bulk/verify", payload)
+      body = json_response(second, 422)
+      result = hd(body["results"])
+      assert result["status"] == "error"
+      assert result["reason"] =~ "already verified"
+
+      # No side effects: verified_at unchanged and still exactly one VerificationResult.
+      reloaded = AdminRepo.get!(Story, story.id)
+      assert reloaded.verified_status == :verified
+      assert reloaded.verified_at == first_verified_at
+
+      results_after_second =
+        VerificationResult
+        |> where([v], v.tenant_id == ^tenant.id and v.story_id == ^story.id)
+        |> AdminRepo.all()
+
+      assert length(results_after_second) == 1
+    end
   end
 
   describe "POST /api/v1/stories/bulk/reject" do
@@ -485,6 +558,47 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       result = hd(body["results"])
       assert result["status"] == "error"
       assert result["reason"] =~ "reason"
+    end
+
+    test "bulk reject blocks self-adjudication (chain-of-custody parity)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      orchestrator = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: orchestrator.id
+        })
+
+      # Story whose implementer IS the caller — reject must be blocked
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :reported_done,
+          assigned_agent_id: orchestrator.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/reject", %{
+          "stories" => [
+            %{"story_id" => story.id, "reason" => "Self rejection attempt", "findings" => %{}}
+          ]
+        })
+
+      # Single-story batch that is fully blocked -> 422 (no successes).
+      body = json_response(conn, 422)
+      result = hd(body["results"])
+      assert result["status"] == "error"
+      assert result["reason"] =~ "chain-of-custody"
+
+      # Story remains unrejected — the bypass is closed.
+      assert AdminRepo.get!(Story, story.id).verified_status == :unverified
     end
   end
 

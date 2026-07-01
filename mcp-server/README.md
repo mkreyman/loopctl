@@ -117,7 +117,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 | Tool | Description |
 |---|---|
-| `bulk_mark_complete` | Bulk mark multiple stories as complete in a single API call. |
+| `bulk_mark_complete` | **Backfill-only.** Bulk-marks pre-existing, never-dispatched stories (pending, unassigned, no dispatch lineage) as complete in a single call. Dispatched stories are refused — they must go through the normal report → review → verify flow. |
 | `verify_all_in_epic` | Bulk verify all reported_done, unverified stories in an epic. |
 
 ### Token Efficiency Tools

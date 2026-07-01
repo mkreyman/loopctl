@@ -1945,8 +1945,9 @@ const TOOLS = [
   {
     name: "bulk_mark_complete",
     description:
-      "Bulk mark multiple stories as complete in a single API call. " +
-      "Each story entry needs a story_id, summary, and review_type. Uses the ORCH key.",
+      "Bulk mark multiple stories as complete (backfill-only for never-dispatched work). " +
+      "ADMIN USE ONLY: backfill pre-existing completed work into pending stories that never entered the dispatch lifecycle. " +
+      "For dispatched stories, use the normal report/review/verify flow. Each story entry needs a story_id, summary, and review_type. Uses the ORCH key.",
     inputSchema: {
       type: "object",
       properties: {

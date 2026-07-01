@@ -257,7 +257,7 @@ defmodule Loopctl.BulkOperations do
          actor_id,
          actor_label
        ) do
-    with :ok <- Progress.mark_complete_allowed?(story),
+    with :ok <- Progress.ensure_mark_complete_allowed(story),
          {:ok, updated} <- apply_mark_complete(story) do
       create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
 
@@ -333,8 +333,8 @@ defmodule Loopctl.BulkOperations do
 
   defp process_verify(story, params, tenant_id, orchestrator_agent_id, actor_id, actor_label) do
     with :ok <- validate_verify_preconditions(story),
-         :ok <- Progress.verify_allowed?(story, orchestrator_agent_id),
-         :ok <- Progress.review_conducted?(tenant_id, story.id, story),
+         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id),
+         :ok <- Progress.ensure_review_conducted(tenant_id, story.id, story),
          {:ok, updated} <- apply_verification(story) do
       create_verification_result(tenant_id, story, orchestrator_agent_id, params)
       audit_verification(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -352,6 +352,7 @@ defmodule Loopctl.BulkOperations do
 
     with :ok <- validate_reason(reason),
          :ok <- validate_reject_preconditions(story),
+         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id),
          {:ok, updated} <- apply_rejection(story, reason) do
       create_rejection_result(tenant_id, story, orchestrator_agent_id, params)
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -428,10 +429,16 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp validate_verify_preconditions(story) do
-    if story.agent_status == :reported_done do
-      :ok
-    else
-      {:error, "Story must be in reported_done status to verify (current: #{story.agent_status})"}
+    cond do
+      story.verified_status == :verified ->
+        {:error, :already_verified}
+
+      story.agent_status == :reported_done ->
+        :ok
+
+      true ->
+        {:error,
+         "Story must be in reported_done status to verify (current: #{story.agent_status})"}
     end
   end
 
