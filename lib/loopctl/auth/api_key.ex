@@ -30,6 +30,7 @@ defmodule Loopctl.Auth.ApiKey do
     field :last_used_at, :utc_datetime_usec
     field :expires_at, :utc_datetime_usec
     field :revoked_at, :utc_datetime_usec
+    field :sth_bootstrap_consumed_at, :utc_datetime_usec
 
     timestamps()
   end
@@ -75,6 +76,19 @@ defmodule Loopctl.Auth.ApiKey do
   @spec expire_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
   def expire_changeset(api_key, expires_at) do
     change(api_key, expires_at: expires_at)
+  end
+
+  @doc """
+  Changeset that stamps the one-time STH witness bootstrap grace as consumed.
+
+  Once a key has bootstrapped, `LoopctlWeb.Plugs.ValidateWitnessHeader`
+  rejects any further `X-Loopctl-STH-Bootstrap` requests from it — the key
+  must present a real `X-Loopctl-Last-Known-STH` header on every subsequent
+  request (custody-03 / GHSA-36g5-mcrh-rcrm).
+  """
+  @spec consume_bootstrap_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
+  def consume_bootstrap_changeset(api_key) do
+    change(api_key, sth_bootstrap_consumed_at: DateTime.utc_now())
   end
 
   @doc """
