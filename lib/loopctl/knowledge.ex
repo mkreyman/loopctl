@@ -53,6 +53,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
@@ -377,6 +378,7 @@ defmodule Loopctl.Knowledge do
   defp gate_proposal(tenant_id, attrs, %{verdict: :duplicate} = assessment, opts) do
     case canonical_neighbor(tenant_id, assessment, opts) do
       {:ok, existing} ->
+        log_gate(tenant_id, "gate_duplicate", "rejected duplicate", existing, assessment, opts)
         {:ok, %{verdict: :duplicate, article: existing, created: false, assessment: assessment}}
 
       # The canonical neighbor vanished (deleted/unpublished) between assess and now —
@@ -392,6 +394,8 @@ defmodule Loopctl.Knowledge do
       |> Map.put("status", "draft")
       |> stamp_proposal_metadata(assessment)
 
+    neighbor = List.first(assessment.neighbors)
+    log_gate(tenant_id, "gate_draft", "drafted (high overlap)", neighbor, assessment, opts)
     create_proposal(tenant_id, gated_attrs, assessment, opts, :gated_to_draft)
   end
 
@@ -415,6 +419,31 @@ defmodule Loopctl.Knowledge do
         {:error, changeset}
     end
   end
+
+  # Concise curation-log line for a gate decision (only written when the tenant has
+  # kb_curation_log on — KbCuration.record no-ops otherwise).
+  defp log_gate(tenant_id, kind, prefix, neighbor, assessment, opts) do
+    {nid, ntitle} =
+      case neighbor do
+        %Article{id: id, title: title} -> {id, title}
+        %{id: id, title: title} -> {id, title}
+        _ -> {nil, nil}
+      end
+
+    summary =
+      prefix <>
+        if(ntitle, do: " of \"#{ntitle}\"", else: "") <>
+        if(assessment.score, do: " (sim=#{fmt_sim(assessment.score)})", else: "")
+
+    KbCuration.record(tenant_id, kind, summary,
+      refs: Enum.reject([nid], &is_nil/1),
+      actor: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+      metadata: %{"similarity" => assessment.score}
+    )
+  end
+
+  defp fmt_sim(s) when is_float(s), do: :erlang.float_to_binary(s, decimals: 3)
+  defp fmt_sim(s), do: to_string(s)
 
   defp canonical_neighbor(tenant_id, %{neighbors: [%{id: id} | _]}, opts) do
     case get_article(tenant_id, id, Keyword.take(opts, [:visibility_agent_id])) do
@@ -3324,23 +3353,36 @@ defmodule Loopctl.Knowledge do
       %ConflictResolution{tenant_id: tenant_id}
       |> ConflictResolution.changeset(row_attrs)
 
-    AdminRepo.insert(changeset,
-      on_conflict:
-        {:replace,
-         [
-           :authoritative_article_id,
-           :classification,
-           :disposition,
-           :confidence,
-           :evidence,
-           :annotated_by,
-           :annotated_at,
-           :executed_at,
-           :execution_result,
-           :updated_at
-         ]},
-      conflict_target: [:tenant_id, :source_article_id, :target_article_id]
-    )
+    result =
+      AdminRepo.insert(changeset,
+        on_conflict:
+          {:replace,
+           [
+             :authoritative_article_id,
+             :classification,
+             :disposition,
+             :confidence,
+             :evidence,
+             :annotated_by,
+             :annotated_at,
+             :executed_at,
+             :execution_result,
+             :updated_at
+           ]},
+        conflict_target: [:tenant_id, :source_article_id, :target_article_id]
+      )
+
+    with {:ok, %ConflictResolution{disposition: :dismiss} = res} <- result do
+      log_resolution(
+        tenant_id,
+        res,
+        "dismiss",
+        "dismissed as #{res.classification || "not-a-conflict"}",
+        [res.source_article_id, res.target_article_id]
+      )
+    end
+
+    result
   end
 
   @doc """
@@ -3410,6 +3452,17 @@ defmodule Loopctl.Knowledge do
           "loser" => loser
         })
 
+        log_resolution(
+          tenant_id,
+          r,
+          "supersede",
+          "\"#{title_of(loser)}\" retired for \"#{title_of(winner)}\"",
+          [
+            winner,
+            loser
+          ]
+        )
+
         true
 
       # Already superseded / link exists → the disposition is effectively done; record
@@ -3478,6 +3531,13 @@ defmodule Loopctl.Knowledge do
         end)
 
         mark_resolution_executed(r, %{"action" => "merged_draft", "draft_id" => draft.id})
+
+        log_resolution(tenant_id, r, "merge", "drafted \"#{draft.title}\" from 2 sources", [
+          draft.id,
+          r.source_article_id,
+          r.target_article_id
+        ])
+
         true
 
       # A draft with this title already exists (likely a prior run) — stop retrying.
@@ -3507,6 +3567,24 @@ defmodule Loopctl.Knowledge do
     r
     |> Ecto.Changeset.change(executed_at: DateTime.utc_now(), execution_result: execution_result)
     |> AdminRepo.update()
+  end
+
+  # Concise curation-log line for a conflict resolution (no-ops unless the tenant has
+  # kb_curation_log on). `refs` are the article ids involved; actor/confidence come from
+  # the recorded verdict.
+  defp log_resolution(tenant_id, %ConflictResolution{} = r, kind, summary, refs) do
+    KbCuration.record(tenant_id, kind, summary,
+      refs: refs,
+      actor: r.annotated_by,
+      confidence: r.confidence && to_string(r.confidence)
+    )
+  end
+
+  defp title_of(article_id) do
+    case AdminRepo.get(Article, article_id) do
+      %Article{title: title} -> title
+      _ -> article_id
+    end
   end
 
   @doc """

@@ -17,6 +17,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
 
   action_fallback LoopctlWeb.FallbackController
@@ -322,12 +323,88 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     json(conn, RetrievalMetrics.list_snapshots(tenant_id, opts))
   end
 
+  operation(:curation_log,
+    summary: "KB curation adjustment log",
+    description:
+      "The concise, human-readable log of KB CURATION adjustments (novelty-gate decisions, " <>
+        "conflict supersede/merge/dismiss) — the 'what did the KB change' feed for rollout " <>
+        "analysis. Recorded only while the tenant has `settings.kb_curation_log` on (toggle " <>
+        "via PATCH /api/v1/admin/tenants/:id). Most recent first. Role: orchestrator+.",
+    parameters: [
+      kind: [
+        in: :query,
+        type: :string,
+        description: "Filter by kind (gate_duplicate|gate_draft|supersede|merge|dismiss)",
+        required: false
+      ],
+      since: [
+        in: :query,
+        type: :string,
+        description: "ISO8601 date/datetime lower bound (inclusive)",
+        required: false
+      ],
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Events per page (default 50, max 500). Clamped, never rejected.",
+        required: false
+      ],
+      offset: [
+        in: :query,
+        type: :integer,
+        description: "Events to skip (default 0)",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Curation log", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/curation-log"
+  def curation_log(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    opts =
+      []
+      |> put_limit(params["limit"], 50, 500)
+      |> put_offset(params["offset"])
+      |> maybe_put(:kind, params["kind"])
+      |> maybe_put(:since, parse_since(params["since"]))
+
+    json(conn, KbCuration.list(tenant_id, opts))
+  end
+
   # ---------------------------------------------------------------------------
   # Internals
   # ---------------------------------------------------------------------------
 
   defp put_limit(opts, value, default, max_value) do
     Keyword.put(opts, :limit, parse_int(value, default) |> max(1) |> min(max_value))
+  end
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, _key, ""), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  # Accept an ISO8601 datetime OR date for the curation-log `since` lower bound.
+  defp parse_since(nil), do: nil
+  defp parse_since(""), do: nil
+
+  defp parse_since(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _} ->
+        dt
+
+      _ ->
+        case Date.from_iso8601(value) do
+          {:ok, d} -> d
+          _ -> nil
+        end
+    end
   end
 
   # Offset enables paging the ranking past the first page — never rejected, so a

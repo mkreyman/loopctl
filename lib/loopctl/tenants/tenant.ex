@@ -163,8 +163,11 @@ defmodule Loopctl.Tenants.Tenant do
         not is_map(value) or is_struct(value) ->
           [settings: "must be a map"]
 
-        not valid_knowledge_auto_extract?(value) ->
+        not valid_boolean_setting?(value, "knowledge_auto_extract") ->
           [settings: "knowledge_auto_extract must be a boolean"]
+
+        not valid_boolean_setting?(value, "kb_curation_log") ->
+          [settings: "kb_curation_log must be a boolean"]
 
         true ->
           []
@@ -172,8 +175,9 @@ defmodule Loopctl.Tenants.Tenant do
     end)
   end
 
-  defp valid_knowledge_auto_extract?(settings) do
-    case Map.get(settings, "knowledge_auto_extract") do
+  # A recognized boolean setting is either absent or an actual boolean.
+  defp valid_boolean_setting?(settings, key) do
+    case Map.get(settings, key) do
       nil -> true
       val when is_boolean(val) -> true
       _ -> false

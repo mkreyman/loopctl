@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.30.0 — 2026-07-01 (toggleable KB curation log)
+
+### Added
+
+- **`knowledge_curation_log`** — the concise, human-readable feed of KB curation
+  adjustments (novelty-gate `gate_duplicate`/`gate_draft`, conflict `supersede`/`merge`/
+  `dismiss`), for analyzing the rollout. Recorded ONLY while a tenant has
+  `settings.kb_curation_log` on — a per-tenant toggle flipped via the admin tenant API
+  (`PATCH /api/v1/admin/tenants/:id` with `settings:{kb_curation_log:true}`); off by
+  default = no rows, no overhead. Filter by `kind`/`since`, most recent first.
+  Orchestrator role.
+
 ## 2.29.0 — 2026-07-01 (retrieval precision metric)
 
 ### Added
