@@ -11,6 +11,7 @@ Mox.defmock(Loopctl.MockWebAuthn, for: Loopctl.WebAuthn.Behaviour)
 Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
 Mox.defmock(Loopctl.MockProposalAssessor, for: Loopctl.Knowledge.ProposalAssessorBehaviour)
+Mox.defmock(Loopctl.MockMergeSynthesizer, for: Loopctl.Knowledge.MergeSynthesizerBehaviour)
 # US-27.15: webhook delivery DI. ScaleAlerts and the webhook worker share the
 # `:webhook_delivery` key. In :test it resolves to this mock; the DataCase default stub
 # delegates to Loopctl.Webhooks.ReqDelivery so the existing Req.Test-stub-based webhook

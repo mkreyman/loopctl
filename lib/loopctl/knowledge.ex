@@ -3344,11 +3344,17 @@ defmodule Loopctl.Knowledge do
   end
 
   @doc """
-  Nightly executor for `:supersede` resolutions (route-the-findings #4, step 1). Applies
-  only high-confidence, not-yet-executed supersedes — reversible and audited: reuses
-  `create_link/3` to create a `supersedes` link (winner → loser) and transition the loser
-  to `:superseded`. Bounded per run via `opts[:limit]`. `:dismiss` needs no execution
-  (recorded complete); `:merge` is left for the LLM step. Returns the count applied.
+  Nightly executor for conflict resolutions (route-the-findings #4). Applies only
+  high-confidence, not-yet-executed rows — all reversible/non-destructive and audited:
+
+    * `:supersede` — reuses `create_link/3` to create a `supersedes` link (winner → loser)
+      and transition the loser to `:superseded` (reversible).
+    * `:merge` — the LLM synthesizes a merged article (step 2); it lands as a **draft**
+      (never auto-published) with both sources preserved and `merged_from` metadata, plus
+      `relates_to` links to the sources. On synthesis failure the row is left for retry.
+
+  `:dismiss` needs no execution (recorded complete on annotate). Bounded per run via
+  `opts[:limit]`. Returns the count applied.
   """
   @spec execute_conflict_resolutions(Ecto.UUID.t(), keyword()) :: non_neg_integer()
   def execute_conflict_resolutions(tenant_id, opts \\ []) do
@@ -3358,16 +3364,22 @@ defmodule Loopctl.Knowledge do
       from(r in ConflictResolution,
         where: r.tenant_id == ^tenant_id,
         where: is_nil(r.executed_at),
-        where: r.disposition == :supersede,
+        where: r.disposition in [:supersede, :merge],
         where: r.confidence == :high,
         limit: ^limit
       )
       |> AdminRepo.all()
 
     Enum.reduce(rows, 0, fn r, count ->
-      if apply_supersede(tenant_id, r), do: count + 1, else: count
+      if apply_resolution(tenant_id, r), do: count + 1, else: count
     end)
   end
+
+  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :supersede} = r),
+    do: apply_supersede(tenant_id, r)
+
+  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :merge} = r),
+    do: apply_merge(tenant_id, r)
 
   # The conflict pair is unordered; store it canonically (source <= target by UUID
   # string) so one row covers (A,B) and (B,A).
@@ -3406,6 +3418,89 @@ defmodule Loopctl.Knowledge do
         mark_resolution_executed(r, %{"action" => "noop", "reason" => inspect(reason)})
         false
     end
+  end
+
+  defp apply_merge(tenant_id, %ConflictResolution{} = r) do
+    a = AdminRepo.get_by(Article, id: r.source_article_id, tenant_id: tenant_id)
+    b = AdminRepo.get_by(Article, id: r.target_article_id, tenant_id: tenant_id)
+
+    if is_nil(a) or is_nil(b) do
+      mark_resolution_executed(r, %{"action" => "noop", "reason" => "source missing"})
+      false
+    else
+      do_merge(tenant_id, r, a, b)
+    end
+  end
+
+  defp do_merge(tenant_id, r, a, b) do
+    case merge_synthesizer().synthesize(
+           %{title: a.title, body: a.body},
+           %{title: b.title, body: b.body}
+         ) do
+      {:ok, %{title: title, body: body}} ->
+        create_merged_draft(tenant_id, r, a, title, body)
+
+      # No backend / unparseable → leave unexecuted so a later run (or config) retries;
+      # NEVER draft a placeholder.
+      {:error, reason} ->
+        Logger.warning("ConflictExecutor: merge synthesis failed for #{r.id}: #{inspect(reason)}")
+        false
+    end
+  end
+
+  defp create_merged_draft(tenant_id, r, source_a, title, body) do
+    attrs = %{
+      title: title,
+      body: body,
+      category: source_a.category,
+      status: :draft,
+      tags: ["merged"],
+      metadata: %{
+        "merged_from" => [r.source_article_id, r.target_article_id],
+        "conflict_resolution_id" => r.id
+      }
+    }
+
+    opts = [actor_type: "system", actor_label: "worker:conflict_executor"]
+
+    case create_article(tenant_id, attrs, opts) do
+      {:ok, draft} ->
+        Enum.each([r.source_article_id, r.target_article_id], fn src ->
+          create_link(
+            tenant_id,
+            %{
+              source_article_id: draft.id,
+              target_article_id: src,
+              relationship_type: "relates_to"
+            },
+            opts
+          )
+        end)
+
+        mark_resolution_executed(r, %{"action" => "merged_draft", "draft_id" => draft.id})
+        true
+
+      # A draft with this title already exists (likely a prior run) — stop retrying.
+      {:error, :duplicate_title, existing} ->
+        mark_resolution_executed(r, %{
+          "action" => "noop",
+          "reason" => "title_exists",
+          "existing" => existing.id
+        })
+
+        false
+
+      other ->
+        Logger.warning(
+          "ConflictExecutor: merge draft create failed for #{r.id}: #{inspect(other)}"
+        )
+
+        false
+    end
+  end
+
+  defp merge_synthesizer do
+    Application.get_env(:loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer)
   end
 
   defp mark_resolution_executed(%ConflictResolution{} = r, execution_result) do

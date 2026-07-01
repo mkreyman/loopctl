@@ -300,6 +300,10 @@ config :loopctl, :knowledge_proposal_overlap_threshold, 0.88
 # link for the consuming agent to resolve (merge a redundancy / reconcile a real
 # contradiction). The KB only flags; it never judges which it is.
 config :loopctl, :knowledge_conflict_threshold, 0.93
+
+# Merge synthesizer (#4 step 2): the LLM that combines two articles a grounded agent
+# marked `:merge` into ONE draft. Reuses the shared :anthropic_provider key; drafts only.
+config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
 # Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).
 config :loopctl, :knowledge_lint_max_conflict_promotions, 500

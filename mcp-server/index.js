@@ -2467,7 +2467,9 @@ const TOOLS = [
       "a keyword and a semantic sub-search, each capped at 100, so up to ~200), or filtered_set " +
       "(list mode: the full set). Do NOT use a relevance-mode total_count to size the wiki — use " +
       "list mode or knowledge_stats. " +
-      "Pass story_id when working on a loopctl story so reads attribute correctly.",
+      "Pass story_id when working on a loopctl story so reads attribute correctly. " +
+      "When you knowledge_get a result and it carries `potential_conflicts`, resolve it if it's " +
+      "material to your task (see knowledge_get / the conflict-resolution wiki playbook).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2520,7 +2522,12 @@ const TOOLS = [
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
-      "Pass story_id when working on a loopctl story so reads attribute correctly.",
+      "Pass story_id when working on a loopctl story so reads attribute correctly. " +
+      "If the response carries a non-empty `potential_conflicts` array AND the conflict is " +
+      "material to your current task, act on it: read the peer, judge redundant/complementary/" +
+      "contradictory against the live system, and knowledge_resolve_conflict (dismiss a false " +
+      "positive, supersede when one clearly wins, merge when both should combine). If you can't " +
+      "tell which is right, leave it. See the 'Resolving knowledge conflicts' wiki playbook.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2957,7 +2964,9 @@ const TOOLS = [
       "the two don't actually conflict; drops out of the queue immediately); 'supersede' " +
       "(one article wins — pass authoritative_article_id, the winner; the nightly executor " +
       "creates a supersedes link and retires the loser, but ONLY at confidence:\"high\" — " +
-      "reversible and audited); 'merge' (recorded for the later merge step). Non-destructive " +
+      "reversible and audited); 'merge' (at confidence:\"high\" the nightly executor has an LLM " +
+      "synthesize the two into ONE new DRAFT — both sources preserved, never auto-published, " +
+      "for you/a human to review and publish). Non-destructive " +
       "at agent role — you record intent; the privileged nightly job executes it. " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
@@ -2979,7 +2988,8 @@ const TOOLS = [
           enum: ["dismiss", "supersede", "merge"],
           description:
             "dismiss = false positive; supersede = one wins (set authoritative_article_id); " +
-            "merge = combine (recorded for the later merge step).",
+            "merge = combine both into one new DRAFT (LLM-synthesized by the nightly executor " +
+            "at high confidence; sources preserved, never auto-published).",
         },
         authoritative_article_id: {
           type: "string",

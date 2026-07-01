@@ -233,4 +233,80 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert %{authoritative_article_id: _} = errors_on(changeset)
     end
   end
+
+  describe "merge executor (#4 step 2)" do
+    import Mox
+
+    setup do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, "XML in Elixir with xmerl")
+      b = published(tenant.id, "How to parse XML documents in Elixir")
+      conflict_link(tenant.id, a, b, 0.98)
+      %{tenant: tenant, a: a, b: b}
+    end
+
+    test "high-confidence merge synthesizes a DRAFT, links both sources, leaves them intact",
+         ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _a, _b ->
+        {:ok, %{title: "Parsing XML in Elixir (xmerl)", body: "Merged body covering both."}}
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert 1 == Knowledge.execute_conflict_resolutions(t.id)
+
+      # A new DRAFT exists, tagged merged, pointing at both sources.
+      draft =
+        AdminRepo.get_by(Loopctl.Knowledge.Article,
+          tenant_id: t.id,
+          title: "Parsing XML in Elixir (xmerl)"
+        )
+
+      assert draft.status == :draft
+      assert draft.category == a.category
+      assert draft.metadata["merged_from"] == [min(a.id, b.id), max(a.id, b.id)]
+
+      links =
+        AdminRepo.all(
+          from(l in ArticleLink,
+            where: l.source_article_id == ^draft.id and l.relationship_type == :relates_to,
+            select: l.target_article_id
+          )
+        )
+
+      assert Enum.sort(links) == Enum.sort([a.id, b.id])
+
+      # Sources are untouched (never destroyed by a merge).
+      assert AdminRepo.get(Loopctl.Knowledge.Article, a.id).status == :published
+      assert AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+    end
+
+    test "merge is NOT executed when the synthesizer has no backend (stays for retry)", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+      # Default stub returns {:error, :not_configured}.
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      assert is_nil(row.executed_at)
+    end
+  end
 end
