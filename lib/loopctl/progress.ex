@@ -956,13 +956,14 @@ defmodule Loopctl.Progress do
 
   Returns `:ok` when `orchestrator_agent_id` is permitted to verify `story`, or
   `{:error, :self_verify_blocked}` when the verifier shares dispatch lineage /
-  agent identity with the implementer. Exposed so `Loopctl.BulkOperations`
+  agent identity with the implementer. A nil `orchestrator_agent_id` is treated
+  as an untrusted identity and is always blocked. Exposed so `Loopctl.BulkOperations`
   enforces the SAME self-verify invariant as the single-story `verify_story/4`
   path — otherwise bulk verify is a chain-of-custody bypass.
   """
-  @spec verify_allowed?(Story.t(), Ecto.UUID.t() | nil) ::
+  @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
           :ok | {:error, :self_verify_blocked}
-  def verify_allowed?(story, orchestrator_agent_id) do
+  def ensure_verify_allowed(story, orchestrator_agent_id) do
     case validate_not_self_verify(story, orchestrator_agent_id) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
@@ -974,9 +975,9 @@ defmodule Loopctl.Progress do
   was reported done, else `{:error, :review_not_conducted}`. Mirrors the
   `verify_story/4` review-record requirement for the bulk path.
   """
-  @spec review_conducted?(Ecto.UUID.t(), Ecto.UUID.t(), Story.t()) ::
+  @spec ensure_review_conducted(Ecto.UUID.t(), Ecto.UUID.t(), Story.t()) ::
           :ok | {:error, :review_not_conducted}
-  def review_conducted?(tenant_id, story_id, story) do
+  def ensure_review_conducted(tenant_id, story_id, story) do
     case validate_review_record_exists(tenant_id, story_id, story) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
@@ -990,10 +991,10 @@ defmodule Loopctl.Progress do
   `backfill_story/4`. Prevents mark-complete from being used to self-verify
   dispatched work.
   """
-  @spec mark_complete_allowed?(Story.t()) ::
+  @spec ensure_mark_complete_allowed(Story.t()) ::
           :ok
           | {:error, :already_verified | :story_rejected | :story_has_dispatch_lineage}
-  def mark_complete_allowed?(story) do
+  def ensure_mark_complete_allowed(story) do
     case guard_backfillable(story) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
