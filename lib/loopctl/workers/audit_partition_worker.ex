@@ -30,22 +30,29 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   end
 
   @doc """
-  Idempotently ensure the audit_log partitions for the current month + lookahead exist.
+  Idempotently ensure audit_log partitions exist for a window around the current month.
 
-  Exposed so non-Oban contexts can guarantee partitions without the full worker run
-  (e.g. test-suite startup, where the DB only ran migrations — whose partition window
-  is frozen at migration time and elapses as the wall clock advances).
+  `:back` months (default 0) and `:forward` months (default the worker's lookahead) —
+  both inclusive of the current month. Exposed so non-Oban contexts can guarantee
+  partitions without the full worker run (e.g. test-suite startup, where the DB only ran
+  migrations — whose partition window is both frozen at migration time AND anchored to
+  when the migration happened to run, so fixed-date test rows in a recent PAST month may
+  land outside it. Tests pass `back:` to cover those.)
   """
-  @spec ensure_partitions() :: :ok
-  def ensure_partitions do
-    create_future_partitions()
+  @spec ensure_partitions(keyword()) :: :ok
+  def ensure_partitions(opts \\ []) do
+    back = Keyword.get(opts, :back, 0)
+    forward = Keyword.get(opts, :forward, @future_months)
+    create_partitions(-back..forward)
     :ok
   end
 
-  defp create_future_partitions do
+  defp create_future_partitions, do: create_partitions(0..@future_months)
+
+  defp create_partitions(offset_range) do
     now = DateTime.utc_now()
 
-    for offset <- 0..@future_months do
+    for offset <- offset_range do
       {year, month} = month_offset(now.year, now.month, offset)
       {next_year, next_month} = month_offset(year, month, 1)
 

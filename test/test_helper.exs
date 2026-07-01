@@ -3,12 +3,15 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 
 # audit_log is time-partitioned. The create_audit_log migration seeds partitions for a
-# fixed window (its month + 3), which ELAPSES as the wall clock advances — so after a
-# month rollover the test DB has no partition for "now" and every audit insert fails
-# (prod is unaffected: the nightly AuditPartitionWorker keeps the window ahead). Ensure
-# the current + lookahead partitions exist here (idempotent CREATE IF NOT EXISTS DDL) so
-# the suite doesn't depend on when the migration happened to run.
-Loopctl.Workers.AuditPartitionWorker.ensure_partitions()
+# window anchored to WHEN IT RAN (its month + 3). A fresh CI DB migrated today therefore
+# has no partition for the FIXED past-dated rows many tests insert (e.g. ~U[2026-06-24]),
+# nor for future months as time advances — so audit inserts fail with "no partition".
+# (Prod is unaffected: the nightly AuditPartitionWorker keeps the window ahead.) Ensure a
+# generous window here. It must be COMMITTED DDL, so run it unboxed — a plain query would
+# execute inside the sandbox transaction and be rolled back before any test sees it.
+Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
+  Loopctl.Workers.AuditPartitionWorker.ensure_partitions(back: 12)
+end)
 
 # Scale tests (US-27.1) are opt-in: they seed large corpora, commit rows
 # directly to the DB, and run ANALYZE. They must NEVER run inside the normal
