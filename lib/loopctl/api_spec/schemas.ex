@@ -1939,7 +1939,7 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           nullable: true,
           description: "Most frequently used model",
-          example: "claude-sonnet-4-5"
+          example: "claude-sonnet-5"
         },
         efficiency_rank: %Schema{
           type: :integer,
@@ -1954,7 +1954,7 @@ defmodule Loopctl.ApiSpec.Schemas do
         total_output_tokens: 864_000,
         total_cost_millicents: 2_943_000,
         avg_cost_per_story_millicents: 163_500,
-        primary_model: "claude-sonnet-4-5",
+        primary_model: "claude-sonnet-5",
         efficiency_rank: 1
       }
     })
@@ -2051,7 +2051,7 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         model_breakdown: %{
           "claude-opus-4-5": 12_300_000,
-          "claude-sonnet-4-5": 3_800_000,
+          "claude-sonnet-5": 3_800_000,
           "claude-haiku-3-5": 550_000
         },
         budget_millicents: 20_000_000,

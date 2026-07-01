@@ -1848,7 +1848,7 @@ const TOOLS = [
           properties: {
             input_tokens: { type: "integer", description: "Total input tokens consumed." },
             output_tokens: { type: "integer", description: "Total output tokens consumed." },
-            model_name: { type: "string", description: "Model name (e.g. claude-sonnet-4-5)." },
+            model_name: { type: "string", description: "Model name (e.g. claude-sonnet-5)." },
             cost_millicents: { type: "integer", description: "Total cost in millicents (1/1000 of a cent)." },
           },
         },
@@ -2024,7 +2024,7 @@ const TOOLS = [
         },
         model_name: {
           type: "string",
-          description: "Name of the model used (e.g. claude-sonnet-4-5, gpt-4o).",
+          description: "Name of the model used (e.g. claude-sonnet-5, gpt-4o).",
         },
         cost_millicents: {
           type: "integer",

@@ -38,6 +38,9 @@ All notable changes to loopctl are documented here.
 - `GET /api/v1/routes` is now described as a curated index (not the exhaustive surface), points
   to the OpenAPI spec, and lists the CoC v2 dispatch routes, `recover-cap`, `acceptance_criteria`,
   and the new knowledge endpoints.
+- Refreshed `model_name` examples (OpenAPI schema, MCP tool descriptions, PRD) to the current
+  `claude-sonnet-5` id. `model_name` remains a free-form string and cost is caller-reported, so
+  no code change is needed to record a new model.
 
 ## [Unreleased] — 2026-06-25 — heavy-read pgbouncer outage fix (US-27.13)
 

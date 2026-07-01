@@ -1154,7 +1154,7 @@ Agents include token counts when reporting a story done. The `POST /stories/:id/
   "token_usage": {
     "input_tokens": 48200,
     "output_tokens": 12400,
-    "model": "claude-sonnet-4-5"
+    "model": "claude-sonnet-5"
   }
 }
 ```
