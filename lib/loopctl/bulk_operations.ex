@@ -21,6 +21,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
@@ -256,22 +257,22 @@ defmodule Loopctl.BulkOperations do
          actor_id,
          actor_label
        ) do
-    case apply_mark_complete(story) do
-      {:ok, updated} ->
-        create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
+    with :ok <- Progress.mark_complete_allowed?(story),
+         {:ok, updated} <- apply_mark_complete(story) do
+      create_mark_complete_result(tenant_id, story, orchestrator_agent_id, params)
 
-        audit_mark_complete(
-          tenant_id,
-          story,
-          updated,
-          actor_id,
-          actor_label,
-          orchestrator_agent_id
-        )
+      audit_mark_complete(
+        tenant_id,
+        story,
+        updated,
+        actor_id,
+        actor_label,
+        orchestrator_agent_id
+      )
 
-        emit_mark_complete_event(tenant_id, updated, orchestrator_agent_id, params)
-        %{story_id: story.id, status: "success"}
-
+      emit_mark_complete_event(tenant_id, updated, orchestrator_agent_id, params)
+      %{story_id: story.id, status: "success"}
+    else
       {:error, reason} ->
         %{story_id: story.id, status: "error", reason: format_reason(reason)}
     end
@@ -332,6 +333,8 @@ defmodule Loopctl.BulkOperations do
 
   defp process_verify(story, params, tenant_id, orchestrator_agent_id, actor_id, actor_label) do
     with :ok <- validate_verify_preconditions(story),
+         :ok <- Progress.verify_allowed?(story, orchestrator_agent_id),
+         :ok <- Progress.review_conducted?(tenant_id, story.id, story),
          {:ok, updated} <- apply_verification(story) do
       create_verification_result(tenant_id, story, orchestrator_agent_id, params)
       audit_verification(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -797,6 +800,21 @@ defmodule Loopctl.BulkOperations do
   # ===================================================================
 
   defp format_reason(:reason_required), do: "reason is required and cannot be blank"
+
+  defp format_reason(:self_verify_blocked),
+    do: "cannot verify your own implemented work (chain-of-custody)"
+
+  defp format_reason(:review_not_conducted),
+    do: "no independent review record exists for this story since it was reported done"
+
+  defp format_reason(:story_has_dispatch_lineage),
+    do: "story has dispatch lineage; use the normal verify flow, not mark-complete"
+
+  defp format_reason(:already_verified), do: "story is already verified"
+
+  defp format_reason(:story_rejected),
+    do: "story is rejected; investigate instead of marking it complete"
+
   defp format_reason(reason) when is_binary(reason), do: reason
   defp format_reason(reason), do: inspect(reason)
 end

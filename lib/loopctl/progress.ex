@@ -952,6 +952,55 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
+  Chain-of-custody guard for the bulk-verify path.
+
+  Returns `:ok` when `orchestrator_agent_id` is permitted to verify `story`, or
+  `{:error, :self_verify_blocked}` when the verifier shares dispatch lineage /
+  agent identity with the implementer. Exposed so `Loopctl.BulkOperations`
+  enforces the SAME self-verify invariant as the single-story `verify_story/4`
+  path — otherwise bulk verify is a chain-of-custody bypass.
+  """
+  @spec verify_allowed?(Story.t(), Ecto.UUID.t() | nil) ::
+          :ok | {:error, :self_verify_blocked}
+  def verify_allowed?(story, orchestrator_agent_id) do
+    case validate_not_self_verify(story, orchestrator_agent_id) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Returns `:ok` when an independent review record exists for `story` after it
+  was reported done, else `{:error, :review_not_conducted}`. Mirrors the
+  `verify_story/4` review-record requirement for the bulk path.
+  """
+  @spec review_conducted?(Ecto.UUID.t(), Ecto.UUID.t(), Story.t()) ::
+          :ok | {:error, :review_not_conducted}
+  def review_conducted?(tenant_id, story_id, story) do
+    case validate_review_record_exists(tenant_id, story_id, story) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Structural custody guard for the bulk mark-complete (backfill) path.
+
+  Returns `:ok` only when `story` never entered the dispatch lifecycle, matching
+  `backfill_story/4`. Prevents mark-complete from being used to self-verify
+  dispatched work.
+  """
+  @spec mark_complete_allowed?(Story.t()) ::
+          :ok
+          | {:error, :already_verified | :story_rejected | :story_has_dispatch_lineage}
+  def mark_complete_allowed?(story) do
+    case guard_backfillable(story) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Backfills a story's status when the work was completed outside loopctl.
 
   Sets both `agent_status` and `verified_status` to fully-done values in one
