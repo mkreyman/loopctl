@@ -1163,6 +1163,20 @@ async function knowledgeRetrievalMetrics({ limit, offset } = {}) {
   return toContent(result);
 }
 
+async function knowledgeCurationLog({ kind, since, limit, offset } = {}) {
+  const params = new URLSearchParams();
+  if (kind) params.set("kind", kind);
+  if (since) params.set("since", since);
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/curation-log?${qs}`
+    : "/api/v1/knowledge/curation-log";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeArticleStats({ article_id }) {
   const result = await apiCall(
     "GET",
@@ -3267,6 +3281,39 @@ const TOOLS = [
 
   // Knowledge Analytics Tools (orchestrator key)
   {
+    name: "knowledge_curation_log",
+    description:
+      "The concise, human-readable log of KB CURATION adjustments — novelty-gate decisions " +
+      "(gate_duplicate/gate_draft) and conflict resolutions (supersede/merge/dismiss) — for " +
+      "analyzing the agents'-KB rollout, distinct from the verbose audit log. Each entry is a " +
+      "one-liner: {at, kind, summary, refs, actor, confidence}. RECORDED ONLY while the tenant " +
+      "has the toggle on: settings.kb_curation_log (flip via the admin tenant API, " +
+      "PATCH /api/v1/admin/tenants/:id with settings:{kb_curation_log:true}). Off by default = " +
+      "no rows. Filter by kind and since (ISO8601). Most recent first. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          description:
+            "Optional: filter by kind (gate_duplicate | gate_draft | supersede | merge | dismiss).",
+        },
+        since: {
+          type: "string",
+          description: "Optional: ISO8601 date or datetime lower bound (inclusive).",
+        },
+        limit: {
+          type: "integer",
+          description: "Events per page (default 50, max 500). Clamped, never rejected.",
+          minimum: 1,
+          maximum: 500,
+        },
+        offset: { type: "integer", description: "Events to skip. Default 0.", minimum: 0 },
+      },
+      required: [],
+    },
+  },
+  {
     name: "knowledge_retrieval_metrics",
     description:
       "Return the daily retrieval-PRECISION time series (agents' KB #3): for each day, the " +
@@ -3708,6 +3755,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await knowledgeIngestionJobs();
 
     // Knowledge Analytics Tools
+    case "knowledge_curation_log":
+      return await knowledgeCurationLog(args);
+
     case "knowledge_retrieval_metrics":
       return await knowledgeRetrievalMetrics(args);
 

@@ -4,6 +4,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   setup :verify_on_exit!
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
 
   defp auth_conn(conn, raw_key) do
@@ -705,6 +706,34 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
         |> auth_conn(agent_key)
         |> get(~p"/api/v1/knowledge/analytics/projects/#{project.id}/usage")
 
+      assert json_response(conn, 403)
+    end
+  end
+
+  describe "GET /api/v1/knowledge/curation-log" do
+    test "orchestrator reads the curation feed (filterable by kind)", %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      :ok = KbCuration.record(tenant.id, "supersede", "A retired for B")
+      :ok = KbCuration.record(tenant.id, "dismiss", "not a conflict")
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/curation-log?kind=supersede")
+
+      body = json_response(conn, 200)
+      assert body["meta"]["total_count"] == 1
+      assert [ev] = body["data"]
+      assert ev["kind"] == "supersede"
+      assert ev["summary"] == "A retired for B"
+    end
+
+    test "agent role is rejected (orchestrator+ required)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn = conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/curation-log")
       assert json_response(conn, 403)
     end
   end

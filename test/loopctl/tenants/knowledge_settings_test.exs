@@ -7,6 +7,31 @@ defmodule Loopctl.Tenants.KnowledgeSettingsTest do
 
   # --- TC-21.6.6: Update auto_extract setting via tenant settings endpoint ---
 
+  describe "update_tenant/2 with kb_curation_log" do
+    test "allows toggling kb_curation_log on and off" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, on} =
+               Tenants.update_tenant(tenant, %{"settings" => %{"kb_curation_log" => true}})
+
+      assert on.settings["kb_curation_log"] == true
+
+      assert {:ok, off} =
+               Tenants.update_tenant(on, %{"settings" => %{"kb_curation_log" => false}})
+
+      assert off.settings["kb_curation_log"] == false
+    end
+
+    test "rejects a non-boolean kb_curation_log" do
+      tenant = fixture(:tenant)
+
+      assert {:error, changeset} =
+               Tenants.update_tenant(tenant, %{"settings" => %{"kb_curation_log" => "on"}})
+
+      assert errors_on(changeset).settings != []
+    end
+  end
+
   describe "update_tenant/2 with knowledge_auto_extract" do
     test "allows setting knowledge_auto_extract to false" do
       tenant = fixture(:tenant)
