@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.28.0 — 2026-07-01 (route-the-findings: conflict merge)
+
+### Changed
+
+- **`knowledge_resolve_conflict`** — the `merge` disposition is now live: at
+  `confidence: "high"` the nightly executor has an LLM synthesize the two articles into
+  ONE new **draft** (both sources preserved, never auto-published, for human review).
+  Description updated to reflect that (previously "recorded for the later merge step").
+
 ## 2.27.0 — 2026-06-30 (route-the-findings: conflict resolution)
 
 ### Added

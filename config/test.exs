@@ -244,6 +244,9 @@ config :loopctl, :knowledge_suggest_links, Loopctl.MockSuggestLinks
 # tests choose the verdict deterministically. DataCase default-stubs it to `:novel`
 # (gate is a no-op); ProposalGate's own tests call it directly with MockEmbeddingClient.
 config :loopctl, :proposal_assessor, Loopctl.MockProposalAssessor
+# Merge synthesizer (#4 step 2) — mock so the conflict executor's :merge path is
+# deterministic and makes no Anthropic calls.
+config :loopctl, :merge_synthesizer, Loopctl.MockMergeSynthesizer
 
 # DI (US-27.3): the router wrapped by LoopctlWeb.Plugs.DBErrorBackstop. A thin
 # REAL plug (Loopctl.Test.BackstopRouter) that delegates to LoopctlWeb.Router for

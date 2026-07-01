@@ -198,6 +198,10 @@ defmodule Loopctl.DataCase do
       %{verdict: :novel, score: nil, neighbors: []}
     end)
 
+    # Merge synthesizer defaults to "no backend" so the conflict executor no-ops on
+    # :merge rows unless a test opts in with a real merged result.
+    Mox.stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _a, _b -> {:error, :not_configured} end)
+
     # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header
