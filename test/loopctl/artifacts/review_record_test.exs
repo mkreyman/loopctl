@@ -15,8 +15,8 @@ defmodule Loopctl.Artifacts.ReviewRecordTest do
       refute Map.has_key?(errors_on(changeset), :completed_at)
     end
 
-    test "accepts completed_at slightly in the future (within the 5-minute tolerance)" do
-      near_future = DateTime.add(DateTime.utc_now(), 60, :second)
+    test "accepts completed_at slightly in the future (within the 60-second skew tolerance)" do
+      near_future = DateTime.add(DateTime.utc_now(), 30, :second)
 
       changeset =
         ReviewRecord.create_changeset(%ReviewRecord{}, %{
@@ -42,8 +42,8 @@ defmodule Loopctl.Artifacts.ReviewRecordTest do
       assert message =~ "future"
     end
 
-    test "rejects a completed_at just past the 5-minute tolerance" do
-      just_past_tolerance = DateTime.add(DateTime.utc_now(), 360, :second)
+    test "rejects a completed_at just past the 60-second skew tolerance" do
+      just_past_tolerance = DateTime.add(DateTime.utc_now(), 90, :second)
 
       changeset =
         ReviewRecord.create_changeset(%ReviewRecord{}, %{
