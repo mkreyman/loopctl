@@ -94,12 +94,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
     action = act_on_orphans(tenant_id, report)
     promoted = promote_conflicts(tenant_id)
-    log_audit_event(tenant_id, report, action, promoted)
+    resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
+    log_audit_event(tenant_id, report, action, promoted, resolutions_applied)
 
     Logger.info(
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
-        "conflicts_promoted=#{promoted}"
+        "conflicts_promoted=#{promoted} resolutions_applied=#{resolutions_applied}"
     )
 
     :ok
@@ -232,7 +233,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> MapSet.new()
   end
 
-  defp log_audit_event(tenant_id, report, action, promoted) do
+  defp log_audit_event(tenant_id, report, action, promoted, resolutions_applied) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
       entity_id: tenant_id,
@@ -244,7 +245,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "summary" => report.summary,
         "orphans_relinked" => action.relinked,
         "orphans_embedding_enqueued" => action.embedding_enqueued,
-        "conflicts_promoted" => promoted
+        "conflicts_promoted" => promoted,
+        "resolutions_applied" => resolutions_applied
       }
     })
   end

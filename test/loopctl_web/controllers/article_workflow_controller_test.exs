@@ -1289,4 +1289,71 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert length(pair["articles"]) == 2
     end
   end
+
+  describe "POST /api/v1/knowledge/conflicts/resolve" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id, title: "A", status: :published})
+      b = fixture(:article, %{tenant_id: tenant.id, title: "B", status: :published})
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+      |> AdminRepo.insert!()
+
+      %{conn: auth_conn(conn, raw_key), tenant: tenant, a: a, b: b}
+    end
+
+    test "an agent can dismiss a conflict (takes effect immediately)", ctx do
+      %{conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "dismiss",
+          "classification" => "complementary"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "dismiss"
+      assert body["data"]["executed"] == true
+    end
+
+    test "records a high-confidence supersede (deferred to the executor)", ctx do
+      %{conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "supersede"
+      assert body["data"]["executed"] == false
+      assert body["note"] =~ "nightly executor"
+    end
+
+    test "422 when supersede omits the authoritative article", ctx do
+      %{conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede"
+        })
+
+      assert json_response(conn, 422)
+    end
+  end
 end

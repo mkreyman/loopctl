@@ -1050,6 +1050,29 @@ async function knowledgeConflicts({ limit, offset }) {
   return toContent(result);
 }
 
+async function knowledgeResolveConflict({
+  source_article_id,
+  target_article_id,
+  disposition,
+  authoritative_article_id,
+  classification,
+  evidence,
+  confidence,
+}) {
+  const payload = { source_article_id, target_article_id, disposition };
+  if (authoritative_article_id) payload.authoritative_article_id = authoritative_article_id;
+  if (classification) payload.classification = classification;
+  if (evidence) payload.evidence = evidence;
+  if (confidence) payload.confidence = confidence;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/conflicts/resolve",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeLint({ project_id, stale_days, min_coverage, max_per_category }) {
   const params = new URLSearchParams();
   if (stale_days != null) params.set("stale_days", String(stale_days));
@@ -2926,6 +2949,69 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_resolve_conflict",
+    description:
+      "Record YOUR verdict on a potential-conflict pair (from knowledge_conflicts or an " +
+      "article's potential_conflicts). You have the live context the KB lacks — it never " +
+      "re-judges, it acts on what you record. Dispositions: 'dismiss' (a false positive — " +
+      "the two don't actually conflict; drops out of the queue immediately); 'supersede' " +
+      "(one article wins — pass authoritative_article_id, the winner; the nightly executor " +
+      "creates a supersedes link and retires the loser, but ONLY at confidence:\"high\" — " +
+      "reversible and audited); 'merge' (recorded for the later merge step). Non-destructive " +
+      "at agent role — you record intent; the privileged nightly job executes it. " +
+      "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
+      "Resolve only conflicts material to your current task; adjudicate against the actual " +
+      "system, and if you can't tell which is right, leave it (or record low confidence) " +
+      "rather than guessing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_article_id: {
+          type: "string",
+          description: "One article of the conflict pair (UUID). Order does not matter.",
+        },
+        target_article_id: {
+          type: "string",
+          description: "The other article of the conflict pair (UUID).",
+        },
+        disposition: {
+          type: "string",
+          enum: ["dismiss", "supersede", "merge"],
+          description:
+            "dismiss = false positive; supersede = one wins (set authoritative_article_id); " +
+            "merge = combine (recorded for the later merge step).",
+        },
+        authoritative_article_id: {
+          type: "string",
+          description:
+            "For supersede/merge: the WINNING article (must be one of the pair). The other " +
+            "is the loser to retire/merge into the winner.",
+        },
+        classification: {
+          type: "string",
+          enum: ["redundant", "complementary", "contradictory"],
+          description:
+            "Your judgment of the relationship: redundant (same claim), complementary (same " +
+            "topic, different facets — usually a dismiss), or contradictory (can't both be true).",
+        },
+        evidence: {
+          type: "string",
+          description:
+            "Why you're sure — ideally a ground-truth reference (commit, file:line, URL, or the " +
+            "observed behavior). Recorded for audit and for a human reviewing low-confidence calls.",
+        },
+        confidence: {
+          type: "string",
+          enum: ["high", "medium", "low"],
+          description:
+            "high, medium, or low. supersede auto-executes only at 'high'; lower confidence is " +
+            "recorded but left for review. Default medium.",
+        },
+      },
+      required: ["source_article_id", "target_article_id", "disposition"],
+    },
+  },
+  {
     name: "knowledge_lint",
     description:
       "Run a lint check on the knowledge wiki to identify stale, low-coverage, or broken articles. " +
@@ -3547,6 +3633,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_conflicts":
       return await knowledgeConflicts(args);
+
+    case "knowledge_resolve_conflict":
+      return await knowledgeResolveConflict(args);
 
     case "knowledge_lint":
       return await knowledgeLint(args);

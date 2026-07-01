@@ -1133,6 +1133,55 @@ async function knowledgeConflicts({ limit, offset } = {}) {
   return await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
 }
 
+async function knowledgeResolveConflict({
+  source_article_id,
+  target_article_id,
+  disposition,
+  authoritative_article_id,
+  classification,
+  evidence,
+  confidence,
+} = {}) {
+  const payload = { source_article_id, target_article_id, disposition };
+  if (authoritative_article_id) payload.authoritative_article_id = authoritative_article_id;
+  if (classification) payload.classification = classification;
+  if (evidence) payload.evidence = evidence;
+  if (confidence) payload.confidence = confidence;
+  return await apiCall(
+    "POST",
+    "/api/v1/knowledge/conflicts/resolve",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+}
+
+describe("knowledge_resolve_conflict (verdict passthrough)", () => {
+  test("POSTs the verdict with the agent key and only the provided fields", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "r1", disposition: "supersede", executed: false } }, 201);
+
+    await knowledgeResolveConflict({
+      source_article_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      target_article_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      disposition: "supersede",
+      authoritative_article_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      confidence: "high",
+    });
+
+    const { url, options } = calls[0];
+    assert.equal(options.method, "POST");
+    assert.equal(new URL(url).pathname, "/api/v1/knowledge/conflicts/resolve");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    const sent = JSON.parse(options.body);
+    assert.equal(sent.disposition, "supersede");
+    assert.equal(sent.authoritative_article_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+    assert.equal(sent.confidence, "high");
+    // Omitted optionals aren't sent.
+    assert.equal(sent.evidence, undefined);
+    assert.equal(sent.classification, undefined);
+  });
+});
+
 describe("knowledge_conflicts (route-the-findings review surface)", () => {
   test("GETs the conflicts endpoint with the agent key and forwards pagination", async () => {
     setupEnv();

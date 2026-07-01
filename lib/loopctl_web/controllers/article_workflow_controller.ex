@@ -256,6 +256,44 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     }
   )
 
+  operation(:resolve_conflict,
+    summary: "Record a verdict on a potential-conflict pair",
+    description:
+      "Record how a potential-conflict pair should be resolved. `dismiss` (false positive) " <>
+        "takes effect immediately; `supersede` (with authoritative_article_id) is applied by " <>
+        "the nightly executor at confidence \"high\" — it creates a supersedes link and " <>
+        "retires the loser (reversible, audited); `merge` is recorded for the later LLM step. " <>
+        "The KB never re-judges — it acts on your verdict. Last-write-wins per pair. Role: agent+.",
+    request_body:
+      {"Resolution", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:source_article_id, :target_article_id, :disposition],
+         properties: %{
+           source_article_id: %OpenApiSpex.Schema{type: :string},
+           target_article_id: %OpenApiSpex.Schema{type: :string},
+           disposition: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["dismiss", "supersede", "merge"]
+           },
+           authoritative_article_id: %OpenApiSpex.Schema{type: :string},
+           classification: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["redundant", "complementary", "contradictory"]
+           },
+           evidence: %OpenApiSpex.Schema{type: :string},
+           confidence: %OpenApiSpex.Schema{type: :string, enum: ["high", "medium", "low"]}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Recorded", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   operation(:bulk_unpublish,
     summary: "Bulk unpublish articles",
     description:
@@ -657,6 +695,56 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       json(conn, result)
     end
   end
+
+  @doc "POST /api/v1/knowledge/conflicts/resolve"
+  def resolve_conflict(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    attrs = %{
+      "source_article_id" => params["source_article_id"],
+      "target_article_id" => params["target_article_id"],
+      "disposition" => params["disposition"],
+      "authoritative_article_id" => params["authoritative_article_id"],
+      "classification" => params["classification"],
+      "evidence" => params["evidence"],
+      "confidence" => params["confidence"]
+    }
+
+    case Knowledge.annotate_conflict(tenant_id, attrs, audit_opts) do
+      {:ok, resolution} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          data: %{
+            id: resolution.id,
+            disposition: to_string(resolution.disposition),
+            confidence: to_string(resolution.confidence),
+            executed: not is_nil(resolution.executed_at)
+          },
+          note: resolution_note(resolution)
+        })
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  defp resolution_note(%{disposition: :dismiss}),
+    do: "Dismissed as a false positive — the pair is removed from the conflict queue."
+
+  defp resolution_note(%{disposition: :supersede, confidence: :high}),
+    do:
+      "Recorded. The nightly executor will supersede the loser (create a supersedes link " <>
+        "and retire it) — reversible and audited."
+
+  defp resolution_note(%{disposition: :supersede}),
+    do:
+      "Recorded, but NOT auto-applied: supersede executes only at confidence \"high\". " <>
+        "Left for review at the current confidence."
+
+  defp resolution_note(%{disposition: :merge}),
+    do: "Recorded for the merge (LLM-synthesis) step — not applied by the nightly executor yet."
 
   # --- Private helpers ---
 

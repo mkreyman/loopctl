@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.27.0 — 2026-06-30 (route-the-findings: conflict resolution)
+
+### Added
+
+- **`knowledge_resolve_conflict`** — record your verdict on a potential-conflict pair.
+  You have the live context the KB lacks; it acts on what you record, never re-judges.
+  `dismiss` (false positive) takes effect immediately; `supersede` (with
+  `authoritative_article_id`) is applied by the nightly executor at `confidence: "high"`
+  (creates a supersedes link + retires the loser, reversible + audited); `merge` is
+  recorded for the later synthesis step. Non-destructive at agent role — you record
+  intent, the privileged nightly job executes. Last-write-wins per pair.
+
 ## 2.26.0 — 2026-06-30 (route-the-findings: conflict review surface)
 
 ### Added
