@@ -429,10 +429,16 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp validate_verify_preconditions(story) do
-    if story.agent_status == :reported_done do
-      :ok
-    else
-      {:error, "Story must be in reported_done status to verify (current: #{story.agent_status})"}
+    cond do
+      story.verified_status == :verified ->
+        {:error, :already_verified}
+
+      story.agent_status == :reported_done ->
+        :ok
+
+      true ->
+        {:error,
+         "Story must be in reported_done status to verify (current: #{story.agent_status})"}
     end
   end
 
