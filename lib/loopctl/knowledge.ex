@@ -52,6 +52,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
@@ -607,6 +608,7 @@ defmodule Loopctl.Knowledge do
               incoming_links: :source_article
             )
             |> filter_visible_links(vis)
+            |> drop_resolved_conflict_links(tenant_id)
 
           Analytics.record_access(
             tenant_id,
@@ -652,6 +654,49 @@ defmodule Loopctl.Knowledge do
 
   defp link_side_visible?(%Article{} = far_side, vis), do: visible_to_caller?(far_side, vis)
   defp link_side_visible?(_not_loaded, _vis), do: false
+
+  # Route-the-findings (#4): a `:potential_conflict` link whose pair already has a
+  # resolution (dismissed/superseded/etc.) is no longer an OPEN conflict — drop it from
+  # the surfaced links so `article_data_with_links`' `potential_conflicts` field shows
+  # only conflicts still awaiting a decision. Other link types are untouched.
+  defp drop_resolved_conflict_links(article, tenant_id) do
+    peers =
+      (article.outgoing_links ++ article.incoming_links)
+      |> Enum.filter(&(&1.relationship_type == :potential_conflict))
+      |> Enum.flat_map(&[&1.source_article_id, &1.target_article_id])
+      |> Enum.uniq()
+
+    resolved = resolved_peer_ids(tenant_id, article.id, peers)
+
+    %{
+      article
+      | outgoing_links: reject_resolved(article.outgoing_links, article.id, resolved),
+        incoming_links: reject_resolved(article.incoming_links, article.id, resolved)
+    }
+  end
+
+  defp resolved_peer_ids(_tenant_id, _article_id, []), do: MapSet.new()
+
+  defp resolved_peer_ids(tenant_id, article_id, _peers) do
+    from(r in ConflictResolution,
+      where: r.tenant_id == ^tenant_id,
+      where: r.source_article_id == ^article_id or r.target_article_id == ^article_id,
+      select: {r.source_article_id, r.target_article_id}
+    )
+    |> AdminRepo.all()
+    |> Enum.flat_map(fn {s, t} -> [s, t] end)
+    |> Enum.reject(&(&1 == article_id))
+    |> MapSet.new()
+  end
+
+  defp reject_resolved(links, article_id, resolved) do
+    Enum.reject(links, fn l ->
+      l.relationship_type == :potential_conflict and
+        (MapSet.member?(resolved, l.source_article_id) or
+           MapSet.member?(resolved, l.target_article_id)) and
+        (l.source_article_id == article_id or l.target_article_id == article_id)
+    end)
+  end
 
   # Extracts the attribution context map from the caller's opts. Returns
   # an empty map when neither `:project_id` nor `:story_id` was provided.
@@ -3180,10 +3225,24 @@ defmodule Loopctl.Knowledge do
     limit = opts |> Keyword.get(:limit, 50) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
+    # The queue shows OPEN conflicts only — a pair a retrieving agent has already
+    # ruled on (a `conflict_resolutions` row, either direction) drops out.
     base =
       from(l in ArticleLink,
+        as: :link,
         where: l.tenant_id == ^tenant_id,
-        where: l.relationship_type == :potential_conflict
+        where: l.relationship_type == :potential_conflict,
+        where:
+          not exists(
+            from(r in ConflictResolution,
+              where:
+                r.tenant_id == parent_as(:link).tenant_id and
+                  ((r.source_article_id == parent_as(:link).source_article_id and
+                      r.target_article_id == parent_as(:link).target_article_id) or
+                     (r.source_article_id == parent_as(:link).target_article_id and
+                        r.target_article_id == parent_as(:link).source_article_id))
+            )
+          )
       )
 
     total_count = AdminRepo.aggregate(base, :count, :id)
@@ -3215,6 +3274,144 @@ defmodule Loopctl.Knowledge do
       end)
 
     %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}
+  end
+
+  @doc """
+  Record a retrieving agent's VERDICT on a potential-conflict pair (route-the-findings
+  #4). The agent judges with live context; the KB never re-judges. Non-destructive: this
+  writes only a `conflict_resolutions` row (last-write-wins per pair), so it's safe at
+  agent role.
+
+  Dispositions:
+
+    * `:dismiss` — a false positive (the two don't actually conflict). Takes effect
+      immediately: the pair drops out of the conflict queue and the nightly sweep won't
+      re-surface it.
+    * `:supersede` — one article wins; the loser should be retired. Requires
+      `authoritative_article_id` (the winner, one of the pair). Applied by the nightly
+      executor when `confidence: :high` — it creates a `supersedes` link and transitions
+      the loser to `:superseded` (reversible + audited).
+    * `:merge` — recorded for the later LLM-synthesis step; not executed here.
+
+  `attrs`: `source_article_id`, `target_article_id` (any order), `disposition`, and
+  optionally `authoritative_article_id`, `classification`, `evidence`, `confidence`
+  (default `:medium`). Returns `{:ok, %ConflictResolution{}}` or `{:error, changeset}`.
+  """
+  @spec annotate_conflict(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, ConflictResolution.t()} | {:error, Ecto.Changeset.t()}
+  def annotate_conflict(tenant_id, attrs, opts \\ []) do
+    get = fn key -> attrs[key] || attrs[to_string(key)] end
+    {src, tgt} = canonical_pair(get.(:source_article_id), get.(:target_article_id))
+    disposition = get.(:disposition)
+    now = DateTime.utc_now()
+
+    row_attrs = %{
+      source_article_id: src,
+      target_article_id: tgt,
+      authoritative_article_id: get.(:authoritative_article_id),
+      classification: get.(:classification),
+      disposition: disposition,
+      confidence: get.(:confidence) || :medium,
+      evidence: get.(:evidence),
+      annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+      annotated_at: now,
+      # A dismiss is complete on record; supersede/merge defer to the executor.
+      executed_at: if(to_string(disposition) == "dismiss", do: now, else: nil),
+      execution_result: %{}
+    }
+
+    changeset =
+      %ConflictResolution{tenant_id: tenant_id}
+      |> ConflictResolution.changeset(row_attrs)
+
+    AdminRepo.insert(changeset,
+      on_conflict:
+        {:replace,
+         [
+           :authoritative_article_id,
+           :classification,
+           :disposition,
+           :confidence,
+           :evidence,
+           :annotated_by,
+           :annotated_at,
+           :executed_at,
+           :execution_result,
+           :updated_at
+         ]},
+      conflict_target: [:tenant_id, :source_article_id, :target_article_id]
+    )
+  end
+
+  @doc """
+  Nightly executor for `:supersede` resolutions (route-the-findings #4, step 1). Applies
+  only high-confidence, not-yet-executed supersedes — reversible and audited: reuses
+  `create_link/3` to create a `supersedes` link (winner → loser) and transition the loser
+  to `:superseded`. Bounded per run via `opts[:limit]`. `:dismiss` needs no execution
+  (recorded complete); `:merge` is left for the LLM step. Returns the count applied.
+  """
+  @spec execute_conflict_resolutions(Ecto.UUID.t(), keyword()) :: non_neg_integer()
+  def execute_conflict_resolutions(tenant_id, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 200)
+
+    rows =
+      from(r in ConflictResolution,
+        where: r.tenant_id == ^tenant_id,
+        where: is_nil(r.executed_at),
+        where: r.disposition == :supersede,
+        where: r.confidence == :high,
+        limit: ^limit
+      )
+      |> AdminRepo.all()
+
+    Enum.reduce(rows, 0, fn r, count ->
+      if apply_supersede(tenant_id, r), do: count + 1, else: count
+    end)
+  end
+
+  # The conflict pair is unordered; store it canonically (source <= target by UUID
+  # string) so one row covers (A,B) and (B,A).
+  defp canonical_pair(a, b) when is_binary(a) and is_binary(b) and a > b, do: {b, a}
+  defp canonical_pair(a, b), do: {a, b}
+
+  defp apply_supersede(tenant_id, %ConflictResolution{} = r) do
+    winner = r.authoritative_article_id
+    loser = if winner == r.source_article_id, do: r.target_article_id, else: r.source_article_id
+
+    result =
+      create_link(
+        tenant_id,
+        %{
+          source_article_id: winner,
+          target_article_id: loser,
+          relationship_type: "supersedes"
+        },
+        actor_type: "system",
+        actor_label: "worker:conflict_executor"
+      )
+
+    case result do
+      {:ok, _link} ->
+        mark_resolution_executed(r, %{
+          "action" => "superseded",
+          "winner" => winner,
+          "loser" => loser
+        })
+
+        true
+
+      # Already superseded / link exists → the disposition is effectively done; record
+      # and stop retrying. Any other error also stops (bad annotation), captured for review.
+      {:error, reason} ->
+        mark_resolution_executed(r, %{"action" => "noop", "reason" => inspect(reason)})
+        false
+    end
+  end
+
+  defp mark_resolution_executed(%ConflictResolution{} = r, execution_result) do
+    r
+    |> Ecto.Changeset.change(executed_at: DateTime.utc_now(), execution_result: execution_result)
+    |> AdminRepo.update()
   end
 
   @doc """
