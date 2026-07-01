@@ -59,8 +59,9 @@ defmodule Loopctl.Artifacts.ReviewRecord do
   The `tenant_id`, `story_id`, and `reviewer_agent_id` are set
   programmatically, not via cast.
 
-  Validates that `completed_at` is not in the future (within 5 minutes tolerance)
-  and that it is after the story's `reported_done_at` timestamp.
+  Validates that `completed_at` is not more than 5 minutes in the future, so a
+  client cannot backdate the future to permanently satisfy the verify-time
+  review-record check (`Loopctl.Progress.ensure_review_conducted/3`).
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(record \\ %__MODULE__{}, attrs) do

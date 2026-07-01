@@ -771,29 +771,26 @@ defmodule Loopctl.Progress do
          :ok <- validate_not_self_review(story, reviewer_agent_id) do
       attrs = build_review_attrs(params)
 
-      # Validate completed_at against story.reported_done_at before creating changeset
-      with :ok <- validate_review_completed_at(attrs, story) do
-        changeset =
-          %ReviewRecord{
-            tenant_id: tenant_id,
-            story_id: story_id,
-            reviewer_agent_id: reviewer_agent_id
-          }
-          |> ReviewRecord.create_changeset(attrs)
+      changeset =
+        %ReviewRecord{
+          tenant_id: tenant_id,
+          story_id: story_id,
+          reviewer_agent_id: reviewer_agent_id
+        }
+        |> ReviewRecord.create_changeset(attrs)
 
-        multi =
-          Multi.new()
-          |> Multi.insert(:review_record, changeset)
-          |> enqueue_knowledge_extraction(tenant_id)
+      multi =
+        Multi.new()
+        |> Multi.insert(:review_record, changeset)
+        |> enqueue_knowledge_extraction(tenant_id)
 
-        handle_review_transaction(
-          AdminRepo.transaction(multi),
-          tenant_id,
-          story,
-          attrs,
-          reviewer_agent_id
-        )
-      end
+      handle_review_transaction(
+        AdminRepo.transaction(multi),
+        tenant_id,
+        story,
+        attrs,
+        reviewer_agent_id
+      )
     end
   end
 
@@ -871,18 +868,6 @@ defmodule Loopctl.Progress do
   defp validate_story_reported_done(%Story{agent_status: :reported_done}), do: :ok
 
   defp validate_story_reported_done(_story), do: {:error, :story_not_reported_done}
-
-  # Validates that review completed_at is after story.reported_done_at
-  defp validate_review_completed_at(attrs, story) do
-    completed_at = Map.get(attrs, :completed_at)
-    reported_done_at = story.reported_done_at
-
-    if reported_done_at && DateTime.compare(completed_at, reported_done_at) == :lt do
-      {:error, :review_completed_before_reported_done}
-    else
-      :ok
-    end
-  end
 
   # --- Orchestrator Verification (US-7.2) ---
 

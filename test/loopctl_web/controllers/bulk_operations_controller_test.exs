@@ -4,6 +4,7 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
@@ -401,7 +402,7 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
       assert AdminRepo.get!(Story, story.id).verified_status == :unverified
     end
 
-    test "bulk verify blocks re-verification of already-verified story", %{conn: conn} do
+    test "bulk verify blocks re-verification after a first successful verify", %{conn: conn} do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -415,37 +416,62 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
           agent_id: orchestrator.id
         })
 
-      # Story that is already verified
+      # Distinct implementer (self-verify guard passes) with a review record so the
+      # first bulk verify actually succeeds.
       story =
         fixture(:story, %{
           tenant_id: tenant.id,
           epic_id: epic.id,
           agent_status: :reported_done,
-          verified_status: :verified,
           assigned_agent_id: implementer.id
         })
 
-      conn =
-        conn
-        |> auth_conn(raw_key)
-        |> post(~p"/api/v1/stories/bulk/verify", %{
-          "stories" => [
-            %{
-              "story_id" => story.id,
-              "result" => "pass",
-              "summary" => "re-verify",
-              "review_type" => "x"
-            }
-          ]
-        })
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: story.id})
 
-      body = json_response(conn, 422)
+      payload = %{
+        "stories" => [
+          %{
+            "story_id" => story.id,
+            "result" => "pass",
+            "summary" => "first",
+            "review_type" => "x"
+          }
+        ]
+      }
+
+      # First verify succeeds.
+      first = conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/bulk/verify", payload)
+      assert hd(json_response(first, 200)["results"])["status"] == "success"
+
+      verified_story = AdminRepo.get!(Story, story.id)
+      assert verified_story.verified_status == :verified
+      first_verified_at = verified_story.verified_at
+
+      results_after_first =
+        VerificationResult
+        |> where([v], v.tenant_id == ^tenant.id and v.story_id == ^story.id)
+        |> AdminRepo.all()
+
+      assert length(results_after_first) == 1
+
+      # Second verify of the SAME story is blocked as already-verified.
+      second = conn |> auth_conn(raw_key) |> post(~p"/api/v1/stories/bulk/verify", payload)
+      body = json_response(second, 422)
       result = hd(body["results"])
       assert result["status"] == "error"
       assert result["reason"] =~ "already verified"
 
-      # Story remains verified — no re-verification occurred
-      assert AdminRepo.get!(Story, story.id).verified_status == :verified
+      # No side effects: verified_at unchanged and still exactly one VerificationResult.
+      reloaded = AdminRepo.get!(Story, story.id)
+      assert reloaded.verified_status == :verified
+      assert reloaded.verified_at == first_verified_at
+
+      results_after_second =
+        VerificationResult
+        |> where([v], v.tenant_id == ^tenant.id and v.story_id == ^story.id)
+        |> AdminRepo.all()
+
+      assert length(results_after_second) == 1
     end
   end
 
