@@ -29,8 +29,10 @@ defmodule LoopctlWeb.BulkMarkCompleteControllerTest do
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
       {raw_key, _} = orchestrator_key(tenant.id)
 
+      # mark-complete is backfill for pre-existing (never-dispatched) work, so
+      # both stories are pending with no dispatch lineage.
       s1 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
-      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :implementing})
+      s2 = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
 
       conn =
         conn
@@ -214,6 +216,42 @@ defmodule LoopctlWeb.BulkMarkCompleteControllerTest do
 
       # validate_orchestrator_agent_linked returns bad_request
       json_response(conn, 400)
+    end
+
+    test "rejects mark-complete of a dispatched story (chain-of-custody)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      implementer = fixture(:agent, %{tenant_id: tenant.id})
+      {raw_key, _} = orchestrator_key(tenant.id)
+
+      # A story that entered the dispatch lifecycle must NOT be force-completed
+      # via mark-complete (that would bypass report/review/verify).
+      dispatched =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :implementing,
+          assigned_agent_id: implementer.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/mark-complete", %{
+          "stories" => [%{"story_id" => dispatched.id, "summary" => "should be blocked"}]
+        })
+
+      # Fully-blocked single-story batch -> 422 (no successes).
+      body = json_response(conn, 422)
+      result = hd(body["results"])
+      assert result["status"] == "error"
+      assert result["reason"] =~ "dispatch lineage"
+
+      # Untouched.
+      story_after = AdminRepo.get!(Story, dispatched.id)
+      assert story_after.agent_status == :implementing
+      assert story_after.verified_status == :unverified
     end
 
     test "cross-tenant isolation: cannot mark another tenant's stories", %{conn: conn} do

@@ -189,6 +189,11 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
           agent_status: :reported_done
         })
 
+      # An independent review record must exist before verify (chain-of-custody
+      # parity with the single-story verify path).
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: s1.id})
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: s2.id})
+
       conn =
         conn
         |> auth_conn(raw_key)
@@ -274,6 +279,9 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
           agent_status: :reported_done
         })
 
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: s1.id})
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: s2.id})
+
       conn =
         conn
         |> auth_conn(raw_key)
@@ -302,6 +310,95 @@ defmodule LoopctlWeb.BulkOperationsControllerTest do
         |> AdminRepo.all()
 
       assert length(events) == 2
+    end
+
+    test "bulk verify blocks self-verification (chain-of-custody parity)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      orchestrator = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: orchestrator.id
+        })
+
+      # Story whose implementer IS the caller — verify must be blocked even though
+      # a review record exists.
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :reported_done,
+          assigned_agent_id: orchestrator.id
+        })
+
+      fixture(:review_record, %{tenant_id: tenant.id, story_id: story.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/verify", %{
+          "stories" => [
+            %{
+              "story_id" => story.id,
+              "result" => "pass",
+              "summary" => "self",
+              "review_type" => "x"
+            }
+          ]
+        })
+
+      # Single-story batch that is fully blocked -> 422 (no successes).
+      body = json_response(conn, 422)
+      result = hd(body["results"])
+      assert result["status"] == "error"
+      assert result["reason"] =~ "chain-of-custody"
+
+      # Story remains unverified — the bypass is closed.
+      assert AdminRepo.get!(Story, story.id).verified_status == :unverified
+    end
+
+    test "bulk verify requires an independent review record", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      implementer = fixture(:agent, %{tenant_id: tenant.id})
+      orchestrator = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _api_key} =
+        fixture(:api_key, %{
+          tenant_id: tenant.id,
+          role: :orchestrator,
+          agent_id: orchestrator.id
+        })
+
+      # Distinct implementer (self-verify guard passes) but NO review record.
+      story =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: epic.id,
+          agent_status: :reported_done,
+          assigned_agent_id: implementer.id
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/bulk/verify", %{
+          "stories" => [
+            %{"story_id" => story.id, "result" => "pass", "summary" => "ok", "review_type" => "x"}
+          ]
+        })
+
+      body = json_response(conn, 422)
+      result = hd(body["results"])
+      assert result["status"] == "error"
+      assert result["reason"] =~ "review"
+
+      assert AdminRepo.get!(Story, story.id).verified_status == :unverified
     end
   end
 
