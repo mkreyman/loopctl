@@ -10,6 +10,17 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+// Single source of truth for the server version: the package.json this file
+// ships with (npm always includes package.json in the published tarball).
+// Keeping it derived prevents the handshake version from drifting from the
+// published package version.
+const SERVER_VERSION = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8")
+).version;
 
 // ---------------------------------------------------------------------------
 // HTTP helper — witness protocol state
@@ -3558,7 +3569,7 @@ const TOOLS = [
 const server = new Server(
   {
     name: "loopctl",
-    version: "1.2.0",
+    version: SERVER_VERSION,
   },
   {
     capabilities: { tools: {} },
