@@ -232,6 +232,61 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
 
       assert %{authoritative_article_id: _} = errors_on(changeset)
     end
+
+    # kb-02 (GHSA-9gqg-9r6p-658v) primary fix: a verdict may only be recorded against a
+    # REAL, system-flagged potential-conflict pair. Two arbitrary articles with no
+    # potential_conflict link cannot be resolved — this closes the fabrication path
+    # where an agent picks any two articles and has the executor retire one.
+    test "rejects a verdict on a pair with no potential_conflict link (no row created)", ctx do
+      %{tenant: t} = ctx
+      x = published(t.id, "X")
+      y = published(t.id, "Y")
+
+      assert {:error, :no_potential_conflict} =
+               Knowledge.annotate_conflict(t.id, %{
+                 "source_article_id" => x.id,
+                 "target_article_id" => y.id,
+                 "disposition" => "supersede",
+                 "authoritative_article_id" => x.id,
+                 "confidence" => "high"
+               })
+
+      # Nothing persisted for the fabricated pair, so the executor retires nothing.
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get(Loopctl.Knowledge.Article, x.id).status == :published
+      assert AdminRepo.get(Loopctl.Knowledge.Article, y.id).status == :published
+    end
+
+    # A dismiss verdict is likewise only accepted for a real flagged pair.
+    test "rejects a dismiss on a pair with no potential_conflict link", ctx do
+      %{tenant: t} = ctx
+      x = published(t.id, "X")
+      y = published(t.id, "Y")
+
+      assert {:error, :no_potential_conflict} =
+               Knowledge.annotate_conflict(t.id, %{
+                 "source_article_id" => x.id,
+                 "target_article_id" => y.id,
+                 "disposition" => "dismiss"
+               })
+    end
+
+    # Tenant isolation: tenant B's flag does not authorize resolving tenant A's pair.
+    test "a potential_conflict link in another tenant does not authorize this tenant", ctx do
+      %{a: a, b: b} = ctx
+      other = fixture(:tenant)
+
+      # The real flag lives in the setup tenant. Resolving the SAME article ids under a
+      # different tenant must not find it.
+      assert {:error, :no_potential_conflict} =
+               Knowledge.annotate_conflict(other.id, %{
+                 "source_article_id" => a.id,
+                 "target_article_id" => b.id,
+                 "disposition" => "supersede",
+                 "authoritative_article_id" => a.id,
+                 "confidence" => "high"
+               })
+    end
   end
 
   describe "merge executor (#4 step 2)" do

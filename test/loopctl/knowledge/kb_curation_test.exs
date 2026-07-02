@@ -117,6 +117,16 @@ defmodule Loopctl.Knowledge.KbCurationTest do
       a = fixture(:article, %{tenant_id: t.id, status: :published})
       b = fixture(:article, %{tenant_id: t.id, status: :published})
 
+      # kb-02: a verdict is only accepted for a real system-flagged conflict.
+      %ArticleLink{tenant_id: t.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.95}
+      })
+      |> AdminRepo.insert!()
+
       {:ok, _} =
         Knowledge.annotate_conflict(t.id, %{
           "source_article_id" => a.id,

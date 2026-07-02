@@ -11,6 +11,7 @@ defmodule LoopctlWeb.ArticleLinkController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias LoopctlWeb.ArticleLinkJSON
   alias LoopctlWeb.AuditContext
@@ -33,7 +34,9 @@ defmodule LoopctlWeb.ArticleLinkController do
     description:
       "Creates a directed link between two articles in the same tenant. " <>
         "When relationship_type is 'supersedes', the target article's status " <>
-        "is set to 'superseded'. Role: agent+.",
+        "is set to 'superseded' (retired), so that destructive relationship_type " <>
+        "requires role: user+. Non-destructive types (relates_to, derived_from, " <>
+        "contradicts) are agent+.",
     request_body:
       {"ArticleLink params", "application/json",
        %OpenApiSpex.Schema{
@@ -89,7 +92,29 @@ defmodule LoopctlWeb.ArticleLinkController do
 
   @doc "POST /api/v1/article_links"
   def create(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+    rel_type = params["relationship_type"] || params[:relationship_type]
+
+    # kb-01 (GHSA-9g2g-cm9x-9r2p): a "supersedes" link retires the TARGET article
+    # (published -> superseded), hiding it from every default published read
+    # (search/graph/context all default status: :published). That is a DESTRUCTIVE
+    # op, so — consistent with archive/unpublish — it requires role: :user. The other
+    # relationship types (relates_to, derived_from, contradicts) are non-destructive
+    # and stay at :agent. This is an in-action check (not a static RequireRole plug)
+    # because destructiveness depends on the body param relationship_type.
+    if destructive_relationship?(rel_type) and
+         not Role.role_at_least?(api_key.role, :user) do
+      forbidden(
+        conn,
+        "Creating a 'supersedes' link retires the target article, which removes it " <>
+          "from published reads. This destructive operation requires the user role or higher."
+      )
+    else
+      do_create(conn, api_key.tenant_id, params)
+    end
+  end
+
+  defp do_create(conn, tenant_id, params) do
     opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
 
     case Knowledge.create_link(tenant_id, params, opts) do
@@ -104,6 +129,16 @@ defmodule LoopctlWeb.ArticleLinkController do
       {:error, :target_not_found} ->
         {:error, :not_found}
     end
+  end
+
+  # A "supersedes" link is the one relationship_type that retires (hides) its target.
+  defp destructive_relationship?(rel_type), do: to_string(rel_type) == "supersedes"
+
+  # 403 body matches the RequireRole plug / FallbackController shape.
+  defp forbidden(conn, message) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{error: %{status: 403, message: message}})
   end
 
   @doc "DELETE /api/v1/article_links/:id"

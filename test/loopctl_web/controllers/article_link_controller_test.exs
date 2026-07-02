@@ -33,9 +33,12 @@ defmodule LoopctlWeb.ArticleLinkControllerTest do
       assert body["data"]["inserted_at"] != nil
     end
 
-    test ":supersedes link sets target article status to :superseded", %{conn: conn} do
+    # kb-01 (GHSA-9g2g-cm9x-9r2p): a "supersedes" link retires (hides) the target, so
+    # it is a destructive op — creating one requires role: user+ (was previously agent+,
+    # which let any agent hide an arbitrary published article).
+    test ":supersedes link at user role sets target article status to :superseded", %{conn: conn} do
       tenant = fixture(:tenant)
-      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       article_a = fixture(:article, %{tenant_id: tenant.id, title: "New Version"})
 
       article_b =
@@ -55,6 +58,59 @@ defmodule LoopctlWeb.ArticleLinkControllerTest do
       # Verify the target article is now superseded
       {:ok, updated_target} = Loopctl.Knowledge.get_article(tenant.id, article_b.id)
       assert updated_target.status == :superseded
+    end
+
+    test "an agent creating a :supersedes link is forbidden (403), target stays published",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article_a = fixture(:article, %{tenant_id: tenant.id, title: "New Version"})
+
+      article_b =
+        fixture(:article, %{tenant_id: tenant.id, title: "Old Version", status: :published})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => article_a.id,
+          "target_article_id" => article_b.id,
+          "relationship_type" => "supersedes"
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["status"] == 403
+
+      # The target must NOT have been hidden — still published/visible.
+      {:ok, target} = Loopctl.Knowledge.get_article(tenant.id, article_b.id)
+      assert target.status == :published
+
+      # And no supersedes link was created.
+      refute Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ArticleLink,
+               tenant_id: tenant.id,
+               source_article_id: article_a.id,
+               target_article_id: article_b.id,
+               relationship_type: :supersedes
+             )
+    end
+
+    test "an agent can still create a non-destructive link (derived_from) (201)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article_a = fixture(:article, %{tenant_id: tenant.id, title: "Derived"})
+      article_b = fixture(:article, %{tenant_id: tenant.id, title: "Source"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => article_a.id,
+          "target_article_id" => article_b.id,
+          "relationship_type" => "derived_from"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["relationship_type"] == "derived_from"
     end
 
     test "rejects self-link (422)", %{conn: conn} do

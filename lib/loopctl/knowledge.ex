@@ -3327,63 +3327,93 @@ defmodule Loopctl.Knowledge do
   (default `:medium`). Returns `{:ok, %ConflictResolution{}}` or `{:error, changeset}`.
   """
   @spec annotate_conflict(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, ConflictResolution.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, ConflictResolution.t()}
+          | {:error, Ecto.Changeset.t() | :no_potential_conflict}
   def annotate_conflict(tenant_id, attrs, opts \\ []) do
     get = fn key -> attrs[key] || attrs[to_string(key)] end
     {src, tgt} = canonical_pair(get.(:source_article_id), get.(:target_article_id))
-    disposition = get.(:disposition)
-    now = DateTime.utc_now()
 
-    row_attrs = %{
-      source_article_id: src,
-      target_article_id: tgt,
-      authoritative_article_id: get.(:authoritative_article_id),
-      classification: get.(:classification),
-      disposition: disposition,
-      confidence: get.(:confidence) || :medium,
-      evidence: get.(:evidence),
-      annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
-      annotated_at: now,
-      # A dismiss is complete on record; supersede/merge defer to the executor.
-      executed_at: if(to_string(disposition) == "dismiss", do: now, else: nil),
-      execution_result: %{}
-    }
+    # kb-02 (GHSA-9gqg-9r6p-658v): a verdict may only be recorded against a REAL,
+    # system-flagged conflict. Without this guard an agent could fabricate a verdict
+    # on ANY two in-tenant articles and have the nightly executor retire/merge one of
+    # them. Require a `:potential_conflict` ArticleLink for the pair (the linker/lint
+    # sweep flags these; stored in either direction) BEFORE accepting any disposition.
+    with :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
+      disposition = get.(:disposition)
+      now = DateTime.utc_now()
 
-    changeset =
-      %ConflictResolution{tenant_id: tenant_id}
-      |> ConflictResolution.changeset(row_attrs)
+      row_attrs = %{
+        source_article_id: src,
+        target_article_id: tgt,
+        authoritative_article_id: get.(:authoritative_article_id),
+        classification: get.(:classification),
+        disposition: disposition,
+        confidence: get.(:confidence) || :medium,
+        evidence: get.(:evidence),
+        annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+        annotated_at: now,
+        # A dismiss is complete on record; supersede/merge defer to the executor.
+        executed_at: if(to_string(disposition) == "dismiss", do: now, else: nil),
+        execution_result: %{}
+      }
 
-    result =
-      AdminRepo.insert(changeset,
-        on_conflict:
-          {:replace,
-           [
-             :authoritative_article_id,
-             :classification,
-             :disposition,
-             :confidence,
-             :evidence,
-             :annotated_by,
-             :annotated_at,
-             :executed_at,
-             :execution_result,
-             :updated_at
-           ]},
-        conflict_target: [:tenant_id, :source_article_id, :target_article_id]
-      )
+      changeset =
+        %ConflictResolution{tenant_id: tenant_id}
+        |> ConflictResolution.changeset(row_attrs)
 
-    with {:ok, %ConflictResolution{disposition: :dismiss} = res} <- result do
-      log_resolution(
-        tenant_id,
-        res,
-        "dismiss",
-        "dismissed as #{res.classification || "not-a-conflict"}",
-        [res.source_article_id, res.target_article_id]
-      )
+      result =
+        AdminRepo.insert(changeset,
+          on_conflict:
+            {:replace,
+             [
+               :authoritative_article_id,
+               :classification,
+               :disposition,
+               :confidence,
+               :evidence,
+               :annotated_by,
+               :annotated_at,
+               :executed_at,
+               :execution_result,
+               :updated_at
+             ]},
+          conflict_target: [:tenant_id, :source_article_id, :target_article_id]
+        )
+
+      with {:ok, %ConflictResolution{disposition: :dismiss} = res} <- result do
+        log_resolution(
+          tenant_id,
+          res,
+          "dismiss",
+          "dismissed as #{res.classification || "not-a-conflict"}",
+          [res.source_article_id, res.target_article_id]
+        )
+      end
+
+      result
     end
-
-    result
   end
+
+  # kb-02: true only when the linker/lint sweep actually flagged this pair as a
+  # potential conflict (link stored in either direction). When an id is missing we
+  # return :ok and defer to the changeset's required-field validation (surfaces as a
+  # 422) rather than masking a malformed request as "no conflict".
+  defp validate_potential_conflict_exists(tenant_id, src, tgt)
+       when is_binary(src) and is_binary(tgt) do
+    exists? =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where:
+          (l.source_article_id == ^src and l.target_article_id == ^tgt) or
+            (l.source_article_id == ^tgt and l.target_article_id == ^src)
+      )
+      |> AdminRepo.exists?()
+
+    if exists?, do: :ok, else: {:error, :no_potential_conflict}
+  end
+
+  defp validate_potential_conflict_exists(_tenant_id, _src, _tgt), do: :ok
 
   @doc """
   Nightly executor for conflict resolutions (route-the-findings #4). Applies only

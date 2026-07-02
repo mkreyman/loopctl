@@ -14,6 +14,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.BulkOps
   alias LoopctlWeb.ArticleJSON
@@ -263,7 +264,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "takes effect immediately; `supersede` (with authoritative_article_id) is applied by " <>
         "the nightly executor at confidence \"high\" — it creates a supersedes link and " <>
         "retires the loser (reversible, audited); `merge` is recorded for the later LLM step. " <>
-        "The KB never re-judges — it acts on your verdict. Last-write-wins per pair. Role: agent+.",
+        "The KB never re-judges — it acts on your verdict. Last-write-wins per pair. Only " <>
+        "pairs the system flagged (GET /knowledge/conflicts) may be resolved; an unknown pair " <>
+        "returns 422. `dismiss` is agent+; the destructive `supersede`/`merge` dispositions " <>
+        "require user+.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -698,7 +702,33 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+    disposition = params["disposition"]
+
+    # kb-02 (GHSA-9gqg-9r6p-658v): `supersede` (retire the loser) and `merge` (retire +
+    # LLM-synthesize) are the DESTRUCTIVE dispositions — the nightly executor applies
+    # them by transitioning an article out of published. Consistent with archive/
+    # unpublish, recording such a verdict requires role: :user. `dismiss` (a false
+    # positive) is non-destructive and stays at :agent, preserving the intended
+    # agent-annotates flow. This is an in-action check (not a static RequireRole plug)
+    # because destructiveness depends on the body param disposition. Enforcing at the
+    # boundary means no agent-originated destructive verdict is ever PERSISTED, so the
+    # executor can never act on one (the ConflictResolution row carries no originating
+    # role, making the controller the only place with the caller's role in hand).
+    if destructive_disposition?(disposition) and
+         not Role.role_at_least?(api_key.role, :user) do
+      forbidden(
+        conn,
+        "Resolving a conflict as '#{disposition}' retires or merges an article, which " <>
+          "removes it from published reads. This destructive disposition requires the " <>
+          "user role or higher. Agents may 'dismiss' a false positive."
+      )
+    else
+      do_resolve_conflict(conn, api_key.tenant_id, params)
+    end
+  end
+
+  defp do_resolve_conflict(conn, tenant_id, params) do
     audit_opts = AuditContext.from_conn(conn)
 
     attrs = %{
@@ -725,9 +755,27 @@ defmodule LoopctlWeb.ArticleWorkflowController do
           note: resolution_note(resolution)
         })
 
+      # kb-02: no system-flagged :potential_conflict link exists for this pair — the
+      # caller may not fabricate a verdict on an arbitrary pair.
+      {:error, :no_potential_conflict} ->
+        {:error, :unprocessable_entity,
+         "No potential-conflict link exists for this article pair. Only pairs the system " <>
+           "flagged as potential conflicts (see GET /api/v1/knowledge/conflicts) can be resolved."}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end
+  end
+
+  # supersede/merge lead the nightly executor to retire (and, for merge, synthesize
+  # over) an article — the destructive dispositions. dismiss is non-destructive.
+  defp destructive_disposition?(disposition), do: to_string(disposition) in ["supersede", "merge"]
+
+  # 403 body matches the RequireRole plug / FallbackController shape.
+  defp forbidden(conn, message) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{error: %{status: 403, message: message}})
   end
 
   defp resolution_note(%{disposition: :dismiss}),
