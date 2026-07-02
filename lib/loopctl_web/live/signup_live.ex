@@ -36,36 +36,68 @@ defmodule LoopctlWeb.SignupLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    ip = peer_ip(socket)
+    # NB: we do NOT rate-limit page views here. Merely loading /signup must
+    # never consume the bucket — the limit lives on the abusable `signup`
+    # submission (tenant creation). We only resolve + stash the per-IP rate
+    # key at mount, when the connect_info (peer + forwarded headers) is
+    # available on the connected socket.
+    challenge = new_challenge()
 
-    case rate_limiter().check_rate("signup:#{ip}", @rate_window_ms, @max_signups_per_ip) do
-      {:deny, _limit} ->
-        {:ok,
-         socket
-         |> put_flash(:error, "Too many signup attempts. Please try again later.")
-         |> push_navigate(to: ~p"/")}
+    {:ok,
+     socket
+     |> assign(:page_title, "Sign up a new tenant")
+     |> assign(:form, to_form(%{"name" => "", "slug" => "", "email" => ""}, as: :tenant))
+     |> assign(:authenticators, [])
+     |> assign(:max_authenticators, Tenants.max_authenticators_per_signup())
+     |> assign(:challenge, challenge)
+     |> assign(:challenge_payload, encode_challenge(challenge))
+     |> assign(:learn_more_url, @learn_more_url)
+     |> assign(:friendly_name_draft, "")
+     |> assign(:rate_key, signup_rate_key(socket))
+     |> assign(:error, nil)}
+  end
 
-      {:allow, _count} ->
-        challenge = new_challenge()
-
-        {:ok,
-         socket
-         |> assign(:page_title, "Sign up a new tenant")
-         |> assign(:form, to_form(%{"name" => "", "slug" => "", "email" => ""}, as: :tenant))
-         |> assign(:authenticators, [])
-         |> assign(:max_authenticators, Tenants.max_authenticators_per_signup())
-         |> assign(:challenge, challenge)
-         |> assign(:challenge_payload, encode_challenge(challenge))
-         |> assign(:learn_more_url, @learn_more_url)
-         |> assign(:friendly_name_draft, "")
-         |> assign(:error, nil)}
+  # Builds the rate-limit bucket key for the *signup submission*. Keyed on the
+  # true client IP (resolved through the forwarded headers, so one abuser can
+  # only exhaust their own bucket). When the IP is genuinely unknown (no
+  # forwarded header and no peer — e.g. a direct/local connection or a test),
+  # we fall back to a per-connection key so a burst can never collapse into a
+  # single shared "unknown" bucket that locks out every other visitor.
+  defp signup_rate_key(socket) do
+    case client_ip(socket) do
+      {:ok, ip} -> "signup:ip:#{ip}"
+      :unknown -> "signup:session:#{socket.id}"
     end
   end
 
-  defp peer_ip(socket) do
+  # Resolves the real client IP the same way the HTTP pipeline's `RemoteIp`
+  # plug does: prefer the forwarded chain (`x-forwarded-for`, which Fly's proxy
+  # populates with the true client), then fall back to the direct websocket
+  # peer for non-proxied/local connections.
+  defp client_ip(socket) do
+    case forwarded_ip(socket) do
+      {:ok, _ip} = resolved -> resolved
+      :unknown -> direct_peer_ip(socket)
+    end
+  end
+
+  defp forwarded_ip(socket) do
+    case Phoenix.LiveView.get_connect_info(socket, :x_headers) do
+      headers when is_list(headers) and headers != [] ->
+        case RemoteIp.from(headers) do
+          nil -> :unknown
+          addr -> {:ok, addr |> :inet.ntoa() |> to_string()}
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp direct_peer_ip(socket) do
     case Phoenix.LiveView.get_connect_info(socket, :peer_data) do
-      %{address: addr} -> addr |> :inet.ntoa() |> to_string()
-      _ -> "unknown"
+      %{address: addr} -> {:ok, addr |> :inet.ntoa() |> to_string()}
+      _ -> :unknown
     end
   end
 
@@ -167,7 +199,7 @@ defmodule LoopctlWeb.SignupLive do
   end
 
   @impl true
-  def handle_event("attestation_error", %{"reason" => reason}, socket) do
+  def handle_event("attestation_error", %{"reason" => reason}, socket) when is_binary(reason) do
     message =
       case reason do
         "webauthn_unsupported" ->
@@ -184,12 +216,23 @@ defmodule LoopctlWeb.SignupLive do
     {:noreply, assign(socket, :error, message)}
   end
 
-  @impl true
-  def handle_event("remove_authenticator", %{"index" => index}, socket) do
-    index = String.to_integer(index)
+  # Malformed attestation_error (missing/non-binary "reason") from a public
+  # client is ignored rather than allowed to crash the LiveView process.
+  def handle_event("attestation_error", _params, socket), do: {:noreply, socket}
 
-    new_auths = List.delete_at(socket.assigns.authenticators, index)
-    {:noreply, assign(socket, :authenticators, new_auths)}
+  @impl true
+  def handle_event("remove_authenticator", params, socket) do
+    # Never trust the client-supplied index: parse it defensively and
+    # bounds-check against the current list. A non-parseable or out-of-range
+    # index is a no-op instead of crashing the public LiveView process.
+    with index when is_binary(index) <- Map.get(params, "index"),
+         {parsed, ""} <- Integer.parse(index),
+         true <- parsed >= 0 and parsed < length(socket.assigns.authenticators) do
+      new_auths = List.delete_at(socket.assigns.authenticators, parsed)
+      {:noreply, assign(socket, :authenticators, new_auths)}
+    else
+      _ -> {:noreply, socket}
+    end
   end
 
   @impl true
@@ -200,52 +243,73 @@ defmodule LoopctlWeb.SignupLive do
          assign(socket, :error, "Enroll at least one authenticator before completing signup")}
 
       auths ->
-        attrs = Map.put(params, "authenticators", auths)
+        case rate_limiter().check_rate(
+               socket.assigns.rate_key,
+               @rate_window_ms,
+               @max_signups_per_ip
+             ) do
+          {:allow, _count} ->
+            complete_signup(params, auths, socket)
 
-        case Tenants.signup(attrs) do
-          {:ok, %{tenant: tenant}} ->
-            token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
-
+          {:deny, _limit} ->
             {:noreply,
-             socket
-             |> put_flash(:info, "Tenant signup complete — welcome to loopctl")
-             |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")}
-
-          {:error, :slug_taken} ->
-            {:noreply,
-             assign(
-               socket,
-               :form,
-               to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
-             )
-             |> assign(:error, "That slug is already in use")}
-
-          {:error, :email_taken} ->
-            {:noreply,
-             assign(
-               socket,
-               :form,
-               to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
-             )
-             |> assign(:error, "That email is already associated with a tenant")}
-
-          {:error, :no_authenticators} ->
-            {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
-
-          {:error, :too_many_authenticators} ->
-            {:noreply,
-             assign(
-               socket,
-               :error,
-               "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
-             )}
-
-          {:error, %Ecto.Changeset{} = changeset} ->
-            {:noreply,
-             socket
-             |> assign(:form, to_form(changeset, as: :tenant))
-             |> assign(:error, "Please correct the highlighted fields")}
+             assign(socket, :error, "Too many signup attempts. Please try again later.")}
         end
+    end
+  end
+
+  # Catch-all for malformed / unknown client events on this public LiveView.
+  # Must be the LAST handle_event clause. Ignoring them keeps an attacker from
+  # crashing the process (and spamming the logs) with junk websocket frames.
+  @impl true
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
+
+  defp complete_signup(params, auths, socket) do
+    attrs = Map.put(params, "authenticators", auths)
+
+    case Tenants.signup(attrs) do
+      {:ok, %{tenant: tenant}} ->
+        token = Phoenix.Token.sign(LoopctlWeb.Endpoint, "onboarding", tenant.id)
+
+        {:noreply,
+         socket
+         |> put_flash(:info, "Tenant signup complete — welcome to loopctl")
+         |> push_navigate(to: ~p"/tenants/#{tenant.id}/onboarding?token=#{token}")}
+
+      {:error, :slug_taken} ->
+        {:noreply,
+         assign(
+           socket,
+           :form,
+           to_form(params, as: :tenant, errors: [slug: {"slug_taken", []}])
+         )
+         |> assign(:error, "That slug is already in use")}
+
+      {:error, :email_taken} ->
+        {:noreply,
+         assign(
+           socket,
+           :form,
+           to_form(params, as: :tenant, errors: [email: {"email_taken", []}])
+         )
+         |> assign(:error, "That email is already associated with a tenant")}
+
+      {:error, :no_authenticators} ->
+        {:noreply, assign(socket, :error, "Enroll at least one authenticator")}
+
+      {:error, :too_many_authenticators} ->
+        {:noreply,
+         assign(
+           socket,
+           :error,
+           "At most #{socket.assigns.max_authenticators} authenticators can be enrolled"
+         )}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:noreply,
+         socket
+         |> assign(:form, to_form(changeset, as: :tenant))
+         |> assign(:error, "Please correct the highlighted fields")}
     end
   end
 

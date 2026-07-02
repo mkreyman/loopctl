@@ -207,6 +207,210 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
+  describe "signup rate limiting (web-01, per-IP, action-scoped)" do
+    test "loading /signup never consumes the rate-limit bucket; only the submission does",
+         %{conn: conn} do
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        send(test_pid, {:bucket, bucket})
+        {:allow, 1}
+      end)
+
+      conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "203.0.113.7")
+
+      # Many page views (the abuse the old code punished everyone for) must
+      # NOT touch the rate limiter at all.
+      for _ <- 1..10 do
+        {:ok, _view, _html} = live(conn, ~p"/signup")
+      end
+
+      refute_received {:bucket, _}
+
+      # A real submission checks the limiter exactly once, keyed by the real
+      # forwarded client IP — not the raw peer, and not a shared bucket.
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      view
+      |> form("#signup-form", %{
+        "tenant" => %{
+          "name" => "IP Corp",
+          "slug" => "ip-corp",
+          "email" => "ip@corp.example"
+        }
+      })
+      |> render_submit()
+
+      assert_receive {:bucket, "signup:ip:203.0.113.7"}
+    end
+
+    test "one IP hitting the limit does not lock out a different IP", %{conn: conn} do
+      # Deny only the abuser's per-IP bucket; everyone else is allowed.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:ip:198.51.100.1", _window, _limit -> {:deny, 5}
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+
+      abuser_conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "198.51.100.1")
+      {:ok, abuser_view, _html} = live(abuser_conn, ~p"/signup")
+      enroll_authenticator(abuser_view)
+
+      abuser_html =
+        abuser_view
+        |> form("#signup-form", %{
+          "tenant" => %{
+            "name" => "Abuser",
+            "slug" => "abuser-corp",
+            "email" => "abuser@corp.example"
+          }
+        })
+        |> render_submit()
+
+      assert abuser_html =~ "Too many signup attempts"
+      refute AdminRepo.get_by(Tenant, slug: "abuser-corp")
+
+      # A different IP is unaffected — signup still completes.
+      victim_conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "203.0.113.9")
+      {:ok, victim_view, _html} = live(victim_conn, ~p"/signup")
+      enroll_authenticator(victim_view)
+
+      assert {:error, {:live_redirect, %{to: redirect_to}}} =
+               victim_view
+               |> form("#signup-form", %{
+                 "tenant" => %{
+                   "name" => "Victim Corp",
+                   "slug" => "victim-corp",
+                   "email" => "victim@corp.example"
+                 }
+               })
+               |> render_submit()
+
+      assert redirect_to =~ "/onboarding"
+      assert AdminRepo.get_by(Tenant, slug: "victim-corp")
+    end
+
+    test "a genuinely-unknown client IP falls back to a per-connection bucket, never a shared one",
+         %{conn: conn} do
+      test_pid = self()
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        send(test_pid, {:bucket, bucket})
+        {:allow, 1}
+      end)
+
+      # No forwarded header AND no peer data — the genuinely-unknown case.
+      conn = Plug.Conn.put_private(conn, :live_view_connect_info, %{})
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      view
+      |> form("#signup-form", %{
+        "tenant" => %{
+          "name" => "Unknown Corp",
+          "slug" => "unknown-corp",
+          "email" => "unknown@corp.example"
+        }
+      })
+      |> render_submit()
+
+      assert_receive {:bucket, bucket}
+      # Per-connection (session) bucket, NOT a single shared "unknown" bucket.
+      assert bucket =~ ~r/\Asignup:session:/
+      refute bucket == "signup:unknown"
+      refute bucket == "signup:ip:unknown"
+    end
+  end
+
+  describe "malformed websocket events (web-02, no crash)" do
+    test "remove_authenticator with a non-parseable index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      assert has_element?(view, "#authenticator-0")
+
+      render_hook(view, "remove_authenticator", %{"index" => "x"})
+
+      # Process is still alive and the entry is untouched.
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a non-binary index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{"index" => 3})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with an out-of-range index is a no-op", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{"index" => "5"})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a missing index key is a no-op", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "a valid remove_authenticator still removes the right entry", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view, "First Key")
+      enroll_authenticator(view, "Second Key")
+
+      assert has_element?(view, "#authenticator-0")
+      assert has_element?(view, "#authenticator-1")
+
+      # Remove the first entry; the second slides into index 0.
+      render_hook(view, "remove_authenticator", %{"index" => "0"})
+
+      html = render(view)
+      refute has_element?(view, "#authenticator-1")
+      assert has_element?(view, "#authenticator-0")
+      assert html =~ "Second Key"
+      refute html =~ "First Key"
+    end
+
+    test "attestation_error without a reason key is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_error", %{})
+
+      # Alive and no error surfaced from the malformed frame.
+      refute has_element?(view, "#signup-error")
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a known attestation_error reason still surfaces its message", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_error", %{"reason" => "webauthn_unsupported"})
+
+      assert html =~ "does not support WebAuthn"
+    end
+
+    test "an entirely unknown event is ignored and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "totally_bogus_event", %{"junk" => true})
+
+      assert has_element?(view, "#signup-form")
+    end
+  end
+
   describe "legacy tenant creation paths (TC-26.0.1.6)" do
     test "POST /api/v1/tenants/register returns 404", %{conn: conn} do
       conn =
@@ -279,5 +483,27 @@ defmodule LoopctlWeb.SignupLiveTest do
       assert {:error, {:live_redirect, %{to: "/"}}} =
                live(conn, ~p"/tenants/#{missing_id}/onboarding?token=#{token}")
     end
+  end
+
+  # Drives the full enroll flow (name → request challenge → capture attestation)
+  # so a signup submission has a valid authenticator. Relies on the default
+  # `Loopctl.MockWebAuthn` stub wired via config/test.exs returning {:ok, _}.
+  defp enroll_authenticator(view, name \\ "Primary Key") do
+    view
+    |> element("#signup-form")
+    |> render_change(%{
+      "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+      "friendly_name" => name
+    })
+
+    view |> element("#enroll-authenticator-btn") |> render_click()
+
+    render_hook(view, "attestation_captured", %{
+      "attestation_object" => "YWJjZA",
+      "client_data_json" => "eyJmb28iOiJiYXIifQ",
+      "credential_id" => "Y3JlZC1pZA"
+    })
+
+    view
   end
 end

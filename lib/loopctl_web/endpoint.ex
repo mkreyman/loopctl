@@ -12,9 +12,14 @@ defmodule LoopctlWeb.Endpoint do
     same_site: "Lax"
   ]
 
+  # `:peer_data` + `:x_headers` are required so LiveViews can resolve the
+  # real client IP behind Fly's proxy (via RemoteIp on the forwarded
+  # `x-forwarded-for` header) rather than trusting the raw websocket peer,
+  # which is always Fly's edge proxy. See `LoopctlWeb.SignupLive` for the
+  # per-IP rate limiting that relies on this.
   socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: @session_options]],
-    longpoll: [connect_info: [session: @session_options]]
+    websocket: [connect_info: [:peer_data, :x_headers, session: @session_options]],
+    longpoll: [connect_info: [:peer_data, :x_headers, session: @session_options]]
 
   # Serve at "/" the static files from "priv/static" directory.
   #
