@@ -82,50 +82,60 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  # Resolves the real client IP with an explicit trust boundary:
+  # PEER-ANCHORED trust boundary. The only unspoofable signal is the TCP peer
+  # (connect_info :peer_data); the X-Forwarded-For chain is 100% client-supplied
+  # and must NEVER be trusted on its own. We therefore anchor on the peer:
   #
-  #   1. If the forwarded chain demonstrably traversed a trusted proxy (a hop
-  #      RemoteIp peels off the right using the shared `:remote_ip_opts`
-  #      allow-list), trust the originating client it returns.
-  #   2. Otherwise, if the raw peer is a genuine PUBLIC address (a direct,
-  #      non-proxied connection — local dev / tests), the unforgeable TCP peer
-  #      IS the client; any client-supplied forwarding header is ignored.
-  #   3. Otherwise (behind a proxy with no trustworthy forwarded client, or no
-  #      peer at all) → `:unknown`, so the caller uses a per-connection bucket.
+  #   1. No peer (no :peer_data) → per-connection bucket.
+  #   2. Peer IS a configured trusted proxy (`:remote_ip_opts[:proxies]` — on Fly
+  #      the app receives from fly-proxy over the `fdaa::/16` 6PN, which the
+  #      default config lists) → the request genuinely arrived via our proxy, so
+  #      resolve the originating client from the forwarded chain with plain
+  #      `RemoteIp.from/2`. The proxy appends the real client, and RemoteIp scans
+  #      right-to-left, so a client-forged prefix on the left is never returned.
+  #      If the chain yields nothing usable, fail safe to per-connection.
+  #   3. Peer is NOT a trusted proxy (direct / public / non-proxied connection) →
+  #      IGNORE the forwarded header entirely and key on the unspoofable peer IP.
+  #      This is what defeats the `"9.9.9.9, 127.0.0.1"` spoof: a forged header
+  #      from a non-proxy peer can never choose the bucket.
   defp client_ip(socket) do
-    case forwarded_client(forwarded_headers(socket)) do
-      {:ok, ip} ->
-        {:ok, ip}
-
-      :untrusted ->
-        peer = peer_address(socket)
-
-        if is_tuple(peer) and not proxy_peer?(peer) do
-          {:ok, ntoa(peer)}
-        else
-          :unknown
-        end
+    case peer_address(socket) do
+      nil -> :unknown
+      peer -> client_ip_for_peer(peer, socket)
     end
   end
 
-  # Trust a forwarded client ONLY when the chain contains a recognizable
-  # trusted-proxy/reserved hop that RemoteIp peels off the right. If the whole
-  # chain is a single client-controlled value with no proxy hop behind it
-  # (`client == rightmost`), or nothing usable is present, it is UNTRUSTED — an
-  # attacker cannot mint fresh per-IP buckets by forging `x-forwarded-for`.
-  defp forwarded_client([]), do: :untrusted
-
-  defp forwarded_client(headers) do
-    opts = remote_ip_opts()
-    client = RemoteIp.from(headers, opts)
-    # With every IP forced to :client, RemoteIp returns the raw rightmost hop.
-    rightmost = RemoteIp.from(headers, Keyword.merge(opts, clients: ["0.0.0.0/0", "::/0"]))
-
-    cond do
-      is_nil(client) -> :untrusted
-      client == rightmost -> :untrusted
-      true -> {:ok, ntoa(client)}
+  defp client_ip_for_peer(peer, socket) do
+    if trusted_proxy_peer?(peer) do
+      forwarded_client_ip(socket)
+    else
+      {:ok, ntoa(peer)}
     end
+  end
+
+  defp forwarded_client_ip(socket) do
+    case RemoteIp.from(forwarded_headers(socket), remote_ip_opts()) do
+      nil -> :unknown
+      addr -> {:ok, ntoa(addr)}
+    end
+  end
+
+  # Is the raw TCP peer one of our configured trusted proxies? Checked with a
+  # CIDR-contains against `:remote_ip_opts[:proxies]` (parsed via RemoteIp.Block),
+  # the SAME list `plug RemoteIp` uses. Anything not explicitly listed — every
+  # public client, and any un-pinned intermediary — is untrusted, so the default
+  # is safe: a non-proxy peer never trusts the header.
+  defp trusted_proxy_peer?(peer) when tuple_size(peer) in [4, 8] do
+    encoded = RemoteIp.Block.encode(peer)
+    Enum.any?(proxy_blocks(), &RemoteIp.Block.contains?(&1, encoded))
+  end
+
+  defp trusted_proxy_peer?(_), do: false
+
+  defp proxy_blocks do
+    remote_ip_opts()
+    |> Keyword.get(:proxies, [])
+    |> Enum.map(&RemoteIp.Block.parse!/1)
   end
 
   defp forwarded_headers(socket) do
@@ -141,18 +151,6 @@ defmodule LoopctlWeb.SignupLive do
       _ -> nil
     end
   end
-
-  # True when `addr` is a reverse-proxy / reserved address (loopback, RFC1918
-  # private, or `fc00::/7` unique-local — which covers Fly's `fdaa::/16` 6PN).
-  # Such a peer means the request arrived via a proxy, so the peer is NOT the
-  # client and must never be used as a bucket key.
-  defp proxy_peer?({127, _, _, _}), do: true
-  defp proxy_peer?({10, _, _, _}), do: true
-  defp proxy_peer?({172, b, _, _}) when b in 16..31, do: true
-  defp proxy_peer?({192, 168, _, _}), do: true
-  defp proxy_peer?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-  defp proxy_peer?({g, _, _, _, _, _, _, _}) when g >= 0xFC00 and g <= 0xFDFF, do: true
-  defp proxy_peer?(_), do: false
 
   defp ntoa(addr), do: addr |> :inet.ntoa() |> to_string()
 

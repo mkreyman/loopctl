@@ -152,20 +152,22 @@ config :loopctl, LoopctlWeb.Endpoint,
   live_view: [signing_salt: "xpgWTdmT"]
 
 # RemoteIp trusted-proxy configuration — SHARED by the `plug RemoteIp` in
-# endpoint.ex AND by `RemoteIp.from/2` in LoopctlWeb.SignupLive, so the HTTP
-# pipeline and the LiveView resolve the client IP identically.
+# endpoint.ex AND by `LoopctlWeb.SignupLive`, so the HTTP pipeline and the
+# LiveView resolve the client IP against the same trusted-proxy allow-list.
 #
-# RemoteIp scans the forwarding headers right-to-left and returns the first IP
-# that is NOT a known proxy or reserved (loopback/private/`fc00::/7`, which
-# already covers Fly's `fdaa::/16` 6PN). `:proxies` lets us peel additional
-# *public* proxy hops — most importantly the app-assigned Fly edge IP that Fly
-# appends as the RIGHTMOST `x-forwarded-for` entry (see
-# https://fly.io/docs/networking/request-headers/). Until those are pinned,
-# SignupLive fails safe to a per-connection bucket rather than trusting an
-# un-peeled proxy IP (which would collapse every visitor into one bucket).
+# SignupLive is PEER-ANCHORED: it trusts the client-supplied `x-forwarded-for`
+# chain ONLY when the unspoofable TCP peer (connect_info :peer_data) is one of
+# these `:proxies` CIDRs. On Fly the app receives connections from fly-proxy over
+# the `fdaa::/16` 6PN, so that is the safe default. A peer NOT in this list (any
+# public/direct client) is never trusted — its forwarded header is ignored and
+# the bucket is keyed on the peer itself. This is what prevents an attacker from
+# minting attacker-chosen rate-limit buckets by forging `x-forwarded-for`.
 #
-# Operators SHOULD extend `:proxies` with their Fly app/edge CIDRs (e.g. via
-# runtime.exs from an env var) so the real originating client is returned.
+# Operators MUST pin their real proxy CIDRs here for the header to be trusted:
+#   * Fly: `fdaa::/16` (the 6PN the app receives from) — already the default.
+#   * nginx / other reverse proxy in front: add its peer CIDR (e.g. loopback or
+#     the LAN range the proxy connects from). Without it, requests fall back to
+#     per-peer keying (safe, but coarser) instead of the real client IP.
 config :loopctl, :remote_ip_opts, proxies: ~w[fdaa::/16]
 
 # Configure Elixir's Logger — structured JSON logging with tenant context.
