@@ -216,10 +216,29 @@ defmodule Loopctl.AuditChain do
     |> AdminRepo.one()
   end
 
+  # Postgres bigint (int8) upper bound. `chain_position` is a bigint, so a
+  # position outside 0..max cannot exist in the chain AND would raise
+  # DBConnection.EncodeError if handed to Postgrex — out-of-range lookups
+  # short-circuit to nil instead. Single source of truth for callers that guard
+  # the input up front (e.g. the witness plug).
+  @max_chain_position 9_223_372_036_854_775_807
+
+  @doc "The maximum valid chain position (Postgres bigint upper bound)."
+  @spec max_chain_position() :: pos_integer()
+  def max_chain_position, do: @max_chain_position
+
   @doc """
   Returns the smallest STH with chain_position >= the given position.
+
+  Defensively returns `nil` for a non-integer or out-of-bigint-range position, so
+  no caller (including the public, unauthenticated STH endpoint) can hand an
+  unencodable value to Postgrex.
   """
-  @spec get_sth_at_position(Ecto.UUID.t(), non_neg_integer()) :: SignedTreeHead.t() | nil
+  @spec get_sth_at_position(Ecto.UUID.t(), integer()) :: SignedTreeHead.t() | nil
+  def get_sth_at_position(_tenant_id, position)
+      when not is_integer(position) or position < 0 or position > @max_chain_position,
+      do: nil
+
   def get_sth_at_position(tenant_id, position) do
     from(s in SignedTreeHead,
       where: s.tenant_id == ^tenant_id and s.chain_position >= ^position,

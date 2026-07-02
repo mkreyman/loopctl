@@ -78,18 +78,11 @@ defmodule Loopctl.Auth.ApiKey do
     change(api_key, expires_at: expires_at)
   end
 
-  @doc """
-  Changeset that stamps the one-time STH witness bootstrap grace as consumed.
-
-  Once a key has bootstrapped, `LoopctlWeb.Plugs.ValidateWitnessHeader`
-  rejects any further `X-Loopctl-STH-Bootstrap` requests from it — the key
-  must present a real `X-Loopctl-Last-Known-STH` header on every subsequent
-  request (custody-03 / GHSA-36g5-mcrh-rcrm).
-  """
-  @spec consume_bootstrap_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
-  def consume_bootstrap_changeset(api_key) do
-    change(api_key, sth_bootstrap_consumed_at: DateTime.utc_now())
-  end
+  # NOTE: the one-time STH bootstrap grace (custody-03) is consumed via an
+  # atomic conditional `UPDATE ... WHERE sth_bootstrap_consumed_at IS NULL`
+  # in `LoopctlWeb.Plugs.ValidateWitnessHeader` — NOT via a changeset — so the
+  # NULL guard is evaluated by Postgres and two concurrent first-requests
+  # cannot both win. See that plug for the single-winner logic.
 
   @doc """
   Returns the list of valid roles.
