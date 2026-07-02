@@ -355,6 +355,58 @@ defmodule Loopctl.WebAuthn.ReauthTest do
       {:ok, r3} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
       assert r3.sign_count == 6
     end
+
+    test "an asserted counter of 0 against a NONZERO stored counter is rejected (FIDO2 clone signal)" do
+      # The exact §7.2 clone signal: an authenticator that previously reported a
+      # counter of 10 now reports 0. This must be refused and the stored counter
+      # must NOT be clobbered to 0. Guards the `new_count == 0` branch: collapsing
+      # it (e.g. to `sign_count == ^id` with no counter predicate) would silently
+      # readmit the clone while the rest of the suite stayed green.
+      tenant = fixture(:tenant)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 10)
+
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:ok, %{sign_count: 0}}
+      end)
+
+      {:ok, issued} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      assert {:error, :counter_regression} =
+               Reauth.verify_and_consume(
+                 tenant.id,
+                 @purpose,
+                 assertion_params(issued.challenge_id, auth.credential_id)
+               )
+
+      # Counter unchanged — NOT clobbered to 0.
+      {:ok, reloaded} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
+      assert reloaded.sign_count == 10
+    end
+
+    test "a 0/0 counter (authenticator without a counter) is accepted per spec" do
+      # Symmetric guard for the other collapse direction: folding the 0-branch into
+      # a bare `sign_count < new_count` would reject legitimate no-counter (0/0)
+      # authenticators. Stored 0 + asserted 0 must succeed.
+      tenant = fixture(:tenant)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 0)
+
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:ok, %{sign_count: 0}}
+      end)
+
+      {:ok, issued} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      assert {:ok, %{sign_count: 0}} =
+               Reauth.verify_and_consume(
+                 tenant.id,
+                 @purpose,
+                 assertion_params(issued.challenge_id, auth.credential_id)
+               )
+
+      {:ok, reloaded} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
+      assert reloaded.sign_count == 0
+      assert reloaded.last_used_at != nil
+    end
   end
 
   describe "tenant isolation" do

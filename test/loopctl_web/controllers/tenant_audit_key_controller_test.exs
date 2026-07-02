@@ -7,6 +7,9 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
 
   import Loopctl.Fixtures
 
+  alias Loopctl.Tenants
+  alias Loopctl.Tenants.RootAuthenticators
+
   setup :verify_on_exit!
 
   # Builds the assertion request object with SEPARATE base64url fields
@@ -253,8 +256,46 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
       assert json_response(conn, 401)["error"]["code"] == "webauthn_failed"
 
       # Key unchanged.
-      {:ok, reloaded} = Loopctl.Tenants.get_tenant(tenant.id)
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
       assert reloaded.audit_signing_public_key == pub_key
+    end
+
+    test "rejects a counter-drop-to-zero (clone signal) and does NOT rotate", %{conn: conn} do
+      pub_key = :crypto.strong_rand_bytes(32)
+      tenant = fixture(:tenant, %{audit_signing_public_key: pub_key})
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 10)
+      {raw_key, _api_key} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      # Authenticator that previously reported counter 10 now reports 0 — the
+      # FIDO2 §7.2 clone signal. Must be refused; the key must NOT rotate.
+      Mox.stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:ok, %{sign_count: 0}}
+      end)
+
+      authed = put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+      challenge_data =
+        authed
+        |> post(~p"/api/v1/tenants/#{tenant.id}/rotate-audit-key/challenge", %{})
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      conn =
+        post(authed, ~p"/api/v1/tenants/#{tenant.id}/rotate-audit-key", %{
+          "webauthn_assertion" =>
+            assertion_body(challenge_data["challenge_id"], auth.credential_id)
+        })
+
+      assert json_response(conn, 401)["error"]["code"] == "webauthn_failed"
+
+      # Audit key unchanged, and the stored counter was NOT clobbered to 0.
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      assert reloaded.audit_signing_public_key == pub_key
+
+      {:ok, reloaded_auth} =
+        RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
+
+      assert reloaded_auth.sign_count == 10
     end
 
     test "rejects an invalid signature and does NOT rotate", %{conn: conn} do
@@ -283,7 +324,7 @@ defmodule LoopctlWeb.TenantAuditKeyControllerTest do
 
       assert json_response(conn, 401)["error"]["code"] == "webauthn_failed"
 
-      {:ok, reloaded} = Loopctl.Tenants.get_tenant(tenant.id)
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
       assert reloaded.audit_signing_public_key == pub_key
     end
 
