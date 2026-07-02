@@ -6,10 +6,21 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
   alias Loopctl.Workers.CostAnomalyWorker
+
+  defp detected_audit_count(tenant_id, story_id) do
+    from(a in AuditLog,
+      where:
+        a.tenant_id == ^tenant_id and a.entity_type == "cost_anomaly" and
+          a.action == "detected" and
+          fragment("?->>'story_id' = ?", a.metadata, ^story_id)
+    )
+    |> AdminRepo.aggregate(:count)
+  end
 
   defp setup_tenant_with_epic do
     tenant = fixture(:tenant)
@@ -340,6 +351,42 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
       anomalies = AdminRepo.all(CostAnomaly)
       assert length(anomalies) == 1
       assert hd(anomalies).story_id == expensive.id
+
+      # Exactly ONE "detected" audit entry across the repeated runs -- notify
+      # fires only on the genuine insert, never on the subsequent update/no-op
+      # runs (FIX1: persisted-only notification).
+      assert detected_audit_count(ctx.tenant.id, expensive.id) == 1
+    end
+
+    # FIX1c: when an unresolved anomaly already exists for a story (as a
+    # concurrent winner would have written), a run must UPDATE it in place and
+    # NOT emit a second "detected" audit entry -- i.e. never notify for a
+    # non-newly-persisted anomaly.
+    test "does not emit a second detected audit entry when the anomaly already exists" do
+      ctx = setup_tenant_with_epic()
+      period = Date.utc_today()
+
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      expensive = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100_000)
+
+      # Pre-existing unresolved anomaly (as though a concurrent run already
+      # inserted + notified for it).
+      fixture(:cost_anomaly, %{
+        tenant_id: ctx.tenant.id,
+        story_id: expensive.id,
+        anomaly_type: :high_cost,
+        story_cost_millicents: 90_000,
+        reference_avg_millicents: 30_000,
+        deviation_factor: Decimal.new("3.0")
+      })
+
+      insert_epic_summary(ctx, period, 32_500)
+
+      assert :ok = CostAnomalyWorker.perform(%Oban.Job{args: period_args(period)})
+
+      # Still exactly one anomaly row, and NO new "detected" audit entry.
+      assert length(AdminRepo.all(CostAnomaly)) == 1
+      assert detected_audit_count(ctx.tenant.id, expensive.id) == 0
     end
 
     test "succeeds when no tenants exist" do
