@@ -9,7 +9,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.KnowledgeLintWorker
+
+  # The lint worker acts on orphans by enqueuing (inline, in-process) ArticleLinkingWorker,
+  # whose similarity lookup is injected (Loopctl.Knowledge.SimilaritySearch.Behaviour). The
+  # DataCase default stub returns [] (so most lint tests link nothing — they assert counts,
+  # not links); the one test that asserts an orphan pair actually gets re-linked feeds a
+  # deterministic candidate, keeping the whole path off the flaky 250 ms heavy read.
 
   # A published article with a known embedding vector, written directly via
   # AdminRepo to bypass the inline Oban cascade (embedding -> linking) that
@@ -83,6 +90,21 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       # Two similar, published, unlinked articles -> both orphans.
       a = published_article_with_embedding(tenant.id, similar_embedding())
       b = published_article_with_embedding(tenant.id, near_similar_embedding())
+
+      # Each orphan's re-link job asks for its nearest neighbor (excluding itself); return the
+      # OTHER article of the pair so the two get linked. Called once per embedded orphan.
+      a_id = a.id
+      b_id = b.id
+      a_cand = %{id: a.id, title: a.title, category: a.category, similarity_score: 0.99}
+      b_cand = %{id: b.id, title: b.title, category: b.category, similarity_score: 0.99}
+
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, opts ->
+        case Keyword.fetch!(opts, :exclude_id) do
+          ^a_id -> [b_cand]
+          ^b_id -> [a_cand]
+          _ -> []
+        end
+      end)
 
       assert :ok =
                KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})

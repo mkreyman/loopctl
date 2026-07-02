@@ -5,17 +5,32 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.ArticleLinkingWorker
+
+  # The similarity lookup is injected behind `Loopctl.Knowledge.SimilaritySearch.Behaviour`
+  # (config-based DI). These unit tests drive the worker's LINKING logic (the relates_to /
+  # potential_conflict threshold split, both-direction dedup, the audit event, idempotency)
+  # by feeding it DETERMINISTIC candidate lists via Mox — never the real pgvector kNN, which
+  # runs through `Loopctl.HeavyRead` under a 250 ms `SET LOCAL statement_timeout` transaction
+  # and flaked these tests on a loaded DB (57014 query_canceled). The real
+  # `VectorSearch.nearest/4` path keeps its own coverage in the "real vector search
+  # (integration)" describe block below.
 
   defp setup_tenant do
     tenant = fixture(:tenant)
     %{tenant: tenant}
   end
 
-  # Creates a published article with a known embedding vector, bypassing
-  # the inline Oban cascade (embedding worker -> linking worker).
-  defp create_article_with_embedding(tenant_id, embedding, attrs \\ %{}) do
+  # A published article with a (value-irrelevant) embedding, written directly via AdminRepo
+  # to bypass the inline Oban cascade (embedding worker -> linking worker). The SOURCE needs a
+  # non-nil embedding for the worker to proceed; CANDIDATES need only to exist (article_links
+  # FKs are `on_delete: :restrict`). Similarity is controlled by the injected mock, NOT by the
+  # embedding vector, so a single dummy vector serves every article here.
+  defp create_published_article(tenant_id, attrs \\ %{}) do
     base_attrs = %{
       title: "Article #{System.unique_integer([:positive])}",
       body: "Test article body.",
@@ -24,50 +39,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       tags: []
     }
 
-    article =
-      fixture(:article, Map.merge(base_attrs, Map.put(attrs, :tenant_id, tenant_id)))
-
-    # Set published + embedding directly via AdminRepo to avoid Oban inline cascade
-    article
-    |> Ecto.Changeset.change(%{status: :published, embedding: embedding})
+    fixture(:article, Map.merge(base_attrs, Map.put(attrs, :tenant_id, tenant_id)))
+    |> Ecto.Changeset.change(%{status: :published, embedding: List.duplicate(0.1, 1536)})
     |> AdminRepo.update!()
   end
 
-  # Helper: generate deterministic embedding vectors.
-  #
-  # Cosine similarity measures direction, not magnitude. Uniform vectors
-  # (all same value) always have similarity 1.0 regardless of value.
-  # We use sparse directional vectors to control similarity:
-  # - similar_embedding: positive in first half, zero in second half
-  # - near_similar_embedding: same pattern with small perturbation (high cosine sim)
-  # - dissimilar_embedding: zero in first half, positive in second half (orthogonal)
-  defp similar_embedding do
-    List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  end
-
-  defp dissimilar_embedding do
-    # Orthogonal to similar_embedding -- cosine similarity near 0
-    List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
-  end
-
-  defp near_similar_embedding do
-    # Very close to similar_embedding but with small perturbation
-    List.duplicate(1.0, 768)
-    |> List.update_at(0, fn _ -> 0.99 end)
-    |> List.update_at(1, fn _ -> 1.01 end)
-    |> Kernel.++(List.duplicate(0.01, 768))
-  end
-
-  # cos(similar_embedding, near_miss_embedding) = 1/sqrt(1 + 1.518^2) ~= 0.55 —
-  # a deliberate near-miss of the default 0.6 cutoff but above a lenient 0.5.
-  defp near_miss_embedding do
-    List.duplicate(1.0, 768) ++ List.duplicate(1.518, 768)
-  end
-
-  # cos(similar_embedding, this) = 768 / (sqrt(768) * sqrt(1536)) ~= 0.707 — related
-  # (>= 0.6) but below the 0.93 conflict threshold.
-  defp moderately_similar_embedding do
-    List.duplicate(1.0, 1536)
+  # Builds a candidate map in the EXACT shape `VectorSearch.nearest/4` returns; the worker
+  # keys on `:id` and `:similarity_score`.
+  defp candidate(article, score) do
+    %{id: article.id, title: article.title, category: article.category, similarity_score: score}
   end
 
   defp links_of_type(tenant_id, a_id, b_id, type) do
@@ -84,15 +64,19 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   describe "potential conflict detection (#4)" do
     test "flags a near-identical pair with a :potential_conflict link" do
       %{tenant: tenant} = setup_tenant()
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      dup = create_article_with_embedding(tenant.id, near_similar_embedding())
+      source = create_published_article(tenant.id)
+      dup = create_published_article(tenant.id)
+
+      # >= the 0.93 conflict threshold: gets BOTH an ambient relates_to and a conflict flag.
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(dup, 0.99)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # Both an ambient relates_to AND the conflict flag.
       assert [_] = links_of_type(tenant.id, source.id, dup.id, :relates_to)
       assert [conflict] = links_of_type(tenant.id, source.id, dup.id, :potential_conflict)
       assert conflict.metadata["similarity_score"] >= 0.93
@@ -101,8 +85,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
     test "a merely-related pair (below the conflict threshold) gets NO conflict flag" do
       %{tenant: tenant} = setup_tenant()
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      related = create_article_with_embedding(tenant.id, moderately_similar_embedding())
+      source = create_published_article(tenant.id)
+      related = create_published_article(tenant.id)
+
+      # >= 0.6 (relates) but < 0.93 (no conflict).
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(related, 0.70)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
@@ -117,18 +106,28 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   # --- TC-21.2.1: Creates relates_to links for similar articles ---
 
   describe "perform/1 creates links" do
-    test "creates relates_to links for similar articles" do
+    test "creates a relates_to link for a returned candidate and passes the self/scope opts" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      target = create_published_article(tenant.id)
 
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      target = create_article_with_embedding(tenant.id, near_similar_embedding())
+      # Assert the worker WIRES the lookup correctly: self-exclusion anchor, tenant-wide
+      # project scope for a tenant-wide source, an indexed-query threshold of 0.0 (the floor
+      # is applied in-memory), and a bounded over-fetch pool.
+      expect(MockArticleSimilaritySearch, :nearest, fn tenant_id, _emb, max, opts ->
+        assert tenant_id == tenant.id
+        assert Keyword.fetch!(opts, :exclude_id) == source.id
+        assert Keyword.fetch!(opts, :project_or_global) == nil
+        assert Keyword.fetch!(opts, :threshold) == 0.0
+        assert Keyword.fetch!(opts, :pool) == VectorSearch.pool_size(max)
+        [candidate(target, 0.88)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # Verify link was created
       links =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant.id,
@@ -141,26 +140,29 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert length(links) == 1
       link = hd(links)
       assert link.metadata["auto_generated"] == true
-      assert is_float(link.metadata["similarity_score"])
-      assert link.metadata["similarity_score"] >= 0.6
+      assert link.metadata["similarity_score"] == 0.88
     end
   end
 
   # --- TC-21.2.2: Skips articles below threshold ---
 
   describe "perform/1 threshold filtering" do
-    test "skips articles below similarity threshold" do
+    test "skips a candidate below the (in-memory) similarity threshold" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      dissimilar = create_published_article(tenant.id)
 
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      _dissimilar = create_article_with_embedding(tenant.id, dissimilar_embedding())
+      # 0.05 < the default 0.6 floor: the worker applies `sim >= threshold` in memory and
+      # drops it, even though the lookup surfaced it (it was asked for `threshold: 0.0`).
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(dissimilar, 0.05)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # No links should be created
       links =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant.id,
@@ -173,10 +175,14 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
     test "a per-job threshold override links a near-miss neighbor (orphan self-heal)" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      near_miss = create_published_article(tenant.id)
 
-      # cos(source, near_miss) ~= 0.55: under the default 0.6, over a lenient 0.5.
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      near_miss = create_article_with_embedding(tenant.id, near_miss_embedding())
+      # Same candidate at 0.55 both runs: the DIFFERENCE is the in-memory floor. Default
+      # 0.6 drops it; the per-job 0.5 override keeps it. Stub (called twice, same return).
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(near_miss, 0.55)]
+      end)
 
       # Default threshold: no link (this is why orphans stay orphaned).
       assert :ok =
@@ -198,18 +204,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
                  }
                })
 
-      links =
-        from(l in ArticleLink,
-          where: l.tenant_id == ^tenant.id,
-          where:
-            (l.source_article_id == ^source.id and l.target_article_id == ^near_miss.id) or
-              (l.source_article_id == ^near_miss.id and l.target_article_id == ^source.id)
-        )
-        |> AdminRepo.all()
+      links = links_of_type(tenant.id, source.id, near_miss.id, :relates_to)
 
       assert length(links) == 1
-      assert hd(links).metadata["similarity_score"] >= 0.5
-      assert hd(links).metadata["similarity_score"] < 0.6
+      assert hd(links).metadata["similarity_score"] == 0.55
     end
   end
 
@@ -218,15 +216,21 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   describe "idempotency" do
     test "re-running does not create duplicate links" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      target = create_published_article(tenant.id)
 
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      _target = create_article_with_embedding(tenant.id, near_similar_embedding())
+      stub(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.88)]
+      end)
 
-      # Run once
-      assert :ok =
-               ArticleLinkingWorker.perform(%Oban.Job{
-                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
-               })
+      run = fn ->
+        assert :ok =
+                 ArticleLinkingWorker.perform(%Oban.Job{
+                   args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+                 })
+      end
+
+      run.()
 
       count_before =
         from(l in ArticleLink,
@@ -235,11 +239,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
         )
         |> AdminRepo.aggregate(:count)
 
-      # Run again
-      assert :ok =
-               ArticleLinkingWorker.perform(%Oban.Job{
-                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
-               })
+      run.()
 
       count_after =
         from(l in ArticleLink,
@@ -253,11 +253,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
     test "does not create duplicate when link exists in reverse direction" do
       %{tenant: tenant} = setup_tenant()
+      article_a = create_published_article(tenant.id)
+      article_b = create_published_article(tenant.id)
 
-      article_a = create_article_with_embedding(tenant.id, similar_embedding())
-      article_b = create_article_with_embedding(tenant.id, near_similar_embedding())
-
-      # Create a link in the B -> A direction manually
+      # Pre-existing link in the B -> A direction.
       %ArticleLink{tenant_id: tenant.id}
       |> ArticleLink.changeset(%{
         source_article_id: article_b.id,
@@ -267,44 +266,45 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       })
       |> AdminRepo.insert!()
 
-      # Now run linking for A -- should not create A -> B since B -> A exists
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(article_b, 0.99)]
+      end)
+
+      # Linking A must NOT create A -> B (B -> A already exists).
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => article_a.id, "tenant_id" => tenant.id}
                })
 
-      links =
-        from(l in ArticleLink,
-          where: l.tenant_id == ^tenant.id,
-          where: l.relationship_type == :relates_to,
-          where:
-            (l.source_article_id == ^article_a.id and l.target_article_id == ^article_b.id) or
-              (l.source_article_id == ^article_b.id and l.target_article_id == ^article_a.id)
-        )
-        |> AdminRepo.all()
-
-      # Only the manually created relates_to one should exist (a high-similarity pair
+      # Only the manually created relates_to one should exist (the high-similarity pair
       # also gets a separate :potential_conflict flag — that's #4, asserted elsewhere).
-      assert length(links) == 1
+      assert length(links_of_type(tenant.id, article_a.id, article_b.id, :relates_to)) == 1
     end
   end
 
   # --- TC-21.2.4: Tenant isolation ---
 
   describe "tenant isolation" do
-    test "tenant A's articles do not link to tenant B's articles" do
+    test "the worker scopes the lookup to the caller tenant" do
       %{tenant: tenant_a} = setup_tenant()
       %{tenant: tenant_b} = setup_tenant()
 
-      source_a = create_article_with_embedding(tenant_a.id, similar_embedding())
-      _target_b = create_article_with_embedding(tenant_b.id, near_similar_embedding())
+      source_a = create_published_article(tenant_a.id)
+      _target_b = create_published_article(tenant_b.id)
+
+      # Real tenant isolation lives in VectorSearch/HeavyRead (their own tests); here we
+      # assert the worker passes the CALLER's tenant and links only what the lookup returns.
+      # A same-tenant lookup finds no candidates -> no links.
+      expect(MockArticleSimilaritySearch, :nearest, fn tenant_id, _emb, _k, _opts ->
+        assert tenant_id == tenant_a.id
+        []
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source_a.id, "tenant_id" => tenant_a.id}
                })
 
-      # No links should be created (no similar articles in tenant A)
       links =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant_a.id,
@@ -315,13 +315,14 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert links == []
     end
 
-    test "worker with wrong tenant returns :ok (article not visible)" do
+    test "worker with wrong tenant returns :ok without a lookup (article not visible)" do
       %{tenant: tenant_a} = setup_tenant()
       %{tenant: tenant_b} = setup_tenant()
 
-      article_a = create_article_with_embedding(tenant_a.id, similar_embedding())
+      article_a = create_published_article(tenant_a.id)
 
-      # Run with wrong tenant_id
+      # get_article_with_embedding(tenant_b, …) is a miss -> the worker no-ops before any
+      # similarity lookup (the default DataCase stub is never invoked).
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => article_a.id, "tenant_id" => tenant_b.id}
@@ -329,32 +330,24 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     end
   end
 
-  # --- TC-21.2.5: Respects max comparison limit ---
+  # --- TC-21.2.5: Links every returned candidate ---
 
-  describe "max comparisons limit" do
-    test "limits results to configured max_comparisons" do
+  describe "candidate fan-out" do
+    test "creates a relates_to link for each returned candidate" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      targets = for _i <- 1..3, do: create_published_article(tenant.id)
 
-      # Create source article
-      source = create_article_with_embedding(tenant.id, similar_embedding())
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        Enum.map(targets, &candidate(&1, 0.80))
+      end)
 
-      # Create 3 similar articles
-      for _i <- 1..3 do
-        create_article_with_embedding(tenant.id, near_similar_embedding())
-      end
-
-      # Override max_comparisons to 2 via Application config
-      # Note: We test the limiting behavior by checking the worker
-      # respects limits. Since we can't use Application.put_env in tests,
-      # we verify the default behavior works. The max_comparisons
-      # config is set in config.exs (default 50).
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # All 3 similar articles should be linked (within default limit of 50). Scope to
-      # :relates_to — high-similarity pairs also get a :potential_conflict link (#4).
+      # 0.80 is >= 0.6 (relates) but < 0.93 (no conflict), so exactly 3 relates_to links.
       link_count =
         from(l in ArticleLink,
           where: l.tenant_id == ^tenant.id,
@@ -373,7 +366,6 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
     test "returns :ok for article with no embedding" do
       %{tenant: tenant} = setup_tenant()
 
-      # Create article without embedding (draft status, no embedding set)
       article = fixture(:article, %{tenant_id: tenant.id, status: :draft})
 
       assert :ok =
@@ -396,31 +388,22 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   # --- Project scoping ---
 
   describe "project scoping" do
-    test "project-scoped article links to same-project and tenant-wide articles" do
+    test "passes the same-project-or-tenant-wide scope and links the returned candidates" do
       %{tenant: tenant} = setup_tenant()
       project = fixture(:project, %{tenant_id: tenant.id})
 
-      source =
-        create_article_with_embedding(tenant.id, similar_embedding(), %{
-          project_id: project.id
-        })
+      source = create_published_article(tenant.id, %{project_id: project.id})
+      same_project = create_published_article(tenant.id, %{project_id: project.id})
+      tenant_wide = create_published_article(tenant.id)
 
-      # Same project article
-      same_project =
-        create_article_with_embedding(tenant.id, near_similar_embedding(), %{
-          project_id: project.id
-        })
-
-      # Tenant-wide article (no project)
-      tenant_wide = create_article_with_embedding(tenant.id, near_similar_embedding())
-
-      # Different project article
-      other_project = fixture(:project, %{tenant_id: tenant.id})
-
-      _different_project =
-        create_article_with_embedding(tenant.id, near_similar_embedding(), %{
-          project_id: other_project.id
-        })
+      # The worker must pass `:project_or_global => source.project_id` (the "same-project OR
+      # tenant-wide" scope VectorSearch enforces). The lookup then returns exactly the in-scope
+      # rows; the worker links them. (Cross-project EXCLUSION is VectorSearch's job, covered by
+      # the integration test + VectorSearch's own suite.)
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, opts ->
+        assert Keyword.fetch!(opts, :project_or_global) == project.id
+        [candidate(same_project, 0.70), candidate(tenant_wide, 0.70)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
@@ -436,11 +419,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
         |> AdminRepo.all()
         |> MapSet.new()
 
-      # Should link to same-project and tenant-wide
       assert MapSet.member?(link_target_ids, same_project.id)
       assert MapSet.member?(link_target_ids, tenant_wide.id)
-
-      # Should NOT link to different project
       assert MapSet.size(link_target_ids) == 2
     end
   end
@@ -450,16 +430,18 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   describe "audit event" do
     test "logs knowledge.articles_linked audit event" do
       %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      target = create_published_article(tenant.id)
 
-      source = create_article_with_embedding(tenant.id, similar_embedding())
-      _target = create_article_with_embedding(tenant.id, near_similar_embedding())
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(target, 0.99)]
+      end)
 
       assert :ok =
                ArticleLinkingWorker.perform(%Oban.Job{
                  args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                })
 
-      # Check audit log
       audit =
         from(a in Loopctl.Audit.AuditLog,
           where: a.tenant_id == ^tenant.id,
@@ -473,8 +455,8 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert audit.actor_type == "system"
       assert audit.actor_label == "worker:article_linking"
       assert audit.new_state["article_id"] == source.id
-      # 2 links: a :relates_to and, since the pair is near-identical (>= conflict
-      # threshold), a :potential_conflict flag (#4) — both are auto-links created here.
+      # 2 links: a :relates_to and, since the pair is >= the conflict threshold, a
+      # :potential_conflict flag (#4) — both are auto-links created here.
       assert audit.new_state["new_link_count"] == 2
     end
   end
@@ -519,6 +501,68 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
       assert job.changes.queue == "knowledge"
       assert job.changes.max_attempts == 3
+    end
+  end
+
+  # --- Real vector search (integration) ---
+  #
+  # ONE test that exercises the ACTUAL `VectorSearch.nearest/4` path with real embeddings,
+  # to keep the wiring the worker depends on under test: the exact opts the worker builds
+  # produce a `[%{id, similarity_score}]` result where a genuinely-similar seeded article
+  # scores above the link threshold and an orthogonal one does not. This is a single, tiny
+  # kNN read (no subsequent timed op in the same test), so it is robust — it does NOT sit
+  # under the compounded 250 ms flake the DI change removed from the worker's unit tests.
+  describe "real vector search (integration)" do
+    @describetag :integration
+
+    defp similar_embedding, do: List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
+
+    defp near_similar_embedding do
+      List.duplicate(1.0, 768)
+      |> List.update_at(0, fn _ -> 0.99 end)
+      |> List.update_at(1, fn _ -> 1.01 end)
+      |> Kernel.++(List.duplicate(0.01, 768))
+    end
+
+    defp dissimilar_embedding, do: List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
+
+    defp publish_with_embedding(tenant_id, embedding) do
+      fixture(:article, %{
+        tenant_id: tenant_id,
+        title: "Article #{System.unique_integer([:positive])}",
+        body: "Test article body.",
+        category: :pattern,
+        tags: []
+      })
+      |> Ecto.Changeset.change(%{status: :published, embedding: embedding})
+      |> AdminRepo.update!()
+    end
+
+    test "returns the real candidate shape with a similar hit above the threshold" do
+      %{tenant: tenant} = setup_tenant()
+
+      source = publish_with_embedding(tenant.id, similar_embedding())
+      similar = publish_with_embedding(tenant.id, near_similar_embedding())
+      dissimilar = publish_with_embedding(tenant.id, dissimilar_embedding())
+
+      {:ok, src} = Knowledge.get_article_with_embedding(tenant.id, source.id)
+
+      results =
+        VectorSearch.nearest(tenant.id, src.embedding, 50,
+          exclude_id: source.id,
+          project_or_global: nil,
+          threshold: 0.0,
+          pool: VectorSearch.pool_size(50)
+        )
+
+      # Exact return shape the worker maps over: %{id, similarity_score, …}.
+      assert Enum.all?(results, &match?(%{id: _, similarity_score: _}, &1))
+
+      by_id = Map.new(results, &{&1.id, &1.similarity_score})
+
+      # The near-identical article clears the 0.6 link threshold; the orthogonal one does not.
+      assert Map.fetch!(by_id, similar.id) >= 0.6
+      assert Map.get(by_id, dissimilar.id, 0.0) < 0.6
     end
   end
 end

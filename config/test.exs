@@ -297,3 +297,12 @@ config :loopctl, :rls_role, "loopctl_app"
 
 # KnowledgeMocWorker: low tag threshold so tests need only a few tagged articles.
 config :loopctl, knowledge_moc_min_tag_count: 2
+
+# DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
+# linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
+# is unit-tested with deterministic candidate lists — never through the real pgvector kNN,
+# which runs under a 250ms SET LOCAL statement_timeout heavy read that flaked those tests
+# on a loaded DB (57014 query_canceled). The DataCase default stub returns [] so unrelated
+# tests (and the inline-Oban cascade) see no candidates; tests that assert linking set
+# Mox expectations. The real VectorSearch.nearest path keeps a dedicated integration test.
+config :loopctl, :article_similarity_search, Loopctl.MockArticleSimilaritySearch

@@ -202,6 +202,18 @@ defmodule Loopctl.DataCase do
     # :merge rows unless a test opts in with a real merged result.
     Mox.stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _a, _b -> {:error, :not_configured} end)
 
+    # ArticleLinkingWorker similarity lookup: default to NO candidates so unrelated tests
+    # (and the inline-Oban embedding→linking cascade an article create/publish triggers)
+    # behave exactly as before — a real vector search over a fresh corpus finds nothing to
+    # link. Tests that assert linking override this with `Mox.expect/3` returning crafted
+    # candidate maps. This keeps the worker off the timed heavy-read path in every test.
+    Mox.stub(Loopctl.MockArticleSimilaritySearch, :nearest, fn _tenant_id,
+                                                               _embedding,
+                                                               _k,
+                                                               _opts ->
+      []
+    end)
+
     # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header
