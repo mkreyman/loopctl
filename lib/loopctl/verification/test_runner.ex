@@ -8,9 +8,77 @@ defmodule Loopctl.Verification.TestRunner do
   This is the core lazy-bastard defense — the verifier does not trust
   the implementer's self-report. The tests run in a clean subprocess
   that the implementer cannot reach.
+
+  ## Untrusted-code execution (advisory ie-03, GHSA-38cj-97f6-r82q)
+
+  This runner clones a tenant-supplied repo and runs `mix deps.get` + `mix test`
+  against it — i.e. it executes **third-party code**. It is NOT a sandbox.
+
+  Because of that, it is **disabled by default** and only runs when an operator
+  explicitly opts in with:
+
+      config :loopctl, :enable_local_test_runner, true
+
+  When the flag is off (the default in every environment, including prod),
+  `run_tests/2` returns `{:error, :runner_disabled}` before any clone or
+  subprocess runs. Turn it on ONLY inside an egress-restricted, ephemeral
+  sandbox — enabling it on a host with outbound network + `git`/`mix` exposes
+  the untrusted-code-exec and clone-time SSRF surface described below.
+
+  The remaining containment, in order of strength:
+
+    1. **Off by default** (the flag above) — the primary mitigation.
+    2. **Input validation** in this module and in
+       `Loopctl.Verification.VerificationRun` — a `commit_sha` is constrained to
+       a hex git object id and a `repo_url` to a well-formed `http(s)` URL — so
+       neither can inject a subprocess argument or escape the temp directory.
+    3. In production the release image also ships no `git`/`mix`, so even if the
+       flag were flipped there the `System.cmd/3` calls would raise `:enoent`.
+
+  True isolation (running each verification in an ephemeral, network-restricted
+  container with a CPU/memory/time budget) is the intended future hardening and
+  is deliberately out of scope for this change.
+
+  ## Input hardening (advisory ie-04, GHSA-pv74-gwwh-g92x)
+
+    * `commit_sha` is re-validated here (defence in depth — the schema already
+      validates it) before it is used in `git checkout` or a path. A hex-only
+      value (`[0-9a-f]{7,64}`) cannot be a `-`-leading git flag nor contain `/`
+      or `..`.
+    * `repo_url` is validated to an `http(s)` URL with a real host, closing the
+      `ext::sh -c '…'` / `file://` / local-path / `-`-leading remote-helper RCE
+      vectors.
+    * `git clone` passes `--` before its positional args (`clone --depth 1 --
+      <repo_url> <work_dir>`) so a `-`-leading URL can't be read as a flag.
+      `git checkout <commit_sha>` does **not** use `--` (that would make git
+      treat the value as a *pathspec* rather than a revision); it is safe purely
+      because `commit_sha` is validated to `[0-9a-f]{7,64}` and so can never be a
+      flag.
+    * The working directory uses a random, non-user-derived name, and cleanup
+      (`File.rm_rf/1`) only ever fires against a path provably inside the system
+      temp directory.
+
+  ### Clone-time SSRF is only partially mitigated
+
+  `repo_url` is also screened by the shared SSRF egress guard
+  (`Loopctl.Net.UrlGuard`) just before the clone, but that guard resolves DNS
+  once. `git clone` is a separate subprocess that **re-resolves the hostname at
+  connect time** and cannot be pinned to the validated IP the way a `Req`
+  request can (there is no SNI/`Host`/connect-IP override via the git CLI). A
+  hostile authoritative server answering with TTL=0 can therefore return a
+  public address to the guard and a private one to `git` (DNS rebinding), so the
+  guard does **not** fully close clone-time SSRF. The syntactic rejections
+  (`ext::`/`file://`/leading-dash/non-http scheme) ARE fully effective; the
+  DNS-rebinding residual is the reason this runner must only be enabled inside an
+  egress-restricted sandbox (see the disable flag above).
   """
 
   require Logger
+
+  alias Loopctl.Net.UrlGuard
+  alias Loopctl.Verification.VerificationRun
+
+  @allowed_repo_schemes ~w(https http)
 
   @doc """
   Executes tests for a commit SHA in the given repo.
@@ -28,18 +96,83 @@ defmodule Loopctl.Verification.TestRunner do
   """
   @spec run_tests(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
   def run_tests(repo_url, commit_sha) do
-    work_dir = Path.join(System.tmp_dir!(), "loopctl_verify_#{commit_sha}")
+    # Validate BEFORE building a path or spawning any subprocess. A bad SHA or
+    # URL must never reach `git`, `mix`, or `File.rm_rf/1`. The runner-enabled
+    # gate is checked AFTER validation (validation is pure and side-effect-free)
+    # but still BEFORE any clone/exec, so a disabled runner never touches the
+    # network or filesystem.
+    with :ok <- validate_commit_sha(commit_sha),
+         :ok <- validate_repo_url_syntax(repo_url),
+         :ok <- check_runner_enabled(),
+         :ok <- validate_repo_url_egress(repo_url) do
+      work_dir = build_work_dir()
 
-    try do
-      with :ok <- clone_repo(repo_url, commit_sha, work_dir),
-           {:ok, output} <- execute_mix_test(work_dir) do
-        results = parse_test_output(output)
-        {:ok, results}
+      try do
+        with :ok <- clone_repo(repo_url, commit_sha, work_dir),
+             {:ok, output} <- execute_mix_test(work_dir) do
+          results = parse_test_output(output)
+          {:ok, results}
+        end
+      after
+        # Always clean up the clone — but only ever inside the temp dir.
+        safe_rm_rf(work_dir)
       end
-    after
-      # Always clean up the clone
-      File.rm_rf(work_dir)
     end
+  end
+
+  @doc """
+  Returns `true` when `repo_url` is a well-formed `http`/`https` URL with a real
+  host. Everything else — `ext::`, `file://`, `ssh://`, a bare local path, or a
+  `-`-leading value — is rejected so it can never reach `git clone`.
+  """
+  @spec safe_repo_url?(term()) :: boolean()
+  def safe_repo_url?(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    is_binary(uri.scheme) and String.downcase(uri.scheme) in @allowed_repo_schemes and
+      is_binary(uri.host) and uri.host != "" and
+      not String.starts_with?(url, "-")
+  end
+
+  def safe_repo_url?(_url), do: false
+
+  @doc """
+  Builds the clone working directory: `loopctl_verify_<random>` under the system
+  temp dir. The name is NOT derived from any user input, so it can never contain
+  `/` or `..` and therefore can never escape the temp directory.
+  """
+  @spec build_work_dir() :: String.t()
+  def build_work_dir do
+    unique = 16 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    Path.join(System.tmp_dir!(), "loopctl_verify_" <> unique)
+  end
+
+  @doc """
+  Returns `true` only when `path` resolves to a location strictly inside the
+  system temp directory. Used to fence `File.rm_rf/1` so a malformed or escaped
+  path can never delete an arbitrary directory.
+  """
+  @spec within_tmp?(term()) :: boolean()
+  def within_tmp?(path) when is_binary(path) do
+    tmp = Path.expand(System.tmp_dir!())
+    expanded = Path.expand(path)
+
+    expanded != tmp and String.starts_with?(expanded, tmp <> "/")
+  end
+
+  def within_tmp?(_path), do: false
+
+  @doc """
+  Returns whether the local test runner is enabled.
+
+  Disabled by default — the runner executes untrusted third-party code and is
+  subject to a clone-time DNS-rebinding SSRF residual, so it must be explicitly
+  opted in (and run inside an egress-restricted sandbox) via
+  `config :loopctl, :enable_local_test_runner, true`.
+  """
+  @spec enabled?() :: boolean()
+  def enabled? do
+    Application.get_env(:loopctl, :enable_local_test_runner, false) == true
   end
 
   @doc """
@@ -55,8 +188,52 @@ defmodule Loopctl.Verification.TestRunner do
 
   # --- Private ---
 
+  defp check_runner_enabled do
+    if enabled?(), do: :ok, else: {:error, :runner_disabled}
+  end
+
+  defp validate_commit_sha(commit_sha) do
+    if VerificationRun.valid_commit_sha?(commit_sha) do
+      :ok
+    else
+      {:error, :invalid_commit_sha}
+    end
+  end
+
+  # Pure syntactic guard: closes the RCE/arg-injection vectors (ext::/file://,
+  # non-http scheme, missing host, leading dash). No network I/O — runs before
+  # the enable gate so a syntactically bad URL is rejected even when the runner
+  # is disabled.
+  defp validate_repo_url_syntax(repo_url) do
+    if safe_repo_url?(repo_url), do: :ok, else: {:error, :invalid_repo_url}
+  end
+
+  # SSRF egress guard (resolves DNS). Runs ONLY after the enable gate and only
+  # just before the clone, so a disabled runner performs no network I/O. NOTE:
+  # this does not fully close clone-time SSRF — `git clone` re-resolves DNS at
+  # connect time and can't be IP-pinned (see the moduledoc's DNS-rebinding
+  # note); it is defence in depth, not a complete barrier.
+  defp validate_repo_url_egress(repo_url) do
+    case UrlGuard.validate_egress(repo_url) do
+      {:ok, _uri} -> :ok
+      {:error, _reason} -> {:error, :invalid_repo_url}
+    end
+  end
+
+  defp safe_rm_rf(work_dir) do
+    if within_tmp?(work_dir) do
+      File.rm_rf(work_dir)
+    else
+      Logger.error("TestRunner: refusing to rm_rf path outside tmp: #{inspect(work_dir)}")
+      {:ok, []}
+    end
+  end
+
   defp clone_repo(repo_url, commit_sha, work_dir) do
-    case System.cmd("git", ["clone", "--depth", "1", repo_url, work_dir], stderr_to_stdout: true) do
+    # `--` before positional args: a `-`-leading repo_url can't become a flag.
+    case System.cmd("git", ["clone", "--depth", "1", "--", repo_url, work_dir],
+           stderr_to_stdout: true
+         ) do
       {_, 0} ->
         case System.cmd("git", ["checkout", commit_sha],
                cd: work_dir,

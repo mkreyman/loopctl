@@ -52,6 +52,13 @@ config :loopctl, Loopctl.HeavyReadRepo,
 # tests stay sub-second.
 config :loopctl, :heavy_read_statement_timeout_ms, 250
 
+# Keep the L3 local test runner DISABLED in tests (it clones repos + runs
+# `mix test` on untrusted code). TestRunner's tests exercise the disabled path
+# and the validation-rejection paths WITHOUT ever cloning a real repo; input
+# validation runs before this gate, so validation-rejection is asserted
+# independently of the flag.
+config :loopctl, :enable_local_test_runner, false
+
 # DI (US-27.11): route Loopctl.HeavyRead's heavy reads to AdminRepo in tests, so
 # they see the same sandbox transaction that fixtures write to. Prod/dev default to
 # the dedicated Loopctl.HeavyReadRepo pool.

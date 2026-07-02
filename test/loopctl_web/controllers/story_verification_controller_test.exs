@@ -6,6 +6,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Progress
+  alias Loopctl.Verification.VerificationRun
 
   setup :verify_on_exit!
 
@@ -98,6 +99,55 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert result.summary == "All artifacts present, tests pass"
       assert result.review_type == "enhanced_review"
       assert result.orchestrator_agent_id == orch_agent.id
+    end
+
+    test "enqueues a verification_run and returns run_id for a valid commit_sha", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+      sha = String.duplicate("a", 40)
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good",
+          "review_type" => "enhanced",
+          "commit_sha" => sha
+        })
+
+      body = json_response(conn, 202)
+      assert body["run_id"] != nil
+      refute Map.has_key?(body, "verification_run_error")
+
+      run = Loopctl.AdminRepo.get(VerificationRun, body["run_id"])
+      assert run.commit_sha == sha
+    end
+
+    test "rejects a malformed commit_sha with 422 and does NOT verify the story", %{conn: conn} do
+      %{story: story, orch_key: orch_key} = setup_reported_story()
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post(~p"/api/v1/stories/#{story.id}/verify", %{
+          "summary" => "All good",
+          "review_type" => "enhanced",
+          "commit_sha" => "../../etc/passwd"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "commit_sha"
+      # The raw malicious value is not echoed back verbatim.
+      refute body["error"]["message"] =~ "passwd"
+
+      # The chain-of-custody state was NOT mutated: no misleading "verified" +
+      # no orphaned/missing verification_run.
+      reloaded = Loopctl.AdminRepo.get(Loopctl.WorkBreakdown.Story, story.id)
+      assert reloaded.verified_status == :unverified
+
+      runs =
+        Loopctl.AdminRepo.all(from(r in VerificationRun, where: r.story_id == ^story.id))
+
+      assert runs == []
     end
 
     test "verifies with result=partial", %{conn: conn} do

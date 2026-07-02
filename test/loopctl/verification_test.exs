@@ -7,7 +7,9 @@ defmodule Loopctl.VerificationTest do
 
   import Loopctl.Fixtures
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Verification
+  alias Loopctl.Verification.VerificationRun
 
   setup :verify_on_exit!
 
@@ -23,12 +25,45 @@ defmodule Loopctl.VerificationTest do
     test "creates a pending verification run" do
       %{tenant: tenant, story: story} = setup_ctx()
 
+      sha = String.duplicate("a", 40)
+
       assert {:ok, run} =
-               Verification.create_run(tenant.id, story.id, %{commit_sha: "abc123"})
+               Verification.create_run(tenant.id, story.id, %{commit_sha: sha})
 
       assert run.status == "pending"
       assert run.story_id == story.id
-      assert run.commit_sha == "abc123"
+      assert run.commit_sha == sha
+    end
+  end
+
+  describe "create_run_and_enqueue/3 (atomic run row + Oban job)" do
+    test "creates the run and returns {:ok, run}" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      sha = String.duplicate("a", 40)
+
+      assert {:ok, run} =
+               Verification.create_run_and_enqueue(tenant.id, story.id, %{commit_sha: sha})
+
+      assert run.commit_sha == sha
+      # The run row is persisted (committed with its enqueued job).
+      assert AdminRepo.get(VerificationRun, run.id)
+    end
+
+    test "rolls back atomically on failure — no orphaned 'pending' run row" do
+      %{tenant: tenant, story: story} = setup_ctx()
+
+      # An invalid commit_sha makes the :run insert step fail. Because the run
+      # insert and the Oban job insert share ONE transaction, a failure in
+      # either step rolls back the whole thing — so there is never an orphaned
+      # "pending" run left behind with no job to execute it (nor a job with no
+      # run). This is the atomicity guarantee that replaces the old
+      # create_run + discarded Oban.insert two-step.
+      assert {:error, %Ecto.Changeset{}} =
+               Verification.create_run_and_enqueue(tenant.id, story.id, %{
+                 commit_sha: "../../etc"
+               })
+
+      assert AdminRepo.all(from(r in VerificationRun, where: r.story_id == ^story.id)) == []
     end
   end
 
