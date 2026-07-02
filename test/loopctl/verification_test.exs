@@ -23,12 +23,14 @@ defmodule Loopctl.VerificationTest do
     test "creates a pending verification run" do
       %{tenant: tenant, story: story} = setup_ctx()
 
+      sha = String.duplicate("a", 40)
+
       assert {:ok, run} =
-               Verification.create_run(tenant.id, story.id, %{commit_sha: "abc123"})
+               Verification.create_run(tenant.id, story.id, %{commit_sha: sha})
 
       assert run.status == "pending"
       assert run.story_id == story.id
-      assert run.commit_sha == "abc123"
+      assert run.commit_sha == sha
     end
   end
 
