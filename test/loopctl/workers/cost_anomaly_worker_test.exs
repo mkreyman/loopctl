@@ -3,9 +3,12 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
 
   setup :verify_on_exit!
 
+  import Ecto.Query
+
   alias Loopctl.AdminRepo
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
+  alias Loopctl.TokenUsage.Report
   alias Loopctl.Workers.CostAnomalyWorker
 
   defp setup_tenant_with_epic do
@@ -18,12 +21,7 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
   end
 
   defp create_story_with_reports(tenant, epic, agent, cost_millicents) do
-    story =
-      fixture(:story, %{
-        tenant_id: tenant.id,
-        epic_id: epic.id,
-        project_id: epic.project_id
-      })
+    story = create_bare_story(tenant, epic)
 
     # Insert a token usage report directly for this story
     fixture(:token_usage_report, %{
@@ -35,6 +33,58 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
     })
 
     story
+  end
+
+  defp create_bare_story(tenant, epic) do
+    fixture(:story, %{
+      tenant_id: tenant.id,
+      epic_id: epic.id,
+      project_id: epic.project_id
+    })
+  end
+
+  # Adds a report to a story, optionally backdated `days_ago` days so we can
+  # model a story whose cost is spread across multiple days.
+  defp add_report(tenant, story, agent, epic, cost_millicents, days_ago) do
+    report =
+      fixture(:token_usage_report, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        agent_id: agent.id,
+        project_id: epic.project_id,
+        cost_millicents: cost_millicents
+      })
+
+    if days_ago > 0 do
+      ts = DateTime.add(DateTime.utc_now(), -days_ago, :day)
+
+      from(r in Report, where: r.id == ^report.id)
+      |> AdminRepo.update_all(set: [inserted_at: ts])
+    end
+
+    report
+  end
+
+  # Inserts the epic cost summary the rollup would have written for `period`.
+  # Only its existence (scope_type + period) marks the epic as a candidate; the
+  # comparison baseline is recomputed from cumulative story totals, so `avg` here
+  # only matters for the pre-fix (single-day-slice) behavior.
+  defp insert_epic_summary(ctx, period, avg) do
+    %CostSummary{tenant_id: ctx.tenant.id}
+    |> CostSummary.changeset(%{
+      scope_type: :epic,
+      scope_id: ctx.epic.id,
+      period_start: period,
+      period_end: period,
+      total_cost_millicents: avg,
+      report_count: 1,
+      avg_cost_per_story_millicents: avg
+    })
+    |> AdminRepo.insert!()
+  end
+
+  defp period_args(period) do
+    %{"period_start" => Date.to_iso8601(period), "period_end" => Date.to_iso8601(period)}
   end
 
   describe "perform/1" do
@@ -164,6 +214,12 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
       period_start = Date.utc_today()
       period_end = Date.utc_today()
 
+      # 3 normal + 1 expensive story so the expensive one is genuinely > 3x the
+      # epic per-story-total average: (10k + 10k + 10k + 100k) / 4 = 32_500;
+      # 100_000 / 32_500 = 3.07x.
+      _normal1 = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      _normal2 = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      _normal3 = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
       expensive = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100_000)
 
       # Pre-existing anomaly for this story
@@ -183,9 +239,9 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
         scope_id: ctx.epic.id,
         period_start: period_start,
         period_end: period_end,
-        total_cost_millicents: 100_000,
-        report_count: 1,
-        avg_cost_per_story_millicents: 25_000
+        total_cost_millicents: 130_000,
+        report_count: 4,
+        avg_cost_per_story_millicents: 32_500
       })
       |> AdminRepo.insert!()
 
@@ -202,9 +258,88 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
       assert length(anomalies) == 1
       anomaly = hd(anomalies)
       assert anomaly.id == existing.id
-      # Updated with new figures
+      # Updated with the recomputed cumulative-total figures.
       assert anomaly.story_cost_millicents == 100_000
-      assert anomaly.reference_avg_millicents == 25_000
+      assert anomaly.reference_avg_millicents == 32_500
+    end
+
+    # tokens-06(a): a story that is expensive CUMULATIVELY but cheap on any
+    # single day must still be flagged. The old per-day-slice comparison missed
+    # it because no individual day crossed the threshold.
+    test "flags a story whose cumulative cost across multiple days exceeds 3x the epic average" do
+      ctx = setup_tenant_with_epic()
+      period = Date.utc_today()
+
+      # 5 normal stories, each a single 10k report today.
+      for _ <- 1..5, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+
+      # One expensive story: 60k total spread across 3 days (20k each). No single
+      # day's slice (20k) trips the comparison; only the cumulative total does.
+      expensive = create_bare_story(ctx.tenant, ctx.epic)
+      add_report(ctx.tenant, expensive, ctx.agent, ctx.epic, 20_000, 0)
+      add_report(ctx.tenant, expensive, ctx.agent, ctx.epic, 20_000, 5)
+      add_report(ctx.tenant, expensive, ctx.agent, ctx.epic, 20_000, 10)
+
+      # Epic per-story-total avg = (5*10k + 60k) / 6 = 18_333; 60k/18_333 = 3.27x.
+      insert_epic_summary(ctx, period, 18_333)
+
+      assert :ok = CostAnomalyWorker.perform(%Oban.Job{args: period_args(period)})
+
+      high = AdminRepo.all(CostAnomaly) |> Enum.filter(&(&1.anomaly_type == :high_cost))
+      assert length(high) == 1
+      anomaly = hd(high)
+      assert anomaly.story_id == expensive.id
+      # Full cumulative cost, not a single day's slice.
+      assert anomaly.story_cost_millicents == 60_000
+    end
+
+    # tokens-06(b): a completed story that gets a tiny follow-up report on a
+    # later day must NOT be flagged suspiciously_low -- its cumulative total is
+    # normal even though the follow-up day's slice alone is minuscule.
+    test "does not flag a completed story as suspiciously_low when it gets a small later follow-up" do
+      ctx = setup_tenant_with_epic()
+      period = Date.utc_today()
+
+      # 3 normal stories, each 30k today.
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 30_000)
+
+      # A story that already cost 30k earlier (backdated, out of today's window)
+      # and gets a tiny 100mc follow-up today. Cumulative total = 30_100 (normal),
+      # even though today's slice alone is only 100mc.
+      completed = create_bare_story(ctx.tenant, ctx.epic)
+      add_report(ctx.tenant, completed, ctx.agent, ctx.epic, 30_000, 7)
+      add_report(ctx.tenant, completed, ctx.agent, ctx.epic, 100, 0)
+
+      # Per-story-total avg = (3*30k + 30_100) / 4 = 30_025; 30_100/30_025 ≈ 1.0x.
+      insert_epic_summary(ctx, period, 30_025)
+
+      assert :ok = CostAnomalyWorker.perform(%Oban.Job{args: period_args(period)})
+
+      anomalies = AdminRepo.all(CostAnomaly)
+      refute Enum.any?(anomalies, &(&1.anomaly_type == :suspiciously_low))
+      assert anomalies == []
+    end
+
+    # tokens-06(c): repeated nightly runs over an unchanged total must not pile
+    # up duplicate anomaly rows.
+    test "does not create duplicate anomaly rows across repeated runs for the same unchanged total" do
+      ctx = setup_tenant_with_epic()
+      period = Date.utc_today()
+
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      expensive = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100_000)
+
+      # Per-story-total avg = (3*10k + 100k) / 4 = 32_500; 100k/32_500 = 3.07x.
+      insert_epic_summary(ctx, period, 32_500)
+
+      job = %Oban.Job{args: period_args(period)}
+      assert :ok = CostAnomalyWorker.perform(job)
+      assert :ok = CostAnomalyWorker.perform(job)
+      assert :ok = CostAnomalyWorker.perform(job)
+
+      anomalies = AdminRepo.all(CostAnomaly)
+      assert length(anomalies) == 1
+      assert hd(anomalies).story_id == expensive.id
     end
 
     test "succeeds when no tenants exist" do

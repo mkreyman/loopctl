@@ -59,6 +59,30 @@ defmodule Loopctl.TokenUsageWebhookEventsTest do
     |> AdminRepo.all()
   end
 
+  # Anomaly detection compares a story's cumulative total against the epic's
+  # per-story-total average (tokens-06), so a single expensive story is not
+  # anomalous relative to itself. Seed cheap sibling stories in the same epic so
+  # the target story is genuinely > 3x the epic average.
+  defp seed_cheap_siblings(tenant_id, project_id, epic_id, agent_id, count, cost_millicents) do
+    for _ <- 1..count do
+      sibling =
+        fixture(:story, %{tenant_id: tenant_id, epic_id: epic_id, project_id: project_id})
+
+      {:ok, _report} =
+        TokenUsage.create_report(tenant_id, %{
+          story_id: sibling.id,
+          agent_id: agent_id,
+          project_id: project_id,
+          input_tokens: 100,
+          output_tokens: 50,
+          model_name: "claude-opus-4",
+          cost_millicents: cost_millicents
+        })
+    end
+
+    :ok
+  end
+
   # --- AC-21.7.1: New event types are registered ---
 
   describe "valid event types (AC-21.7.1)" do
@@ -595,6 +619,10 @@ defmodule Loopctl.TokenUsageWebhookEventsTest do
           cost_millicents: 20_000
         })
 
+      # Cheap siblings so the 20k story is > 3x the epic per-story-total avg:
+      # (20k + 3*1k) / 4 = 5_750; 20k/5_750 = 3.48x.
+      seed_cheap_siblings(tenant.id, project.id, epic.id, agent.id, 3, 1_000)
+
       # Run the worker which will detect the anomaly from yesterday's rollup data
       # Since we're in Oban inline mode and the worker runs against yesterday's period,
       # we test via perform/1 with an explicit period matching today
@@ -655,6 +683,9 @@ defmodule Loopctl.TokenUsageWebhookEventsTest do
           cost_millicents: 20_000
         })
 
+      # (20k + 3*1k) / 4 = 5_750; 20k/5_750 = 3.48x -> high_cost.
+      seed_cheap_siblings(tenant.id, project.id, epic.id, agent.id, 3, 1_000)
+
       job_args = %{
         "period_start" => Date.to_iso8601(period),
         "period_end" => Date.to_iso8601(period)
@@ -703,6 +734,9 @@ defmodule Loopctl.TokenUsageWebhookEventsTest do
           model_name: "claude-opus-4",
           cost_millicents: 20_000
         })
+
+      # (20k + 3*1k) / 4 = 5_750; 20k/5_750 = 3.48x -> high_cost.
+      seed_cheap_siblings(tenant.id, project.id, epic.id, agent.id, 3, 1_000)
 
       job_args = %{
         "period_start" => Date.to_iso8601(period),
@@ -841,6 +875,9 @@ defmodule Loopctl.TokenUsageWebhookEventsTest do
           model_name: "claude-opus-4",
           cost_millicents: 20_000
         })
+
+      # (20k + 3*1k) / 4 = 5_750; 20k/5_750 = 3.48x -> high_cost for tenant A.
+      seed_cheap_siblings(tenant_a.id, project_a.id, epic_a.id, agent_a.id, 3, 1_000)
 
       job_args = %{
         "period_start" => Date.to_iso8601(period),

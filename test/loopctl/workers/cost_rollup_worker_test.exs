@@ -120,22 +120,130 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
       assert hd(summaries).total_cost_millicents == 15_000
     end
 
-    test "handles rollup service errors gracefully" do
-      tenant = fixture(:tenant)
+    # tokens-08: a transient per-tenant failure must NOT be swallowed into :ok
+    # (Oban would never retry, permanently losing that day's summaries). The job
+    # must return an error so Oban retries, while succeeded tenants stay persisted.
+    test "returns an error (so Oban retries) when a tenant rollup fails, still persisting succeeded tenants" do
+      good_tenant = fixture(:tenant)
+      bad_tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: good_tenant.id})
 
-      expect(Loopctl.MockCostRollup, :aggregate, fn _, _, _ ->
-        {:error, "database timeout"}
+      good_tenant_id = good_tenant.id
+      bad_tenant_id = bad_tenant.id
+
+      expect(Loopctl.MockCostRollup, :aggregate, 2, fn tenant_id, _start, _end ->
+        cond do
+          tenant_id == good_tenant_id ->
+            {:ok,
+             [
+               %{
+                 scope_type: :project,
+                 scope_id: project.id,
+                 total_input_tokens: 1_000,
+                 total_output_tokens: 500,
+                 total_cost_millicents: 2_000,
+                 report_count: 2,
+                 model_breakdown: %{},
+                 avg_cost_per_story_millicents: 1_000
+               }
+             ]}
+
+          tenant_id == bad_tenant_id ->
+            {:error, "database timeout"}
+        end
       end)
 
-      # Should still return :ok (logs errors but doesn't fail job)
+      result =
+        CostRollupWorker.perform(%Oban.Job{
+          args: %{
+            "period_start" => "2026-04-02",
+            "period_end" => "2026-04-02",
+            "tenant_ids" => [good_tenant.id, bad_tenant.id]
+          }
+        })
+
+      # Not :ok -> Oban will retry the job
+      assert {:error, {:rollup_failed, failed_ids}} = result
+      assert bad_tenant.id in failed_ids
+      refute good_tenant.id in failed_ids
+
+      import Ecto.Query
+
+      # The good tenant's summary was still written despite the other's failure.
+      good_summaries =
+        from(c in CostSummary, where: c.tenant_id == ^good_tenant.id) |> AdminRepo.all()
+
+      assert length(good_summaries) == 1
+      assert hd(good_summaries).total_cost_millicents == 2_000
+
+      # The failed tenant wrote nothing.
+      bad_summaries =
+        from(c in CostSummary, where: c.tenant_id == ^bad_tenant.id) |> AdminRepo.all()
+
+      assert bad_summaries == []
+    end
+
+    # tokens-09: a multi-day backfill (period_start..period_end) must produce ONE
+    # daily summary row PER DAY, not a single collapsed row at period_start.
+    test "backfill over a date range writes one daily summary row per day" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      d1 = ~D[2026-04-01]
+      d2 = ~D[2026-04-02]
+      d3 = ~D[2026-04-03]
+
+      # Each day rolls up its OWN totals; the worker must call aggregate once per
+      # day with a single-day window (period_start == period_end == day).
+      day_cost = fn
+        ^d1 -> 1_000
+        ^d2 -> 2_000
+        ^d3 -> 3_000
+      end
+
+      expect(Loopctl.MockCostRollup, :aggregate, 3, fn _tenant_id, start_date, end_date ->
+        assert start_date == end_date
+
+        {:ok,
+         [
+           %{
+             scope_type: :project,
+             scope_id: project.id,
+             total_input_tokens: 0,
+             total_output_tokens: 0,
+             total_cost_millicents: day_cost.(start_date),
+             report_count: 1,
+             model_breakdown: %{},
+             avg_cost_per_story_millicents: nil
+           }
+         ]}
+      end)
+
       assert :ok =
                CostRollupWorker.perform(%Oban.Job{
                  args: %{
-                   "period_start" => "2026-04-02",
-                   "period_end" => "2026-04-02",
+                   "period_start" => Date.to_iso8601(d1),
+                   "period_end" => Date.to_iso8601(d3),
                    "tenant_ids" => [tenant.id]
                  }
                })
+
+      import Ecto.Query
+
+      summaries =
+        from(c in CostSummary,
+          where: c.tenant_id == ^tenant.id,
+          order_by: c.period_start
+        )
+        |> AdminRepo.all()
+
+      # THREE daily rows, not one collapsed row at d1.
+      assert length(summaries) == 3
+
+      assert Enum.map(summaries, & &1.period_start) == [d1, d2, d3]
+      # Each row is a single-day period with its own totals.
+      assert Enum.all?(summaries, fn s -> s.period_start == s.period_end end)
+      assert Enum.map(summaries, & &1.total_cost_millicents) == [1_000, 2_000, 3_000]
     end
 
     test "defaults period to yesterday when not provided" do

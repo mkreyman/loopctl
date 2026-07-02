@@ -53,37 +53,37 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   end
 
   defp detect_anomalies(tenant_id, period_start, period_end) do
-    # Get epic summaries for this period that have an avg cost
-    epic_summaries =
+    # Which epics to (re-)evaluate this run: those that were rolled up in the
+    # period. The rollup writes DAILY epic summaries (period_start == period_end
+    # == day), so a backfill range D1..D3 is covered by matching any summary
+    # whose period_start falls within [period_start, period_end] rather than an
+    # exact (start, end) pair (tokens-09 consistency).
+    epic_ids =
       CostSummary
       |> where([cs], cs.tenant_id == ^tenant_id)
       |> where([cs], cs.scope_type == :epic)
-      |> where([cs], cs.period_start == ^period_start)
-      |> where([cs], cs.period_end == ^period_end)
-      |> where([cs], not is_nil(cs.avg_cost_per_story_millicents))
-      |> where([cs], cs.avg_cost_per_story_millicents > 0)
+      |> where([cs], cs.period_start >= ^period_start and cs.period_start <= ^period_end)
+      |> select([cs], cs.scope_id)
+      |> distinct(true)
       |> AdminRepo.all()
 
-    if epic_summaries == [] do
-      :ok
-    else
-      # Build a map of epic_id => avg_cost_per_story_millicents for fast lookup
-      epic_avg_map =
-        Map.new(epic_summaries, fn cs -> {cs.scope_id, cs.avg_cost_per_story_millicents} end)
-
-      epic_ids = Map.keys(epic_avg_map)
-      check_all_epic_stories(tenant_id, epic_ids, epic_avg_map, period_start, period_end)
+    if epic_ids != [] do
+      check_all_epic_stories(tenant_id, epic_ids)
     end
 
     :ok
   end
 
-  # Issues ONE query for per-story costs across ALL epics, then processes in memory.
-  defp check_all_epic_stories(tenant_id, epic_ids, epic_avg_map, period_start, period_end) do
-    start_dt = NaiveDateTime.new!(period_start, ~T[00:00:00])
-    end_dt = NaiveDateTime.new!(period_end, ~T[23:59:59.999999])
-
-    # Single query: per-story costs grouped by (story_id, epic_id) for all epics
+  # Anomaly detection compares LIKE-FOR-LIKE: a story's CUMULATIVE lifetime cost
+  # against the epic's per-story average of those same cumulative totals
+  # (tokens-06). Using a single day's slice both (a) missed multi-day-expensive
+  # stories whose per-day cost stayed under threshold, and (b) produced false
+  # `suspiciously_low` flags when an already-counted story got a tiny follow-up
+  # report on a later day. There is deliberately NO inserted_at window here.
+  #
+  # Issues ONE query for per-story lifetime costs across ALL epics, then
+  # processes in memory.
+  defp check_all_epic_stories(tenant_id, epic_ids) do
     story_costs =
       Report
       |> join(:inner, [r], s in Story, on: r.story_id == s.id)
@@ -91,7 +91,6 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       |> where([r, _s], is_nil(r.deleted_at))
       |> Report.exclude_stranded_corrections()
       |> where([_r, s], s.epic_id in ^epic_ids)
-      |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> group_by([r, s], [r.story_id, s.epic_id])
       |> select([r, s], %{
         story_id: r.story_id,
@@ -100,10 +99,25 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       })
       |> AdminRepo.all()
 
+    epic_avg_map = build_epic_avg_map(story_costs)
+
     Enum.each(story_costs, fn %{story_id: story_id, epic_id: epic_id, total_cost: total_cost} ->
       epic_avg = Map.get(epic_avg_map, epic_id)
       cost = to_int(total_cost)
       check_and_flag_anomaly(tenant_id, story_id, cost, epic_avg)
+    end)
+  end
+
+  # Epic per-story-total average, computed from the same cumulative story totals
+  # we compare against (each story counted once).
+  defp build_epic_avg_map(story_costs) do
+    story_costs
+    |> Enum.group_by(& &1.epic_id)
+    |> Map.new(fn {epic_id, stories} ->
+      totals = Enum.map(stories, &to_int(&1.total_cost))
+      count = length(totals)
+      avg = if count > 0, do: div(Enum.sum(totals), count), else: 0
+      {epic_id, avg}
     end)
   end
 

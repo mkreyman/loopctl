@@ -41,33 +41,63 @@ defmodule Loopctl.Workers.CostRollupWorker do
     # Allow overriding the period for testing/backfills
     {period_start, period_end} = resolve_period(args)
 
+    # cost_summaries are DAILY-granularity rows keyed on the unique index
+    # (tenant_id, scope_type, scope_id, period_start). A multi-day range is a
+    # backfill: roll up and upsert EACH day independently (each day is the
+    # window [day, day]) so daily summaries stay correct and a range never
+    # collapses into a single overwriting row at period_start (tokens-09).
+    days = Date.range(period_start, period_end)
+
     tenants = list_active_tenants(args)
-    Logger.info("CostRollupWorker: starting rollup for #{length(tenants)} tenants")
 
-    results =
-      Enum.map(tenants, fn tenant ->
-        case rollup_tenant(tenant.id, period_start, period_end) do
-          :ok ->
-            :ok
+    Logger.info(
+      "CostRollupWorker: starting rollup for #{length(tenants)} tenant(s) over #{Enum.count(days)} day(s)"
+    )
 
-          {:error, reason} ->
-            Logger.warning("CostRollupWorker: failed for tenant #{tenant.id}: #{inspect(reason)}")
+    failures =
+      for tenant <- tenants, day <- days, reduce: [] do
+        acc ->
+          case rollup_tenant(tenant.id, day, day) do
+            :ok ->
+              acc
 
-            {:error, tenant.id, reason}
-        end
-      end)
+            {:error, reason} ->
+              Logger.warning(
+                "CostRollupWorker: failed for tenant #{tenant.id} on #{Date.to_iso8601(day)}: " <>
+                  "#{inspect(reason)}"
+              )
 
-    errors = Enum.filter(results, &match?({:error, _, _}, &1))
-
-    if errors != [] do
-      Logger.warning("CostRollupWorker: #{length(errors)} tenant(s) failed")
-    end
+              [{tenant.id, day, reason} | acc]
+          end
+      end
 
     # Chain the anomaly worker regardless of partial failures so that
-    # successful tenants still get anomaly detection (ADV-11).
+    # successful tenants still get anomaly detection (ADV-11). Both the upsert
+    # and the chained job are idempotent, so a retry of this job re-runs them
+    # safely.
     chain_anomaly_worker(period_start, period_end)
 
-    :ok
+    handle_failures(failures)
+  end
+
+  # A failed tenant/day rollup (e.g. a transient DB timeout or connection drop)
+  # must NOT be reported as success -- Oban treats :ok as done and would never
+  # retry, permanently losing that day's cost_summaries (tokens-08). Succeeded
+  # tenant/days are already persisted via the idempotent upsert, so returning an
+  # error only re-computes identical rows for them on retry while giving the
+  # failed ones another attempt. Failed tenant ids are surfaced for observability.
+  defp handle_failures([]), do: :ok
+
+  defp handle_failures(failures) do
+    failed_tenant_ids =
+      failures |> Enum.map(fn {tenant_id, _day, _reason} -> tenant_id end) |> Enum.uniq()
+
+    Logger.warning(
+      "CostRollupWorker: #{length(failures)} tenant/day rollup(s) failed across " <>
+        "#{length(failed_tenant_ids)} tenant(s); returning error so Oban retries"
+    )
+
+    {:error, {:rollup_failed, failed_tenant_ids}}
   end
 
   @doc false

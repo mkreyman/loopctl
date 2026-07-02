@@ -14,6 +14,8 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
 
   import Ecto.Query
 
+  require Logger
+
   alias Loopctl.AdminRepo
   alias Loopctl.TokenUsage.Report
   alias Loopctl.WorkBreakdown.Story
@@ -30,7 +32,20 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
 
     {:ok, agent_rows ++ epic_rows ++ project_rows}
   rescue
-    e -> {:error, Exception.message(e)}
+    e ->
+      # Isolate the failure to this tenant/day (don't crash the whole batch),
+      # but surface it as {:error} so CostRollupWorker returns an error and Oban
+      # retries -- a transient DB error must not be swallowed into a success
+      # that permanently loses this day's summaries (tokens-08). Log with the
+      # stacktrace so a genuine (non-transient) bug is still observable rather
+      # than masked behind blanket retries.
+      Logger.error(
+        "DefaultRollup.aggregate failed for tenant #{tenant_id} " <>
+          "(#{Date.to_iso8601(period_start)}..#{Date.to_iso8601(period_end)}): " <>
+          Exception.format(:error, e, __STACKTRACE__)
+      )
+
+      {:error, Exception.message(e)}
   end
 
   # --- Agent scope ---
