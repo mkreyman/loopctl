@@ -37,6 +37,7 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
 
   @behaviour Plug
 
+  import Ecto.Query, only: [from: 2]
   import Plug.Conn
 
   require Logger
@@ -49,6 +50,10 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   # exactly 22 characters. This is the ONLY accepted client prefix length —
   # the comparison window is fixed by the server, not by client input.
   @sig_prefix_length 22
+  # chain_position is a Postgres bigint; reject anything outside the signed
+  # 64-bit range up front so an oversized (arbitrary-precision) Elixir int
+  # never reaches the query and raises a DBConnection.EncodeError (custody-03b).
+  @max_chain_position 9_223_372_036_854_775_807
   @zero_sth_prefix Base.url_encode64(:binary.copy(<<0>>, 16), padding: false)
   @zero_sth "0:#{@zero_sth_prefix}"
 
@@ -120,11 +125,17 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
 
     if tenant_id do
       case Integer.parse(position_str) do
-        {position, ""} when position >= 0 ->
+        {position, ""} when position >= 0 and position <= @max_chain_position ->
           compare_against_server_sth(conn, tenant_id, position, sig_prefix)
 
         _ ->
-          malformed(conn, "Position must be a non-negative integer")
+          # custody-03b: rejects negatives, non-integers, AND values beyond the
+          # Postgres bigint range BEFORE the query, so an oversized position
+          # yields a 412 rather than a 500 from Postgrex.
+          malformed(
+            conn,
+            "Position must be a non-negative integer within the signed 64-bit range"
+          )
       end
     else
       # No tenant context (superadmin or public) — skip divergence check.
@@ -135,8 +146,11 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   defp compare_against_server_sth(conn, tenant_id, position, sig_prefix) do
     case AuditChain.get_sth_at_position(tenant_id, position) do
       nil ->
-        # No STH at this position — agent may be ahead of the server, allow.
-        conn
+        # custody-02: NO pass-through. The server is the SOLE source of STHs, so
+        # a position beyond the tenant's latest sealed STH is not something an
+        # honest agent can know (its cached position is always <= latest sealed).
+        # Treat it as resync-required, never a silent bypass.
+        resync_required(conn, tenant_id, position, sig_prefix, "future_position")
 
       sth ->
         server_prefix = server_sig_prefix(sth.signature)
@@ -146,25 +160,27 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
         if Plug.Crypto.secure_compare(server_prefix, sig_prefix) do
           conn
         else
-          witness_divergence(conn, tenant_id, position, sig_prefix, server_prefix)
+          resync_required(conn, tenant_id, position, sig_prefix, "prefix_mismatch")
         end
     end
   end
 
-  # custody-01: a raw client-supplied prefix mismatch is NOT proof of a fork —
-  # it is almost always a stale client cache. Do NOT halt the tenant. Tell the
-  # client to resync (handing it the current STH) and emit telemetry so genuine
-  # divergence can be monitored/alerted out-of-band.
-  defp witness_divergence(conn, tenant_id, position, sig_prefix, server_prefix) do
+  # custody-01/02: a raw client-supplied prefix mismatch OR an unverifiable
+  # (future) position is NOT proof of a fork — it is almost always a stale
+  # client cache. Do NOT halt the tenant. Tell the client to resync (handing it
+  # the current STH) and emit telemetry so genuine divergence can be
+  # monitored/alerted out-of-band. Shared by the prefix-mismatch and
+  # future-position cases so they return the identical 409 + resync response.
+  defp resync_required(conn, tenant_id, position, sig_prefix, reason) do
     Logger.warning(
       "WITNESS DIVERGENCE (client-reported, NOT halting): tenant=#{tenant_id} " <>
-        "position=#{position} client_prefix=#{sig_prefix} server_prefix=#{server_prefix}"
+        "position=#{position} reason=#{reason} client_prefix=#{sig_prefix}"
     )
 
     :telemetry.execute(
       [:loopctl, :witness, :divergence],
       %{count: 1},
-      %{tenant_id: tenant_id, position: position}
+      %{tenant_id: tenant_id, position: position, reason: reason}
     )
 
     conn
@@ -185,45 +201,42 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
     |> halt()
   end
 
-  # custody-03: one-time bootstrap grace, keyed on the resolved API key.
+  # custody-03: one-time bootstrap grace, made ATOMIC and DB-authoritative to
+  # close a read-then-write TOCTOU race — the in-memory struct's nil is NOT
+  # trusted. A single conditional UPDATE guarded by the NULL predicate decides
+  # the winner: exactly one concurrent first-request flips the column (count 1)
+  # and is granted; every other (count 0) is already consumed and rejected.
   defp handle_bootstrap_grace(conn) do
     case conn.assigns[:current_api_key] do
-      %ApiKey{sth_bootstrap_consumed_at: nil} = api_key ->
-        grant_bootstrap_grace(conn, api_key)
-
-      %ApiKey{} ->
-        # Already bootstrapped once — must present a real witness header now.
-        bootstrap_already_consumed(conn)
+      %ApiKey{id: id, tenant_id: tenant_id} when is_binary(id) ->
+        atomic_consume_bootstrap(conn, id, tenant_id)
 
       _ ->
-        # No resolved API key row to record consumption on (defensive: the
-        # authenticated pipeline sets current_api_key before this plug). Grant
-        # the grace without stamping rather than crashing.
-        put_bootstrap_headers(conn, get_tenant_id(conn))
-    end
-  end
-
-  defp grant_bootstrap_grace(conn, %ApiKey{} = api_key) do
-    case stamp_bootstrap_consumed(api_key) do
-      {:ok, _updated} ->
-        put_bootstrap_headers(conn, api_key.tenant_id)
-
-      {:error, reason} ->
-        # Fail closed: if we cannot record consumption we must not grant an
-        # unbounded (repeatable) grace. Fall back to requiring the header.
-        Logger.warning(
-          "ValidateWitnessHeader: failed to stamp bootstrap consumption for " <>
-            "api_key=#{api_key.id}: #{inspect(reason)}"
-        )
-
+        # No resolved API key row to record consumption on — cannot grant a
+        # bounded one-time grace, so require the real header (fail closed).
+        # Defensive: the authenticated pipeline sets current_api_key first.
         missing_header(conn)
     end
   end
 
-  defp stamp_bootstrap_consumed(%ApiKey{} = api_key) do
-    api_key
-    |> ApiKey.consume_bootstrap_changeset()
-    |> AdminRepo.update()
+  defp atomic_consume_bootstrap(conn, id, tenant_id) do
+    {count, _} =
+      from(a in ApiKey, where: a.id == ^id and is_nil(a.sth_bootstrap_consumed_at))
+      |> AdminRepo.update_all(set: [sth_bootstrap_consumed_at: DateTime.utc_now()])
+
+    case count do
+      1 -> put_bootstrap_headers(conn, tenant_id)
+      0 -> bootstrap_already_consumed(conn)
+    end
+  rescue
+    exception ->
+      # Fail closed on a DB error: never grant an unbounded (repeatable) grace.
+      Logger.warning(
+        "ValidateWitnessHeader: atomic bootstrap consume failed for " <>
+          "api_key=#{id}: #{inspect(exception)}"
+      )
+
+      missing_header(conn)
   end
 
   defp put_bootstrap_headers(conn, tenant_id) do

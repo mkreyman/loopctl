@@ -214,14 +214,90 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
                "witness_bootstrap_already_consumed"
     end
 
-    test "no resolved api key (superadmin/absent) does not crash and grants grace" do
+    test "atomic consume is single-winner even when the in-memory struct still shows nil (TOCTOU)" do
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      assert is_nil(api_key.sth_bootstrap_consumed_at)
+
+      # Both requests carry the SAME pre-fetched nil struct — exactly what two
+      # concurrent first-requests would read before either writes. The old
+      # read-then-write logic granted BOTH; the atomic conditional UPDATE must
+      # let exactly one win and reject the other 412.
+      conn1 = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+      conn2 = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+
+      conns = [conn1, conn2]
+      granted = Enum.count(conns, fn c -> not c.halted end)
+
+      rejected =
+        Enum.count(conns, fn c ->
+          c.halted and c.status == 412 and
+            Jason.decode!(c.resp_body)["error"]["code"] == "witness_bootstrap_already_consumed"
+        end)
+
+      assert granted == 1
+      assert rejected == 1
+
+      # And the DB reflects a single consumption stamp.
+      reloaded = AdminRepo.get!(ApiKey, api_key.id)
+      assert %DateTime{} = reloaded.sth_bootstrap_consumed_at
+    end
+
+    test "no resolved api key (absent) cannot bootstrap — 412 missing header, no crash" do
       conn =
         base_conn()
         |> put_req_header("x-loopctl-sth-bootstrap", "true")
         |> ValidateWitnessHeader.call(@enforce)
 
-      refute conn.halted
-      assert [_sth] = get_resp_header(conn, "x-loopctl-current-sth")
+      assert conn.halted
+      assert conn.status == 412
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_header_missing"
+    end
+  end
+
+  describe "FIX 2 — a future position cannot skip the divergence check" do
+    test "position beyond the latest sealed STH returns 409 resync, no pass-through, no halt" do
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      tenant_id = api_key.tenant_id
+      # Latest sealed STH is at position 5; nothing exists at/after 999_999_999.
+      insert_sth(tenant_id, 5)
+
+      conn =
+        base_conn()
+        |> put_req_header("x-loopctl-last-known-sth", "999999999:#{@other_prefix}")
+        |> with_api_key(api_key)
+        |> ValidateWitnessHeader.call(@enforce)
+
+      # Must NOT pass through — it is halted with the resync 409.
+      assert conn.halted
+      assert conn.status == 409
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_divergence"
+
+      assert [hint] = get_resp_header(conn, "x-loopctl-current-sth")
+      assert hint =~ ~r/\A\d+:[A-Za-z0-9_-]{22}\z/
+
+      # And custody is NOT halted by this raw client input.
+      {:ok, tenant} = Tenants.get_tenant(tenant_id)
+      refute Tenants.custody_halted?(tenant)
+    end
+  end
+
+  describe "FIX 3 — oversized position is rejected, not a 500" do
+    test "a position larger than bigint max returns 412 malformed (no Postgrex encode 500)" do
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      insert_sth(api_key.tenant_id, 5)
+
+      conn =
+        base_conn()
+        |> put_req_header(
+          "x-loopctl-last-known-sth",
+          "99999999999999999999999999:#{@other_prefix}"
+        )
+        |> with_api_key(api_key)
+        |> ValidateWitnessHeader.call(@enforce)
+
+      assert conn.halted
+      assert conn.status == 412
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_header_malformed"
     end
   end
 end
