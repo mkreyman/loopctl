@@ -11,10 +11,23 @@ defmodule LoopctlWeb.TokenUsageCorrectionsControllerTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Skills
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  defp same_tenant_skill_version(tenant_id) do
+    skill =
+      fixture(:skill, %{
+        tenant_id: tenant_id,
+        name: "skill-#{System.unique_integer([:positive])}"
+      })
+
+    {:ok, version} = Skills.get_version(tenant_id, skill.id, 1)
+    version
   end
 
   defp setup_with_user_key do
@@ -262,6 +275,101 @@ defmodule LoopctlWeb.TokenUsageCorrectionsControllerTest do
         })
 
       assert json_response(conn, 404)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # tokens-10: skill_version tenant-ownership on the correction path
+  # ---------------------------------------------------------------------------
+
+  describe "POST /api/v1/token-usage/:id/correction — skill_version ownership (tokens-10)" do
+    test "cross-tenant skill_version_id is rejected 422, no correction stored", %{conn: conn} do
+      %{user_key: user_key, agent_key: agent_key, story: story, report: report} =
+        setup_with_user_key()
+
+      # A skill_version owned by a DIFFERENT tenant — tenant isolation.
+      other_tenant = fixture(:tenant)
+      foreign_version = same_tenant_skill_version(other_tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-usage/#{report.id}/correction", %{
+          "input_tokens" => -100,
+          "output_tokens" => -50,
+          "cost_millicents" => -250,
+          "skill_version_id" => foreign_version.id
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "skill_version_id"
+
+      # No correction row stored: only the original report remains.
+      list_conn =
+        build_conn()
+        |> auth_conn(agent_key)
+        |> get(~p"/api/v1/stories/#{story.id}/token-usage")
+
+      assert json_response(list_conn, 200)["meta"]["total_count"] == 1
+    end
+
+    test "same-tenant skill_version_id creates the correction (201)", %{conn: conn} do
+      %{tenant: tenant, user_key: user_key, report: report} = setup_with_user_key()
+      version = same_tenant_skill_version(tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-usage/#{report.id}/correction", %{
+          "input_tokens" => -100,
+          "output_tokens" => -50,
+          "cost_millicents" => -250,
+          "skill_version_id" => version.id
+        })
+
+      body = json_response(conn, 201)
+      assert body["token_usage_report"]["skill_version_id"] == version.id
+    end
+
+    test "nonexistent skill_version_id is rejected 422, no correction stored", %{conn: conn} do
+      %{user_key: user_key, agent_key: agent_key, story: story, report: report} =
+        setup_with_user_key()
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-usage/#{report.id}/correction", %{
+          "input_tokens" => -100,
+          "output_tokens" => -50,
+          "cost_millicents" => -250,
+          "skill_version_id" => Ecto.UUID.generate()
+        })
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+
+      list_conn =
+        build_conn()
+        |> auth_conn(agent_key)
+        |> get(~p"/api/v1/stories/#{story.id}/token-usage")
+
+      assert json_response(list_conn, 200)["meta"]["total_count"] == 1
+    end
+
+    test "malformed (non-UUID) skill_version_id yields 422, not 500", %{conn: conn} do
+      %{user_key: user_key, report: report} = setup_with_user_key()
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-usage/#{report.id}/correction", %{
+          "input_tokens" => -100,
+          "output_tokens" => -50,
+          "cost_millicents" => -250,
+          "skill_version_id" => "not-a-uuid"
+        })
+
+      assert json_response(conn, 422)["error"]["status"] == 422
     end
   end
 end
