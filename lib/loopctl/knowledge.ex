@@ -3143,6 +3143,14 @@ defmodule Loopctl.Knowledge do
   @spec create_link(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ArticleLink.t()} | {:error, Ecto.Changeset.t() | :target_not_found}
   def create_link(tenant_id, attrs, opts \\ []) do
+    # kb-02 DEFENSE IN DEPTH: provenance/score flags are SYSTEM-authored only. Strip them
+    # from any caller-supplied metadata before building the changeset so no create_link
+    # path (the public API controller AND direct callers like OKF import) can plant the
+    # `auto_generated`/`similarity_score` markers that promote_conflicts/1 and
+    # validate_potential_conflict_exists/3 trust. System conflict-writers
+    # (ArticleLinkingWorker, promote_conflicts) insert via AdminRepo directly, NOT through
+    # create_link, so this stripping never touches legitimate system provenance.
+    attrs = strip_system_metadata(attrs)
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]
     rel_type = attrs[:relationship_type] || attrs["relationship_type"]
@@ -3261,6 +3269,9 @@ defmodule Loopctl.Knowledge do
         as: :link,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
+        # kb-02: only surface SYSTEM-flagged conflicts as resolvable evidence, so a stray
+        # or legacy non-system potential_conflict row is never presented to a :user.
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where:
           not exists(
             from(r in ConflictResolution,
@@ -3327,63 +3338,104 @@ defmodule Loopctl.Knowledge do
   (default `:medium`). Returns `{:ok, %ConflictResolution{}}` or `{:error, changeset}`.
   """
   @spec annotate_conflict(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, ConflictResolution.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, ConflictResolution.t()}
+          | {:error, Ecto.Changeset.t() | :no_potential_conflict}
   def annotate_conflict(tenant_id, attrs, opts \\ []) do
     get = fn key -> attrs[key] || attrs[to_string(key)] end
     {src, tgt} = canonical_pair(get.(:source_article_id), get.(:target_article_id))
-    disposition = get.(:disposition)
-    now = DateTime.utc_now()
 
-    row_attrs = %{
-      source_article_id: src,
-      target_article_id: tgt,
-      authoritative_article_id: get.(:authoritative_article_id),
-      classification: get.(:classification),
-      disposition: disposition,
-      confidence: get.(:confidence) || :medium,
-      evidence: get.(:evidence),
-      annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
-      annotated_at: now,
-      # A dismiss is complete on record; supersede/merge defer to the executor.
-      executed_at: if(to_string(disposition) == "dismiss", do: now, else: nil),
-      execution_result: %{}
-    }
+    # kb-02 (GHSA-9gqg-9r6p-658v): a verdict may only be recorded against a REAL,
+    # system-flagged conflict. Without this guard an agent could fabricate a verdict
+    # on ANY two in-tenant articles and have the nightly executor retire/merge one of
+    # them. Require a `:potential_conflict` ArticleLink for the pair (the linker/lint
+    # sweep flags these; stored in either direction) BEFORE accepting any disposition.
+    with :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
+      disposition = get.(:disposition)
+      now = DateTime.utc_now()
 
-    changeset =
-      %ConflictResolution{tenant_id: tenant_id}
-      |> ConflictResolution.changeset(row_attrs)
+      row_attrs = %{
+        source_article_id: src,
+        target_article_id: tgt,
+        authoritative_article_id: get.(:authoritative_article_id),
+        classification: get.(:classification),
+        disposition: disposition,
+        confidence: get.(:confidence) || :medium,
+        evidence: get.(:evidence),
+        annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+        annotated_at: now,
+        # A dismiss is complete on record; supersede/merge defer to the executor.
+        # Compare without to_string/1 so a non-scalar disposition (e.g. a JSON object)
+        # can't raise here — it falls through to the changeset's inclusion validation.
+        executed_at: if(disposition in ["dismiss", :dismiss], do: now, else: nil),
+        execution_result: %{}
+      }
 
-    result =
-      AdminRepo.insert(changeset,
-        on_conflict:
-          {:replace,
-           [
-             :authoritative_article_id,
-             :classification,
-             :disposition,
-             :confidence,
-             :evidence,
-             :annotated_by,
-             :annotated_at,
-             :executed_at,
-             :execution_result,
-             :updated_at
-           ]},
-        conflict_target: [:tenant_id, :source_article_id, :target_article_id]
-      )
+      changeset =
+        %ConflictResolution{tenant_id: tenant_id}
+        |> ConflictResolution.changeset(row_attrs)
 
-    with {:ok, %ConflictResolution{disposition: :dismiss} = res} <- result do
-      log_resolution(
-        tenant_id,
-        res,
-        "dismiss",
-        "dismissed as #{res.classification || "not-a-conflict"}",
-        [res.source_article_id, res.target_article_id]
-      )
+      result =
+        AdminRepo.insert(changeset,
+          on_conflict:
+            {:replace,
+             [
+               :authoritative_article_id,
+               :classification,
+               :disposition,
+               :confidence,
+               :evidence,
+               :annotated_by,
+               :annotated_at,
+               :executed_at,
+               :execution_result,
+               :updated_at
+             ]},
+          conflict_target: [:tenant_id, :source_article_id, :target_article_id]
+        )
+
+      with {:ok, %ConflictResolution{disposition: :dismiss} = res} <- result do
+        log_resolution(
+          tenant_id,
+          res,
+          "dismiss",
+          "dismissed as #{res.classification || "not-a-conflict"}",
+          [res.source_article_id, res.target_article_id]
+        )
+      end
+
+      result
     end
-
-    result
   end
+
+  # kb-02: true only when the linker/lint sweep actually flagged this pair as a
+  # potential conflict (link stored in either direction). When an id is missing we
+  # return :ok and defer to the changeset's required-field validation (surfaces as a
+  # 422) rather than masking a malformed request as "no conflict".
+  #
+  # PROVENANCE (kb-02 FIX A, defense in depth): require the flag to be SYSTEM-generated
+  # (`metadata.auto_generated == true`), the marker both writer sites set —
+  # `KnowledgeLintWorker.promote_conflicts/1` and `ArticleLinkingWorker`. Presence of a
+  # `:potential_conflict` link alone is NOT sufficient evidence: even though the public
+  # link controller now refuses to create that type, requiring the provenance marker
+  # means no future/alternate path that plants such a link can be leveraged to fabricate
+  # a destructive verdict.
+  defp validate_potential_conflict_exists(tenant_id, src, tgt)
+       when is_binary(src) and is_binary(tgt) do
+    exists? =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        where:
+          (l.source_article_id == ^src and l.target_article_id == ^tgt) or
+            (l.source_article_id == ^tgt and l.target_article_id == ^src)
+      )
+      |> AdminRepo.exists?()
+
+    if exists?, do: :ok, else: {:error, :no_potential_conflict}
+  end
+
+  defp validate_potential_conflict_exists(_tenant_id, _src, _tgt), do: :ok
 
   @doc """
   Nightly executor for conflict resolutions (route-the-findings #4). Applies only
@@ -3417,10 +3469,29 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :supersede} = r),
+  # kb-02 FIX B (TOCTOU): the flag is checked at annotate time, but a :user may DELETE
+  # the potential_conflict link (retracting a mistaken flag) after the verdict is
+  # recorded and before the nightly run. Re-validate the SYSTEM flag still exists right
+  # before acting; if it was retracted, noop (audited) instead of retiring/merging.
+  defp apply_resolution(tenant_id, %ConflictResolution{} = r) do
+    case validate_potential_conflict_exists(tenant_id, r.source_article_id, r.target_article_id) do
+      :ok ->
+        apply_disposition(tenant_id, r)
+
+      {:error, :no_potential_conflict} ->
+        mark_resolution_executed(r, %{
+          "action" => "noop",
+          "reason" => "potential_conflict flag retracted"
+        })
+
+        false
+    end
+  end
+
+  defp apply_disposition(tenant_id, %ConflictResolution{disposition: :supersede} = r),
     do: apply_supersede(tenant_id, r)
 
-  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :merge} = r),
+  defp apply_disposition(tenant_id, %ConflictResolution{disposition: :merge} = r),
     do: apply_merge(tenant_id, r)
 
   # The conflict pair is unordered; store it canonically (source <= target by UUID
@@ -5017,6 +5088,31 @@ defmodule Loopctl.Knowledge do
   end
 
   defp maybe_supersede_target(multi, _tenant_id, _target_id, _rel_type), do: multi
+
+  # kb-02: metadata keys reserved for system provenance. Callers of create_link/3 must
+  # never set these (both string- and atom-key forms are dropped). Referencing the atoms
+  # literally keeps them as existing atoms — no String.to_atom on input.
+  @reserved_metadata_keys [
+    "auto_generated",
+    "similarity_score",
+    :auto_generated,
+    :similarity_score
+  ]
+
+  defp strip_system_metadata(attrs) when is_map(attrs) do
+    cond do
+      is_map(attrs[:metadata]) ->
+        Map.put(attrs, :metadata, Map.drop(attrs[:metadata], @reserved_metadata_keys))
+
+      is_map(attrs["metadata"]) ->
+        Map.put(attrs, "metadata", Map.drop(attrs["metadata"], @reserved_metadata_keys))
+
+      true ->
+        attrs
+    end
+  end
+
+  defp strip_system_metadata(attrs), do: attrs
 
   defp build_link_audit(tenant_id, changes, opts) do
     actor_id = Keyword.get(opts, :actor_id)

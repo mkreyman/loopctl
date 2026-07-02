@@ -252,6 +252,67 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert [] == conflict_links(tenant.id, a.id, b.id)
     end
 
+    # kb-02: a relates_to link WITHOUT the system auto_generated marker (the agent-forged
+    # case, even at a very high similarity_score) is NOT promoted — this closes the
+    # laundering path where an agent plants a relates_to+score to mint a system-stamped
+    # potential_conflict.
+    test "does NOT promote a relates_to link that is not system-authored" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+
+      # No "auto_generated" marker — as if planted by an agent via the public API.
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :relates_to,
+        metadata: %{"similarity_score" => 0.99}
+      })
+      |> AdminRepo.insert!()
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [] == conflict_links(tenant.id, a.id, b.id)
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["conflicts_promoted"] == 0
+    end
+
+    # kb-02 end-to-end: an agent-created relates_to link (metadata stripped by
+    # create_link) cannot be laundered into a resolvable potential_conflict, even at
+    # similarity 0.99 — the pair never becomes system-flagged, so a verdict is refused.
+    test "an agent-created relates_to link cannot be laundered into a resolvable conflict" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+
+      # Model the agent's API POST (which routes through create_link): forged provenance
+      # + score. create_link strips the reserved keys.
+      {:ok, link} =
+        Loopctl.Knowledge.create_link(tenant.id, %{
+          source_article_id: a.id,
+          target_article_id: b.id,
+          relationship_type: :relates_to,
+          metadata: %{"auto_generated" => true, "similarity_score" => 0.99}
+        })
+
+      refute Map.has_key?(link.metadata, "auto_generated")
+
+      # Nightly promotion must NOT mint a potential_conflict from the forged link.
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      assert [] == conflict_links(tenant.id, a.id, b.id)
+
+      # And a resolution verdict for the pair is refused (no system flag).
+      assert {:error, :no_potential_conflict} =
+               Loopctl.Knowledge.annotate_conflict(tenant.id, %{
+                 "source_article_id" => a.id,
+                 "target_article_id" => b.id,
+                 "disposition" => "supersede",
+                 "authoritative_article_id" => a.id,
+                 "confidence" => "high"
+               })
+    end
+
     test "is idempotent — a second run promotes nothing new" do
       tenant = fixture(:tenant)
       a = published_article_with_embedding(tenant.id, similar_embedding())

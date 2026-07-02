@@ -1293,7 +1293,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
   describe "POST /api/v1/knowledge/conflicts/resolve" do
     setup %{conn: conn} do
       tenant = fixture(:tenant)
-      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       a = fixture(:article, %{tenant_id: tenant.id, title: "A", status: :published})
       b = fixture(:article, %{tenant_id: tenant.id, title: "B", status: :published})
 
@@ -1306,7 +1307,13 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       })
       |> AdminRepo.insert!()
 
-      %{conn: auth_conn(conn, raw_key), tenant: tenant, a: a, b: b}
+      %{
+        conn: auth_conn(conn, agent_key),
+        user_conn: auth_conn(conn, user_key),
+        tenant: tenant,
+        a: a,
+        b: b
+      }
     end
 
     test "an agent can dismiss a conflict (takes effect immediately)", ctx do
@@ -1325,8 +1332,11 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["data"]["executed"] == true
     end
 
-    test "records a high-confidence supersede (deferred to the executor)", ctx do
-      %{conn: conn, a: a, b: b} = ctx
+    # kb-02: a user (destructive role) records a high-confidence supersede on a REAL
+    # potential conflict, and the nightly executor then retires the loser end-to-end.
+    test "a user records a high-confidence supersede applied by the executor (loser retired)",
+         ctx do
+      %{user_conn: conn, tenant: tenant, a: a, b: b} = ctx
 
       conn =
         post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
@@ -1341,10 +1351,84 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["data"]["disposition"] == "supersede"
       assert body["data"]["executed"] == false
       assert body["note"] =~ "nightly executor"
+
+      # Executor retires the loser.
+      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
+    end
+
+    # kb-02 (GHSA-9gqg-9r6p-658v): an :agent may NOT record a destructive verdict.
+    test "an agent recording a supersede is forbidden (403); no row, executor retires nothing",
+         ctx do
+      %{conn: conn, tenant: tenant, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      body = json_response(conn, 403)
+      assert body["error"]["status"] == 403
+
+      # No verdict row was persisted, so the nightly executor has nothing to apply.
+      assert is_nil(
+               Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution,
+                 tenant_id: tenant.id
+               )
+             )
+
+      assert 0 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+    end
+
+    # kb-02: an agent may not have the nightly executor MERGE (retire + synthesize) either.
+    test "an agent recording a merge is forbidden (403)", ctx do
+      %{conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert json_response(conn, 403)
+    end
+
+    # kb-02: fabrication guard — resolving a pair the system never flagged is rejected,
+    # even for a privileged user, so no arbitrary pair can be retired via the executor.
+    test "422 when the pair has no potential-conflict link (fabricated pair)", ctx do
+      %{user_conn: conn, tenant: tenant} = ctx
+      x = fixture(:article, %{tenant_id: tenant.id, title: "X", status: :published})
+      y = fixture(:article, %{tenant_id: tenant.id, title: "Y", status: :published})
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => x.id,
+          "target_article_id" => y.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => x.id,
+          "confidence" => "high"
+        })
+
+      assert json_response(conn, 422)
+      # No verdict row for the fabricated pair.
+      assert 0 ==
+               Loopctl.AdminRepo.aggregate(
+                 Loopctl.Knowledge.ConflictResolution,
+                 :count,
+                 :id
+               )
     end
 
     test "422 when supersede omits the authoritative article", ctx do
-      %{conn: conn, a: a, b: b} = ctx
+      %{user_conn: conn, a: a, b: b} = ctx
 
       conn =
         post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
@@ -1354,6 +1438,44 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         })
 
       assert json_response(conn, 422)
+    end
+
+    # kb-02 FIX C: a non-scalar disposition must 422, not crash to_string/1 (500).
+    test "a non-scalar disposition is a 422, not a 500 crash", ctx do
+      %{user_conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => %{"nested" => "object"}
+        })
+
+      assert json_response(conn, 422)
+    end
+
+    # Tenant isolation: a user in tenant B cannot resolve tenant A's flagged pair —
+    # from B's perspective the potential_conflict link does not exist (422).
+    test "a caller in another tenant cannot resolve the pair (422)", ctx do
+      %{tenant: tenant_a, a: a, b: b, conn: base_conn} = ctx
+      tenant_b = fixture(:tenant)
+      {user_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})
+
+      conn =
+        base_conn
+        |> auth_conn(user_key_b)
+        |> post(~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert json_response(conn, 422)
+      # Tenant A's article is untouched.
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+      _ = tenant_a
     end
   end
 end
