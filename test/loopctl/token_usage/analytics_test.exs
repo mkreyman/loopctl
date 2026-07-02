@@ -534,4 +534,233 @@ defmodule Loopctl.TokenUsage.AnalyticsTest do
       assert result.data == []
     end
   end
+
+  # --- tokens-07: stable ranked/paginated metrics with a unique tiebreaker ---
+  #
+  # agent_metrics ranks by integer avg-cost-per-story (SUM/COUNT), model_metrics
+  # ranks by total cost, and epic_metrics paginates by epic.number (unique only
+  # per project). All three make ties/collisions common. Without a unique final
+  # sort term (agent_id / model_name / epic id), OFFSET pagination can
+  # skip/duplicate rows and efficiency_rank becomes nondeterministic.
+  #
+  # The `union covers once` / `deterministic across calls` tests are behavioral
+  # coverage but not reliable regression guards on their own — inside a sandbox
+  # transaction Postgres tends to return tied rows in insertion order, so the
+  # instability may not surface even without the tiebreaker. The authoritative
+  # guards are the `... ORDER BY tiebreaker (SQL guard)` tests, which assert on
+  # the emitted SQL and fail deterministically the moment the tiebreaker is
+  # dropped from the query's ORDER BY.
+
+  describe "tokens-07: agent_metrics is stable when avg cost per story ties" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # Two agents, each with exactly one story costing 1000 millicents ->
+      # identical avg_cost_per_story (1000) -> a rank/pagination tie.
+      agent_ids =
+        for i <- 1..2 do
+          agent = fixture(:agent, %{tenant_id: tenant.id, name: "agent-#{i}"})
+
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: epic.id,
+              project_id: project.id,
+              number: "#{i}.1"
+            })
+
+          fixture(:token_usage_report, %{
+            tenant_id: tenant.id,
+            story_id: story.id,
+            agent_id: agent.id,
+            project_id: project.id,
+            model_name: "model-x",
+            input_tokens: 100,
+            output_tokens: 50,
+            cost_millicents: 1000,
+            phase: "implementing"
+          })
+
+          agent.id
+        end
+
+      %{tenant: tenant, agent_ids: agent_ids}
+    end
+
+    test "page 1 + page 2 cover every tied agent exactly once", %{
+      tenant: tenant,
+      agent_ids: agent_ids
+    } do
+      {:ok, page1} = Analytics.agent_metrics(tenant.id, page: 1, page_size: 1)
+      {:ok, page2} = Analytics.agent_metrics(tenant.id, page: 2, page_size: 1)
+
+      # Confirm the tie actually exists.
+      assert Enum.all?(page1.data ++ page2.data, &(&1.avg_cost_per_story_millicents == 1000))
+
+      collected = Enum.map(page1.data ++ page2.data, & &1.agent_id)
+      assert length(collected) == 2
+      assert MapSet.new(collected) == MapSet.new(agent_ids)
+    end
+
+    test "efficiency_rank is deterministic across repeated calls", %{tenant: tenant} do
+      {:ok, first} = Analytics.agent_metrics(tenant.id, page_size: 20)
+      {:ok, second} = Analytics.agent_metrics(tenant.id, page_size: 20)
+
+      ranking = fn result -> Enum.map(result.data, &{&1.agent_id, &1.efficiency_rank}) end
+
+      assert ranking.(first) == ranking.(second)
+      # Ranks are the contiguous 1..N with no gaps/dupes on ties.
+      assert Enum.map(first.data, & &1.efficiency_rank) == [1, 2]
+    end
+
+    test "ORDER BY ends with the unique agent_id tiebreaker (SQL guard)", %{tenant: tenant} do
+      assert_paginated_order_by_tiebreaker(
+        fn -> Analytics.agent_metrics(tenant.id, page_size: 10) end,
+        ~s|"agent_id"|
+      )
+    end
+  end
+
+  describe "tokens-07: model_metrics is stable when total cost ties" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Two models with identical total cost (1000 each) -> a sort tie on the
+      # `desc: sum(cost)` ordering.
+      for model <- ["model-alpha", "model-beta"] do
+        fixture(:token_usage_report, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          model_name: model,
+          input_tokens: 100,
+          output_tokens: 50,
+          cost_millicents: 1000,
+          phase: "implementing"
+        })
+      end
+
+      %{tenant: tenant}
+    end
+
+    test "page 1 + page 2 cover every tied model exactly once", %{tenant: tenant} do
+      {:ok, page1} = Analytics.model_metrics(tenant.id, page: 1, page_size: 1)
+      {:ok, page2} = Analytics.model_metrics(tenant.id, page: 2, page_size: 1)
+
+      collected = Enum.map(page1.data ++ page2.data, & &1.model_name)
+      assert length(collected) == 2
+      assert MapSet.new(collected) == MapSet.new(["model-alpha", "model-beta"])
+    end
+
+    test "model ordering is deterministic across repeated calls", %{tenant: tenant} do
+      {:ok, first} = Analytics.model_metrics(tenant.id, page_size: 20)
+      {:ok, second} = Analytics.model_metrics(tenant.id, page_size: 20)
+
+      assert Enum.map(first.data, & &1.model_name) == Enum.map(second.data, & &1.model_name)
+    end
+
+    test "ORDER BY ends with the unique model_name tiebreaker (SQL guard)", %{tenant: tenant} do
+      assert_paginated_order_by_tiebreaker(
+        fn -> Analytics.model_metrics(tenant.id, page_size: 10) end,
+        ~s|"model_name"|
+      )
+    end
+  end
+
+  describe "tokens-07: epic_metrics is stable when epic.number collides across projects" do
+    setup do
+      tenant = fixture(:tenant)
+
+      # epic.number is unique only per (tenant_id, project_id). Two projects each
+      # with an epic #1 -> the same sort key with no project_id filter.
+      epic_ids =
+        for _ <- 1..4 do
+          project = fixture(:project, %{tenant_id: tenant.id})
+          epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+          epic.id
+        end
+
+      %{tenant: tenant, epic_ids: epic_ids}
+    end
+
+    test "paging with no project_id covers every colliding epic exactly once", %{
+      tenant: tenant,
+      epic_ids: epic_ids
+    } do
+      collected =
+        Stream.iterate(1, &(&1 + 1))
+        |> Enum.reduce_while([], fn page, acc ->
+          {:ok, %{data: data}} = Analytics.epic_metrics(tenant.id, page: page, page_size: 2)
+          new_acc = acc ++ Enum.map(data, & &1.epic_id)
+          if length(data) < 2, do: {:halt, new_acc}, else: {:cont, new_acc}
+        end)
+
+      assert length(collected) == 4
+      assert MapSet.new(collected) == MapSet.new(epic_ids)
+    end
+
+    test "ORDER BY ends with the unique epic id tiebreaker (SQL guard)", %{tenant: tenant} do
+      assert_paginated_order_by_tiebreaker(
+        fn -> Analytics.epic_metrics(tenant.id, page_size: 10) end,
+        ~s|"id"|
+      )
+    end
+  end
+
+  # Asserts the paginated (ORDER BY + LIMIT) query emitted by `fun` ends its
+  # ORDER BY with a term containing `tiebreaker` (e.g. ~s|"agent_id"|). Scoped to
+  # self() so concurrent async tests don't leak queries into the capture. This is
+  # the authoritative regression guard: it fails deterministically the moment a
+  # unique final sort term is dropped from the ORDER BY.
+  defp assert_paginated_order_by_tiebreaker(fun, tiebreaker) do
+    test_pid = self()
+    handler_id = "sql-capture-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :admin_repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid, do: send(test_pid, {:captured_sql, query})
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+
+    paginated =
+      []
+      |> drain_captured_sql()
+      |> Enum.filter(&(String.contains?(&1, "ORDER BY") and String.contains?(&1, "LIMIT")))
+
+    assert paginated != [], "expected a paginated (ORDER BY + LIMIT) query, got none"
+
+    Enum.each(paginated, fn query ->
+      [_, after_order] = String.split(query, "ORDER BY", parts: 2)
+
+      final_term =
+        after_order
+        |> String.split(~r/\s+LIMIT/, parts: 2)
+        |> List.first()
+        |> String.split(",")
+        |> List.last()
+        |> String.trim()
+
+      assert String.contains?(final_term, tiebreaker),
+             "ORDER BY final term #{inspect(final_term)} is missing unique tiebreaker #{tiebreaker}\nfull query: #{query}"
+    end)
+  end
+
+  defp drain_captured_sql(acc) do
+    receive do
+      {:captured_sql, q} -> drain_captured_sql([q | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
 end

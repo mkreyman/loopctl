@@ -98,7 +98,11 @@ defmodule Loopctl.TokenUsage.Analytics do
             r.story_id,
             r.cost_millicents,
             r.story_id
-          )
+          ),
+        # Unique deterministic tiebreaker (the group-by key). Integer division
+        # makes avg-cost ties common; without this, OFFSET pagination could
+        # skip/duplicate rows AND efficiency_rank would be nondeterministic.
+        asc: r.agent_id
       )
       |> limit(^page_size)
       |> offset(^offset)
@@ -170,7 +174,11 @@ defmodule Loopctl.TokenUsage.Analytics do
 
     epics =
       epic_base
-      |> order_by([e], asc: e.number)
+      # asc: e.id is a unique, deterministic tiebreaker. epic.number is only
+      # unique per (tenant_id, project_id); GET /analytics/epics without a
+      # project_id filter returns every project's epic #1/#2/... sharing a
+      # number, so OFFSET pagination would skip/duplicate epics without it.
+      |> order_by([e], asc: e.number, asc: e.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -333,7 +341,9 @@ defmodule Loopctl.TokenUsage.Analytics do
         total_cost_millicents: sum(r.cost_millicents),
         report_count: count(r.id)
       })
-      |> order_by([r], desc: sum(r.cost_millicents))
+      # Unique deterministic tiebreaker (the group-by key) so OFFSET pagination
+      # is stable and rank ordering is deterministic when total costs tie.
+      |> order_by([r], desc: sum(r.cost_millicents), asc: r.model_name)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()

@@ -93,7 +93,10 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
     stories =
       ready_query
-      |> order_by([s], asc: s.sort_key)
+      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+      # never skips or duplicates rows sharing a sort_key (sort_key is NOT
+      # unique — especially across projects when no project_id filter is set).
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -162,16 +165,26 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
     stories =
       blocked_query
-      |> order_by([s], asc: s.sort_key)
+      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+      # never skips or duplicates rows sharing a sort_key.
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
 
-    # For each blocked story, fetch its blocking dependencies (story + epic level)
+    # Batch-fetch blocking dependencies for the whole page in O(1) queries
+    # (two total) instead of 2 per story, to avoid N+1 resource exhaustion on
+    # this agent-polled endpoint.
+    story_ids = Enum.map(stories, & &1.id)
+    epic_ids = stories |> Enum.map(& &1.epic_id) |> Enum.uniq()
+
+    story_blockers_by_story = fetch_blocking_story_dependencies(tenant_id, story_ids)
+    epic_blockers_by_epic = fetch_blocking_epic_dependencies(tenant_id, epic_ids)
+
     data =
       Enum.map(stories, fn story ->
-        story_blockers = fetch_blocking_story_dependencies(story.id)
-        epic_blockers = fetch_blocking_epic_dependencies(story.epic_id)
+        story_blockers = Map.get(story_blockers_by_story, story.id, [])
+        epic_blockers = Map.get(epic_blockers_by_epic, story.epic_id, [])
 
         %{
           story: story,
@@ -279,12 +292,20 @@ defmodule Loopctl.WorkBreakdown.Queries do
     end
   end
 
-  defp fetch_blocking_story_dependencies(story_id) do
+  # Batch-fetch story-level blockers for an entire page of blocked stories in a
+  # single query. Returns %{story_id => [blocker_map, ...]} so each story can be
+  # attached its own blockers in memory (O(1) queries per page, not O(page_size)).
+  defp fetch_blocking_story_dependencies(_tenant_id, [] = _story_ids), do: %{}
+
+  defp fetch_blocking_story_dependencies(tenant_id, story_ids) do
     from(sd in StoryDependency,
       join: dep in Story,
       on: dep.id == sd.depends_on_story_id,
-      where: sd.story_id == ^story_id and dep.verified_status != :verified,
+      where:
+        sd.tenant_id == ^tenant_id and sd.story_id in ^story_ids and
+          dep.verified_status != :verified,
       select: %{
+        story_id: sd.story_id,
         id: dep.id,
         number: dep.number,
         title: dep.title,
@@ -293,15 +314,23 @@ defmodule Loopctl.WorkBreakdown.Queries do
       }
     )
     |> AdminRepo.all()
+    |> Enum.group_by(& &1.story_id, &Map.delete(&1, :story_id))
   end
 
-  defp fetch_blocking_epic_dependencies(epic_id) do
+  # Batch-fetch epic-level blockers for an entire page in a single query.
+  # Returns %{epic_id => [blocker_map, ...]} keyed by the blocked story's epic.
+  defp fetch_blocking_epic_dependencies(_tenant_id, [] = _epic_ids), do: %{}
+
+  defp fetch_blocking_epic_dependencies(tenant_id, epic_ids) do
     # Find unverified stories in prerequisite epics (via epic_dependencies)
     from(ed in EpicDependency,
       join: prereq_story in Story,
       on: prereq_story.epic_id == ed.depends_on_epic_id,
-      where: ed.epic_id == ^epic_id and prereq_story.verified_status != :verified,
+      where:
+        ed.tenant_id == ^tenant_id and ed.epic_id in ^epic_ids and
+          prereq_story.verified_status != :verified,
       select: %{
+        epic_id: ed.epic_id,
         id: prereq_story.id,
         number: prereq_story.number,
         title: prereq_story.title,
@@ -310,5 +339,6 @@ defmodule Loopctl.WorkBreakdown.Queries do
       }
     )
     |> AdminRepo.all()
+    |> Enum.group_by(& &1.epic_id, &Map.delete(&1, :epic_id))
   end
 end
