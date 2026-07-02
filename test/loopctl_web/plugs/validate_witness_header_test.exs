@@ -196,6 +196,27 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
       assert %DateTime{} = reloaded.sth_bootstrap_consumed_at
     end
 
+    test "a DB error while consuming fails closed (412) with a sanitized, SQL-free log" do
+      # A malformed (non-UUID) api_key id makes Ecto raise while running the
+      # atomic consume, exercising the rescue path: Fix 2 (fail closed, grace not
+      # granted) + Fix 3 (sanitized logging, never the raw SQL query text).
+      bad_key = %ApiKey{id: "not-a-uuid", tenant_id: Ecto.UUID.generate()}
+
+      {conn, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          bad_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+        end)
+
+      assert conn.halted
+      assert conn.status == 412
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_header_missing"
+
+      # Log records the failure but leaks no SQL — struct name / sqlstate only.
+      assert log =~ "atomic bootstrap consume failed"
+      refute log =~ "query:"
+      refute log =~ ~r/SELECT|INSERT|UPDATE/
+    end
+
     test "a second bootstrap request from the same key is rejected 412" do
       {_raw, api_key} = fixture(:api_key, %{role: :agent})
 

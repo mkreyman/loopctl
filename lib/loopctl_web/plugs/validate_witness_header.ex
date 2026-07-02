@@ -258,10 +258,12 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   end
 
   # Never inspect/1 a raw DB exception: %Postgrex.Error{} carries the literal SQL
-  # statement in its :query field. Log only the struct name + SQLSTATE, matching
-  # the US-27.3 sanitized-logging convention used elsewhere.
-  defp sanitized_db_error(%Postgrex.Error{postgres: %{code: code}}),
-    do: "Postgrex.Error sqlstate=#{code}"
+  # statement in its :query field. Log only the struct name + the real SQLSTATE,
+  # reusing LoopctlWeb.DBError.sqlstate/1 (the US-27.3 single source of truth,
+  # which reads postgres.pg_code — the raw 5-char SQLSTATE — not the human atom)
+  # so this line correlates with the rest of the app's DB-error logs.
+  defp sanitized_db_error(%Postgrex.Error{} = exception),
+    do: "Postgrex.Error sqlstate=#{LoopctlWeb.DBError.sqlstate(exception) || "unknown"}"
 
   defp sanitized_db_error(exception), do: inspect(exception.__struct__)
 
