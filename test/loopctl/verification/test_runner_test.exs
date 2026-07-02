@@ -54,12 +54,22 @@ defmodule Loopctl.Verification.TestRunnerTest do
       refute TestRunner.within_tmp?(nil)
     end
 
-    test "a hostile SHA-shaped value can never produce a work_dir outside tmp" do
-      # work_dir is no longer derived from the SHA at all, so even an oversized /
-      # traversal-shaped value can't influence the path — every build stays in tmp.
+    test "build_work_dir/0 takes no input, so no SHA can ever reach the path" do
+      # This documents the design, it does NOT feed a SHA into build_work_dir/0
+      # (which is zero-arity): the path is derived from random bytes alone, so a
+      # hostile commit_sha value has no channel to influence it. Every build
+      # lands strictly inside the system temp dir.
       Enum.each(1..50, fn _ ->
         assert TestRunner.within_tmp?(TestRunner.build_work_dir())
       end)
+    end
+  end
+
+  describe "enabled?/0 (runner gate, default off — advisory ie-03)" do
+    test "is disabled in the test environment" do
+      # config/test.exs keeps :enable_local_test_runner false; the runner
+      # executes untrusted code and must be opt-in per environment.
+      refute TestRunner.enabled?()
     end
   end
 
@@ -67,7 +77,7 @@ defmodule Loopctl.Verification.TestRunnerTest do
     @valid_sha String.duplicate("a", 40)
     @valid_url "https://github.com/acme/app.git"
 
-    test "returns :invalid_commit_sha for a traversal SHA" do
+    test "returns :invalid_commit_sha for a traversal SHA (before the enable gate)" do
       assert {:error, :invalid_commit_sha} =
                TestRunner.run_tests(@valid_url, "../../etc")
     end
@@ -92,6 +102,12 @@ defmodule Loopctl.Verification.TestRunnerTest do
 
     test "returns :invalid_repo_url for a bare local path" do
       assert {:error, :invalid_repo_url} = TestRunner.run_tests("/tmp/evil", @valid_sha)
+    end
+
+    test "returns :runner_disabled for valid input when the runner is off (no clone)" do
+      # Valid SHA + URL pass validation, then hit the default-off gate: the
+      # runner never clones or executes anything.
+      assert {:error, :runner_disabled} = TestRunner.run_tests(@valid_url, @valid_sha)
     end
   end
 end

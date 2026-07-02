@@ -260,6 +260,12 @@ config :loopctl, Loopctl.Vault,
 # DI: Content extractor for knowledge ingestion
 config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
 
+# L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
+# it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
+# (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF
+# residual. Enable ONLY inside an egress-restricted, ephemeral sandbox.
+config :loopctl, :enable_local_test_runner, false
+
 # DI: Article category classifier for the reclassification backfill
 # (KnowledgeReclassifyWorker). Overridden in test env.
 config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifier

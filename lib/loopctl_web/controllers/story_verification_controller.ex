@@ -13,10 +13,13 @@ defmodule LoopctlWeb.StoryVerificationController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  require Logger
+
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Artifacts
   alias Loopctl.Progress
   alias Loopctl.Verification
+  alias Loopctl.Verification.VerificationRun
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.Workers.VerificationRunnerWorker
   alias LoopctlWeb.AuditContext
@@ -162,25 +165,34 @@ defmodule LoopctlWeb.StoryVerificationController do
   def verify(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
 
-    with :ok <- validate_orchestrator_agent_linked(api_key) do
+    # Validate a client-supplied commit_sha BEFORE Progress.verify_story mutates
+    # the story: a malformed sha must not flip the story to verified and then
+    # silently fail to enqueue the L3 run (which would return a misleading 202
+    # with run_id: null and leave no audit trail of the skipped re-execution).
+    with :ok <- validate_orchestrator_agent_linked(api_key),
+         :ok <- validate_commit_sha_param(params) do
       tenant_id = api_key.tenant_id
       opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
 
       case Progress.verify_story(tenant_id, story_id, params, opts) do
         {:ok, story} ->
-          run_id = enqueue_verification_run(tenant_id, story_id, params)
+          {run_id, run_error} = enqueue_verification_run(tenant_id, story_id, params)
+
+          body =
+            %{
+              status: "verification_pending",
+              run_id: run_id,
+              story: story,
+              next_action: %{
+                description: "Poll GET /api/v1/stories/#{story_id}/verifications for results",
+                learn_more: "https://loopctl.com/wiki/verification-runs"
+              }
+            }
+            |> maybe_put_run_error(run_error)
 
           conn
           |> put_status(:accepted)
-          |> json(%{
-            status: "verification_pending",
-            run_id: run_id,
-            story: story,
-            next_action: %{
-              description: "Poll GET /api/v1/stories/#{story_id}/verifications for results",
-              learn_more: "https://loopctl.com/wiki/verification-runs"
-            }
-          })
+          |> json(body)
 
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
@@ -405,7 +417,31 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   defp validate_orchestrator_agent_linked(_api_key), do: :ok
 
-  # US-26.4.4.1: enqueue a verification_run and return the run_id
+  # Reject a client-supplied `commit_sha` that isn't a valid git object id
+  # BEFORE any mutation. `commit_sha` is optional, so nil/absent passes through;
+  # a present-but-malformed value is surfaced as a 422 (never leaking the raw
+  # value back to the client verbatim).
+  defp validate_commit_sha_param(params) do
+    case Map.get(params, "commit_sha") do
+      nil ->
+        :ok
+
+      sha ->
+        if VerificationRun.valid_commit_sha?(sha) do
+          :ok
+        else
+          {:error, :unprocessable_entity,
+           "commit_sha must be a lowercase hexadecimal git object id (7-64 chars)"}
+        end
+    end
+  end
+
+  # US-26.4.4.1: enqueue a verification_run. Returns `{run_id, run_error}` where
+  # `run_error` is nil on success or a short, safe reason string on failure. A
+  # changeset failure here (commit_sha is pre-validated above, so this is
+  # normally a constraint/DB error) is logged AND surfaced in the response so
+  # the missing L3 re-execution is visible and auditable — never silently
+  # swallowed into a misleading 202 with run_id: null.
   defp enqueue_verification_run(tenant_id, story_id, params) do
     attrs = %{
       commit_sha: Map.get(params, "commit_sha"),
@@ -418,10 +454,30 @@ defmodule LoopctlWeb.StoryVerificationController do
         |> VerificationRunnerWorker.new()
         |> Oban.insert()
 
-        run.id
+        {run.id, nil}
 
-      _ ->
-        nil
+      {:error, %Ecto.Changeset{} = changeset} ->
+        fields = Keyword.keys(changeset.errors)
+
+        Logger.warning(
+          "VerificationRunner: failed to create verification_run for story " <>
+            "#{story_id} (tenant #{tenant_id}); invalid fields: #{inspect(fields)}. " <>
+            "L3 re-execution was NOT enqueued."
+        )
+
+        {nil, "verification_run_not_created: invalid #{inspect(fields)}"}
+
+      {:error, reason} ->
+        Logger.warning(
+          "VerificationRunner: failed to create verification_run for story " <>
+            "#{story_id} (tenant #{tenant_id}): #{inspect(reason)}. " <>
+            "L3 re-execution was NOT enqueued."
+        )
+
+        {nil, "verification_run_not_created"}
     end
   end
+
+  defp maybe_put_run_error(body, nil), do: body
+  defp maybe_put_run_error(body, error), do: Map.put(body, :verification_run_error, error)
 end
