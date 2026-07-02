@@ -201,10 +201,10 @@ defmodule Loopctl.TokenUsage do
            }}
   def get_story_totals(tenant_id, story_id) do
     query =
-      Report
-      |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^story_id)
-      |> where([r], is_nil(r.deleted_at))
-      |> select([r], %{
+      tenant_id
+      |> countable_reports()
+      |> where([report: r], r.story_id == ^story_id)
+      |> select([report: r], %{
         total_input_tokens: coalesce(sum(r.input_tokens), 0),
         total_output_tokens: coalesce(sum(r.output_tokens), 0),
         total_tokens: coalesce(sum(r.input_tokens), 0) + coalesce(sum(r.output_tokens), 0),
@@ -376,6 +376,9 @@ defmodule Loopctl.TokenUsage do
 
       multi =
         Multi.new()
+        |> Multi.run(:lock_story, fn repo, _changes ->
+          acquire_story_correction_lock(repo, tenant_id, original.story_id)
+        end)
         |> Multi.run(:validate_totals, fn _repo, _changes ->
           validate_correction_totals(tenant_id, original, attrs)
         end)
@@ -429,6 +432,28 @@ defmodule Loopctl.TokenUsage do
           {:error, error}
       end
     end
+  end
+
+  # Namespace for the per-story correction advisory lock (tokens-02).
+  @correction_lock_namespace 2_113_002
+
+  # Serializes concurrent corrections for the SAME story so the "totals never go
+  # negative" invariant holds under concurrency (tokens-02). Without it, two
+  # concurrent corrections (double-submit / retry) each read the pre-correction
+  # total under READ COMMITTED, both pass validate_correction_totals, and both
+  # commit — driving the story total negative (and with it any epic/project
+  # rollup, which is just a sum of per-story totals, so a non-negative story
+  # total guarantees non-negative epic/project totals).
+  #
+  # pg_advisory_xact_lock is held until the transaction commits/rolls back, so
+  # the second correction blocks until the first commits, then re-reads the
+  # now-updated total and is correctly rejected (422) if it would over-subtract.
+  # Keyed on a fixed namespace + hash({tenant_id, story_id}); phash2/1 is bounded
+  # to 2^27-1 which fits a PostgreSQL int4 lock key.
+  defp acquire_story_correction_lock(repo, tenant_id, story_id) do
+    key = :erlang.phash2({tenant_id, story_id})
+    repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@correction_lock_namespace, key])
+    {:ok, :locked}
   end
 
   # Validates that the sum of story totals + correction values >= 0.
@@ -875,70 +900,88 @@ defmodule Loopctl.TokenUsage do
       utilization_pct =
         if budget.budget_millicents > 0, do: div(spend * 100, budget.budget_millicents), else: 0
 
-      # Fire warning and exceeded independently so both fire when a single
-      # report pushes past both thresholds at once.
-      if utilization_pct >= budget.alert_threshold_pct do
+      # Warning and exceeded are evaluated independently so a single report that
+      # crosses both thresholds at once fires both. The SAME warning_fired /
+      # exceeded_fired CAS that dedups the webhook now ALSO gates the
+      # threshold_crossed AUDIT write, so the audit row is written exactly ONCE
+      # per real crossing (the below -> at/over transition), not on every report
+      # while already over budget (tokens-05). A genuine NEW crossing — e.g.
+      # crossing 100% after previously only crossing the warning threshold —
+      # still claims its own flag and writes its audit row once.
+      if utilization_pct >= budget.alert_threshold_pct and
+           claim_budget_threshold(budget, :warning) do
         emit_threshold_crossed(tenant_id, budget, utilization_pct, "warning")
-        maybe_fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report)
+        fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report)
       end
 
-      if utilization_pct >= 100 do
+      if utilization_pct >= 100 and claim_budget_threshold(budget, :exceeded) do
         emit_threshold_crossed(tenant_id, budget, utilization_pct, "exceeded")
-        maybe_fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report)
+        fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report)
       end
     end)
   end
 
-  # Fires a budget_warning webhook event using atomic CAS to prevent duplicate
-  # fires under concurrent requests. The UPDATE ... WHERE warning_fired = false
-  # atomically claims the right to fire; only the winner (count == 1) proceeds.
-  defp maybe_fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report) do
+  # Atomically claims the right to emit a budget threshold crossing (the audit
+  # row AND the webhook) exactly once, via compare-and-swap on the
+  # warning_fired / exceeded_fired flag. UPDATE ... WHERE <flag> = false claims
+  # the below -> at/over transition; only the winner (count == 1) proceeds, so
+  # concurrent reports can't double-fire. The flags are reset by
+  # reset_budget_flags_if_needed/2 (spend drops) and update_budget/4 (budget
+  # changes), so a genuine re-crossing claims again.
+  defp claim_budget_threshold(budget, :warning) do
     {count, _} =
       Budget
       |> where([b], b.id == ^budget.id and b.warning_fired == false)
       |> AdminRepo.update_all(set: [warning_fired: true, updated_at: DateTime.utc_now()])
 
-    if count == 1 do
-      payload = %{
-        "budget_id" => budget.id,
-        "scope_type" => to_string(budget.scope_type),
-        "scope_id" => budget.scope_id,
-        "budget_millicents" => budget.budget_millicents,
-        "current_spend_millicents" => spend,
-        "utilization_pct" => utilization_pct,
-        "alert_threshold_pct" => budget.alert_threshold_pct,
-        "triggering_report_id" => report.id
-      }
-
-      fire_budget_event(tenant_id, "token.budget_warning", report.project_id, payload)
-    end
+    count == 1
   end
 
-  # Fires a budget_exceeded webhook event using atomic CAS to prevent duplicate
-  # fires under concurrent requests. Same pattern as warning above.
-  defp maybe_fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report) do
+  defp claim_budget_threshold(budget, :exceeded) do
     {count, _} =
       Budget
       |> where([b], b.id == ^budget.id and b.exceeded_fired == false)
       |> AdminRepo.update_all(set: [exceeded_fired: true, updated_at: DateTime.utc_now()])
 
-    if count == 1 do
-      overage = max(spend - budget.budget_millicents, 0)
+    count == 1
+  end
 
-      payload = %{
-        "budget_id" => budget.id,
-        "scope_type" => to_string(budget.scope_type),
-        "scope_id" => budget.scope_id,
-        "budget_millicents" => budget.budget_millicents,
-        "current_spend_millicents" => spend,
-        "utilization_pct" => utilization_pct,
-        "alert_threshold_pct" => budget.alert_threshold_pct,
-        "triggering_report_id" => report.id,
-        "overage_millicents" => overage
-      }
+  # Fires a budget_warning webhook event. Deduplication is handled by the
+  # claim_budget_threshold/2 CAS at the call site, so this only builds the
+  # payload and enqueues the event.
+  defp fire_warning_webhook(tenant_id, budget, spend, utilization_pct, report) do
+    payload = %{
+      "budget_id" => budget.id,
+      "scope_type" => to_string(budget.scope_type),
+      "scope_id" => budget.scope_id,
+      "budget_millicents" => budget.budget_millicents,
+      "current_spend_millicents" => spend,
+      "utilization_pct" => utilization_pct,
+      "alert_threshold_pct" => budget.alert_threshold_pct,
+      "triggering_report_id" => report.id
+    }
 
-      fire_budget_event(tenant_id, "token.budget_exceeded", report.project_id, payload)
-    end
+    fire_budget_event(tenant_id, "token.budget_warning", report.project_id, payload)
+  end
+
+  # Fires a budget_exceeded webhook event. Deduplication is handled by the
+  # claim_budget_threshold/2 CAS at the call site.
+  defp fire_exceeded_webhook(tenant_id, budget, spend, utilization_pct, report) do
+    overage = max(spend - budget.budget_millicents, 0)
+
+    payload = %{
+      "budget_id" => budget.id,
+      "scope_type" => to_string(budget.scope_type),
+      "scope_id" => budget.scope_id,
+      "budget_millicents" => budget.budget_millicents,
+      "current_spend_millicents" => spend,
+      "utilization_pct" => utilization_pct,
+      "alert_threshold_pct" => budget.alert_threshold_pct,
+      "triggering_report_id" => report.id,
+      "overage_millicents" => overage
+    }
+
+    fire_budget_event(tenant_id, "token.budget_exceeded", report.project_id, payload)
   end
 
   # Creates webhook events for matching subscriptions. Passes project_id so
@@ -1199,26 +1242,49 @@ defmodule Loopctl.TokenUsage do
     where(query, [b], b.scope_id == ^value)
   end
 
+  # Base query for reports that count toward story/epic/project totals and spend.
+  #
+  # A report counts when it is NOT soft-deleted AND, if it is a correction
+  # (`corrects_report_id` set), its original report is also NOT soft-deleted.
+  # The LEFT JOIN on the original (at most one row per correction, so sums do
+  # not fan out) lets a single predicate exclude a negative correction whose
+  # original was soft-deleted or expired — otherwise the surviving negative
+  # correction would strand and drive story/epic/project totals negative
+  # (tokens-04). Originals (`corrects_report_id IS NULL`) always count when live.
+  defp countable_reports(tenant_id) do
+    from(r in Report,
+      as: :report,
+      left_join: orig in Report,
+      as: :original,
+      on: orig.id == r.corrects_report_id,
+      where: r.tenant_id == ^tenant_id,
+      where: is_nil(r.deleted_at),
+      where:
+        is_nil(r.corrects_report_id) or
+          (not is_nil(orig.id) and is_nil(orig.deleted_at))
+    )
+  end
+
   defp spend_query(tenant_id, :story, scope_id) do
-    Report
-    |> where([r], r.tenant_id == ^tenant_id and r.story_id == ^scope_id)
-    |> where([r], is_nil(r.deleted_at))
-    |> select([r], coalesce(sum(r.cost_millicents), 0))
+    tenant_id
+    |> countable_reports()
+    |> where([report: r], r.story_id == ^scope_id)
+    |> select([report: r], coalesce(sum(r.cost_millicents), 0))
   end
 
   defp spend_query(tenant_id, :epic, scope_id) do
-    Report
-    |> join(:inner, [r], s in Story, on: r.story_id == s.id)
-    |> where([r, s], r.tenant_id == ^tenant_id and s.epic_id == ^scope_id)
-    |> where([r, _s], is_nil(r.deleted_at))
-    |> select([r, _s], coalesce(sum(r.cost_millicents), 0))
+    tenant_id
+    |> countable_reports()
+    |> join(:inner, [report: r], s in Story, as: :story, on: r.story_id == s.id)
+    |> where([story: s], s.epic_id == ^scope_id)
+    |> select([report: r], coalesce(sum(r.cost_millicents), 0))
   end
 
   defp spend_query(tenant_id, :project, scope_id) do
-    Report
-    |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^scope_id)
-    |> where([r], is_nil(r.deleted_at))
-    |> select([r], coalesce(sum(r.cost_millicents), 0))
+    tenant_id
+    |> countable_reports()
+    |> where([report: r], r.project_id == ^scope_id)
+    |> select([report: r], coalesce(sum(r.cost_millicents), 0))
   end
 
   # Batch computes spend for all budgets in at most 3 queries (one per scope type)
@@ -1246,32 +1312,32 @@ defmodule Loopctl.TokenUsage do
   end
 
   defp batch_spend_query(tenant_id, :story, scope_ids) do
-    Report
-    |> where([r], r.tenant_id == ^tenant_id and r.story_id in ^scope_ids)
-    |> where([r], is_nil(r.deleted_at))
-    |> group_by([r], r.story_id)
-    |> select([r], {r.story_id, coalesce(sum(r.cost_millicents), 0)})
+    tenant_id
+    |> countable_reports()
+    |> where([report: r], r.story_id in ^scope_ids)
+    |> group_by([report: r], r.story_id)
+    |> select([report: r], {r.story_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()
     |> Enum.map(fn {scope_id, spend} -> {{:story, scope_id}, decimal_to_int(spend)} end)
   end
 
   defp batch_spend_query(tenant_id, :epic, scope_ids) do
-    Report
-    |> join(:inner, [r], s in Story, on: r.story_id == s.id)
-    |> where([r, s], r.tenant_id == ^tenant_id and s.epic_id in ^scope_ids)
-    |> where([r, _s], is_nil(r.deleted_at))
-    |> group_by([r, s], s.epic_id)
-    |> select([r, s], {s.epic_id, coalesce(sum(r.cost_millicents), 0)})
+    tenant_id
+    |> countable_reports()
+    |> join(:inner, [report: r], s in Story, as: :story, on: r.story_id == s.id)
+    |> where([story: s], s.epic_id in ^scope_ids)
+    |> group_by([story: s], s.epic_id)
+    |> select([report: r, story: s], {s.epic_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()
     |> Enum.map(fn {scope_id, spend} -> {{:epic, scope_id}, decimal_to_int(spend)} end)
   end
 
   defp batch_spend_query(tenant_id, :project, scope_ids) do
-    Report
-    |> where([r], r.tenant_id == ^tenant_id and r.project_id in ^scope_ids)
-    |> where([r], is_nil(r.deleted_at))
-    |> group_by([r], r.project_id)
-    |> select([r], {r.project_id, coalesce(sum(r.cost_millicents), 0)})
+    tenant_id
+    |> countable_reports()
+    |> where([report: r], r.project_id in ^scope_ids)
+    |> group_by([report: r], r.project_id)
+    |> select([report: r], {r.project_id, coalesce(sum(r.cost_millicents), 0)})
     |> AdminRepo.all()
     |> Enum.map(fn {scope_id, spend} -> {{:project, scope_id}, decimal_to_int(spend)} end)
   end
