@@ -49,6 +49,12 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
 
   def backoff_seconds(_attempt), do: List.last(@backoff_schedule)
 
+  # Hard per-job wall-clock cap (backstop to the bounded DNS resolve in the egress
+  # guard + Req receive_timeout). A hostile/slow webhook target can't pin a
+  # :webhooks queue slot indefinitely (ie-02 / GHSA-jh42-wf7g-f5rg).
+  @impl Oban.Worker
+  def timeout(_job), do: :timer.seconds(30)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"webhook_event_id" => event_id, "tenant_id" => tenant_id}}) do
     with {:ok, event} <- load_event(tenant_id, event_id),

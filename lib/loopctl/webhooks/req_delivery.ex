@@ -8,17 +8,36 @@ defmodule Loopctl.Webhooks.ReqDelivery do
 
   @behaviour Loopctl.Webhooks.DeliveryBehaviour
 
+  alias Loopctl.Net.UrlGuard
+
   @impl true
   def deliver(url, body, headers) do
+    # Validate AND pin at delivery time (not just at changeset time) to defend
+    # against DNS rebinding / TOCTOU (ie-02 / GHSA-jh42-wf7g-f5rg): pin/1 resolves
+    # the host ONCE, and pinned_request_opts/1 makes Req connect to that exact IP
+    # while keeping the original host for Host/SNI/cert — so there is no second
+    # resolution for an attacker to rebind.
+    case UrlGuard.pin(url) do
+      {:ok, pinned} -> do_deliver(pinned, body, headers)
+      {:error, reason} -> {:error, "blocked_url: #{reason}"}
+    end
+  end
+
+  defp do_deliver(pinned, body, headers) do
+    # Fold the caller's headers into pinned_request_opts so the explicit `Host`
+    # header it sets is preserved (a plain `Keyword.merge(headers: ...)` would
+    # clobber it).
     req_opts =
-      [
-        url: url,
+      UrlGuard.pinned_request_opts(pinned, headers)
+      |> Keyword.merge(
         method: :post,
         body: body,
-        headers: headers,
         receive_timeout: 10_000,
-        retry: false
-      ]
+        retry: false,
+        # Never follow redirects — a 302 hop would re-enter an unvalidated URL,
+        # bypassing the egress guard above (ie-02 / GHSA-jh42-wf7g-f5rg).
+        redirect: false
+      )
       |> maybe_add_plug()
 
     case Req.request(req_opts) do

@@ -89,6 +89,78 @@ defmodule Loopctl.WebhooksTest do
       assert errors_on(changeset).url
     end
 
+    # SSRF egress guard (ie-02 / GHSA-jh42-wf7g-f5rg). IP-literal URLs bypass DNS,
+    # so these assert the changeset blocklist directly, no DNS stub required.
+    for {label, url} <- [
+          {"cloud metadata IPv4", "http://169.254.169.254/latest/meta-data/"},
+          {"loopback IPv4", "http://127.0.0.1/hooks"},
+          {"private 10/8", "https://10.0.0.5/hooks"},
+          {"private 192.168/16", "https://192.168.1.10/hooks"},
+          {"unspecified 0.0.0.0", "http://0.0.0.0/hooks"},
+          {"decimal-encoded loopback", "http://2130706433/hooks"},
+          {"hex-encoded loopback", "http://0x7f000001/hooks"},
+          {"IPv6 loopback", "http://[::1]/hooks"},
+          {"Fly 6PN ULA", "http://[fdaa::1]/hooks"},
+          {"IPv4-mapped loopback", "http://[::ffff:127.0.0.1]/hooks"}
+        ] do
+      test "rejects a webhook targeting #{label}" do
+        tenant = fixture(:tenant)
+
+        {:error, changeset} =
+          Webhooks.create_webhook(tenant.id, %{
+            "url" => unquote(url),
+            "events" => ["story.status_changed"]
+          })
+
+        assert "must not target a private or loopback address" in errors_on(changeset).url
+      end
+    end
+
+    test "rejects a non-http(s) scheme" do
+      tenant = fixture(:tenant)
+
+      {:error, changeset} =
+        Webhooks.create_webhook(tenant.id, %{
+          "url" => "ftp://93.184.216.34/hooks",
+          "events" => ["story.status_changed"]
+        })
+
+      assert "must use HTTPS or HTTP scheme" in errors_on(changeset).url
+    end
+
+    test "rejects a hostname that resolves to a private address (DNS rebinding)" do
+      tenant = fixture(:tenant)
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        {:ok, [{169, 254, 169, 254}]}
+      end)
+
+      {:error, changeset} =
+        Webhooks.create_webhook(tenant.id, %{
+          "url" => "https://rebind.example.com/hooks",
+          "events" => ["story.status_changed"]
+        })
+
+      assert "must not target a private or loopback address" in errors_on(changeset).url
+    end
+
+    test "reports an unresolvable host distinctly from a private address" do
+      tenant = fixture(:tenant)
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        {:error, :nxdomain}
+      end)
+
+      {:error, changeset} =
+        Webhooks.create_webhook(tenant.id, %{
+          "url" => "https://does-not-resolve.example.com/hooks",
+          "events" => ["story.status_changed"]
+        })
+
+      assert "host could not be resolved" in errors_on(changeset).url
+      refute "must not target a private or loopback address" in errors_on(changeset).url
+    end
+
     test "enforces max_webhooks limit" do
       tenant = fixture(:tenant, %{settings: %{"max_webhooks" => 2}})
 

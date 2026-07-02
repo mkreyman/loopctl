@@ -136,6 +136,74 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert body["error"]["message"] =~ "source_type"
     end
 
+    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm): a URL pointing at a
+    # private / loopback / cloud-metadata address is rejected 4xx up front, before
+    # any job is enqueued or fetched.
+    test "returns 422 for a URL targeting the cloud metadata endpoint", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://169.254.169.254/latest/meta-data/",
+          source_type: "web_article"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
+    test "returns 422 for a decimal-encoded loopback URL", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://2130706433/secret",
+          source_type: "web_article"
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
+    test "returns 422 for a v4-in-v6 NAT64-embedded metadata URL", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
+          source_type: "web_article"
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
+    test "returns 422 with a distinct message when the host cannot be resolved", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "https://does-not-resolve.example.com/x",
+          source_type: "web_article"
+        })
+
+      message = json_response(conn, 422)["error"]["message"]
+      assert message =~ "could not be resolved"
+      refute message =~ "private, loopback, or metadata"
+    end
+
     test "agent role is rejected (requires orchestrator)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -322,6 +390,72 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         })
 
       assert json_response(conn, 403)
+    end
+
+    # FIX 2 (worker-01 / GHSA-j7m9-ffmr-pwhm): a batch of URL items pointing at an
+    # unresponsive nameserver must NOT tie up the request. Task.async_stream caps
+    # each item at the (test-configured, short) per-item deadline and maps a hung
+    # item to a validation_timeout error instead of hanging the whole batch.
+    test "bounds the batch when the resolver hangs (validation_timeout, no hang)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Resolver never returns → each item's pin exceeds the per-item deadline and
+      # is killed. (Reaches the task via the $callers chain async_stream sets.)
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> Process.sleep(:infinity) end)
+
+      items = [
+        %{url: "https://slow-a.example.com/x", source_type: "web_article"},
+        %{url: "https://slow-b.example.com/x", source_type: "web_article"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+      assert Enum.all?(body["data"], &(&1["status"] == "error"))
+      assert Enum.all?(body["data"], &(&1["error"] == "validation_timeout"))
+    end
+
+    # FIX 1: a genuine (non-timeout) raise in ONE item must not crash the whole
+    # request. async_stream_nolink monitors (not links) the task, so the raise
+    # becomes a per-item validation_failed error while other items still succeed
+    # and the request returns 200. Under the old bare Task.async_stream this
+    # raise would have killed the request.
+    @tag :capture_log
+    test "a raising item yields validation_failed; other items still return 200",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # One host makes the resolver raise; everything else resolves public.
+      stub(Loopctl.MockDnsResolver, :resolve, fn
+        "boom.example.com" -> raise "resolver boom"
+        _host -> {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      items = [
+        %{url: "https://boom.example.com/x", source_type: "web_article"},
+        %{content: "Valid inline content", source_type: "newsletter"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+
+      [first, second] = body["data"]
+      # Ordering is preserved (ordered: true): item 1 crashed, item 2 queued.
+      assert first["status"] == "error"
+      assert first["error"] == "validation_failed"
+      assert second["status"] == "queued"
     end
 
     test "tenant isolation: tenant A cannot see tenant B's batch jobs", %{conn: conn} do

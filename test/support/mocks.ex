@@ -25,6 +25,12 @@ Mox.defmock(Loopctl.MockArticleSimilaritySearch,
 # worker tests keep working, while the ScaleAlerts tests override deliver/3 directly.
 Mox.defmock(Loopctl.MockDelivery, for: Loopctl.Webhooks.DeliveryBehaviour)
 
+# SSRF egress guard (ie-02 / worker-01) DNS resolution DI. Lets UrlGuard tests
+# feed deterministic A/AAAA records for a bare hostname without touching real DNS.
+# DataCase default-stubs `resolve/1` to a public IP so hostname-based webhook and
+# ingestion tests pass; DNS-rebinding tests override it to return a private address.
+Mox.defmock(Loopctl.MockDnsResolver, for: Loopctl.Net.DnsResolver.Behaviour)
+
 # US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by

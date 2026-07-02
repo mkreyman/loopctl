@@ -19,6 +19,8 @@ defmodule Loopctl.Webhooks.Webhook do
 
   use Loopctl.Schema
 
+  alias Loopctl.Net.UrlGuard
+
   @type t :: %__MODULE__{}
 
   @valid_event_types ~w(
@@ -99,54 +101,23 @@ defmodule Loopctl.Webhooks.Webhook do
     |> foreign_key_constraint(:project_id)
   end
 
-  @private_ip_prefixes ~w(
-    10.
-    172.16.
-    172.17.
-    172.18.
-    172.19.
-    172.20.
-    172.21.
-    172.22.
-    172.23.
-    172.24.
-    172.25.
-    172.26.
-    172.27.
-    172.28.
-    172.29.
-    172.30.
-    172.31.
-    192.168.
-    169.254.
-    127.
-  )
-
+  # SSRF egress guard (ie-02 / GHSA-jh42-wf7g-f5rg). Delegates to the shared
+  # Loopctl.Net.UrlGuard, which does scheme allowlisting, real DNS resolution,
+  # and a private/loopback/link-local/metadata blocklist for BOTH IPv4 and IPv6
+  # (the old @private_ip_prefixes string blocklist missed IPv6, numeric IPv4,
+  # 0.0.0.0, and did no DNS resolution). Re-validated again at delivery time in
+  # Loopctl.Webhooks.ReqDelivery to defend against DNS rebinding.
   defp validate_url(changeset) do
     validate_change(changeset, :url, fn :url, url ->
-      uri = URI.parse(url)
-
-      cond do
-        uri.scheme not in ["https", "http"] ->
-          [url: "must use HTTPS or HTTP scheme"]
-
-        is_nil(uri.host) or uri.host == "" ->
-          [url: "must have a valid host"]
-
-        private_host?(uri.host) ->
-          [url: "must not target a private or loopback address"]
-
-        true ->
-          []
+      case UrlGuard.validate_egress(url) do
+        {:ok, _uri} -> []
+        {:error, :invalid_scheme} -> [url: "must use HTTPS or HTTP scheme"]
+        {:error, :missing_host} -> [url: "must have a valid host"]
+        {:error, :invalid_url} -> [url: "must be a valid URL"]
+        {:error, :dns_resolution_failed} -> [url: "host could not be resolved"]
+        {:error, :blocked_ip} -> [url: "must not target a private or loopback address"]
       end
     end)
-  end
-
-  defp private_host?(host) do
-    normalized = String.downcase(host)
-
-    normalized in ["localhost", "::1"] or
-      Enum.any?(@private_ip_prefixes, &String.starts_with?(normalized, &1))
   end
 
   defp validate_events(changeset) do

@@ -145,6 +145,52 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     end
   end
 
+  # --- SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm) ---
+
+  describe "perform/1 refuses blocked URLs (SSRF)" do
+    test "refuses to fetch the cloud metadata endpoint" do
+      %{tenant: tenant} = setup_tenant()
+
+      # The extractor must never be reached — the guard short-circuits before
+      # any HTTP fetch or extraction.
+      Req.Test.stub(ContentIngestionWorker, fn _conn ->
+        flunk("SSRF guard should have blocked the request before Req.get/1")
+      end)
+
+      assert {:error, {:url_blocked, :blocked_ip}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 200,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "http://169.254.169.254/latest/meta-data/",
+                   "content_hash" => "ssrf1",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+    end
+
+    test "refuses a hostname that resolves to a private address (DNS rebinding)" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        {:ok, [{10, 0, 0, 5}]}
+      end)
+
+      assert {:error, {:url_blocked, :blocked_ip}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 201,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://rebind.example.com/x",
+                   "content_hash" => "ssrf2",
+                   "source_type" => "web_article"
+                 }
+               })
+    end
+  end
+
   # --- Validation filters invalid articles ---
 
   describe "perform/1 validation" do

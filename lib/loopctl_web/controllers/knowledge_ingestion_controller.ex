@@ -9,7 +9,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  require Logger
+
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
   alias LoopctlWeb.Helpers.Pagination
 
@@ -184,9 +187,62 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     items = params["items"]
 
     with :ok <- validate_batch_items(items) do
-      results = Enum.map(items, &enqueue_item_result(tenant_id, &1))
+      results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
+  end
+
+  # Bound the aggregate request time (worker-01 / GHSA-j7m9-ffmr-pwhm). Each item
+  # does bounded per-item DNS validation (A+AAAA), but a serial Enum.map over up
+  # to @batch_max (50) items could still tie up a web worker for minutes on
+  # unresponsive nameservers. async_stream caps concurrency AND imposes a per-item
+  # wall-clock deadline; a hung item is killed and mapped to a validation_timeout
+  # error, so the whole request is bounded regardless of any single hanging item.
+  # Ordering + per-item result shape are preserved.
+  #
+  # We use the NOLINK Task.Supervisor variant (monitors, not links) so a genuine
+  # (non-timeout) raise in one item — e.g. an Oban.insert pool checkout-timeout
+  # under the 10-way intra-request concurrency — is caught and returned as a
+  # per-item {:exit, reason} error instead of killing the whole request (Bandit's
+  # HTTP/2 stream process does not trap exits). This preserves the "one bad item
+  # never fails the whole batch" invariant.
+  #
+  # tenant_id is passed explicitly into each task (no process-dict/RLS state is
+  # relied on); Ecto Sandbox + Mox resolve via the `$callers` chain that
+  # Task.Supervisor.async_stream_nolink propagates.
+  defp process_batch_items(tenant_id, items) do
+    Loopctl.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(
+      items,
+      fn item -> enqueue_item_result(tenant_id, item) end,
+      max_concurrency: 10,
+      timeout: batch_item_timeout_ms(),
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.map(fn
+      {:ok, result} ->
+        result
+
+      {:exit, :timeout} ->
+        Logger.warning("batch item validation timeout")
+        %{status: "error", error: "validation_timeout"}
+
+      {:exit, reason} ->
+        Logger.warning("batch item validation crashed: #{inspect(reason)}")
+        %{status: "error", error: "validation_failed"}
+    end)
+  end
+
+  # Per-item wall-clock deadline for batch validation. Config-based DI so the
+  # timeout path is testable deterministically without a multi-second wait.
+  @default_batch_item_timeout_ms 5_000
+  defp batch_item_timeout_ms do
+    Application.get_env(
+      :loopctl,
+      :batch_item_validation_timeout_ms,
+      @default_batch_item_timeout_ms
+    )
   end
 
   operation(:index,
@@ -284,7 +340,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     publish = params["publish"] == true or params["publish"] == "true"
 
     with :ok <- validate_content_source(url, content),
-         :ok <- validate_source_type(source_type) do
+         :ok <- validate_source_type(source_type),
+         :ok <- validate_url_egress(url) do
       content_hash = compute_content_hash(url || content)
 
       job_args =
@@ -383,6 +440,35 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   defp validate_source_type(""), do: {:error, :unprocessable_entity, "'source_type' is required"}
   defp validate_source_type(_), do: :ok
+
+  # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Reject a URL that points
+  # at a private / loopback / link-local / cloud-metadata address up front (4xx)
+  # so a bad URL never reaches the worker. Content-only ingests (url == nil) skip
+  # this. The worker re-validates before fetching to defend against DNS rebinding.
+  defp validate_url_egress(nil), do: :ok
+
+  defp validate_url_egress(url) when is_binary(url) do
+    case UrlGuard.validate_egress(url) do
+      {:ok, _uri} ->
+        :ok
+
+      {:error, :invalid_scheme} ->
+        {:error, :unprocessable_entity, "'url' must use the http or https scheme"}
+
+      {:error, :invalid_url} ->
+        {:error, :unprocessable_entity, "'url' is not a valid URL"}
+
+      {:error, :missing_host} ->
+        {:error, :unprocessable_entity, "'url' must have a valid host"}
+
+      {:error, :dns_resolution_failed} ->
+        {:error, :unprocessable_entity, "'url' host could not be resolved"}
+
+      {:error, :blocked_ip} ->
+        {:error, :unprocessable_entity,
+         "'url' must not target a private, loopback, or metadata address"}
+    end
+  end
 
   defp compute_content_hash(input) when is_binary(input) do
     :crypto.hash(:sha256, input) |> Base.encode16(case: :lower)
