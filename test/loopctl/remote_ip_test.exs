@@ -62,4 +62,23 @@ defmodule Loopctl.RemoteIpTest do
       assert RemoteIp.to_string_ip("nope") == nil
     end
   end
+
+  describe "proxy?/1" do
+    test "true for an address inside a configured :proxies CIDR" do
+      # config/test.exs pins :proxies to 198.51.100.0/24.
+      assert RemoteIp.proxy?({198, 51, 100, 50})
+      assert RemoteIp.proxy?({198, 51, 100, 1})
+    end
+
+    test "false for a public / non-proxy address" do
+      refute RemoteIp.proxy?({203, 0, 113, 7})
+      refute RemoteIp.proxy?({127, 0, 0, 1})
+      refute RemoteIp.proxy?({0x2606, 0x4700, 0, 0, 0, 0, 0, 1})
+    end
+
+    test "false for non-address input" do
+      refute RemoteIp.proxy?(nil)
+      refute RemoteIp.proxy?("nope")
+    end
+  end
 end

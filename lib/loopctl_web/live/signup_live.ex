@@ -82,11 +82,19 @@ defmodule LoopctlWeb.SignupLive do
   `conn.remote_ip`.
   """
   def signup_session(conn) do
-    ip =
-      Loopctl.RemoteIp.string_from(conn.req_headers) ||
-        Loopctl.RemoteIp.to_string_ip(conn.remote_ip)
+    %{"client_ip" => Loopctl.RemoteIp.string_from(conn.req_headers) || peer_identity(conn)}
+  end
 
-    %{"client_ip" => ip}
+  # The raw peer is a valid per-visitor identity ONLY when it is NOT one of our
+  # configured proxies. A proxy peer (e.g. Fly's 6PN, when no forwarded header
+  # resolved) would collapse every visitor onto one bucket, so we return nil and
+  # let signup_rate_key/2 fall back to the per-connection bucket.
+  defp peer_identity(conn) do
+    if Loopctl.RemoteIp.proxy?(conn.remote_ip) do
+      nil
+    else
+      Loopctl.RemoteIp.to_string_ip(conn.remote_ip)
+    end
   end
 
   @impl true
@@ -167,31 +175,18 @@ defmodule LoopctlWeb.SignupLive do
     end)
   end
 
-  defp cap_tenant_params(params), do: params
-
-  @impl true
-  def handle_event("validate", %{"tenant" => params} = all, socket) do
-    # Form-change handler: not rate-limited (it fires per keystroke), but every
-    # attacker-controlled string is size-capped so a huge value can never be
-    # echoed back into the re-rendered form (echo-amplification).
-    friendly = cap_string(Map.get(all, "friendly_name", socket.assigns.friendly_name_draft))
-    params = cap_tenant_params(params)
-
-    {:noreply,
-     socket
-     |> assign(:form, to_form(params, as: :tenant, errors: form_errors(params)))
-     |> assign(:friendly_name_draft, friendly)
-     |> clear_error()}
+  defp extract_friendly(params, socket) do
+    params
+    |> Map.get("friendly_name", socket.assigns.friendly_name_draft)
+    |> cap_string()
+    |> String.trim()
   end
 
-  @impl true
-  def handle_event("request_attestation", %{} = params, socket) do
-    friendly_name =
-      params
-      |> Map.get("friendly_name", socket.assigns.friendly_name_draft || "")
-      |> to_string()
-      |> String.trim()
-      |> truncate_to(@max_friendly_name_bytes)
+  defp do_request_attestation(params, socket) do
+    # extract_friendly/2 is binary-safe (cap_string returns "" for a non-binary
+    # crafted friendly_name) and byte-capped, so a huge value can never be
+    # processed/echoed and `to_string` can never crash.
+    friendly_name = extract_friendly(params, socket)
 
     cond do
       length(socket.assigns.authenticators) >= socket.assigns.max_authenticators ->
@@ -199,14 +194,6 @@ defmodule LoopctlWeb.SignupLive do
 
       friendly_name == "" ->
         {:noreply, assign(socket, :error, "Please name this authenticator before enrolling")}
-
-      match?({:error, _}, ensure_action_budget(socket)) ->
-        {:noreply,
-         assign(
-           socket,
-           :error,
-           "Too many authenticator enrollment requests. Please try again later."
-         )}
 
       true ->
         challenge = new_challenge()
@@ -222,6 +209,41 @@ defmodule LoopctlWeb.SignupLive do
            friendly_name: friendly_name,
            rp_id: Keyword.get(WebAuthn.rp_opts(), :rp_id, "loopctl.com")
          })}
+    end
+  end
+
+  @impl true
+  def handle_event("validate", %{"tenant" => params} = all, socket) when is_map(params) do
+    # Form-change handler: not rate-limited (it fires per keystroke), but every
+    # attacker-controlled string is size-capped so a huge value can never be
+    # echoed back into the re-rendered form (echo-amplification). `is_map(params)`
+    # guards against a crafted non-map "tenant"; anything else falls to the
+    # module catch-all (no-op).
+    friendly = cap_string(Map.get(all, "friendly_name", socket.assigns.friendly_name_draft))
+    params = cap_tenant_params(params)
+
+    {:noreply,
+     socket
+     |> assign(:form, to_form(params, as: :tenant, errors: form_errors(params)))
+     |> assign(:friendly_name_draft, friendly)
+     |> clear_error()}
+  end
+
+  @impl true
+  def handle_event("request_attestation", %{} = params, socket) do
+    # Draw the shared action budget FIRST — before extracting/truncating the
+    # friendly_name — so a throttled call never pays the (bounded) parsing cost.
+    case ensure_action_budget(socket) do
+      {:error, _message} ->
+        {:noreply,
+         assign(
+           socket,
+           :error,
+           "Too many authenticator enrollment requests. Please try again later."
+         )}
+
+      :ok ->
+        do_request_attestation(params, socket)
     end
   end
 
@@ -269,10 +291,13 @@ defmodule LoopctlWeb.SignupLive do
   def handle_event("attestation_error", _params, socket), do: {:noreply, socket}
 
   @impl true
-  def handle_event("remove_authenticator", %{"index" => index}, socket) when is_binary(index) do
-    # Never trust the client-supplied index: parse it defensively and
-    # bounds-check against the current list. A non-parseable or out-of-range
-    # index is a no-op instead of crashing the public LiveView process.
+  def handle_event("remove_authenticator", %{"index" => index}, socket)
+      when is_binary(index) and byte_size(index) <= 3 do
+    # `byte_size(index) <= 3` (O(1)) is a hard pre-parse guard: a legit index is
+    # 0..(max_authenticators-1), a single digit. Without it, Integer.parse ->
+    # :erlang.binary_to_integer raises SystemLimitError on a ~2M-digit string
+    # (crashing the process, uncaught by with/else) and burns O(n) CPU on a
+    # ~1M-digit one. Then parse + bounds-check; any miss is a no-op.
     with {parsed, ""} <- Integer.parse(index),
          true <- parsed >= 0 and parsed < length(socket.assigns.authenticators) do
       new_auths = List.delete_at(socket.assigns.authenticators, parsed)
@@ -282,12 +307,15 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  # Missing "index", non-binary index, or a non-map payload is a no-op — a
-  # non-map would otherwise crash `Map.get/3` before the with/else could run.
+  # Oversized index (> 3 bytes), non-binary index, missing "index", or a non-map
+  # payload is a no-op — a non-map would otherwise crash `Map.get/3` before the
+  # with/else could run, and an oversized index would crash Integer.parse.
   def handle_event("remove_authenticator", _params, socket), do: {:noreply, socket}
 
   @impl true
-  def handle_event("signup", %{"tenant" => params}, socket) do
+  def handle_event("signup", %{"tenant" => params}, socket) when is_map(params) do
+    # `is_map(params)` guards a crafted non-map "tenant"; anything else falls to
+    # the module catch-all (no-op).
     case socket.assigns.authenticators do
       [] ->
         {:noreply,
@@ -519,17 +547,27 @@ defmodule LoopctlWeb.SignupLive do
   defp cap_string(value) when is_binary(value), do: truncate_to(value, @max_friendly_name_bytes)
   defp cap_string(_value), do: ""
 
-  # Truncate a binary to a maximum byte size (best-effort at a char boundary).
+  # BYTE-based truncation, O(max_bytes) — never grapheme-based (String.slice/
+  # String.length/String.split_at walk the WHOLE input, and Unicode combining
+  # marks ("Zalgo") collapse to one grapheme so a multi-MB string escapes a
+  # grapheme cap entirely and burns O(input) CPU). We take the first `max_bytes`
+  # bytes and snap back to the nearest valid UTF-8 boundary (≤ 3 bytes).
   # Callers always pass a binary (guarded by cap_string/1, safe_reason/1,
   # cap_tenant_params/1, or an explicit to_string/1).
   defp truncate_to(string, max_bytes) when is_binary(string) and byte_size(string) <= max_bytes,
     do: string
 
   defp truncate_to(string, max_bytes) when is_binary(string) do
-    string
-    |> String.slice(0, max_bytes)
-    |> String.split_at(max_bytes)
-    |> elem(0)
+    string |> :binary.part(0, max_bytes) |> snap_utf8()
+  end
+
+  # Drop up to 3 trailing bytes so the result is valid UTF-8 (a code point is
+  # at most 4 bytes, so cutting mid-sequence leaves ≤ 3 dangling bytes).
+  defp snap_utf8(bin) do
+    Enum.find_value(0..3, "", fn n ->
+      candidate = :binary.part(bin, 0, byte_size(bin) - n)
+      if String.valid?(candidate), do: candidate
+    end)
   end
 
   @impl true

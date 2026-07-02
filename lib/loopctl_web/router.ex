@@ -30,10 +30,6 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.CheckCustodyHalt
   end
 
-  pipeline :registration_rate_limit do
-    plug LoopctlWeb.Plugs.RegistrationRateLimiter
-  end
-
   # Landing page — browser pipeline (HTML)
   scope "/", LoopctlWeb do
     pipe_through :browser

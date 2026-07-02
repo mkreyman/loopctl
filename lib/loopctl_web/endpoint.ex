@@ -18,8 +18,17 @@ defmodule LoopctlWeb.Endpoint do
   # `Loopctl.RemoteIp` resolver) and hands it to `LoopctlWeb.SignupLive` through
   # the SIGNED session (see the `:public_signup` live_session in the router). So
   # the socket only needs the session.
+  # `max_frame_size: 64_000` is a transport-layer DoS backstop: Bandit's default
+  # websocket frame cap is 8 MB, letting every LiveView handler receive multi-MB
+  # payloads (emoji/Zalgo/bignum/8 MB-echo abuse). No LiveView in this app needs
+  # a large inbound frame — the biggest legit one is the WebAuthn
+  # `attestation_captured` event (attestation_object + client_data_json +
+  # credential_id, a few KB); signup/onboarding/wiki carry only tiny events. So
+  # 64 KB bounds ALL inbound frames at the transport (over-cap frames are dropped
+  # and the connection closed by Bandit). This is defense-in-depth ON TOP OF the
+  # per-handler size caps and rate limits.
   socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: @session_options]],
+    websocket: [connect_info: [session: @session_options], max_frame_size: 64_000],
     longpoll: [connect_info: [session: @session_options]]
 
   # Serve at "/" the static files from "priv/static" directory.

@@ -42,6 +42,20 @@ defmodule Loopctl.RemoteIp do
   def string_from(headers), do: headers |> from() |> to_string_ip()
 
   @doc """
+  True when `addr` is within one of the configured `:proxies` CIDRs.
+
+  Used so the raw TCP peer is never treated as a per-visitor identity when it is
+  actually the proxy (keying on it would collapse every visitor onto one bucket).
+  """
+  @spec proxy?(:inet.ip_address() | term()) :: boolean()
+  def proxy?(addr) when tuple_size(addr) in [4, 8] do
+    encoded = RemoteIp.Block.encode(addr)
+    Enum.any?(proxy_blocks(), &RemoteIp.Block.contains?(&1, encoded))
+  end
+
+  def proxy?(_), do: false
+
+  @doc """
   Normalizes an `:inet.ip_address/0` tuple to a stable string.
 
   IPv4-mapped IPv6 (`::ffff:a.b.c.d`, i.e. `{0,0,0,0,0,0xffff,_,_}` — how Bandit
@@ -59,6 +73,10 @@ defmodule Loopctl.RemoteIp do
 
   defp resolve_header(headers, header_name) do
     RemoteIp.from(headers, Keyword.put(opts(), :headers, [header_name]))
+  end
+
+  defp proxy_blocks do
+    opts() |> Keyword.get(:proxies, []) |> Enum.map(&RemoteIp.Block.parse!/1)
   end
 
   defp opts, do: Application.get_env(:loopctl, :remote_ip_opts, [])

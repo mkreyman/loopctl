@@ -344,6 +344,19 @@ defmodule LoopctlWeb.SignupLiveTest do
       conn = %Plug.Conn{remote_ip: {0, 0, 0, 0, 0, 0xFFFF, 0xCB00, 0x7107}, req_headers: []}
       assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
     end
+
+    test "signup_session/1 returns nil for a PROXY peer with no forwarded header" do
+      # No fly-client-ip / XFF; the raw peer is a configured proxy (198.51.100.0/24
+      # in test). Keying on it would collapse every visitor onto one bucket, so it
+      # returns nil -> signup_rate_key/2 uses the per-connection bucket.
+      conn = %Plug.Conn{remote_ip: {198, 51, 100, 50}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => nil}
+    end
+
+    test "signup_session/1 uses a PUBLIC (non-proxy) peer as the visitor identity" do
+      conn = %Plug.Conn{remote_ip: {203, 0, 113, 7}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
+    end
   end
 
   describe "attestation verification is protected server-side (web-01 expensive path)" do
@@ -836,6 +849,88 @@ defmodule LoopctlWeb.SignupLiveTest do
 
       assert {:error, {:live_redirect, %{to: "/"}}} =
                live(conn, ~p"/tenants/#{missing_id}/onboarding?token=#{token}")
+    end
+  end
+
+  describe "resource-exhaustion backstops (byte truncation, bignum, type guards)" do
+    test "an emoji friendly_name is BYTE-capped (not grapheme-capped) and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # 100 emoji = 400 bytes; the 120-byte cap keeps ≤ 30 emoji.
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => String.duplicate("😀", 100)
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+      render_hook(view, "attestation_captured", valid_attestation())
+
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      # A 40-emoji run (160 bytes) can never survive a 120-byte cap.
+      refute html =~ String.duplicate("😀", 40)
+    end
+
+    test "a Zalgo (combining-mark) friendly_name is byte-capped and does not burn CPU / crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # ~100 KB but ONE grapheme — the old grapheme cap returned it whole.
+      zalgo = "e" <> String.duplicate("̃", 50_000)
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => zalgo
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+      render_hook(view, "attestation_captured", valid_attestation())
+
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      refute html =~ String.duplicate("̃", 1_000)
+    end
+
+    test "remove_authenticator with a ~2M-digit index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      # Without the O(1) byte guard, Integer.parse would raise SystemLimitError.
+      render_hook(view, "remove_authenticator", %{"index" => String.duplicate("9", 2_000_000)})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "validate with a non-map tenant is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "validate", %{"tenant" => ["not", "a", "map"]})
+
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "signup with a non-map tenant is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "signup", %{"tenant" => "not-a-map"})
+
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "request_attestation with a non-binary friendly_name does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "request_attestation", %{"friendly_name" => %{"x" => 1}})
+
+      assert has_element?(view, "#signup-form")
+      # cap_string returns "" for a non-binary -> the empty-name branch, no crash.
+      assert html =~ "Please name this authenticator"
     end
   end
 
