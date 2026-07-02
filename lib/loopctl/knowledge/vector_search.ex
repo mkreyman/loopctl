@@ -121,6 +121,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
   per-read transaction is now unavoidable behind pgbouncer.
   """
 
+  @behaviour Loopctl.Knowledge.SimilaritySearchBehaviour
+
   import Ecto.Query
 
   alias Loopctl.HeavyRead
@@ -246,6 +248,7 @@ defmodule Loopctl.Knowledge.VectorSearch do
   `target_embedding` is a plain `[float()]` list or a `%Pgvector{}` — normalized to
   a bound `^[float()]` param via `to_embedding_list/1` (never the struct — #168).
   """
+  @impl true
   @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) :: [
           candidate()
         ]

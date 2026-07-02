@@ -309,6 +309,12 @@ config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).
 config :loopctl, :knowledge_lint_max_conflict_promotions, 500
 
+# DI: the nearest-neighbour similarity lookup Loopctl.Workers.ArticleLinkingWorker uses
+# (Loopctl.Knowledge.SimilaritySearchBehaviour). Production/dev run the real
+# index-correct pgvector kNN helper; config/test.exs swaps in a Mox mock so the worker's
+# linking logic can be unit-tested deterministically off the timed heavy-read path.
+config :loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 
