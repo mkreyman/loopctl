@@ -21,7 +21,6 @@ defmodule LoopctlWeb.StoryVerificationController do
   alias Loopctl.Verification
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.WorkBreakdown.Stories
-  alias Loopctl.Workers.VerificationRunnerWorker
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
@@ -436,31 +435,29 @@ defmodule LoopctlWeb.StoryVerificationController do
     end
   end
 
-  # US-26.4.4.1: enqueue a verification_run. Returns `{run_id, run_error}` where
-  # `run_error` is nil on success or a short, safe reason string on failure. A
-  # changeset failure here (commit_sha is pre-validated above, so this is
-  # normally a constraint/DB error) is logged AND surfaced in the response so
-  # the missing L3 re-execution is visible and auditable — never silently
-  # swallowed into a misleading 202 with run_id: null.
+  # US-26.4.4.1: atomically create a verification_run AND enqueue its runner job
+  # (both commit or neither — see Verification.create_run_and_enqueue/3).
+  # Returns `{run_id, run_error}` where `run_error` is nil on success or a short,
+  # safe reason string on failure. commit_sha is pre-validated above, so a
+  # failure here is normally a constraint / transient DB error; it is logged AND
+  # surfaced in the response so the missing L3 re-execution is visible and
+  # auditable — never silently swallowed into a misleading 202 with run_id: null,
+  # and never left as an orphaned "pending" run with no job.
   defp enqueue_verification_run(tenant_id, story_id, params) do
     attrs = %{
       commit_sha: Map.get(params, "commit_sha"),
       runner_type: "ci_github"
     }
 
-    case Verification.create_run(tenant_id, story_id, attrs) do
+    case Verification.create_run_and_enqueue(tenant_id, story_id, attrs) do
       {:ok, run} ->
-        %{"run_id" => run.id, "tenant_id" => tenant_id}
-        |> VerificationRunnerWorker.new()
-        |> Oban.insert()
-
         {run.id, nil}
 
       {:error, %Ecto.Changeset{} = changeset} ->
         fields = Keyword.keys(changeset.errors)
 
         Logger.warning(
-          "VerificationRunner: failed to create verification_run for story " <>
+          "VerificationRunner: failed to create/enqueue verification_run for story " <>
             "#{story_id} (tenant #{tenant_id}); invalid fields: #{inspect(fields)}. " <>
             "L3 re-execution was NOT enqueued."
         )
@@ -469,7 +466,7 @@ defmodule LoopctlWeb.StoryVerificationController do
 
       {:error, reason} ->
         Logger.warning(
-          "VerificationRunner: failed to create verification_run for story " <>
+          "VerificationRunner: failed to create/enqueue verification_run for story " <>
             "#{story_id} (tenant #{tenant_id}): #{inspect(reason)}. " <>
             "L3 re-execution was NOT enqueued."
         )

@@ -8,8 +8,12 @@ defmodule Loopctl.Verification do
 
   import Ecto.Query
 
+  require Logger
+
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Verification.VerificationRun
+  alias Loopctl.Workers.VerificationRunnerWorker
 
   @doc "Creates a new verification run for a story."
   @spec create_run(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
@@ -18,6 +22,47 @@ defmodule Loopctl.Verification do
     %VerificationRun{tenant_id: tenant_id, story_id: story_id}
     |> VerificationRun.changeset(attrs)
     |> AdminRepo.insert()
+  end
+
+  @doc """
+  Atomically creates a verification run AND enqueues its runner job.
+
+  The run row and the Oban job are inserted in a single `Ecto.Multi`
+  transaction: either both commit or neither does. This guarantees a run row is
+  never left in `"pending"` with no job to execute it (and no job is ever
+  enqueued for a run that failed to insert).
+
+  Returns `{:ok, run}` or `{:error, reason}`. A raised DB exception during the
+  transaction (e.g. a transient `Postgrex`/`DBConnection` error) is caught and
+  returned as `{:error, exception}` — the transaction has already rolled back,
+  so there is no orphaned run — letting the caller surface the failure instead
+  of leaking an uncaught 500.
+  """
+  @spec create_run_and_enqueue(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, VerificationRun.t()} | {:error, term()}
+  def create_run_and_enqueue(tenant_id, story_id, attrs \\ %{}) do
+    run_changeset =
+      %VerificationRun{tenant_id: tenant_id, story_id: story_id}
+      |> VerificationRun.changeset(attrs)
+
+    Multi.new()
+    |> Multi.insert(:run, run_changeset)
+    |> Oban.insert(:job, fn %{run: run} ->
+      VerificationRunnerWorker.new(%{"run_id" => run.id, "tenant_id" => tenant_id})
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{run: run}} -> {:ok, run}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  rescue
+    exception ->
+      Logger.error(
+        "Verification.create_run_and_enqueue crashed for story #{story_id} " <>
+          "(tenant #{tenant_id}): #{Exception.message(exception)}"
+      )
+
+      {:error, exception}
   end
 
   @doc "Gets a verification run by ID, tenant-scoped."
