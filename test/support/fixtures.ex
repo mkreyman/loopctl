@@ -25,6 +25,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
+  alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
   alias Loopctl.TokenUsage.CostAnomaly
@@ -53,6 +54,24 @@ defmodule Loopctl.Fixtures do
         status: :active
       },
       Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:root_authenticator, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    Map.merge(
+      %{
+        credential_id: :crypto.strong_rand_bytes(16),
+        # COSE public key persisted the same way the Wax adapter does —
+        # `:erlang.term_to_binary/1` of a COSE key map — so the reauth path
+        # can round-trip it. The mock WebAuthn adapter ignores it in tests.
+        public_key: :erlang.term_to_binary(%{1 => 2, 3 => -7}),
+        attestation_format: "none",
+        sign_count: 0,
+        friendly_name: "Test Authenticator #{System.unique_integer([:positive])}"
+      },
+      attrs
     )
   end
 
@@ -407,6 +426,24 @@ defmodule Loopctl.Fixtures do
     else
       tenant
     end
+  end
+
+  def fixture(:root_authenticator, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.delete(attrs, :tenant_id)}
+
+        tid ->
+          {tid, Map.delete(attrs, :tenant_id)}
+      end
+
+    %RootAuthenticator{tenant_id: tenant_id}
+    |> RootAuthenticator.create_changeset(build(:root_authenticator, attrs))
+    |> AdminRepo.insert!()
   end
 
   def fixture(:agent, attrs) do

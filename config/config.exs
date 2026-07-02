@@ -233,6 +233,7 @@ config :loopctl, Oban,
      crontab: [
        {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
        {"0 * * * *", Loopctl.Workers.BulkDeleteTokenCleanupWorker},
+       {"0 * * * *", Loopctl.Workers.ReauthChallengeCleanupWorker},
        {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
        {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
        {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},

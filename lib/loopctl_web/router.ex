@@ -116,6 +116,7 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+    post "/tenants/:id/rotate-audit-key/challenge", TenantAuditKeyController, :challenge
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
     post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap
 

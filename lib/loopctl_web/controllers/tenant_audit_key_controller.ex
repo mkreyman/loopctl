@@ -1,18 +1,51 @@
 defmodule LoopctlWeb.TenantAuditKeyController do
   @moduledoc """
-  US-26.0.2 — Public key retrieval and key rotation for tenant audit signing keys.
+  US-26.0.2 / crypto-01 — Public key retrieval and key rotation for tenant
+  audit signing keys.
 
   The public key endpoint is unauthenticated (intended for external
-  verification). The rotation endpoint requires WebAuthn + user role.
+  verification). Rotation is gated by a real, two-step, challenge-bound
+  WebAuthn reauthentication ceremony (GHSA-c3cw-5f7p-g76r):
+
+    1. `POST /tenants/:id/rotate-audit-key/challenge` issues an
+       authentication challenge bound to the tenant's enrolled root
+       authenticators and stores it server-side (single-use, short TTL).
+    2. `POST /tenants/:id/rotate-audit-key` verifies the client's assertion
+       against that STORED challenge (origin, RP-ID, signature against the
+       enrolled COSE key, sign-counter regression) before rotating.
+
+  Both steps require `user` role (enforced by the router pipeline + the
+  `RequireRole` plug) AND tenant ownership (checked here).
   """
 
   use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Tenants
-  alias Loopctl.WebAuthn
+  alias Loopctl.WebAuthn.Reauth
+
+  @rotate_purpose "rotate_audit_key"
 
   # Key management requires user role — agents must not rotate/bootstrap keys
-  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:rotate, :bootstrap]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :user] when action in [:rotate, :bootstrap, :challenge]
+
+  tags(["Tenants"])
+
+  operation(:show,
+    summary: "Get tenant audit public key",
+    description:
+      "Returns the tenant's ed25519 audit signing public key as PEM (default) " <>
+        "or JWK (Accept: application/jwk+json). Public — no authentication required.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    security: [],
+    responses: %{
+      200 =>
+        {"Public key (PEM or JWK)", "application/x-pem-file", %OpenApiSpex.Schema{type: :string}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   GET /api/v1/tenants/:id/audit_public_key
@@ -46,29 +79,102 @@ defmodule LoopctlWeb.TenantAuditKeyController do
     end
   end
 
+  operation(:challenge,
+    summary: "Issue an audit-key rotation reauth challenge",
+    description:
+      "Step 1 of the challenge-bound WebAuthn reauthentication ceremony. Issues " <>
+        "an authentication challenge bound to the tenant's enrolled root " <>
+        "authenticators, stores it server-side (single-use, short TTL) and returns " <>
+        "the opaque `challenge_id`, the base64url challenge bytes, and the allowed " <>
+        "credential ids. Requires user role and tenant ownership.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 => {"Reauth challenge", "application/json", Schemas.ReauthChallengeResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      422 => {"No enrolled authenticators", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  @doc """
+  POST /api/v1/tenants/:id/rotate-audit-key/challenge
+
+  Step 1 of the reauth ceremony. Mints a server-side, single-use,
+  TTL-bounded authentication challenge bound to the caller's tenant and
+  returns the opaque handle plus allowed credential ids.
+  """
+  def challenge(conn, %{"id" => tenant_id}) do
+    if owns_tenant?(conn, tenant_id) do
+      case Reauth.issue_challenge(tenant_id, @rotate_purpose) do
+        {:ok, issued} ->
+          conn
+          |> put_status(:ok)
+          |> json(%{
+            data: %{
+              challenge_id: issued.challenge_id,
+              challenge: issued.challenge,
+              allowed_credentials: issued.allowed_credentials,
+              rp_id: issued.rp_id,
+              expires_at: issued.expires_at
+            }
+          })
+
+        {:error, :no_authenticators} ->
+          conn
+          |> put_status(:unprocessable_entity)
+          |> json(%{
+            error: %{
+              message: "Tenant has no enrolled root authenticator to authorize rotation",
+              code: "no_authenticators",
+              status: 422
+            }
+          })
+
+        {:error, _reason} ->
+          conn
+          |> put_status(:internal_server_error)
+          |> json(%{error: %{message: "Failed to issue reauth challenge", status: 500}})
+      end
+    else
+      forbidden(conn)
+    end
+  end
+
+  operation(:rotate,
+    summary: "Rotate the tenant audit signing key",
+    description:
+      "Step 2 of the challenge-bound WebAuthn reauthentication ceremony. Verifies " <>
+        "the assertion against the STORED challenge from step 1 (challenge binding, " <>
+        "origin, RP-ID, signature against the enrolled COSE key, sign-counter " <>
+        "regression) and, on success, rotates the ed25519 audit keypair. Requires " <>
+        "user role and tenant ownership.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    request_body: {"WebAuthn assertion", "application/json", Schemas.RotateAuditKeyRequest},
+    responses: %{
+      200 => {"Key rotated", "application/json", Schemas.AuditKeyResponse},
+      401 => {"WebAuthn required or failed", "application/json", Schemas.ErrorResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"No audit key to rotate", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
   @doc """
   POST /api/v1/tenants/:id/rotate-audit-key
 
-  Rotates the tenant's audit signing keypair. Requires:
-  1. Authenticated with user-role key (enforced by router pipeline)
+  Step 2 of the reauth ceremony. Rotates the tenant's audit signing
+  keypair. Requires:
+  1. Authenticated with a user-role key (enforced by router pipeline)
   2. Caller owns the target tenant (checked here)
-  3. Valid WebAuthn assertion in the request body
+  3. A WebAuthn assertion verified against a STORED challenge from step 1
   """
   def rotate(conn, %{"id" => tenant_id} = params) do
-    # Ownership check: caller must own the target tenant
-    caller_tenant_id =
-      case conn.assigns do
-        %{current_api_key: %{tenant_id: tid}} -> tid
-        _ -> nil
-      end
+    assertion = Map.get(params, "webauthn_assertion")
 
     cond do
-      caller_tenant_id != tenant_id ->
-        conn
-        |> put_status(:forbidden)
-        |> json(%{error: %{message: "Forbidden", status: 403}})
+      not owns_tenant?(conn, tenant_id) ->
+        forbidden(conn)
 
-      is_nil(Map.get(params, "webauthn_assertion")) ->
+      not is_map(assertion) ->
         conn
         |> put_status(:unauthorized)
         |> json(%{
@@ -80,57 +186,21 @@ defmodule LoopctlWeb.TenantAuditKeyController do
         })
 
       true ->
-        do_rotate(conn, tenant_id, params)
+        do_rotate(conn, tenant_id, assertion)
     end
   end
 
-  defp do_rotate(conn, tenant_id, params) do
-    assertion_b64 = Map.fetch!(params, "webauthn_assertion")
-    assertion_bytes = decode_assertion(assertion_b64)
+  defp do_rotate(conn, tenant_id, assertion) do
+    # Verify the assertion against the STORED challenge and the tenant's
+    # enrolled authenticator (challenge binding, signature, counter). The
+    # ceremony is single-use: the challenge is consumed here regardless of
+    # outcome. On success `verified.signature` is the genuinely verified
+    # assertion signature, persisted as the rotation proof.
+    case Reauth.verify_and_consume(tenant_id, @rotate_purpose, assertion) do
+      {:ok, verified} ->
+        rotate_after_reauth(conn, tenant_id, verified.signature)
 
-    # Verify the WebAuthn assertion against the tenant's enrolled authenticators
-    case verify_webauthn_assertion(tenant_id, assertion_bytes) do
-      {:ok, _} ->
-        case Tenants.rotate_audit_key(tenant_id, assertion_bytes) do
-          {:ok, tenant} ->
-            conn
-            |> put_status(:ok)
-            |> json(%{
-              data: %{
-                tenant_id: tenant.id,
-                audit_signing_public_key: Base.encode64(tenant.audit_signing_public_key),
-                rotated_at: tenant.audit_key_rotated_at
-              }
-            })
-
-          {:error, :not_found} ->
-            conn
-            |> put_status(:not_found)
-            |> json(%{error: %{message: "Not found", status: 404}})
-
-          {:error, :no_existing_key} ->
-            conn
-            |> put_status(:unprocessable_entity)
-            |> json(%{error: %{message: "No audit key to rotate", status: 422}})
-
-          {:error, {:audit_key_storage_failed, _reason}} ->
-            conn
-            |> put_status(:internal_server_error)
-            |> json(%{
-              error: %{
-                message: "Failed to store the new audit key. Please retry.",
-                code: "audit_key_storage_failed",
-                status: 500
-              }
-            })
-
-          {:error, _reason} ->
-            conn
-            |> put_status(:internal_server_error)
-            |> json(%{error: %{message: "Key rotation failed", status: 500}})
-        end
-
-      {:error, _} ->
+      {:error, _reason} ->
         conn
         |> put_status(:unauthorized)
         |> json(%{
@@ -143,22 +213,61 @@ defmodule LoopctlWeb.TenantAuditKeyController do
     end
   end
 
-  defp verify_webauthn_assertion(tenant_id, assertion_bytes) do
-    # Use the WebAuthn adapter to verify the assertion. For now,
-    # we pass the assertion as a payload map that the adapter expects.
-    challenge = WebAuthn.new_authentication_challenge([])
+  defp rotate_after_reauth(conn, tenant_id, rotation_signature) do
+    case Tenants.rotate_audit_key(tenant_id, rotation_signature) do
+      {:ok, tenant} ->
+        conn
+        |> put_status(:ok)
+        |> json(%{
+          data: %{
+            tenant_id: tenant.id,
+            audit_signing_public_key: Base.encode64(tenant.audit_signing_public_key),
+            rotated_at: tenant.audit_key_rotated_at
+          }
+        })
 
-    WebAuthn.verify_authentication(
-      %{
-        credential_id: assertion_bytes,
-        authenticator_data: assertion_bytes,
-        signature: assertion_bytes,
-        client_data_json: assertion_bytes
-      },
-      challenge,
-      tenant_id: tenant_id
-    )
+      {:error, :not_found} ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: %{message: "Not found", status: 404}})
+
+      {:error, :no_existing_key} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: %{message: "No audit key to rotate", status: 422}})
+
+      {:error, {:audit_key_storage_failed, _reason}} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{
+          error: %{
+            message: "Failed to store the new audit key. Please retry.",
+            code: "audit_key_storage_failed",
+            status: 500
+          }
+        })
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{error: %{message: "Key rotation failed", status: 500}})
+    end
   end
+
+  operation(:bootstrap,
+    summary: "Bootstrap an audit signing keypair for a legacy tenant",
+    description:
+      "Generates the initial ed25519 audit keypair for a tenant that predates the " <>
+        "Chain of Custody v2 signup ceremony. Requires user role and tenant " <>
+        "ownership. Refuses (409) if a key already exists — use rotate-audit-key.",
+    parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
+    responses: %{
+      200 => {"Audit keypair bootstrapped", "application/json", Schemas.AuditKeyResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"Key already exists", "application/json", Schemas.ErrorResponse}
+    }
+  )
 
   @doc """
   POST /api/v1/tenants/:id/bootstrap-audit-key
@@ -168,18 +277,10 @@ defmodule LoopctlWeb.TenantAuditKeyController do
   the target tenant. Refuses if a key already exists.
   """
   def bootstrap(conn, %{"id" => tenant_id}) do
-    caller_tenant_id =
-      case conn.assigns do
-        %{current_api_key: %{tenant_id: tid}} -> tid
-        _ -> nil
-      end
-
-    if caller_tenant_id != tenant_id do
-      conn
-      |> put_status(:forbidden)
-      |> json(%{error: %{message: "Forbidden", status: 403}})
-    else
+    if owns_tenant?(conn, tenant_id) do
       do_bootstrap(conn, tenant_id)
+    else
+      forbidden(conn)
     end
   end
 
@@ -249,12 +350,19 @@ defmodule LoopctlWeb.TenantAuditKeyController do
     }
   end
 
-  defp decode_assertion(assertion) when is_binary(assertion) do
-    case Base.decode64(assertion) do
-      {:ok, bytes} -> bytes
-      :error -> assertion
+  # Ownership check: the caller's user-role key must belong to the target
+  # tenant. This is the authorization gate that sits alongside (never
+  # replaces) the WebAuthn crypto layer.
+  defp owns_tenant?(conn, tenant_id) do
+    case conn.assigns do
+      %{current_api_key: %{tenant_id: tid}} -> tid == tenant_id
+      _ -> false
     end
   end
 
-  defp decode_assertion(_), do: <<>>
+  defp forbidden(conn) do
+    conn
+    |> put_status(:forbidden)
+    |> json(%{error: %{message: "Forbidden", status: 403}})
+  end
 end
