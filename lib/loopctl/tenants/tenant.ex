@@ -26,6 +26,8 @@ defmodule Loopctl.Tenants.Tenant do
 
   schema "tenants" do
     field :name, :string
+    # Immutable after creation — keys the audit-key Fly secret name (rls-02).
+    # See update_changeset/2 moduletext; never add :slug to its cast list.
     field :slug, :string
     field :email, :string
     field :settings, :map, default: %{}
@@ -88,30 +90,56 @@ defmodule Loopctl.Tenants.Tenant do
     |> validate_email()
     |> validate_settings()
     |> unique_constraint(:slug)
+    # rls-03: yield a clean 422 (not a 500 ConstraintError) on email collision.
+    |> unique_constraint(:email, name: :tenants_email_index)
   end
 
   @doc """
   Changeset for updating an existing tenant.
 
   Accepts `token_data_retention_days` (integer >= 30, or nil to disable).
+
+  ## Slug is immutable on update (security: rls-02)
+
+  `:slug` is deliberately **not** cast here. The tenant slug is the key
+  from which the ed25519 audit-key Fly secret name is derived
+  (`Loopctl.Secrets.audit_key_secret_name/1`). `Loopctl.TenantKeys`
+  re-derives that name from the tenant's *current* slug on every cache
+  miss, so renaming the slug would strand the audit-key secret: after the
+  5-minute cache TTL, capability-token signing (the normal orchestrator
+  dispatch/cap-minting path) and AuditChain STH signing would hard-fail
+  for the whole tenant indefinitely, and a subsequent rotation would
+  orphan the old secret permanently. The slug is therefore set once at
+  signup/creation and must never change on the update path — this holds
+  for both the `:user` (`PATCH /tenants/me`) and superadmin
+  (`PATCH /admin/tenants/:id`) flows, since both route through this
+  changeset via `Tenants.update_tenant/2` and `update_tenant_admin/2`.
+
+  The proper root fix — keying `Secrets.audit_key_secret_name/1` off the
+  immutable `tenant_id` and migrating the existing slug-named Fly secrets
+  — is deferred because it requires migrating live secrets. See advisory
+  GHSA-v62j-7vgr-rfqp (rls-02).
+
+  Also adds `unique_constraint(:email)` (security: rls-03) so an email
+  collision with another tenant returns a clean `{:error, changeset}`
+  (422) instead of raising `Ecto.ConstraintError` (500) — a 500 vs 422
+  difference is a cross-tenant email-enumeration oracle.
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(tenant, attrs) do
     tenant
     |> cast(attrs, [
       :name,
-      :slug,
       :email,
       :settings,
       :default_story_budget_millicents,
       :token_data_retention_days
     ])
-    |> validate_slug()
     |> validate_email()
     |> validate_settings()
     |> validate_number(:default_story_budget_millicents, greater_than: 0)
     |> validate_retention_days()
-    |> unique_constraint(:slug)
+    |> unique_constraint(:email, name: :tenants_email_index)
   end
 
   @doc """

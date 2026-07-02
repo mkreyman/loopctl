@@ -58,5 +58,55 @@ defmodule LoopctlWeb.TenantControllerTest do
       body = json_response(conn, 200)
       assert body["tenant"]["settings"]["rate_limit_requests_per_minute"] == 500
     end
+
+    # rls-02: slug is immutable on update. A PATCH attempting to rename it
+    # succeeds (other fields apply) but leaves the slug — and therefore the
+    # audit-key secret name — unchanged.
+    test "ignores attempts to change slug (rls-02)", %{conn: conn} do
+      tenant = fixture(:tenant, %{slug: "keep-slug", name: "Old Name"})
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> patch(~p"/api/v1/tenants/me", %{"slug" => "hijacked-slug", "name" => "New Name"})
+
+      body = json_response(conn, 200)
+      assert body["tenant"]["name"] == "New Name"
+      assert body["tenant"]["slug"] == "keep-slug"
+    end
+
+    # rls-03: colliding with another tenant's email must return 422, not 500.
+    # A 500 here would be a cross-tenant email-enumeration oracle.
+    test "returns 422 (not 500) when email is already used by another tenant (rls-03)",
+         %{conn: conn} do
+      _other = fixture(:tenant, %{email: "taken@example.com"})
+      tenant = fixture(:tenant, %{email: "mine@example.com"})
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> patch(~p"/api/v1/tenants/me", %{"email" => "taken@example.com"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert "has already been taken" in body["error"]["details"]["email"]
+      # The response leaks nothing about the other tenant beyond the message.
+      refute Map.has_key?(body["error"]["details"], :id)
+    end
+
+    test "allows updating to a unique email (rls-03)", %{conn: conn} do
+      tenant = fixture(:tenant, %{email: "mine@example.com"})
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> patch(~p"/api/v1/tenants/me", %{"email" => "fresh@example.com"})
+
+      body = json_response(conn, 200)
+      assert body["tenant"]["email"] == "fresh@example.com"
+    end
   end
 end
