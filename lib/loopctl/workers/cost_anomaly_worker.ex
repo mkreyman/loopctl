@@ -17,7 +17,13 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   - Suspiciously low: 0.1x average
   """
 
-  use Oban.Worker, queue: :analytics, max_attempts: 3
+  # `unique` on the period args so that repeated enqueues within the window
+  # (e.g. a CostRollupWorker retry re-chaining the same period) collapse to ONE
+  # job instead of running concurrently on the :analytics queue (FIX1a).
+  use Oban.Worker,
+    queue: :analytics,
+    max_attempts: 3,
+    unique: [period: 600, fields: [:worker, :args], keys: [:period_start, :period_end]]
 
   require Logger
 
@@ -37,6 +43,9 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
 
   @high_cost_threshold Decimal.new("3.0")
   @low_cost_threshold Decimal.new("0.1")
+
+  # Matches CostRollupWorker: reject/clamp a pathological period range.
+  @max_backfill_days 90
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: args}) do
@@ -121,7 +130,13 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
     end)
   end
 
-  defp check_and_flag_anomaly(tenant_id, story_id, story_cost, epic_avg) when epic_avg > 0 do
+  # `story_cost >= 0` mirrors the `epic_avg > 0` guard: a story whose net
+  # cumulative cost is negative (an over-correction) is not a meaningful
+  # deviation -- it would always fall below the low-cost threshold and produce a
+  # bogus :suspiciously_low anomaly. Excluding it here stops the negative anomaly
+  # at the source, before create_anomaly (FIX A.1).
+  defp check_and_flag_anomaly(tenant_id, story_id, story_cost, epic_avg)
+       when epic_avg > 0 and story_cost >= 0 do
     factor = Decimal.div(Decimal.new(story_cost), Decimal.new(epic_avg))
 
     cond do
@@ -170,58 +185,109 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
           existing
       end
     else
+      # Enforce the SAME invariants the changeset would (create == update
+      # symmetry): insert_all bypasses CostAnomaly.create_changeset/2, so we run
+      # the changeset here to validate (e.g. non-negative story_cost/reference_avg)
+      # and BAIL on invalid input -- no insert, no notify (FIX A.2). The source
+      # guard already rejects negative story_cost; this is defense in depth so a
+      # future caller can't reach insert_all with values the changeset rejects.
       changeset =
-        %CostAnomaly{tenant_id: tenant_id, story_id: story_id}
-        |> CostAnomaly.create_changeset(%{
-          anomaly_type: anomaly_type,
-          story_cost_millicents: story_cost,
-          reference_avg_millicents: epic_avg,
-          deviation_factor: Decimal.round(factor, 2)
-        })
+        CostAnomaly.create_changeset(
+          %CostAnomaly{tenant_id: tenant_id, story_id: story_id},
+          %{
+            anomaly_type: anomaly_type,
+            story_cost_millicents: story_cost,
+            reference_avg_millicents: epic_avg,
+            deviation_factor: Decimal.round(factor, 2)
+          }
+        )
 
-      # Use on_conflict: :nothing to gracefully handle a race with the unique
-      # partial index (cost_anomalies_unresolved_unique) -- ADV-3.
-      case AdminRepo.insert(changeset,
-             on_conflict: :nothing,
-             conflict_target:
-               {:unsafe_fragment,
-                ~s|("tenant_id","story_id","anomaly_type") WHERE resolved = false|}
-           ) do
-        {:ok, anomaly} ->
-          # Emit change feed + audit log entry for the newly detected anomaly (AC-21.8.3, AC-21.8.5)
-          Audit.create_log_entry(tenant_id, %{
-            entity_type: "cost_anomaly",
-            entity_id: anomaly.id,
-            action: "detected",
-            actor_type: "system",
-            new_state: %{
-              "anomaly_type" => to_string(anomaly.anomaly_type),
-              "story_id" => anomaly.story_id,
-              "deviation_factor" => Decimal.to_string(anomaly.deviation_factor),
-              "story_cost_millicents" => anomaly.story_cost_millicents,
-              "reference_avg_millicents" => anomaly.reference_avg_millicents
-            },
-            metadata: %{
-              "anomaly_id" => anomaly.id,
-              "story_id" => anomaly.story_id,
-              "anomaly_type" => to_string(anomaly.anomaly_type),
-              "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
-            }
-          })
+      if changeset.valid? do
+        insert_new_anomaly(tenant_id, changeset)
+      else
+        Logger.warning(
+          "CostAnomalyWorker: invalid anomaly for story #{story_id}, skipping: " <>
+            "#{inspect(changeset.errors)}"
+        )
 
-          # Fire token.anomaly_detected webhook event (AC-21.7.7)
-          fire_anomaly_webhook(tenant_id, anomaly)
-
-          anomaly
-
-        {:error, changeset} ->
-          Logger.warning(
-            "CostAnomalyWorker: failed to insert anomaly for story #{story_id}: #{inspect(changeset.errors)}"
-          )
-
-          nil
+        nil
       end
     end
+  end
+
+  # Derives the insert_all row from the VALIDATED changeset (so every NOT NULL
+  # column + defaults are set exactly as the changeset would set them) and writes
+  # it race-safely. insert_all + on_conflict: :nothing reports the REAL number of
+  # rows written against the unique partial index
+  # (cost_anomalies_unresolved_unique): 1 = we genuinely inserted (notify), 0 = a
+  # concurrent run won the race and already notified (skip). This closes the
+  # check-then-insert race that AdminRepo.insert/2 with on_conflict: :nothing had,
+  # where it returned {:ok, struct} carrying a client-generated, UNPERSISTED id on
+  # conflict, so the losing run would emit an audit entry + token.anomaly_detected
+  # webhook for an anomaly_id that was never persisted (FIX1c).
+  defp insert_new_anomaly(tenant_id, changeset) do
+    now = DateTime.utc_now()
+
+    entry =
+      changeset
+      |> Ecto.Changeset.apply_changes()
+      |> Map.take([
+        :tenant_id,
+        :story_id,
+        :anomaly_type,
+        :story_cost_millicents,
+        :reference_avg_millicents,
+        :deviation_factor,
+        :resolved,
+        :archived,
+        :metadata
+      ])
+      |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+
+    case AdminRepo.insert_all(CostAnomaly, [entry],
+           on_conflict: :nothing,
+           conflict_target:
+             {:unsafe_fragment,
+              ~s|("tenant_id","story_id","anomaly_type") WHERE resolved = false|},
+           returning: true
+         ) do
+      {1, [anomaly]} ->
+        notify_new_anomaly(tenant_id, anomaly)
+        anomaly
+
+      {0, _} ->
+        # Lost the race: the concurrent inserter already emitted audit + webhook.
+        nil
+    end
+  end
+
+  # Emits the audit log entry (AC-21.8.3, AC-21.8.5) and fires the
+  # token.anomaly_detected webhook (AC-21.7.7). Called ONLY for a genuinely
+  # persisted anomaly, never for a conflict/no-op insert.
+  defp notify_new_anomaly(tenant_id, anomaly) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "cost_anomaly",
+      entity_id: anomaly.id,
+      action: "detected",
+      actor_type: "system",
+      new_state: %{
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "story_id" => anomaly.story_id,
+        "deviation_factor" => Decimal.to_string(anomaly.deviation_factor),
+        "story_cost_millicents" => anomaly.story_cost_millicents,
+        "reference_avg_millicents" => anomaly.reference_avg_millicents
+      },
+      metadata: %{
+        "anomaly_id" => anomaly.id,
+        "story_id" => anomaly.story_id,
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
+      }
+    })
+
+    fire_anomaly_webhook(tenant_id, anomaly)
+
+    :ok
   end
 
   # Fires a token.anomaly_detected webhook for newly created anomalies.
@@ -329,7 +395,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
               yesterday
           end
 
-        {start_date, end_date}
+        normalize_and_cap(start_date, end_date)
 
       other ->
         Logger.warning(
@@ -338,6 +404,31 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
 
         yesterday = Date.add(Date.utc_today(), -1)
         {yesterday, yesterday}
+    end
+  end
+
+  # Normalize a (possibly reversed) parsed range and cap its width, matching
+  # CostRollupWorker. A reversed range (start > end) is swapped -- otherwise the
+  # candidate-epic query (period_start >= start and <= end) would match NOTHING
+  # and silently skip anomaly detection for the whole range (FIX2). A range wider
+  # than @max_backfill_days is clamped (FIX3).
+  defp normalize_and_cap(start_date, end_date) do
+    {s, e} =
+      if Date.compare(start_date, end_date) == :gt,
+        do: {end_date, start_date},
+        else: {start_date, end_date}
+
+    if Date.diff(e, s) > @max_backfill_days do
+      capped_end = Date.add(s, @max_backfill_days)
+
+      Logger.warning(
+        "CostAnomalyWorker: period range #{Date.to_iso8601(s)}..#{Date.to_iso8601(e)} " <>
+          "exceeds #{@max_backfill_days} days; clamping end to #{Date.to_iso8601(capped_end)}"
+      )
+
+      {s, capped_end}
+    else
+      {s, e}
     end
   end
 

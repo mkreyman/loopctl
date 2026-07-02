@@ -1,5 +1,6 @@
 defmodule Loopctl.Workers.CostRollupWorkerTest do
   use Loopctl.DataCase, async: true
+  use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!
 
@@ -120,10 +121,12 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
       assert hd(summaries).total_cost_millicents == 15_000
     end
 
-    # tokens-08: a transient per-tenant failure must NOT be swallowed into :ok
-    # (Oban would never retry, permanently losing that day's summaries). The job
-    # must return an error so Oban retries, while succeeded tenants stay persisted.
-    test "returns an error (so Oban retries) when a tenant rollup fails, still persisting succeeded tenants" do
+    # tokens-08 + FIX4: a transient per-tenant failure must NOT be swallowed into
+    # a plain success with no follow-up (Oban would never retry, permanently
+    # losing that day's summaries). The batch re-enqueues a NARROW follow-up
+    # scoped to only the failed tenant/day, so healthy tenants are not
+    # re-computed, and succeeded tenants stay persisted.
+    test "re-enqueues a scoped retry for the failed tenant only, persisting succeeded tenants" do
       good_tenant = fixture(:tenant)
       bad_tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: good_tenant.id})
@@ -131,6 +134,8 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
       good_tenant_id = good_tenant.id
       bad_tenant_id = bad_tenant.id
 
+      # Exactly TWO aggregate calls (good + bad) during the batch. The scoped
+      # retry is only ENQUEUED (manual mode), so it does not re-invoke aggregate.
       expect(Loopctl.MockCostRollup, :aggregate, 2, fn tenant_id, _start, _end ->
         cond do
           tenant_id == good_tenant_id ->
@@ -154,18 +159,30 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
       end)
 
       result =
-        CostRollupWorker.perform(%Oban.Job{
-          args: %{
-            "period_start" => "2026-04-02",
-            "period_end" => "2026-04-02",
-            "tenant_ids" => [good_tenant.id, bad_tenant.id]
-          }
-        })
+        Oban.Testing.with_testing_mode(:manual, fn ->
+          CostRollupWorker.perform(%Oban.Job{
+            args: %{
+              "period_start" => "2026-04-02",
+              "period_end" => "2026-04-02",
+              "tenant_ids" => [good_tenant.id, bad_tenant.id]
+            }
+          })
+        end)
 
-      # Not :ok -> Oban will retry the job
-      assert {:error, {:rollup_failed, failed_ids}} = result
-      assert bad_tenant.id in failed_ids
-      refute good_tenant.id in failed_ids
+      # Batch reports success but the failure is NOT lost -- it is re-enqueued.
+      assert result == :ok
+
+      # A scoped follow-up job is enqueued for ONLY the failed tenant/day, so
+      # healthy tenants are not re-computed on the retry.
+      scoped_jobs =
+        all_enqueued(worker: CostRollupWorker)
+        |> Enum.filter(&(&1.args["scoped_retry"] == true))
+
+      assert length(scoped_jobs) == 1
+      scoped = hd(scoped_jobs)
+      assert scoped.args["tenant_ids"] == [bad_tenant.id]
+      assert scoped.args["period_start"] == "2026-04-02"
+      assert scoped.args["period_end"] == "2026-04-02"
 
       import Ecto.Query
 
@@ -181,6 +198,155 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
         from(c in CostSummary, where: c.tenant_id == ^bad_tenant.id) |> AdminRepo.all()
 
       assert bad_summaries == []
+    end
+
+    # FIX4: a scoped retry job that fails again does NOT re-enqueue (which would
+    # loop) -- it returns an error so Oban's bounded retry takes over.
+    test "a scoped retry that fails again returns an error instead of re-enqueueing" do
+      bad_tenant = fixture(:tenant)
+
+      expect(Loopctl.MockCostRollup, :aggregate, fn _tenant_id, _start, _end ->
+        {:error, "still timing out"}
+      end)
+
+      result =
+        Oban.Testing.with_testing_mode(:manual, fn ->
+          CostRollupWorker.perform(%Oban.Job{
+            args: %{
+              "period_start" => "2026-04-02",
+              "period_end" => "2026-04-02",
+              "tenant_ids" => [bad_tenant.id],
+              "scoped_retry" => true
+            }
+          })
+        end)
+
+      assert {:error, {:rollup_failed, failed_ids}} = result
+      assert bad_tenant.id in failed_ids
+
+      # It must NOT have re-enqueued another scoped retry (no unbounded loop).
+      assert all_enqueued(worker: CostRollupWorker) == []
+    end
+
+    # FIX2: a reversed period range is normalized (swapped), not silently skipped.
+    # Strengthened so it FAILS without the swap: the chained CostAnomalyWorker
+    # must receive the EARLIER date as period_start (without the swap it would
+    # carry the later date and the anomaly candidate query would match nothing).
+    test "normalizes a reversed period range and chains anomaly detection with the earlier date first" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      d1 = ~D[2026-04-01]
+      d2 = ~D[2026-04-02]
+
+      # period_start AFTER period_end -> must be swapped to [d1, d2] and roll up
+      # BOTH days (2 aggregate calls), not zero.
+      expect(Loopctl.MockCostRollup, :aggregate, 2, fn _tenant_id, start_date, end_date ->
+        assert start_date == end_date
+        assert start_date in [d1, d2]
+
+        {:ok,
+         [
+           %{
+             scope_type: :project,
+             scope_id: project.id,
+             total_input_tokens: 0,
+             total_output_tokens: 0,
+             total_cost_millicents: 100,
+             report_count: 1,
+             model_breakdown: %{},
+             avg_cost_per_story_millicents: nil
+           }
+         ]}
+      end)
+
+      {result, anomaly_jobs} =
+        Oban.Testing.with_testing_mode(:manual, fn ->
+          r =
+            CostRollupWorker.perform(%Oban.Job{
+              args: %{
+                # reversed on purpose
+                "period_start" => Date.to_iso8601(d2),
+                "period_end" => Date.to_iso8601(d1),
+                "tenant_ids" => [tenant.id]
+              }
+            })
+
+          {r, all_enqueued(worker: Loopctl.Workers.CostAnomalyWorker)}
+        end)
+
+      assert result == :ok
+
+      import Ecto.Query
+
+      summaries =
+        from(c in CostSummary, where: c.tenant_id == ^tenant.id, order_by: c.period_start)
+        |> AdminRepo.all()
+
+      assert Enum.map(summaries, & &1.period_start) == [d1, d2]
+
+      # The chained anomaly worker gets the normalized (earlier-first) range.
+      assert [anomaly_job] = anomaly_jobs
+      assert anomaly_job.args["period_start"] == Date.to_iso8601(d1)
+      assert anomaly_job.args["period_end"] == Date.to_iso8601(d2)
+    end
+
+    # FIX3: an over-cap backfill range is clamped (not run unbounded).
+    test "clamps a backfill range wider than the max to the cap" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      start_date = ~D[2026-01-01]
+      # ~1 year -> must be clamped to 90 days (91 daily rows: day 0..90 inclusive).
+      end_date = ~D[2026-12-31]
+      expected_last = Date.add(start_date, 90)
+
+      expect(Loopctl.MockCostRollup, :aggregate, 91, fn _tenant_id, day, day2 ->
+        assert day == day2
+        assert Date.compare(day, start_date) != :lt
+        assert Date.compare(day, expected_last) != :gt
+
+        {:ok,
+         [
+           %{
+             scope_type: :project,
+             scope_id: project.id,
+             total_input_tokens: 0,
+             total_output_tokens: 0,
+             total_cost_millicents: 1,
+             report_count: 1,
+             model_breakdown: %{},
+             avg_cost_per_story_millicents: nil
+           }
+         ]}
+      end)
+
+      assert :ok =
+               CostRollupWorker.perform(%Oban.Job{
+                 args: %{
+                   "period_start" => Date.to_iso8601(start_date),
+                   "period_end" => Date.to_iso8601(end_date),
+                   "tenant_ids" => [tenant.id]
+                 }
+               })
+
+      import Ecto.Query
+
+      count =
+        from(c in CostSummary, where: c.tenant_id == ^tenant.id) |> AdminRepo.aggregate(:count)
+
+      # 91 daily rows (start .. start+90 inclusive), NOT 365.
+      assert count == 91
+
+      last_day =
+        from(c in CostSummary,
+          where: c.tenant_id == ^tenant.id,
+          order_by: [desc: c.period_start],
+          limit: 1
+        )
+        |> AdminRepo.one()
+
+      assert last_day.period_start == expected_last
     end
 
     # tokens-09: a multi-day backfill (period_start..period_end) must produce ONE
