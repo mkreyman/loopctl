@@ -11,7 +11,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.ArticleLinkingWorker
 
-  # The similarity lookup is injected behind `Loopctl.Knowledge.SimilaritySearch.Behaviour`
+  # The similarity lookup is injected behind `Loopctl.Knowledge.SimilaritySearchBehaviour`
   # (config-based DI). These unit tests drive the worker's LINKING logic (the relates_to /
   # potential_conflict threshold split, both-direction dedup, the audit event, idempotency)
   # by feeding it DETERMINISTIC candidate lists via Mox — never the real pgvector kNN, which

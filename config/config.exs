@@ -310,7 +310,7 @@ config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
 config :loopctl, :knowledge_lint_max_conflict_promotions, 500
 
 # DI: the nearest-neighbour similarity lookup Loopctl.Workers.ArticleLinkingWorker uses
-# (Loopctl.Knowledge.SimilaritySearch.Behaviour). Production/dev run the real
+# (Loopctl.Knowledge.SimilaritySearchBehaviour). Production/dev run the real
 # index-correct pgvector kNN helper; config/test.exs swaps in a Mox mock so the worker's
 # linking logic can be unit-tested deterministically off the timed heavy-read path.
 config :loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch

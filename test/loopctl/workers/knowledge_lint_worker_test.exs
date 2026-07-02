@@ -13,7 +13,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
   alias Loopctl.Workers.KnowledgeLintWorker
 
   # The lint worker acts on orphans by enqueuing (inline, in-process) ArticleLinkingWorker,
-  # whose similarity lookup is injected (Loopctl.Knowledge.SimilaritySearch.Behaviour). The
+  # whose similarity lookup is injected (Loopctl.Knowledge.SimilaritySearchBehaviour). The
   # DataCase default stub returns [] (so most lint tests link nothing — they assert counts,
   # not links); the one test that asserts an orphan pair actually gets re-linked feeds a
   # deterministic candidate, keeping the whole path off the flaky 250 ms heavy read.

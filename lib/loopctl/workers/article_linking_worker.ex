@@ -70,6 +70,14 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.VectorSearch
 
+  # Compile-time DI for the similarity lookup. The worker uses this to fetch
+  # nearest-neighbour candidates; in tests it resolves to a Mox mock, in prod to VectorSearch.
+  @similarity_search Application.compile_env(
+                       :loopctl,
+                       :article_similarity_search,
+                       Loopctl.Knowledge.VectorSearch
+                     )
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"article_id" => article_id, "tenant_id" => tenant_id} = args}) do
     case Knowledge.get_article_with_embedding(tenant_id, article_id) do
@@ -124,19 +132,6 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   end
 
   # --- Private ---
-
-  # The similarity lookup is injected (config-based DI) so the worker's LINKING
-  # logic can be unit-tested with deterministic candidate lists instead of the real
-  # pgvector kNN, which runs through `Loopctl.HeavyRead` under a short
-  # `SET LOCAL statement_timeout` transaction (250 ms in test) and flaked those unit
-  # tests on a loaded DB (57014 query_canceled). Defaults to the real
-  # `Loopctl.Knowledge.VectorSearch` (prod/dev via config/config.exs); the test env
-  # maps `:article_similarity_search` to a Mox mock. NOTE: only the DB-touching
-  # `nearest/4` is injected — `VectorSearch.max_k/0` and `VectorSearch.pool_size/1`
-  # above are pure clamps (config + arithmetic, no DB), so they stay direct.
-  defp similarity_search do
-    Application.get_env(:loopctl, :article_similarity_search, VectorSearch)
-  end
 
   defp find_and_link_similar(article, tenant_id, threshold, max_comparisons) do
     log_if_exceeds_limit(article, tenant_id, max_comparisons)
@@ -214,7 +209,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   # documented post-ANN-filter limitation `VectorSearch` carries for `tags`/`category`.
   defp find_similar_articles(article, tenant_id, threshold, max_comparisons) do
     tenant_id
-    |> similarity_search().nearest(article.embedding, max_comparisons,
+    |> @similarity_search.nearest(article.embedding, max_comparisons,
       exclude_id: article.id,
       project_or_global: article.project_id,
       threshold: 0.0,

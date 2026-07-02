@@ -1,4 +1,4 @@
-defmodule Loopctl.Knowledge.SimilaritySearch.Behaviour do
+defmodule Loopctl.Knowledge.SimilaritySearchBehaviour do
   @moduledoc """
   Injectable contract for the nearest-neighbour similarity lookup that
   `Loopctl.Workers.ArticleLinkingWorker` depends on.
@@ -29,7 +29,7 @@ defmodule Loopctl.Knowledge.SimilaritySearch.Behaviour do
       `config/test.exs`).
 
   Resolved by the worker with config-based DI:
-  `Application.get_env(:loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch)`.
+  `Application.compile_env(:loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch)`.
   """
 
   @typedoc """

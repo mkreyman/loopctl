@@ -16,7 +16,7 @@ Mox.defmock(Loopctl.MockMergeSynthesizer, for: Loopctl.Knowledge.MergeSynthesize
 # unit tests feed deterministic candidate lists instead of exercising the real 250ms-timed
 # pgvector heavy read (the flake source). DataCase default-stubs `nearest/4` to return [].
 Mox.defmock(Loopctl.MockArticleSimilaritySearch,
-  for: Loopctl.Knowledge.SimilaritySearch.Behaviour
+  for: Loopctl.Knowledge.SimilaritySearchBehaviour
 )
 
 # US-27.15: webhook delivery DI. ScaleAlerts and the webhook worker share the
