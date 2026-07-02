@@ -34,6 +34,18 @@ defmodule LoopctlWeb.SignupLive do
   @max_signups_per_ip 5
   @rate_window_ms 60_000 * 60
 
+  # WebAuthn attestation verification is CPU-bound (CBOR decode + COSE parse +
+  # signature verify). Cap the number of verify attempts per client per window
+  # so a single pre-auth websocket cannot pin the scheduler, independently of
+  # the final signup-submission limit. Comfortably above a legit ceremony
+  # (up to 5 authenticators + a few retries).
+  @max_webauthn_verifications 20
+
+  # Reject attestation fields larger than this BEFORE base64-decoding them, to
+  # bound the per-call CBOR-decode cost. A real FIDO2 attestation object is well
+  # under 8 KB.
+  @max_attestation_field_bytes 8 * 1024
+
   @impl true
   def mount(_params, _session, socket) do
     # NB: we do NOT rate-limit page views here. Merely loading /signup must
@@ -57,12 +69,12 @@ defmodule LoopctlWeb.SignupLive do
      |> assign(:error, nil)}
   end
 
-  # Builds the rate-limit bucket key for the *signup submission*. Keyed on the
-  # true client IP (resolved through the forwarded headers, so one abuser can
-  # only exhaust their own bucket). When the IP is genuinely unknown (no
-  # forwarded header and no peer — e.g. a direct/local connection or a test),
-  # we fall back to a per-connection key so a burst can never collapse into a
-  # single shared "unknown" bucket that locks out every other visitor.
+  # Builds the rate-limit bucket key for the abusable signup actions. Keyed on
+  # the true client IP so one abuser can only exhaust their own bucket. When the
+  # client cannot be trusted (behind a proxy but no genuine trusted-proxy hop,
+  # RFC 7239 `Forwarded` not captured by `:x_headers`, or an empty chain), we
+  # fall back to a PER-CONNECTION key — never the shared proxy peer, which would
+  # collapse every visitor into one bucket and re-create the platform-wide DoS.
   defp signup_rate_key(socket) do
     case client_ip(socket) do
       {:ok, ip} -> "signup:ip:#{ip}"
@@ -70,36 +82,81 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  # Resolves the real client IP the same way the HTTP pipeline's `RemoteIp`
-  # plug does: prefer the forwarded chain (`x-forwarded-for`, which Fly's proxy
-  # populates with the true client), then fall back to the direct websocket
-  # peer for non-proxied/local connections.
+  # Resolves the real client IP with an explicit trust boundary:
+  #
+  #   1. If the forwarded chain demonstrably traversed a trusted proxy (a hop
+  #      RemoteIp peels off the right using the shared `:remote_ip_opts`
+  #      allow-list), trust the originating client it returns.
+  #   2. Otherwise, if the raw peer is a genuine PUBLIC address (a direct,
+  #      non-proxied connection — local dev / tests), the unforgeable TCP peer
+  #      IS the client; any client-supplied forwarding header is ignored.
+  #   3. Otherwise (behind a proxy with no trustworthy forwarded client, or no
+  #      peer at all) → `:unknown`, so the caller uses a per-connection bucket.
   defp client_ip(socket) do
-    case forwarded_ip(socket) do
-      {:ok, _ip} = resolved -> resolved
-      :unknown -> direct_peer_ip(socket)
-    end
-  end
+    case forwarded_client(forwarded_headers(socket)) do
+      {:ok, ip} ->
+        {:ok, ip}
 
-  defp forwarded_ip(socket) do
-    case Phoenix.LiveView.get_connect_info(socket, :x_headers) do
-      headers when is_list(headers) and headers != [] ->
-        case RemoteIp.from(headers) do
-          nil -> :unknown
-          addr -> {:ok, addr |> :inet.ntoa() |> to_string()}
+      :untrusted ->
+        peer = peer_address(socket)
+
+        if is_tuple(peer) and not proxy_peer?(peer) do
+          {:ok, ntoa(peer)}
+        else
+          :unknown
         end
-
-      _ ->
-        :unknown
     end
   end
 
-  defp direct_peer_ip(socket) do
+  # Trust a forwarded client ONLY when the chain contains a recognizable
+  # trusted-proxy/reserved hop that RemoteIp peels off the right. If the whole
+  # chain is a single client-controlled value with no proxy hop behind it
+  # (`client == rightmost`), or nothing usable is present, it is UNTRUSTED — an
+  # attacker cannot mint fresh per-IP buckets by forging `x-forwarded-for`.
+  defp forwarded_client([]), do: :untrusted
+
+  defp forwarded_client(headers) do
+    opts = remote_ip_opts()
+    client = RemoteIp.from(headers, opts)
+    # With every IP forced to :client, RemoteIp returns the raw rightmost hop.
+    rightmost = RemoteIp.from(headers, Keyword.merge(opts, clients: ["0.0.0.0/0", "::/0"]))
+
+    cond do
+      is_nil(client) -> :untrusted
+      client == rightmost -> :untrusted
+      true -> {:ok, ntoa(client)}
+    end
+  end
+
+  defp forwarded_headers(socket) do
+    case Phoenix.LiveView.get_connect_info(socket, :x_headers) do
+      headers when is_list(headers) -> headers
+      _ -> []
+    end
+  end
+
+  defp peer_address(socket) do
     case Phoenix.LiveView.get_connect_info(socket, :peer_data) do
-      %{address: addr} -> {:ok, addr |> :inet.ntoa() |> to_string()}
-      _ -> :unknown
+      %{address: addr} -> addr
+      _ -> nil
     end
   end
+
+  # True when `addr` is a reverse-proxy / reserved address (loopback, RFC1918
+  # private, or `fc00::/7` unique-local — which covers Fly's `fdaa::/16` 6PN).
+  # Such a peer means the request arrived via a proxy, so the peer is NOT the
+  # client and must never be used as a bucket key.
+  defp proxy_peer?({127, _, _, _}), do: true
+  defp proxy_peer?({10, _, _, _}), do: true
+  defp proxy_peer?({172, b, _, _}) when b in 16..31, do: true
+  defp proxy_peer?({192, 168, _, _}), do: true
+  defp proxy_peer?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp proxy_peer?({g, _, _, _, _, _, _, _}) when g >= 0xFC00 and g <= 0xFDFF, do: true
+  defp proxy_peer?(_), do: false
+
+  defp ntoa(addr), do: addr |> :inet.ntoa() |> to_string()
+
+  defp remote_ip_opts, do: Application.get_env(:loopctl, :remote_ip_opts, [])
 
   defp rate_limiter do
     Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
@@ -117,13 +174,9 @@ defmodule LoopctlWeb.SignupLive do
   end
 
   @impl true
-  def handle_event("request_attestation", params, socket) do
+  def handle_event("request_attestation", %{} = params, socket) do
     friendly_name =
       params
-      |> case do
-        nil -> %{}
-        map when is_map(map) -> map
-      end
       |> Map.get("friendly_name", socket.assigns.friendly_name_draft || "")
       |> to_string()
       |> String.trim()
@@ -152,8 +205,128 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
+  # Malformed request_attestation (non-map payload) is ignored, not crashed.
+  def handle_event("request_attestation", _params, socket), do: {:noreply, socket}
+
   @impl true
-  def handle_event("attestation_captured", params, socket) do
+  def handle_event("attestation_captured", %{} = params, socket) do
+    # SERVER-SIDE enforcement, in this handler, before any crypto runs — the
+    # client-side max/name gate in request_attestation can be skipped by sending
+    # attestation_captured straight over the websocket. Order matters: capacity
+    # and size checks reject WITHOUT consuming the verification budget; only a
+    # genuine attempt draws down the per-window rate limit.
+    with :ok <- ensure_enrollment_capacity(socket),
+         :ok <- ensure_attestation_size(params),
+         :ok <- ensure_verification_budget(socket) do
+      verify_attestation(params, socket)
+    else
+      {:error, message} -> {:noreply, assign(socket, :error, message)}
+    end
+  end
+
+  # Malformed attestation_captured (non-map payload) is ignored, not crashed.
+  def handle_event("attestation_captured", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("attestation_error", %{"reason" => reason}, socket) when is_binary(reason) do
+    message =
+      case reason do
+        "webauthn_unsupported" ->
+          "This browser does not support WebAuthn — try Safari, Chrome, or Firefox"
+
+        "no_credential" ->
+          "The browser returned no credential — please try again"
+
+        _ ->
+          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason)}")
+          "Authenticator ceremony failed. Please retry."
+      end
+
+    {:noreply, assign(socket, :error, message)}
+  end
+
+  # Malformed attestation_error (missing/non-binary "reason") from a public
+  # client is ignored rather than allowed to crash the LiveView process.
+  def handle_event("attestation_error", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("remove_authenticator", %{"index" => index}, socket) when is_binary(index) do
+    # Never trust the client-supplied index: parse it defensively and
+    # bounds-check against the current list. A non-parseable or out-of-range
+    # index is a no-op instead of crashing the public LiveView process.
+    with {parsed, ""} <- Integer.parse(index),
+         true <- parsed >= 0 and parsed < length(socket.assigns.authenticators) do
+      new_auths = List.delete_at(socket.assigns.authenticators, parsed)
+      {:noreply, assign(socket, :authenticators, new_auths)}
+    else
+      _ -> {:noreply, socket}
+    end
+  end
+
+  # Missing "index", non-binary index, or a non-map payload is a no-op — a
+  # non-map would otherwise crash `Map.get/3` before the with/else could run.
+  def handle_event("remove_authenticator", _params, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("signup", %{"tenant" => params}, socket) do
+    case socket.assigns.authenticators do
+      [] ->
+        {:noreply,
+         assign(socket, :error, "Enroll at least one authenticator before completing signup")}
+
+      auths ->
+        case rate_limiter().check_rate(
+               socket.assigns.rate_key,
+               @rate_window_ms,
+               @max_signups_per_ip
+             ) do
+          {:allow, _count} ->
+            complete_signup(params, auths, socket)
+
+          {:deny, _limit} ->
+            {:noreply,
+             assign(socket, :error, "Too many signup attempts. Please try again later.")}
+        end
+    end
+  end
+
+  # Catch-all for malformed / unknown client events on this public LiveView.
+  # Must be the LAST handle_event clause. Ignoring them keeps an attacker from
+  # crashing the process (and spamming the logs) with junk websocket frames.
+  @impl true
+  def handle_event(_event, _params, socket), do: {:noreply, socket}
+
+  defp ensure_enrollment_capacity(socket) do
+    if length(socket.assigns.authenticators) >= socket.assigns.max_authenticators do
+      {:error, "Maximum authenticators enrolled"}
+    else
+      :ok
+    end
+  end
+
+  defp ensure_attestation_size(params) do
+    within? =
+      ["attestation_object", "client_data_json", "credential_id"]
+      |> Enum.all?(fn key -> field_within_size?(Map.get(params, key, "")) end)
+
+    if within?, do: :ok, else: {:error, "Attestation payload too large"}
+  end
+
+  defp field_within_size?(value) when is_binary(value),
+    do: byte_size(value) <= @max_attestation_field_bytes
+
+  defp field_within_size?(_), do: true
+
+  defp ensure_verification_budget(socket) do
+    bucket = "signup:webauthn:#{socket.assigns.rate_key}"
+
+    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_webauthn_verifications) do
+      {:allow, _count} -> :ok
+      {:deny, _limit} -> {:error, "Too many verification attempts. Please try again later."}
+    end
+  end
+
+  defp verify_attestation(params, socket) do
     attestation_object_b64 = Map.get(params, "attestation_object", "")
     client_data_b64 = Map.get(params, "client_data_json", "")
     credential_id_b64 = Map.get(params, "credential_id", "")
@@ -197,72 +370,6 @@ defmodule LoopctlWeb.SignupLive do
          )}
     end
   end
-
-  @impl true
-  def handle_event("attestation_error", %{"reason" => reason}, socket) when is_binary(reason) do
-    message =
-      case reason do
-        "webauthn_unsupported" ->
-          "This browser does not support WebAuthn — try Safari, Chrome, or Firefox"
-
-        "no_credential" ->
-          "The browser returned no credential — please try again"
-
-        _ ->
-          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason)}")
-          "Authenticator ceremony failed. Please retry."
-      end
-
-    {:noreply, assign(socket, :error, message)}
-  end
-
-  # Malformed attestation_error (missing/non-binary "reason") from a public
-  # client is ignored rather than allowed to crash the LiveView process.
-  def handle_event("attestation_error", _params, socket), do: {:noreply, socket}
-
-  @impl true
-  def handle_event("remove_authenticator", params, socket) do
-    # Never trust the client-supplied index: parse it defensively and
-    # bounds-check against the current list. A non-parseable or out-of-range
-    # index is a no-op instead of crashing the public LiveView process.
-    with index when is_binary(index) <- Map.get(params, "index"),
-         {parsed, ""} <- Integer.parse(index),
-         true <- parsed >= 0 and parsed < length(socket.assigns.authenticators) do
-      new_auths = List.delete_at(socket.assigns.authenticators, parsed)
-      {:noreply, assign(socket, :authenticators, new_auths)}
-    else
-      _ -> {:noreply, socket}
-    end
-  end
-
-  @impl true
-  def handle_event("signup", %{"tenant" => params}, socket) do
-    case socket.assigns.authenticators do
-      [] ->
-        {:noreply,
-         assign(socket, :error, "Enroll at least one authenticator before completing signup")}
-
-      auths ->
-        case rate_limiter().check_rate(
-               socket.assigns.rate_key,
-               @rate_window_ms,
-               @max_signups_per_ip
-             ) do
-          {:allow, _count} ->
-            complete_signup(params, auths, socket)
-
-          {:deny, _limit} ->
-            {:noreply,
-             assign(socket, :error, "Too many signup attempts. Please try again later.")}
-        end
-    end
-  end
-
-  # Catch-all for malformed / unknown client events on this public LiveView.
-  # Must be the LAST handle_event clause. Ignoring them keeps an attacker from
-  # crashing the process (and spamming the logs) with junk websocket frames.
-  @impl true
-  def handle_event(_event, _params, socket), do: {:noreply, socket}
 
   defp complete_signup(params, auths, socket) do
     attrs = Map.put(params, "authenticators", auths)

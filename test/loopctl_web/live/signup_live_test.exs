@@ -16,6 +16,11 @@ defmodule LoopctlWeb.SignupLiveTest do
 
   setup :verify_on_exit!
 
+  # Matches the test proxy allow-list in config/test.exs (:remote_ip_opts). A
+  # request "through the proxy" carries this as the rightmost X-Forwarded-For
+  # entry; RemoteIp peels it and returns the real originating client.
+  @trusted_proxy_hop "198.51.100.50"
+
   describe "GET /signup (TC-26.0.1.7)" do
     test "renders with design-system classes and no daisyUI", %{conn: conn} do
       {:ok, _view, html} = live(conn, ~p"/signup")
@@ -207,17 +212,13 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
-  describe "signup rate limiting (web-01, per-IP, action-scoped)" do
+  describe "signup rate limiting (web-01, per-IP, action-scoped, spoof-resistant)" do
     test "loading /signup never consumes the rate-limit bucket; only the submission does",
          %{conn: conn} do
       test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
-        send(test_pid, {:bucket, bucket})
-        {:allow, 1}
-      end)
-
-      conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "203.0.113.7")
+      conn = proxied_conn(conn, "203.0.113.7")
 
       # Many page views (the abuse the old code punished everyone for) must
       # NOT touch the rate limiter at all.
@@ -227,52 +228,59 @@ defmodule LoopctlWeb.SignupLiveTest do
 
       refute_received {:bucket, _}
 
-      # A real submission checks the limiter exactly once, keyed by the real
-      # forwarded client IP — not the raw peer, and not a shared bucket.
+      # A real submission checks the limiter, keyed by the real forwarded
+      # client IP peeled from behind the trusted proxy hop.
       {:ok, view, _html} = live(conn, ~p"/signup")
       enroll_authenticator(view)
-
-      view
-      |> form("#signup-form", %{
-        "tenant" => %{
-          "name" => "IP Corp",
-          "slug" => "ip-corp",
-          "email" => "ip@corp.example"
-        }
-      })
-      |> render_submit()
+      submit_tenant(view, "IP Corp", "ip-corp", "ip@corp.example")
 
       assert_receive {:bucket, "signup:ip:203.0.113.7"}
     end
 
+    test "the client is peeled from behind the trusted proxy hop, not the proxy IP itself",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      {:ok, view, _html} = live(proxied_conn(conn, "203.0.113.7"), ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Real Corp", "real-corp", "real@corp.example")
+
+      assert_receive {:bucket, "signup:ip:203.0.113.7"}
+    end
+
+    test "a client-forged X-Forwarded-For prepend cannot choose the bucket", %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # Attacker prepends a forged value; the proxy still appends the true
+      # client + its own hop. RemoteIp scans right-to-left, so the forged
+      # prefix is ignored and the bucket keys on the real client.
+      chain = "6.6.6.6, 203.0.113.7, #{@trusted_proxy_hop}"
+      {:ok, view, _html} = live(forwarded_conn(conn, chain), ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Prepend Corp", "prepend-corp", "prepend@corp.example")
+
+      assert_receive {:bucket, bucket}
+      assert bucket == "signup:ip:203.0.113.7"
+      refute bucket == "signup:ip:6.6.6.6"
+    end
+
     test "one IP hitting the limit does not lock out a different IP", %{conn: conn} do
-      # Deny only the abuser's per-IP bucket; everyone else is allowed.
       stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "signup:ip:198.51.100.1", _window, _limit -> {:deny, 5}
+        "signup:ip:203.0.113.1", _window, _limit -> {:deny, 5}
         _bucket, _window, _limit -> {:allow, 1}
       end)
 
-      abuser_conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "198.51.100.1")
-      {:ok, abuser_view, _html} = live(abuser_conn, ~p"/signup")
+      {:ok, abuser_view, _html} = live(proxied_conn(conn, "203.0.113.1"), ~p"/signup")
       enroll_authenticator(abuser_view)
-
-      abuser_html =
-        abuser_view
-        |> form("#signup-form", %{
-          "tenant" => %{
-            "name" => "Abuser",
-            "slug" => "abuser-corp",
-            "email" => "abuser@corp.example"
-          }
-        })
-        |> render_submit()
+      abuser_html = submit_tenant(abuser_view, "Abuser", "abuser-corp", "abuser@corp.example")
 
       assert abuser_html =~ "Too many signup attempts"
       refute AdminRepo.get_by(Tenant, slug: "abuser-corp")
 
       # A different IP is unaffected — signup still completes.
-      victim_conn = Plug.Conn.put_req_header(conn, "x-forwarded-for", "203.0.113.9")
-      {:ok, victim_view, _html} = live(victim_conn, ~p"/signup")
+      {:ok, victim_view, _html} = live(proxied_conn(conn, "203.0.113.9"), ~p"/signup")
       enroll_authenticator(victim_view)
 
       assert {:error, {:live_redirect, %{to: redirect_to}}} =
@@ -290,36 +298,128 @@ defmodule LoopctlWeb.SignupLiveTest do
       assert AdminRepo.get_by(Tenant, slug: "victim-corp")
     end
 
-    test "a genuinely-unknown client IP falls back to a per-connection bucket, never a shared one",
+    test "a lone client-supplied XFF from a public direct peer is ignored, keyed on the peer",
          %{conn: conn} do
       test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
-        send(test_pid, {:bucket, bucket})
-        {:allow, 1}
-      end)
+      # Direct connection (public peer, no trusted proxy in front). The forged
+      # header is ignored; the unforgeable TCP peer is the client.
+      conn =
+        connect_info_conn(conn, %{
+          peer_data: %{address: {203, 0, 113, 50}},
+          x_headers: [{"x-forwarded-for", "6.6.6.6"}]
+        })
 
-      # No forwarded header AND no peer data — the genuinely-unknown case.
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Direct Corp", "direct-corp", "direct@corp.example")
+
+      assert_receive {:bucket, bucket}
+      assert bucket == "signup:ip:203.0.113.50"
+      refute bucket == "signup:ip:6.6.6.6"
+    end
+
+    test "an RFC 7239 Forwarded-only request behind the proxy falls to a per-connection bucket",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # `Forwarded:` (RFC 7239) is not captured by connect_info :x_headers, and
+      # the peer is the shared proxy — must NOT collapse onto the peer bucket.
+      conn =
+        connect_info_conn(conn, %{
+          peer_data: %{address: {0, 0, 0, 0, 0, 0, 0, 1}},
+          x_headers: []
+        })
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Fwd Corp", "fwd-corp", "fwd@corp.example")
+
+      assert_receive {:bucket, bucket}
+      assert bucket =~ ~r/\Asignup:session:/
+      refute bucket == "signup:ip:::1"
+    end
+
+    test "a genuinely-unknown client (no peer, no headers) uses a per-connection bucket",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
       conn = Plug.Conn.put_private(conn, :live_view_connect_info, %{})
 
       {:ok, view, _html} = live(conn, ~p"/signup")
       enroll_authenticator(view)
-
-      view
-      |> form("#signup-form", %{
-        "tenant" => %{
-          "name" => "Unknown Corp",
-          "slug" => "unknown-corp",
-          "email" => "unknown@corp.example"
-        }
-      })
-      |> render_submit()
+      submit_tenant(view, "Unknown Corp", "unknown-corp", "unknown@corp.example")
 
       assert_receive {:bucket, bucket}
-      # Per-connection (session) bucket, NOT a single shared "unknown" bucket.
       assert bucket =~ ~r/\Asignup:session:/
       refute bucket == "signup:unknown"
       refute bucket == "signup:ip:unknown"
+    end
+  end
+
+  describe "attestation verification is protected server-side (web-01 expensive path)" do
+    test "attestation_captured enforces the authenticator cap even when the UI gate is skipped",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      max = Loopctl.Tenants.max_authenticators_per_signup()
+
+      # Skip request_attestation and spam attestation_captured straight over the
+      # socket, as an attacker would. The cap must hold server-side.
+      for _ <- 1..(max + 5) do
+        render_hook(view, "attestation_captured", valid_attestation())
+      end
+
+      assert has_element?(view, "#authenticator-#{max - 1}")
+      refute has_element?(view, "#authenticator-#{max}")
+    end
+
+    test "attestation_captured rejects an oversized payload before decoding", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html =
+        render_hook(view, "attestation_captured", %{
+          "attestation_object" => String.duplicate("A", 9_000),
+          "client_data_json" => "eyJmb28iOiJiYXIifQ",
+          "credential_id" => "Y3JlZC1pZA"
+        })
+
+      assert html =~ "Attestation payload too large"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "attestation_captured is rate-limited so a burst cannot pin the scheduler",
+         %{conn: conn} do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:webauthn:" <> _rest, _w, _l -> {:deny, 20}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_captured", valid_attestation())
+
+      assert html =~ "Too many verification attempts"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "a non-map attestation_captured payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_captured", ["not", "a", "map"])
+
+      refute has_element?(view, "#authenticator-0")
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a non-map request_attestation payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "request_attestation", ["not", "a", "map"])
+
+      assert has_element?(view, "#signup-form")
     end
   end
 
@@ -343,6 +443,16 @@ defmodule LoopctlWeb.SignupLiveTest do
       enroll_authenticator(view)
 
       render_hook(view, "remove_authenticator", %{"index" => 3})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a non-map payload is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", ["not", "a", "map"])
 
       assert has_element?(view, "#authenticator-0")
     end
@@ -391,6 +501,14 @@ defmodule LoopctlWeb.SignupLiveTest do
 
       # Alive and no error surfaced from the malformed frame.
       refute has_element?(view, "#signup-error")
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a non-map attestation_error payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_error", ["boom"])
+
       assert has_element?(view, "#signup-form")
     end
 
@@ -498,12 +616,47 @@ defmodule LoopctlWeb.SignupLiveTest do
 
     view |> element("#enroll-authenticator-btn") |> render_click()
 
-    render_hook(view, "attestation_captured", %{
+    render_hook(view, "attestation_captured", valid_attestation())
+
+    view
+  end
+
+  defp valid_attestation do
+    %{
       "attestation_object" => "YWJjZA",
       "client_data_json" => "eyJmb28iOiJiYXIifQ",
       "credential_id" => "Y3JlZC1pZA"
-    })
+    }
+  end
 
+  defp submit_tenant(view, name, slug, email) do
     view
+    |> form("#signup-form", %{"tenant" => %{"name" => name, "slug" => slug, "email" => email}})
+    |> render_submit()
+  end
+
+  # Sets a raw X-Forwarded-For chain on the (dis)connect request.
+  defp forwarded_conn(conn, chain), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", chain)
+
+  # Simulates a request through the trusted proxy: real client, then the proxy
+  # hop appended on the right (as Fly appends its app IP).
+  defp proxied_conn(conn, client_ip),
+    do: forwarded_conn(conn, "#{client_ip}, #{@trusted_proxy_hop}")
+
+  # Fully controls the LiveView connect_info (peer_data / x_headers).
+  defp connect_info_conn(conn, info) when is_map(info),
+    do: Plug.Conn.put_private(conn, :live_view_connect_info, info)
+
+  # Rate-limiter stub that reports only the signup bucket (ignores the separate
+  # per-verification webauthn bucket) so bucket assertions are unambiguous.
+  defp capture_bucket(test_pid) do
+    fn
+      "signup:webauthn:" <> _rest, _window, _limit ->
+        {:allow, 1}
+
+      bucket, _window, _limit ->
+        send(test_pid, {:bucket, bucket})
+        {:allow, 1}
+    end
   end
 end

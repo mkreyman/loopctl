@@ -151,6 +151,23 @@ config :loopctl, LoopctlWeb.Endpoint,
   pubsub_server: Loopctl.PubSub,
   live_view: [signing_salt: "xpgWTdmT"]
 
+# RemoteIp trusted-proxy configuration — SHARED by the `plug RemoteIp` in
+# endpoint.ex AND by `RemoteIp.from/2` in LoopctlWeb.SignupLive, so the HTTP
+# pipeline and the LiveView resolve the client IP identically.
+#
+# RemoteIp scans the forwarding headers right-to-left and returns the first IP
+# that is NOT a known proxy or reserved (loopback/private/`fc00::/7`, which
+# already covers Fly's `fdaa::/16` 6PN). `:proxies` lets us peel additional
+# *public* proxy hops — most importantly the app-assigned Fly edge IP that Fly
+# appends as the RIGHTMOST `x-forwarded-for` entry (see
+# https://fly.io/docs/networking/request-headers/). Until those are pinned,
+# SignupLive fails safe to a per-connection bucket rather than trusting an
+# un-peeled proxy IP (which would collapse every visitor into one bucket).
+#
+# Operators SHOULD extend `:proxies` with their Fly app/edge CIDRs (e.g. via
+# runtime.exs from an env var) so the real originating client is returned.
+config :loopctl, :remote_ip_opts, proxies: ~w[fdaa::/16]
+
 # Configure Elixir's Logger — structured JSON logging with tenant context.
 # Production uses JSON via LoggerJSON; dev/test override with human-readable format.
 config :logger, :default_handler,

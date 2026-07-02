@@ -40,8 +40,11 @@ defmodule LoopctlWeb.Endpoint do
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :loopctl
   end
 
-  # Resolve client IP behind reverse proxy (nginx) for rate limiting
-  plug RemoteIp
+  # Resolve client IP behind reverse proxy (nginx / Fly) for rate limiting.
+  # Opts are shared with LoopctlWeb.SignupLive via the :remote_ip_opts config
+  # key so the HTTP pipeline and the LiveView resolve the client IP identically
+  # (same trusted-proxy allow-list).
+  plug RemoteIp, Application.compile_env(:loopctl, :remote_ip_opts, [])
 
   plug Plug.RequestId
   # US-27.4: clear tenant_id on every request (before routing).
