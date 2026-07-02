@@ -51,6 +51,29 @@ defmodule Loopctl.Net.UrlGuardTest do
     end
   end
 
+  # v4-in-v6 transition embeddings that smuggle a private v4 (ie-02 follow-up).
+  describe "validate_egress/2 blocks v4-in-v6 transition embeddings" do
+    for {label, host} <- [
+          # NAT64 well-known 64:ff9b::/96 (RFC 6052)
+          {"NAT64 loopback", "[64:ff9b::7f00:1]"},
+          {"NAT64 metadata", "[64:ff9b::a9fe:a9fe]"},
+          {"NAT64 private-10", "[64:ff9b::a00:1]"},
+          # 6to4 2002::/16 (RFC 3056)
+          {"6to4 loopback", "[2002:7f00:1::]"},
+          {"6to4 metadata", "[2002:a9fe:a9fe::]"},
+          {"6to4 private-10", "[2002:a00:1::]"},
+          # Teredo 2001:0::/32 (RFC 4380) — client v4 = low 32 bits XOR 0xFFFFFFFF
+          {"Teredo loopback", "[2001:0:0:0:0:0:80ff:fffe]"},
+          {"Teredo metadata", "[2001:0:0:0:0:0:5601:5601]"},
+          {"Teredo private-10", "[2001:0:0:0:0:0:f5ff:fffe]"}
+        ] do
+      test "blocks #{label} (#{host})" do
+        assert {:error, :blocked_ip} =
+                 UrlGuard.validate_egress("https://#{unquote(host)}/path")
+      end
+    end
+  end
+
   describe "validate_egress/2 with a public address" do
     test "allows a public IPv4 literal (no DNS)" do
       assert {:ok, %URI{host: "93.184.216.34"}} =
@@ -131,6 +154,67 @@ defmodule Loopctl.Net.UrlGuardTest do
 
       assert {:error, :dns_resolution_failed} =
                UrlGuard.validate_egress("https://nope.example.com/x")
+    end
+  end
+
+  # A hostile/unresponsive nameserver must not hang the caller — a bounded
+  # resolve that times out fails CLOSED (blocked), never open (FIX B).
+  describe "validate_egress/2 fails closed on DNS timeout" do
+    test "a resolver timeout blocks the URL" do
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        {:error, :timeout}
+      end)
+
+      assert {:error, :dns_resolution_failed} =
+               UrlGuard.validate_egress("https://slow.example.com/x")
+    end
+  end
+
+  # pin/1 + pinned_request_opts/1 resolve ONCE and make the client connect to
+  # that exact IP, so there is no second lookup to rebind (FIX C).
+  describe "pin/2 and pinned_request_opts/1 (DNS-rebinding defense)" do
+    test "pins the connection to the validated IP while preserving the host" do
+      expect(Loopctl.MockDnsResolver, :resolve, fn "hooks.example.com" ->
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      assert {:ok, pinned} = UrlGuard.pin("https://hooks.example.com:8443/deliver?q=1")
+      assert pinned.host == "hooks.example.com"
+      assert pinned.ip == {93, 184, 216, 34}
+
+      opts = UrlGuard.pinned_request_opts(pinned)
+      # The connection target is the validated IP literal, NOT the hostname —
+      # so the HTTP client cannot re-resolve and be rebound to a private IP.
+      assert opts[:url] == "https://93.184.216.34:8443/deliver?q=1"
+      # ...but the original host is preserved for Host header / TLS SNI / cert.
+      assert opts[:connect_options] == [hostname: "hooks.example.com"]
+    end
+
+    test "resolves the host exactly once (nothing left to rebind)" do
+      # Mox verifies the arity-1 expectation was called exactly once on exit.
+      expect(Loopctl.MockDnsResolver, :resolve, 1, fn _host ->
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      assert {:ok, _pinned} = UrlGuard.pin("https://once.example.com/x")
+    end
+
+    test "pins a public IPv6 literal with brackets" do
+      assert {:ok, pinned} = UrlGuard.pin("https://[2606:2800:220:1::1]/x")
+      opts = UrlGuard.pinned_request_opts(pinned)
+      assert opts[:url] == "https://[2606:2800:220:1::1]/x"
+      assert opts[:connect_options] == [hostname: "2606:2800:220:1::1"]
+    end
+
+    test "an IP-literal URL pins to itself" do
+      assert {:ok, pinned} = UrlGuard.pin("https://93.184.216.34/hooks")
+      opts = UrlGuard.pinned_request_opts(pinned)
+      assert opts[:url] == "https://93.184.216.34/hooks"
+      assert opts[:connect_options] == [hostname: "93.184.216.34"]
+    end
+
+    test "pin/1 rejects a blocked host (same checks as validate_egress)" do
+      assert {:error, :blocked_ip} = UrlGuard.pin("http://169.254.169.254/latest")
     end
   end
 end

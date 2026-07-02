@@ -63,5 +63,21 @@ defmodule Loopctl.Webhooks.ReqDeliveryTest do
       assert {:ok, %{status: 200}} =
                ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [])
     end
+
+    test "a legit hostname-based delivery still succeeds through the pinned path" do
+      # Resolve ONCE to a public IP; the connection is pinned to that IP while the
+      # original host is preserved for Host/SNI/cert (proves pinning didn't break
+      # normal delivery — FIX C).
+      expect(Loopctl.MockDnsResolver, :resolve, 1, fn "hooks.example.com" ->
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        Req.Test.json(conn, %{"ok" => true})
+      end)
+
+      assert {:ok, %{status: 200}} =
+               ReqDelivery.deliver("https://hooks.example.com/hooks", "{}", [])
+    end
   end
 end

@@ -170,6 +170,40 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert json_response(conn, 422)["error"]["message"] =~ "private, loopback, or metadata"
     end
 
+    test "returns 422 for a v4-in-v6 NAT64-embedded metadata URL", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
+          source_type: "web_article"
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
+    test "returns 422 with a distinct message when the host cannot be resolved", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "https://does-not-resolve.example.com/x",
+          source_type: "web_article"
+        })
+
+      message = json_response(conn, 422)["error"]["message"]
+      assert message =~ "could not be resolved"
+      refute message =~ "private, loopback, or metadata"
+    end
+
     test "agent role is rejected (requires orchestrator)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

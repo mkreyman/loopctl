@@ -406,7 +406,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       {:error, :missing_host} ->
         {:error, :unprocessable_entity, "'url' must have a valid host"}
 
-      {:error, _blocked} ->
+      {:error, :dns_resolution_failed} ->
+        {:error, :unprocessable_entity, "'url' host could not be resolved"}
+
+      {:error, :blocked_ip} ->
         {:error, :unprocessable_entity,
          "'url' must not target a private, loopback, or metadata address"}
     end

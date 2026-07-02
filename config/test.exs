@@ -306,6 +306,12 @@ config :loopctl, knowledge_moc_min_tag_count: 2
 # the DNS-rebinding tests override it with Mox.expect/3 to return a private address.
 config :loopctl, :dns_resolver, Loopctl.MockDnsResolver
 
+# Bounded DNS resolution (FIX B): the guard resolves under this timeout and fails
+# closed if it elapses. Tests use the Mox resolver so this only affects the
+# Loopctl.Net.DnsResolver.Default unit test; keep it short so any accidental real
+# lookup can't hang the suite.
+config :loopctl, :dns_resolve_timeout_ms, 2_000
+
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
 # is unit-tested with deterministic candidate lists — never through the real pgvector kNN,

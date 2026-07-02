@@ -144,6 +144,23 @@ defmodule Loopctl.WebhooksTest do
       assert "must not target a private or loopback address" in errors_on(changeset).url
     end
 
+    test "reports an unresolvable host distinctly from a private address" do
+      tenant = fixture(:tenant)
+
+      expect(Loopctl.MockDnsResolver, :resolve, fn _host ->
+        {:error, :nxdomain}
+      end)
+
+      {:error, changeset} =
+        Webhooks.create_webhook(tenant.id, %{
+          "url" => "https://does-not-resolve.example.com/hooks",
+          "events" => ["story.status_changed"]
+        })
+
+      assert "host could not be resolved" in errors_on(changeset).url
+      refute "must not target a private or loopback address" in errors_on(changeset).url
+    end
+
     test "enforces max_webhooks limit" do
       tenant = fixture(:tenant, %{settings: %{"max_webhooks" => 2}})
 

@@ -86,6 +86,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
+  # Hard per-job wall-clock cap (backstop to the bounded DNS resolve + Req
+  # receive_timeout). A hostile/slow endpoint can't pin a :knowledge queue slot
+  # indefinitely (worker-01 / GHSA-j7m9-ffmr-pwhm).
+  @impl Oban.Worker
+  def timeout(_job), do: :timer.seconds(30)
+
   # --- Private ---
 
   defp extract_with_chunking(content, source_type) do
@@ -171,11 +177,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp resolve_content(url, _content) when is_binary(url) do
-    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Re-validate the
+    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Validate AND pin the
     # user-supplied URL immediately before fetching (the controller also validates
-    # at enqueue time; re-checking here defends against DNS rebinding / TOCTOU).
-    case UrlGuard.validate_egress(url) do
-      {:ok, _uri} -> fetch_url(url)
+    # at enqueue time). pin/1 resolves once and the connection targets that exact
+    # IP, closing the DNS-rebinding / TOCTOU window.
+    case UrlGuard.pin(url) do
+      {:ok, pinned} -> fetch_url(url, pinned)
       {:error, reason} -> blocked_url(url, reason)
     end
   end
@@ -191,17 +198,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     {:error, {:url_blocked, reason}}
   end
 
-  defp fetch_url(url) do
+  defp fetch_url(url, pinned) do
     req_opts =
-      [
-        url: url,
+      UrlGuard.pinned_request_opts(pinned)
+      |> Keyword.merge(
         receive_timeout: 15_000,
         retry: :transient,
         max_retries: 1,
         # Do not follow redirects — a redirect hop would re-enter an unvalidated
         # URL and bypass the egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm).
         redirect: false
-      ]
+      )
       |> maybe_add_plug()
 
     case Req.get(req_opts) do

@@ -114,7 +114,8 @@ defmodule Loopctl.Webhooks.Webhook do
         {:error, :invalid_scheme} -> [url: "must use HTTPS or HTTP scheme"]
         {:error, :missing_host} -> [url: "must have a valid host"]
         {:error, :invalid_url} -> [url: "must be a valid URL"]
-        {:error, _blocked} -> [url: "must not target a private or loopback address"]
+        {:error, :dns_resolution_failed} -> [url: "host could not be resolved"]
+        {:error, :blocked_ip} -> [url: "must not target a private or loopback address"]
       end
     end)
   end

@@ -20,22 +20,36 @@ defmodule Loopctl.Net.UrlGuard do
   ## Defense layers
 
     1. **Scheme allowlist** — only `http`/`https` (override via `:schemes`).
-    2. **Real DNS resolution** — a bare host that is not already an IP literal is
-       resolved (A *and* AAAA) via `Loopctl.Net.DnsResolver`; a hostname that
-       resolves to a private address is blocked. IP-literal forms (dotted v4,
-       decimal/hex IPv4, and IPv6 literals) are parsed directly with
-       `:inet.parse_address/1`.
+    2. **Real DNS resolution (bounded)** — a bare host that is not already an IP
+       literal is resolved (A *and* AAAA) via `Loopctl.Net.DnsResolver` under a
+       bounded timeout (fail closed on timeout); a hostname that resolves to a
+       private address is blocked. IP-literal forms (dotted v4, decimal/hex IPv4,
+       and IPv6 literals) are parsed directly with `:inet.parse_address/1`.
     3. **Private-range blocklist for BOTH families** — v4: `0.0.0.0/8`,
        `10.0.0.0/8`, `100.64.0.0/10` (CGNAT), `127.0.0.0/8`, `169.254.0.0/16`
        (cloud metadata), `172.16.0.0/12`, `192.168.0.0/16`; v6: `::`, `::1`,
-       `fe80::/10` (link-local), `fc00::/7` (ULA incl. Fly `fdaa::`), and
-       IPv4-mapped `::ffff:0:0/96` (the embedded v4 is decoded and re-checked
-       against the v4 rules). If a host resolves to *multiple* addresses and
-       *any* one is blocked, the whole URL is rejected.
+       `fe80::/10` (link-local), `fc00::/7` (ULA incl. Fly `fdaa::`), and every
+       v4-in-v6 embedding that could smuggle a private v4 past the v6 rules —
+       IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, NAT64
+       `64:ff9b::/96` (RFC 6052), 6to4 `2002::/16` (RFC 3056), and Teredo
+       `2001:0::/32` (RFC 4380). For every embedding the inner v4 is decoded and
+       re-checked against the v4 rules. If a host resolves to *multiple*
+       addresses and *any* one is blocked, the whole URL is rejected.
 
-  Callers MUST re-validate on every request (DNS rebinding / TOCTOU), not only at
-  submission time, and MUST disable redirect following (`redirect: false`) so a
-  302 hop can't re-enter an unvalidated URL.
+  ## Connecting safely — pin the validated IP
+
+  Re-validating a hostname before a request is NOT sufficient on its own: an HTTP
+  client re-resolves the hostname at connect time (a *separate* DNS lookup), so a
+  TTL=0 attacker can answer the validation lookup with a public IP and the connect
+  lookup with a private one (DNS rebinding / TOCTOU). To close that window,
+  connection sites use `pin/1` + `pinned_request_opts/1`: the URL authority is
+  rewritten to the *single* validated IP while the original hostname is preserved
+  for the `Host` header, TLS SNI, and certificate verification (via Mint's
+  `:hostname` connect option). The client therefore connects to exactly the IP the
+  guard vetted — there is no second resolution to rebind.
+
+  Callers MUST also disable redirect following (`redirect: false`) so a 302 hop
+  can't re-enter an unvalidated URL.
   """
 
   import Bitwise
@@ -49,6 +63,12 @@ defmodule Loopctl.Net.UrlGuard do
           | :dns_resolution_failed
           | :blocked_ip
 
+  @typedoc """
+  A validated URL together with the single IP it was pinned to and the original
+  host to preserve for `Host`/SNI/cert verification.
+  """
+  @type pinned :: %{uri: URI.t(), host: String.t(), ip: :inet.ip_address()}
+
   @doc """
   Validates that `url` is safe to fetch from a server-side context.
 
@@ -56,14 +76,33 @@ defmodule Loopctl.Net.UrlGuard do
   it resolves to is a public, routable address. Returns `{:error, reason}`
   otherwise, where `reason` is one of `t:reason/0`.
 
+  Use this at submission/enqueue time (changeset, controller). At connection time
+  prefer `pin/2` + `pinned_request_opts/1` to also close the DNS-rebinding window.
+
   ## Options
 
     * `:schemes` — list of allowed URI schemes (default `["http", "https"]`).
   """
   @spec validate_egress(String.t(), keyword()) :: {:ok, URI.t()} | {:error, reason()}
-  def validate_egress(url, opts \\ [])
+  def validate_egress(url, opts \\ []) do
+    case pin(url, opts) do
+      {:ok, %{uri: uri}} -> {:ok, uri}
+      {:error, _reason} = err -> err
+    end
+  end
 
-  def validate_egress(url, opts) when is_binary(url) do
+  @doc """
+  Validates `url` and returns the single IP to pin the connection to.
+
+  Same checks as `validate_egress/2`, but on success returns
+  `{:ok, %{uri: uri, host: host, ip: ip}}` where `ip` is the first (already
+  vetted) resolved address. Feed the result to `pinned_request_opts/1` to build
+  Req options that connect to that exact IP.
+  """
+  @spec pin(String.t(), keyword()) :: {:ok, pinned()} | {:error, reason()}
+  def pin(url, opts \\ [])
+
+  def pin(url, opts) when is_binary(url) do
     schemes = Keyword.get(opts, :schemes, @default_schemes)
     uri = URI.parse(url)
 
@@ -71,11 +110,29 @@ defmodule Loopctl.Net.UrlGuard do
          {:ok, host} <- host(uri),
          {:ok, ips} <- resolve(host),
          :ok <- check_ips(ips) do
-      {:ok, uri}
+      {:ok, %{uri: uri, host: strip_brackets(host), ip: hd(ips)}}
     end
   end
 
-  def validate_egress(_url, _opts), do: {:error, :invalid_url}
+  def pin(_url, _opts), do: {:error, :invalid_url}
+
+  @doc """
+  Builds Req options that connect to the pinned IP while preserving the original
+  host for the `Host` header, TLS SNI, and certificate verification.
+
+  Returns `[url: connect_url, connect_options: [hostname: original_host]]`, where
+  `connect_url` has its authority rewritten to the validated IP literal (IPv6 is
+  bracketed). Merge this with the caller's method/body/headers and
+  `redirect: false`.
+  """
+  @spec pinned_request_opts(pinned()) :: keyword()
+  def pinned_request_opts(%{uri: uri, host: host, ip: ip}) do
+    connect_url =
+      %URI{uri | host: ip_literal(ip), authority: nil}
+      |> URI.to_string()
+
+    [url: connect_url, connect_options: [hostname: host]]
+  end
 
   # --- scheme / host ---
 
@@ -115,6 +172,9 @@ defmodule Loopctl.Net.UrlGuard do
     |> String.replace_suffix("]", "")
   end
 
+  # `:inet.ntoa/1` yields the bare address; URI.to_string/1 re-brackets IPv6.
+  defp ip_literal(ip), do: ip |> :inet.ntoa() |> List.to_string()
+
   # --- Blocklist ---
 
   # Any blocked address in the resolved set fails the whole URL.
@@ -125,16 +185,32 @@ defmodule Loopctl.Net.UrlGuard do
   # --- IPv4 ---
   defp blocked?({a, b, _c, _d}), do: blocked_ipv4?(a, b)
 
-  # IPv4-mapped IPv6 (::ffff:0:0/96): decode the embedded v4's first two octets
-  # (all blocked ranges are determined by them) and re-check against the v4 rules.
+  # --- v4-in-v6 embeddings: decode the inner v4 and re-check the v4 rules ---
+
+  # IPv4-mapped (::ffff:0:0/96)
   defp blocked?({0, 0, 0, 0, 0, 0xFFFF, g6, _g7}) do
     blocked_ipv4?(g6 >>> 8, g6 &&& 0xFF)
   end
 
-  # IPv4-compatible IPv6 (::0.0.0.0/96, incl. :: and ::1): decode the embedded v4
-  # and re-check. Covers ::1 (→ 0.0.0.1, blocked by 0.0.0.0/8) and :: as well.
+  # IPv4-compatible (::0.0.0.0/96, incl. :: and ::1 → 0.0.0.1)
   defp blocked?({0, 0, 0, 0, 0, 0, g6, _g7}) do
     blocked_ipv4?(g6 >>> 8, g6 &&& 0xFF)
+  end
+
+  # NAT64 well-known prefix (64:ff9b::/96, RFC 6052)
+  defp blocked?({0x0064, 0xFF9B, 0, 0, 0, 0, g6, _g7}) do
+    blocked_ipv4?(g6 >>> 8, g6 &&& 0xFF)
+  end
+
+  # 6to4 (2002::/16, RFC 3056): inner v4 in groups 1..2
+  defp blocked?({0x2002, w, _x, _, _, _, _, _}) do
+    blocked_ipv4?(w >>> 8, w &&& 0xFF)
+  end
+
+  # Teredo (2001:0::/32, RFC 4380): client v4 is the low 32 bits XOR 0xFFFFFFFF
+  defp blocked?({0x2001, 0, _, _, _, _, s6, s7}) do
+    v4 = bnot(s6 <<< 16 ||| s7) &&& 0xFFFFFFFF
+    blocked_ipv4?(v4 >>> 24, v4 >>> 16 &&& 0xFF)
   end
 
   # --- IPv6 ---
