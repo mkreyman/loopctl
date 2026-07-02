@@ -150,6 +150,39 @@ defmodule Loopctl.Workers.TokenDataArchivalWorkerTest do
       assert log_entry.new_state["retention_days"] == 90
     end
 
+    @tag :capture_log
+    test "per-tenant fault isolation: one tenant raising does not abort the run (tokens-03)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      tenant_ids = [tenant_a.id, tenant_b.id]
+
+      tenant_a_id = tenant_a.id
+
+      table_name = :"archival_faulted_#{System.unique_integer([:positive])}"
+      processed = :ets.new(table_name, [:set, :public])
+
+      # tenant_a's hard-delete RAISES (simulating an unexpected DB/FK error).
+      # tenant_b must still be processed and perform/1 must still return :ok —
+      # one tenant's failure can never wedge the whole run.
+      expect(Loopctl.MockTokenArchival, :hard_delete_expired_reports, 2, fn tid ->
+        :ets.insert(processed, {tid, true})
+
+        if tid == tenant_a_id do
+          raise "simulated archival failure for one tenant"
+        else
+          {:ok, 0}
+        end
+      end)
+
+      assert :ok = TokenDataArchivalWorker.perform(%Oban.Job{args: %{"tenant_ids" => tenant_ids}})
+
+      # Both tenants were attempted despite tenant_a raising.
+      assert :ets.member(processed, tenant_a_id)
+      assert :ets.member(processed, tenant_b.id)
+
+      :ets.delete(processed)
+    end
+
     test "tenant isolation: each tenant processed independently" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)

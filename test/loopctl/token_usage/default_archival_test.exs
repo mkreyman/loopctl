@@ -129,6 +129,29 @@ defmodule Loopctl.TokenUsage.DefaultArchivalTest do
     report
   end
 
+  # Insert a correction referencing an original report via Repo.with_tenant.
+  defp insert_correction(ctx, original) do
+    {:ok, correction} =
+      Repo.with_tenant(ctx.tenant.id, fn ->
+        %Report{
+          tenant_id: ctx.tenant.id,
+          story_id: ctx.story.id,
+          agent_id: ctx.agent.id,
+          project_id: ctx.project.id,
+          corrects_report_id: original.id
+        }
+        |> Report.correction_changeset(%{
+          input_tokens: -10,
+          output_tokens: -5,
+          model_name: "claude-opus-4",
+          cost_millicents: -50
+        })
+        |> Repo.insert!()
+      end)
+
+    correction
+  end
+
   # Backdate a report's inserted_at
   defp backdate_report(report, days_ago) do
     past = DateTime.add(DateTime.utc_now(), -days_ago * 86_400, :second)
@@ -276,6 +299,50 @@ defmodule Loopctl.TokenUsage.DefaultArchivalTest do
         Repo.with_tenant(ctx_b.tenant.id, fn -> Repo.get(Report, report_b.id) end)
 
       assert fetched_b != nil
+    end
+  end
+
+  describe "hard_delete_expired_reports/1 with corrections (tokens-03)" do
+    test "does NOT hard-delete an expired original still referenced by a live correction (no FK crash)" do
+      ctx = make_context()
+      original = insert_report(ctx)
+      # A live correction (recent) referencing the original survives the cutoff.
+      correction = insert_correction(ctx, original)
+
+      # Original soft-deleted > 30 days ago (past the grace cutoff).
+      soft_delete_report(original, 31)
+
+      # Must NOT raise an FK violation and must NOT delete the referenced original.
+      assert {:ok, 0} = DefaultArchival.hard_delete_expired_reports(ctx.tenant.id)
+
+      assert Repo.get(Report, original.id) != nil
+      assert Repo.get(Report, correction.id) != nil
+    end
+
+    test "hard-deletes both when correction and original have expired (correction first, FK-safe)" do
+      ctx = make_context()
+      original = insert_report(ctx)
+      correction = insert_correction(ctx, original)
+
+      # Both soft-deleted past the grace cutoff.
+      soft_delete_report(original, 31)
+      soft_delete_report(correction, 31)
+
+      # One run removes both — the correction (a leaf) first, then the now
+      # unreferenced original — FK-safe and crash-free.
+      assert {:ok, 2} = DefaultArchival.hard_delete_expired_reports(ctx.tenant.id)
+
+      assert Repo.get(Report, original.id) == nil
+      assert Repo.get(Report, correction.id) == nil
+    end
+
+    test "still hard-deletes an expired original that has NO corrections" do
+      ctx = make_context()
+      original = insert_report(ctx)
+      soft_delete_report(original, 31)
+
+      assert {:ok, 1} = DefaultArchival.hard_delete_expired_reports(ctx.tenant.id)
+      assert Repo.get(Report, original.id) == nil
     end
   end
 

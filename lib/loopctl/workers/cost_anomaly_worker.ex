@@ -89,6 +89,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
       |> join(:inner, [r], s in Story, on: r.story_id == s.id)
       |> where([r, _s], r.tenant_id == ^tenant_id)
       |> where([r, _s], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> where([_r, s], s.epic_id in ^epic_ids)
       |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> group_by([r, s], [r.story_id, s.epic_id])

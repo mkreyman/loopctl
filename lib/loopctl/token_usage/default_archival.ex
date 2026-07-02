@@ -106,14 +106,29 @@ defmodule Loopctl.TokenUsage.DefaultArchival do
 
   # Hard-delete pass: permanently remove reports deleted > grace_days ago.
   # Uses a subquery (WHERE id IN (...)) to apply batched delete.
+  #
+  # Skip-if-referenced (tokens-03): an expired original that is STILL referenced
+  # by a correction (via `corrects_report_id`) is excluded from the delete set.
+  # `corrects_report_id` has no ON DELETE cascade/nullify, so hard-deleting a
+  # referenced original raises an FK violation that would crash the archival
+  # worker and wedge archival for every tenant in the run. Corrections are
+  # created later than their originals, so a correction survives the cutoff after
+  # its original expires — we skip the original until the correction ALSO expires
+  # and is hard-deleted (corrections are leaves: nothing references them, so they
+  # are removed first). This preserves total attribution: we never null out a
+  # correction's `corrects_report_id`. The batch loop still terminates because a
+  # permanently-referenced original is never selected (count reaches 0).
   defp do_hard_delete_batch(tenant_id, grace_cutoff, total_deleted) do
     result =
       Repo.with_tenant(tenant_id, fn ->
         subq =
           from(r in Report,
+            as: :expired,
             where: r.tenant_id == ^tenant_id,
             where: not is_nil(r.deleted_at),
             where: r.deleted_at < ^grace_cutoff,
+            where:
+              not exists(from(c in Report, where: c.corrects_report_id == parent_as(:expired).id)),
             select: r.id,
             limit: @batch_size
           )

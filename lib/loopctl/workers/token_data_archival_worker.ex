@@ -60,12 +60,30 @@ defmodule Loopctl.Workers.TokenDataArchivalWorker do
     tenants = list_active_tenants(args)
     Logger.info("TokenDataArchivalWorker: processing #{length(tenants)} tenants")
 
-    Enum.each(tenants, &process_tenant/1)
+    Enum.each(tenants, &process_tenant_safe/1)
 
     :ok
   end
 
   # --- Private helpers ---
+
+  # Per-tenant fault isolation (tokens-03): a failure processing ONE tenant must
+  # NOT abort the whole run for the others. Any RAISED error (e.g. an unexpected
+  # DB/FK error while hard-deleting) is caught and logged so archival still runs
+  # for every other tenant — one tenant's data can never wedge global archival.
+  # Expected `{:error, _}` returns from the archival service are already handled
+  # non-fatally inside run_soft_delete/run_hard_delete/run_archive_anomalies.
+  defp process_tenant_safe(%Tenant{id: tenant_id} = tenant) do
+    process_tenant(tenant)
+  rescue
+    e ->
+      Logger.error(
+        "TokenDataArchivalWorker: tenant #{tenant_id} failed, skipping to next tenant: " <>
+          Exception.message(e)
+      )
+
+      :ok
+  end
 
   defp process_tenant(%Tenant{id: tenant_id, token_data_retention_days: retention_days}) do
     # Hard-delete pass runs for ALL tenants (clears previously soft-deleted reports)

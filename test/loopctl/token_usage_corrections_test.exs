@@ -72,6 +72,12 @@ defmodule Loopctl.TokenUsageCorrectionsTest do
     |> AdminRepo.all()
   end
 
+  defp count_threshold_audits(tenant_id, threshold_type) do
+    tenant_id
+    |> find_audit_entries("token_budget", "threshold_crossed")
+    |> Enum.count(&(&1.metadata["threshold_type"] == threshold_type))
+  end
+
   # ---------------------------------------------------------------------------
   # AC-21.13.1: Soft delete
   # ---------------------------------------------------------------------------
@@ -590,6 +596,343 @@ defmodule Loopctl.TokenUsageCorrectionsTest do
 
       other_tenant = fixture(:tenant)
       assert {:error, :not_found} = TokenUsage.get_report(other_tenant.id, report.id)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # tokens-02: concurrent correction validation cannot drive totals negative
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # tokens-03 retention gap: correction chains are bounded to depth 1
+  # ---------------------------------------------------------------------------
+
+  describe "create_correction/4 forbids correcting a correction (tokens-03)" do
+    test "correcting an ORIGINAL report succeeds" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      assert {:ok, _correction} =
+               TokenUsage.create_correction(tenant.id, original.id, %{
+                 input_tokens: -100,
+                 output_tokens: -50,
+                 cost_millicents: -250
+               })
+    end
+
+    test "correcting a CORRECTION returns 422 (bounds the chain to depth 1)" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      {:ok, correction} =
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: -100,
+          output_tokens: -50,
+          cost_millicents: -250
+        })
+
+      # A correction-of-a-correction would create an unbounded lineage
+      # (A <- B <- C ...) that defers hard-delete of the whole chain past
+      # retention forever. It must be rejected.
+      assert {:error, :unprocessable_entity, message} =
+               TokenUsage.create_correction(tenant.id, correction.id, %{
+                 input_tokens: -10,
+                 output_tokens: -5,
+                 cost_millicents: -25
+               })
+
+      assert message == "cannot correct a correction"
+
+      # No second-level correction row was written.
+      corrections_of_correction =
+        Report
+        |> where([r], r.corrects_report_id == ^correction.id)
+        |> AdminRepo.all()
+
+      assert corrections_of_correction == []
+    end
+  end
+
+  describe "create_correction/4 concurrency safety (tokens-02)" do
+    test "concurrent corrections on the same story: exactly one wins, total never negative" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      # story total: cost 2500. Two racing corrections of -2000 each would each
+      # pass validation against the PRE-correction total (2500 - 2000 = 500 >= 0)
+      # but together (2500 - 4000) are impossible. The per-story advisory lock
+      # serializes them so the loser re-reads the winner's committed total and is
+      # rejected — the total can never be driven negative.
+      original = create_report(tenant.id, story, agent, project)
+
+      corr = fn ->
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_millicents: -2000
+        })
+      end
+
+      # Task.async propagates $callers, so the sandbox connection is shared with
+      # the racing tasks (mirrors orchestrator_test.exs optimistic-locking race).
+      results =
+        [Task.async(corr), Task.async(corr)]
+        |> Task.await_many(5_000)
+
+      successes = Enum.filter(results, &match?({:ok, _}, &1))
+      rejects = Enum.filter(results, &match?({:error, :unprocessable_entity, _}, &1))
+
+      assert length(successes) == 1
+      assert length(rejects) == 1
+
+      {:ok, totals} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert totals.total_cost_millicents == 500
+      assert totals.total_cost_millicents >= 0
+    end
+
+    test "takes a per-story advisory lock so concurrent corrections serialize" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      test_pid = self()
+      handler_id = "tokens-02-lock-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :admin_repo, :query],
+        fn _event, _measurements, %{query: query}, _config ->
+          if query =~ "pg_advisory_xact_lock" do
+            send(test_pid, {:advisory_lock_query, query})
+          end
+        end,
+        nil
+      )
+
+      try do
+        assert {:ok, _correction} =
+                 TokenUsage.create_correction(tenant.id, original.id, %{
+                   input_tokens: -100,
+                   output_tokens: -50,
+                   cost_millicents: -250
+                 })
+      after
+        :telemetry.detach(handler_id)
+      end
+
+      # The correction transaction MUST acquire the per-story advisory xact lock
+      # that serializes concurrent corrections. If the lock step is removed, no
+      # such query runs under READ COMMITTED and two racing corrections could
+      # both pass validation — this assertion fails, catching that regression.
+      assert_receive {:advisory_lock_query, _}, 500
+    end
+
+    test "serialized over-subtraction is rejected; the story total never goes negative" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      # story total: cost 2500, input 1000, output 500
+      original = create_report(tenant.id, story, agent, project)
+
+      # First correction zeroes the story out -> total 0.
+      assert {:ok, _} =
+               TokenUsage.create_correction(tenant.id, original.id, %{
+                 input_tokens: -1000,
+                 output_tokens: -500,
+                 cost_millicents: -2500
+               })
+
+      {:ok, after_first} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert after_first.total_cost_millicents == 0
+
+      # A SECOND correction (the double-submit/retry twin) that would subtract the
+      # same amount again must re-read the now-updated total and be rejected. The
+      # advisory lock forces this re-read under concurrency, so exactly one of two
+      # racing corrections wins and the total can never be driven negative.
+      assert {:error, :unprocessable_entity, message} =
+               TokenUsage.create_correction(tenant.id, original.id, %{
+                 input_tokens: 0,
+                 output_tokens: 0,
+                 cost_millicents: -2500
+               })
+
+      assert message =~ "cost_millicents"
+
+      {:ok, final} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert final.total_cost_millicents == 0
+      assert final.total_cost_millicents >= 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # tokens-04: soft-deleting an original must not strand its negative correction
+  # ---------------------------------------------------------------------------
+
+  describe "soft-delete total consistency (tokens-04)" do
+    test "soft-deleting an original excludes its negative correction (total never negative)" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      # original: cost 2500, input 1000, output 500
+      original = create_report(tenant.id, story, agent, project)
+
+      {:ok, _correction} =
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: -100,
+          output_tokens: -50,
+          cost_millicents: -250
+        })
+
+      # Both live: 2500 - 250 = 2250
+      {:ok, before} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert before.total_cost_millicents == 2250
+
+      # Soft-delete the ORIGINAL. Its surviving negative correction must NOT be
+      # counted on its own — that would strand it and drive the total to -250.
+      {:ok, _} = TokenUsage.delete_report(tenant.id, original.id)
+
+      {:ok, after_delete} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert after_delete.total_cost_millicents == 0
+      assert after_delete.total_input_tokens == 0
+      assert after_delete.total_output_tokens == 0
+      assert after_delete.total_cost_millicents >= 0
+      # The correction is excluded from the count as well.
+      assert after_delete.report_count == 0
+    end
+
+    test "a correction whose original is live still counts normally" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      {:ok, _correction} =
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: -100,
+          output_tokens: -50,
+          cost_millicents: -250
+        })
+
+      {:ok, totals} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert totals.total_cost_millicents == 2250
+      assert totals.total_input_tokens == 900
+      assert totals.total_output_tokens == 450
+      assert totals.report_count == 2
+    end
+
+    test "story/epic/project scope spend all exclude a stranded correction" do
+      %{tenant: tenant, story: story, agent: agent, project: project, epic: epic} =
+        setup_context()
+
+      original = create_report(tenant.id, story, agent, project)
+
+      {:ok, _} =
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_millicents: -250
+        })
+
+      {:ok, _} = TokenUsage.delete_report(tenant.id, original.id)
+
+      assert TokenUsage.get_scope_spend(tenant.id, :story, story.id) == 0
+      assert TokenUsage.get_scope_spend(tenant.id, :epic, epic.id) == 0
+      assert TokenUsage.get_scope_spend(tenant.id, :project, project.id) == 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # tokens-05: threshold_crossed audit rows are deduplicated per real crossing
+  # ---------------------------------------------------------------------------
+
+  describe "threshold_crossed audit dedup (tokens-05)" do
+    test "first warning crossing writes ONE audit; subsequent over-warning reports write none" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # First report crosses the warning threshold (8500/10000 = 85%).
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 8_500})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+
+      # Further reports while STILL over the warning threshold must NOT write
+      # another threshold_crossed audit row (the bug wrote one on every report).
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 200})
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 200})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+    end
+
+    test "crossing 100% after only warning writes the exceeded audit exactly once" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # Cross warning only (85%).
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 8_500})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+      assert count_threshold_audits(tenant.id, "exceeded") == 0
+
+      # Now cross 100% — a GENUINE new crossing writes the exceeded audit once.
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 3_000})
+      assert count_threshold_audits(tenant.id, "exceeded") == 1
+      assert count_threshold_audits(tenant.id, "warning") == 1
+
+      # A further over-100% report writes NO additional audit rows.
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 500})
+      assert count_threshold_audits(tenant.id, "exceeded") == 1
+      assert count_threshold_audits(tenant.id, "warning") == 1
+    end
+
+    test "a single report crossing BOTH thresholds writes one warning and one exceeded" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      # 6000/5000 = 120% crosses warning AND exceeded at once.
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 6_000})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+      assert count_threshold_audits(tenant.id, "exceeded") == 1
+
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 500})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+      assert count_threshold_audits(tenant.id, "exceeded") == 1
+    end
+
+    test "reset semantics: after spend drops below threshold, a re-crossing writes a new audit" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+
+      {:ok, _budget} =
+        TokenUsage.create_budget(tenant.id, %{
+          scope_type: :story,
+          scope_id: story.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      report = create_report(tenant.id, story, agent, project, %{cost_millicents: 8_500})
+      assert count_threshold_audits(tenant.id, "warning") == 1
+
+      # Drop spend far below the warning threshold via a correction — this resets
+      # warning_fired (same reset path the webhook dedup uses).
+      {:ok, _} =
+        TokenUsage.create_correction(tenant.id, report.id, %{
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_millicents: -8_000
+        })
+
+      # Re-cross the warning threshold — a NEW crossing writes another audit row.
+      create_report(tenant.id, story, agent, project, %{cost_millicents: 8_000})
+      assert count_threshold_audits(tenant.id, "warning") == 2
     end
   end
 end
