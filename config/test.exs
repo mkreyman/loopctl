@@ -166,12 +166,10 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 # DI: Use mock rate limiter in tests
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 
-# Mirrors the prod shape: `fly-client-ip` is authoritative (the signup tests set
-# it to assert the real client is used, not Fly's appended app IP), with
-# `x-forwarded-for` as the off-Fly fallback via `conn.remote_ip`.
-config :loopctl, :remote_ip_opts,
-  headers: ["fly-client-ip", "x-forwarded-for"],
-  proxies: ~w[198.51.100.0/24]
+# Trusted-proxy range for the shared Loopctl.RemoteIp resolver in tests. Headers
+# are chosen per-call (singleton fly-client-ip / x-forwarded-for), so only
+# :proxies is configured here.
+config :loopctl, :remote_ip_opts, proxies: ~w[198.51.100.0/24]
 
 # DI: Use mock clock in tests
 config :loopctl, :clock, Loopctl.MockClock

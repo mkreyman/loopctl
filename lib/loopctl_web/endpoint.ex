@@ -14,10 +14,10 @@ defmodule LoopctlWeb.Endpoint do
 
   # The signup rate limiter no longer resolves the client IP from the fragile
   # LiveView connect_info. Instead the HTTP pipeline resolves it (via the
-  # `plug RemoteIp` below, preferring the unspoofable `fly-client-ip` header)
-  # and hands it to `LoopctlWeb.SignupLive` through the SIGNED session (see the
-  # `:public_signup` live_session in the router). So the socket only needs the
-  # session.
+  # `LoopctlWeb.Plugs.ClientIp` plug below, which uses the shared
+  # `Loopctl.RemoteIp` resolver) and hands it to `LoopctlWeb.SignupLive` through
+  # the SIGNED session (see the `:public_signup` live_session in the router). So
+  # the socket only needs the session.
   socket "/live", Phoenix.LiveView.Socket,
     websocket: [connect_info: [session: @session_options]],
     longpoll: [connect_info: [session: @session_options]]
@@ -41,13 +41,13 @@ defmodule LoopctlWeb.Endpoint do
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :loopctl
   end
 
-  # Resolve the client IP behind Fly's proxy for rate limiting. Opts (headers +
-  # trusted proxies) are shared with LoopctlWeb.SignupLive via the
-  # :remote_ip_opts config key. `fly-client-ip` (set by fly-proxy to the real
-  # connecting client, and NOT client-forgeable) is listed first; SignupLive
-  # additionally reads it directly so it is never contaminated by the app IP
-  # that Fly appends to X-Forwarded-For.
-  plug RemoteIp, Application.compile_env(:loopctl, :remote_ip_opts, [])
+  # Resolve the real client IP into conn.remote_ip for the WHOLE pipeline
+  # (registration rate limiter, logging, session init) via the shared
+  # Loopctl.RemoteIp resolver, which resolves `fly-client-ip` and
+  # `x-forwarded-for` INDEPENDENTLY — immune to the `remote_ip` two-header
+  # wire-order collapse that returns Fly's app IP. Leaves conn.remote_ip as the
+  # raw peer when nothing is resolvable (never 0.0.0.0).
+  plug LoopctlWeb.Plugs.ClientIp
 
   plug Plug.RequestId
   # US-27.4: clear tenant_id on every request (before routing).

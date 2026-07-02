@@ -46,50 +46,48 @@ defmodule LoopctlWeb.SignupLive do
   # under 8 KB.
   @max_attestation_field_bytes 8 * 1024
 
+  # Cap friendly_name to prevent unbounded string allocation and echo DoS.
+  # Matches the RootAuthenticator `validate_length(:friendly_name, max: 120)`
+  # schema bound, so a valid name is never truncated. A real name is 10-50 bytes.
+  @max_friendly_name_bytes 120
+
+  # Cap attestation error reason before logging to prevent large-payload logging DoS.
+  # A real error reason is well under this limit.
+  @max_error_reason_bytes 500
+
+  # Cap tenant metadata fields (name/slug/email) before they are echoed back or
+  # persisted. Schema maxes are name 120 / slug 64; 512 is a safe upper bound.
+  @max_tenant_field_bytes 512
+
+  # SHARED per-connection budget that EVERY abusable handler (crypto, logging or
+  # echoing attacker input) draws from, so no single handler is an unrated
+  # amplifier. Generous vs a legit ceremony (~5 enrollments + a few retries +
+  # submit). The tighter per-purpose caps (WebAuthn verify, signup submit) apply
+  # on top for defense in depth.
+  @max_actions_per_window 60
+
   @doc """
   Builds the LiveView session for the `:public_signup` live_session (wired via
   the router's `session: {__MODULE__, :signup_session, []}` MFA).
 
-  This runs in the HTTP pipeline — where `conn.remote_ip` is already resolved by
-  `plug RemoteIp` and the request headers are present — and stashes the resolved
-  client IP into the SIGNED session. The client cannot forge a signed session,
-  so this is the trustworthy channel for the rate-limit key. The value is read
-  back (identically) on BOTH the disconnected and connected `mount/3`.
+  Runs in the HTTP pipeline (where `conn.remote_ip` is already resolved by the
+  `LoopctlWeb.Plugs.ClientIp` plug and the request headers are present) and
+  stashes the resolved client IP into the SIGNED session. The client cannot
+  forge a signed session, so this is the trustworthy channel for the rate-limit
+  key; it is read back identically on BOTH the disconnected and connected mount.
+
+  Uses the shared `Loopctl.RemoteIp` resolver (single source of truth with the
+  endpoint plug): resolves the forwarding headers first (preferring the
+  unspoofable `fly-client-ip`), then falls back to the plug-resolved
+  `conn.remote_ip`.
   """
   def signup_session(conn) do
-    %{"client_ip" => resolve_client_ip(conn)}
-  end
+    ip =
+      Loopctl.RemoteIp.string_from(conn.req_headers) ||
+        Loopctl.RemoteIp.to_string_ip(conn.remote_ip)
 
-  # Prefer `fly-client-ip` — fly-proxy sets it to the real connecting client and
-  # OVERWRITES any client-supplied value, so it is unspoofable AND immune to the
-  # app-assigned IP that Fly appends as the rightmost `x-forwarded-for` entry
-  # (RemoteIp scans right-to-left, so a combined XFF would otherwise resolve to
-  # that app IP and collapse every visitor onto one bucket). Off Fly there is no
-  # such header, so fall back to `conn.remote_ip` (resolved by `plug RemoteIp`
-  # from X-Forwarded-For for an nginx-style proxy, or the raw peer locally).
-  defp resolve_client_ip(conn) do
-    (fly_client_ip(conn) || conn.remote_ip)
-    |> normalize_ip_string()
+    %{"client_ip" => ip}
   end
-
-  defp fly_client_ip(conn) do
-    RemoteIp.from(conn.req_headers, Keyword.put(remote_ip_opts(), :headers, ["fly-client-ip"]))
-  end
-
-  # Render an address tuple as a stable string. IPv4-mapped IPv6
-  # (`::ffff:a.b.c.d`, i.e. `{0,0,0,0,0,0xffff,_,_}`) — how Bandit surfaces IPv4
-  # peers on a dual-stack `::` bind — is normalized to the plain IPv4 form so
-  # buckets are stable regardless of the socket family.
-  defp normalize_ip_string({0, 0, 0, 0, 0, 0xFFFF, ab, cd}) do
-    <<a, b, c, d>> = <<ab::16, cd::16>>
-    normalize_ip_string({a, b, c, d})
-  end
-
-  defp normalize_ip_string(addr) when tuple_size(addr) in [4, 8] do
-    addr |> :inet.ntoa() |> to_string()
-  end
-
-  defp normalize_ip_string(_), do: nil
 
   @impl true
   def mount(_params, session, socket) do
@@ -125,15 +123,59 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
-  defp remote_ip_opts, do: Application.get_env(:loopctl, :remote_ip_opts, [])
-
   defp rate_limiter do
     Application.get_env(:loopctl, :rate_limiter, Loopctl.RateLimiter.Hammer)
   end
 
+  # Shared per-connection action budget. Every abusable handler draws from this
+  # single bucket so the TOTAL rate of expensive/logging/echoing events is
+  # bounded (no single handler is an unrated amplifier).
+  defp ensure_action_budget(socket) do
+    bucket = "signup:actions:#{socket.assigns.rate_key}"
+
+    case rate_limiter().check_rate(bucket, @rate_window_ms, @max_actions_per_window) do
+      {:allow, _count} -> :ok
+      {:deny, _limit} -> {:error, "Too many attempts. Please slow down and try again later."}
+    end
+  end
+
+  # Size cap on a client-supplied string, applied uniformly before processing,
+  # echoing, or logging. Non-binary values are treated as within-bounds (they
+  # are normalized/dropped elsewhere).
+  defp within_size?(value, max) when is_binary(value), do: byte_size(value) <= max
+  defp within_size?(_value, _max), do: true
+
+  defp ensure_tenant_field_sizes(params) do
+    within? =
+      ["name", "slug", "email"]
+      |> Enum.all?(fn key -> within_size?(Map.get(params, key), @max_tenant_field_bytes) end)
+
+    if within?, do: :ok, else: {:error, "Tenant details are too long"}
+  end
+
+  # Truncate every binary tenant field so an oversized value is never echoed
+  # back into the re-rendered form.
+  defp cap_tenant_params(params) when is_map(params) do
+    Enum.reduce(["name", "slug", "email"], params, fn key, acc ->
+      case Map.get(acc, key) do
+        value when is_binary(value) ->
+          Map.put(acc, key, truncate_to(value, @max_tenant_field_bytes))
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp cap_tenant_params(params), do: params
+
   @impl true
   def handle_event("validate", %{"tenant" => params} = all, socket) do
-    friendly = Map.get(all, "friendly_name", socket.assigns.friendly_name_draft)
+    # Form-change handler: not rate-limited (it fires per keystroke), but every
+    # attacker-controlled string is size-capped so a huge value can never be
+    # echoed back into the re-rendered form (echo-amplification).
+    friendly = cap_string(Map.get(all, "friendly_name", socket.assigns.friendly_name_draft))
+    params = cap_tenant_params(params)
 
     {:noreply,
      socket
@@ -149,6 +191,7 @@ defmodule LoopctlWeb.SignupLive do
       |> Map.get("friendly_name", socket.assigns.friendly_name_draft || "")
       |> to_string()
       |> String.trim()
+      |> truncate_to(@max_friendly_name_bytes)
 
     cond do
       length(socket.assigns.authenticators) >= socket.assigns.max_authenticators ->
@@ -156,6 +199,14 @@ defmodule LoopctlWeb.SignupLive do
 
       friendly_name == "" ->
         {:noreply, assign(socket, :error, "Please name this authenticator before enrolling")}
+
+      match?({:error, _}, ensure_action_budget(socket)) ->
+        {:noreply,
+         assign(
+           socket,
+           :error,
+           "Too many authenticator enrollment requests. Please try again later."
+         )}
 
       true ->
         challenge = new_challenge()
@@ -184,7 +235,8 @@ defmodule LoopctlWeb.SignupLive do
     # attestation_captured straight over the websocket. Order matters: capacity
     # and size checks reject WITHOUT consuming the verification budget; only a
     # genuine attempt draws down the per-window rate limit.
-    with :ok <- ensure_enrollment_capacity(socket),
+    with :ok <- ensure_action_budget(socket),
+         :ok <- ensure_enrollment_capacity(socket),
          :ok <- ensure_attestation_size(params),
          :ok <- ensure_verification_budget(socket) do
       verify_attestation(params, socket)
@@ -199,22 +251,17 @@ defmodule LoopctlWeb.SignupLive do
   @impl true
   def handle_event("attestation_error", %{"reason" => reason}, socket) do
     # A "reason" key is present (the browser hook reported a failure), so surface
-    # a message. A non-binary reason (crafted frame) is not trusted for display —
-    # it falls through to the safe generic message rather than crashing.
-    message =
-      case reason do
-        "webauthn_unsupported" ->
-          "This browser does not support WebAuthn — try Safari, Chrome, or Firefox"
+    # a message. Draw the shared action budget so a burst of these can't flood
+    # the logs / CPU, and NEVER inspect/log more than a capped slice of the
+    # attacker-controlled reason. A non-binary reason (crafted frame) falls
+    # through to the safe generic message rather than crashing.
+    case ensure_action_budget(socket) do
+      {:error, message} ->
+        {:noreply, assign(socket, :error, message)}
 
-        "no_credential" ->
-          "The browser returned no credential — please try again"
-
-        other ->
-          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(other)}")
-          "Authenticator ceremony failed. Please retry."
-      end
-
-    {:noreply, assign(socket, :error, message)}
+      :ok ->
+        {:noreply, assign(socket, :error, attestation_error_message(reason))}
+    end
   end
 
   # Malformed attestation_error (missing/non-binary "reason") from a public
@@ -247,17 +294,22 @@ defmodule LoopctlWeb.SignupLive do
          assign(socket, :error, "Enroll at least one authenticator before completing signup")}
 
       auths ->
-        case rate_limiter().check_rate(
-               socket.assigns.rate_key,
-               @rate_window_ms,
-               @max_signups_per_ip
-             ) do
-          {:allow, _count} ->
-            complete_signup(params, auths, socket)
-
+        with :ok <- ensure_action_budget(socket),
+             :ok <- ensure_tenant_field_sizes(params),
+             {:allow, _count} <-
+               rate_limiter().check_rate(
+                 socket.assigns.rate_key,
+                 @rate_window_ms,
+                 @max_signups_per_ip
+               ) do
+          complete_signup(params, auths, socket)
+        else
           {:deny, _limit} ->
             {:noreply,
              assign(socket, :error, "Too many signup attempts. Please try again later.")}
+
+          {:error, message} ->
+            {:noreply, assign(socket, :error, message)}
         end
     end
   end
@@ -297,6 +349,24 @@ defmodule LoopctlWeb.SignupLive do
       {:deny, _limit} -> {:error, "Too many verification attempts. Please try again later."}
     end
   end
+
+  defp attestation_error_message("webauthn_unsupported"),
+    do: "This browser does not support WebAuthn — try Safari, Chrome, or Firefox"
+
+  defp attestation_error_message("no_credential"),
+    do: "The browser returned no credential — please try again"
+
+  defp attestation_error_message(reason) do
+    Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(safe_reason(reason))}")
+    "Authenticator ceremony failed. Please retry."
+  end
+
+  # Only ever expose a short, capped slice of the attacker-controlled reason to
+  # the logs; anything non-binary or oversized is logged as a fixed placeholder.
+  defp safe_reason(reason) when is_binary(reason),
+    do: truncate_to(reason, @max_error_reason_bytes)
+
+  defp safe_reason(_reason), do: "<non-binary or oversized payload>"
 
   defp verify_attestation(params, socket) do
     attestation_object_b64 = Map.get(params, "attestation_object", "")
@@ -429,15 +499,38 @@ defmodule LoopctlWeb.SignupLive do
     |> maybe_blank_error(:email, params["email"])
   end
 
-  defp maybe_blank_error(errors, field, value) do
-    if String.trim(value || "") == "" do
+  defp maybe_blank_error(errors, field, value) when is_binary(value) do
+    if String.trim(value) == "" do
       [{field, {"can't be blank", []}} | errors]
     else
       errors
     end
   end
 
+  defp maybe_blank_error(errors, field, nil), do: [{field, {"can't be blank", []}} | errors]
+
+  # A non-binary present value (crafted frame) is treated as present, never
+  # trimmed — trimming a non-binary would crash the process.
+  defp maybe_blank_error(errors, _field, _value), do: errors
+
   defp clear_error(socket), do: assign(socket, :error, nil)
+
+  # Size-cap a friendly-name string for echo. Non-binary input becomes "".
+  defp cap_string(value) when is_binary(value), do: truncate_to(value, @max_friendly_name_bytes)
+  defp cap_string(_value), do: ""
+
+  # Truncate a binary to a maximum byte size (best-effort at a char boundary).
+  # Callers always pass a binary (guarded by cap_string/1, safe_reason/1,
+  # cap_tenant_params/1, or an explicit to_string/1).
+  defp truncate_to(string, max_bytes) when is_binary(string) and byte_size(string) <= max_bytes,
+    do: string
+
+  defp truncate_to(string, max_bytes) when is_binary(string) do
+    string
+    |> String.slice(0, max_bytes)
+    |> String.split_at(max_bytes)
+    |> elem(0)
+  end
 
   @impl true
   def render(assigns) do

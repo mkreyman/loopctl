@@ -615,6 +615,186 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
+  describe "DoS regression tests (final three vectors: friendly_name, reason, XFF order)" do
+    test "request_attestation rejects an oversized friendly_name (8MB attack) before use",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send 8MB friendly_name (Bandit's default max_frame_size)
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => String.duplicate("A", 8 * 1024 * 1024)
+      })
+
+      # View should still be alive and no authenticator should be created
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "request_attestation caps friendly_name to @max_friendly_name_bytes", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send a 1000-byte friendly_name (well above the 200-byte cap)
+      large_name = String.duplicate("X", 1000)
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => large_name
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+
+      # Capture attestation with the oversized name
+      render_hook(view, "attestation_captured", %{
+        "attestation_object" => "YWJjZA",
+        "client_data_json" => "eyJmb28iOiJiYXIifQ",
+        "credential_id" => "Y3JlZC1pZA"
+      })
+
+      # Authenticator should be enrolled, but name should be truncated
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      # The full 1000-byte name should NOT appear in the rendered output
+      refute html =~ String.duplicate("X", 200)
+    end
+
+    test "attestation_error caps an 8MB reason before logging and draws the action budget",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # An 8MB reason (Bandit's default max_frame_size). It must never be
+      # inspected/logged in full — safe_reason/1 truncates it — and the process
+      # must stay alive and surface the generic message.
+      html =
+        render_hook(view, "attestation_error", %{
+          "reason" => String.duplicate("E", 8 * 1024 * 1024)
+        })
+
+      assert html =~ "Authenticator ceremony failed"
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "attestation_error is bounded by the shared per-connection action budget",
+         %{conn: conn} do
+      # When the shared action budget is exhausted, attestation_error stops
+      # doing work (no logging) and reports the throttle message.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_error", %{"reason" => "webauthn_unsupported"})
+
+      assert html =~ "Too many attempts"
+    end
+
+    test "request_attestation draws the shared per-connection action budget", %{conn: conn} do
+      # request_attestation draws the SHARED "signup:actions:" budget (so no
+      # single handler is an unrated amplifier). Deny it and the handler reports
+      # the rate-limit message.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => "Primary"
+      })
+
+      html = view |> element("#enroll-authenticator-btn") |> render_click()
+
+      assert html =~ "Too many authenticator enrollment requests"
+    end
+
+    test "Fly XFF ordering regression: fly-client-ip wins over rightmost XFF entry",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # Real Fly shape: fly-client-ip is the real client, XFF has app IP rightmost.
+      # The old code's RemoteIp multi-header semantics could lose to the rightmost
+      # XFF entry (66.241.125.10 = Fly app IP). Verify it doesn't.
+      conn = fly_conn(conn, "203.0.113.100", xff: "203.0.113.100, 66.241.125.10")
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view, "YubiKey")
+
+      view
+      |> form("#signup-form", %{
+        "tenant" => %{
+          "name" => "XFF Ordering Test",
+          "slug" => "xff-order-test",
+          "email" => "xff@order.test"
+        }
+      })
+      |> render_submit()
+
+      assert_receive {:bucket, bucket}
+      # MUST resolve to the real client, NOT the app IP.
+      assert bucket == "signup:ip:203.0.113.100"
+      refute bucket == "signup:ip:66.241.125.10"
+    end
+
+    test "attestation_captured is bounded by the shared action budget before any crypto",
+         %{conn: conn} do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_captured", valid_attestation())
+
+      assert html =~ "Too many attempts"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "signup rejects oversized tenant fields before creating a tenant", %{conn: conn} do
+      {:ok, view, _html} = live(fly_conn(conn, "203.0.113.7"), ~p"/signup")
+      enroll_authenticator(view)
+
+      html =
+        view
+        |> form("#signup-form", %{
+          "tenant" => %{
+            "name" => String.duplicate("N", 2000),
+            "slug" => "oversized",
+            "email" => "oversized@corp.example"
+          }
+        })
+        |> render_submit()
+
+      assert html =~ "Tenant details are too long"
+      refute AdminRepo.get_by(Tenant, slug: "oversized")
+    end
+
+    test "validate caps an oversized tenant field so it is never echoed back", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html =
+        view
+        |> element("#signup-form")
+        |> render_change(%{
+          "tenant" => %{"name" => String.duplicate("N", 2000), "slug" => "", "email" => ""},
+          "friendly_name" => ""
+        })
+
+      # Truncated to @max_tenant_field_bytes (512); a 600-run can never appear.
+      refute html =~ String.duplicate("N", 600)
+    end
+  end
+
   describe "/tenants/:id/onboarding" do
     test "renders onboarding checklist with a valid signed token", %{conn: conn} do
       tenant = fixture(:tenant, %{name: "Onboarding Target"})
@@ -707,11 +887,15 @@ defmodule LoopctlWeb.SignupLiveTest do
   defp maybe_put_xff(conn, nil), do: conn
   defp maybe_put_xff(conn, xff), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", xff)
 
-  # Rate-limiter stub that reports only the signup bucket (ignores the separate
-  # per-verification webauthn bucket) so bucket assertions are unambiguous.
+  # Rate-limiter stub that reports only the primary signup submission bucket
+  # (ignores the shared per-connection action budget and the per-verification
+  # webauthn bucket) so bucket assertions are unambiguous.
   defp capture_bucket(test_pid) do
     fn
       "signup:webauthn:" <> _rest, _window, _limit ->
+        {:allow, 1}
+
+      "signup:actions:" <> _rest, _window, _limit ->
         {:allow, 1}
 
       bucket, _window, _limit ->

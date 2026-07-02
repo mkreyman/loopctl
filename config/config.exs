@@ -151,29 +151,25 @@ config :loopctl, LoopctlWeb.Endpoint,
   pubsub_server: Loopctl.PubSub,
   live_view: [signing_salt: "xpgWTdmT"]
 
-# RemoteIp configuration — SHARED by the `plug RemoteIp` in endpoint.ex AND by
-# `LoopctlWeb.SignupLive`, so the HTTP pipeline and the signup rate limiter
-# resolve the client IP against the same header + trusted-proxy list.
+# RemoteIp `:proxies` — trusted intermediary CIDRs, honored by the shared
+# `Loopctl.RemoteIp` resolver (used by BOTH `LoopctlWeb.Plugs.ClientIp` and
+# `LoopctlWeb.SignupLive`). `Loopctl.RemoteIp` resolves `fly-client-ip` and
+# `x-forwarded-for` INDEPENDENTLY (each with a SINGLETON `:headers` list), so we
+# deliberately do NOT set a multi-header `:headers` here: that would trigger
+# RemoteIp's wire-order collapse where Fly's app IP (appended as the rightmost
+# X-Forwarded-For entry) wins the right-to-left scan and buckets everyone
+# together. `fly-client-ip` (set by fly-proxy to the real client, unforgeable)
+# is preferred; `x-forwarded-for` is the off-Fly fallback.
 #
-# `fly-client-ip` is listed FIRST and is authoritative: fly-proxy sets it to the
-# real connecting client and OVERWRITES any client-supplied value, so it is not
-# forgeable. SignupLive reads it directly (single-header) so the app-assigned IP
-# that Fly appends as the RIGHTMOST `x-forwarded-for` entry can never win the
-# right-to-left RemoteIp scan and collapse every visitor onto one bucket.
-# `x-forwarded-for` remains as the OFF-Fly fallback (e.g. an nginx front-end).
-#
-# `:proxies` (Fly's `fdaa::/16` 6PN by default) marks trusted intermediaries so
-# reserved/proxy hops are peeled. Operators behind a different reverse proxy
-# should add its egress CIDR.
+# `:proxies` = Fly's `fdaa::/16` 6PN by default; add another reverse proxy's
+# egress CIDR if one fronts this app.
 #
 # RESIDUAL (documented, accepted infra boundary): a malicious SAME-Fly-org
 # sibling app with direct 6PN access to this app's port could set `fly-client-ip`
 # itself. Same-org is a trusted boundary — a hostile sibling app is a far larger
 # compromise than signup rate limits — so this is NOT a reachable vuln for the
 # normal public-internet threat model.
-config :loopctl, :remote_ip_opts,
-  headers: ["fly-client-ip", "x-forwarded-for"],
-  proxies: ~w[fdaa::/16]
+config :loopctl, :remote_ip_opts, proxies: ~w[fdaa::/16]
 
 # Configure Elixir's Logger — structured JSON logging with tenant context.
 # Production uses JSON via LoggerJSON; dev/test override with human-readable format.
