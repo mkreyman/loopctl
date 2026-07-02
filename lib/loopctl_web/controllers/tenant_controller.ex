@@ -36,8 +36,11 @@ defmodule LoopctlWeb.TenantController do
 
   operation(:update,
     summary: "Update current tenant profile",
-    description: "Updates the tenant profile. Requires user+ role.",
-    request_body: {"Update params", "application/json", Schemas.TenantResponse},
+    description:
+      "Updates the tenant profile. Requires user+ role. " <>
+        "`slug` is immutable post-creation (it keys the audit-key secret) and is " <>
+        "not part of the request body — see rls-02.",
+    request_body: {"Update params", "application/json", Schemas.TenantUpdateRequest},
     responses: %{
       200 => {"Updated tenant", "application/json", Schemas.TenantResponse},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},

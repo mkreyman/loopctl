@@ -189,6 +189,45 @@ defmodule LoopctlWeb.AdminTenantControllerTest do
       assert body["tenant"]["name"] == "New Name"
     end
 
+    # rls-02: the superadmin update path shares Tenant.update_changeset via
+    # update_tenant_admin/2, so slug must be immutable here too. Guards the
+    # security-critical admin route against a future regression.
+    test "ignores attempts to change slug (rls-02)", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+
+      tenant = fixture(:tenant, %{slug: "keep-slug", name: "Old Name"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/admin/tenants/#{tenant.id}", %{
+          "slug" => "hijacked-slug",
+          "name" => "New Name"
+        })
+
+      body = json_response(conn, 200)
+      assert body["tenant"]["name"] == "New Name"
+      assert body["tenant"]["slug"] == "keep-slug"
+    end
+
+    # rls-03: colliding with another tenant's email must return 422, not 500
+    # (a 500 would be a cross-tenant email-enumeration oracle).
+    test "returns 422 (not 500) on duplicate email (rls-03)", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+
+      _other = fixture(:tenant, %{email: "taken@example.com"})
+      tenant = fixture(:tenant, %{email: "mine@example.com"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/admin/tenants/#{tenant.id}", %{"email" => "taken@example.com"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["details"] == %{"email" => ["has already been taken"]}
+    end
+
     test "creates audit log entry on update", %{conn: conn} do
       {raw_key, api_key} = fixture(:api_key, %{role: :superadmin})
 

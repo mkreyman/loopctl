@@ -10,6 +10,8 @@ defmodule Loopctl.Tenants do
   and are not subject to RLS policies.
   """
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -460,6 +462,7 @@ defmodule Loopctl.Tenants do
   """
   @spec update_tenant(Tenant.t(), map()) :: {:ok, Tenant.t()} | {:error, Ecto.Changeset.t()}
   def update_tenant(%Tenant{} = tenant, attrs) do
+    warn_on_slug_mutation_attempt(tenant, attrs)
     attrs = merge_settings(tenant, attrs)
 
     tenant
@@ -595,6 +598,7 @@ defmodule Loopctl.Tenants do
   @spec update_tenant_admin(Tenant.t(), map()) ::
           {:ok, Tenant.t()} | {:error, Ecto.Changeset.t()}
   def update_tenant_admin(%Tenant{} = tenant, attrs) do
+    warn_on_slug_mutation_attempt(tenant, attrs)
     attrs = merge_settings(tenant, attrs)
 
     tenant
@@ -823,6 +827,24 @@ defmodule Loopctl.Tenants do
 
       _ ->
         attrs
+    end
+  end
+
+  # rls-02: slug is immutable on update (it keys the audit-key secret name),
+  # and `update_changeset/2` silently drops any uncast `:slug`. A request that
+  # nonetheless tries to rename the slug is exactly the operation that would
+  # strand the audit-signing secret, so leave a forensic trail without changing
+  # the ignored-and-succeeds behavior. Advisory GHSA-v62j-7vgr-rfqp.
+  defp warn_on_slug_mutation_attempt(%Tenant{id: id, slug: current}, attrs) do
+    case Map.get(attrs, "slug") || Map.get(attrs, :slug) do
+      new_slug when is_binary(new_slug) and new_slug != current ->
+        Logger.warning(
+          "attempted slug mutation ignored for tenant #{id} " <>
+            "(#{inspect(current)} -> #{inspect(new_slug)}); slug is immutable (rls-02)"
+        )
+
+      _ ->
+        :ok
     end
   end
 

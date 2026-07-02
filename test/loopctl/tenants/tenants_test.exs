@@ -1,8 +1,11 @@
 defmodule Loopctl.TenantsTest do
   use Loopctl.DataCase, async: true
 
+  import ExUnit.CaptureLog
+
   setup :verify_on_exit!
 
+  alias Loopctl.Secrets
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Tenant
 
@@ -37,6 +40,16 @@ defmodule Loopctl.TenantsTest do
       attrs = %{name: "Other Corp", slug: "acme-corp", email: "other@example.com"}
       assert {:error, changeset} = Tenants.create_tenant(attrs)
       assert "has already been taken" in errors_on(changeset).slug
+    end
+
+    # rls-03: duplicate email on create must also yield a changeset error
+    # (422), never a raised Ecto.ConstraintError (500).
+    test "rejects duplicate email" do
+      fixture(:tenant, %{email: "dupe@example.com"})
+
+      attrs = %{name: "Other Corp", slug: "other-corp", email: "dupe@example.com"}
+      assert {:error, changeset} = Tenants.create_tenant(attrs)
+      assert "has already been taken" in errors_on(changeset).email
     end
 
     test "rejects invalid slug format - uppercase" do
@@ -112,6 +125,104 @@ defmodule Loopctl.TenantsTest do
       tenant = fixture(:tenant)
       assert {:ok, updated} = Tenants.update_tenant(tenant, %{name: "New Name"})
       assert updated.name == "New Name"
+    end
+
+    # rls-02: the slug keys the audit-key Fly secret name. Renaming it would
+    # strand the secret (signing hard-fails after the cache TTL), so slug must
+    # be immutable on the update path.
+    test "ignores attempts to change slug (immutable — rls-02)" do
+      tenant = fixture(:tenant, %{slug: "original-slug"})
+
+      assert {:ok, updated} =
+               Tenants.update_tenant(tenant, %{slug: "renamed-slug", name: "New Name"})
+
+      # The unrelated field change lands; the slug does not.
+      assert updated.name == "New Name"
+      assert updated.slug == "original-slug"
+
+      # Custody link: the derived audit-key secret name is unchanged, so the
+      # tenant's audit key remains resolvable after an unrelated update.
+      assert Secrets.audit_key_secret_name(updated.slug) ==
+               Secrets.audit_key_secret_name(tenant.slug)
+    end
+
+    test "update_changeset does not cast :slug (immutable — rls-02)" do
+      tenant = fixture(:tenant, %{slug: "keep-me"})
+      changeset = Tenant.update_changeset(tenant, %{slug: "changed", name: "New"})
+
+      refute Map.has_key?(changeset.changes, :slug)
+      assert changeset.changes[:name] == "New"
+    end
+
+    # rls-02: an attempted (and ignored) slug rename must leave a forensic
+    # trail — it's the exact probe that would strand the audit-signing secret.
+    test "logs a warning on an attempted slug mutation (rls-02 observability)" do
+      tenant = fixture(:tenant, %{slug: "original-slug"})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, updated} =
+                   Tenants.update_tenant(tenant, %{slug: "renamed-slug", name: "New Name"})
+
+          assert updated.slug == "original-slug"
+        end)
+
+      assert log =~ "attempted slug mutation ignored for tenant #{tenant.id}"
+    end
+
+    test "does not log when slug is unchanged or absent (rls-02 observability)" do
+      tenant = fixture(:tenant, %{slug: "steady-slug"})
+
+      # slug absent
+      log_absent = capture_log(fn -> Tenants.update_tenant(tenant, %{name: "Renamed"}) end)
+      refute log_absent =~ "attempted slug mutation"
+
+      # slug present but identical
+      log_same =
+        capture_log(fn ->
+          Tenants.update_tenant(tenant, %{slug: "steady-slug", name: "Renamed Again"})
+        end)
+
+      refute log_same =~ "attempted slug mutation"
+    end
+
+    # rls-03: a colliding email must produce a clean changeset error, not a
+    # raised Ecto.ConstraintError (which would surface as a 500 and act as a
+    # cross-tenant email-enumeration oracle).
+    test "returns changeset error on duplicate email instead of raising (rls-03)" do
+      _other = fixture(:tenant, %{email: "taken@example.com"})
+      tenant = fixture(:tenant, %{email: "mine@example.com"})
+
+      assert {:error, changeset} =
+               Tenants.update_tenant(tenant, %{email: "taken@example.com"})
+
+      assert "has already been taken" in errors_on(changeset).email
+    end
+
+    test "allows updating to a unique email (rls-03)" do
+      tenant = fixture(:tenant, %{email: "mine@example.com"})
+
+      assert {:ok, updated} =
+               Tenants.update_tenant(tenant, %{email: "fresh@example.com"})
+
+      assert updated.email == "fresh@example.com"
+    end
+
+    # Tenant isolation: tenant B cannot claim tenant A's email, and the
+    # rejection leaks nothing about A beyond the standard uniqueness message.
+    test "tenant cannot take another tenant's email (isolation — rls-03)" do
+      tenant_a = fixture(:tenant, %{email: "a@example.com", name: "Tenant A"})
+      tenant_b = fixture(:tenant, %{email: "b@example.com"})
+
+      assert {:error, changeset} =
+               Tenants.update_tenant(tenant_b, %{email: "a@example.com"})
+
+      assert errors_on(changeset) == %{email: ["has already been taken"]}
+
+      # Tenant A is untouched.
+      assert {:ok, reloaded_a} = Tenants.get_tenant(tenant_a.id)
+      assert reloaded_a.email == "a@example.com"
+      assert reloaded_a.name == "Tenant A"
     end
   end
 

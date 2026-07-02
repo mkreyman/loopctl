@@ -141,6 +141,43 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule TenantUpdateRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "TenantUpdateRequest",
+      description:
+        "Request body for `PATCH /api/v1/tenants/me` (and the superadmin " <>
+          "`PATCH /api/v1/admin/tenants/:id`). NOTE: `slug` is intentionally " <>
+          "absent — it is immutable after creation because it keys the tenant's " <>
+          "audit-key secret name (security: rls-02, advisory GHSA-v62j-7vgr-rfqp). " <>
+          "Sending `slug` has no effect.",
+      type: :object,
+      properties: %{
+        name: %Schema{type: :string, description: "Tenant display name"},
+        email: %Schema{type: :string, format: :email, description: "Contact email"},
+        settings: %Schema{type: :object, additionalProperties: true},
+        default_story_budget_millicents: %Schema{
+          type: :integer,
+          nullable: true,
+          description: "Tenant-wide default story budget (millicents); null to unset"
+        },
+        token_data_retention_days: %Schema{
+          type: :integer,
+          nullable: true,
+          description: "Token-usage retention in days (>= 30); null disables archival"
+        }
+      },
+      example: %{
+        name: "My Org",
+        email: "admin@example.com",
+        settings: %{},
+        token_data_retention_days: 90
+      }
+    })
+  end
+
   # ---------- WebAuthn signup (US-26.0.1) ----------
 
   defmodule WebAuthnChallenge do
