@@ -16,11 +16,6 @@ defmodule LoopctlWeb.SignupLiveTest do
 
   setup :verify_on_exit!
 
-  # A TCP peer inside the test proxy allow-list (config/test.exs :remote_ip_opts,
-  # 198.51.100.0/24). Trust is PEER-ANCHORED: the forwarded header is trusted
-  # only when the unspoofable peer is one of these proxies.
-  @trusted_proxy_peer {198, 51, 100, 50}
-
   describe "GET /signup (TC-26.0.1.7)" do
     test "renders with design-system classes and no daisyUI", %{conn: conn} do
       {:ok, _view, html} = live(conn, ~p"/signup")
@@ -212,94 +207,71 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
-  describe "signup rate limiting (web-01, peer-anchored, spoof-resistant)" do
-    test "loading /signup never consumes the rate-limit bucket; only the submission does",
+  describe "signup rate limiting (web-01, session Fly-Client-IP, spoof-resistant)" do
+    test "REAL Fly shape: fly-client-ip resolves to the client, NOT the app IP Fly appends to XFF",
          %{conn: conn} do
       test_pid = self()
       stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      conn = proxied_conn(conn, "203.0.113.7")
+      # Exactly the shape the gate said the old code collapsed on: Fly appends
+      # the app-assigned IP as the rightmost X-Forwarded-For entry. Resolving via
+      # fly-client-ip (unspoofable) keys on the real client, never the app IP.
+      conn = fly_conn(conn, "203.0.113.7", xff: "203.0.113.7, 66.241.125.10")
 
-      # Many page views (the abuse the old code punished everyone for) must
-      # NOT touch the rate limiter at all.
-      for _ <- 1..10 do
+      # Page loads must NOT consume the bucket.
+      for _ <- 1..5 do
         {:ok, _view, _html} = live(conn, ~p"/signup")
       end
 
       refute_received {:bucket, _}
 
-      # A real submission checks the limiter, keyed by the real forwarded
-      # client IP — trusted because the PEER is a configured proxy.
       {:ok, view, _html} = live(conn, ~p"/signup")
       enroll_authenticator(view)
-      submit_tenant(view, "IP Corp", "ip-corp", "ip@corp.example")
-
-      assert_receive {:bucket, "signup:ip:203.0.113.7"}
-    end
-
-    test "genuine Fly-style: trusted proxy peer + XFF ending in the real client keys on the client",
-         %{conn: conn} do
-      test_pid = self()
-      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
-
-      {:ok, view, _html} = live(proxied_conn(conn, "203.0.113.7"), ~p"/signup")
-      enroll_authenticator(view)
-      submit_tenant(view, "Real Corp", "real-corp", "real@corp.example")
-
-      assert_receive {:bucket, "signup:ip:203.0.113.7"}
-    end
-
-    test "a client-forged X-Forwarded-For prepend cannot choose the bucket (trusted proxy peer)",
-         %{conn: conn} do
-      test_pid = self()
-      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
-
-      # Peer IS a trusted proxy; the proxy appends the real client on the right.
-      # RemoteIp scans right-to-left, so the forged prefix is ignored.
-      {:ok, view, _html} = live(proxied_conn(conn, "6.6.6.6, 203.0.113.7"), ~p"/signup")
-      enroll_authenticator(view)
-      submit_tenant(view, "Prepend Corp", "prepend-corp", "prepend@corp.example")
+      submit_tenant(view, "Fly Corp", "fly-corp", "fly@corp.example")
 
       assert_receive {:bucket, bucket}
       assert bucket == "signup:ip:203.0.113.7"
-      refute bucket == "signup:ip:6.6.6.6"
+      # The app IP Fly appends to XFF must never become the bucket key.
+      refute bucket == "signup:ip:66.241.125.10"
     end
 
-    test "REPRODUCED ATTACK: forged XFF ending in a reserved IP from a non-proxy public peer " <>
-           "keys on the peer, never the attacker's value",
+    test "two different real clients get two different buckets (no collapse to the app IP)",
          %{conn: conn} do
       test_pid = self()
       stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      # The exact bypass: XFF "9.9.9.9, 127.0.0.1" from a PUBLIC peer that is NOT
-      # a configured proxy. Peer-anchoring ignores the header entirely and keys
-      # on the unspoofable peer. Pre-fix this keyed on signup:ip:9.9.9.9.
-      {:ok, view, _html} =
-        live(direct_conn(conn, {198, 51, 99, 1}, "9.9.9.9, 127.0.0.1"), ~p"/signup")
+      {:ok, view1, _html} =
+        live(fly_conn(conn, "203.0.113.7", xff: "203.0.113.7, 66.241.125.10"), ~p"/signup")
 
-      enroll_authenticator(view)
-      submit_tenant(view, "Attacker", "attacker-corp", "attacker@corp.example")
+      enroll_authenticator(view1)
+      submit_tenant(view1, "Corp A", "corp-a", "a@corp.example")
+      assert_receive {:bucket, "signup:ip:203.0.113.7"}
 
-      assert_receive {:bucket, bucket}
-      assert bucket == "signup:ip:198.51.99.1"
-      refute bucket == "signup:ip:9.9.9.9"
+      {:ok, view2, _html} =
+        live(fly_conn(conn, "203.0.113.9", xff: "203.0.113.9, 66.241.125.10"), ~p"/signup")
+
+      enroll_authenticator(view2)
+      submit_tenant(view2, "Corp B", "corp-b", "b@corp.example")
+      assert_receive {:bucket, "signup:ip:203.0.113.9"}
     end
 
-    test "the shipped default proxies (fdaa::/16) never trust a public peer" do
-      # Proves the DEFAULT config is safe against the reproduced attack: a public
-      # peer is not contained in fdaa::/16, so its forwarded header is ignored.
-      fdaa = RemoteIp.Block.parse!("fdaa::/16")
+    test "a client-forged x-forwarded-for cannot override the fly-client-ip client",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      refute RemoteIp.Block.contains?(fdaa, RemoteIp.Block.encode({198, 51, 99, 1}))
-      refute RemoteIp.Block.contains?(fdaa, RemoteIp.Block.encode({9, 9, 9, 9}))
+      # fly-proxy overwrites fly-client-ip with the real client; the attacker's
+      # forged XFF (incl. the reserved-suffix trick that broke the old code) is
+      # never consulted for the bucket.
+      conn = fly_conn(conn, "203.0.113.7", xff: "9.9.9.9, 127.0.0.1")
 
-      refute RemoteIp.Block.contains?(
-               fdaa,
-               RemoteIp.Block.encode({0x2606, 0x4700, 0, 0, 0, 0, 0, 1})
-             )
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Forged Corp", "forged-corp", "forged@corp.example")
 
-      # But the Fly 6PN peer the app actually receives from IS trusted.
-      assert RemoteIp.Block.contains?(fdaa, RemoteIp.Block.encode({0xFDAA, 0, 1, 0, 0, 0, 0, 5}))
+      assert_receive {:bucket, bucket}
+      assert bucket == "signup:ip:203.0.113.7"
+      refute bucket == "signup:ip:9.9.9.9"
     end
 
     test "one IP hitting the limit does not lock out a different IP", %{conn: conn} do
@@ -308,7 +280,7 @@ defmodule LoopctlWeb.SignupLiveTest do
         _bucket, _window, _limit -> {:allow, 1}
       end)
 
-      {:ok, abuser_view, _html} = live(proxied_conn(conn, "203.0.113.1"), ~p"/signup")
+      {:ok, abuser_view, _html} = live(fly_conn(conn, "203.0.113.1"), ~p"/signup")
       enroll_authenticator(abuser_view)
       abuser_html = submit_tenant(abuser_view, "Abuser", "abuser-corp", "abuser@corp.example")
 
@@ -316,7 +288,7 @@ defmodule LoopctlWeb.SignupLiveTest do
       refute AdminRepo.get_by(Tenant, slug: "abuser-corp")
 
       # A different IP is unaffected — signup still completes.
-      {:ok, victim_view, _html} = live(proxied_conn(conn, "203.0.113.9"), ~p"/signup")
+      {:ok, victim_view, _html} = live(fly_conn(conn, "203.0.113.9"), ~p"/signup")
       enroll_authenticator(victim_view)
 
       assert {:error, {:live_redirect, %{to: redirect_to}}} =
@@ -334,49 +306,43 @@ defmodule LoopctlWeb.SignupLiveTest do
       assert AdminRepo.get_by(Tenant, slug: "victim-corp")
     end
 
-    test "a direct public peer with no forwarded header keys on the peer", %{conn: conn} do
-      test_pid = self()
-      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
-
-      {:ok, view, _html} = live(direct_conn(conn, {203, 0, 113, 50}, nil), ~p"/signup")
-      enroll_authenticator(view)
-      submit_tenant(view, "Direct Corp", "direct-corp", "direct@corp.example")
-
-      assert_receive {:bucket, bucket}
-      assert bucket == "signup:ip:203.0.113.50"
-    end
-
-    test "a trusted proxy peer with no usable forwarded client falls to a per-connection bucket",
+    test "off Fly (no fly-client-ip): falls back to conn.remote_ip from x-forwarded-for",
          %{conn: conn} do
       test_pid = self()
       stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
 
-      # Behind the proxy but no X-Forwarded-For captured (e.g. RFC 7239
-      # `Forwarded:` only, which connect_info :x_headers does not collect).
-      # Must NOT collapse onto the shared proxy peer.
-      {:ok, view, _html} = live(proxied_conn(conn, nil), ~p"/signup")
+      # No fly-client-ip header; the HTTP-pipeline RemoteIp plug resolves
+      # conn.remote_ip from X-Forwarded-For (e.g. an nginx front end).
+      {:ok, view, _html} = live(xff_conn(conn, "203.0.113.20"), ~p"/signup")
       enroll_authenticator(view)
-      submit_tenant(view, "Fwd Corp", "fwd-corp", "fwd@corp.example")
+      submit_tenant(view, "Nginx Corp", "nginx-corp", "nginx@corp.example")
 
-      assert_receive {:bucket, bucket}
-      assert bucket =~ ~r/\Asignup:session:/
-      refute bucket == "signup:ip:198.51.100.50"
+      assert_receive {:bucket, "signup:ip:203.0.113.20"}
     end
 
-    test "no peer at all (no :peer_data) uses a per-connection bucket", %{conn: conn} do
-      test_pid = self()
-      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+    # The signed-session resolver is a plain public function; exercise its edge
+    # cases directly (the LiveViewTest adapter always injects a loopback peer, so
+    # the truly-unresolvable branch can't be reached through `live/2`).
+    test "signup_session/1 yields a nil client_ip when nothing is resolvable" do
+      # nil -> mount's signup_rate_key/2 falls back to signup:session:<id>,
+      # never a shared bucket.
+      bare = %Plug.Conn{remote_ip: nil, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(bare) == %{"client_ip" => nil}
+    end
 
-      conn = Plug.Conn.put_private(conn, :live_view_connect_info, %{})
+    test "signup_session/1 prefers fly-client-ip over a forged x-forwarded-for and the peer" do
+      conn =
+        %Plug.Conn{remote_ip: {10, 0, 0, 9}, req_headers: []}
+        |> Plug.Conn.put_req_header("fly-client-ip", "203.0.113.7")
+        |> Plug.Conn.put_req_header("x-forwarded-for", "9.9.9.9, 66.241.125.10")
 
-      {:ok, view, _html} = live(conn, ~p"/signup")
-      enroll_authenticator(view)
-      submit_tenant(view, "Unknown Corp", "unknown-corp", "unknown@corp.example")
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
+    end
 
-      assert_receive {:bucket, bucket}
-      assert bucket =~ ~r/\Asignup:session:/
-      refute bucket == "signup:unknown"
-      refute bucket == "signup:ip:unknown"
+    test "signup_session/1 normalizes an IPv4-mapped IPv6 peer to plain IPv4" do
+      # ::ffff:203.0.113.7 (how Bandit surfaces IPv4 peers on a dual-stack bind).
+      conn = %Plug.Conn{remote_ip: {0, 0, 0, 0, 0, 0xFFFF, 0xCB00, 0x7107}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
     end
   end
 
@@ -579,6 +545,76 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
+  describe "input validation for WebAuthn handlers (web-02 regression, from master)" do
+    test "remove_authenticator gracefully handles non-integer index", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => "Primary"
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+
+      render_hook(view, "attestation_captured", %{
+        "attestation_object" => "YWJjZA",
+        "client_data_json" => "eyJmb28iOiJiYXIifQ",
+        "credential_id" => "Y3JlZC1pZA"
+      })
+
+      # Try to remove with an invalid index (non-numeric string)
+      # Should not crash; authenticator list should remain unchanged
+      html = render_hook(view, "remove_authenticator", %{"index" => "not-a-number"})
+      assert html =~ "Primary"
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator gracefully handles negative index", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => "First"
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+
+      render_hook(view, "attestation_captured", %{
+        "attestation_object" => "YWJjZA",
+        "client_data_json" => "eyJmb28iOiJiYXIifQ",
+        "credential_id" => "Y3JlZC1pZA"
+      })
+
+      # Try to remove with a negative index
+      # Should not crash; authenticator list should remain unchanged
+      html = render_hook(view, "remove_authenticator", %{"index" => "-1"})
+      assert html =~ "First"
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "attestation_error gracefully handles non-string reason", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send an attestation_error with a numeric reason instead of string
+      # Should not crash; should use a safe default message
+      html = render_hook(view, "attestation_error", %{"reason" => 123})
+      assert html =~ "Authenticator ceremony failed"
+    end
+
+    test "attestation_error gracefully handles nil reason", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send an attestation_error with a nil reason
+      # Should not crash; should use a safe default message
+      html = render_hook(view, "attestation_error", %{"reason" => nil})
+      assert html =~ "Authenticator ceremony failed"
+    end
+  end
+
   describe "/tenants/:id/onboarding" do
     test "renders onboarding checklist with a valid signed token", %{conn: conn} do
       tenant = fixture(:tenant, %{name: "Onboarding Target"})
@@ -655,24 +691,21 @@ defmodule LoopctlWeb.SignupLiveTest do
     |> render_submit()
   end
 
-  # Fully controls the connected LiveView's connect_info: the TCP peer (which is
-  # what trust is anchored on) and the client-supplied X-Forwarded-For chain.
-  defp put_connect_info(conn, peer, xff_chain) do
-    headers = if xff_chain, do: [{"x-forwarded-for", xff_chain}], else: []
-
-    Plug.Conn.put_private(conn, :live_view_connect_info, %{
-      peer_data: %{address: peer},
-      x_headers: headers
-    })
+  # A request that arrived through fly-proxy: the unspoofable `fly-client-ip`
+  # header carries the real client. Optionally include an attacker/Fly-shaped
+  # `x-forwarded-for` (via `xff:`) to prove it is never consulted for the bucket.
+  defp fly_conn(conn, client_ip, opts \\ []) do
+    conn
+    |> Plug.Conn.put_req_header("fly-client-ip", client_ip)
+    |> maybe_put_xff(Keyword.get(opts, :xff))
   end
 
-  # A request that genuinely arrived via our trusted proxy: peer ∈ the configured
-  # :proxies range, carrying the forwarded chain the proxy appended.
-  defp proxied_conn(conn, xff_chain), do: put_connect_info(conn, @trusted_proxy_peer, xff_chain)
+  # An off-Fly request with only `x-forwarded-for` (e.g. an nginx front end); the
+  # HTTP-pipeline RemoteIp plug resolves conn.remote_ip from it.
+  defp xff_conn(conn, xff), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", xff)
 
-  # A direct / non-proxied connection from `peer` carrying a client-controlled
-  # forwarding header (untrusted because the peer is not a configured proxy).
-  defp direct_conn(conn, peer, xff_chain), do: put_connect_info(conn, peer, xff_chain)
+  defp maybe_put_xff(conn, nil), do: conn
+  defp maybe_put_xff(conn, xff), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", xff)
 
   # Rate-limiter stub that reports only the signup bucket (ignores the separate
   # per-verification webauthn bucket) so bucket assertions are unambiguous.

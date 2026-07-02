@@ -46,13 +46,58 @@ defmodule LoopctlWeb.SignupLive do
   # under 8 KB.
   @max_attestation_field_bytes 8 * 1024
 
+  @doc """
+  Builds the LiveView session for the `:public_signup` live_session (wired via
+  the router's `session: {__MODULE__, :signup_session, []}` MFA).
+
+  This runs in the HTTP pipeline — where `conn.remote_ip` is already resolved by
+  `plug RemoteIp` and the request headers are present — and stashes the resolved
+  client IP into the SIGNED session. The client cannot forge a signed session,
+  so this is the trustworthy channel for the rate-limit key. The value is read
+  back (identically) on BOTH the disconnected and connected `mount/3`.
+  """
+  def signup_session(conn) do
+    %{"client_ip" => resolve_client_ip(conn)}
+  end
+
+  # Prefer `fly-client-ip` — fly-proxy sets it to the real connecting client and
+  # OVERWRITES any client-supplied value, so it is unspoofable AND immune to the
+  # app-assigned IP that Fly appends as the rightmost `x-forwarded-for` entry
+  # (RemoteIp scans right-to-left, so a combined XFF would otherwise resolve to
+  # that app IP and collapse every visitor onto one bucket). Off Fly there is no
+  # such header, so fall back to `conn.remote_ip` (resolved by `plug RemoteIp`
+  # from X-Forwarded-For for an nginx-style proxy, or the raw peer locally).
+  defp resolve_client_ip(conn) do
+    (fly_client_ip(conn) || conn.remote_ip)
+    |> normalize_ip_string()
+  end
+
+  defp fly_client_ip(conn) do
+    RemoteIp.from(conn.req_headers, Keyword.put(remote_ip_opts(), :headers, ["fly-client-ip"]))
+  end
+
+  # Render an address tuple as a stable string. IPv4-mapped IPv6
+  # (`::ffff:a.b.c.d`, i.e. `{0,0,0,0,0,0xffff,_,_}`) — how Bandit surfaces IPv4
+  # peers on a dual-stack `::` bind — is normalized to the plain IPv4 form so
+  # buckets are stable regardless of the socket family.
+  defp normalize_ip_string({0, 0, 0, 0, 0, 0xFFFF, ab, cd}) do
+    <<a, b, c, d>> = <<ab::16, cd::16>>
+    normalize_ip_string({a, b, c, d})
+  end
+
+  defp normalize_ip_string(addr) when tuple_size(addr) in [4, 8] do
+    addr |> :inet.ntoa() |> to_string()
+  end
+
+  defp normalize_ip_string(_), do: nil
+
   @impl true
-  def mount(_params, _session, socket) do
+  def mount(_params, session, socket) do
     # NB: we do NOT rate-limit page views here. Merely loading /signup must
     # never consume the bucket — the limit lives on the abusable `signup`
-    # submission (tenant creation). We only resolve + stash the per-IP rate
-    # key at mount, when the connect_info (peer + forwarded headers) is
-    # available on the connected socket.
+    # submission and the WebAuthn verification. The signed session carries the
+    # HTTP-pipeline-resolved client IP (see signup_session/1); we only stash the
+    # derived bucket key. Available on both the disconnected and connected mount.
     challenge = new_challenge()
 
     {:ok,
@@ -65,94 +110,20 @@ defmodule LoopctlWeb.SignupLive do
      |> assign(:challenge_payload, encode_challenge(challenge))
      |> assign(:learn_more_url, @learn_more_url)
      |> assign(:friendly_name_draft, "")
-     |> assign(:rate_key, signup_rate_key(socket))
+     |> assign(:rate_key, signup_rate_key(session, socket))
      |> assign(:error, nil)}
   end
 
-  # Builds the rate-limit bucket key for the abusable signup actions. Keyed on
-  # the true client IP so one abuser can only exhaust their own bucket. When the
-  # client cannot be trusted (behind a proxy but no genuine trusted-proxy hop,
-  # RFC 7239 `Forwarded` not captured by `:x_headers`, or an empty chain), we
-  # fall back to a PER-CONNECTION key — never the shared proxy peer, which would
-  # collapse every visitor into one bucket and re-create the platform-wide DoS.
-  defp signup_rate_key(socket) do
-    case client_ip(socket) do
-      {:ok, ip} -> "signup:ip:#{ip}"
-      :unknown -> "signup:session:#{socket.id}"
+  # Per-IP bucket keyed on the signed-session client IP. If the session carries
+  # no resolvable IP (should not happen behind Fly, but for safety / local /
+  # direct connections) fall back to a PER-CONNECTION key — never a shared
+  # bucket, which would re-create the platform-wide DoS.
+  defp signup_rate_key(session, socket) do
+    case session do
+      %{"client_ip" => ip} when is_binary(ip) and ip != "" -> "signup:ip:#{ip}"
+      _ -> "signup:session:#{socket.id}"
     end
   end
-
-  # PEER-ANCHORED trust boundary. The only unspoofable signal is the TCP peer
-  # (connect_info :peer_data); the X-Forwarded-For chain is 100% client-supplied
-  # and must NEVER be trusted on its own. We therefore anchor on the peer:
-  #
-  #   1. No peer (no :peer_data) → per-connection bucket.
-  #   2. Peer IS a configured trusted proxy (`:remote_ip_opts[:proxies]` — on Fly
-  #      the app receives from fly-proxy over the `fdaa::/16` 6PN, which the
-  #      default config lists) → the request genuinely arrived via our proxy, so
-  #      resolve the originating client from the forwarded chain with plain
-  #      `RemoteIp.from/2`. The proxy appends the real client, and RemoteIp scans
-  #      right-to-left, so a client-forged prefix on the left is never returned.
-  #      If the chain yields nothing usable, fail safe to per-connection.
-  #   3. Peer is NOT a trusted proxy (direct / public / non-proxied connection) →
-  #      IGNORE the forwarded header entirely and key on the unspoofable peer IP.
-  #      This is what defeats the `"9.9.9.9, 127.0.0.1"` spoof: a forged header
-  #      from a non-proxy peer can never choose the bucket.
-  defp client_ip(socket) do
-    case peer_address(socket) do
-      nil -> :unknown
-      peer -> client_ip_for_peer(peer, socket)
-    end
-  end
-
-  defp client_ip_for_peer(peer, socket) do
-    if trusted_proxy_peer?(peer) do
-      forwarded_client_ip(socket)
-    else
-      {:ok, ntoa(peer)}
-    end
-  end
-
-  defp forwarded_client_ip(socket) do
-    case RemoteIp.from(forwarded_headers(socket), remote_ip_opts()) do
-      nil -> :unknown
-      addr -> {:ok, ntoa(addr)}
-    end
-  end
-
-  # Is the raw TCP peer one of our configured trusted proxies? Checked with a
-  # CIDR-contains against `:remote_ip_opts[:proxies]` (parsed via RemoteIp.Block),
-  # the SAME list `plug RemoteIp` uses. Anything not explicitly listed — every
-  # public client, and any un-pinned intermediary — is untrusted, so the default
-  # is safe: a non-proxy peer never trusts the header.
-  defp trusted_proxy_peer?(peer) when tuple_size(peer) in [4, 8] do
-    encoded = RemoteIp.Block.encode(peer)
-    Enum.any?(proxy_blocks(), &RemoteIp.Block.contains?(&1, encoded))
-  end
-
-  defp trusted_proxy_peer?(_), do: false
-
-  defp proxy_blocks do
-    remote_ip_opts()
-    |> Keyword.get(:proxies, [])
-    |> Enum.map(&RemoteIp.Block.parse!/1)
-  end
-
-  defp forwarded_headers(socket) do
-    case Phoenix.LiveView.get_connect_info(socket, :x_headers) do
-      headers when is_list(headers) -> headers
-      _ -> []
-    end
-  end
-
-  defp peer_address(socket) do
-    case Phoenix.LiveView.get_connect_info(socket, :peer_data) do
-      %{address: addr} -> addr
-      _ -> nil
-    end
-  end
-
-  defp ntoa(addr), do: addr |> :inet.ntoa() |> to_string()
 
   defp remote_ip_opts, do: Application.get_env(:loopctl, :remote_ip_opts, [])
 
@@ -226,7 +197,10 @@ defmodule LoopctlWeb.SignupLive do
   def handle_event("attestation_captured", _params, socket), do: {:noreply, socket}
 
   @impl true
-  def handle_event("attestation_error", %{"reason" => reason}, socket) when is_binary(reason) do
+  def handle_event("attestation_error", %{"reason" => reason}, socket) do
+    # A "reason" key is present (the browser hook reported a failure), so surface
+    # a message. A non-binary reason (crafted frame) is not trusted for display —
+    # it falls through to the safe generic message rather than crashing.
     message =
       case reason do
         "webauthn_unsupported" ->
@@ -235,8 +209,8 @@ defmodule LoopctlWeb.SignupLive do
         "no_credential" ->
           "The browser returned no credential — please try again"
 
-        _ ->
-          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason)}")
+        other ->
+          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(other)}")
           "Authenticator ceremony failed. Please retry."
       end
 

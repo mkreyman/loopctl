@@ -151,24 +151,29 @@ config :loopctl, LoopctlWeb.Endpoint,
   pubsub_server: Loopctl.PubSub,
   live_view: [signing_salt: "xpgWTdmT"]
 
-# RemoteIp trusted-proxy configuration — SHARED by the `plug RemoteIp` in
-# endpoint.ex AND by `LoopctlWeb.SignupLive`, so the HTTP pipeline and the
-# LiveView resolve the client IP against the same trusted-proxy allow-list.
+# RemoteIp configuration — SHARED by the `plug RemoteIp` in endpoint.ex AND by
+# `LoopctlWeb.SignupLive`, so the HTTP pipeline and the signup rate limiter
+# resolve the client IP against the same header + trusted-proxy list.
 #
-# SignupLive is PEER-ANCHORED: it trusts the client-supplied `x-forwarded-for`
-# chain ONLY when the unspoofable TCP peer (connect_info :peer_data) is one of
-# these `:proxies` CIDRs. On Fly the app receives connections from fly-proxy over
-# the `fdaa::/16` 6PN, so that is the safe default. A peer NOT in this list (any
-# public/direct client) is never trusted — its forwarded header is ignored and
-# the bucket is keyed on the peer itself. This is what prevents an attacker from
-# minting attacker-chosen rate-limit buckets by forging `x-forwarded-for`.
+# `fly-client-ip` is listed FIRST and is authoritative: fly-proxy sets it to the
+# real connecting client and OVERWRITES any client-supplied value, so it is not
+# forgeable. SignupLive reads it directly (single-header) so the app-assigned IP
+# that Fly appends as the RIGHTMOST `x-forwarded-for` entry can never win the
+# right-to-left RemoteIp scan and collapse every visitor onto one bucket.
+# `x-forwarded-for` remains as the OFF-Fly fallback (e.g. an nginx front-end).
 #
-# Operators MUST pin their real proxy CIDRs here for the header to be trusted:
-#   * Fly: `fdaa::/16` (the 6PN the app receives from) — already the default.
-#   * nginx / other reverse proxy in front: add its peer CIDR (e.g. loopback or
-#     the LAN range the proxy connects from). Without it, requests fall back to
-#     per-peer keying (safe, but coarser) instead of the real client IP.
-config :loopctl, :remote_ip_opts, proxies: ~w[fdaa::/16]
+# `:proxies` (Fly's `fdaa::/16` 6PN by default) marks trusted intermediaries so
+# reserved/proxy hops are peeled. Operators behind a different reverse proxy
+# should add its egress CIDR.
+#
+# RESIDUAL (documented, accepted infra boundary): a malicious SAME-Fly-org
+# sibling app with direct 6PN access to this app's port could set `fly-client-ip`
+# itself. Same-org is a trusted boundary — a hostile sibling app is a far larger
+# compromise than signup rate limits — so this is NOT a reachable vuln for the
+# normal public-internet threat model.
+config :loopctl, :remote_ip_opts,
+  headers: ["fly-client-ip", "x-forwarded-for"],
+  proxies: ~w[fdaa::/16]
 
 # Configure Elixir's Logger — structured JSON logging with tenant context.
 # Production uses JSON via LoggerJSON; dev/test override with human-readable format.

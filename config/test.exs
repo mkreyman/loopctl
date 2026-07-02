@@ -166,11 +166,12 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 # DI: Use mock rate limiter in tests
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 
-# Trusted-proxy range used to simulate a real reverse-proxy hop in tests.
-# The signup LiveView tests append an IP from this block as the rightmost
-# x-forwarded-for entry to prove RemoteIp peels the proxy hop and returns the
-# real originating client (and that a chain with NO such hop is not trusted).
-config :loopctl, :remote_ip_opts, proxies: ~w[198.51.100.0/24]
+# Mirrors the prod shape: `fly-client-ip` is authoritative (the signup tests set
+# it to assert the real client is used, not Fly's appended app IP), with
+# `x-forwarded-for` as the off-Fly fallback via `conn.remote_ip`.
+config :loopctl, :remote_ip_opts,
+  headers: ["fly-client-ip", "x-forwarded-for"],
+  proxies: ~w[198.51.100.0/24]
 
 # DI: Use mock clock in tests
 config :loopctl, :clock, Loopctl.MockClock

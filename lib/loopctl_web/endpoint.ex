@@ -12,14 +12,15 @@ defmodule LoopctlWeb.Endpoint do
     same_site: "Lax"
   ]
 
-  # `:peer_data` + `:x_headers` are required so LiveViews can resolve the
-  # real client IP behind Fly's proxy (via RemoteIp on the forwarded
-  # `x-forwarded-for` header) rather than trusting the raw websocket peer,
-  # which is always Fly's edge proxy. See `LoopctlWeb.SignupLive` for the
-  # per-IP rate limiting that relies on this.
+  # The signup rate limiter no longer resolves the client IP from the fragile
+  # LiveView connect_info. Instead the HTTP pipeline resolves it (via the
+  # `plug RemoteIp` below, preferring the unspoofable `fly-client-ip` header)
+  # and hands it to `LoopctlWeb.SignupLive` through the SIGNED session (see the
+  # `:public_signup` live_session in the router). So the socket only needs the
+  # session.
   socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [:peer_data, :x_headers, session: @session_options]],
-    longpoll: [connect_info: [:peer_data, :x_headers, session: @session_options]]
+    websocket: [connect_info: [session: @session_options]],
+    longpoll: [connect_info: [session: @session_options]]
 
   # Serve at "/" the static files from "priv/static" directory.
   #
@@ -40,10 +41,12 @@ defmodule LoopctlWeb.Endpoint do
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :loopctl
   end
 
-  # Resolve client IP behind reverse proxy (nginx / Fly) for rate limiting.
-  # Opts are shared with LoopctlWeb.SignupLive via the :remote_ip_opts config
-  # key so the HTTP pipeline and the LiveView resolve the client IP identically
-  # (same trusted-proxy allow-list).
+  # Resolve the client IP behind Fly's proxy for rate limiting. Opts (headers +
+  # trusted proxies) are shared with LoopctlWeb.SignupLive via the
+  # :remote_ip_opts config key. `fly-client-ip` (set by fly-proxy to the real
+  # connecting client, and NOT client-forgeable) is listed first; SignupLive
+  # additionally reads it directly so it is never contaminated by the app IP
+  # that Fly appends to X-Forwarded-For.
   plug RemoteIp, Application.compile_env(:loopctl, :remote_ip_opts, [])
 
   plug Plug.RequestId
