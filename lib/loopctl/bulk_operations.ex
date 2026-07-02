@@ -811,6 +811,11 @@ defmodule Loopctl.BulkOperations do
   defp format_reason(:self_verify_blocked),
     do: "cannot verify your own implemented work (chain-of-custody)"
 
+  defp format_reason(:missing_assigned_agent),
+    do:
+      "story is reported_done with no assigned agent or dispatch lineage; " <>
+        "its custody chain is broken and it cannot be verified"
+
   defp format_reason(:review_not_conducted),
     do: "no independent review record exists for this story since it was reported done"
 

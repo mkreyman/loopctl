@@ -148,13 +148,18 @@ defmodule Loopctl.Progress.EpicCompletionTest do
                  orchestrator_agent_id: orch_agent.id
                )
 
-      # Re-set to reported_done for re-verification
+      # Re-set to reported_done for re-verification. Rejection auto-resets the
+      # story (clears assigned_agent_id), so re-establish an implementing agent
+      # distinct from the orchestrator to satisfy the reported_done⇒assigned-agent
+      # invariant (DB CHECK) without becoming a self-verify.
       story = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      impl_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
       story
       |> Ecto.Changeset.change(%{
         agent_status: :reported_done,
         verified_status: :unverified,
+        assigned_agent_id: impl_agent.id,
         reported_done_at: DateTime.utc_now()
       })
       |> Loopctl.AdminRepo.update!()

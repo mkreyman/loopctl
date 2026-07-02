@@ -305,6 +305,9 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
 
+        {:error, :missing_assigned_agent} ->
+          {:error, :missing_assigned_agent}
+
         {:error, :reason_required} ->
           {:error, :unprocessable_entity, "reason is required and cannot be blank"}
 

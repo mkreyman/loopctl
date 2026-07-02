@@ -16,6 +16,13 @@ defmodule Loopctl.Artifacts.ReviewRecord do
   - `fixes_count` -- number of issues that were fixed
   - `summary` -- human-readable summary of review findings
   - `completed_at` -- when the review pipeline completed (must be AFTER reported_done_at)
+  - `reviewed_report_at` -- snapshot of the story's `reported_done_at` at the time
+    this review was created. Binds the review to the specific report generation it
+    reviewed (chain-of-custody INVARIANT 2). `verify_story/4` / `bulk_verify`
+    require this to equal the story's CURRENT `reported_done_at`, so a review of a
+    superseded report no longer qualifies. Set programmatically, never cast.
+    Nullable: legacy pre-migration records are `NULL` and grandfathered as
+    "matches".
   """
 
   use Loopctl.Schema
@@ -34,6 +41,7 @@ defmodule Loopctl.Artifacts.ReviewRecord do
              :disproved_count,
              :summary,
              :completed_at,
+             :reviewed_report_at,
              :inserted_at,
              :updated_at
            ]}
@@ -50,6 +58,10 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     field :summary, :string
     field :completed_at, :utc_datetime_usec
 
+    # Snapshot of story.reported_done_at at review creation (INVARIANT 2).
+    # Set programmatically in Loopctl.Progress.record_review/4 — NOT in cast.
+    field :reviewed_report_at, :utc_datetime_usec
+
     timestamps()
   end
 
@@ -62,10 +74,10 @@ defmodule Loopctl.Artifacts.ReviewRecord do
   Validates that `completed_at` is not more than 60 seconds in the future (a
   clock-skew allowance), so a client cannot forward-date a review to satisfy the
   verify-time review-record check (`Loopctl.Progress.ensure_review_conducted/3`)
-  for a report that had not yet happened. NOTE: this bounds, but does not fully
-  eliminate, the stale-review-vs-re-report window — the structural closure
-  (binding a review record to the specific report generation it covers) is
-  tracked with the chain-of-custody invariant work.
+  for a report that had not yet happened. This `completed_at` skew check remains
+  as a SECONDARY guard; the primary structural closure of the
+  stale-review-vs-re-report window is `reviewed_report_at` (INVARIANT 2), which
+  binds each review to the exact report generation it covers.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(record \\ %__MODULE__{}, attrs) do

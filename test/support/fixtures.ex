@@ -1332,6 +1332,20 @@ defmodule Loopctl.Fixtures do
   defp apply_story_overrides(story, :pending, :unverified, nil), do: story
 
   defp apply_story_overrides(story, agent_status, verified_status, assigned_agent_id) do
+    # DB CHECK stories_reported_done_requires_agent (chain-of-custody INVARIANT 1):
+    # a reported_done story must carry provenance for who did the work — an
+    # assigned agent (unless backfilled). Keep fixtures realistic AND valid by
+    # auto-assigning a fresh agent when a test asks for reported_done without
+    # specifying one. Tests that need the illegitimate reported_done + NULL-agent
+    # state (e.g. asserting the CHECK/guard rejects it) build it directly, not via
+    # this fixture.
+    assigned_agent_id =
+      if agent_status == :reported_done and is_nil(assigned_agent_id) do
+        fixture(:agent, %{tenant_id: story.tenant_id}).id
+      else
+        assigned_agent_id
+      end
+
     overrides =
       %{agent_status: agent_status, verified_status: verified_status}
       |> maybe_put(:assigned_agent_id, assigned_agent_id)

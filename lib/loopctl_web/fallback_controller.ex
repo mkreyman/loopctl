@@ -144,6 +144,28 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  def call(conn, {:error, :missing_assigned_agent}) do
+    # INVARIANT 1: verify/review attempted on a custody-orphaned reported_done
+    # story (no assigned agent, no dispatch lineage). This is a data-integrity /
+    # custody-chain violation, NOT a byzantine self-verify attempt, so we do NOT
+    # halt the tenant — we return a clear 409 so the caller re-establishes
+    # provenance (the DB CHECK stories_reported_done_requires_agent makes this
+    # unreachable for well-formed data).
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "missing_assigned_agent",
+        message:
+          "Story is reported_done but has no assigned agent or dispatch lineage. " <>
+            "Its custody chain is broken, so it cannot be verified or reviewed. " <>
+            "Re-establish provenance (claim/report or backfill) before proceeding.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
   def call(conn, {:error, :self_report_blocked}) do
     halt_tenant_on_violation(conn, "self_report_blocked")
 

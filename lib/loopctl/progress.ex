@@ -833,7 +833,12 @@ defmodule Loopctl.Progress do
         %ReviewRecord{
           tenant_id: tenant_id,
           story_id: story_id,
-          reviewer_agent_id: reviewer_agent_id
+          reviewer_agent_id: reviewer_agent_id,
+          # INVARIANT 2: bind this review to the report generation it reviewed by
+          # snapshotting the story's CURRENT reported_done_at. Programmatic (never
+          # cast from client input). verify_story/4 + bulk_verify later require
+          # this to match the story's reported_done_at at verify time.
+          reviewed_report_at: story.reported_done_at
         }
         |> ReviewRecord.create_changeset(attrs)
 
@@ -1021,7 +1026,7 @@ defmodule Loopctl.Progress do
   the single-story `verify_story/4` path — otherwise bulk verify is a chain-of-custody bypass.
   """
   @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
-          :ok | {:error, :self_verify_blocked}
+          :ok | {:error, :self_verify_blocked | :missing_assigned_agent}
   def ensure_verify_allowed(story, orchestrator_agent_id) do
     case validate_not_self_verify(story, orchestrator_agent_id) do
       {:ok, _} -> :ok
@@ -1588,6 +1593,17 @@ defmodule Loopctl.Progress do
   defp validate_not_self_verify(story, orchestrator_agent_id) do
     # US-26.2.2 AC-2: use lineage comparison when dispatch IDs are available
     cond do
+      # INVARIANT 1 (fail closed / §2.2 "nil is never permissive"): a story that
+      # is reported_done but not yet verified, with NO assigned agent and NO
+      # dispatch lineage, has no implementer to compare the verifier against — the
+      # checks below would pass VACUOUSLY (a non-nil verifier is never == a nil
+      # implementer). Reject rather than allow a custody-orphaned verify. (The DB
+      # CHECK stories_reported_done_requires_agent makes this state unreachable;
+      # this is the defense-in-depth backstop. Backfilled stories are already
+      # verified and never reach here.)
+      custody_orphaned?(story) ->
+        {:error, :missing_assigned_agent}
+
       # Lineage-based check (preferred): compare dispatch lineage paths
       not is_nil(story.implementer_dispatch_id) and not is_nil(story.verifier_dispatch_id) ->
         impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
@@ -1614,6 +1630,22 @@ defmodule Loopctl.Progress do
       {:error, _} -> []
     end
   end
+
+  # INVARIANT 1: a story is "custody orphaned" when it is reported_done and still
+  # unverified but carries no provenance for who did the work — no assigned agent
+  # and no implementer dispatch lineage. Such a story cannot be legitimately
+  # verified or reviewed (there is no implementer to separate the verifier/reviewer
+  # from), so the self-* guards fail closed on it. The DB CHECK constraint makes
+  # this state unreachable in practice; this predicate is the code-level backstop.
+  defp custody_orphaned?(%Story{
+         agent_status: :reported_done,
+         verified_status: :unverified,
+         assigned_agent_id: nil,
+         implementer_dispatch_id: nil
+       }),
+       do: true
+
+  defp custody_orphaned?(_story), do: false
 
   defp validate_verifiable(story) do
     cond do
@@ -1651,7 +1683,20 @@ defmodule Loopctl.Progress do
 
     query =
       if reported_done_at do
-        where(query, [r], r.completed_at > ^reported_done_at)
+        # Primary structural guard (INVARIANT 2): the review must have reviewed
+        # THIS report generation — reviewed_report_at is snapshotted from
+        # reported_done_at at review-creation time. If the story was re-reported
+        # since, the snapshot no longer matches and the review no longer qualifies
+        # (a fresh review of the new generation is required). Legacy pre-migration
+        # reviews have reviewed_report_at IS NULL and are grandfathered as matching
+        # (see migration 20260702130200). Secondary guard (kept): the review must
+        # have completed after the report (completed_at > reported_done_at).
+        query
+        |> where(
+          [r],
+          is_nil(r.reviewed_report_at) or r.reviewed_report_at == ^reported_done_at
+        )
+        |> where([r], r.completed_at > ^reported_done_at)
       else
         query
       end
@@ -2045,15 +2090,25 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # nil reviewer_agent_id: this is a human operator (user-role key with no agent).
-  # Humans are structurally different from the assigned implementing agent, so
-  # nil cannot equal any agent_id — pass through. The controller enforces that
-  # agent/orchestrator-role keys must provide a real reviewer_agent_id.
-  defp validate_not_self_review(_story, nil), do: :ok
-
   defp validate_not_self_review(story, reviewer_agent_id) do
-    # US-26.2.2 AC-2: use lineage when available, fallback to agent_id
     cond do
+      # INVARIANT 1 (fail closed): reviewing a custody-orphaned reported_done story
+      # is illegitimate — there is no known implementer, so the reviewer cannot be
+      # proven distinct and the check below would pass vacuously. Fires regardless
+      # of reviewer identity (including nil human reviewers). Backstops the DB
+      # CHECK stories_reported_done_requires_agent.
+      custody_orphaned?(story) ->
+        {:error, :missing_assigned_agent}
+
+      # nil reviewer_agent_id: this is a human operator (user-role key with no
+      # agent). Humans are structurally different from the assigned implementing
+      # agent, so nil cannot equal any agent_id — pass through. The controller
+      # enforces that agent/orchestrator-role keys must provide a real
+      # reviewer_agent_id.
+      is_nil(reviewer_agent_id) ->
+        :ok
+
+      # US-26.2.2 AC-2: use lineage when available, fallback to agent_id
       not is_nil(story.implementer_dispatch_id) ->
         # Same fallback pattern as self_report — full lineage comparison
         # will be wired when reviewer dispatch tracking is added

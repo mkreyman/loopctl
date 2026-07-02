@@ -196,13 +196,18 @@ defmodule LoopctlWeb.VerificationListingTest do
         "reason" => "Regression found"
       })
 
-      # Advance story back to reported_done for second verify; set fresh reported_done_at
+      # Advance story back to reported_done for second verify; set fresh
+      # reported_done_at. Rejection auto-resets the story (clears assigned_agent_id),
+      # so re-establish an implementing agent (distinct from the orchestrator) to
+      # keep the story from being custody-orphaned (INVARIANT 1 fail-closed guard).
       story_now = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)
+      impl_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
       story_now
       |> Ecto.Changeset.change(%{
         agent_status: :reported_done,
         verified_status: :unverified,
+        assigned_agent_id: impl_agent.id,
         reported_done_at: DateTime.utc_now()
       })
       |> Loopctl.AdminRepo.update!()
