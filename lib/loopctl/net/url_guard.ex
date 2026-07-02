@@ -138,8 +138,11 @@ defmodule Loopctl.Net.UrlGuard do
   def pinned_request_opts(pinned, extra_headers \\ [])
 
   def pinned_request_opts(%{uri: uri, host: host, ip: ip}, extra_headers) do
+    # Map-update (not %URI{uri | ...}) — `uri` arrives via a plain map pattern
+    # so Elixir 1.19's stricter struct-update type check rejects the struct
+    # form under --warnings-as-errors; the map update preserves the URI struct.
     connect_url =
-      %URI{uri | host: ip_literal(ip), authority: nil}
+      %{uri | host: ip_literal(ip), authority: nil}
       |> URI.to_string()
 
     host_header = {"host", host_header_value(host, uri.scheme, uri.port)}
