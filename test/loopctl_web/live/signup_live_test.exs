@@ -207,6 +207,327 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
+  describe "signup rate limiting (web-01, session Fly-Client-IP, spoof-resistant)" do
+    test "REAL Fly shape: fly-client-ip resolves to the client, NOT the app IP Fly appends to XFF",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # Exactly the shape the gate said the old code collapsed on: Fly appends
+      # the app-assigned IP as the rightmost X-Forwarded-For entry. Resolving via
+      # fly-client-ip (unspoofable) keys on the real client, never the app IP.
+      conn = fly_conn(conn, "203.0.113.7", xff: "203.0.113.7, 66.241.125.10")
+
+      # Page loads must NOT consume the bucket.
+      for _ <- 1..5 do
+        {:ok, _view, _html} = live(conn, ~p"/signup")
+      end
+
+      refute_received {:bucket, _}
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Fly Corp", "fly-corp", "fly@corp.example")
+
+      assert_receive {:bucket, bucket}
+      assert bucket == "signup:ip:203.0.113.7"
+      # The app IP Fly appends to XFF must never become the bucket key.
+      refute bucket == "signup:ip:66.241.125.10"
+    end
+
+    test "two different real clients get two different buckets (no collapse to the app IP)",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      {:ok, view1, _html} =
+        live(fly_conn(conn, "203.0.113.7", xff: "203.0.113.7, 66.241.125.10"), ~p"/signup")
+
+      enroll_authenticator(view1)
+      submit_tenant(view1, "Corp A", "corp-a", "a@corp.example")
+      assert_receive {:bucket, "signup:ip:203.0.113.7"}
+
+      {:ok, view2, _html} =
+        live(fly_conn(conn, "203.0.113.9", xff: "203.0.113.9, 66.241.125.10"), ~p"/signup")
+
+      enroll_authenticator(view2)
+      submit_tenant(view2, "Corp B", "corp-b", "b@corp.example")
+      assert_receive {:bucket, "signup:ip:203.0.113.9"}
+    end
+
+    test "a client-forged x-forwarded-for cannot override the fly-client-ip client",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # fly-proxy overwrites fly-client-ip with the real client; the attacker's
+      # forged XFF (incl. the reserved-suffix trick that broke the old code) is
+      # never consulted for the bucket.
+      conn = fly_conn(conn, "203.0.113.7", xff: "9.9.9.9, 127.0.0.1")
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Forged Corp", "forged-corp", "forged@corp.example")
+
+      assert_receive {:bucket, bucket}
+      assert bucket == "signup:ip:203.0.113.7"
+      refute bucket == "signup:ip:9.9.9.9"
+    end
+
+    test "one IP hitting the limit does not lock out a different IP", %{conn: conn} do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:ip:203.0.113.1", _window, _limit -> {:deny, 5}
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+
+      {:ok, abuser_view, _html} = live(fly_conn(conn, "203.0.113.1"), ~p"/signup")
+      enroll_authenticator(abuser_view)
+      abuser_html = submit_tenant(abuser_view, "Abuser", "abuser-corp", "abuser@corp.example")
+
+      assert abuser_html =~ "Too many signup attempts"
+      refute AdminRepo.get_by(Tenant, slug: "abuser-corp")
+
+      # A different IP is unaffected — signup still completes.
+      {:ok, victim_view, _html} = live(fly_conn(conn, "203.0.113.9"), ~p"/signup")
+      enroll_authenticator(victim_view)
+
+      assert {:error, {:live_redirect, %{to: redirect_to}}} =
+               victim_view
+               |> form("#signup-form", %{
+                 "tenant" => %{
+                   "name" => "Victim Corp",
+                   "slug" => "victim-corp",
+                   "email" => "victim@corp.example"
+                 }
+               })
+               |> render_submit()
+
+      assert redirect_to =~ "/onboarding"
+      assert AdminRepo.get_by(Tenant, slug: "victim-corp")
+    end
+
+    test "off Fly (no fly-client-ip): falls back to conn.remote_ip from x-forwarded-for",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # No fly-client-ip header; the HTTP-pipeline RemoteIp plug resolves
+      # conn.remote_ip from X-Forwarded-For (e.g. an nginx front end).
+      {:ok, view, _html} = live(xff_conn(conn, "203.0.113.20"), ~p"/signup")
+      enroll_authenticator(view)
+      submit_tenant(view, "Nginx Corp", "nginx-corp", "nginx@corp.example")
+
+      assert_receive {:bucket, "signup:ip:203.0.113.20"}
+    end
+
+    # The signed-session resolver is a plain public function; exercise its edge
+    # cases directly (the LiveViewTest adapter always injects a loopback peer, so
+    # the truly-unresolvable branch can't be reached through `live/2`).
+    test "signup_session/1 yields a nil client_ip when nothing is resolvable" do
+      # nil -> mount's signup_rate_key/2 falls back to signup:session:<id>,
+      # never a shared bucket.
+      bare = %Plug.Conn{remote_ip: nil, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(bare) == %{"client_ip" => nil}
+    end
+
+    test "signup_session/1 prefers fly-client-ip over a forged x-forwarded-for and the peer" do
+      conn =
+        %Plug.Conn{remote_ip: {10, 0, 0, 9}, req_headers: []}
+        |> Plug.Conn.put_req_header("fly-client-ip", "203.0.113.7")
+        |> Plug.Conn.put_req_header("x-forwarded-for", "9.9.9.9, 66.241.125.10")
+
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
+    end
+
+    test "signup_session/1 normalizes an IPv4-mapped IPv6 peer to plain IPv4" do
+      # ::ffff:203.0.113.7 (how Bandit surfaces IPv4 peers on a dual-stack bind).
+      conn = %Plug.Conn{remote_ip: {0, 0, 0, 0, 0, 0xFFFF, 0xCB00, 0x7107}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
+    end
+
+    test "signup_session/1 returns nil for a PROXY peer with no forwarded header" do
+      # No fly-client-ip / XFF; the raw peer is a configured proxy (198.51.100.0/24
+      # in test). Keying on it would collapse every visitor onto one bucket, so it
+      # returns nil -> signup_rate_key/2 uses the per-connection bucket.
+      conn = %Plug.Conn{remote_ip: {198, 51, 100, 50}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => nil}
+    end
+
+    test "signup_session/1 uses a PUBLIC (non-proxy) peer as the visitor identity" do
+      conn = %Plug.Conn{remote_ip: {203, 0, 113, 7}, req_headers: []}
+      assert LoopctlWeb.SignupLive.signup_session(conn) == %{"client_ip" => "203.0.113.7"}
+    end
+  end
+
+  describe "attestation verification is protected server-side (web-01 expensive path)" do
+    test "attestation_captured enforces the authenticator cap even when the UI gate is skipped",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      max = Loopctl.Tenants.max_authenticators_per_signup()
+
+      # Skip request_attestation and spam attestation_captured straight over the
+      # socket, as an attacker would. The cap must hold server-side.
+      for _ <- 1..(max + 5) do
+        render_hook(view, "attestation_captured", valid_attestation())
+      end
+
+      assert has_element?(view, "#authenticator-#{max - 1}")
+      refute has_element?(view, "#authenticator-#{max}")
+    end
+
+    test "attestation_captured rejects an oversized payload before decoding", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html =
+        render_hook(view, "attestation_captured", %{
+          "attestation_object" => String.duplicate("A", 9_000),
+          "client_data_json" => "eyJmb28iOiJiYXIifQ",
+          "credential_id" => "Y3JlZC1pZA"
+        })
+
+      assert html =~ "Attestation payload too large"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "attestation_captured is rate-limited so a burst cannot pin the scheduler",
+         %{conn: conn} do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:webauthn:" <> _rest, _w, _l -> {:deny, 20}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_captured", valid_attestation())
+
+      assert html =~ "Too many verification attempts"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "a non-map attestation_captured payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_captured", ["not", "a", "map"])
+
+      refute has_element?(view, "#authenticator-0")
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a non-map request_attestation payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "request_attestation", ["not", "a", "map"])
+
+      assert has_element?(view, "#signup-form")
+    end
+  end
+
+  describe "malformed websocket events (web-02, no crash)" do
+    test "remove_authenticator with a non-parseable index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      assert has_element?(view, "#authenticator-0")
+
+      render_hook(view, "remove_authenticator", %{"index" => "x"})
+
+      # Process is still alive and the entry is untouched.
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a non-binary index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{"index" => 3})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a non-map payload is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", ["not", "a", "map"])
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with an out-of-range index is a no-op", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{"index" => "5"})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "remove_authenticator with a missing index key is a no-op", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      render_hook(view, "remove_authenticator", %{})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "a valid remove_authenticator still removes the right entry", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view, "First Key")
+      enroll_authenticator(view, "Second Key")
+
+      assert has_element?(view, "#authenticator-0")
+      assert has_element?(view, "#authenticator-1")
+
+      # Remove the first entry; the second slides into index 0.
+      render_hook(view, "remove_authenticator", %{"index" => "0"})
+
+      html = render(view)
+      refute has_element?(view, "#authenticator-1")
+      assert has_element?(view, "#authenticator-0")
+      assert html =~ "Second Key"
+      refute html =~ "First Key"
+    end
+
+    test "attestation_error without a reason key is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_error", %{})
+
+      # Alive and no error surfaced from the malformed frame.
+      refute has_element?(view, "#signup-error")
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a non-map attestation_error payload is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "attestation_error", ["boom"])
+
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "a known attestation_error reason still surfaces its message", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_error", %{"reason" => "webauthn_unsupported"})
+
+      assert html =~ "does not support WebAuthn"
+    end
+
+    test "an entirely unknown event is ignored and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "totally_bogus_event", %{"junk" => true})
+
+      assert has_element?(view, "#signup-form")
+    end
+  end
+
   describe "legacy tenant creation paths (TC-26.0.1.6)" do
     test "POST /api/v1/tenants/register returns 404", %{conn: conn} do
       conn =
@@ -237,25 +558,7 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
-  describe "rate limiting by peer IP (web-01 regression)" do
-    test "each peer IP is rate-limited separately", %{conn: conn} do
-      # Verify that peer_data is available in connect_info and properly
-      # parsed into separate rate-limit buckets. Without this fix, all
-      # unauthenticated signups collapse into a single bucket.
-
-      # First IP
-      {:ok, view1, _html} = live(conn, ~p"/signup")
-      assert has_element?(view1, "#signup-form")
-
-      # Second IP (simulated by modifying connect_info)
-      # The test framework uses the same IP for all requests, so we at least
-      # verify that the page loads (no crash from missing :peer_data)
-      {:ok, view2, _html} = live(conn, ~p"/signup")
-      assert has_element?(view2, "#signup-form")
-    end
-  end
-
-  describe "input validation for WebAuthn handlers (web-02 regression)" do
+  describe "input validation for WebAuthn handlers (web-02 regression, from master)" do
     test "remove_authenticator gracefully handles non-integer index", %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/signup")
 
@@ -325,6 +628,186 @@ defmodule LoopctlWeb.SignupLiveTest do
     end
   end
 
+  describe "DoS regression tests (final three vectors: friendly_name, reason, XFF order)" do
+    test "request_attestation rejects an oversized friendly_name (8MB attack) before use",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send 8MB friendly_name (Bandit's default max_frame_size)
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => String.duplicate("A", 8 * 1024 * 1024)
+      })
+
+      # View should still be alive and no authenticator should be created
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "request_attestation caps friendly_name to @max_friendly_name_bytes", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # Send a 1000-byte friendly_name (well above the 200-byte cap)
+      large_name = String.duplicate("X", 1000)
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => large_name
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+
+      # Capture attestation with the oversized name
+      render_hook(view, "attestation_captured", %{
+        "attestation_object" => "YWJjZA",
+        "client_data_json" => "eyJmb28iOiJiYXIifQ",
+        "credential_id" => "Y3JlZC1pZA"
+      })
+
+      # Authenticator should be enrolled, but name should be truncated
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      # The full 1000-byte name should NOT appear in the rendered output
+      refute html =~ String.duplicate("X", 200)
+    end
+
+    test "attestation_error caps an 8MB reason before logging and draws the action budget",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # An 8MB reason (Bandit's default max_frame_size). It must never be
+      # inspected/logged in full — safe_reason/1 truncates it — and the process
+      # must stay alive and surface the generic message.
+      html =
+        render_hook(view, "attestation_error", %{
+          "reason" => String.duplicate("E", 8 * 1024 * 1024)
+        })
+
+      assert html =~ "Authenticator ceremony failed"
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "attestation_error is bounded by the shared per-connection action budget",
+         %{conn: conn} do
+      # When the shared action budget is exhausted, attestation_error stops
+      # doing work (no logging) and reports the throttle message.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_error", %{"reason" => "webauthn_unsupported"})
+
+      assert html =~ "Too many attempts"
+    end
+
+    test "request_attestation draws the shared per-connection action budget", %{conn: conn} do
+      # request_attestation draws the SHARED "signup:actions:" budget (so no
+      # single handler is an unrated amplifier). Deny it and the handler reports
+      # the rate-limit message.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => "Primary"
+      })
+
+      html = view |> element("#enroll-authenticator-btn") |> render_click()
+
+      assert html =~ "Too many authenticator enrollment requests"
+    end
+
+    test "Fly XFF ordering regression: fly-client-ip wins over rightmost XFF entry",
+         %{conn: conn} do
+      test_pid = self()
+      stub(Loopctl.MockRateLimiter, :check_rate, capture_bucket(test_pid))
+
+      # Real Fly shape: fly-client-ip is the real client, XFF has app IP rightmost.
+      # The old code's RemoteIp multi-header semantics could lose to the rightmost
+      # XFF entry (66.241.125.10 = Fly app IP). Verify it doesn't.
+      conn = fly_conn(conn, "203.0.113.100", xff: "203.0.113.100, 66.241.125.10")
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view, "YubiKey")
+
+      view
+      |> form("#signup-form", %{
+        "tenant" => %{
+          "name" => "XFF Ordering Test",
+          "slug" => "xff-order-test",
+          "email" => "xff@order.test"
+        }
+      })
+      |> render_submit()
+
+      assert_receive {:bucket, bucket}
+      # MUST resolve to the real client, NOT the app IP.
+      assert bucket == "signup:ip:203.0.113.100"
+      refute bucket == "signup:ip:66.241.125.10"
+    end
+
+    test "attestation_captured is bounded by the shared action budget before any crypto",
+         %{conn: conn} do
+      stub(Loopctl.MockRateLimiter, :check_rate, fn
+        "signup:actions:" <> _rest, _w, _l -> {:deny, 60}
+        _bucket, _w, _l -> {:allow, 1}
+      end)
+
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "attestation_captured", valid_attestation())
+
+      assert html =~ "Too many attempts"
+      refute has_element?(view, "#authenticator-0")
+    end
+
+    test "signup rejects oversized tenant fields before creating a tenant", %{conn: conn} do
+      {:ok, view, _html} = live(fly_conn(conn, "203.0.113.7"), ~p"/signup")
+      enroll_authenticator(view)
+
+      html =
+        view
+        |> form("#signup-form", %{
+          "tenant" => %{
+            "name" => String.duplicate("N", 2000),
+            "slug" => "oversized",
+            "email" => "oversized@corp.example"
+          }
+        })
+        |> render_submit()
+
+      assert html =~ "Tenant details are too long"
+      refute AdminRepo.get_by(Tenant, slug: "oversized")
+    end
+
+    test "validate caps an oversized tenant field so it is never echoed back", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html =
+        view
+        |> element("#signup-form")
+        |> render_change(%{
+          "tenant" => %{"name" => String.duplicate("N", 2000), "slug" => "", "email" => ""},
+          "friendly_name" => ""
+        })
+
+      # Truncated to @max_tenant_field_bytes (512); a 600-run can never appear.
+      refute html =~ String.duplicate("N", 600)
+    end
+  end
+
   describe "/tenants/:id/onboarding" do
     test "renders onboarding checklist with a valid signed token", %{conn: conn} do
       tenant = fixture(:tenant, %{name: "Onboarding Target"})
@@ -366,6 +849,170 @@ defmodule LoopctlWeb.SignupLiveTest do
 
       assert {:error, {:live_redirect, %{to: "/"}}} =
                live(conn, ~p"/tenants/#{missing_id}/onboarding?token=#{token}")
+    end
+  end
+
+  describe "resource-exhaustion backstops (byte truncation, bignum, type guards)" do
+    test "an emoji friendly_name is BYTE-capped (not grapheme-capped) and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # 100 emoji = 400 bytes; the 120-byte cap keeps ≤ 30 emoji.
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => String.duplicate("😀", 100)
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+      render_hook(view, "attestation_captured", valid_attestation())
+
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      # A 40-emoji run (160 bytes) can never survive a 120-byte cap.
+      refute html =~ String.duplicate("😀", 40)
+    end
+
+    test "a Zalgo (combining-mark) friendly_name is byte-capped and does not burn CPU / crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # ~100 KB but ONE grapheme — the old grapheme cap returned it whole.
+      zalgo = "e" <> String.duplicate("̃", 50_000)
+
+      view
+      |> element("#signup-form")
+      |> render_change(%{
+        "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+        "friendly_name" => zalgo
+      })
+
+      view |> element("#enroll-authenticator-btn") |> render_click()
+      render_hook(view, "attestation_captured", valid_attestation())
+
+      html = render(view)
+      assert has_element?(view, "#authenticator-0")
+      refute html =~ String.duplicate("̃", 1_000)
+    end
+
+    test "remove_authenticator with a ~2M-digit index is a no-op and does not crash",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+      enroll_authenticator(view)
+
+      # Without the O(1) byte guard, Integer.parse would raise SystemLimitError.
+      render_hook(view, "remove_authenticator", %{"index" => String.duplicate("9", 2_000_000)})
+
+      assert has_element?(view, "#authenticator-0")
+    end
+
+    test "validate with a non-map tenant is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "validate", %{"tenant" => ["not", "a", "map"]})
+
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "signup with a non-map tenant is a no-op and does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      render_hook(view, "signup", %{"tenant" => "not-a-map"})
+
+      assert has_element?(view, "#signup-form")
+    end
+
+    test "request_attestation with a non-binary friendly_name does not crash", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      html = render_hook(view, "request_attestation", %{"friendly_name" => %{"x" => 1}})
+
+      assert has_element?(view, "#signup-form")
+      # cap_string returns "" for a non-binary -> the empty-name branch, no crash.
+      assert html =~ "Please name this authenticator"
+    end
+
+    test "validate drops an oversized field as an O(1) no-op (not echoed back)", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # 100 KB > the 64 KB validate reject threshold: the whole event is a no-op
+      # BEFORE any capping/echo, so the payload can never reach the re-render.
+      oversized = String.duplicate("Z", 100_000)
+
+      html =
+        render_hook(view, "validate", %{
+          "tenant" => %{"name" => oversized, "slug" => "", "email" => ""},
+          "friendly_name" => ""
+        })
+
+      assert has_element?(view, "#signup-form")
+      refute html =~ String.duplicate("Z", 1_000)
+    end
+  end
+
+  # Drives the full enroll flow (name → request challenge → capture attestation)
+  # so a signup submission has a valid authenticator. Relies on the default
+  # `Loopctl.MockWebAuthn` stub wired via config/test.exs returning {:ok, _}.
+  defp enroll_authenticator(view, name \\ "Primary Key") do
+    view
+    |> element("#signup-form")
+    |> render_change(%{
+      "tenant" => %{"name" => "", "slug" => "", "email" => ""},
+      "friendly_name" => name
+    })
+
+    view |> element("#enroll-authenticator-btn") |> render_click()
+
+    render_hook(view, "attestation_captured", valid_attestation())
+
+    view
+  end
+
+  defp valid_attestation do
+    %{
+      "attestation_object" => "YWJjZA",
+      "client_data_json" => "eyJmb28iOiJiYXIifQ",
+      "credential_id" => "Y3JlZC1pZA"
+    }
+  end
+
+  defp submit_tenant(view, name, slug, email) do
+    view
+    |> form("#signup-form", %{"tenant" => %{"name" => name, "slug" => slug, "email" => email}})
+    |> render_submit()
+  end
+
+  # A request that arrived through fly-proxy: the unspoofable `fly-client-ip`
+  # header carries the real client. Optionally include an attacker/Fly-shaped
+  # `x-forwarded-for` (via `xff:`) to prove it is never consulted for the bucket.
+  defp fly_conn(conn, client_ip, opts \\ []) do
+    conn
+    |> Plug.Conn.put_req_header("fly-client-ip", client_ip)
+    |> maybe_put_xff(Keyword.get(opts, :xff))
+  end
+
+  # An off-Fly request with only `x-forwarded-for` (e.g. an nginx front end); the
+  # HTTP-pipeline RemoteIp plug resolves conn.remote_ip from it.
+  defp xff_conn(conn, xff), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", xff)
+
+  defp maybe_put_xff(conn, nil), do: conn
+  defp maybe_put_xff(conn, xff), do: Plug.Conn.put_req_header(conn, "x-forwarded-for", xff)
+
+  # Rate-limiter stub that reports only the primary signup submission bucket
+  # (ignores the shared per-connection action budget and the per-verification
+  # webauthn bucket) so bucket assertions are unambiguous.
+  defp capture_bucket(test_pid) do
+    fn
+      "signup:webauthn:" <> _rest, _window, _limit ->
+        {:allow, 1}
+
+      "signup:actions:" <> _rest, _window, _limit ->
+        {:allow, 1}
+
+      bucket, _window, _limit ->
+        send(test_pid, {:bucket, bucket})
+        {:allow, 1}
     end
   end
 end

@@ -43,7 +43,9 @@ config :loopctl, Loopctl.HeavyReadRepo,
 config :loopctl, LoopctlWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
-  http: [ip: {127, 0, 0, 1}],
+  # `websocket_options` caps a reassembled multi-frame websocket message (Bandit
+  # server-level backstop; see the runtime.exs note).
+  http: [ip: {127, 0, 0, 1}, websocket_options: [max_fragmented_message_size: 64_000]],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,

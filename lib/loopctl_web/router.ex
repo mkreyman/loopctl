@@ -30,10 +30,6 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.CheckCustodyHalt
   end
 
-  pipeline :registration_rate_limit do
-    plug LoopctlWeb.Plugs.RegistrationRateLimiter
-  end
-
   # Landing page — browser pipeline (HTML)
   scope "/", LoopctlWeb do
     pipe_through :browser
@@ -50,7 +46,12 @@ defmodule LoopctlWeb.Router do
     # outside any authenticated pipeline — signup is the only way to
     # create a tenant and the resulting onboarding page is reachable
     # by URL until auth scoping is added in a follow-up story.
-    live_session :public_signup do
+    # `session:` MFA resolves the client IP in the HTTP pipeline (where
+    # `plug RemoteIp` has run and `fly-client-ip` is present) and signs it into
+    # the session, so SignupLive gets an unspoofable per-IP rate-limit key on
+    # both the disconnected and connected mount. See SignupLive.signup_session/1.
+    live_session :public_signup,
+      session: {LoopctlWeb.SignupLive, :signup_session, []} do
       live "/signup", SignupLive, :index
       live "/tenants/:id/onboarding", TenantOnboardingLive, :index
     end
