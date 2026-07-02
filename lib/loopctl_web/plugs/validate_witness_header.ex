@@ -53,7 +53,8 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   # chain_position is a Postgres bigint; reject anything outside the signed
   # 64-bit range up front so an oversized (arbitrary-precision) Elixir int
   # never reaches the query and raises a DBConnection.EncodeError (custody-03b).
-  @max_chain_position 9_223_372_036_854_775_807
+  # Single source of truth: AuditChain also enforces this bound defensively.
+  @max_chain_position AuditChain.max_chain_position()
   @zero_sth_prefix Base.url_encode64(:binary.copy(<<0>>, 16), padding: false)
   @zero_sth "0:#{@zero_sth_prefix}"
 
@@ -220,30 +221,49 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   end
 
   defp atomic_consume_bootstrap(conn, id, tenant_id) do
+    # Read the STH the client will cache BEFORE consuming the one-time grace.
+    # This lookup is read-only and idempotent, so doing it first means a
+    # transient read failure raises here — with the grace NOT yet consumed
+    # (rescued to a retryable missing_header) — instead of AFTER the UPDATE has
+    # already burned the grace, which would permanently strand the key.
+    sth_value = current_sth_value(tenant_id)
+
     {count, _} =
       from(a in ApiKey, where: a.id == ^id and is_nil(a.sth_bootstrap_consumed_at))
       |> AdminRepo.update_all(set: [sth_bootstrap_consumed_at: DateTime.utc_now()])
 
     case count do
-      1 -> put_bootstrap_headers(conn, tenant_id)
+      # Winner: grant the grace. Only pure response-header setting remains after
+      # the committed UPDATE, so nothing here can fail and strand the client.
+      1 -> grant_bootstrap_grace(conn, sth_value)
       0 -> bootstrap_already_consumed(conn)
     end
   rescue
     exception ->
-      # Fail closed on a DB error: never grant an unbounded (repeatable) grace.
+      # Fail closed on a DB error BEFORE the grace is consumed (the STH read or
+      # the UPDATE itself): never grant an unbounded/repeatable grace, and never
+      # burn the one-time grace on a transient failure — this path is retryable.
       Logger.warning(
         "ValidateWitnessHeader: atomic bootstrap consume failed for " <>
-          "api_key=#{id}: #{inspect(exception)}"
+          "api_key=#{id}: #{sanitized_db_error(exception)}"
       )
 
       missing_header(conn)
   end
 
-  defp put_bootstrap_headers(conn, tenant_id) do
+  defp grant_bootstrap_grace(conn, sth_value) do
     conn
-    |> put_resp_header("x-loopctl-current-sth", current_sth_value(tenant_id))
+    |> put_resp_header("x-loopctl-current-sth", sth_value)
     |> put_resp_header("x-loopctl-sth-warning", "missing_header_bootstrap_grace")
   end
+
+  # Never inspect/1 a raw DB exception: %Postgrex.Error{} carries the literal SQL
+  # statement in its :query field. Log only the struct name + SQLSTATE, matching
+  # the US-27.3 sanitized-logging convention used elsewhere.
+  defp sanitized_db_error(%Postgrex.Error{postgres: %{code: code}}),
+    do: "Postgrex.Error sqlstate=#{code}"
+
+  defp sanitized_db_error(exception), do: inspect(exception.__struct__)
 
   defp bootstrap_already_consumed(conn) do
     conn
