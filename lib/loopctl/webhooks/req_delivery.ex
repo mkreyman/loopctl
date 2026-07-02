@@ -8,8 +8,20 @@ defmodule Loopctl.Webhooks.ReqDelivery do
 
   @behaviour Loopctl.Webhooks.DeliveryBehaviour
 
+  alias Loopctl.Net.UrlGuard
+
   @impl true
   def deliver(url, body, headers) do
+    # Re-validate at delivery time, not just at changeset time, to defend against
+    # DNS rebinding / TOCTOU: a host that resolved public when the webhook was
+    # created may now resolve to an internal address (ie-02 / GHSA-jh42-wf7g-f5rg).
+    case UrlGuard.validate_egress(url) do
+      {:ok, _uri} -> do_deliver(url, body, headers)
+      {:error, reason} -> {:error, "blocked_url: #{reason}"}
+    end
+  end
+
+  defp do_deliver(url, body, headers) do
     req_opts =
       [
         url: url,
@@ -17,7 +29,10 @@ defmodule Loopctl.Webhooks.ReqDelivery do
         body: body,
         headers: headers,
         receive_timeout: 10_000,
-        retry: false
+        retry: false,
+        # Never follow redirects — a 302 hop would re-enter an unvalidated URL,
+        # bypassing the egress guard above (ie-02 / GHSA-jh42-wf7g-f5rg).
+        redirect: false
       ]
       |> maybe_add_plug()
 

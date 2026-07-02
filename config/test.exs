@@ -298,6 +298,14 @@ config :loopctl, :rls_role, "loopctl_app"
 # KnowledgeMocWorker: low tag threshold so tests need only a few tagged articles.
 config :loopctl, knowledge_moc_min_tag_count: 2
 
+# SSRF egress guard DNS resolution DI (ie-02 / worker-01). The UrlGuard resolves
+# bare hostnames through this; in tests we swap in a Mox mock so no real network
+# DNS is hit. IP-literal test cases (169.254.169.254, ::1, fdaa::1, 2130706433, …)
+# bypass DNS entirely via :inet.parse_address. DataCase default-stubs `resolve/1`
+# to a public IP so existing example.com-based webhook/ingestion tests keep passing;
+# the DNS-rebinding tests override it with Mox.expect/3 to return a private address.
+config :loopctl, :dns_resolver, Loopctl.MockDnsResolver
+
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
 # is unit-tested with deterministic candidate lists — never through the real pgvector kNN,

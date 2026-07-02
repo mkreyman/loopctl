@@ -214,6 +214,14 @@ defmodule Loopctl.DataCase do
       []
     end)
 
+    # SSRF egress guard (ie-02 / worker-01): default-resolve any bare hostname to a
+    # public, routable IP so existing example.com-based webhook and content-ingestion
+    # tests pass unchanged. IP-literal cases bypass DNS entirely; the DNS-rebinding
+    # tests override this with Mox.expect/3 to return a private address.
+    Mox.stub(Loopctl.MockDnsResolver, :resolve, fn _host ->
+      {:ok, [{93, 184, 216, 34}]}
+    end)
+
     # US-27.3: the DBErrorBackstop test seam (Loopctl.Test.BackstopRouter) is a
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header

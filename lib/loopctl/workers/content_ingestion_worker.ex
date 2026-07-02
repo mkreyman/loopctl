@@ -37,6 +37,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
+  alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
   @content_extractor Application.compile_env(
@@ -170,8 +171,37 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp resolve_content(url, _content) when is_binary(url) do
+    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Re-validate the
+    # user-supplied URL immediately before fetching (the controller also validates
+    # at enqueue time; re-checking here defends against DNS rebinding / TOCTOU).
+    case UrlGuard.validate_egress(url) do
+      {:ok, _uri} -> fetch_url(url)
+      {:error, reason} -> blocked_url(url, reason)
+    end
+  end
+
+  defp resolve_content(nil, _), do: {:error, :no_content}
+
+  defp blocked_url(url, reason) do
+    Logger.warning(
+      "ContentIngestionWorker: refusing to fetch blocked URL " <>
+        "(url=#{url}, reason=#{reason})"
+    )
+
+    {:error, {:url_blocked, reason}}
+  end
+
+  defp fetch_url(url) do
     req_opts =
-      [url: url, receive_timeout: 15_000, retry: :transient, max_retries: 1]
+      [
+        url: url,
+        receive_timeout: 15_000,
+        retry: :transient,
+        max_retries: 1,
+        # Do not follow redirects — a redirect hop would re-enter an unvalidated
+        # URL and bypass the egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm).
+        redirect: false
+      ]
       |> maybe_add_plug()
 
     case Req.get(req_opts) do
@@ -195,8 +225,6 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         {:error, {:url_fetch_error, reason}}
     end
   end
-
-  defp resolve_content(nil, _), do: {:error, :no_content}
 
   defp derive_source_id(content_hash) do
     # Derive a deterministic UUID from the content hash.

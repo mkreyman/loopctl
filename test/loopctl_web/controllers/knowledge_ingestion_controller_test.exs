@@ -136,6 +136,40 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert body["error"]["message"] =~ "source_type"
     end
 
+    # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm): a URL pointing at a
+    # private / loopback / cloud-metadata address is rejected 4xx up front, before
+    # any job is enqueued or fetched.
+    test "returns 422 for a URL targeting the cloud metadata endpoint", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://169.254.169.254/latest/meta-data/",
+          source_type: "web_article"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
+    test "returns 422 for a decimal-encoded loopback URL", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          url: "http://2130706433/secret",
+          source_type: "web_article"
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "private, loopback, or metadata"
+    end
+
     test "agent role is rejected (requires orchestrator)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

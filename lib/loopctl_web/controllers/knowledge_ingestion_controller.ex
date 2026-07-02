@@ -10,6 +10,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
   alias LoopctlWeb.Helpers.Pagination
 
@@ -284,7 +285,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     publish = params["publish"] == true or params["publish"] == "true"
 
     with :ok <- validate_content_source(url, content),
-         :ok <- validate_source_type(source_type) do
+         :ok <- validate_source_type(source_type),
+         :ok <- validate_url_egress(url) do
       content_hash = compute_content_hash(url || content)
 
       job_args =
@@ -383,6 +385,32 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   defp validate_source_type(""), do: {:error, :unprocessable_entity, "'source_type' is required"}
   defp validate_source_type(_), do: :ok
+
+  # SSRF egress guard (worker-01 / GHSA-j7m9-ffmr-pwhm). Reject a URL that points
+  # at a private / loopback / link-local / cloud-metadata address up front (4xx)
+  # so a bad URL never reaches the worker. Content-only ingests (url == nil) skip
+  # this. The worker re-validates before fetching to defend against DNS rebinding.
+  defp validate_url_egress(nil), do: :ok
+
+  defp validate_url_egress(url) when is_binary(url) do
+    case UrlGuard.validate_egress(url) do
+      {:ok, _uri} ->
+        :ok
+
+      {:error, :invalid_scheme} ->
+        {:error, :unprocessable_entity, "'url' must use the http or https scheme"}
+
+      {:error, :invalid_url} ->
+        {:error, :unprocessable_entity, "'url' is not a valid URL"}
+
+      {:error, :missing_host} ->
+        {:error, :unprocessable_entity, "'url' must have a valid host"}
+
+      {:error, _blocked} ->
+        {:error, :unprocessable_entity,
+         "'url' must not target a private, loopback, or metadata address"}
+    end
+  end
 
   defp compute_content_hash(input) when is_binary(input) do
     :crypto.hash(:sha256, input) |> Base.encode16(case: :lower)
