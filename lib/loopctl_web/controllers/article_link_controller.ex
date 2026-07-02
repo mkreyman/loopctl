@@ -56,7 +56,12 @@ defmodule LoopctlWeb.ArticleLinkController do
       201 =>
         {"Link created", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Forbidden (a 'supersedes' link requires role: user+)", "application/json",
+         Schemas.ErrorResponse},
+      422 =>
+        {"Validation error (incl. a non-public/unknown relationship_type)", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -90,27 +95,43 @@ defmodule LoopctlWeb.ArticleLinkController do
 
   # --- Actions ---
 
+  # Only these relationship types are publicly creatable via this controller.
+  # `:potential_conflict` is SYSTEM-generated ONLY (planted directly by
+  # KnowledgeLintWorker.promote_conflicts/1 and ArticleLinkingWorker via AdminRepo,
+  # bypassing this controller) — letting an agent create one here would forge the
+  # "system flagged this pair" evidence that the conflict-resolution guard trusts
+  # (kb-02). Anything outside this set (incl. potential_conflict and junk) is a 422.
+  @public_relationship_types ~w(relates_to derived_from contradicts supersedes)
+
   @doc "POST /api/v1/article_links"
   def create(conn, params) do
     api_key = conn.assigns.current_api_key
     rel_type = params["relationship_type"] || params[:relationship_type]
 
-    # kb-01 (GHSA-9g2g-cm9x-9r2p): a "supersedes" link retires the TARGET article
-    # (published -> superseded), hiding it from every default published read
-    # (search/graph/context all default status: :published). That is a DESTRUCTIVE
-    # op, so — consistent with archive/unpublish — it requires role: :user. The other
-    # relationship types (relates_to, derived_from, contradicts) are non-destructive
-    # and stay at :agent. This is an in-action check (not a static RequireRole plug)
-    # because destructiveness depends on the body param relationship_type.
-    if destructive_relationship?(rel_type) and
-         not Role.role_at_least?(api_key.role, :user) do
-      forbidden(
-        conn,
-        "Creating a 'supersedes' link retires the target article, which removes it " <>
-          "from published reads. This destructive operation requires the user role or higher."
-      )
-    else
-      do_create(conn, api_key.tenant_id, params)
+    cond do
+      # kb-02 FIX A: refuse system-only / unknown relationship types at the boundary.
+      # There is no OpenApiSpex CastAndValidate plug wired here, so the operation enum
+      # is documentation-only — this check is the actual enforcement.
+      not public_relationship?(rel_type) ->
+        {:error, :unprocessable_entity,
+         "relationship_type must be one of: relates_to, derived_from, contradicts, supersedes."}
+
+      # kb-01 (GHSA-9g2g-cm9x-9r2p): a "supersedes" link retires the TARGET article
+      # (published -> superseded), hiding it from every default published read
+      # (search/graph/context all default status: :published). That is a DESTRUCTIVE
+      # op, so — consistent with archive/unpublish — it requires role: :user. The other
+      # relationship types (relates_to, derived_from, contradicts) are non-destructive
+      # and stay at :agent. In-action check (not a static RequireRole plug) because
+      # destructiveness depends on the body param relationship_type.
+      destructive_relationship?(rel_type) and not Role.role_at_least?(api_key.role, :user) ->
+        forbidden(
+          conn,
+          "Creating a 'supersedes' link retires the target article, which removes it " <>
+            "from published reads. This destructive operation requires the user role or higher."
+        )
+
+      true ->
+        do_create(conn, api_key.tenant_id, params)
     end
   end
 
@@ -131,8 +152,18 @@ defmodule LoopctlWeb.ArticleLinkController do
     end
   end
 
+  # Guarded against non-scalar JSON values (e.g. a map/list body) so to_string/1 can't
+  # raise a 500 (kb-02 FIX C) — a non-binary/atom value simply isn't a public type.
+  defp public_relationship?(rel_type) when is_binary(rel_type) or is_atom(rel_type),
+    do: to_string(rel_type) in @public_relationship_types
+
+  defp public_relationship?(_), do: false
+
   # A "supersedes" link is the one relationship_type that retires (hides) its target.
-  defp destructive_relationship?(rel_type), do: to_string(rel_type) == "supersedes"
+  defp destructive_relationship?(rel_type) when is_binary(rel_type) or is_atom(rel_type),
+    do: to_string(rel_type) == "supersedes"
+
+  defp destructive_relationship?(_), do: false
 
   # 403 body matches the RequireRole plug / FallbackController shape.
   defp forbidden(conn, message) do

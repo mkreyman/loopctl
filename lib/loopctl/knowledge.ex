@@ -3353,7 +3353,9 @@ defmodule Loopctl.Knowledge do
         annotated_by: Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
         annotated_at: now,
         # A dismiss is complete on record; supersede/merge defer to the executor.
-        executed_at: if(to_string(disposition) == "dismiss", do: now, else: nil),
+        # Compare without to_string/1 so a non-scalar disposition (e.g. a JSON object)
+        # can't raise here — it falls through to the changeset's inclusion validation.
+        executed_at: if(disposition in ["dismiss", :dismiss], do: now, else: nil),
         execution_result: %{}
       }
 
@@ -3398,12 +3400,21 @@ defmodule Loopctl.Knowledge do
   # potential conflict (link stored in either direction). When an id is missing we
   # return :ok and defer to the changeset's required-field validation (surfaces as a
   # 422) rather than masking a malformed request as "no conflict".
+  #
+  # PROVENANCE (kb-02 FIX A, defense in depth): require the flag to be SYSTEM-generated
+  # (`metadata.auto_generated == true`), the marker both writer sites set —
+  # `KnowledgeLintWorker.promote_conflicts/1` and `ArticleLinkingWorker`. Presence of a
+  # `:potential_conflict` link alone is NOT sufficient evidence: even though the public
+  # link controller now refuses to create that type, requiring the provenance marker
+  # means no future/alternate path that plants such a link can be leveraged to fabricate
+  # a destructive verdict.
   defp validate_potential_conflict_exists(tenant_id, src, tgt)
        when is_binary(src) and is_binary(tgt) do
     exists? =
       from(l in ArticleLink,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where:
           (l.source_article_id == ^src and l.target_article_id == ^tgt) or
             (l.source_article_id == ^tgt and l.target_article_id == ^src)
@@ -3447,10 +3458,29 @@ defmodule Loopctl.Knowledge do
     end)
   end
 
-  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :supersede} = r),
+  # kb-02 FIX B (TOCTOU): the flag is checked at annotate time, but a :user may DELETE
+  # the potential_conflict link (retracting a mistaken flag) after the verdict is
+  # recorded and before the nightly run. Re-validate the SYSTEM flag still exists right
+  # before acting; if it was retracted, noop (audited) instead of retiring/merging.
+  defp apply_resolution(tenant_id, %ConflictResolution{} = r) do
+    case validate_potential_conflict_exists(tenant_id, r.source_article_id, r.target_article_id) do
+      :ok ->
+        apply_disposition(tenant_id, r)
+
+      {:error, :no_potential_conflict} ->
+        mark_resolution_executed(r, %{
+          "action" => "noop",
+          "reason" => "potential_conflict flag retracted"
+        })
+
+        false
+    end
+  end
+
+  defp apply_disposition(tenant_id, %ConflictResolution{disposition: :supersede} = r),
     do: apply_supersede(tenant_id, r)
 
-  defp apply_resolution(tenant_id, %ConflictResolution{disposition: :merge} = r),
+  defp apply_disposition(tenant_id, %ConflictResolution{disposition: :merge} = r),
     do: apply_merge(tenant_id, r)
 
   # The conflict pair is unordered; store it canonically (source <= target by UUID

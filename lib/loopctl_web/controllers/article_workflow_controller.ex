@@ -293,7 +293,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       201 =>
         {"Recorded", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Forbidden (destructive supersede/merge dispositions require role: user+)",
+         "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, or no system-flagged potential_conflict for the pair",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -769,7 +774,13 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   # supersede/merge lead the nightly executor to retire (and, for merge, synthesize
   # over) an article — the destructive dispositions. dismiss is non-destructive.
-  defp destructive_disposition?(disposition), do: to_string(disposition) in ["supersede", "merge"]
+  # Guarded against non-scalar JSON values so to_string/1 can't raise a 500
+  # (kb-02 FIX C); a non-binary/atom disposition falls through to the changeset's
+  # inclusion validation (422).
+  defp destructive_disposition?(disposition) when is_binary(disposition) or is_atom(disposition),
+    do: to_string(disposition) in ["supersede", "merge"]
+
+  defp destructive_disposition?(_), do: false
 
   # 403 body matches the RequireRole plug / FallbackController shape.
   defp forbidden(conn, message) do

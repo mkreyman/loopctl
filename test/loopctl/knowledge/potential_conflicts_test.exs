@@ -257,6 +257,62 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert AdminRepo.get(Loopctl.Knowledge.Article, y.id).status == :published
     end
 
+    # kb-02 FIX B (TOCTOU): retracting the flag after the verdict is recorded stops the
+    # executor — it noops instead of retiring the loser.
+    test "executor noops when the potential_conflict flag was retracted after the verdict", ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      # A :user retracts the mistaken flag (DELETE link) before the nightly run.
+      link =
+        AdminRepo.get_by(ArticleLink, tenant_id: t.id, relationship_type: :potential_conflict)
+
+      {:ok, _} = Knowledge.delete_link(t.id, link.id)
+
+      # Executor must NOT retire the loser; it records a noop.
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+      assert AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      refute is_nil(row.executed_at)
+      assert row.execution_result["reason"] == "potential_conflict flag retracted"
+    end
+
+    # kb-02 FIX A provenance: a :potential_conflict link WITHOUT the system
+    # `auto_generated` marker is not accepted as evidence (a forged/non-system flag).
+    test "rejects a verdict when the potential_conflict link is not system-generated", ctx do
+      %{tenant: t} = ctx
+      x = published(t.id, "X")
+      y = published(t.id, "Y")
+
+      # A flag lacking the auto_generated provenance marker (as if planted by a non-system path).
+      %ArticleLink{tenant_id: t.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: x.id,
+        target_article_id: y.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"similarity_score" => 0.99}
+      })
+      |> AdminRepo.insert!()
+
+      assert {:error, :no_potential_conflict} =
+               Knowledge.annotate_conflict(t.id, %{
+                 "source_article_id" => x.id,
+                 "target_article_id" => y.id,
+                 "disposition" => "supersede",
+                 "authoritative_article_id" => x.id,
+                 "confidence" => "high"
+               })
+    end
+
     # A dismiss verdict is likewise only accepted for a real flagged pair.
     test "rejects a dismiss on a pair with no potential_conflict link", ctx do
       %{tenant: t} = ctx

@@ -113,6 +113,73 @@ defmodule LoopctlWeb.ArticleLinkControllerTest do
       assert body["data"]["relationship_type"] == "derived_from"
     end
 
+    # kb-02 FIX A: potential_conflict is SYSTEM-generated only. An agent must not be able
+    # to plant the "system flagged this pair" evidence the conflict-resolution guard trusts.
+    test "an agent creating a :potential_conflict link is rejected (422), no link created",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id})
+      b = fixture(:article, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "relationship_type" => "potential_conflict"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+
+      refute Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ArticleLink,
+               tenant_id: tenant.id,
+               source_article_id: a.id,
+               target_article_id: b.id,
+               relationship_type: :potential_conflict
+             )
+    end
+
+    test "even a user cannot create a :potential_conflict link (system-only, 422)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id})
+      b = fixture(:article, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "relationship_type" => "potential_conflict"
+        })
+
+      assert json_response(conn, 422)
+    end
+
+    # kb-02 FIX C: a non-scalar relationship_type must 422, not crash to_string/1 (500).
+    test "a non-scalar relationship_type value is a 422, not a 500 crash", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id})
+      b = fixture(:article, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "relationship_type" => %{"nested" => "object"}
+        })
+
+      assert json_response(conn, 422)
+    end
+
     test "rejects self-link (422)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

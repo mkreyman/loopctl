@@ -1440,6 +1440,20 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert json_response(conn, 422)
     end
 
+    # kb-02 FIX C: a non-scalar disposition must 422, not crash to_string/1 (500).
+    test "a non-scalar disposition is a 422, not a 500 crash", ctx do
+      %{user_conn: conn, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => %{"nested" => "object"}
+        })
+
+      assert json_response(conn, 422)
+    end
+
     # Tenant isolation: a user in tenant B cannot resolve tenant A's flagged pair —
     # from B's perspective the potential_conflict link does not exist (422).
     test "a caller in another tenant cannot resolve the pair (422)", ctx do
