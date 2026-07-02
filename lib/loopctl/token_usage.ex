@@ -125,17 +125,11 @@ defmodule Loopctl.TokenUsage do
           })
 
           # Check budget thresholds after report creation (AC-21.8.2).
-          # Wrapped in try/rescue so a DB failure during threshold checking
-          # does not crash the report creation flow (the report is committed).
-          try do
-            check_budget_thresholds(tenant_id, report)
-          rescue
-            e ->
-              Logger.warning(
-                "Budget threshold check failed for report #{report.id}: " <>
-                  Exception.message(e)
-              )
-          end
+          # Shared entry point used by BOTH creation paths (this standalone
+          # path and Progress.report_story/4) so neither can bypass budget
+          # alerting. Non-fatal: a DB failure during threshold checking does
+          # not crash the report creation flow (the report is committed).
+          check_budget_thresholds_for_report(tenant_id, report)
 
           {:ok, report}
 
@@ -143,42 +137,6 @@ defmodule Loopctl.TokenUsage do
           {:error, changeset}
       end
     end
-  end
-
-  @doc """
-  Creates a token usage report within an Ecto.Multi pipeline.
-
-  Used by `Progress.report_story/4` to atomically create a token usage
-  report alongside a status transition.
-
-  ## Parameters
-
-  - `multi` -- the Ecto.Multi struct
-  - `name` -- the step name in the multi
-  - `tenant_id` -- the tenant UUID
-  - `attrs` -- map of report attributes (story_id, agent_id, project_id, etc.)
-
-  ## Returns
-
-  The updated Ecto.Multi struct.
-  """
-  @spec create_report_in_multi(Ecto.Multi.t(), atom(), Ecto.UUID.t(), map()) :: Ecto.Multi.t()
-  def create_report_in_multi(multi, name, tenant_id, attrs) do
-    attrs = normalize_attrs(attrs)
-
-    story_id = Map.get(attrs, :story_id)
-    agent_id = Map.get(attrs, :agent_id)
-    project_id = Map.get(attrs, :project_id)
-
-    Ecto.Multi.insert(multi, name, fn _changes ->
-      %Report{
-        tenant_id: tenant_id,
-        story_id: story_id,
-        agent_id: agent_id,
-        project_id: project_id
-      }
-      |> Report.create_changeset(attrs)
-    end)
   end
 
   @doc """
@@ -387,7 +345,14 @@ defmodule Loopctl.TokenUsage do
   def create_correction(tenant_id, original_report_id, attrs, opts \\ []) do
     attrs = normalize_attrs(attrs)
 
-    with {:ok, original} <- get_report(tenant_id, original_report_id) do
+    # Enforce skill_version tenant-ownership (tokens-10), the SAME guard the
+    # create_report/3 and Progress.report_story/4 paths run. A cross-tenant (or
+    # non-existent / malformed) skill_version_id is rejected BEFORE the changeset
+    # is built, so no correction row is stored. "" is treated as absent, mirroring
+    # Progress.validate_token_usage_ownership/2.
+    with :ok <-
+           validate_skill_version_ownership(tenant_id, correction_skill_version_id(attrs)),
+         {:ok, original} <- get_report(tenant_id, original_report_id) do
       correction_input_tokens = Map.get(attrs, :input_tokens, 0)
       correction_output_tokens = Map.get(attrs, :output_tokens, 0)
 
@@ -430,7 +395,8 @@ defmodule Loopctl.TokenUsage do
               "input_tokens" => correction.input_tokens,
               "output_tokens" => correction.output_tokens,
               "cost_millicents" => correction.cost_millicents,
-              "model_name" => correction.model_name
+              "model_name" => correction.model_name,
+              "skill_version_id" => correction.skill_version_id
             },
             metadata: %{
               "corrects_report_id" => original.id,
@@ -438,7 +404,8 @@ defmodule Loopctl.TokenUsage do
               "project_id" => correction.project_id,
               "input_tokens" => correction_input_tokens,
               "output_tokens" => correction_output_tokens,
-              "cost_millicents" => Map.get(attrs, :cost_millicents, 0)
+              "cost_millicents" => Map.get(attrs, :cost_millicents, 0),
+              "skill_version_id" => correction.skill_version_id
             }
           }
         end)
@@ -866,6 +833,32 @@ defmodule Loopctl.TokenUsage do
 
   # --- Budget threshold check (AC-21.8.2, AC-21.7.5, AC-21.7.6) ---
 
+  @doc """
+  Runs budget threshold checks for a freshly-created token usage report.
+
+  Fires any `token.budget_warning` / `token.budget_exceeded` webhooks, writes
+  the `threshold_crossed` audit entries, and flips the budget
+  `warning_fired` / `exceeded_fired` flags — exactly the alerting behaviour of
+  the standalone `create_report/3` path.
+
+  This is the single entry point used by BOTH token-usage report creation paths
+  (`create_report/3` and `Progress.report_story/4`) so neither can bypass budget
+  alerting. Non-fatal: wrapped so a DB failure during threshold checking never
+  crashes the caller's flow (the report is already committed when this runs).
+  """
+  @spec check_budget_thresholds_for_report(Ecto.UUID.t(), Report.t()) :: :ok
+  def check_budget_thresholds_for_report(tenant_id, %Report{} = report) do
+    check_budget_thresholds(tenant_id, report)
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "Budget threshold check failed for report #{report.id}: " <> Exception.message(e)
+      )
+
+      :ok
+  end
+
   # After a token usage report is created, check all applicable budgets
   # and emit threshold_crossed audit entries and webhook events for any
   # that have been crossed. Deduplication is enforced via warning_fired
@@ -1037,24 +1030,52 @@ defmodule Loopctl.TokenUsage do
 
   # --- Private helpers ---
 
-  # Validates that skill_version_id (if provided) exists and belongs to the tenant.
-  # The ownership chain is: skill_versions -> skills -> tenant_id.
+  @doc """
+  Validates that `skill_version_id` (if provided) exists and belongs to the tenant.
+
+  The ownership chain is: `skill_versions -> skills -> tenant_id`. A
+  cross-tenant, non-existent, or malformed (non-UUID) `skill_version_id` returns
+  `{:error, :unprocessable_entity, message}`.
+
+  Public so ALL THREE token-usage report creation paths (`create_report/3`,
+  `create_correction/4`, and `Progress.report_story/4`) enforce the SAME
+  tenant-ownership guard and none can drift.
+
+  A malformed value is UUID-validated up front so it yields a clean 422 rather
+  than raising `Ecto.Query.CastError` (an unhandled 500) inside the query.
+  """
   @spec validate_skill_version_ownership(Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
           :ok | {:error, :unprocessable_entity, String.t()}
-  defp validate_skill_version_ownership(_tenant_id, nil), do: :ok
+  def validate_skill_version_ownership(_tenant_id, nil), do: :ok
 
-  defp validate_skill_version_ownership(tenant_id, skill_version_id) do
-    exists =
-      SkillVersion
-      |> join(:inner, [sv], s in Skill, on: sv.skill_id == s.id)
-      |> where([sv, s], sv.id == ^skill_version_id and s.tenant_id == ^tenant_id)
-      |> AdminRepo.exists?()
+  def validate_skill_version_ownership(tenant_id, skill_version_id) do
+    case Ecto.UUID.cast(skill_version_id) do
+      :error ->
+        {:error, :unprocessable_entity,
+         "skill_version_id does not exist or belongs to a different tenant"}
 
-    if exists do
-      :ok
-    else
-      {:error, :unprocessable_entity,
-       "skill_version_id does not exist or belongs to a different tenant"}
+      {:ok, uuid} ->
+        exists =
+          SkillVersion
+          |> join(:inner, [sv], s in Skill, on: sv.skill_id == s.id)
+          |> where([sv, s], sv.id == ^uuid and s.tenant_id == ^tenant_id)
+          |> AdminRepo.exists?()
+
+        if exists do
+          :ok
+        else
+          {:error, :unprocessable_entity,
+           "skill_version_id does not exist or belongs to a different tenant"}
+        end
+    end
+  end
+
+  # Extracts the skill_version_id from correction attrs (already normalized to
+  # atom keys), treating "" as absent — mirrors Progress.validate_token_usage_ownership/2.
+  defp correction_skill_version_id(attrs) do
+    case Map.get(attrs, :skill_version_id) do
+      "" -> nil
+      id -> id
     end
   end
 
