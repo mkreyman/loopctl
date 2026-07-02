@@ -125,17 +125,11 @@ defmodule Loopctl.TokenUsage do
           })
 
           # Check budget thresholds after report creation (AC-21.8.2).
-          # Wrapped in try/rescue so a DB failure during threshold checking
-          # does not crash the report creation flow (the report is committed).
-          try do
-            check_budget_thresholds(tenant_id, report)
-          rescue
-            e ->
-              Logger.warning(
-                "Budget threshold check failed for report #{report.id}: " <>
-                  Exception.message(e)
-              )
-          end
+          # Shared entry point used by BOTH creation paths (this standalone
+          # path and Progress.report_story/4) so neither can bypass budget
+          # alerting. Non-fatal: a DB failure during threshold checking does
+          # not crash the report creation flow (the report is committed).
+          check_budget_thresholds_for_report(tenant_id, report)
 
           {:ok, report}
 
@@ -866,6 +860,32 @@ defmodule Loopctl.TokenUsage do
 
   # --- Budget threshold check (AC-21.8.2, AC-21.7.5, AC-21.7.6) ---
 
+  @doc """
+  Runs budget threshold checks for a freshly-created token usage report.
+
+  Fires any `token.budget_warning` / `token.budget_exceeded` webhooks, writes
+  the `threshold_crossed` audit entries, and flips the budget
+  `warning_fired` / `exceeded_fired` flags — exactly the alerting behaviour of
+  the standalone `create_report/3` path.
+
+  This is the single entry point used by BOTH token-usage report creation paths
+  (`create_report/3` and `Progress.report_story/4`) so neither can bypass budget
+  alerting. Non-fatal: wrapped so a DB failure during threshold checking never
+  crashes the caller's flow (the report is already committed when this runs).
+  """
+  @spec check_budget_thresholds_for_report(Ecto.UUID.t(), Report.t()) :: :ok
+  def check_budget_thresholds_for_report(tenant_id, %Report{} = report) do
+    check_budget_thresholds(tenant_id, report)
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "Budget threshold check failed for report #{report.id}: " <> Exception.message(e)
+      )
+
+      :ok
+  end
+
   # After a token usage report is created, check all applicable budgets
   # and emit threshold_crossed audit entries and webhook events for any
   # that have been crossed. Deduplication is enforced via warning_fired
@@ -1037,13 +1057,22 @@ defmodule Loopctl.TokenUsage do
 
   # --- Private helpers ---
 
-  # Validates that skill_version_id (if provided) exists and belongs to the tenant.
-  # The ownership chain is: skill_versions -> skills -> tenant_id.
+  @doc """
+  Validates that `skill_version_id` (if provided) exists and belongs to the tenant.
+
+  The ownership chain is: `skill_versions -> skills -> tenant_id`. A
+  cross-tenant or non-existent `skill_version_id` returns
+  `{:error, :unprocessable_entity, message}`.
+
+  Public so BOTH token-usage report creation paths (`create_report/3` and
+  `Progress.report_story/4`) enforce the SAME tenant-ownership guard and neither
+  can drift.
+  """
   @spec validate_skill_version_ownership(Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
           :ok | {:error, :unprocessable_entity, String.t()}
-  defp validate_skill_version_ownership(_tenant_id, nil), do: :ok
+  def validate_skill_version_ownership(_tenant_id, nil), do: :ok
 
-  defp validate_skill_version_ownership(tenant_id, skill_version_id) do
+  def validate_skill_version_ownership(tenant_id, skill_version_id) do
     exists =
       SkillVersion
       |> join(:inner, [sv], s in Skill, on: sv.skill_id == s.id)

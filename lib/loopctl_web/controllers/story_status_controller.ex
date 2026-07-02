@@ -350,6 +350,10 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :not_found} ->
         {:error, :not_found}
 
+      # Cross-tenant / non-existent token_usage skill_version_id (tokens-10).
+      {:error, :unprocessable_entity, message} ->
+        {:error, :unprocessable_entity, message}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end

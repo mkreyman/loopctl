@@ -4,11 +4,92 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
   import Ecto.Query
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
+  alias Loopctl.Skills
+  alias Loopctl.TokenUsage
+  alias Loopctl.TokenUsage.Budget
+  alias Loopctl.TokenUsage.Report
+  alias Loopctl.Webhooks
+  alias Loopctl.Webhooks.WebhookEvent
 
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
+  end
+
+  # Puts a story into :implementing (assigned to the implementer) and mints a
+  # DIFFERENT reviewer agent + key so cross-agent report calls succeed
+  # (chain-of-custody). Returns the base context plus :reviewer / :reviewer_key.
+  defp implementing_story_with_reviewer(attrs \\ %{}) do
+    ctx = setup_story_with_agent(attrs)
+
+    story =
+      ctx.story
+      |> Ecto.Changeset.change(%{
+        agent_status: :implementing,
+        assigned_agent_id: ctx.agent.id,
+        assigned_at: DateTime.utc_now()
+      })
+      |> AdminRepo.update!()
+
+    reviewer = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :implementer})
+
+    {reviewer_key, _} =
+      fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :agent, agent_id: reviewer.id})
+
+    ctx
+    |> Map.put(:story, story)
+    |> Map.put(:reviewer, reviewer)
+    |> Map.put(:reviewer_key, reviewer_key)
+  end
+
+  defp token_usage_payload(overrides) do
+    Map.merge(
+      %{
+        "input_tokens" => 1000,
+        "output_tokens" => 500,
+        "model_name" => "claude-opus-4",
+        "cost_millicents" => 8_500
+      },
+      overrides
+    )
+  end
+
+  defp create_webhook_for_events(tenant_id, events) do
+    {:ok, %{webhook: webhook}} =
+      Webhooks.create_webhook(tenant_id, %{
+        "url" => "https://example.com/hooks/#{System.unique_integer([:positive])}",
+        "events" => events
+      })
+
+    webhook
+  end
+
+  defp find_webhook_events(tenant_id, event_type) do
+    WebhookEvent
+    |> where([e], e.tenant_id == ^tenant_id and e.event_type == ^event_type)
+    |> AdminRepo.all()
+  end
+
+  defp threshold_crossed_entries(tenant_id, budget_id, threshold_type) do
+    AuditLog
+    |> where([a], a.tenant_id == ^tenant_id and a.entity_type == "token_budget")
+    |> where([a], a.action == "threshold_crossed" and a.entity_id == ^budget_id)
+    |> AdminRepo.all()
+    |> Enum.filter(fn e -> e.metadata["threshold_type"] == threshold_type end)
+  end
+
+  defp same_tenant_skill_version(tenant_id) do
+    skill =
+      fixture(:skill, %{
+        tenant_id: tenant_id,
+        name: "skill-#{System.unique_integer([:positive])}"
+      })
+
+    {:ok, version} = Skills.get_version(tenant_id, skill.id, 1)
+    version
   end
 
   defp setup_story_with_agent(attrs \\ %{}) do
@@ -390,6 +471,248 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
       body = json_response(conn, 422)
       assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- tokens-01: budget thresholds fire on the report_story path ---
+
+  describe "POST /api/v1/stories/:id/report with token_usage — budget alerting (tokens-01)" do
+    test "story budget: crossing alert_threshold_pct fires warning (only) + audit + flag",
+         %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      _webhook =
+        create_webhook_for_events(ctx.tenant.id, [
+          "token.budget_warning",
+          "token.budget_exceeded"
+        ])
+
+      {:ok, budget} =
+        TokenUsage.create_budget(ctx.tenant.id, %{
+          scope_type: :story,
+          scope_id: ctx.story.id,
+          budget_millicents: 10_000,
+          alert_threshold_pct: 80
+        })
+
+      # 8,500 / 10,000 = 85% -> warning fires, exceeded does NOT
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"cost_millicents" => 8_500})
+        })
+
+      assert json_response(conn, 200)
+
+      assert [_warning_event] = find_webhook_events(ctx.tenant.id, "token.budget_warning")
+      assert [] == find_webhook_events(ctx.tenant.id, "token.budget_exceeded")
+
+      assert [_] = threshold_crossed_entries(ctx.tenant.id, budget.id, "warning")
+      assert [] == threshold_crossed_entries(ctx.tenant.id, budget.id, "exceeded")
+
+      reloaded = AdminRepo.get!(Budget, budget.id)
+      assert reloaded.warning_fired == true
+      assert reloaded.exceeded_fired == false
+    end
+
+    test "story budget: exceeding 100% fires BOTH warning and exceeded + audit + flags",
+         %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      _webhook =
+        create_webhook_for_events(ctx.tenant.id, [
+          "token.budget_warning",
+          "token.budget_exceeded"
+        ])
+
+      {:ok, budget} =
+        TokenUsage.create_budget(ctx.tenant.id, %{
+          scope_type: :story,
+          scope_id: ctx.story.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      # 6,000 / 5,000 = 120% -> both warning and exceeded fire
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"cost_millicents" => 6_000})
+        })
+
+      assert json_response(conn, 200)
+
+      assert [warning_event] = find_webhook_events(ctx.tenant.id, "token.budget_warning")
+      assert [exceeded_event] = find_webhook_events(ctx.tenant.id, "token.budget_exceeded")
+
+      assert warning_event.payload["scope_type"] == "story"
+      assert exceeded_event.payload["overage_millicents"] == 1_000
+
+      assert [_] = threshold_crossed_entries(ctx.tenant.id, budget.id, "warning")
+      assert [_] = threshold_crossed_entries(ctx.tenant.id, budget.id, "exceeded")
+
+      reloaded = AdminRepo.get!(Budget, budget.id)
+      assert reloaded.warning_fired == true
+      assert reloaded.exceeded_fired == true
+    end
+
+    test "epic and project budgets also fire on the report_story path", %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      _webhook =
+        create_webhook_for_events(ctx.tenant.id, ["token.budget_exceeded"])
+
+      {:ok, epic_budget} =
+        TokenUsage.create_budget(ctx.tenant.id, %{
+          scope_type: :epic,
+          scope_id: ctx.epic.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      {:ok, project_budget} =
+        TokenUsage.create_budget(ctx.tenant.id, %{
+          scope_type: :project,
+          scope_id: ctx.project.id,
+          budget_millicents: 5_000,
+          alert_threshold_pct: 80
+        })
+
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"cost_millicents" => 6_000})
+        })
+
+      assert json_response(conn, 200)
+
+      # Both epic-scope and project-scope budgets produce exceeded events
+      assert Enum.count(find_webhook_events(ctx.tenant.id, "token.budget_exceeded")) == 2
+
+      assert [_] = threshold_crossed_entries(ctx.tenant.id, epic_budget.id, "exceeded")
+      assert [_] = threshold_crossed_entries(ctx.tenant.id, project_budget.id, "exceeded")
+
+      assert AdminRepo.get!(Budget, epic_budget.id).exceeded_fired == true
+      assert AdminRepo.get!(Budget, project_budget.id).exceeded_fired == true
+    end
+
+    test "a report under threshold fires nothing", %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      _webhook =
+        create_webhook_for_events(ctx.tenant.id, [
+          "token.budget_warning",
+          "token.budget_exceeded"
+        ])
+
+      {:ok, budget} =
+        TokenUsage.create_budget(ctx.tenant.id, %{
+          scope_type: :story,
+          scope_id: ctx.story.id,
+          budget_millicents: 100_000,
+          alert_threshold_pct: 80
+        })
+
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"cost_millicents" => 1_000})
+        })
+
+      assert json_response(conn, 200)
+
+      assert [] == find_webhook_events(ctx.tenant.id, "token.budget_warning")
+      assert [] == find_webhook_events(ctx.tenant.id, "token.budget_exceeded")
+      assert [] == threshold_crossed_entries(ctx.tenant.id, budget.id, "warning")
+      assert [] == threshold_crossed_entries(ctx.tenant.id, budget.id, "exceeded")
+
+      reloaded = AdminRepo.get!(Budget, budget.id)
+      assert reloaded.warning_fired == false
+      assert reloaded.exceeded_fired == false
+    end
+  end
+
+  # --- tokens-10: cross-tenant skill_version_id rejected on the report path ---
+
+  describe "POST /api/v1/stories/:id/report with token_usage — skill_version ownership (tokens-10)" do
+    test "cross-tenant skill_version_id is rejected 422, no report stored, nothing leaked",
+         %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      # A skill_version owned by a DIFFERENT tenant.
+      other_tenant = fixture(:tenant)
+      foreign_version = same_tenant_skill_version(other_tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"skill_version_id" => foreign_version.id})
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "skill_version_id"
+
+      # No report row was stored for the story.
+      assert 0 ==
+               Report
+               |> where([r], r.story_id == ^ctx.story.id)
+               |> AdminRepo.aggregate(:count, :id)
+
+      # And nothing leaks through the read endpoint.
+      index_conn =
+        build_conn()
+        |> auth_conn(ctx.reviewer_key)
+        |> get(~p"/api/v1/stories/#{ctx.story.id}/token-usage")
+
+      index_body = json_response(index_conn, 200)
+      assert index_body["data"] == []
+      assert index_body["meta"]["total_count"] == 0
+    end
+
+    test "same-tenant skill_version_id still works", %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+      version = same_tenant_skill_version(ctx.tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"skill_version_id" => version.id})
+        })
+
+      assert json_response(conn, 200)
+
+      report =
+        Report
+        |> where([r], r.story_id == ^ctx.story.id)
+        |> AdminRepo.one()
+
+      assert report.skill_version_id == version.id
+    end
+
+    test "nonexistent skill_version_id is rejected 422 with no report stored", %{conn: conn} do
+      ctx = implementing_story_with_reviewer()
+
+      conn =
+        conn
+        |> auth_conn(ctx.reviewer_key)
+        |> post(~p"/api/v1/stories/#{ctx.story.id}/report", %{
+          "token_usage" => token_usage_payload(%{"skill_version_id" => Ecto.UUID.generate()})
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+
+      assert 0 ==
+               Report
+               |> where([r], r.story_id == ^ctx.story.id)
+               |> AdminRepo.aggregate(:count, :id)
     end
   end
 

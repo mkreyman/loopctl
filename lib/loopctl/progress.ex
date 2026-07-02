@@ -24,6 +24,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Capabilities
   alias Loopctl.Dispatches
   alias Loopctl.Tenants
+  alias Loopctl.TokenUsage
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
@@ -506,8 +507,22 @@ defmodule Loopctl.Progress do
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
-          {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()} | Ecto.Changeset.t()}
+          {:ok, Story.t()}
+          | {:error, atom() | {:invalid_transition, map()} | Ecto.Changeset.t()}
+          | {:error, :unprocessable_entity, String.t()}
   def report_story(tenant_id, story_id, opts \\ [], artifact_params \\ nil) do
+    token_usage_params = Keyword.get(opts, :token_usage)
+
+    # Enforce skill_version tenant-ownership BEFORE the report transaction, the
+    # SAME guard the standalone TokenUsage.create_report/3 path runs. A
+    # cross-tenant (or non-existent) skill_version_id is rejected here, so no
+    # report row is ever stored. The 3-tuple maps to a 422 via FallbackController.
+    with :ok <- validate_token_usage_ownership(tenant_id, token_usage_params) do
+      do_report_story(tenant_id, story_id, opts, artifact_params)
+    end
+  end
+
+  defp do_report_story(tenant_id, story_id, opts, artifact_params) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -582,15 +597,58 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :consume_cap, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
-      {:error, :artifact, changeset, _} -> {:error, changeset}
-      {:error, :token_usage_report, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated} = results} ->
+        # Run budget threshold checks AFTER commit, through the SAME shared
+        # entry point the standalone create_report path uses — firing budget
+        # warning/exceeded webhooks + threshold_crossed audit entries and
+        # flipping warning_fired/exceeded_fired. No-op when no token usage
+        # was reported.
+        maybe_check_token_budget_thresholds(tenant_id, results)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :consume_cap, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
+
+      {:error, :artifact, changeset, _} ->
+        {:error, changeset}
+
+      {:error, :token_usage_report, changeset, _} ->
+        {:error, changeset}
     end
   end
+
+  # Enforce skill_version tenant-ownership on the report_story path, mirroring
+  # the standalone TokenUsage.create_report/3 guard. Reads skill_version_id out
+  # of the raw token_usage params (JSON string keys), treating "" as absent.
+  defp validate_token_usage_ownership(_tenant_id, nil), do: :ok
+
+  defp validate_token_usage_ownership(tenant_id, params) when is_map(params) do
+    skill_version_id =
+      case Map.get(params, "skill_version_id", Map.get(params, :skill_version_id)) do
+        "" -> nil
+        id -> id
+      end
+
+    TokenUsage.validate_skill_version_ownership(tenant_id, skill_version_id)
+  end
+
+  # Fires budget threshold alerting for the freshly-created token usage report
+  # (if any) via the shared TokenUsage entry point. No-op when the report
+  # transaction created no token usage report.
+  defp maybe_check_token_budget_thresholds(tenant_id, %{token_usage_report: report}) do
+    TokenUsage.check_budget_thresholds_for_report(tenant_id, report)
+  end
+
+  defp maybe_check_token_budget_thresholds(_tenant_id, _results), do: :ok
 
   @doc """
   Signals that the assigned agent has finished implementation and requests review.
@@ -2125,8 +2183,6 @@ defmodule Loopctl.Progress do
   defp maybe_create_token_usage_report(multi, _tenant_id, _story_id, _agent_id, nil), do: multi
 
   defp maybe_create_token_usage_report(multi, tenant_id, story_id, agent_id, params) do
-    alias Loopctl.TokenUsage
-
     Multi.run(multi, :token_usage_report, fn _repo, %{lock: story} ->
       attrs =
         params
