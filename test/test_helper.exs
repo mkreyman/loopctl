@@ -40,4 +40,22 @@ nightly_excluded = if System.get_env("SCALE_NIGHTLY"), do: [], else: [:scale_nig
 #   PGBOUNCER_URL=postgres://postgres:postgres@127.0.0.1:6432/loopctl_test \
 #     mix test --include pgbouncer test/loopctl/pgbouncer_startup_params_test.exs
 pgbouncer_excluded = if System.get_env("PGBOUNCER_URL"), do: [], else: [:pgbouncer]
-ExUnit.configure(exclude: scale_excluded ++ nightly_excluded ++ pgbouncer_excluded)
+
+# :requires_ipv6 — the SSRF IP-pinning Host-header regression test stands up a
+# loopback HTTP server bound to ::1 (the ONLY way to exercise Req.Finch.run/1's
+# IPv6 host-injection path). Probe ::1 bindability once; skip (not error) the
+# tagged test on environments lacking IPv6 loopback, while keeping full coverage
+# where IPv6 exists (local dev, ubuntu-latest CI). IPv4 round-trip stays always-on.
+ipv6_excluded =
+  case :gen_tcp.listen(0, [:inet6, ip: {0, 0, 0, 0, 0, 0, 0, 1}, active: false]) do
+    {:ok, socket} ->
+      :gen_tcp.close(socket)
+      []
+
+    {:error, _reason} ->
+      [:requires_ipv6]
+  end
+
+ExUnit.configure(
+  exclude: scale_excluded ++ nightly_excluded ++ pgbouncer_excluded ++ ipv6_excluded
+)

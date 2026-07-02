@@ -9,6 +9,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  require Logger
+
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
@@ -193,17 +195,25 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # Bound the aggregate request time (worker-01 / GHSA-j7m9-ffmr-pwhm). Each item
   # does bounded per-item DNS validation (A+AAAA), but a serial Enum.map over up
   # to @batch_max (50) items could still tie up a web worker for minutes on
-  # unresponsive nameservers. Task.async_stream caps concurrency AND imposes a
-  # per-item wall-clock deadline; a hung item is killed and mapped to a
-  # validation_timeout error, so the whole request is bounded regardless of any
-  # single hanging item. Ordering + per-item result shape are preserved.
+  # unresponsive nameservers. async_stream caps concurrency AND imposes a per-item
+  # wall-clock deadline; a hung item is killed and mapped to a validation_timeout
+  # error, so the whole request is bounded regardless of any single hanging item.
+  # Ordering + per-item result shape are preserved.
+  #
+  # We use the NOLINK Task.Supervisor variant (monitors, not links) so a genuine
+  # (non-timeout) raise in one item — e.g. an Oban.insert pool checkout-timeout
+  # under the 10-way intra-request concurrency — is caught and returned as a
+  # per-item {:exit, reason} error instead of killing the whole request (Bandit's
+  # HTTP/2 stream process does not trap exits). This preserves the "one bad item
+  # never fails the whole batch" invariant.
   #
   # tenant_id is passed explicitly into each task (no process-dict/RLS state is
   # relied on); Ecto Sandbox + Mox resolve via the `$callers` chain that
-  # Task.async_stream propagates.
+  # Task.Supervisor.async_stream_nolink propagates.
   defp process_batch_items(tenant_id, items) do
-    items
-    |> Task.async_stream(
+    Loopctl.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(
+      items,
       fn item -> enqueue_item_result(tenant_id, item) end,
       max_concurrency: 10,
       timeout: batch_item_timeout_ms(),
@@ -211,9 +221,16 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
       ordered: true
     )
     |> Enum.map(fn
-      {:ok, result} -> result
-      {:exit, :timeout} -> %{status: "error", error: "validation_timeout"}
-      {:exit, _reason} -> %{status: "error", error: "validation_failed"}
+      {:ok, result} ->
+        result
+
+      {:exit, :timeout} ->
+        Logger.warning("batch item validation timeout")
+        %{status: "error", error: "validation_timeout"}
+
+      {:exit, reason} ->
+        Logger.warning("batch item validation crashed: #{inspect(reason)}")
+        %{status: "error", error: "validation_failed"}
     end)
   end
 

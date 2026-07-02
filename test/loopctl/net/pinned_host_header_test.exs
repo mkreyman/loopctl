@@ -20,6 +20,22 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
   @ipv4_loopback {127, 0, 0, 1}
   @ipv6_loopback {0, 0, 0, 0, 0, 0, 0, 1}
 
+  setup context do
+    # Skip IPv6 tests on systems without IPv6 loopback bindability
+    if context[:requires_ipv6] do
+      case :gen_udp.open(0, [:inet6, {:ip, @ipv6_loopback}]) do
+        {:ok, socket} ->
+          :gen_udp.close(socket)
+          :ok
+
+        {:error, _reason} ->
+          {:skip, "IPv6 loopback not available on this system"}
+      end
+    else
+      :ok
+    end
+  end
+
   test "IPv4-pinned request sends the original hostname as Host" do
     port = start_echo_server(@ipv4_loopback, :echo_v4)
 
@@ -27,6 +43,7 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
              "webhook.example.com:#{port}"
   end
 
+  @tag :requires_ipv6
   test "IPv6-pinned request sends the original hostname as Host, not [::1] (FIX 1)" do
     port = start_echo_server(@ipv6_loopback, :echo_v6)
 
