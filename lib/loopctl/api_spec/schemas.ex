@@ -291,6 +291,121 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule ReauthChallengeResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "ReauthChallengeResponse",
+      description:
+        "Step 1 of the audit-key rotation reauth ceremony (crypto-01). The " <>
+          "server-minted, single-use `challenge_id` must be echoed back in the " <>
+          "assertion step. All binary fields are base64url encoded.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          required: [:challenge_id, :challenge, :allowed_credentials],
+          properties: %{
+            challenge_id: %Schema{
+              type: :string,
+              format: :uuid,
+              description: "Opaque single-use handle for the stored challenge"
+            },
+            challenge: %Schema{
+              type: :string,
+              description:
+                "Base64url-encoded challenge bytes to feed into navigator.credentials.get()"
+            },
+            allowed_credentials: %Schema{
+              type: :array,
+              items: %Schema{type: :string},
+              description: "Base64url credential ids the client may assert with"
+            },
+            rp_id: %Schema{type: :string, description: "Relying party id"},
+            expires_at: %Schema{type: :string, format: :"date-time"}
+          }
+        }
+      }
+    })
+  end
+
+  defmodule WebAuthnAssertion do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "WebAuthnAssertion",
+      description:
+        "Assertion produced by `navigator.credentials.get()`, posted back to " <>
+          "verify a reauth challenge. All binary fields are base64url encoded and " <>
+          "are SEPARATE values (never one blob reused for all fields).",
+      type: :object,
+      required: [
+        :challenge_id,
+        :credential_id,
+        :authenticator_data,
+        :signature,
+        :client_data_json
+      ],
+      properties: %{
+        challenge_id: %Schema{
+          type: :string,
+          format: :uuid,
+          description: "The `challenge_id` returned by the challenge step"
+        },
+        credential_id: %Schema{type: :string, description: "Base64url asserting credential id"},
+        authenticator_data: %Schema{type: :string, description: "Base64url authenticator data"},
+        signature: %Schema{type: :string, description: "Base64url assertion signature"},
+        client_data_json: %Schema{type: :string, description: "Base64url raw client data JSON"}
+      }
+    })
+  end
+
+  defmodule RotateAuditKeyRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RotateAuditKeyRequest",
+      description:
+        "Step 2 of the reauth ceremony. Carries the WebAuthn assertion that is " <>
+          "verified against the STORED challenge from step 1 before rotation.",
+      type: :object,
+      required: [:webauthn_assertion],
+      properties: %{
+        webauthn_assertion: WebAuthnAssertion
+      }
+    })
+  end
+
+  defmodule AuditKeyResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuditKeyResponse",
+      description: "Result of an audit-key rotation or bootstrap.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant_id: %Schema{type: :string, format: :uuid},
+            audit_signing_public_key: %Schema{
+              type: :string,
+              description: "Base64-encoded ed25519 public key"
+            },
+            rotated_at: %Schema{type: :string, format: :"date-time", nullable: true},
+            message: %Schema{type: :string}
+          }
+        }
+      }
+    })
+  end
+
   # ---------- API Keys ----------
 
   defmodule ApiKeyCreateRequest do

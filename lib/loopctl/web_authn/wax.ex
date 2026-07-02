@@ -53,15 +53,36 @@ defmodule Loopctl.WebAuthn.Wax do
   end
 
   @impl true
-  def verify_authentication(payload, challenge, _opts) do
+  def verify_authentication(payload, challenge, opts) do
     credential_id = Map.fetch!(payload, :credential_id)
     auth_data = Map.fetch!(payload, :authenticator_data)
     signature = Map.fetch!(payload, :signature)
     client_data_json = Map.fetch!(payload, :client_data_json)
 
-    case Wax.authenticate(credential_id, auth_data, signature, client_data_json, challenge, []) do
-      {:ok, auth_data} -> {:ok, %{sign_count: auth_data.sign_count}}
-      {:error, _reason} -> {:error, :invalid_assertion}
+    # crypto-01: the enrolled credentials — `{credential_id, stored_public_key}`
+    # pairs — are threaded in via opts and their COSE keys decoded here so
+    # `Wax.authenticate/6` verifies the signature against a REAL enrolled key.
+    # Passing an empty list (the old placeholder) meant no key was ever loaded
+    # and the signature was never actually checked.
+    credentials =
+      opts
+      |> Keyword.get(:allow_credentials, [])
+      |> Enum.map(fn {cred_id, public_key} -> {cred_id, decode_cose_key(public_key)} end)
+
+    case Wax.authenticate(
+           credential_id,
+           auth_data,
+           signature,
+           client_data_json,
+           challenge,
+           credentials
+         ) do
+      {:ok, authenticator_data} ->
+        {:ok, %{sign_count: authenticator_data.sign_count}}
+
+      {:error, reason} ->
+        Logger.warning("WebAuthn authentication failed: #{inspect(reason)}")
+        {:error, :invalid_assertion}
     end
   end
 
@@ -86,5 +107,16 @@ defmodule Loopctl.WebAuthn.Wax do
   # round-trip without a second parser implementation.
   defp encode_cose_key(cose_key) when is_map(cose_key) do
     :erlang.term_to_binary(cose_key)
+  end
+
+  # Inverse of encode_cose_key/1. Already-decoded maps (e.g. supplied by a
+  # test double) pass through untouched. `[:safe]` guards against decoding
+  # funs / new atoms from a tampered row.
+  defp decode_cose_key(cose_key) when is_map(cose_key), do: cose_key
+
+  defp decode_cose_key(public_key) when is_binary(public_key) do
+    :erlang.binary_to_term(public_key, [:safe])
+  rescue
+    _ -> %{}
   end
 end
