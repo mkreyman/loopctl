@@ -667,6 +667,36 @@ defmodule Loopctl.KnowledgeTest do
       assert audit.tenant_id == tenant.id
     end
 
+    # kb-02: caller-supplied provenance/score flags are SYSTEM-reserved and must be
+    # stripped so a link created via create_link can never be laundered into a
+    # system-stamped potential_conflict by the nightly promote_conflicts pass.
+    test "strips system-reserved metadata keys from caller input" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, source} =
+        Knowledge.create_article(tenant.id, %{title: "S", body: "B", category: :pattern})
+
+      {:ok, target} =
+        Knowledge.create_article(tenant.id, %{title: "T", body: "B", category: :pattern})
+
+      assert {:ok, %ArticleLink{} = link} =
+               Knowledge.create_link(tenant.id, %{
+                 source_article_id: source.id,
+                 target_article_id: target.id,
+                 relationship_type: :relates_to,
+                 metadata: %{
+                   "auto_generated" => true,
+                   "similarity_score" => 0.99,
+                   "reason" => "kept"
+                 }
+               })
+
+      refute Map.has_key?(link.metadata, "auto_generated")
+      refute Map.has_key?(link.metadata, "similarity_score")
+      # Non-reserved keys are preserved.
+      assert link.metadata["reason"] == "kept"
+    end
+
     test "rejects link when source article belongs to different tenant" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)

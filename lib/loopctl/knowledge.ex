@@ -3143,6 +3143,14 @@ defmodule Loopctl.Knowledge do
   @spec create_link(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ArticleLink.t()} | {:error, Ecto.Changeset.t() | :target_not_found}
   def create_link(tenant_id, attrs, opts \\ []) do
+    # kb-02 DEFENSE IN DEPTH: provenance/score flags are SYSTEM-authored only. Strip them
+    # from any caller-supplied metadata before building the changeset so no create_link
+    # path (the public API controller AND direct callers like OKF import) can plant the
+    # `auto_generated`/`similarity_score` markers that promote_conflicts/1 and
+    # validate_potential_conflict_exists/3 trust. System conflict-writers
+    # (ArticleLinkingWorker, promote_conflicts) insert via AdminRepo directly, NOT through
+    # create_link, so this stripping never touches legitimate system provenance.
+    attrs = strip_system_metadata(attrs)
     source_id = attrs[:source_article_id] || attrs["source_article_id"]
     target_id = attrs[:target_article_id] || attrs["target_article_id"]
     rel_type = attrs[:relationship_type] || attrs["relationship_type"]
@@ -3261,6 +3269,9 @@ defmodule Loopctl.Knowledge do
         as: :link,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
+        # kb-02: only surface SYSTEM-flagged conflicts as resolvable evidence, so a stray
+        # or legacy non-system potential_conflict row is never presented to a :user.
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where:
           not exists(
             from(r in ConflictResolution,
@@ -5077,6 +5088,31 @@ defmodule Loopctl.Knowledge do
   end
 
   defp maybe_supersede_target(multi, _tenant_id, _target_id, _rel_type), do: multi
+
+  # kb-02: metadata keys reserved for system provenance. Callers of create_link/3 must
+  # never set these (both string- and atom-key forms are dropped). Referencing the atoms
+  # literally keeps them as existing atoms — no String.to_atom on input.
+  @reserved_metadata_keys [
+    "auto_generated",
+    "similarity_score",
+    :auto_generated,
+    :similarity_score
+  ]
+
+  defp strip_system_metadata(attrs) when is_map(attrs) do
+    cond do
+      is_map(attrs[:metadata]) ->
+        Map.put(attrs, :metadata, Map.drop(attrs[:metadata], @reserved_metadata_keys))
+
+      is_map(attrs["metadata"]) ->
+        Map.put(attrs, "metadata", Map.drop(attrs["metadata"], @reserved_metadata_keys))
+
+      true ->
+        attrs
+    end
+  end
+
+  defp strip_system_metadata(attrs), do: attrs
 
   defp build_link_audit(tenant_id, changes, opts) do
     actor_id = Keyword.get(opts, :actor_id)

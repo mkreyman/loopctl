@@ -176,6 +176,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         as: :rel,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :relates_to,
+        # PROVENANCE (kb-02): only promote relates_to links that a SYSTEM writer
+        # authored (ArticleLinkingWorker stamps auto_generated:true + a real cosine
+        # similarity_score). Without this, an agent could POST a relates_to link with a
+        # forged similarity_score and launder it into a system-stamped potential_conflict
+        # here — which would then satisfy validate_potential_conflict_exists and let a
+        # fabricated pair be resolved into a supersede. The public link controller now
+        # strips these keys from caller input, so a genuine agent link never carries a
+        # score; this filter is the second, independent barrier at the promotion site.
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
         where: fragment("(?->>'similarity_score')::float >= ?", l.metadata, ^threshold),
         where:
           not exists(

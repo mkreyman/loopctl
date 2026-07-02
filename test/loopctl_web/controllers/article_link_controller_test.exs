@@ -161,6 +161,39 @@ defmodule LoopctlWeb.ArticleLinkControllerTest do
       assert json_response(conn, 422)
     end
 
+    # kb-02: system-reserved provenance/score metadata is stripped from caller input, so
+    # an agent cannot plant the auto_generated/similarity_score markers via the API.
+    test "strips system-reserved metadata keys from an agent-created link", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id})
+      b = fixture(:article, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/article_links", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "relationship_type" => "relates_to",
+          "metadata" => %{
+            "auto_generated" => true,
+            "similarity_score" => 0.99,
+            "reason" => "kept"
+          }
+        })
+
+      body = json_response(conn, 201)
+      refute Map.has_key?(body["data"]["metadata"], "auto_generated")
+      refute Map.has_key?(body["data"]["metadata"], "similarity_score")
+      assert body["data"]["metadata"]["reason"] == "kept"
+
+      # Confirm at the persistence layer too.
+      link = Loopctl.AdminRepo.get(Loopctl.Knowledge.ArticleLink, body["data"]["id"])
+      refute Map.has_key?(link.metadata, "auto_generated")
+      refute Map.has_key?(link.metadata, "similarity_score")
+    end
+
     # kb-02 FIX C: a non-scalar relationship_type must 422, not crash to_string/1 (500).
     test "a non-scalar relationship_type value is a 422, not a 500 crash", %{conn: conn} do
       tenant = fixture(:tenant)
