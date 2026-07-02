@@ -21,7 +21,16 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :loopctl, LoopctlWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+  http: [
+    port: String.to_integer(System.get_env("PORT", "4000")),
+    # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
+    # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
+    # :max_fragmented_message_size). It caps a REASSEMBLED (multi-frame) websocket
+    # message; the socket DSL `max_frame_size: 64_000` caps a single frame.
+    # Without this, N sub-64KB continuation frames reassemble into one message up
+    # to Bandit's 8 MB default, bypassing the per-frame cap.
+    websocket_options: [max_fragmented_message_size: 64_000]
+  ]
 
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.

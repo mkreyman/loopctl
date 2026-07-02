@@ -105,7 +105,14 @@ end
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
 config :loopctl, LoopctlWeb.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 4002],
+  # `websocket_options` caps a reassembled multi-frame websocket message (Bandit
+  # server-level backstop; see runtime.exs). Asserted by a regression test so a
+  # future edit that drops it fails CI.
+  http: [
+    ip: {127, 0, 0, 1},
+    port: 4002,
+    websocket_options: [max_fragmented_message_size: 64_000]
+  ],
   secret_key_base: "QO3UeePU6EXaPNWZRMdH5lL+t+XQNelN9GHOJKhFgp8FEtjlvGzWWXoMiQI1EOE3",
   server: false
 

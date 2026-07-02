@@ -66,6 +66,13 @@ defmodule LoopctlWeb.SignupLive do
   # on top for defense in depth.
   @max_actions_per_window 60
 
+  # O(1) hard reject for the ONE unrated handler (validate, fires per keystroke).
+  # A field larger than this is dropped as a no-op BEFORE any processing/echo, so
+  # a flood of large validate frames can't pin the scheduler even if the
+  # transport fragmented-message cap were ever misconfigured. Matches the frame
+  # cap; legit form input is far smaller.
+  @max_validate_field_bytes 64_000
+
   @doc """
   Builds the LiveView session for the `:public_signup` live_session (wired via
   the router's `session: {__MODULE__, :signup_session, []}` MFA).
@@ -147,6 +154,20 @@ defmodule LoopctlWeb.SignupLive do
     end
   end
 
+  # O(1) reject: is any validate field larger than the hard cap? `byte_size/1` is
+  # O(1) on a binary, so this bounds validate's work regardless of input size.
+  defp oversized_validate?(all, params) do
+    field_oversized?(Map.get(all, "friendly_name")) or
+      Enum.any?(["name", "slug", "email"], fn key ->
+        field_oversized?(Map.get(params, key))
+      end)
+  end
+
+  defp field_oversized?(value) when is_binary(value),
+    do: byte_size(value) > @max_validate_field_bytes
+
+  defp field_oversized?(_value), do: false
+
   # Size cap on a client-supplied string, applied uniformly before processing,
   # echoing, or logging. Non-binary values are treated as within-bounds (they
   # are normalized/dropped elsewhere).
@@ -214,19 +235,23 @@ defmodule LoopctlWeb.SignupLive do
 
   @impl true
   def handle_event("validate", %{"tenant" => params} = all, socket) when is_map(params) do
-    # Form-change handler: not rate-limited (it fires per keystroke), but every
-    # attacker-controlled string is size-capped so a huge value can never be
-    # echoed back into the re-rendered form (echo-amplification). `is_map(params)`
-    # guards against a crafted non-map "tenant"; anything else falls to the
-    # module catch-all (no-op).
-    friendly = cap_string(Map.get(all, "friendly_name", socket.assigns.friendly_name_draft))
-    params = cap_tenant_params(params)
+    # Form-change handler: not rate-limited (it fires per keystroke). Two bounds
+    # keep it safe: (1) an O(1) byte-size reject drops any oversized field as a
+    # no-op BEFORE processing; (2) every remaining field is byte-capped so a huge
+    # value can never be echoed into the re-rendered form. `is_map(params)` guards
+    # a crafted non-map "tenant"; anything else falls to the module catch-all.
+    if oversized_validate?(all, params) do
+      {:noreply, socket}
+    else
+      friendly = cap_string(Map.get(all, "friendly_name", socket.assigns.friendly_name_draft))
+      params = cap_tenant_params(params)
 
-    {:noreply,
-     socket
-     |> assign(:form, to_form(params, as: :tenant, errors: form_errors(params)))
-     |> assign(:friendly_name_draft, friendly)
-     |> clear_error()}
+      {:noreply,
+       socket
+       |> assign(:form, to_form(params, as: :tenant, errors: form_errors(params)))
+       |> assign(:friendly_name_draft, friendly)
+       |> clear_error()}
+    end
   end
 
   @impl true

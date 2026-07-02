@@ -932,6 +932,23 @@ defmodule LoopctlWeb.SignupLiveTest do
       # cap_string returns "" for a non-binary -> the empty-name branch, no crash.
       assert html =~ "Please name this authenticator"
     end
+
+    test "validate drops an oversized field as an O(1) no-op (not echoed back)", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/signup")
+
+      # 100 KB > the 64 KB validate reject threshold: the whole event is a no-op
+      # BEFORE any capping/echo, so the payload can never reach the re-render.
+      oversized = String.duplicate("Z", 100_000)
+
+      html =
+        render_hook(view, "validate", %{
+          "tenant" => %{"name" => oversized, "slug" => "", "email" => ""},
+          "friendly_name" => ""
+        })
+
+      assert has_element?(view, "#signup-form")
+      refute html =~ String.duplicate("Z", 1_000)
+    end
   end
 
   # Drives the full enroll flow (name → request challenge → capture attestation)
