@@ -363,14 +363,12 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       assert reloaded.assigned_agent_id == agent.id
     end
 
-    test "refuses backfill after force_unclaim clears assigned_agent_id", %{conn: conn} do
-      # SECURITY: force_unclaim_story clears assigned_agent_id but leaves
-      # agent_status in a non-:pending state (typically :pending is set back
-      # but only after unclaim actually happens through the real path). A
-      # simpler attack model: a story with agent_status=:implementing but
-      # assigned_agent_id=nil (impossible in practice — the guard catches
-      # this too via the agent_status check). The broader defense is that
-      # guard_backfillable refuses any non-:pending agent_status.
+    test "refuses backfill of an in-progress story with an accurate reason (not a false dispatch-lineage claim)",
+         %{conn: conn} do
+      # An :implementing story with a NULL assigned_agent_id (impossible in
+      # practice — claim sets the agent) carries NO dispatch lineage. The guard
+      # must still REFUSE it, but with an ACCURATE reason (:story_in_progress —
+      # "being worked"), NOT a misleading "dispatch lineage" claim.
       tenant = fixture(:tenant)
 
       {raw_key, _api_key} =
@@ -379,15 +377,6 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
-      # force_unclaim sets agent_status=:pending and clears assigned_agent_id.
-      # BUT it does NOT clear implementer_dispatch_id. Test that the guard
-      # catches a story with only implementer_dispatch_id set by asserting
-      # agent_status check works — the pragmatic attack scenario is blocked
-      # by agent_status != :pending (tested in the next test) and the
-      # strict guard is a defense in depth.
-
-      # For now: test the obvious case — agent_status=:implementing should
-      # refuse regardless of assigned_agent_id.
       story =
         fixture(:story, %{
           tenant_id: tenant.id,
@@ -402,7 +391,11 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         |> post(~p"/api/v1/stories/#{story.id}/backfill", %{"reason" => "bypass attempt"})
 
       body = json_response(conn, 422)
-      assert body["error"]["message"] =~ "dispatch lineage"
+      # Accurate :story_in_progress reason ("being worked"), NOT the misleading
+      # dispatch-lineage refusal — the message must not falsely claim the story
+      # HAS dispatch lineage when it does not.
+      assert body["error"]["message"] =~ "being worked"
+      refute body["error"]["message"] =~ "has loopctl dispatch lineage"
 
       # Story state unchanged
       reloaded = Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id)

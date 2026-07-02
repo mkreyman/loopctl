@@ -35,14 +35,31 @@ defmodule Loopctl.Repo.Migrations.AddReportedDoneRequiresAgentCheckToStories do
   Pre-flight: dev (`loopctl_dev`) and test (`loopctl_test`) both have 0 stories, so
   the constraint applies cleanly; no legacy backfill needed.
 
-  Reversible: Ecto auto-derives the `DROP CONSTRAINT` for `create constraint`.
+  Production-safe locking: added `NOT VALID` first (a fast catalog-only change that
+  does NOT scan the table), then `VALIDATE CONSTRAINT` in a separate statement —
+  which takes only a `SHARE UPDATE EXCLUSIVE` lock (concurrent reads AND writes
+  allowed) instead of the `ACCESS EXCLUSIVE` full-table lock a plain
+  `ADD CONSTRAINT ... CHECK` would hold for the whole scan. Behavior is identical
+  on the empty dev/test tables; this is purely the safe form for a populated
+  production `stories` table.
+
+  Reversible: the `execute/2` up/down pairs drop the constraint on rollback
+  (the VALIDATE step's down is a no-op — dropping the constraint removes it whole).
   """
   use Ecto.Migration
 
+  @check "agent_status <> 'reported_done' OR implementer_dispatch_id IS NULL OR assigned_agent_id IS NOT NULL"
+
   def change do
-    create constraint(:stories, :stories_reported_done_requires_agent,
-             check:
-               "agent_status <> 'reported_done' OR implementer_dispatch_id IS NULL OR assigned_agent_id IS NOT NULL"
-           )
+    execute(
+      "ALTER TABLE stories ADD CONSTRAINT stories_reported_done_requires_agent CHECK (#{@check}) NOT VALID",
+      "ALTER TABLE stories DROP CONSTRAINT stories_reported_done_requires_agent"
+    )
+
+    execute(
+      "ALTER TABLE stories VALIDATE CONSTRAINT stories_reported_done_requires_agent",
+      # Down no-op: the ADD's down (above) drops the constraint entirely on rollback.
+      "SELECT 1"
+    )
   end
 end

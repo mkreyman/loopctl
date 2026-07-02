@@ -49,6 +49,44 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
   defp review_params(summary),
     do: %{"review_type" => "enhanced", "summary" => summary}
 
+  # An import-shaped orphan: reported_done + unverified + NULL-agent + NULL-dispatch
+  # with a pre-existing reported_done_at (as `initial_agent_status: "reported_done"`
+  # import produces). Permitted by the scoped CHECK; blocked at verify/review by the
+  # custody-orphaned guard; recoverable via backfill / bulk mark-complete.
+  defp imported_orphan(tenant, epic, reported_done_at) do
+    fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+    |> Ecto.Changeset.change(%{
+      agent_status: :reported_done,
+      verified_status: :unverified,
+      reported_done_at: reported_done_at
+    })
+    |> AdminRepo.update!()
+  end
+
+  # A genuinely reported+reviewed story (assigned agent + qualifying review) in the
+  # given tenant/epic, ready to verify. Returns {story, reviewer}.
+  defp healthy_reviewed_story(tenant, epic, reported_done_at) do
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+    reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+    story =
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+      |> Ecto.Changeset.change(%{
+        agent_status: :reported_done,
+        assigned_agent_id: agent.id,
+        assigned_at: now_usec(),
+        reported_done_at: reported_done_at
+      })
+      |> AdminRepo.update!()
+
+    {:ok, _} =
+      Progress.record_review(tenant.id, story.id, review_params("ok"),
+        reviewer_agent_id: reviewer.id
+      )
+
+    {story, reviewer}
+  end
+
   # ------------------------------------------------------------------
   # INVARIANT 1 — reported_done requires an assigned agent
   # ------------------------------------------------------------------
@@ -335,6 +373,100 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
                Progress.verify_story(tenant_b.id, story_b.id, %{"summary" => "x"},
                  orchestrator_agent_id: orch_b.id
                )
+    end
+  end
+
+  # ------------------------------------------------------------------
+  # INVARIANT 1 — recovery path for imported agentless reported_done work
+  # ------------------------------------------------------------------
+
+  describe "INVARIANT 1: imported agentless reported_done has a working recovery" do
+    test "backfill_story recovers it (preserving reported_done_at) while verify/review stay blocked" do
+      t1 = seconds_ago(200)
+      tenant = fixture(:tenant)
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+      story = imported_orphan(tenant, epic, t1)
+      orch = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      # Fail-closed on the WRONG paths…
+      assert {:error, :missing_assigned_agent} =
+               Progress.verify_story(tenant.id, story.id, %{"summary" => "x"},
+                 orchestrator_agent_id: orch.id
+               )
+
+      assert {:error, :missing_assigned_agent} =
+               Progress.record_review(tenant.id, story.id, review_params("x"),
+                 reviewer_agent_id: orch.id
+               )
+
+      # …recover on the RIGHT path, WITHOUT destroying the pre-loopctl-done
+      # provenance (reported_done_at preserved, not overwritten/cleared).
+      assert {:ok, updated} =
+               Progress.backfill_story(tenant.id, story.id, %{"reason" => "pre-existing import"})
+
+      assert updated.agent_status == :reported_done
+      assert updated.verified_status == :verified
+      assert is_nil(updated.assigned_agent_id)
+      assert DateTime.compare(updated.reported_done_at, t1) == :eq
+    end
+
+    test "bulk mark-complete recovers it, preserving reported_done_at" do
+      t1 = seconds_ago(200)
+      tenant = fixture(:tenant)
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+      story = imported_orphan(tenant, epic, t1)
+      orch = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      entry = %{
+        "story_id" => story.id,
+        "summary" => "pre-existing",
+        "review_type" => "pre_existing"
+      }
+
+      assert {:ok, [result]} = BulkOperations.bulk_mark_complete(tenant.id, [entry], orch.id)
+      assert result.status == "success"
+
+      reloaded = AdminRepo.get!(Story, story.id)
+      assert reloaded.verified_status == :verified
+      assert is_nil(reloaded.assigned_agent_id)
+      assert DateTime.compare(reloaded.reported_done_at, t1) == :eq
+    end
+  end
+
+  describe "INVARIANT 1: bulk paths emit per-story :missing_assigned_agent" do
+    test "bulk_verify errors the orphan per-story without failing the healthy story in the batch" do
+      t1 = seconds_ago(100)
+      tenant = fixture(:tenant)
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+
+      orphan = imported_orphan(tenant, epic, t1)
+      {healthy, reviewer} = healthy_reviewed_story(tenant, epic, t1)
+
+      entries =
+        for id <- [orphan.id, healthy.id],
+            do: %{"story_id" => id, "summary" => "b", "review_type" => "enhanced"}
+
+      assert {:ok, results} = BulkOperations.bulk_verify(tenant.id, entries, reviewer.id)
+
+      by_id = Map.new(results, &{&1.story_id, &1})
+      assert by_id[orphan.id].status == "error"
+      assert by_id[orphan.id].reason =~ "custody chain is broken"
+      assert by_id[healthy.id].status == "success"
+    end
+
+    test "bulk_reject errors the orphan per-story without failing the whole batch" do
+      t1 = seconds_ago(100)
+      tenant = fixture(:tenant)
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+
+      orphan = imported_orphan(tenant, epic, t1)
+      orch = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      entry = %{"story_id" => orphan.id, "reason" => "regression"}
+
+      assert {:ok, [result]} = BulkOperations.bulk_reject(tenant.id, [entry], orch.id)
+      assert result.status == "error"
+      assert result.reason =~ "custody chain is broken"
     end
   end
 end

@@ -17,6 +17,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
+  - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message

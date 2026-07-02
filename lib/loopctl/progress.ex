@@ -1051,13 +1051,20 @@ defmodule Loopctl.Progress do
   @doc """
   Structural custody guard for the bulk mark-complete (backfill) path.
 
-  Returns `:ok` only when `story` never entered the dispatch lifecycle, matching
-  `backfill_story/4`. Prevents mark-complete from being used to self-verify
-  dispatched work.
+  Returns `:ok` only when `story` never entered the dispatch lifecycle (no
+  dispatch markers) — including a never-dispatched story already at
+  `agent_status: :reported_done` (e.g. imported with
+  `initial_agent_status: "reported_done"`), for which mark-complete is the
+  correct remediation. Matches `backfill_story/4`. Prevents mark-complete from
+  being used to self-verify dispatched work.
   """
   @spec ensure_mark_complete_allowed(Story.t()) ::
           :ok
-          | {:error, :already_verified | :story_rejected | :story_has_dispatch_lineage}
+          | {:error,
+             :already_verified
+             | :story_rejected
+             | :story_has_dispatch_lineage
+             | :story_in_progress}
   def ensure_mark_complete_allowed(story) do
     case guard_backfillable(story) do
       {:ok, _} -> :ok
@@ -1095,7 +1102,11 @@ defmodule Loopctl.Progress do
     * `{:error, :reason_required}` — `reason` missing or blank
     * `{:error, :already_verified}` — story already `:verified` (idempotent no-op)
     * `{:error, :story_rejected}` — story is `:rejected`; investigate instead of papering over
-    * `{:error, :story_has_dispatch_lineage}` — story has an `assigned_agent_id`; use the normal verify flow
+    * `{:error, :story_has_dispatch_lineage}` — story has a dispatch marker
+      (`assigned_agent_id`, `implementer_dispatch_id`, or `verifier_dispatch_id`);
+      use the normal report/review/verify flow
+    * `{:error, :story_in_progress}` — story is mid-lifecycle (e.g. `:contracted`)
+      with no dispatch lineage yet; it is being worked, not pre-existing done work
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -1110,6 +1121,7 @@ defmodule Loopctl.Progress do
              | :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_in_progress
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
@@ -1265,22 +1277,29 @@ defmodule Loopctl.Progress do
 
   defp handle_backfill_success(story), do: {:ok, story}
 
-  # Backfill is ONLY for stories that never entered loopctl's dispatch lifecycle.
-  # The refusal conditions are:
+  # Backfill / bulk mark-complete is ONLY for stories that never entered loopctl's
+  # dispatch lifecycle. "Never dispatched" is defined by the ABSENCE of dispatch
+  # markers (assigned_agent_id, implementer_dispatch_id, verifier_dispatch_id) —
+  # NOT by agent_status == :pending. This matters because a story imported with
+  # `initial_agent_status: "reported_done"` (or a prior mark-complete) is
+  # never-dispatched work sitting at agent_status == :reported_done with NULL
+  # dispatch markers; backfill/mark-complete must remain its correct remediation
+  # (it sets verified_status without needing an agent, preserving reported_done_at
+  # provenance). Without this, INVARIANT 1's custody-orphaned guard would strand
+  # such a story — verify/review fail closed AND backfill wrongly refused.
   #
-  #   - verified (nothing to do)
-  #   - rejected (investigate, don't paper over)
-  #   - agent_status is past :pending (contract/claim/start/report all indicate
-  #     an agent engaged with this story)
-  #   - any dispatch lineage field is set (implementer_dispatch_id,
-  #     verifier_dispatch_id). These are the "ever-dispatched" markers that
-  #     force_unclaim_story does NOT clear — relying on assigned_agent_id alone
-  #     is bypassable via force_unclaim → backfill.
+  # Refusal conditions, in order:
+  #   - verified (nothing to do) / rejected (investigate, don't paper over)
+  #   - ANY dispatch marker set — genuine dispatch lineage; use the normal
+  #     report → review → verify flow. These are the "ever-dispatched" markers
+  #     force_unclaim_story does NOT clear, so relying on assigned_agent_id alone
+  #     is bypassable; all three are checked.
+  #   - otherwise, only :pending or :reported_done (never-dispatched) are
+  #     backfillable; a story mid-lifecycle (:contracted with no dispatch yet) is
+  #     being worked, not pre-existing done work — an ACCURATE reason, not a false
+  #     "dispatch lineage" claim.
   defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
   defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
-
-  defp guard_backfillable(%{agent_status: status}) when status != :pending,
-    do: {:error, :story_has_dispatch_lineage}
 
   defp guard_backfillable(%{assigned_agent_id: agent_id}) when not is_nil(agent_id),
     do: {:error, :story_has_dispatch_lineage}
@@ -1291,7 +1310,10 @@ defmodule Loopctl.Progress do
   defp guard_backfillable(%{verifier_dispatch_id: id}) when not is_nil(id),
     do: {:error, :story_has_dispatch_lineage}
 
-  defp guard_backfillable(_story), do: {:ok, :ok}
+  # No dispatch markers from here down.
+  defp guard_backfillable(%{agent_status: :pending}), do: {:ok, :ok}
+  defp guard_backfillable(%{agent_status: :reported_done}), do: {:ok, :ok}
+  defp guard_backfillable(_story), do: {:error, :story_in_progress}
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()
@@ -1602,6 +1624,7 @@ defmodule Loopctl.Progress do
       # this is the defense-in-depth backstop. Backfilled stories are already
       # verified and never reach here.)
       custody_orphaned?(story) ->
+        log_custody_orphaned(story, orchestrator_agent_id, "verify")
         {:error, :missing_assigned_agent}
 
       # Lineage-based check (preferred): compare dispatch lineage paths
@@ -1646,6 +1669,20 @@ defmodule Loopctl.Progress do
        do: true
 
   defp custody_orphaned?(_story), do: false
+
+  # Observability for INVARIANT 1: emit a warning (no tenant halt, unlike the
+  # byzantine self_verify path) whenever the custody-orphaned guard fires, so
+  # operators can distinguish a broken import batch (recoverable via
+  # backfill/mark-complete) from a probing attempt. Includes story + tenant +
+  # calling identity.
+  defp log_custody_orphaned(%Story{} = story, caller_agent_id, operation) do
+    Logger.warning(
+      "custody_orphaned_blocked: #{operation} blocked — reported_done story has no " <>
+        "assigned agent or dispatch lineage (custody chain broken) " <>
+        "story_id=#{story.id} tenant_id=#{story.tenant_id} " <>
+        "caller_agent_id=#{inspect(caller_agent_id)}"
+    )
+  end
 
   defp validate_verifiable(story) do
     cond do
@@ -2098,6 +2135,7 @@ defmodule Loopctl.Progress do
       # of reviewer identity (including nil human reviewers). Backstops the DB
       # CHECK stories_reported_done_requires_agent.
       custody_orphaned?(story) ->
+        log_custody_orphaned(story, reviewer_agent_id, "review")
         {:error, :missing_assigned_agent}
 
       # nil reviewer_agent_id: this is a human operator (user-role key with no
