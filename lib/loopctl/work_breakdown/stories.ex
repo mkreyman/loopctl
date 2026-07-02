@@ -246,7 +246,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     stories =
       base_query
-      |> order_by([s], asc: s.sort_key)
+      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+      # never skips or duplicates rows sharing a sort_key.
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -292,7 +294,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     stories =
       base_query
-      |> order_by([s], asc: s.sort_key)
+      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+      # never skips or duplicates rows sharing a sort_key.
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^limit)
       |> offset(^offset)
       |> AdminRepo.all()

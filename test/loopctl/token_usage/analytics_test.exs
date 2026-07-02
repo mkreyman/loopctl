@@ -534,4 +534,116 @@ defmodule Loopctl.TokenUsage.AnalyticsTest do
       assert result.data == []
     end
   end
+
+  # --- tokens-07: stable ranked/paginated metrics with a unique tiebreaker ---
+  #
+  # agent_metrics ranks by integer avg-cost-per-story (SUM/COUNT) and model_metrics
+  # ranks by total cost. Both make ties common. Without a unique final sort term
+  # (agent_id / model_name), OFFSET pagination skips/duplicates tied rows across
+  # pages and efficiency_rank is nondeterministic run-to-run. These tests would
+  # fail on the pre-fix order_by.
+
+  describe "tokens-07: agent_metrics is stable when avg cost per story ties" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # Two agents, each with exactly one story costing 1000 millicents ->
+      # identical avg_cost_per_story (1000) -> a rank/pagination tie.
+      agent_ids =
+        for i <- 1..2 do
+          agent = fixture(:agent, %{tenant_id: tenant.id, name: "agent-#{i}"})
+
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: epic.id,
+              project_id: project.id,
+              number: "#{i}.1"
+            })
+
+          fixture(:token_usage_report, %{
+            tenant_id: tenant.id,
+            story_id: story.id,
+            agent_id: agent.id,
+            project_id: project.id,
+            model_name: "model-x",
+            input_tokens: 100,
+            output_tokens: 50,
+            cost_millicents: 1000,
+            phase: "implementing"
+          })
+
+          agent.id
+        end
+
+      %{tenant: tenant, agent_ids: agent_ids}
+    end
+
+    test "page 1 + page 2 cover every tied agent exactly once", %{
+      tenant: tenant,
+      agent_ids: agent_ids
+    } do
+      {:ok, page1} = Analytics.agent_metrics(tenant.id, page: 1, page_size: 1)
+      {:ok, page2} = Analytics.agent_metrics(tenant.id, page: 2, page_size: 1)
+
+      # Confirm the tie actually exists.
+      assert Enum.all?(page1.data ++ page2.data, &(&1.avg_cost_per_story_millicents == 1000))
+
+      collected = Enum.map(page1.data ++ page2.data, & &1.agent_id)
+      assert length(collected) == 2
+      assert MapSet.new(collected) == MapSet.new(agent_ids)
+    end
+
+    test "efficiency_rank is deterministic across repeated calls", %{tenant: tenant} do
+      {:ok, first} = Analytics.agent_metrics(tenant.id, page_size: 20)
+      {:ok, second} = Analytics.agent_metrics(tenant.id, page_size: 20)
+
+      ranking = fn result -> Enum.map(result.data, &{&1.agent_id, &1.efficiency_rank}) end
+
+      assert ranking.(first) == ranking.(second)
+      # Ranks are the contiguous 1..N with no gaps/dupes on ties.
+      assert Enum.map(first.data, & &1.efficiency_rank) == [1, 2]
+    end
+  end
+
+  describe "tokens-07: model_metrics is stable when total cost ties" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Two models with identical total cost (1000 each) -> a sort tie on the
+      # `desc: sum(cost)` ordering.
+      for model <- ["model-alpha", "model-beta"] do
+        fixture(:token_usage_report, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          model_name: model,
+          input_tokens: 100,
+          output_tokens: 50,
+          cost_millicents: 1000,
+          phase: "implementing"
+        })
+      end
+
+      %{tenant: tenant}
+    end
+
+    test "page 1 + page 2 cover every tied model exactly once", %{tenant: tenant} do
+      {:ok, page1} = Analytics.model_metrics(tenant.id, page: 1, page_size: 1)
+      {:ok, page2} = Analytics.model_metrics(tenant.id, page: 2, page_size: 1)
+
+      collected = Enum.map(page1.data ++ page2.data, & &1.model_name)
+      assert length(collected) == 2
+      assert MapSet.new(collected) == MapSet.new(["model-alpha", "model-beta"])
+    end
+
+    test "model ordering is deterministic across repeated calls", %{tenant: tenant} do
+      {:ok, first} = Analytics.model_metrics(tenant.id, page_size: 20)
+      {:ok, second} = Analytics.model_metrics(tenant.id, page_size: 20)
+
+      assert Enum.map(first.data, & &1.model_name) == Enum.map(second.data, & &1.model_name)
+    end
+  end
 end
