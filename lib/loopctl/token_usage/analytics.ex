@@ -67,6 +67,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
       |> where([r], not is_nil(r.agent_id))
+      |> Report.exclude_stranded_corrections()
       |> apply_date_filters(opts)
       |> apply_project_filter(opts)
 
@@ -243,6 +244,7 @@ defmodule Loopctl.TokenUsage.Analytics do
           Report
           |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^project_id)
           |> where([r], is_nil(r.deleted_at))
+          |> Report.exclude_stranded_corrections()
           |> select([r], %{
             total_input_tokens: coalesce(sum(r.input_tokens), 0),
             total_output_tokens: coalesce(sum(r.output_tokens), 0),
@@ -311,6 +313,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       Report
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> apply_date_filters(opts)
       |> apply_project_filter(opts)
 
@@ -401,6 +404,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       Report
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> apply_date_filters(opts)
       |> apply_project_filter(opts)
 
@@ -500,6 +504,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       Report
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> apply_date_filters(opts)
       |> apply_project_filter(opts)
       |> apply_agent_filter(opts)
@@ -638,6 +643,7 @@ defmodule Loopctl.TokenUsage.Analytics do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.agent_id in ^agent_ids)
     |> where([r], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> apply_date_filters(opts)
     |> apply_project_filter(opts)
     |> group_by([r], [r.agent_id, r.model_name])
@@ -664,6 +670,7 @@ defmodule Loopctl.TokenUsage.Analytics do
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, _s], r.tenant_id == ^tenant_id)
     |> where([r, _s], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> where([_r, s], s.epic_id in ^epic_ids)
     |> group_by([_r, s], s.epic_id)
     |> select([r, s], %{
@@ -714,6 +721,7 @@ defmodule Loopctl.TokenUsage.Analytics do
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, _s], r.tenant_id == ^tenant_id)
     |> where([r, _s], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> where([_r, s], s.epic_id in ^epic_ids)
     |> group_by([r, s], [s.epic_id, r.model_name])
     |> select([r, s], %{
@@ -754,6 +762,7 @@ defmodule Loopctl.TokenUsage.Analytics do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^project_id)
     |> where([r], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> group_by([r], r.phase)
     |> select([r], %{
       phase: r.phase,
@@ -767,6 +776,7 @@ defmodule Loopctl.TokenUsage.Analytics do
     Report
     |> where([r], r.tenant_id == ^tenant_id and r.project_id == ^project_id)
     |> where([r], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> group_by([r], r.model_name)
     |> select([r], %{
       model_name: r.model_name,
@@ -826,6 +836,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       Report
       |> where([r], r.tenant_id == ^tenant_id and r.agent_id == ^agent_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> apply_date_filters(opts)
       |> apply_project_filter(opts)
 
@@ -984,6 +995,7 @@ defmodule Loopctl.TokenUsage.Analytics do
       |> where([r, _s], r.tenant_id == ^tenant_id)
       |> where([r, _s], is_nil(r.deleted_at))
       |> where([r, _s], not is_nil(r.agent_id))
+      |> Report.exclude_stranded_corrections()
       |> apply_model_date_filters(opts)
       |> apply_model_project_filter(opts)
       |> group_by([r, _s], r.agent_id)

@@ -352,7 +352,8 @@ defmodule Loopctl.TokenUsage do
     # Progress.validate_token_usage_ownership/2.
     with :ok <-
            validate_skill_version_ownership(tenant_id, correction_skill_version_id(attrs)),
-         {:ok, original} <- get_report(tenant_id, original_report_id) do
+         {:ok, original} <- get_report(tenant_id, original_report_id),
+         :ok <- validate_correctable(original) do
       correction_input_tokens = Map.get(attrs, :input_tokens, 0)
       correction_output_tokens = Map.get(attrs, :output_tokens, 0)
 
@@ -434,8 +435,21 @@ defmodule Loopctl.TokenUsage do
     end
   end
 
-  # Namespace for the per-story correction advisory lock (tokens-02).
-  @correction_lock_namespace 2_113_002
+  # Forbids correcting a correction (tokens-03 retention gap). Corrections may
+  # only target ORIGINAL reports (`corrects_report_id IS NULL`). Allowing chains
+  # (A <- B <- C ...) would let each new leaf perpetually block hard-delete of
+  # its parent — tokens-03's skip-if-referenced guard keys on the immediate
+  # successor — deferring the whole lineage (incl. the original) past retention
+  # forever. Bounding the chain to depth 1 (original <- correction) means the
+  # original is freed for hard-delete once its single correction expires.
+  defp validate_correctable(%Report{corrects_report_id: nil}), do: :ok
+
+  defp validate_correctable(%Report{}),
+    do: {:error, :unprocessable_entity, "cannot correct a correction"}
+
+  # Fixed 8-byte namespace tag folded into the correction lock key so a future,
+  # different-purpose advisory lock on the same story can't collide with this one.
+  @correction_lock_tag <<0x21, 0x13, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00>>
 
   # Serializes concurrent corrections for the SAME story so the "totals never go
   # negative" invariant holds under concurrency (tokens-02). Without it, two
@@ -448,12 +462,42 @@ defmodule Loopctl.TokenUsage do
   # pg_advisory_xact_lock is held until the transaction commits/rolls back, so
   # the second correction blocks until the first commits, then re-reads the
   # now-updated total and is correctly rejected (422) if it would over-subtract.
-  # Keyed on a fixed namespace + hash({tenant_id, story_id}); phash2/1 is bounded
-  # to 2^27-1 which fits a PostgreSQL int4 lock key.
   defp acquire_story_correction_lock(repo, tenant_id, story_id) do
-    key = :erlang.phash2({tenant_id, story_id})
-    repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@correction_lock_namespace, key])
+    key = correction_lock_key(tenant_id, story_id)
+    repo.query!("SELECT pg_advisory_xact_lock($1)", [key])
     {:ok, :locked}
+  end
+
+  @doc """
+  Derives the STABLE, release-independent signed 64-bit PostgreSQL advisory
+  lock key used to serialize concurrent corrections for a `(tenant_id,
+  story_id)` (tokens-02).
+
+  Public so tests can prove the exact key serializes across two real DB sessions.
+
+  NOT `:erlang.phash2` — its hashing can change across OTP releases, so during a
+  rolling deploy that bumps OTP two nodes could compute different keys for the
+  same story and fail to serialize. Byte XOR of the two decoded UUIDs (folded
+  with a fixed namespace tag) is pure and identical on every node/release.
+  """
+  @spec correction_lock_key(Ecto.UUID.t(), Ecto.UUID.t()) :: integer()
+  def correction_lock_key(tenant_id, story_id) do
+    <<story8::binary-8, _::binary>> = uuid_bytes(story_id)
+    <<tenant8::binary-8, _::binary>> = uuid_bytes(tenant_id)
+
+    <<signed::signed-64>> =
+      story8
+      |> :crypto.exor(tenant8)
+      |> :crypto.exor(@correction_lock_tag)
+
+    signed
+  end
+
+  defp uuid_bytes(uuid) do
+    case Ecto.UUID.dump(uuid) do
+      {:ok, bin} -> bin
+      :error -> <<0::128>>
+    end
   end
 
   # Validates that the sum of story totals + correction values >= 0.
@@ -1245,24 +1289,19 @@ defmodule Loopctl.TokenUsage do
   # Base query for reports that count toward story/epic/project totals and spend.
   #
   # A report counts when it is NOT soft-deleted AND, if it is a correction
-  # (`corrects_report_id` set), its original report is also NOT soft-deleted.
-  # The LEFT JOIN on the original (at most one row per correction, so sums do
-  # not fan out) lets a single predicate exclude a negative correction whose
-  # original was soft-deleted or expired — otherwise the surviving negative
-  # correction would strand and drive story/epic/project totals negative
-  # (tokens-04). Originals (`corrects_report_id IS NULL`) always count when live.
+  # (`corrects_report_id` set), its original report is also NOT soft-deleted —
+  # otherwise a surviving negative correction would strand and drive
+  # story/epic/project totals negative (tokens-04). The correction/original
+  # consistency predicate is centralized in
+  # `Report.exclude_stranded_corrections/1` (the single reusable builder shared
+  # with the analytics, rollup, and anomaly total queries) so no query drifts.
   defp countable_reports(tenant_id) do
     from(r in Report,
       as: :report,
-      left_join: orig in Report,
-      as: :original,
-      on: orig.id == r.corrects_report_id,
       where: r.tenant_id == ^tenant_id,
-      where: is_nil(r.deleted_at),
-      where:
-        is_nil(r.corrects_report_id) or
-          (not is_nil(orig.id) and is_nil(orig.deleted_at))
+      where: is_nil(r.deleted_at)
     )
+    |> Report.exclude_stranded_corrections()
   end
 
   defp spend_query(tenant_id, :story, scope_id) do

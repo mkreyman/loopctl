@@ -23,6 +23,8 @@ defmodule Loopctl.TokenUsage.Report do
 
   use Loopctl.Schema, soft_delete: true
 
+  import Ecto.Query, only: [where: 3]
+
   @type t :: %__MODULE__{}
 
   @phases ~w(planning implementing reviewing other)
@@ -144,6 +146,43 @@ defmodule Loopctl.TokenUsage.Report do
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:skill_version_id)
     |> foreign_key_constraint(:corrects_report_id)
+  end
+
+  @doc """
+  Composable query builder that excludes "stranded" correction rows from any
+  `token_usage_reports` aggregate/total query (tokens-04).
+
+  A report counts toward a total only when it is NOT a correction, OR its
+  referenced original is still live (present and not soft-deleted). Without
+  this, a negative correction survives after its original is soft-deleted or
+  expired and drives story/epic/project totals — and any derived spend/rollup —
+  negative.
+
+  This is the SINGLE reusable predicate every total-computing query pipes
+  through, so no query drifts back to a bare `is_nil(deleted_at)` filter. It is
+  expressed as a `where` on the FIRST query binding (a `token_usage_reports`
+  row) via a correlated `EXISTS`, so it composes onto any query — with or
+  without joins — without shifting positional bindings or fanning out sums.
+
+  The correlated subquery is tenant-scoped (`o.tenant_id = r.tenant_id`) as
+  defense-in-depth so it can never count against a cross-tenant original, even
+  under `AdminRepo` (BYPASSRLS).
+
+  Callers must still apply their own `is_nil(r.deleted_at)` filter; this only
+  adds the correction/original consistency predicate.
+  """
+  @spec exclude_stranded_corrections(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def exclude_stranded_corrections(query) do
+    where(
+      query,
+      [r],
+      is_nil(r.corrects_report_id) or
+        fragment(
+          "EXISTS (SELECT 1 FROM token_usage_reports o WHERE o.id = ? AND o.tenant_id = ? AND o.deleted_at IS NULL)",
+          r.corrects_report_id,
+          r.tenant_id
+        )
+    )
   end
 
   @metadata_max_bytes 65_536

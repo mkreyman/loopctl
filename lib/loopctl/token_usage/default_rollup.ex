@@ -39,6 +39,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
       Report
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> where([r], not is_nil(r.agent_id))
       |> group_by([r], r.agent_id)
@@ -75,6 +76,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
       |> join(:inner, [r], s in Story, on: r.story_id == s.id)
       |> where([r, _s], r.tenant_id == ^tenant_id)
       |> where([r, _s], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> group_by([_r, s], s.epic_id)
       |> select([r, s], %{
@@ -115,6 +117,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
       Report
       |> where([r], r.tenant_id == ^tenant_id)
       |> where([r], is_nil(r.deleted_at))
+      |> Report.exclude_stranded_corrections()
       |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
       |> where([r], not is_nil(r.project_id))
       |> group_by([r], r.project_id)
@@ -179,6 +182,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     |> where([r], r.agent_id in ^scope_ids)
     |> where([r], r.tenant_id == ^tenant_id)
     |> where([r], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> group_by([r], [r.agent_id, r.model_name, r.phase])
     |> select([r], %{
@@ -196,6 +200,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     |> join(:inner, [r], s in Story, on: r.story_id == s.id)
     |> where([r, _s], r.tenant_id == ^tenant_id)
     |> where([r, _s], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> where([r, _s], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> where([_r, s], s.epic_id in ^scope_ids)
     |> group_by([r, s], [s.epic_id, r.model_name, r.phase])
@@ -214,6 +219,7 @@ defmodule Loopctl.TokenUsage.DefaultRollup do
     |> where([r], r.project_id in ^scope_ids)
     |> where([r], r.tenant_id == ^tenant_id)
     |> where([r], is_nil(r.deleted_at))
+    |> Report.exclude_stranded_corrections()
     |> where([r], r.inserted_at >= ^start_dt and r.inserted_at <= ^end_dt)
     |> group_by([r], [r.project_id, r.model_name, r.phase])
     |> select([r], %{

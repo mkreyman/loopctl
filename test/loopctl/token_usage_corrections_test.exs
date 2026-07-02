@@ -603,7 +603,91 @@ defmodule Loopctl.TokenUsageCorrectionsTest do
   # tokens-02: concurrent correction validation cannot drive totals negative
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # tokens-03 retention gap: correction chains are bounded to depth 1
+  # ---------------------------------------------------------------------------
+
+  describe "create_correction/4 forbids correcting a correction (tokens-03)" do
+    test "correcting an ORIGINAL report succeeds" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      assert {:ok, _correction} =
+               TokenUsage.create_correction(tenant.id, original.id, %{
+                 input_tokens: -100,
+                 output_tokens: -50,
+                 cost_millicents: -250
+               })
+    end
+
+    test "correcting a CORRECTION returns 422 (bounds the chain to depth 1)" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      original = create_report(tenant.id, story, agent, project)
+
+      {:ok, correction} =
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: -100,
+          output_tokens: -50,
+          cost_millicents: -250
+        })
+
+      # A correction-of-a-correction would create an unbounded lineage
+      # (A <- B <- C ...) that defers hard-delete of the whole chain past
+      # retention forever. It must be rejected.
+      assert {:error, :unprocessable_entity, message} =
+               TokenUsage.create_correction(tenant.id, correction.id, %{
+                 input_tokens: -10,
+                 output_tokens: -5,
+                 cost_millicents: -25
+               })
+
+      assert message == "cannot correct a correction"
+
+      # No second-level correction row was written.
+      corrections_of_correction =
+        Report
+        |> where([r], r.corrects_report_id == ^correction.id)
+        |> AdminRepo.all()
+
+      assert corrections_of_correction == []
+    end
+  end
+
   describe "create_correction/4 concurrency safety (tokens-02)" do
+    test "concurrent corrections on the same story: exactly one wins, total never negative" do
+      %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
+      # story total: cost 2500. Two racing corrections of -2000 each would each
+      # pass validation against the PRE-correction total (2500 - 2000 = 500 >= 0)
+      # but together (2500 - 4000) are impossible. The per-story advisory lock
+      # serializes them so the loser re-reads the winner's committed total and is
+      # rejected — the total can never be driven negative.
+      original = create_report(tenant.id, story, agent, project)
+
+      corr = fn ->
+        TokenUsage.create_correction(tenant.id, original.id, %{
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_millicents: -2000
+        })
+      end
+
+      # Task.async propagates $callers, so the sandbox connection is shared with
+      # the racing tasks (mirrors orchestrator_test.exs optimistic-locking race).
+      results =
+        [Task.async(corr), Task.async(corr)]
+        |> Task.await_many(5_000)
+
+      successes = Enum.filter(results, &match?({:ok, _}, &1))
+      rejects = Enum.filter(results, &match?({:error, :unprocessable_entity, _}, &1))
+
+      assert length(successes) == 1
+      assert length(rejects) == 1
+
+      {:ok, totals} = TokenUsage.get_story_totals(tenant.id, story.id)
+      assert totals.total_cost_millicents == 500
+      assert totals.total_cost_millicents >= 0
+    end
+
     test "takes a per-story advisory lock so concurrent corrections serialize" do
       %{tenant: tenant, story: story, agent: agent, project: project} = setup_context()
       original = create_report(tenant.id, story, agent, project)
