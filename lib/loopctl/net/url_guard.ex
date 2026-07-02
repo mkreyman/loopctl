@@ -120,18 +120,47 @@ defmodule Loopctl.Net.UrlGuard do
   Builds Req options that connect to the pinned IP while preserving the original
   host for the `Host` header, TLS SNI, and certificate verification.
 
-  Returns `[url: connect_url, connect_options: [hostname: original_host]]`, where
-  `connect_url` has its authority rewritten to the validated IP literal (IPv6 is
-  bracketed). Merge this with the caller's method/body/headers and
-  `redirect: false`.
+  Returns `[url: connect_url, connect_options: [hostname: original_host],
+  headers: [{"host", host_header} | extra_headers]]`, where `connect_url` has its
+  authority rewritten to the validated IP literal (IPv6 bracketed).
+
+  The `Host` header is set EXPLICITLY rather than relying on Mint's default: for
+  an IPv6-pinned target, `Req.Finch.run/1` pre-injects `host` = the bracketed IPv6
+  *literal* (because the rewritten URL host contains `:` and `:inet6` is unset),
+  which would win over Mint's `put_new` Host and break vhost routing. Setting the
+  header here makes Req's `put_new_header` a no-op. The value mirrors Mint's
+  `default_host_header/1` (port suffix only when non-default for the scheme).
+
+  Pass the caller's own headers as `extra_headers`; they are appended after the
+  `Host` header. Merge the result with the caller's method/body/`redirect: false`.
   """
-  @spec pinned_request_opts(pinned()) :: keyword()
-  def pinned_request_opts(%{uri: uri, host: host, ip: ip}) do
+  @spec pinned_request_opts(pinned(), [{String.t(), String.t()}]) :: keyword()
+  def pinned_request_opts(pinned, extra_headers \\ [])
+
+  def pinned_request_opts(%{uri: uri, host: host, ip: ip}, extra_headers) do
     connect_url =
       %URI{uri | host: ip_literal(ip), authority: nil}
       |> URI.to_string()
 
-    [url: connect_url, connect_options: [hostname: host]]
+    host_header = {"host", host_header_value(host, uri.scheme, uri.port)}
+
+    [
+      url: connect_url,
+      connect_options: [hostname: host],
+      headers: [host_header | extra_headers]
+    ]
+  end
+
+  # Mirrors Mint.HTTP1.default_host_header/1: host only when the port is the
+  # scheme default, else "host:port". An IPv6-literal original host is bracketed.
+  defp host_header_value(host, scheme, port) do
+    bracketed = if String.contains?(host, ":"), do: "[" <> host <> "]", else: host
+
+    if URI.default_port(scheme) == port do
+      bracketed
+    else
+      "#{bracketed}:#{port}"
+    end
   end
 
   # --- scheme / host ---

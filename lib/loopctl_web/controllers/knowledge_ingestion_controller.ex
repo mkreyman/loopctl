@@ -185,9 +185,47 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     items = params["items"]
 
     with :ok <- validate_batch_items(items) do
-      results = Enum.map(items, &enqueue_item_result(tenant_id, &1))
+      results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
     end
+  end
+
+  # Bound the aggregate request time (worker-01 / GHSA-j7m9-ffmr-pwhm). Each item
+  # does bounded per-item DNS validation (A+AAAA), but a serial Enum.map over up
+  # to @batch_max (50) items could still tie up a web worker for minutes on
+  # unresponsive nameservers. Task.async_stream caps concurrency AND imposes a
+  # per-item wall-clock deadline; a hung item is killed and mapped to a
+  # validation_timeout error, so the whole request is bounded regardless of any
+  # single hanging item. Ordering + per-item result shape are preserved.
+  #
+  # tenant_id is passed explicitly into each task (no process-dict/RLS state is
+  # relied on); Ecto Sandbox + Mox resolve via the `$callers` chain that
+  # Task.async_stream propagates.
+  defp process_batch_items(tenant_id, items) do
+    items
+    |> Task.async_stream(
+      fn item -> enqueue_item_result(tenant_id, item) end,
+      max_concurrency: 10,
+      timeout: batch_item_timeout_ms(),
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.map(fn
+      {:ok, result} -> result
+      {:exit, :timeout} -> %{status: "error", error: "validation_timeout"}
+      {:exit, _reason} -> %{status: "error", error: "validation_failed"}
+    end)
+  end
+
+  # Per-item wall-clock deadline for batch validation. Config-based DI so the
+  # timeout path is testable deterministically without a multi-second wait.
+  @default_batch_item_timeout_ms 5_000
+  defp batch_item_timeout_ms do
+    Application.get_env(
+      :loopctl,
+      :batch_item_validation_timeout_ms,
+      @default_batch_item_timeout_ms
+    )
   end
 
   operation(:index,

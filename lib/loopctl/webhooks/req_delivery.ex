@@ -24,12 +24,14 @@ defmodule Loopctl.Webhooks.ReqDelivery do
   end
 
   defp do_deliver(pinned, body, headers) do
+    # Fold the caller's headers into pinned_request_opts so the explicit `Host`
+    # header it sets is preserved (a plain `Keyword.merge(headers: ...)` would
+    # clobber it).
     req_opts =
-      UrlGuard.pinned_request_opts(pinned)
+      UrlGuard.pinned_request_opts(pinned, headers)
       |> Keyword.merge(
         method: :post,
         body: body,
-        headers: headers,
         receive_timeout: 10_000,
         retry: false,
         # Never follow redirects — a 302 hop would re-enter an unvalidated URL,

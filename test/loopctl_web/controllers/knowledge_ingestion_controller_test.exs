@@ -392,6 +392,35 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert json_response(conn, 403)
     end
 
+    # FIX 2 (worker-01 / GHSA-j7m9-ffmr-pwhm): a batch of URL items pointing at an
+    # unresponsive nameserver must NOT tie up the request. Task.async_stream caps
+    # each item at the (test-configured, short) per-item deadline and maps a hung
+    # item to a validation_timeout error instead of hanging the whole batch.
+    test "bounds the batch when the resolver hangs (validation_timeout, no hang)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Resolver never returns → each item's pin exceeds the per-item deadline and
+      # is killed. (Reaches the task via the $callers chain async_stream sets.)
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> Process.sleep(:infinity) end)
+
+      items = [
+        %{url: "https://slow-a.example.com/x", source_type: "web_article"},
+        %{url: "https://slow-b.example.com/x", source_type: "web_article"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 2
+      assert Enum.all?(body["data"], &(&1["status"] == "error"))
+      assert Enum.all?(body["data"], &(&1["error"] == "validation_timeout"))
+    end
+
     test "tenant isolation: tenant A cannot see tenant B's batch jobs", %{conn: conn} do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)

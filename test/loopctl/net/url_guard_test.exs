@@ -188,6 +188,43 @@ defmodule Loopctl.Net.UrlGuardTest do
       assert opts[:url] == "https://93.184.216.34:8443/deliver?q=1"
       # ...but the original host is preserved for Host header / TLS SNI / cert.
       assert opts[:connect_options] == [hostname: "hooks.example.com"]
+      # Explicit Host header (non-default port → suffix) so Req's put_new_header
+      # can't inject the IP literal.
+      assert opts[:headers] == [{"host", "hooks.example.com:8443"}]
+    end
+
+    test "sets an explicit Host header with no suffix on the default port" do
+      expect(Loopctl.MockDnsResolver, :resolve, fn "hooks.example.com" ->
+        {:ok, [{93, 184, 216, 34}]}
+      end)
+
+      assert {:ok, pinned} = UrlGuard.pin("https://hooks.example.com/deliver")
+      opts = UrlGuard.pinned_request_opts(pinned)
+      assert opts[:headers] == [{"host", "hooks.example.com"}]
+    end
+
+    test "IPv6-pinned target keeps the original hostname in the Host header (FIX 1)" do
+      # Regression: a hostname resolving to an IPv6-only address must NOT send
+      # `Host: [::1]`-style IP literals. Host header stays the hostname.
+      expect(Loopctl.MockDnsResolver, :resolve, fn "v6only.example.com" ->
+        {:ok, [{0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1}]}
+      end)
+
+      assert {:ok, pinned} = UrlGuard.pin("https://v6only.example.com/deliver")
+      opts = UrlGuard.pinned_request_opts(pinned)
+      # Connect to the pinned v6 literal (bracketed in the URL)...
+      assert opts[:url] == "https://[2606:2800:220:1::1]/deliver"
+      # ...but Host header + SNI stay the hostname.
+      assert opts[:connect_options] == [hostname: "v6only.example.com"]
+      assert opts[:headers] == [{"host", "v6only.example.com"}]
+    end
+
+    test "appends caller headers after the Host header" do
+      expect(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{93, 184, 216, 34}]} end)
+
+      assert {:ok, pinned} = UrlGuard.pin("https://hooks.example.com/x")
+      opts = UrlGuard.pinned_request_opts(pinned, [{"x-sig", "abc"}])
+      assert opts[:headers] == [{"host", "hooks.example.com"}, {"x-sig", "abc"}]
     end
 
     test "resolves the host exactly once (nothing left to rebind)" do
@@ -204,6 +241,8 @@ defmodule Loopctl.Net.UrlGuardTest do
       opts = UrlGuard.pinned_request_opts(pinned)
       assert opts[:url] == "https://[2606:2800:220:1::1]/x"
       assert opts[:connect_options] == [hostname: "2606:2800:220:1::1"]
+      # An IPv6-literal original host is bracketed in the Host header too.
+      assert opts[:headers] == [{"host", "[2606:2800:220:1::1]"}]
     end
 
     test "an IP-literal URL pins to itself" do
@@ -211,6 +250,7 @@ defmodule Loopctl.Net.UrlGuardTest do
       opts = UrlGuard.pinned_request_opts(pinned)
       assert opts[:url] == "https://93.184.216.34/hooks"
       assert opts[:connect_options] == [hostname: "93.184.216.34"]
+      assert opts[:headers] == [{"host", "93.184.216.34"}]
     end
 
     test "pin/1 rejects a blocked host (same checks as validate_egress)" do

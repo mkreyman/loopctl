@@ -312,6 +312,11 @@ config :loopctl, :dns_resolver, Loopctl.MockDnsResolver
 # lookup can't hang the suite.
 config :loopctl, :dns_resolve_timeout_ms, 2_000
 
+# Batch ingestion per-item validation deadline (FIX 2). Short in tests so the
+# validation_timeout path (a stubbed slow/failing resolver) is exercised in
+# ~200ms instead of the 5s production default. Config-based DI — no put_env.
+config :loopctl, :batch_item_validation_timeout_ms, 200
+
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
 # is unit-tested with deterministic candidate lists — never through the real pgvector kNN,
