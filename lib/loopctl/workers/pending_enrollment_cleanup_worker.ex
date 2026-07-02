@@ -28,10 +28,14 @@ defmodule Loopctl.Workers.PendingEnrollmentCleanupWorker do
       DateTime.utc_now()
       |> DateTime.add(-Tenants.pending_enrollment_ttl_seconds(), :second)
 
-    # Fetch the abandoned tenants first so we can log their IDs,
-    # then delete. SELECT + DELETE is safe here because no other
-    # process transitions tenants OUT of :pending_enrollment except
-    # the signup Multi (which sets :active atomically).
+    # Fetch the abandoned tenants first purely so we can log their IDs.
+    # The SELECT is observability only — it is NOT a source of truth for
+    # the DELETE. A tenant whose WebAuthn activation Multi commits in the
+    # (sub-millisecond) window between this SELECT and the DELETE below
+    # would flip to `:active`; re-selecting by id alone would then destroy
+    # a legitimately-activated tenant. So `delete_abandoned/2` re-checks
+    # the FULL predicate (`:pending_enrollment` AND older than the cutoff)
+    # atomically at delete time — an activated tenant is excluded.
     abandoned =
       from(t in Tenant,
         where: t.status == :pending_enrollment,
@@ -43,15 +47,38 @@ defmodule Loopctl.Workers.PendingEnrollmentCleanupWorker do
     if abandoned != [] do
       ids = Enum.map(abandoned, & &1.id)
 
-      {deleted_count, _} =
-        from(t in Tenant, where: t.id in ^ids)
-        |> AdminRepo.delete_all()
+      {deleted_count, _} = delete_abandoned(ids, cutoff)
 
       Logger.warning(
-        "PendingEnrollmentCleanupWorker deleted #{deleted_count} abandoned signup tenants: #{inspect(ids)}"
+        "PendingEnrollmentCleanupWorker deleted #{deleted_count} abandoned " <>
+          "signup tenants (of #{length(ids)} candidates): #{inspect(ids)}"
       )
     end
 
     :ok
+  end
+
+  @doc """
+  Atomically deletes the candidate tenants that are STILL abandoned.
+
+  The DELETE re-checks the full abandonment predicate — `:pending_enrollment`
+  status AND `inserted_at` older than `cutoff` — bounded to the observed
+  `ids`. This closes the SELECT-then-DELETE race: a candidate that activated
+  (or was otherwise transitioned out of `:pending_enrollment`) after the
+  observing SELECT no longer matches and is left untouched. Deleting a still
+  pending tenant cascades to its `root_authenticators` / reauth challenges via
+  `on_delete: :delete_all`, which is the intended cleanup of an abandoned
+  ceremony.
+
+  Returns the `{count, nil}` tuple from `delete_all/1`.
+  """
+  @spec delete_abandoned([binary()], DateTime.t()) :: {non_neg_integer(), nil}
+  def delete_abandoned(ids, cutoff) do
+    from(t in Tenant,
+      where: t.id in ^ids,
+      where: t.status == :pending_enrollment,
+      where: t.inserted_at < ^cutoff
+    )
+    |> AdminRepo.delete_all()
   end
 end

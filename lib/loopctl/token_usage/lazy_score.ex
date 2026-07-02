@@ -32,6 +32,13 @@ defmodule Loopctl.TokenUsage.LazyScore do
   """
   @spec compute(map()) :: {float(), [String.t()]}
   def compute(metrics) do
+    # `estimated_hours` is `:decimal` in the Story schema, so a caller reading
+    # it schemaless (or straight off the struct) can hand us a %Decimal{}. The
+    # factor checks + small-story exemption below guard on `is_number/1`, which
+    # a %Decimal{} fails — silently disabling those signals. Normalize to a
+    # plain float once, up front, so every downstream check sees a number.
+    metrics = normalize_estimated_hours(metrics)
+
     factors = [
       check_token_ratio(metrics),
       check_tool_calls(metrics),
@@ -65,6 +72,19 @@ defmodule Loopctl.TokenUsage.LazyScore do
   @doc "Returns true if the score exceeds the re-review threshold."
   @spec flagged?(float()) :: boolean()
   def flagged?(score), do: score > @threshold
+
+  # Coerce a %Decimal{} `estimated_hours` to a float so the numeric guards in
+  # the factor checks and the small-story exemption engage. nil and existing
+  # numbers pass through untouched.
+  defp normalize_estimated_hours(metrics) do
+    case Map.get(metrics, :estimated_hours) do
+      %Decimal{} = decimal ->
+        Map.put(metrics, :estimated_hours, Decimal.to_float(decimal))
+
+      _ ->
+        metrics
+    end
+  end
 
   # --- Factor checks ---
 
