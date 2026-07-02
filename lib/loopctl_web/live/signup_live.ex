@@ -168,8 +168,11 @@ defmodule LoopctlWeb.SignupLive do
 
   @impl true
   def handle_event("attestation_error", %{"reason" => reason}, socket) do
+    # Validate that reason is a string before passing to Logger
+    reason_str = if is_binary(reason), do: reason, else: "unknown"
+
     message =
-      case reason do
+      case reason_str do
         "webauthn_unsupported" ->
           "This browser does not support WebAuthn — try Safari, Chrome, or Firefox"
 
@@ -177,7 +180,7 @@ defmodule LoopctlWeb.SignupLive do
           "The browser returned no credential — please try again"
 
         _ ->
-          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason)}")
+          Logger.warning("WebAuthn ceremony failed with client reason: #{inspect(reason_str)}")
           "Authenticator ceremony failed. Please retry."
       end
 
@@ -186,10 +189,17 @@ defmodule LoopctlWeb.SignupLive do
 
   @impl true
   def handle_event("remove_authenticator", %{"index" => index}, socket) do
-    index = String.to_integer(index)
+    # Parse index safely; ignore request if parsing fails
+    case Integer.parse(index) do
+      {idx, ""} when is_integer(idx) and idx >= 0 ->
+        new_auths = List.delete_at(socket.assigns.authenticators, idx)
+        {:noreply, assign(socket, :authenticators, new_auths)}
 
-    new_auths = List.delete_at(socket.assigns.authenticators, index)
-    {:noreply, assign(socket, :authenticators, new_auths)}
+      _ ->
+        # Invalid index format — silently ignore (don't remove anything)
+        Logger.warning("Invalid authenticator index received: #{inspect(index)}")
+        {:noreply, socket}
+    end
   end
 
   @impl true
