@@ -18,6 +18,7 @@ defmodule Loopctl.WebAuthn.ReauthTest do
   alias Loopctl.Tenants.RootAuthenticators
   alias Loopctl.WebAuthn.Reauth
   alias Loopctl.WebAuthn.ReauthChallenge
+  alias Loopctl.WebAuthn.Wax, as: WaxAdapter
 
   setup :verify_on_exit!
 
@@ -34,6 +35,38 @@ defmodule Loopctl.WebAuthn.ReauthTest do
       },
       overrides
     )
+  end
+
+  # Builds a REAL FIDO2 assertion: syntactically valid authenticator_data +
+  # client_data_json bound to `challenge_bytes`, signed over
+  # `authData <> SHA256(clientDataJSON)` with the ES256 private key — exactly what
+  # Wax.authenticate/6 verifies. rp_id/origin match config/test.exs (localhost).
+  defp signed_assertion(challenge_id, credential_id, priv, challenge_bytes, sign_count) do
+    rp_id = "localhost"
+    origin = "http://localhost:4002"
+
+    # rp_id_hash(32) <> flags(UP|UV = 0x05) <> sign_count(4, big-endian). No
+    # attested credential data on an assertion, so the AT flag stays 0.
+    auth_data =
+      :crypto.hash(:sha256, rp_id) <> <<0x05>> <> <<sign_count::unsigned-big-integer-size(32)>>
+
+    client_data_json =
+      Jason.encode!(%{
+        "type" => "webauthn.get",
+        "challenge" => Base.url_encode64(challenge_bytes, padding: false),
+        "origin" => origin
+      })
+
+    message = auth_data <> :crypto.hash(:sha256, client_data_json)
+    signature = :crypto.sign(:ecdsa, :sha256, message, [priv, :secp256r1])
+
+    %{
+      "challenge_id" => challenge_id,
+      "credential_id" => Base.url_encode64(credential_id, padding: false),
+      "authenticator_data" => Base.url_encode64(auth_data, padding: false),
+      "signature" => Base.url_encode64(signature, padding: false),
+      "client_data_json" => Base.url_encode64(client_data_json, padding: false)
+    }
   end
 
   describe "issue_challenge/2" do
@@ -194,6 +227,133 @@ defmodule Loopctl.WebAuthn.ReauthTest do
 
       {:ok, reloaded} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
       assert reloaded.sign_count == 4
+    end
+  end
+
+  describe "verify_and_consume/3 — real Wax adapter (end-to-end crypto)" do
+    # Delegate the mock to the REAL Loopctl.WebAuthn.Wax adapter for this block so
+    # the full FIDO2 verification runs against genuine ES256 crypto — WITHOUT
+    # Application.put_env. This is the class of bug a mock-only suite cannot catch
+    # (crypto-01 CRITICAL): with the pre-fix code (raw COSE key embedded in the
+    # challenge's allow_credentials) every one of these {:ok, _} assertions FAILS.
+    setup do
+      stub(Loopctl.MockWebAuthn, :new_authentication_challenge, fn opts ->
+        WaxAdapter.new_authentication_challenge(opts)
+      end)
+
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn payload, challenge, opts ->
+        WaxAdapter.verify_authentication(payload, challenge, opts)
+      end)
+
+      # Synthetic P-256 / ES256 keypair enrolled exactly as production stores it.
+      {pub_point, priv} = :crypto.generate_key(:ecdh, :secp256r1)
+      <<4, x::binary-size(32), y::binary-size(32)>> = pub_point
+      cose_key = %{1 => 2, 3 => -7, -1 => 1, -2 => x, -3 => y}
+
+      tenant = fixture(:tenant)
+      credential_id = :crypto.strong_rand_bytes(16)
+
+      fixture(:root_authenticator,
+        tenant_id: tenant.id,
+        credential_id: credential_id,
+        public_key: :erlang.term_to_binary(cose_key),
+        sign_count: 0
+      )
+
+      %{tenant: tenant, credential_id: credential_id, priv: priv}
+    end
+
+    test "accepts a genuine ES256 signature and persists the counter", ctx do
+      {:ok, issued} = Reauth.issue_challenge(ctx.tenant.id, @purpose)
+      challenge_bytes = Base.url_decode64!(issued.challenge, padding: false)
+
+      params =
+        signed_assertion(issued.challenge_id, ctx.credential_id, ctx.priv, challenge_bytes, 1)
+
+      assert {:ok, result} = Reauth.verify_and_consume(ctx.tenant.id, @purpose, params)
+      assert result.sign_count == 1
+
+      {:ok, reloaded} = RootAuthenticators.get_by_credential_id(ctx.tenant.id, ctx.credential_id)
+      assert reloaded.sign_count == 1
+    end
+
+    test "rejects a signature from the wrong key (tampered), key not rotated", ctx do
+      {:ok, issued} = Reauth.issue_challenge(ctx.tenant.id, @purpose)
+      challenge_bytes = Base.url_decode64!(issued.challenge, padding: false)
+
+      # A well-formed DER signature from a DIFFERENT key — fails verification cleanly.
+      {_wrong_pub, wrong_priv} = :crypto.generate_key(:ecdh, :secp256r1)
+
+      params =
+        signed_assertion(issued.challenge_id, ctx.credential_id, wrong_priv, challenge_bytes, 1)
+
+      assert {:error, _} = Reauth.verify_and_consume(ctx.tenant.id, @purpose, params)
+
+      {:ok, reloaded} = RootAuthenticators.get_by_credential_id(ctx.tenant.id, ctx.credential_id)
+      assert reloaded.sign_count == 0
+    end
+
+    test "rejects a valid signature bound to the WRONG challenge", ctx do
+      {:ok, issued} = Reauth.issue_challenge(ctx.tenant.id, @purpose)
+
+      # Sign over random challenge bytes that don't match the stored challenge.
+      wrong_bytes = :crypto.strong_rand_bytes(32)
+
+      params =
+        signed_assertion(issued.challenge_id, ctx.credential_id, ctx.priv, wrong_bytes, 1)
+
+      assert {:error, _} = Reauth.verify_and_consume(ctx.tenant.id, @purpose, params)
+    end
+  end
+
+  describe "atomic sign-counter enforcement" do
+    test "a replayed counter is rejected while a strictly-increasing one persists" do
+      tenant = fixture(:tenant)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 0)
+
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:ok, %{sign_count: 5}}
+      end)
+
+      {:ok, i1} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      assert {:ok, _} =
+               Reauth.verify_and_consume(
+                 tenant.id,
+                 @purpose,
+                 assertion_params(i1.challenge_id, auth.credential_id)
+               )
+
+      {:ok, r1} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
+      assert r1.sign_count == 5
+
+      # Second assertion carrying the SAME counter (replay/clone) — the atomic
+      # conditional UPDATE matches 0 rows (5 < 5 is false) and rejects.
+      {:ok, i2} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      assert {:error, :counter_regression} =
+               Reauth.verify_and_consume(
+                 tenant.id,
+                 @purpose,
+                 assertion_params(i2.challenge_id, auth.credential_id)
+               )
+
+      # A strictly-greater counter is accepted and persisted.
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn _p, _c, _o ->
+        {:ok, %{sign_count: 6}}
+      end)
+
+      {:ok, i3} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      assert {:ok, _} =
+               Reauth.verify_and_consume(
+                 tenant.id,
+                 @purpose,
+                 assertion_params(i3.challenge_id, auth.credential_id)
+               )
+
+      {:ok, r3} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
+      assert r3.sign_count == 6
     end
   end
 

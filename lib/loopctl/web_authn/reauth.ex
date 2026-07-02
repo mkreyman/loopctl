@@ -89,13 +89,19 @@ defmodule Loopctl.WebAuthn.Reauth do
   defp do_issue_challenge(tenant_id, purpose, authenticators) do
     rp_opts = WebAuthn.rp_opts()
 
-    allow_credentials =
-      Enum.map(authenticators, fn auth -> {auth.credential_id, auth.public_key} end)
-
-    challenge =
-      rp_opts
-      |> Keyword.put(:allow_credentials, allow_credentials)
-      |> WebAuthn.new_authentication_challenge()
+    # crypto-01: do NOT embed :allow_credentials in the PERSISTED challenge. The
+    # stored `public_key` is raw `:erlang.term_to_binary(cose_map)` bytes; embedding
+    # those verbatim into `%Wax.Challenge{}.allow_credentials` makes Wax use the raw
+    # binary AS the COSE key (its non-empty allow_credentials branch wins over the
+    # correctly-decoded 6th-arg credentials), so `Wax.CoseKey.verify` hits its
+    # unsupported-algorithm catch-all and ALWAYS rejects — even a valid signature.
+    # The enrolled credentials are supplied (decoded) ONLY at verify time via the
+    # adapter's `:allow_credentials` opt, which is Wax's documented
+    # self-discoverable-credentials contract (the 6th arg is consulted exactly when
+    # `challenge.allow_credentials == []`). The client still receives the allowed
+    # credential ids below — built independently from `authenticators`, NOT from the
+    # challenge struct.
+    challenge = WebAuthn.new_authentication_challenge(rp_opts)
 
     expires_at =
       DateTime.utc_now() |> DateTime.add(@challenge_ttl_seconds, :second)
@@ -169,7 +175,6 @@ defmodule Loopctl.WebAuthn.Reauth do
              challenge,
              allow_credentials: [{authenticator.credential_id, authenticator.public_key}]
            ),
-         :ok <- check_counter(authenticator.sign_count, new_count),
          {:ok, updated} <- persist_counter(authenticator, new_count) do
       {:ok, %{signature: signature, sign_count: new_count, authenticator: updated}}
     else
@@ -209,22 +214,33 @@ defmodule Loopctl.WebAuthn.Reauth do
 
   defp assert_consumed(_repo, _changes), do: {:error, :challenge_not_found}
 
-  # WebAuthn §7.2 step 17: reject cloned/replayed authenticators. A counter
-  # of 0/0 means the authenticator does not implement a signature counter,
-  # which the spec permits; otherwise the new counter must strictly exceed
-  # the stored one.
-  defp check_counter(stored, new) when is_integer(stored) and is_integer(new) do
-    cond do
-      new == 0 and stored == 0 -> :ok
-      new > stored -> :ok
-      true -> {:error, :counter_regression}
-    end
-  end
+  # crypto-01: ATOMIC counter check-and-persist. A single conditional UPDATE both
+  # enforces monotonicity and persists the new counter, closing the TOCTOU where
+  # two concurrent assertions from a cloned/replayed authenticator both read the
+  # old counter, both pass a separate check, and both rotate. 0 rows affected ⇒
+  # the counter did not strictly advance (clone/replay) ⇒ reject.
+  #
+  # WebAuthn §7.2 step 21: a stored/new counter of 0/0 means the authenticator
+  # implements no signature counter, which the spec permits — the `sign_count == 0`
+  # branch accepts that (and touches `last_used_at`) while still rejecting a drop
+  # from a previously-nonzero counter back to 0 (clone signal).
+  defp persist_counter(%RootAuthenticator{} = authenticator, new_count)
+       when is_integer(new_count) and new_count >= 0 do
+    now = DateTime.utc_now()
 
-  defp persist_counter(%RootAuthenticator{} = authenticator, new_count) do
-    authenticator
-    |> RootAuthenticator.touch_changeset(new_count)
-    |> AdminRepo.update()
+    query =
+      if new_count == 0 do
+        from(a in RootAuthenticator, where: a.id == ^authenticator.id and a.sign_count == 0)
+      else
+        from(a in RootAuthenticator,
+          where: a.id == ^authenticator.id and a.sign_count < ^new_count
+        )
+      end
+
+    case AdminRepo.update_all(query, set: [sign_count: new_count, last_used_at: now]) do
+      {1, _} -> {:ok, %{authenticator | sign_count: new_count, last_used_at: now}}
+      {0, _} -> {:error, :counter_regression}
+    end
   end
 
   defp fetch_uuid(params, key) do
