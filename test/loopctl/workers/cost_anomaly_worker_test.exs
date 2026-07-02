@@ -4,6 +4,7 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
@@ -74,6 +75,25 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
     end
 
     report
+  end
+
+  # Adds a (possibly over-correcting) negative correction report that references
+  # a live original, so the story's net cumulative cost can be driven negative.
+  defp add_correction(tenant, story, agent, epic, original_id, cost_millicents) do
+    %Report{
+      tenant_id: tenant.id,
+      story_id: story.id,
+      agent_id: agent.id,
+      project_id: epic.project_id,
+      corrects_report_id: original_id
+    }
+    |> Report.correction_changeset(%{
+      input_tokens: 0,
+      output_tokens: 0,
+      model_name: "claude-opus-4",
+      cost_millicents: cost_millicents
+    })
+    |> AdminRepo.insert!()
   end
 
   # Inserts the epic cost summary the rollup would have written for `period`.
@@ -387,6 +407,118 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
       # Still exactly one anomaly row, and NO new "detected" audit entry.
       assert length(AdminRepo.all(CostAnomaly)) == 1
       assert detected_audit_count(ctx.tenant.id, expensive.id) == 0
+    end
+
+    # FIX A: a story whose net cumulative cost is negative (over-correction) must
+    # NOT be flagged suspiciously_low (and thus never persisted/notified), while a
+    # genuinely low-but-nonnegative story still IS flagged.
+    test "does not flag a net-negative story, but still flags a genuinely low positive story" do
+      ctx = setup_tenant_with_epic()
+      period = Date.utc_today()
+
+      # Normal stories keep the epic average positive.
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 30_000)
+
+      # A genuinely low (but non-negative) story -> SHOULD be flagged.
+      low = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100)
+
+      # A story driven net-negative by an over-correction (+5k then -20k = -15k).
+      negative = create_bare_story(ctx.tenant, ctx.epic)
+      original = add_report(ctx.tenant, negative, ctx.agent, ctx.epic, 5_000, 0)
+      add_correction(ctx.tenant, negative, ctx.agent, ctx.epic, original.id, -20_000)
+
+      insert_epic_summary(ctx, period, 15_000)
+
+      assert :ok = CostAnomalyWorker.perform(%Oban.Job{args: period_args(period)})
+
+      anomalies = AdminRepo.all(CostAnomaly)
+
+      low_anomalies = Enum.filter(anomalies, &(&1.anomaly_type == :suspiciously_low))
+      assert length(low_anomalies) == 1
+      assert hd(low_anomalies).story_id == low.id
+
+      # The negative story produced no anomaly at all...
+      refute Enum.any?(anomalies, &(&1.story_id == negative.id))
+      # ...no negative cost was ever persisted...
+      assert Enum.all?(anomalies, &(&1.story_cost_millicents >= 0))
+      # ...and no audit/notify fired for it.
+      assert detected_audit_count(ctx.tenant.id, negative.id) == 0
+    end
+
+    # FIX A (create == update symmetry): the shared changeset that the insert_all
+    # path now validates through rejects negative costs, so insert_all can never
+    # persist what create_changeset would reject.
+    test "create_changeset rejects negative costs (the invariant the insert path enforces)" do
+      changeset =
+        CostAnomaly.create_changeset(
+          %CostAnomaly{tenant_id: Ecto.UUID.generate(), story_id: Ecto.UUID.generate()},
+          %{
+            anomaly_type: :suspiciously_low,
+            story_cost_millicents: -15_000,
+            reference_avg_millicents: 15_000,
+            deviation_factor: Decimal.new("-1.0")
+          }
+        )
+
+      refute changeset.valid?
+      assert Keyword.has_key?(changeset.errors, :story_cost_millicents)
+    end
+
+    # FIX B: a reversed period range must still detect anomalies (the swap). The
+    # candidate-epic query (period_start >= start and <= end) matches ZERO epics
+    # for a reversed range, so without the swap detection is silently skipped.
+    test "detects anomalies even when the period range is reversed" do
+      ctx = setup_tenant_with_epic()
+      today = Date.utc_today()
+
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      expensive = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100_000)
+
+      insert_epic_summary(ctx, today, 32_500)
+
+      # period_start AFTER period_end (reversed on purpose).
+      args = %{
+        "period_start" => Date.to_iso8601(Date.add(today, 1)),
+        "period_end" => Date.to_iso8601(Date.add(today, -1))
+      }
+
+      assert :ok = CostAnomalyWorker.perform(%Oban.Job{args: args})
+
+      high = Enum.filter(AdminRepo.all(CostAnomaly), &(&1.anomaly_type == :high_cost))
+      assert length(high) == 1
+      assert hd(high).story_id == expensive.id
+    end
+
+    # FIX B: an over-cap period range is clamped, so an epic rolled up beyond the
+    # 90-day cap is not scanned (bounds the work). Without the cap the far epic
+    # would be a candidate and its story flagged.
+    test "clamps an over-cap period range, excluding epics beyond the cap" do
+      ctx = setup_tenant_with_epic()
+      start_date = ~D[2026-01-01]
+      # Epic summary rolled up ~200 days in -> beyond the 90-day cap.
+      far_day = Date.add(start_date, 200)
+
+      for _ <- 1..3, do: create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 10_000)
+      _expensive = create_story_with_reports(ctx.tenant, ctx.epic, ctx.agent, 100_000)
+
+      insert_epic_summary(ctx, far_day, 32_500)
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   CostAnomalyWorker.perform(%Oban.Job{
+                     args: %{
+                       "period_start" => Date.to_iso8601(start_date),
+                       # ~1 year -> clamped to start + 90 days
+                       "period_end" => Date.to_iso8601(Date.add(start_date, 364))
+                     }
+                   })
+        end)
+
+      # The clamp ran...
+      assert log =~ "exceeds 90 days; clamping end"
+      # ...and the far epic (day 200, outside [start, start+90]) was NOT scanned.
+      assert AdminRepo.all(CostAnomaly) == []
     end
 
     test "succeeds when no tenants exist" do

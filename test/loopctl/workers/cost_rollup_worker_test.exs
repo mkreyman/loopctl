@@ -229,7 +229,10 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
     end
 
     # FIX2: a reversed period range is normalized (swapped), not silently skipped.
-    test "normalizes a reversed period range instead of skipping it" do
+    # Strengthened so it FAILS without the swap: the chained CostAnomalyWorker
+    # must receive the EARLIER date as period_start (without the swap it would
+    # carry the later date and the anomaly candidate query would match nothing).
+    test "normalizes a reversed period range and chains anomaly detection with the earlier date first" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
 
@@ -257,15 +260,22 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
          ]}
       end)
 
-      assert :ok =
-               CostRollupWorker.perform(%Oban.Job{
-                 args: %{
-                   # reversed on purpose
-                   "period_start" => Date.to_iso8601(d2),
-                   "period_end" => Date.to_iso8601(d1),
-                   "tenant_ids" => [tenant.id]
-                 }
-               })
+      {result, anomaly_jobs} =
+        Oban.Testing.with_testing_mode(:manual, fn ->
+          r =
+            CostRollupWorker.perform(%Oban.Job{
+              args: %{
+                # reversed on purpose
+                "period_start" => Date.to_iso8601(d2),
+                "period_end" => Date.to_iso8601(d1),
+                "tenant_ids" => [tenant.id]
+              }
+            })
+
+          {r, all_enqueued(worker: Loopctl.Workers.CostAnomalyWorker)}
+        end)
+
+      assert result == :ok
 
       import Ecto.Query
 
@@ -274,6 +284,11 @@ defmodule Loopctl.Workers.CostRollupWorkerTest do
         |> AdminRepo.all()
 
       assert Enum.map(summaries, & &1.period_start) == [d1, d2]
+
+      # The chained anomaly worker gets the normalized (earlier-first) range.
+      assert [anomaly_job] = anomaly_jobs
+      assert anomaly_job.args["period_start"] == Date.to_iso8601(d1)
+      assert anomaly_job.args["period_end"] == Date.to_iso8601(d2)
     end
 
     # FIX3: an over-cap backfill range is clamped (not run unbounded).

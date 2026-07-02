@@ -130,7 +130,13 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
     end)
   end
 
-  defp check_and_flag_anomaly(tenant_id, story_id, story_cost, epic_avg) when epic_avg > 0 do
+  # `story_cost >= 0` mirrors the `epic_avg > 0` guard: a story whose net
+  # cumulative cost is negative (an over-correction) is not a meaningful
+  # deviation -- it would always fall below the low-cost threshold and produce a
+  # bogus :suspiciously_low anomaly. Excluding it here stops the negative anomaly
+  # at the source, before create_anomaly (FIX A.1).
+  defp check_and_flag_anomaly(tenant_id, story_id, story_cost, epic_avg)
+       when epic_avg > 0 and story_cost >= 0 do
     factor = Decimal.div(Decimal.new(story_cost), Decimal.new(epic_avg))
 
     cond do
@@ -179,47 +185,79 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
           existing
       end
     else
-      now = DateTime.utc_now()
+      # Enforce the SAME invariants the changeset would (create == update
+      # symmetry): insert_all bypasses CostAnomaly.create_changeset/2, so we run
+      # the changeset here to validate (e.g. non-negative story_cost/reference_avg)
+      # and BAIL on invalid input -- no insert, no notify (FIX A.2). The source
+      # guard already rejects negative story_cost; this is defense in depth so a
+      # future caller can't reach insert_all with values the changeset rejects.
+      changeset =
+        CostAnomaly.create_changeset(
+          %CostAnomaly{tenant_id: tenant_id, story_id: story_id},
+          %{
+            anomaly_type: anomaly_type,
+            story_cost_millicents: story_cost,
+            reference_avg_millicents: epic_avg,
+            deviation_factor: Decimal.round(factor, 2)
+          }
+        )
 
-      entry = %{
-        id: Ecto.UUID.generate(),
-        tenant_id: tenant_id,
-        story_id: story_id,
-        anomaly_type: anomaly_type,
-        story_cost_millicents: story_cost,
-        reference_avg_millicents: epic_avg,
-        deviation_factor: Decimal.round(factor, 2),
-        resolved: false,
-        archived: false,
-        metadata: %{},
-        inserted_at: now,
-        updated_at: now
-      }
+      if changeset.valid? do
+        insert_new_anomaly(tenant_id, changeset)
+      else
+        Logger.warning(
+          "CostAnomalyWorker: invalid anomaly for story #{story_id}, skipping: " <>
+            "#{inspect(changeset.errors)}"
+        )
 
-      # insert_all + on_conflict: :nothing reports the REAL number of rows
-      # written against the unique partial index
-      # (cost_anomalies_unresolved_unique): 1 = we genuinely inserted (notify),
-      # 0 = a concurrent run won the race and already notified (skip). This
-      # closes the check-then-insert race: AdminRepo.insert/2 with
-      # on_conflict: :nothing returns {:ok, struct} carrying a client-generated,
-      # UNPERSISTED id on conflict, so the losing run would emit an audit entry +
-      # token.anomaly_detected webhook for an anomaly_id that was never persisted
-      # (FIX1c).
-      case AdminRepo.insert_all(CostAnomaly, [entry],
-             on_conflict: :nothing,
-             conflict_target:
-               {:unsafe_fragment,
-                ~s|("tenant_id","story_id","anomaly_type") WHERE resolved = false|},
-             returning: true
-           ) do
-        {1, [anomaly]} ->
-          notify_new_anomaly(tenant_id, anomaly)
-          anomaly
-
-        {0, _} ->
-          # Lost the race: the concurrent inserter already emitted audit + webhook.
-          nil
+        nil
       end
+    end
+  end
+
+  # Derives the insert_all row from the VALIDATED changeset (so every NOT NULL
+  # column + defaults are set exactly as the changeset would set them) and writes
+  # it race-safely. insert_all + on_conflict: :nothing reports the REAL number of
+  # rows written against the unique partial index
+  # (cost_anomalies_unresolved_unique): 1 = we genuinely inserted (notify), 0 = a
+  # concurrent run won the race and already notified (skip). This closes the
+  # check-then-insert race that AdminRepo.insert/2 with on_conflict: :nothing had,
+  # where it returned {:ok, struct} carrying a client-generated, UNPERSISTED id on
+  # conflict, so the losing run would emit an audit entry + token.anomaly_detected
+  # webhook for an anomaly_id that was never persisted (FIX1c).
+  defp insert_new_anomaly(tenant_id, changeset) do
+    now = DateTime.utc_now()
+
+    entry =
+      changeset
+      |> Ecto.Changeset.apply_changes()
+      |> Map.take([
+        :tenant_id,
+        :story_id,
+        :anomaly_type,
+        :story_cost_millicents,
+        :reference_avg_millicents,
+        :deviation_factor,
+        :resolved,
+        :archived,
+        :metadata
+      ])
+      |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+
+    case AdminRepo.insert_all(CostAnomaly, [entry],
+           on_conflict: :nothing,
+           conflict_target:
+             {:unsafe_fragment,
+              ~s|("tenant_id","story_id","anomaly_type") WHERE resolved = false|},
+           returning: true
+         ) do
+      {1, [anomaly]} ->
+        notify_new_anomaly(tenant_id, anomaly)
+        anomaly
+
+      {0, _} ->
+        # Lost the race: the concurrent inserter already emitted audit + webhook.
+        nil
     end
   end
 
