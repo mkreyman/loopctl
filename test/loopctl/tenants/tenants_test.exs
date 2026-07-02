@@ -1,6 +1,8 @@
 defmodule Loopctl.TenantsTest do
   use Loopctl.DataCase, async: true
 
+  import ExUnit.CaptureLog
+
   setup :verify_on_exit!
 
   alias Loopctl.Secrets
@@ -150,6 +152,38 @@ defmodule Loopctl.TenantsTest do
 
       refute Map.has_key?(changeset.changes, :slug)
       assert changeset.changes[:name] == "New"
+    end
+
+    # rls-02: an attempted (and ignored) slug rename must leave a forensic
+    # trail — it's the exact probe that would strand the audit-signing secret.
+    test "logs a warning on an attempted slug mutation (rls-02 observability)" do
+      tenant = fixture(:tenant, %{slug: "original-slug"})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, updated} =
+                   Tenants.update_tenant(tenant, %{slug: "renamed-slug", name: "New Name"})
+
+          assert updated.slug == "original-slug"
+        end)
+
+      assert log =~ "attempted slug mutation ignored for tenant #{tenant.id}"
+    end
+
+    test "does not log when slug is unchanged or absent (rls-02 observability)" do
+      tenant = fixture(:tenant, %{slug: "steady-slug"})
+
+      # slug absent
+      log_absent = capture_log(fn -> Tenants.update_tenant(tenant, %{name: "Renamed"}) end)
+      refute log_absent =~ "attempted slug mutation"
+
+      # slug present but identical
+      log_same =
+        capture_log(fn ->
+          Tenants.update_tenant(tenant, %{slug: "steady-slug", name: "Renamed Again"})
+        end)
+
+      refute log_same =~ "attempted slug mutation"
     end
 
     # rls-03: a colliding email must produce a clean changeset error, not a

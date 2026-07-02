@@ -91,9 +91,9 @@ defmodule LoopctlWeb.TenantControllerTest do
 
       body = json_response(conn, 422)
       assert body["error"]["status"] == 422
-      assert "has already been taken" in body["error"]["details"]["email"]
-      # The response leaks nothing about the other tenant beyond the message.
-      refute Map.has_key?(body["error"]["details"], :id)
+      # The details map leaks nothing about the other tenant beyond the
+      # standard uniqueness message on :email (JSON keys are strings).
+      assert body["error"]["details"] == %{"email" => ["has already been taken"]}
     end
 
     test "allows updating to a unique email (rls-03)", %{conn: conn} do
