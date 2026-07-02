@@ -363,8 +363,75 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
   # sort_key is computed from the story number (major*10000 + minor*10) and is
   # NOT unique — two stories numbered "1.1" in different projects share it. With
   # OFFSET pagination and NO project_id filter, rows sharing a sort_key on a page
-  # boundary get skipped or duplicated across pages unless a unique tiebreaker
-  # (asc: s.id) is appended. These tests would fail on the pre-fix order_by.
+  # boundary can be skipped or duplicated across pages unless a unique tiebreaker
+  # (asc: s.id) is appended.
+  #
+  # The `union covers every id once` tests below are behavioral coverage, but
+  # they are NOT reliable regression guards on their own: inside a single
+  # sandbox transaction Postgres tends to return equal-key rows in insertion
+  # order, so the instability may not manifest even without the tiebreaker. The
+  # authoritative guard is the `assert_paginated_order_by_tiebreaker/2` SQL
+  # assertion, which fails deterministically the moment `asc: s.id` is dropped
+  # from the query's ORDER BY.
+
+  # Captures SQL emitted through AdminRepo *from this test process* while `fun`
+  # runs. Scoped to `self()` so concurrent async tests don't leak queries in.
+  defp capture_admin_sql(fun) do
+    test_pid = self()
+    handler_id = "sql-capture-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :admin_repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid, do: send(test_pid, {:captured_sql, query})
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+
+    drain_captured_sql([])
+  end
+
+  defp drain_captured_sql(acc) do
+    receive do
+      {:captured_sql, q} -> drain_captured_sql([q | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  # Asserts that the paginated (ORDER BY + LIMIT) query emitted by `fun` ends its
+  # ORDER BY with a term containing `tiebreaker` (e.g. ~s|"id"|). Fails fast and
+  # deterministically if a refactor drops the unique final sort term.
+  defp assert_paginated_order_by_tiebreaker(fun, tiebreaker) do
+    paginated =
+      fun
+      |> capture_admin_sql()
+      |> Enum.filter(&(String.contains?(&1, "ORDER BY") and String.contains?(&1, "LIMIT")))
+
+    assert paginated != [], "expected a paginated (ORDER BY + LIMIT) query, got none"
+
+    Enum.each(paginated, fn query ->
+      [_, after_order] = String.split(query, "ORDER BY", parts: 2)
+
+      final_term =
+        after_order
+        |> String.split(~r/\s+LIMIT/, parts: 2)
+        |> List.first()
+        |> String.split(",")
+        |> List.last()
+        |> String.trim()
+
+      assert String.contains?(final_term, tiebreaker),
+             "ORDER BY final term #{inspect(final_term)} is missing unique tiebreaker #{tiebreaker}\nfull query: #{query}"
+    end)
+  end
 
   # Collect every page of a paginated query and return the flat list of ids.
   defp collect_all_pages(fun, page_size) do
@@ -465,6 +532,24 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
 
       assert length(collected) == 5
       assert MapSet.new(collected) == MapSet.new(blocked_ids)
+    end
+
+    test "list_ready_stories ORDER BY ends with the unique id tiebreaker (SQL guard)" do
+      tenant = fixture(:tenant)
+
+      assert_paginated_order_by_tiebreaker(
+        fn -> Queries.list_ready_stories(tenant.id, page_size: 10) end,
+        ~s|"id"|
+      )
+    end
+
+    test "list_blocked_stories ORDER BY ends with the unique id tiebreaker (SQL guard)" do
+      tenant = fixture(:tenant)
+
+      assert_paginated_order_by_tiebreaker(
+        fn -> Queries.list_blocked_stories(tenant.id, page_size: 10) end,
+        ~s|"id"|
+      )
     end
   end
 

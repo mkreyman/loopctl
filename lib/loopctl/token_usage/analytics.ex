@@ -174,7 +174,11 @@ defmodule Loopctl.TokenUsage.Analytics do
 
     epics =
       epic_base
-      |> order_by([e], asc: e.number)
+      # asc: e.id is a unique, deterministic tiebreaker. epic.number is only
+      # unique per (tenant_id, project_id); GET /analytics/epics without a
+      # project_id filter returns every project's epic #1/#2/... sharing a
+      # number, so OFFSET pagination would skip/duplicate epics without it.
+      |> order_by([e], asc: e.number, asc: e.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
