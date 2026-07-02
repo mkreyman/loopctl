@@ -3,12 +3,24 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
 
   setup :verify_on_exit!
 
+  import Loopctl.PlanAssertions, only: [capture_repo_queries: 1]
+
+  alias Loopctl.AdminRepo
   alias Loopctl.WorkBreakdown.Queries
+  alias Loopctl.WorkBreakdown.Story
 
   defp setup_project do
     tenant = fixture(:tenant)
     project = fixture(:project, %{tenant_id: tenant.id})
     %{tenant: tenant, project: project}
+  end
+
+  # sort_key is computed from the story number (not castable). To create the
+  # duplicate-sort_key condition that destabilizes pagination, force a constant
+  # sort_key directly on the given story ids.
+  defp force_sort_key(story_ids, value) do
+    from(s in Story, where: s.id in ^story_ids)
+    |> AdminRepo.update_all(set: [sort_key: value])
   end
 
   describe "list_ready_stories/2" do
@@ -355,6 +367,271 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
       {:ok, result} = Queries.list_blocked_stories(tenant.id, page_size: 500)
 
       assert result.page_size == 500
+    end
+  end
+
+  # --- wb-01 (#245): stable pagination with duplicate sort_key values ---
+
+  describe "list_ready_stories/2 pagination stability (wb-01)" do
+    test "paginates deterministically across pages when sort_key ties" do
+      %{tenant: tenant, project: project} = setup_project()
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # 100 ready stories (pending, no deps), all sharing an identical sort_key.
+      story_ids =
+        for i <- 1..100 do
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: epic.id,
+              project_id: project.id,
+              number: "1.#{i}",
+              agent_status: :pending
+            })
+
+          story.id
+        end
+
+      force_sort_key(story_ids, 0)
+
+      collected =
+        for page <- 1..10 do
+          {:ok, result} =
+            Queries.list_ready_stories(tenant.id,
+              project_id: project.id,
+              page: page,
+              page_size: 10
+            )
+
+          assert result.total == 100,
+                 "expected total 100 on page #{page}, got #{result.total}"
+
+          assert length(result.data) == 10,
+                 "expected 10 rows on page #{page}, got #{length(result.data)}"
+
+          Enum.map(result.data, & &1.id)
+        end
+
+      all_ids = List.flatten(collected)
+
+      assert length(all_ids) == 100,
+             "expected 100 rows total across pages, got #{length(all_ids)}"
+
+      unique_ids = Enum.uniq(all_ids)
+
+      assert length(unique_ids) == 100,
+             "duplicate/skipped rows across pages: #{length(all_ids) - length(unique_ids)} duplicates"
+
+      assert MapSet.new(unique_ids) == MapSet.new(story_ids),
+             "paginated ids did not exactly cover the created stories (skips or duplicates)"
+    end
+
+    test "page order is stable across repeated runs when sort_key ties" do
+      %{tenant: tenant, project: project} = setup_project()
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      story_ids =
+        for i <- 1..30 do
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: epic.id,
+              project_id: project.id,
+              number: "2.#{i}",
+              agent_status: :pending
+            })
+
+          story.id
+        end
+
+      force_sort_key(story_ids, 0)
+
+      fetch_all =
+        fn ->
+          for page <- 1..3 do
+            {:ok, result} =
+              Queries.list_ready_stories(tenant.id,
+                project_id: project.id,
+                page: page,
+                page_size: 10
+              )
+
+            Enum.map(result.data, & &1.id)
+          end
+          |> List.flatten()
+        end
+
+      assert fetch_all.() == fetch_all.(),
+             "row ordering was not stable across identical queries"
+    end
+  end
+
+  describe "list_blocked_stories/2 pagination stability (wb-01)" do
+    test "paginates deterministically across pages when sort_key ties" do
+      %{tenant: tenant, project: project} = setup_project()
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      blocked_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      # blocked_epic depends on prereq_epic, which has an unverified story:
+      # every story in blocked_epic is therefore blocked at the epic level.
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: blocked_epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      fixture(:story, %{
+        tenant_id: tenant.id,
+        epic_id: prereq_epic.id,
+        project_id: project.id,
+        number: "1.1",
+        agent_status: :implementing,
+        verified_status: :unverified
+      })
+
+      story_ids =
+        for i <- 1..100 do
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: blocked_epic.id,
+              project_id: project.id,
+              number: "2.#{i}",
+              agent_status: :pending
+            })
+
+          story.id
+        end
+
+      force_sort_key(story_ids, 0)
+
+      collected =
+        for page <- 1..10 do
+          {:ok, result} =
+            Queries.list_blocked_stories(tenant.id,
+              project_id: project.id,
+              page: page,
+              page_size: 10
+            )
+
+          assert result.total == 100,
+                 "expected total 100 on page #{page}, got #{result.total}"
+
+          assert length(result.data) == 10,
+                 "expected 10 rows on page #{page}, got #{length(result.data)}"
+
+          Enum.map(result.data, & &1.story.id)
+        end
+
+      all_ids = List.flatten(collected)
+
+      assert length(all_ids) == 100,
+             "expected 100 rows total across pages, got #{length(all_ids)}"
+
+      unique_ids = Enum.uniq(all_ids)
+
+      assert length(unique_ids) == 100,
+             "duplicate/skipped rows across pages: #{length(all_ids) - length(unique_ids)} duplicates"
+
+      assert MapSet.new(unique_ids) == MapSet.new(story_ids),
+             "paginated ids did not exactly cover the created blocked stories (skips or duplicates)"
+    end
+  end
+
+  # --- wb-02 (#246): batched blocking-dependency fetch (no N+1) ---
+
+  describe "list_blocked_stories/2 query count (wb-02)" do
+    setup do
+      %{tenant: tenant, project: project} = setup_project()
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      blocked_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: blocked_epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      # A story-level blocker too, so both batch queries return rows.
+      blocker =
+        fixture(:story, %{
+          tenant_id: tenant.id,
+          epic_id: prereq_epic.id,
+          project_id: project.id,
+          number: "1.1",
+          agent_status: :implementing,
+          verified_status: :unverified
+        })
+
+      %{tenant: tenant, project: project, blocked_epic: blocked_epic, blocker: blocker}
+    end
+
+    defp seed_blocked(ctx, %Range{} = range) do
+      for i <- range do
+        story =
+          fixture(:story, %{
+            tenant_id: ctx.tenant.id,
+            epic_id: ctx.blocked_epic.id,
+            project_id: ctx.project.id,
+            number: "2.#{i}",
+            agent_status: :pending
+          })
+
+        fixture(:story_dependency, %{
+          tenant_id: ctx.tenant.id,
+          story_id: story.id,
+          depends_on_story_id: ctx.blocker.id
+        })
+      end
+
+      :ok
+    end
+
+    test "issues a constant number of queries regardless of story count", ctx do
+      seed_blocked(ctx, 1..50)
+
+      queries =
+        capture_repo_queries(fn ->
+          {:ok, result} =
+            Queries.list_blocked_stories(ctx.tenant.id,
+              project_id: ctx.project.id,
+              page_size: 100
+            )
+
+          assert result.total == 50
+          assert length(result.data) == 50
+          # Every story reports its blockers (story-level + epic-level).
+          assert Enum.all?(result.data, &(&1.blocking_dependencies != []))
+        end)
+
+      count = length(queries)
+
+      # count aggregate + main list + batch story deps + batch epic deps == 4.
+      # The buggy version issued 2 extra queries PER story (100+ for 50 stories).
+      assert count < 10,
+             "expected a small constant query count, got #{count} (N+1 regression?)"
+    end
+
+    test "query count does not scale with the number of blocked stories", ctx do
+      seed_blocked(ctx, 1..5)
+
+      small =
+        capture_repo_queries(fn ->
+          Queries.list_blocked_stories(ctx.tenant.id, project_id: ctx.project.id, page_size: 100)
+        end)
+        |> length()
+
+      # Add many more blocked stories to the same dataset.
+      seed_blocked(ctx, 6..50)
+
+      large =
+        capture_repo_queries(fn ->
+          Queries.list_blocked_stories(ctx.tenant.id, project_id: ctx.project.id, page_size: 100)
+        end)
+        |> length()
+
+      assert small == large,
+             "query count scaled with story count (#{small} for 5 stories vs #{large} for 50) — N+1 regression"
     end
   end
 end

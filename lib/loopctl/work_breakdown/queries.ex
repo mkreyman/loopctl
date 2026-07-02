@@ -93,7 +93,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
     stories =
       ready_query
-      |> order_by([s], asc: s.sort_key)
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -162,16 +162,23 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
     stories =
       blocked_query
-      |> order_by([s], asc: s.sort_key)
+      |> order_by([s], asc: s.sort_key, asc: s.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
 
-    # For each blocked story, fetch its blocking dependencies (story + epic level)
+    # Batch-fetch blocking dependencies for all stories at once (avoids N+1).
+    # Two queries total regardless of page size, instead of two per story.
+    story_ids = Enum.map(stories, & &1.id)
+    epic_ids = stories |> Enum.map(& &1.epic_id) |> Enum.uniq()
+
+    story_blockers_by_story = fetch_blocking_story_dependencies_batch(story_ids)
+    epic_blockers_by_epic = fetch_blocking_epic_dependencies_batch(epic_ids)
+
     data =
       Enum.map(stories, fn story ->
-        story_blockers = fetch_blocking_story_dependencies(story.id)
-        epic_blockers = fetch_blocking_epic_dependencies(story.epic_id)
+        story_blockers = Map.get(story_blockers_by_story, story.id, [])
+        epic_blockers = Map.get(epic_blockers_by_epic, story.epic_id, [])
 
         %{
           story: story,
@@ -279,12 +286,17 @@ defmodule Loopctl.WorkBreakdown.Queries do
     end
   end
 
-  defp fetch_blocking_story_dependencies(story_id) do
+  # Batch-fetch story-level blocking dependencies for many stories in one query.
+  # Returns %{story_id => [dependency_map, ...]} (avoids the N+1 pattern).
+  defp fetch_blocking_story_dependencies_batch([] = _story_ids), do: %{}
+
+  defp fetch_blocking_story_dependencies_batch(story_ids) do
     from(sd in StoryDependency,
       join: dep in Story,
       on: dep.id == sd.depends_on_story_id,
-      where: sd.story_id == ^story_id and dep.verified_status != :verified,
+      where: sd.story_id in ^story_ids and dep.verified_status != :verified,
       select: %{
+        story_id: sd.story_id,
         id: dep.id,
         number: dep.number,
         title: dep.title,
@@ -293,15 +305,21 @@ defmodule Loopctl.WorkBreakdown.Queries do
       }
     )
     |> AdminRepo.all()
+    |> Enum.group_by(& &1.story_id, &Map.delete(&1, :story_id))
   end
 
-  defp fetch_blocking_epic_dependencies(epic_id) do
+  # Batch-fetch epic-level blocking dependencies for many epics in one query.
+  # Returns %{epic_id => [dependency_map, ...]} (avoids the N+1 pattern).
+  defp fetch_blocking_epic_dependencies_batch([] = _epic_ids), do: %{}
+
+  defp fetch_blocking_epic_dependencies_batch(epic_ids) do
     # Find unverified stories in prerequisite epics (via epic_dependencies)
     from(ed in EpicDependency,
       join: prereq_story in Story,
       on: prereq_story.epic_id == ed.depends_on_epic_id,
-      where: ed.epic_id == ^epic_id and prereq_story.verified_status != :verified,
+      where: ed.epic_id in ^epic_ids and prereq_story.verified_status != :verified,
       select: %{
+        epic_id: ed.epic_id,
         id: prereq_story.id,
         number: prereq_story.number,
         title: prereq_story.title,
@@ -310,5 +328,6 @@ defmodule Loopctl.WorkBreakdown.Queries do
       }
     )
     |> AdminRepo.all()
+    |> Enum.group_by(& &1.epic_id, &Map.delete(&1, :epic_id))
   end
 end

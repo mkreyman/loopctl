@@ -98,7 +98,8 @@ defmodule Loopctl.TokenUsage.Analytics do
             r.story_id,
             r.cost_millicents,
             r.story_id
-          )
+          ),
+        asc: r.agent_id
       )
       |> limit(^page_size)
       |> offset(^offset)

@@ -202,6 +202,61 @@ defmodule Loopctl.TokenUsage.AnalyticsTest do
       {:ok, own_result} = Analytics.agent_metrics(ctx.tenant.id)
       assert own_result.total == 2
     end
+
+    test "efficiency_rank is deterministic across runs when costs tie (tokens-07)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      # Several agents sharing an IDENTICAL avg cost per story (a rank tie):
+      # each has exactly one story and one report of the same cost.
+      agent_ids =
+        for i <- 1..6 do
+          agent = fixture(:agent, %{tenant_id: tenant.id, name: "tie-agent-#{i}"})
+
+          story =
+            fixture(:story, %{
+              tenant_id: tenant.id,
+              epic_id: epic.id,
+              project_id: project.id,
+              number: "1.#{i}",
+              assigned_agent_id: agent.id
+            })
+
+          fixture(:token_usage_report, %{
+            tenant_id: tenant.id,
+            story_id: story.id,
+            agent_id: agent.id,
+            project_id: project.id,
+            cost_millicents: 1000,
+            input_tokens: 100,
+            output_tokens: 50
+          })
+
+          agent.id
+        end
+
+      ranks_of = fn ->
+        {:ok, result} = Analytics.agent_metrics(tenant.id, page_size: 100)
+        Map.new(result.data, &{&1.agent_id, &1.efficiency_rank})
+      end
+
+      first = ranks_of.()
+      second = ranks_of.()
+
+      # All six agents tie on avg cost per story, yet ranks are a full 1..6 set.
+      assert map_size(first) == 6
+      assert Enum.sort(Map.values(first)) == Enum.to_list(1..6)
+
+      # The secondary agent_id sort makes the tie-break stable across calls.
+      assert first == second,
+             "efficiency_rank was non-deterministic for tied agents: #{inspect(first)} vs #{inspect(second)}"
+
+      for aid <- agent_ids do
+        assert Map.fetch!(first, aid) == Map.fetch!(second, aid),
+               "agent #{aid} changed efficiency_rank between identical runs"
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
