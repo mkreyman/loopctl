@@ -843,5 +843,22 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
       body = json_response(conn, 422)
       assert body["error"]["message"] =~ "project_id"
     end
+
+    test "an array-style project_id[]=x does not 500 (find_contradiction_clusters guarded)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # `?project_id[]=x` decodes to a list, which ProjectId.validate tolerates as
+      # absent; the context guards then keep find_contradiction_clusters/2 (and
+      # published_base_query/2) from CastError-500 on the raw list value.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/knowledge/lint?project_id[]=x")
+
+      assert json_response(conn, 200)["data"]
+    end
   end
 end

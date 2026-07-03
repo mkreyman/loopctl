@@ -218,4 +218,91 @@ defmodule LoopctlWeb.OKFControllerTest do
       assert %{meta: %{total_count: 0}} = Knowledge.list_articles(other.id, category: :reference)
     end
   end
+
+  describe "OKF project_id validation (kbweb-01)" do
+    test "export ?format=json with a malformed project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get(~p"/api/v1/knowledge/okf/export?format=json&project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "streamed export with a malformed project_id returns 422 before committing a 200", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get(~p"/api/v1/knowledge/okf/export?project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "the project-scoped export path with a malformed project_id returns 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get("/api/v1/projects/not-a-uuid/knowledge/okf/export")
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "export ?format=json with a valid project_id still works (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      published(tenant.id, %{title: "Scoped OKF", category: :pattern, project_id: project.id})
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> get(~p"/api/v1/knowledge/okf/export?format=json&project_id=#{project.id}")
+
+      body = json_response(conn, 200)
+      assert is_map(body["data"]["files"])
+    end
+
+    test "import with a malformed project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> post(~p"/api/v1/knowledge/okf/import", %{
+          files: sample_files(),
+          project_id: "not-a-uuid"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "import with a valid project_id still works (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = user_key(tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw)
+        |> post(~p"/api/v1/knowledge/okf/import", %{files: sample_files(), project_id: project.id})
+
+      assert json_response(conn, 200)["data"]["created"] == 1
+    end
+  end
 end

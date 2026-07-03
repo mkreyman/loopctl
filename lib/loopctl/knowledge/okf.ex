@@ -176,10 +176,19 @@ defmodule Loopctl.Knowledge.OKF do
   defp export_query(tenant_id, project_id) do
     query = from(a in Article, where: a.tenant_id == ^tenant_id and a.status == :published)
 
-    if project_id do
-      where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-    else
-      query
+    # Guard the :binary_id cast: a non-UUID project_id (malformed string, or a
+    # non-string that is truthy) would CastError-500 on the `== ^project_id`
+    # comparison — and for the ?format=json export path, AFTER the buffered
+    # bundle build starts. A malformed value scopes to tenant-wide only.
+    cond do
+      is_nil(project_id) ->
+        query
+
+      valid_uuid?(project_id) ->
+        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+
+      true ->
+        where(query, [a], is_nil(a.project_id))
     end
   end
 
@@ -620,7 +629,20 @@ defmodule Loopctl.Knowledge.OKF do
   end
 
   defp scope_project(query, nil), do: where(query, [a], is_nil(a.project_id))
-  defp scope_project(query, project_id), do: where(query, [a], a.project_id == ^project_id)
+
+  # Guard the :binary_id cast for the import loopctl_id lookup: a non-UUID
+  # top-level project_id would CastError-500 on `== ^project_id`. A malformed
+  # value matches nothing (no article belongs to a bogus project).
+  defp scope_project(query, project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [a], a.project_id == ^project_id)
+    else
+      where(query, [a], false)
+    end
+  end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   # Parse one concept file into create_article attrs.
   defp parse_concept(path, content) do

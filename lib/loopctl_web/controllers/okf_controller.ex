@@ -22,6 +22,7 @@ defmodule LoopctlWeb.OKFController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.StreamingExport.OKFFormat
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -75,6 +76,28 @@ defmodule LoopctlWeb.OKFController do
     # path, which has NO count cap).
     tenant_id = conn.assigns.current_api_key.tenant_id
 
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      export_json(conn, tenant_id, params)
+    end
+  end
+
+  def export(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    # Validate BEFORE streaming: send_chunked commits a 200 with no way back to an
+    # error status, so a malformed project_id must be rejected up front.
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      LoopctlWeb.StreamingExport.stream(
+        conn,
+        tenant_id,
+        OKFFormat,
+        "okf-bundle",
+        export_opts(params)
+      )
+    end
+  end
+
+  defp export_json(conn, tenant_id, params) do
     case OKF.build_bundle(tenant_id, export_opts(params)) do
       {:ok, %{files: files, meta: meta}} ->
         json(conn, %{data: %{files: files, meta: meta}})
@@ -93,18 +116,6 @@ defmodule LoopctlWeb.OKFController do
           }
         })
     end
-  end
-
-  def export(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-
-    LoopctlWeb.StreamingExport.stream(
-      conn,
-      tenant_id,
-      OKFFormat,
-      "okf-bundle",
-      export_opts(params)
-    )
   end
 
   operation(:import,
@@ -153,7 +164,8 @@ defmodule LoopctlWeb.OKFController do
   def import(conn, params) do
     api_key = conn.assigns.current_api_key
 
-    with {:ok, files} <- fetch_files(params),
+    with :ok <- ProjectId.validate(params["project_id"]),
+         {:ok, files} <- fetch_files(params),
          {:ok, report} <- OKF.import_files(api_key.tenant_id, files, import_opts(params, api_key)) do
       json(conn, %{data: report})
     else
@@ -169,7 +181,7 @@ defmodule LoopctlWeb.OKFController do
 
   defp export_opts(params) do
     case params["project_id"] do
-      nil -> []
+      value when value in [nil, ""] -> []
       project_id -> [project_id: project_id]
     end
   end
