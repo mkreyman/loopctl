@@ -1456,6 +1456,9 @@ async function createDispatch({
 }
 
 // US-26: Signed Tree Head retrieval
+// TENANT SAFETY WARNING: This endpoint is public (no auth required) and accepts any tenant_id.
+// Callers MUST verify that tenant_id matches their own tenant context to prevent
+// cross-tenant audit probing. The MCP client is responsible for enforcing this boundary.
 async function getSth({ tenant_id }) {
   const result = await apiCall("GET", `/api/v1/audit/sth/${tenant_id}`);
   return toContent(result);
@@ -1472,6 +1475,9 @@ async function getSystemArticles({ slug, category } = {}) {
 }
 
 // US-26: Cap recovery after session crash
+// TENANT SAFETY: The backend validates that the story_id belongs to the authenticated
+// caller's tenant before minting the capability token. The MCP server forwards the
+// request as-is; cross-tenant recovery attempts are rejected by the API with 403.
 async function recoverCap({ story_id, cap_type, lineage }) {
   const body = { cap_type: cap_type || "start_cap", lineage: lineage || [] };
   const result = await apiCall("POST", `/api/v1/stories/${story_id}/recover-cap`, body);
@@ -1519,7 +1525,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Project name." },
+        name: { type: "string", minLength: 1, maxLength: 255, description: "Project name." },
         slug: { type: "string", description: "URL-safe slug." },
         repo_url: { type: "string", description: "GitHub repo URL." },
         description: { type: "string", description: "Project description." },
@@ -1870,6 +1876,7 @@ const TOOLS = [
         },
         review_type: {
           type: "string",
+          enum: ["enhanced_6_agent", "single_reviewer", "orchestrator"],
           description:
             "The type of review conducted (e.g. enhanced_6_agent, single_reviewer, orchestrator).",
         },
@@ -3209,6 +3216,10 @@ const TOOLS = [
         },
       },
       required: ["source_type"],
+      oneOf: [
+        { required: ["source_type", "url"] },
+        { required: ["source_type", "content"] },
+      ],
     },
   },
   {
@@ -3517,11 +3528,15 @@ const TOOLS = [
   // Chain of Custody v2 tools
   {
     name: "get_sth",
-    description: "Get the latest Signed Tree Head for a tenant's audit chain. Public — no auth required.",
+    description:
+      "Get the latest Signed Tree Head for a tenant's audit chain. Public — no auth required. " +
+      "WARNING: This endpoint allows querying any tenant's STH without authentication. " +
+      "Callers MUST validate that the requested tenant_id matches their own tenant context " +
+      "to prevent cross-tenant audit probing.",
     inputSchema: {
       type: "object",
       properties: {
-        tenant_id: { type: "string", description: "Tenant UUID." },
+        tenant_id: { type: "string", description: "Tenant UUID. MUST match the caller's tenant context." },
       },
       required: ["tenant_id"],
     },
@@ -3539,11 +3554,14 @@ const TOOLS = [
   },
   {
     name: "recover_cap",
-    description: "Re-mint a capability token for a story you're assigned to. Use after a session crash when you've lost your cap.",
+    description:
+      "Re-mint a capability token for a story you're assigned to. Use after a session crash when you've lost your cap. " +
+      "SECURITY: The server validates that the story_id belongs to your tenant before minting the cap. " +
+      "Pass story_id only for stories in your own tenant to prevent cross-tenant capability recovery attempts.",
     inputSchema: {
       type: "object",
       properties: {
-        story_id: { type: "string", description: "Story UUID." },
+        story_id: { type: "string", description: "Story UUID. MUST belong to your tenant context." },
         cap_type: { type: "string", enum: ["start_cap", "report_cap"], description: "Which cap to recover (default: start_cap)." },
         lineage: { type: "array", items: { type: "string" }, description: "Your dispatch lineage path." },
       },
