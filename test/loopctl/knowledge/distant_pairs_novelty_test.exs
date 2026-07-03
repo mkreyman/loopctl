@@ -18,6 +18,7 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
+  alias Loopctl.PlanAssertions
 
   # Cosine measures DIRECTION. Two halves: a "base" axis and an "orthogonal" axis. A unit
   # vector at angle θ from base is `[cos θ on base-half, sin θ on orth-half]`. Cosine
@@ -58,8 +59,12 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
     end
 
     test "returns exactly the in-band pair with the correct distance and meta", ctx do
-      assert {:ok, %{pairs: [pair], total_count: 1, has_more: false}} =
+      assert {:ok, %{pairs: [pair], has_more: false} = result} =
                Knowledge.distant_pairs(ctx.tenant.id)
+
+      # #202/#203: no exact total-pair count is computed anymore (it was the O(n²)
+      # cost) — pagination is driven by `has_more` alone.
+      refute Map.has_key?(result, :total_count)
 
       # The single in-band pair is {a0, a60} (cos-dist 0.5). Ordered a.id < b.id.
       {lo, hi} = Enum.min_max([ctx.a0.id, ctx.a60.id])
@@ -73,23 +78,38 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
       article_with_embedding(other.id, embedding_at(0.0), %{})
       article_with_embedding(other.id, embedding_at(:math.pi() / 3), %{})
 
-      assert {:ok, %{pairs: pairs, total_count: total}} =
+      assert {:ok, %{pairs: pairs, has_more: false}} =
                Knowledge.distant_pairs(ctx.tenant.id)
 
       # Still exactly this tenant's single in-band pair, never the other tenant's.
-      assert total == 1
+      assert length(pairs) == 1
       ids = Enum.flat_map(pairs, &[&1.a.id, &1.b.id])
       assert Enum.sort(ids) == Enum.sort([ctx.a0.id, ctx.a60.id])
     end
 
     test "honors a tightened band (no in-band pair → empty)", ctx do
-      assert {:ok, %{pairs: [], total_count: 0, has_more: false}} =
+      assert {:ok, %{pairs: [], has_more: false}} =
                Knowledge.distant_pairs(ctx.tenant.id, min_distance: 0.8, max_distance: 0.9)
     end
 
     test "invalid band is rejected (unchanged contract)", ctx do
       assert {:error, :invalid_distance} =
                Knowledge.distant_pairs(ctx.tenant.id, min_distance: 0.7, max_distance: 0.3)
+    end
+
+    # #202/#203 regression guard: the request path must emit exactly ONE query that
+    # runs the `<=>` band filter over the candidate cross-join. The old shape ran a
+    # SECOND, count(*) query over the same O(candidates²) cross-join — a full pass
+    # that could not early-terminate and was the entire prod-scale latency cost. A
+    # reintroduction of any companion count/aggregate pass would push this back to 2.
+    test "computes the pair set in a SINGLE band pass (no companion count query)", ctx do
+      captured =
+        PlanAssertions.capture_repo_queries(fn ->
+          {:ok, _} = Knowledge.distant_pairs(ctx.tenant.id)
+        end)
+
+      band_queries = Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
+      assert length(band_queries) == 1
     end
   end
 

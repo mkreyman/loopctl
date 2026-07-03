@@ -53,6 +53,32 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
 
     defp pair_ids(pair), do: MapSet.new([pair["a"]["id"], pair["b"]["id"]])
 
+    # Page through EVERY pair for a band (limit=100) following `has_more`, returning the
+    # total number of pairs. Used to assert exact totals without a `total_count` field
+    # (removed in #202/#203 — an exact count was the O(n²) latency cost). `base_params`
+    # is a keyword list so `~p` encodes the query params correctly (interpolating a raw
+    # `"a=1&b=2"` string would URL-encode the `&`/`=`).
+    defp enumerate_all_pairs(conn, key, base_params),
+      do: enumerate_all_pairs(conn, key, base_params, 0, 0)
+
+    defp enumerate_all_pairs(conn, key, base_params, offset, acc) do
+      params = base_params ++ [limit: 100, offset: offset]
+
+      body =
+        conn
+        |> auth_conn(key)
+        |> get(~p"/api/v1/knowledge/pairs?#{params}")
+        |> json_response(200)
+
+      acc = acc + length(body["data"])
+
+      if body["meta"]["has_more"] do
+        enumerate_all_pairs(conn, key, base_params, offset + 100, acc)
+      else
+        acc
+      end
+    end
+
     test "returns only pairs whose cosine distance is inside the band", %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       %{p: p, q: q, u: u} = band_fixture(tenant.id)
@@ -65,9 +91,11 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
 
       pairs = body["data"]
       assert body["meta"]["count"] == length(pairs)
-      # P–Q and P–U
-      assert body["meta"]["total_count"] == 2
+      # P–Q and P–U — both fit on one page.
+      assert length(pairs) == 2
       assert body["meta"]["has_more"] == false
+      # #202/#203: no exact total-pair count is returned (it was the O(n²) cost).
+      refute Map.has_key?(body["meta"], "total_count")
       # Exactly the two in-band pairs P–Q and P–U; nothing involving T.
       assert MapSet.new(Enum.map(pairs, &pair_ids/1)) ==
                MapSet.new([MapSet.new([p.id, q.id]), MapSet.new([p.id, u.id])])
@@ -151,17 +179,15 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
          %{conn: conn} do
       {tenant, key} = setup_tenant_key()
       # Test cap is 25 (config/test.exs). 26 identical-embedding articles → every pair
-      # is at distance 0; the band [0, 0.1] admits them all. total_count is C(25,2)=300
-      # if the cap truncated 26→25 candidates (vs C(26,2)=325 uncapped).
+      # is at distance 0; the band [0, 0.1] admits them all. Enumerating EVERY pair via
+      # pagination yields C(25,2)=300 if the cap truncated 26→25 candidates (vs
+      # C(26,2)=325 uncapped) — an exact-count-field-free way to prove the sample cap.
       for i <- 1..26, do: embedded(tenant.id, "Dup #{i}", [1.0, 0.0])
 
-      body =
-        conn
-        |> auth_conn(key)
-        |> get(~p"/api/v1/knowledge/pairs?min_distance=0&max_distance=0.1&limit=1")
-        |> json_response(200)
+      total =
+        enumerate_all_pairs(conn, key, min_distance: 0, max_distance: 0.1)
 
-      assert body["meta"]["total_count"] == 300
+      assert total == 300
     end
 
     test "paginates deterministically with limit/offset", %{conn: conn} do

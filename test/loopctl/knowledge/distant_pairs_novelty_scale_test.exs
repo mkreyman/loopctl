@@ -21,9 +21,10 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   The bounds are checked under the planner's NATURAL choice (no enable_seqscan=off) against
   the committed, ANALYZEd ~80k corpus from `Loopctl.Knowledge.ScaleSeed`:
 
-    * distant_pairs: EXPLAIN on the ACTUAL count + pairs SQL the request path emits (captured
-      via `PlanAssertions.capture_repo_queries/1`), asserting the `Limit ≤ max_pair_candidates`
-      sample cap dominates every `articles` scan.
+    * distant_pairs: EXPLAIN on the ACTUAL pairs SQL the request path emits (captured via
+      `PlanAssertions.capture_repo_queries/1` — a SINGLE `LIMIT limit+1` page query post
+      #202/#203; the old companion `count(*)` full-pass is gone), asserting the
+      `Limit ≤ max_pair_candidates` sample cap dominates every `articles` scan.
     * novelty: EXPLAIN ANALYZE on `novelty_distance_query/4` (the MIN runs inside a
       `Task.async_stream`, off the test process, so capture can't see it — the builder emits
       the identical SQL+params), asserting ACTUAL `articles` rows stay bounded.
@@ -37,6 +38,7 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.PlanAssertions
   alias Loopctl.Tenants.Tenant
@@ -99,6 +101,11 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
     on_exit(fn ->
       try do
         unboxed(fn ->
+          # Delete links BEFORE articles: article_links has `on_delete: :restrict`, so
+          # deleting the seeded (linked) articles first raises an FK violation, which the
+          # rescue would swallow — leaving the whole ~80k committed corpus behind to
+          # pollute later runs of the shared test DB (a slow `find_orphan_articles` etc.).
+          AdminRepo.delete_all(from(l in ArticleLink, where: l.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
         end)
@@ -120,12 +127,15 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
           {:ok, _} = Knowledge.distant_pairs(tenant.id)
         end)
 
-      # BOTH emitted queries (the count and the paginated pairs) are the self-join with the
-      # `<=>` BETWEEN band; assert the bound on EACH.
+      # Post-#202/#203 the request path emits exactly ONE self-join carrying the `<=>`
+      # BETWEEN band — the paginated `LIMIT limit+1` page. The old companion `count(*)`
+      # query (a SECOND full O(candidates²) pass that could not early-terminate and was
+      # the entire prod-scale cost) is gone; asserting exactly 1 here is the scale-side
+      # regression guard against its reintroduction.
       between_queries =
         Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
 
-      assert length(between_queries) == 2
+      assert length(between_queries) == 1
 
       for {sql, params} <- between_queries do
         # No Seq Scan over the corpus: the candidate subquery is reached via an Index Scan.
