@@ -113,7 +113,7 @@ it fires, the request fast-fails as the structured **504 `db_statement_timeout`*
 
 **Per-endpoint override (optional):** to give one endpoint a tighter (or looser) bound,
 set `:heavy_read_statement_timeout_overrides` (ms) in config — keys
-`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`, `:vector_search`:
+`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge`, `:novelty`, `:vector_search`:
 
 ```elixir
 config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
@@ -124,7 +124,7 @@ dedicated heavy pool (justified by the 8-conn sizing). Leave the map empty unles
 endpoint needs a bound different from the `HEAVY_READ_STATEMENT_TIMEOUT_MS` default.
 
 **Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
-`:semantic_search`, `:distant_pairs`, `:novelty`, `:enumeration`. The enumeration endpoint
+`:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge`, `:novelty`, `:enumeration`. The enumeration endpoint
 (`:knowledge_search_controller` list mode, `list_filtered/2`) now routes through HeavyRead to
 inherit the per-read SET LOCAL statement_timeout and optional per-endpoint override (matching
 the other endpoints). Enumeration pages up to `limit: 1000` rows per request.
