@@ -34,15 +34,22 @@ config :loopctl,
   # heavy reads, e.g. %{suggested_links: 5_000}. Endpoints absent here use the default
   # per-read SET LOCAL statement_timeout (HEAVY_READ_STATEMENT_TIMEOUT_MS, default 10s;
   # US-27.13 — NOT a startup :parameters value, which pgbouncer rejects). Keys:
-  # :suggested_links, :semantic_search, :distant_pairs, :novelty, :enumeration,
-  # :change_feed, :vector_search. NOTE: :distant_pairs,
-  # :semantic_search, and :enumeration each issue TWO reads (count + data); setting an
-  # override for any of them wraps EACH read in its own separate transaction, doubling
-  # the brief checkout count on the heavy pool. :change_feed (US-27.9b) is the
-  # rate-limited orchestrator polling feed — a SINGLE cheap keyset read per request;
-  # its QPS is bounded by the api pipeline's rate limiter, so it adds at most a brief,
-  # fast-releasing checkout and does not erode the K≈6 one-shot fast-read budget.
-  heavy_read_statement_timeout_overrides: %{},
+  # :suggested_links, :semantic_search, :distant_pairs, :distant_pairs_bridge, :novelty,
+  # :enumeration, :change_feed, :vector_search. NOTE: :semantic_search and :enumeration each
+  # issue TWO reads (count + data); setting an override for either wraps EACH read in its own
+  # separate transaction, doubling the brief checkout count on the heavy pool. (:distant_pairs
+  # USED to be in that list — post-#202/#203 it issues a SINGLE paginated read, its exact-count
+  # companion query removed.) :change_feed (US-27.9b) is the rate-limited orchestrator polling
+  # feed — a SINGLE cheap keyset read per request; its QPS is bounded by the api pipeline's
+  # rate limiter, so it adds at most a brief, fast-releasing checkout and does not erode the
+  # K≈6 one-shot fast-read budget.
+  #
+  # :distant_pairs / :distant_pairs_bridge (#202/#203, HIGH-4) carry a 4s backstop — tighter
+  # than the 10s pool default — so a real-scale miss of the Theme-2 <2s target (a deep offset
+  # or a rarely-bridged band that defeats the page's early termination) is CANCELED and frees
+  # its heavy-read slot fast instead of holding it for 10s. The bridge branch reads under its
+  # own key so its (slower) reads are separately observable in slow-query logs.
+  heavy_read_statement_timeout_overrides: %{distant_pairs: 4_000, distant_pairs_bridge: 4_000},
   # US-27.12: set-based bulk archive/unpublish/delete. Each op runs in one
   # transaction that first issues `SET LOCAL statement_timeout = <ms>` so a single
   # large statement can't hold an admin-pool connection indefinitely (blast-radius

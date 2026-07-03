@@ -162,6 +162,13 @@ defmodule Loopctl.Knowledge do
   @max_bridge_pair_candidates 500
   @default_pair_limit 20
   @max_pair_limit 100
+  # Upper bound on `:offset` (#202/#203 review, MED-5). A deep offset defeats the page's
+  # early termination — Postgres must produce `offset + limit + 1` matching pairs before
+  # returning — so an unbounded offset lets a caller force near-full O(candidates²)
+  # evaluation of the cross-join. Clamp it (analogous to `limit`'s `min(@max_pair_limit)`);
+  # operator-tunable via `config :loopctl, :max_pair_offset`. 10_000 ≫ any real page depth
+  # at the default limit (500 pages) yet ≪ the ~500k max pairs at the 1000 candidate cap.
+  @max_pair_offset 10_000
   @default_walk_length 4
   @max_walk_length 25
   # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
@@ -4375,7 +4382,7 @@ defmodule Loopctl.Knowledge do
     min_d = Keyword.get(opts, :min_distance, 0.3)
     max_d = Keyword.get(opts, :max_distance, 0.7)
     limit = opts |> Keyword.get(:limit, @default_pair_limit) |> max(1) |> min(@max_pair_limit)
-    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0) |> min(max_pair_offset())
     bridge? = Keyword.get(opts, :bridge_path, false) == true
     vis = Keyword.get(opts, :visibility_agent_id)
 
@@ -4402,9 +4409,35 @@ defmodule Loopctl.Knowledge do
     Application.get_env(:loopctl, :max_bridge_pair_candidates, @max_bridge_pair_candidates)
   end
 
-  # The sample cap for THIS request: the smaller bridge cap when `bridge_path` is on,
-  # else the full cap.
-  defp pair_candidate_cap(true), do: max_bridge_pair_candidates()
+  # The COMPILE-TIME default caps (the module-attribute constants, config-independent). The
+  # OpenAPI operation doc interpolates these so the numbers in the description can never drift
+  # from the code (#202/#203 review, LOW-9). Public (`@doc false`) only so the controller can
+  # reference them at compile time.
+  @doc false
+  def default_max_pair_candidates, do: @max_pair_candidates
+
+  @doc false
+  def default_max_bridge_pair_candidates, do: @max_bridge_pair_candidates
+
+  # Operator-tunable upper bound on the `:offset` (#202/#203 MED-5).
+  defp max_pair_offset do
+    Application.get_env(:loopctl, :max_pair_offset, @max_pair_offset)
+  end
+
+  # #202/#203 MED-7 invariant: the effective bridge cap NEVER exceeds the general cap, so a
+  # misconfigured larger bridge cap can't make `bridge_path` slower than the non-bridge path
+  # it is meant to bound. Pure + public (`@doc false`) so the clamp is unit-testable without
+  # `Application.put_env` (config-based DI — no put_env in tests).
+  @doc false
+  def effective_bridge_candidate_cap(bridge_cap, general_cap)
+      when is_integer(bridge_cap) and is_integer(general_cap),
+      do: min(bridge_cap, general_cap)
+
+  # The sample cap for THIS request: the (clamped) smaller bridge cap when `bridge_path` is
+  # on, else the full cap.
+  defp pair_candidate_cap(true),
+    do: effective_bridge_candidate_cap(max_bridge_pair_candidates(), max_pair_candidates())
+
   defp pair_candidate_cap(false), do: max_pair_candidates()
 
   # Column-to-column self-join: `(a.embedding <=> b.embedding) BETWEEN $min AND $max` over
@@ -4464,10 +4497,16 @@ defmodule Loopctl.Knowledge do
     # ops. A SINGLE short read now (the exact-count companion read was removed in
     # #202/#203). The query filters `a.tenant_id`/`b.tenant_id`, satisfying the
     # wrapper's structural tenant guard.
+    #
+    # The bridge branch reads under its OWN endpoint key (`:distant_pairs_bridge`) so its
+    # slower per-pair-EXISTS reads carry a distinct `statement_timeout` backstop + slow-query
+    # telemetry tag, separate from the fast non-bridge path (#202/#203 review, HIGH-4).
+    endpoint = if bridge?, do: :distant_pairs_bridge, else: :distant_pairs
+
     pairs_with_lookahead =
       pairs_query
       |> maybe_filter_bridge_path(bridge?, vis)
-      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:distant_pairs)))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(endpoint)))
 
     # Detect has_more by fetching limit+1; only return limit.
     has_more = length(pairs_with_lookahead) > limit

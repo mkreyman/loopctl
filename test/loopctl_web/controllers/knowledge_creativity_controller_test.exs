@@ -94,8 +94,11 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       # P–Q and P–U — both fit on one page.
       assert length(pairs) == 2
       assert body["meta"]["has_more"] == false
-      # #202/#203: no exact total-pair count is returned (it was the O(n²) cost).
-      refute Map.has_key?(body["meta"], "total_count")
+      # #202/#203: total_count is DEPRECATED and always null — kept as a null key for a
+      # backward-compat window (existing clients get null, not a missing key); the exact
+      # count was the O(candidates²) cost. Paginate via has_more.
+      assert Map.has_key?(body["meta"], "total_count")
+      assert body["meta"]["total_count"] == nil
       # Exactly the two in-band pairs P–Q and P–U; nothing involving T.
       assert MapSet.new(Enum.map(pairs, &pair_ids/1)) ==
                MapSet.new([MapSet.new([p.id, q.id]), MapSet.new([p.id, u.id])])
@@ -188,6 +191,35 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
         enumerate_all_pairs(conn, key, min_distance: 0, max_distance: 0.1)
 
       assert total == 300
+    end
+
+    test "bridge_path=true is governed by the smaller bridge candidate cap (#202/#203)",
+         %{conn: conn} do
+      {tenant, key} = setup_tenant_key()
+
+      # Async config: general cap 25, bridge cap 10 (config/test.exs). Seed `n` identical
+      # articles with bridge_cap < n <= general, star-linked so EVERY pair bridges (≤2 hops
+      # via the center), band [0,0.1] admitting all pairs. Enumerating all pairs then reveals
+      # WHICH cap governed each mode — proving the bridge branch uses the tighter cap (a revert
+      # of the bridge-branch dispatch would make both modes enumerate the same C(n,2)).
+      general = Application.get_env(:loopctl, :max_pair_candidates)
+      bridge_cap = Application.get_env(:loopctl, :max_bridge_pair_candidates)
+      assert bridge_cap < general, "bridge cap must be < general cap for this invariant to bind"
+      n = bridge_cap + 5
+      assert n <= general
+
+      [center | rest] = for i <- 1..n, do: embedded(tenant.id, "Dup #{i}", [1.0, 0.0])
+      for a <- rest, do: link(tenant.id, center, a)
+
+      non_bridge = enumerate_all_pairs(conn, key, min_distance: 0, max_distance: 0.1)
+
+      bridge =
+        enumerate_all_pairs(conn, key, min_distance: 0, max_distance: 0.1, bridge_path: true)
+
+      # Non-bridge samples all n (general cap doesn't bind at n); bridge samples only bridge_cap.
+      assert non_bridge == div(n * (n - 1), 2)
+      assert bridge == div(bridge_cap * (bridge_cap - 1), 2)
+      assert bridge < non_bridge
     end
 
     test "paginates deterministically with limit/offset", %{conn: conn} do

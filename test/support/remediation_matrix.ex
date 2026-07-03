@@ -98,11 +98,13 @@ defmodule Loopctl.RemediationMatrix do
   @prior_tag "scale-tag-3"
   @keyset_tag "scale-tag-7"
 
-  # The sampled-candidate LIMIT that bounds the distant_pairs self-join (SAME source as
-  # distant_pairs_novelty_scale_test.exs `@max_pair_candidates`). The genuine bound is this
-  # `Limit ≤ cap` on the candidate subquery — `refute_seq_scan` alone does NOT prove the
-  # O(n²) self-join is sample-bounded (the scan node's pre-LIMIT estimate ≈ corpus).
-  @max_pair_candidates Application.compile_env(:loopctl, :max_pair_candidates, 1_000)
+  # The sampled-candidate LIMIT that bounds the distant_pairs self-join. Read at RUNTIME (not
+  # `compile_env`) because config/test.exs now sets :max_pair_candidates CONDITIONALLY (small in
+  # the async suite, PROD default under the SCALE gate) — a `compile_env` attr would raise the
+  # compile-vs-runtime mismatch guard. The genuine bound is this `Limit ≤ cap` on the candidate
+  # subquery — `refute_seq_scan` alone does NOT prove the O(n²) self-join is sample-bounded (the
+  # scan node's pre-LIMIT estimate ≈ corpus).
+  defp max_pair_candidates, do: Application.get_env(:loopctl, :max_pair_candidates, 1_000)
 
   # The canonical, COMPLETE set of endpoint names this census must cover. The gate
   # asserts the built matrix's endpoint names equal this set, so a silently-dropped
@@ -310,12 +312,14 @@ defmodule Loopctl.RemediationMatrix do
         between =
           Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
 
-        # BOTH emitted band queries (count + paginated pairs) must be present and bounded —
-        # matching the owning gate exactly so the census row's `:pass` means the same thing.
-        if length(between) != 2 do
+        # Exactly ONE emitted band query — the paginated `LIMIT limit+1` page. Post-#202/#203
+        # the companion `count(*)` band query (a second, non-early-terminating O(candidates²)
+        # pass) was removed; matching the owning gate exactly so the census row's `:pass` means
+        # the same thing (mirrors distant_pairs_novelty_scale_test.exs).
+        if length(between) != 1 do
           raise ExUnit.AssertionError,
             message:
-              "distant_pairs expected 2 BETWEEN (band) queries (count + pairs), got #{length(between)}"
+              "distant_pairs expected 1 BETWEEN (band) query (the paginated page), got #{length(between)}"
         end
 
         for {sql, params} <- between do
@@ -323,7 +327,11 @@ defmodule Loopctl.RemediationMatrix do
           # dominated by a `Limit ≤ max_pair_candidates` (refute_seq_scan alone wouldn't prove
           # the O(n²) self-join stays sampled — architect review F2 / BA LOW-1).
           PlanAssertions.refute_seq_scan({sql, params})
-          PlanAssertions.assert_article_scans_capped_by_limit({sql, params}, @max_pair_candidates)
+
+          PlanAssertions.assert_article_scans_capped_by_limit(
+            {sql, params},
+            max_pair_candidates()
+          )
         end
       end),
       asserted("novelty", :vector, fn ->

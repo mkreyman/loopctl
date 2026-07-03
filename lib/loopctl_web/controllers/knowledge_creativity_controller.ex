@@ -28,14 +28,16 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
       "Returns paginated pairs of articles whose embedding cosine distance is in the " <>
         "optimal-novelty band [`min_distance`, `max_distance`] (default 0.3–0.7) — the " <>
         "creative sweet spot. With `bridge_path=true`, only pairs also connected in the " <>
-        "link graph (≤2 hops) are returned (that branch samples a smaller 500-article slice " <>
-        "so its per-pair graph check stays within budget). Agent callers see only their own " <>
-        "and `shared` articles. Each pair: `{a, b, distance}`. Samples up to " <>
-        "1000 embedded published visible articles (lowest-id slice; operator-tunable). " <>
-        "`meta` carries `count` (items in this page) and `has_more` (a `limit+1` look-ahead) " <>
-        "for pagination. No exact total-pair count is returned: computing it requires a full " <>
-        "O(candidates²) pass that dominated latency at scale (#202/#203); page via `has_more`. " <>
-        "Role: agent+.",
+        "link graph (≤2 hops) are returned (that branch samples a smaller " <>
+        "#{Knowledge.default_max_bridge_pair_candidates()}-article slice so its per-pair " <>
+        "graph check stays within budget). Agent callers see only their own and `shared` " <>
+        "articles. Each pair: `{a, b, distance}`. Samples up to " <>
+        "#{Knowledge.default_max_pair_candidates()} embedded published visible articles " <>
+        "(lowest-id slice; operator-tunable). `meta` carries `count` (items in this page) and " <>
+        "`has_more` (a `limit+1` look-ahead) for pagination. NOTE: `meta.total_count` is " <>
+        "DEPRECATED and always `null` on this endpoint — unlike sibling offset/limit " <>
+        "endpoints, an EXACT total here requires a full O(candidates²) pass that dominated " <>
+        "latency at scale (#202/#203), so it was removed; page via `has_more`. Role: agent+.",
     parameters: [
       min_distance: [
         in: :query,
@@ -72,6 +74,14 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
                  has_more: %OpenApiSpex.Schema{
                    type: :boolean,
                    description: "More pairs exist beyond this page (limit+1 look-ahead)"
+                 },
+                 total_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   nullable: true,
+                   deprecated: true,
+                   description:
+                     "DEPRECATED — always null. An exact total pair count is an " <>
+                       "O(candidates²) cost (#202/#203); paginate via has_more instead."
                  }
                }
              }
@@ -103,7 +113,11 @@ defmodule LoopctlWeb.KnowledgeCreativityController do
         data: result.pairs,
         meta: %{
           count: length(result.pairs),
-          has_more: result.has_more
+          has_more: result.has_more,
+          # DEPRECATED, always null (#202/#203): kept as a null key for a backward-compat
+          # window so existing clients that read `meta.total_count` get null rather than a
+          # missing key. Computing an exact total is an O(candidates²) cost; page via has_more.
+          total_count: nil
         }
       })
     else

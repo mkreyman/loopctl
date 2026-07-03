@@ -111,6 +111,36 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
       band_queries = Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
       assert length(band_queries) == 1
     end
+
+    # #202/#203 MED-5: an unbounded offset defeats the page's early termination (Postgres must
+    # produce offset+limit+1 matching pairs before returning), so a huge offset could force
+    # near-full O(candidates²) evaluation. The offset is clamped to an operator-tunable ceiling.
+    test "clamps an out-of-range offset to the ceiling", ctx do
+      huge = 10_000_000
+      ceiling = Application.get_env(:loopctl, :max_pair_offset, 10_000)
+
+      captured =
+        PlanAssertions.capture_repo_queries(fn ->
+          {:ok, _} = Knowledge.distant_pairs(ctx.tenant.id, offset: huge)
+        end)
+
+      {_sql, params} = Enum.find(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
+
+      # The emitted OFFSET is the clamped ceiling, never the caller's out-of-range value.
+      assert ceiling in params
+      refute huge in params
+    end
+  end
+
+  describe "candidate-cap invariant (#202/#203 MED-7)" do
+    test "effective bridge cap never exceeds the general cap (clamps a misconfig)" do
+      # A bridge cap larger than the general cap must clamp DOWN — a bigger bridge sample
+      # would make bridge_path SLOWER than the non-bridge path it is meant to bound.
+      assert Knowledge.effective_bridge_candidate_cap(700, 500) == 500
+      # A bridge cap already smaller than the general cap passes through unchanged.
+      assert Knowledge.effective_bridge_candidate_cap(300, 500) == 300
+      assert Knowledge.effective_bridge_candidate_cap(500, 500) == 500
+    end
   end
 
   describe "novelty_scores — scores unchanged after to_embedding_list normalization (TC-27.7b.2)" do
