@@ -17,6 +17,7 @@ defmodule LoopctlWeb.KnowledgeLintController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -99,17 +100,17 @@ defmodule LoopctlWeb.KnowledgeLintController do
   end
 
   defp parse_lint_params(params) do
-    opts = []
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        case params["project_id"] do
+          value when value in [nil, ""] -> []
+          project_id -> [project_id: project_id]
+        end
 
-    opts =
-      case params["project_id"] do
-        nil -> opts
-        project_id -> Keyword.put(opts, :project_id, project_id)
+      with {:ok, opts} <- parse_stale_days(params, opts),
+           {:ok, opts} <- parse_min_coverage(params, opts) do
+        parse_max_per_category(params, opts)
       end
-
-    with {:ok, opts} <- parse_stale_days(params, opts),
-         {:ok, opts} <- parse_min_coverage(params, opts) do
-      parse_max_per_category(params, opts)
     end
   end
 

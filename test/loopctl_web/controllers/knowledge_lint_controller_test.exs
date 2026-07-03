@@ -781,4 +781,84 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
       assert refetched.status == :published
     end
   end
+
+  describe "GET /api/v1/knowledge/lint project_id validation (kbweb-01)" do
+    test "a malformed project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint", %{project_id: "not-a-uuid"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "a valid project_id returns a 200 report", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        title: "Scoped Lint Pattern",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint", %{project_id: project.id})
+
+      body = json_response(conn, 200)
+      assert is_map(body["data"])
+    end
+
+    test "an absent project_id returns a 200 tenant-wide report", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/lint")
+
+      assert json_response(conn, 200)["data"]
+    end
+
+    test "the project-scoped path with a malformed project_id returns 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/projects/not-a-uuid/knowledge/lint")
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "an array-style project_id[]=x does not 500 (find_contradiction_clusters guarded)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # `?project_id[]=x` decodes to a list, which ProjectId.validate tolerates as
+      # absent; the context guards then keep find_contradiction_clusters/2 (and
+      # published_base_query/2) from CastError-500 on the raw list value.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/knowledge/lint?project_id[]=x")
+
+      assert json_response(conn, 200)["data"]
+    end
+  end
 end

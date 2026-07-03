@@ -66,7 +66,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       }) do
     url = args["url"]
     raw_content = args["content"]
-    project_id = args["project_id"]
+    # Normalize "" -> nil (a blank project_id is "tenant-wide", not a value to dump
+    # against the :binary_id column).
+    project_id = normalize_project_id(args["project_id"])
     # Default draft; publish only when the ingest request opted in (#133).
     publish = args["publish"] == true
 
@@ -74,12 +76,33 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # source_id must be a UUID (:binary_id), so we derive one from the hash.
     source_id = derive_source_id(content_hash)
 
-    with {:ok, content} <- resolve_content(url, raw_content),
+    # Defense in depth (the controller boundary validates before enqueueing): a
+    # malformed / non-string project_id would raise Ecto.ChangeError on insert and,
+    # because the uniqueness key excludes project_id, crash-loop as a poison pill.
+    # DISCARD such a job (no retry) BEFORE any fetch/LLM work rather than raising.
+    with :ok <- validate_project_id(project_id),
+         {:ok, content} <- resolve_content(url, raw_content),
          {:ok, raw_articles} <- extract_with_chunking(content, source_type) do
       articles = validate_and_filter(raw_articles)
       insert_articles(tenant_id, source_id, source_type, project_id, articles, url, publish)
     end
   end
+
+  # nil (tenant-wide) or a valid UUID is fine; anything else is a poison pill —
+  # discard it cleanly (no 3x retry), never raise.
+  defp validate_project_id(nil), do: :ok
+
+  defp validate_project_id(project_id) when is_binary(project_id) do
+    if valid_uuid?(project_id), do: :ok, else: {:discard, {:invalid_project_id, project_id}}
+  end
+
+  defp validate_project_id(other), do: {:discard, {:invalid_project_id, other}}
+
+  defp normalize_project_id(""), do: nil
+  defp normalize_project_id(value), do: value
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   @impl Oban.Worker
   def backoff(%Oban.Job{attempt: attempt}) do
@@ -344,8 +367,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
           status: status
         }
 
+        # perform/1 already discarded jobs with an invalid project_id; this
+        # valid_uuid? guard is defense in depth so the raw struct assign can NEVER
+        # dump a non-UUID against the :binary_id column (a pre-existing queued job
+        # replayed through an older path would otherwise raise). A non-UUID here
+        # falls back to tenant-wide rather than crashing.
         article =
-          if project_id do
+          if valid_uuid?(project_id) do
             %{article | project_id: project_id}
           else
             article

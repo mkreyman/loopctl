@@ -636,4 +636,96 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert List.first(body["data"])["title"] == "Published Hub"
     end
   end
+
+  describe "GET /api/v1/knowledge/search project_id validation (kbweb-01)" do
+    test "a malformed project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "anything", project_id: "not-a-uuid"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "a valid project_id returns 200 filtered to that project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        title: "Scoped Ecto Pattern",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          q: "Ecto",
+          mode: "keyword",
+          project_id: project.id
+        })
+
+      body = json_response(conn, 200)
+      assert Enum.any?(body["data"], &(&1["title"] == "Scoped Ecto Pattern"))
+    end
+
+    test "an absent project_id returns 200 tenant-wide", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Tenant Wide Ecto",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "Ecto", mode: "keyword"})
+
+      assert json_response(conn, 200)["data"] != nil
+    end
+
+    test "a valid project_id from another tenant does not leak (empty, not 500)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+
+      fixture(:article, %{
+        tenant_id: tenant_b.id,
+        project_id: project_b.id,
+        title: "Tenant B Ecto Secret",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          q: "Ecto",
+          mode: "keyword",
+          project_id: project_b.id
+        })
+
+      body = json_response(conn, 200)
+      refute Enum.any?(body["data"], &(&1["title"] == "Tenant B Ecto Secret"))
+    end
+  end
 end

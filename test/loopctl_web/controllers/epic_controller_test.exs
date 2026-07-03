@@ -114,6 +114,20 @@ defmodule LoopctlWeb.EpicControllerTest do
       assert json_response(conn, 404)
     end
 
+    test "returns 404 (not a 500) for a malformed project_id path segment (kbweb-01)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/projects/not-a-uuid/epics", %{"number" => 1, "title" => "Bad"})
+
+      assert json_response(conn, 404)
+    end
+
     test "creates audit log entry", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

@@ -98,14 +98,26 @@ defmodule Loopctl.Projects do
   - `{:ok, %Project{}}` if found
   - `{:error, :not_found}` if not found or belongs to another tenant
   """
-  @spec get_project(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec get_project(Ecto.UUID.t(), term()) ::
           {:ok, Project.t()} | {:error, :not_found}
   def get_project(tenant_id, project_id) do
-    case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      project -> {:ok, project}
+    # `id: project_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value (a malformed path segment reaches here from the many
+    # `/projects/:project_id/*` endpoints that scope through this function). Guard
+    # the cast so a malformed project_id is a clean :not_found (-> 404), never a
+    # 500. This is the shared chokepoint for project-scoped work-breakdown reads.
+    if valid_uuid?(project_id) do
+      case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
+        nil -> {:error, :not_found}
+        project -> {:ok, project}
+      end
+    else
+      {:error, :not_found}
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   @doc """
   Gets a project by slug, scoped to a tenant.

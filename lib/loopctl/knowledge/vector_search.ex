@@ -493,8 +493,16 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # the index-ordered subquery would defeat HNSW (same class as tags/category).
   defp maybe_filter_by_project(query, nil), do: query
 
-  defp maybe_filter_by_project(query, project_id) when is_binary(project_id),
-    do: where(query, [c], c.project_id == ^project_id)
+  defp maybe_filter_by_project(query, project_id) when is_binary(project_id) do
+    # Guard the :binary_id cast (defense in depth — the search controller 4xxs a
+    # malformed project_id first). A non-UUID value matches nothing, mirroring
+    # Loopctl.Knowledge.maybe_filter_by_project_id/2, rather than CastError-500.
+    if valid_uuid?(project_id) do
+      where(query, [c], c.project_id == ^project_id)
+    else
+      where(query, [c], false)
+    end
+  end
 
   # "Same-project OR tenant-wide" project scope on the OUTER pool — the auto-link
   # worker's `scope_by_project/2` semantics (US-21.2.3): a project-scoped source
@@ -504,8 +512,15 @@ defmodule Loopctl.Knowledge.VectorSearch do
   # `maybe_filter_by_project/2`.
   defp maybe_filter_by_project_or_global(query, nil), do: query
 
-  defp maybe_filter_by_project_or_global(query, project_id) when is_binary(project_id),
-    do: where(query, [c], c.project_id == ^project_id or is_nil(c.project_id))
+  defp maybe_filter_by_project_or_global(query, project_id) when is_binary(project_id) do
+    # Guard the :binary_id cast. A malformed value scopes to tenant-wide
+    # (`project_id IS NULL`) rows only rather than CastError-500.
+    if valid_uuid?(project_id) do
+      where(query, [c], c.project_id == ^project_id or is_nil(c.project_id))
+    else
+      where(query, [c], is_nil(c.project_id))
+    end
+  end
 
   # Same agent-visibility metadata predicate as the other knowledge reads
   # (Loopctl.Knowledge.maybe_filter_by_visibility/2), on the `[a]` binding.
@@ -519,6 +534,10 @@ defmodule Loopctl.Knowledge.VectorSearch do
         fragment("?->>'agent_id' = ?", a.metadata, ^agent_id)
     )
   end
+
+  # Only ever called from the `is_binary(project_id)`-guarded clauses above, so a
+  # single binary clause suffices (a catch-all would be dead code).
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
 
   # --- outer (over-the-pool) anti-join: already-linked, both directions ---
 

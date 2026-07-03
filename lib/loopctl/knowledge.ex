@@ -1009,12 +1009,7 @@ defmodule Loopctl.Knowledge do
         where: a.status == :published
       )
 
-    base =
-      if project_id do
-        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-      else
-        base
-      end
+    base = scope_project_or_global(base, project_id)
 
     base =
       base
@@ -1187,12 +1182,7 @@ defmodule Loopctl.Knowledge do
         where: a.status == :published
       )
 
-    base =
-      if project_id do
-        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-      else
-        base
-      end
+    base = scope_project_or_global(base, project_id)
 
     base
     |> maybe_filter_by_category(Keyword.get(opts, :category))
@@ -1252,12 +1242,7 @@ defmodule Loopctl.Knowledge do
 
     base = from(a in Article, where: a.tenant_id == ^tenant_id)
 
-    base =
-      if project_id do
-        where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-      else
-        base
-      end
+    base = scope_project_or_global(base, project_id)
 
     # Visibility (#163): an agent's stats never count another agent's private memories.
     base = maybe_filter_by_visibility(base, Keyword.get(opts, :visibility_agent_id))
@@ -2760,6 +2745,21 @@ defmodule Loopctl.Knowledge do
 
   defp valid_uuid?(id) when is_binary(id), do: match?({:ok, _}, Ecto.UUID.cast(id))
   defp valid_uuid?(_), do: false
+
+  # Applies the "tenant-wide (nil project) OR this project" scope on the `[a]`
+  # (Article) binding, guarding the :binary_id cast. A non-UUID project_id would
+  # raise Ecto.Query.CastError on the `== ^project_id` comparison; a malformed
+  # value scopes to tenant-wide articles only rather than crashing (callers 4xx
+  # at the boundary — this is defense in depth).
+  defp scope_project_or_global(query, nil), do: query
+
+  defp scope_project_or_global(query, project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+    else
+      where(query, [a], is_nil(a.project_id))
+    end
+  end
 
   # Per-id outcome, in request order. Precedence: errored > published > existing-state.
   defp bulk_publish_result(id, existing, published_ids, errored_set) do
@@ -4891,15 +4891,18 @@ defmodule Loopctl.Knowledge do
   defp validate_project_ownership(_tenant_id, nil), do: :ok
 
   defp validate_project_ownership(tenant_id, project_id) do
-    case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
-      nil ->
-        {:error,
-         %Article{}
-         |> Ecto.Changeset.change()
-         |> Ecto.Changeset.add_error(:project_id, "does not belong to this tenant")}
-
-      _project ->
-        :ok
+    # `id: project_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value (a malformed string, or a non-string from a JSON body). Guard
+    # the cast so create/update (and OKF import via create_article/update_article)
+    # return the changeset error -> a clean 422, never a 500.
+    if valid_uuid?(project_id) and
+         not is_nil(AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id)) do
+      :ok
+    else
+      {:error,
+       %Article{}
+       |> Ecto.Changeset.change()
+       |> Ecto.Changeset.add_error(:project_id, "is invalid or does not belong to this tenant")}
     end
   end
 
@@ -4966,7 +4969,16 @@ defmodule Loopctl.Knowledge do
   defp maybe_filter_by_project_id(query, nil), do: query
 
   defp maybe_filter_by_project_id(query, project_id) do
-    where(query, [a], a.project_id == ^project_id)
+    # Defense in depth: `project_id` is a `:binary_id` column, so a non-UUID
+    # value would make `Ecto.UUID.dump/1` fail and raise `Ecto.Query.CastError`
+    # (an unhandled 500). Callers validate at the API boundary and 422 first, but
+    # a malformed value reaching here must not crash — treat it as "matches
+    # nothing", consistent with a valid-but-nonexistent project.
+    if valid_uuid?(project_id) do
+      where(query, [a], a.project_id == ^project_id)
+    else
+      where(query, [a], false)
+    end
   end
 
   defp maybe_filter_by_category(query, nil), do: query
@@ -5930,11 +5942,21 @@ defmodule Loopctl.Knowledge do
   end
 
   defp published_base_query(tenant_id, project_id) do
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id,
-      where: a.status == :published,
-      where: is_nil(a.project_id) or a.project_id == ^project_id
-    )
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published
+      )
+
+    # Defense in depth: a non-UUID project_id would raise Ecto.Query.CastError on
+    # the `== ^project_id` binary_id comparison. Callers 422 before reaching here;
+    # a malformed value that slips through scopes to tenant-wide articles only
+    # (nil project) rather than crashing.
+    if valid_uuid?(project_id) do
+      where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+    else
+      where(base, [a], is_nil(a.project_id))
+    end
   end
 
   defp find_stale_articles(base, stale_days) do
@@ -6037,21 +6059,30 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    links_query =
-      if project_id do
-        from([al, src, tgt] in links_query,
-          where:
-            (is_nil(src.project_id) or src.project_id == ^project_id) and
-              (is_nil(tgt.project_id) or tgt.project_id == ^project_id)
-        )
-      else
-        links_query
-      end
-
-    links = AdminRepo.all(links_query)
+    links = links_query |> scope_contradiction_links(project_id) |> AdminRepo.all()
 
     # Build clusters using union-find approach (group connected articles)
     build_contradiction_clusters(links)
+  end
+
+  # Scope contradiction links to a project, guarding the :binary_id cast. A
+  # non-UUID project_id (e.g. `?project_id[]=x` decodes to a truthy list) would
+  # otherwise CastError-500 on the `== ^project_id` comparison; a malformed value
+  # scopes to tenant-wide (nil-project) links only rather than crashing.
+  defp scope_contradiction_links(query, nil), do: query
+
+  defp scope_contradiction_links(query, project_id) do
+    if valid_uuid?(project_id) do
+      from([al, src, tgt] in query,
+        where:
+          (is_nil(src.project_id) or src.project_id == ^project_id) and
+            (is_nil(tgt.project_id) or tgt.project_id == ^project_id)
+      )
+    else
+      from([al, src, tgt] in query,
+        where: is_nil(src.project_id) and is_nil(tgt.project_id)
+      )
+    end
   end
 
   defp build_contradiction_clusters([]), do: []

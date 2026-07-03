@@ -20,6 +20,7 @@ defmodule LoopctlWeb.ArticleController do
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -266,38 +267,47 @@ defmodule LoopctlWeb.ArticleController do
         }
       })
     else
-      tenant_id = api_key.tenant_id
-      audit_opts = AuditContext.from_conn(conn)
-
-      # If project_id comes from the path (project-scoped route), merge it into
-      # attrs, then set the initial status server-side (never trusting the
-      # caller's `status`): published by default, draft only when the caller
-      # explicitly opted in via draft:true / status:"draft".
-      attrs =
-        params
-        |> maybe_merge_project_id(params["project_id"])
-        |> put_create_status(draft?)
-
-      # Trust model (#163): an agent may only write a memory under its OWN verified
-      # key identity. For agent-role writers that carry agent-memory metadata, stamp
-      # metadata.agent_id from the key (overriding any spoofed value); an agent with
-      # no key identity can't attribute a memory → 403.
-      case bind_agent_identity(api_key, attrs) do
-        {:ok, bound_attrs} ->
-          create_article(conn, tenant_id, bound_attrs, audit_opts, draft?, gate?)
-
-        {:error, :no_agent_identity} ->
-          conn
-          |> put_status(:forbidden)
-          |> json(%{
-            error: %{
-              status: 403,
-              code: "agent_identity_required",
-              message:
-                "This API key has no agent identity; it cannot write an attributed agent memory"
-            }
-          })
+      # Validate project_id (path segment or JSON body) up front so a non-UUID
+      # value returns a clean 422 instead of reaching validate_project_ownership/2
+      # and raising Ecto.Query.CastError (500).
+      with :ok <- ProjectId.validate(params["project_id"]) do
+        create_validated(conn, api_key, params, draft?, gate?)
       end
+    end
+  end
+
+  defp create_validated(conn, api_key, params, draft?, gate?) do
+    tenant_id = api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    # If project_id comes from the path (project-scoped route), merge it into
+    # attrs, then set the initial status server-side (never trusting the caller's
+    # `status`): published by default, draft only when the caller explicitly opted
+    # in via draft:true / status:"draft".
+    attrs =
+      params
+      |> maybe_merge_project_id(params["project_id"])
+      |> put_create_status(draft?)
+
+    # Trust model (#163): an agent may only write a memory under its OWN verified
+    # key identity. For agent-role writers that carry agent-memory metadata, stamp
+    # metadata.agent_id from the key (overriding any spoofed value); an agent with
+    # no key identity can't attribute a memory → 403.
+    case bind_agent_identity(api_key, attrs) do
+      {:ok, bound_attrs} ->
+        create_article(conn, tenant_id, bound_attrs, audit_opts, draft?, gate?)
+
+      {:error, :no_agent_identity} ->
+        conn
+        |> put_status(:forbidden)
+        |> json(%{
+          error: %{
+            status: 403,
+            code: "agent_identity_required",
+            message:
+              "This API key has no agent identity; it cannot write an attributed agent memory"
+          }
+        })
     end
   end
 
@@ -451,7 +461,8 @@ defmodule LoopctlWeb.ArticleController do
 
     # Validate enum-typed filters up front: an unknown value is a client error
     # (400 with the allowed values), not a 404/500 from an Ecto.Enum cast failure.
-    with :ok <- validate_enum(params["status"], @valid_statuses, "status"),
+    with :ok <- ProjectId.validate(params["project_id"]),
+         :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
          {:ok, effective_limit} <- Pagination.validate_limit(params),
          {:ok, match} <- TagMatch.parse(params) do
@@ -475,6 +486,12 @@ defmodule LoopctlWeb.ArticleController do
       result = Knowledge.list_articles(tenant_id, opts)
       json(conn, ArticleJSON.index(%{articles: result.data, meta: result.meta}))
     else
+      # ProjectId.validate/1 returns {:error, :unprocessable_entity, message};
+      # delegate it to the FallbackController (422). Matched before the enum
+      # clause below because that one also has a 3-element error shape.
+      {:error, :unprocessable_entity, _message} = error ->
+        error
+
       {:error, field, allowed} ->
         conn
         |> put_status(:bad_request)
@@ -517,28 +534,32 @@ defmodule LoopctlWeb.ArticleController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
-    attrs =
-      params
-      |> Map.take([
-        "title",
-        "body",
-        "category",
-        "status",
-        "tags",
-        "metadata",
-        "project_id"
-      ])
-      |> Map.reject(fn {_k, v} -> is_nil(v) end)
+    # Validate a caller-supplied project_id (body) before it reaches
+    # validate_project_ownership/2, so a non-UUID returns 422, not a CastError 500.
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      attrs =
+        params
+        |> Map.take([
+          "title",
+          "body",
+          "category",
+          "status",
+          "tags",
+          "metadata",
+          "project_id"
+        ])
+        |> Map.reject(fn {_k, v} -> is_nil(v) end)
 
-    case Knowledge.update_article(tenant_id, article_id, attrs, audit_opts) do
-      {:ok, article} ->
-        json(conn, ArticleJSON.update(%{article: article}))
+      case Knowledge.update_article(tenant_id, article_id, attrs, audit_opts) do
+        {:ok, article} ->
+          json(conn, ArticleJSON.update(%{article: article}))
 
-      {:error, :not_found} ->
-        {:error, :not_found}
+        {:error, :not_found} ->
+          {:error, :not_found}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+        {:error, %Ecto.Changeset{} = changeset} ->
+          {:error, changeset}
+      end
     end
   end
 

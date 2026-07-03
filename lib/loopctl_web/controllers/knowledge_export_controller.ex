@@ -25,6 +25,7 @@ defmodule LoopctlWeb.KnowledgeExportController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge.StreamingExport.ObsidianFormat
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -64,18 +65,24 @@ defmodule LoopctlWeb.KnowledgeExportController do
   def export(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      case params["project_id"] do
-        nil -> []
-        project_id -> [project_id: project_id]
-      end
+    # Validate project_id BEFORE streaming: `send_chunked/2` commits a 200 with
+    # no way back to an error status, so a malformed project_id reaching the
+    # query would raise mid-stream and truncate the archive. Reject it here so
+    # the FallbackController can return a clean 422 before any body is sent.
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        case params["project_id"] do
+          value when value in [nil, ""] -> []
+          project_id -> [project_id: project_id]
+        end
 
-    LoopctlWeb.StreamingExport.stream(
-      conn,
-      tenant_id,
-      ObsidianFormat,
-      "knowledge-export",
-      opts
-    )
+      LoopctlWeb.StreamingExport.stream(
+        conn,
+        tenant_id,
+        ObsidianFormat,
+        "knowledge-export",
+        opts
+      )
+    end
   end
 end

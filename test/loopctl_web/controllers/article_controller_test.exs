@@ -1187,4 +1187,173 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert json_response(conn_delete, 404)
     end
   end
+
+  describe "GET /api/v1/articles project_id validation (kbweb-01)" do
+    test "a malformed project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/articles", %{project_id: "not-a-uuid"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "a valid project_id returns 200 filtered to that project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      in_project =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          title: "In Project",
+          status: :published
+        })
+
+      _tenant_wide =
+        fixture(:article, %{tenant_id: tenant.id, title: "Tenant Wide", status: :published})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/articles", %{project_id: project.id})
+
+      body = json_response(conn, 200)
+      ids = Enum.map(body["data"], & &1["id"])
+      assert in_project.id in ids
+      refute Enum.any?(body["data"], &(&1["title"] == "Tenant Wide"))
+    end
+
+    test "an absent project_id returns 200 tenant-wide", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      fixture(:article, %{tenant_id: tenant.id, title: "Tenant Wide", status: :published})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/articles")
+
+      body = json_response(conn, 200)
+      assert Enum.any?(body["data"], &(&1["title"] == "Tenant Wide"))
+    end
+
+    test "a valid project_id belonging to another tenant does not leak (empty, not 500)", %{
+      conn: conn
+    } do
+      tenant_a = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :agent})
+
+      tenant_b = fixture(:tenant)
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+
+      fixture(:article, %{
+        tenant_id: tenant_b.id,
+        project_id: project_b.id,
+        title: "Tenant B Secret",
+        status: :published
+      })
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> get(~p"/api/v1/articles", %{project_id: project_b.id})
+
+      body = json_response(conn, 200)
+      refute Enum.any?(body["data"], &(&1["title"] == "Tenant B Secret"))
+    end
+  end
+
+  describe "POST/PATCH /api/v1/articles project_id validation (kbweb-01)" do
+    test "create with a malformed body project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Bad Project",
+          "body" => "body",
+          "category" => "pattern",
+          "project_id" => "not-a-uuid"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "create via the project-scoped path with a malformed project_id returns 422", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post("/api/v1/projects/not-a-uuid/articles", %{
+          "title" => "Bad Project Path",
+          "body" => "body",
+          "category" => "pattern"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "create with a valid project_id still works (201, scoped)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Good Project",
+          "body" => "body",
+          "category" => "pattern",
+          "project_id" => project.id
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["project_id"] == project.id
+    end
+
+    test "update with a malformed body project_id returns 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"project_id" => "not-a-uuid"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "update with a valid project_id still works (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"project_id" => project.id})
+
+      body = json_response(conn, 200)
+      assert body["data"]["project_id"] == project.id
+    end
+  end
 end
