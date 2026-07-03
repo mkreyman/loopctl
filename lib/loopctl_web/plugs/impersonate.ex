@@ -99,6 +99,10 @@ defmodule LoopctlWeb.Plugs.Impersonate do
       # Empty header list (no header present)
       [] ->
         conn
+
+      # Empty header value (X-Impersonate-Tenant: "") — treat as if no header
+      [""] ->
+        conn
     end
   end
 
