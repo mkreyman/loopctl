@@ -214,7 +214,7 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
       })
 
       # Make embedding generation fail
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :service_unavailable}
       end)
 

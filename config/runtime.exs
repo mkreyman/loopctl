@@ -189,14 +189,18 @@ if config_env() == :prod do
   # The timeout is enforced per-read via SET LOCAL (HeavyRead.opts/1). See the comment
   # above and config_pgbouncer_safe_parameters_test.exs (the regression guard).
 
-  # OpenAI embedding provider for semantic search (Knowledge Wiki)
-  if openai_key = System.get_env("OPENAI_API_KEY") do
-    config :loopctl, :embedding_provider, %{
-      api_key: openai_key,
-      base_url: System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1",
-      model: System.get_env("OPENAI_EMBEDDING_MODEL") || "text-embedding-3-small"
-    }
-  end
+  # OpenAI-compatible embedding provider for semantic search (Knowledge Wiki).
+  #
+  # BYO (#294 extended to embeddings): the embedding KEY is PER-TENANT — each tenant
+  # supplies its OWN key via `PATCH /tenants/me/llm-config` (stored encrypted, resolved
+  # by `Loopctl.Llm.resolve(tenant_id, :embedding)`). There is intentionally NO global
+  # operator key here — that was the ungated, operator-funded spend path this change
+  # closes. Only the shared ENDPOINT (base_url) + default model live in global config;
+  # a tenant without a configured key simply gets NO embeddings.
+  config :loopctl, :embedding_provider, %{
+    base_url: System.get_env("OPENAI_BASE_URL") || "https://api.openai.com/v1",
+    model: System.get_env("OPENAI_EMBEDDING_MODEL") || "text-embedding-3-small"
+  }
 
   # NOTE (Epic 28, #179): the global `:anthropic_provider` / `:knowledge_classifier_model`
   # config keys were REMOVED. Tenant knowledge-LLM work (content extraction,

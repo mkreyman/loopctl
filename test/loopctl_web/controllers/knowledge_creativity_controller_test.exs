@@ -284,7 +284,7 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
   describe "POST /api/v1/knowledge/novelty (#152 A2)" do
     # Map idea text → a controllable embedding so novelty is deterministic.
     defp stub_idea_embeddings(mapping) do
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         {:ok, e(Map.get(mapping, text, [0.0, 0.0]))}
       end)
     end
@@ -379,7 +379,7 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
 
       # Expect NO embedding calls for blank ideas (would be called for non-blank)
-      Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _ ->
+      Mox.expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _ ->
         {:ok, e([1.0, 0.0])}
       end)
 
@@ -403,7 +403,9 @@ defmodule LoopctlWeb.KnowledgeCreativityControllerTest do
       embedded(tenant.id, "Prior", [1.0, 0.0], %{tags: ["proposal"]})
       # Embedding service errors → that idea scores nil, but prior_count > 0 lets a
       # client tell "embed failed" apart from "no priors to compare against".
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _ -> {:error, :boom} end)
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _ ->
+        {:error, :boom}
+      end)
 
       body =
         conn

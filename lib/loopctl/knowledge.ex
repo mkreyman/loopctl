@@ -4834,7 +4834,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp score_embedding(tenant_id, idea, text, prior_tag, vis) do
-    case generate_embedding(text) do
+    case generate_embedding(tenant_id, text) do
       {:ok, embedding} ->
         Map.put(
           idea,
@@ -5675,7 +5675,7 @@ defmodule Loopctl.Knowledge do
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
-    embedding_result = try_generate_embedding(query_string)
+    embedding_result = try_generate_embedding(tenant_id, query_string)
 
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->
@@ -5836,18 +5836,22 @@ defmodule Loopctl.Knowledge do
   @doc """
   Generate an embedding for the given text with circuit breaker and timeout protection.
 
-  Wraps the configured embedding client with:
+  Resolves the TENANT's OWN embedding key (mandatory BYO) via the configured
+  embedding client, wrapped with:
   - Circuit breaker (opens after #{@failure_threshold} failures within #{@failure_window_seconds}s)
   - 5-second Task.async timeout
   - Crash rescue handler
 
-  Returns `{:ok, embedding}` or `{:error, reason}`.
+  Returns `{:ok, embedding}` or `{:error, reason}`. A keyless tenant yields
+  `{:error, :no_api_key}` WITHOUT tripping the (global) circuit breaker — it is a
+  per-tenant config gap, not a provider outage, so it must not degrade embeddings
+  for tenants that DO have a key.
   """
-  def generate_embedding(query_string) do
-    try_generate_embedding(query_string)
+  def generate_embedding(tenant_id, query_string) when is_binary(tenant_id) do
+    try_generate_embedding(tenant_id, query_string)
   end
 
-  defp try_generate_embedding(query_string) do
+  defp try_generate_embedding(tenant_id, query_string) do
     ensure_circuit_breaker_table()
 
     if circuit_open?() do
@@ -5856,7 +5860,7 @@ defmodule Loopctl.Knowledge do
       task =
         Task.async(fn ->
           try do
-            embedding_client().generate_embedding(query_string)
+            embedding_client().generate_embedding(tenant_id, query_string)
           rescue
             e -> {:error, {:embedding_crash, Exception.message(e)}}
           end
@@ -5866,6 +5870,11 @@ defmodule Loopctl.Knowledge do
         {:ok, {:ok, embedding}} ->
           record_success()
           {:ok, embedding}
+
+        # A missing tenant key is a config gap, not a provider failure — do NOT
+        # record it against the shared circuit breaker.
+        {:ok, {:error, :no_api_key}} ->
+          {:error, :no_api_key}
 
         {:ok, {:error, reason}} ->
           record_failure()

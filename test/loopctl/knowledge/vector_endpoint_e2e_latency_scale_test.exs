@@ -134,7 +134,7 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
     Mox.set_mox_global()
     Loopctl.DataCase.stub_all_defaults()
 
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
       {:ok, ScaleSeed.embedding_for(0)}
     end)
 

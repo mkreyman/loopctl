@@ -162,7 +162,9 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
       # MIN ⇒ ≈ 0.1340 (this is the aggregate that must NOT degrade to top-k-then-min).
       idea_vec = embedding_at(:math.pi() / 6)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text -> {:ok, idea_vec} end)
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, idea_vec}
+      end)
 
       assert {:ok, [scored], prior_count} =
                Knowledge.novelty_scores(tenant.id, [%{text: "an idea"}])
@@ -185,7 +187,10 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyTest do
 
       # This tenant still has exactly its own 2 priors, not the other tenant's.
       idea_vec = embedding_at(0.0)
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text -> {:ok, idea_vec} end)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, idea_vec}
+      end)
 
       assert {:ok, [scored], prior_count} =
                Knowledge.novelty_scores(tenant.id, [%{text: "y"}])

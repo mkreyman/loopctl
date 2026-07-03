@@ -73,7 +73,7 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
     # The deterministic idea embedding the novelty test scores against (a real seeded
     # vector). Stubbed in THIS (the global-owner) process — global mode only lets the
     # owner set stubs, and the off-process Task.async_stream workers read it globally.
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
       {:ok, ScaleSeed.embedding_for(0)}
     end)
 

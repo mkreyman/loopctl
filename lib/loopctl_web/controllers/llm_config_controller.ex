@@ -1,13 +1,14 @@
 defmodule LoopctlWeb.LlmConfigController do
   @moduledoc """
-  Per-tenant BYO Anthropic LLM configuration (Epic 28 residual, #179).
+  Per-tenant BYO Anthropic LLM + embedding configuration (Epic 28 residual, #179).
 
   - `GET   /api/v1/tenants/me/llm-config` — the tenant's model choices +
-    `has_api_key` + a masked last-4 hint. NEVER returns the key itself.
-  - `PATCH /api/v1/tenants/me/llm-config` — set/rotate the api_key and the three
-    per-operation models (partial-merge; omitted fields are left untouched).
+    `has_api_key` / `has_embedding_key` + masked last-4 hints. NEVER returns a key.
+  - `PATCH /api/v1/tenants/me/llm-config` — set/rotate the Anthropic `api_key`, the
+    OpenAI `embedding_api_key`, and the per-operation models (partial-merge;
+    omitted fields are left untouched).
 
-  Both endpoints require the `:user` role — this endpoint stores a tenant secret,
+  Both endpoints require the `:user` role — this endpoint stores tenant secrets,
   so per the security checklist (managing secrets ⇒ `:user`) neither agents nor
   orchestrators may read or write it.
   """
@@ -28,9 +29,10 @@ defmodule LoopctlWeb.LlmConfigController do
   operation(:show,
     summary: "Get the tenant's LLM configuration",
     description:
-      "Returns the per-operation model choices, whether an Anthropic API key is " <>
-        "configured (`has_api_key`), and a masked last-4 hint. The key itself is " <>
-        "never returned. Role: user+.",
+      "Returns the per-operation model choices, whether an Anthropic API key " <>
+        "(`has_api_key`) and an embedding API key (`has_embedding_key`) are " <>
+        "configured, plus masked last-4 hints. No key itself is ever returned. " <>
+        "Role: user+.",
     responses: %{
       200 => {"LLM config", "application/json", Schemas.LlmConfigResponse},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
@@ -42,9 +44,9 @@ defmodule LoopctlWeb.LlmConfigController do
   operation(:update,
     summary: "Set the tenant's LLM configuration",
     description:
-      "Sets/rotates the tenant's OWN Anthropic API key (stored encrypted, never " <>
-        "returned) and the three per-operation models. loopctl fronts no LLM cost " <>
-        "— the tenant's key bills the tenant. Role: user+.",
+      "Sets/rotates the tenant's OWN Anthropic API key + OpenAI embedding key " <>
+        "(both stored encrypted, never returned) and the per-operation models. " <>
+        "loopctl fronts no cost — the tenant's keys bill the tenant. Role: user+.",
     request_body: {"LLM config", "application/json", Schemas.LlmConfigUpdateRequest},
     responses: %{
       200 => {"Updated LLM config", "application/json", Schemas.LlmConfigResponse},
@@ -73,6 +75,13 @@ defmodule LoopctlWeb.LlmConfigController do
 
   # Whitelist the accepted keys so nothing else (e.g. tenant_id) can slip in.
   defp config_params(params) do
-    Map.take(params, ["api_key", "extraction_model", "classification_model", "merge_model"])
+    Map.take(params, [
+      "api_key",
+      "extraction_model",
+      "classification_model",
+      "merge_model",
+      "embedding_api_key",
+      "embedding_model"
+    ])
   end
 end

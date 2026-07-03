@@ -355,7 +355,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       query_embedding = make_embedding(:query)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, query_embedding}
       end)
 
@@ -397,7 +397,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         status: :published
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :service_unavailable}
       end)
 
@@ -460,7 +460,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         status: :published
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, make_embedding(:query)}
       end)
 
@@ -520,7 +520,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       query_embedding = make_embedding(:query)
 
       # With semantic_weight=0.8, conceptual match should rank higher
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, query_embedding}
       end)
 
@@ -531,7 +531,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
                )
 
       # With keyword_weight=0.8, exact match should rank higher
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, query_embedding}
       end)
 
@@ -581,7 +581,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       # Fail 3 times to trip the circuit breaker
       for _i <- 1..3 do
-        expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+        expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
           {:error, :service_unavailable}
         end)
 
@@ -609,7 +609,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       })
 
       # One failure
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :temporary_failure}
       end)
 
@@ -619,7 +619,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # Then a success (resets failure count)
       query_embedding = make_embedding(:query)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, query_embedding}
       end)
 
@@ -627,7 +627,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
                Knowledge.search_combined(tenant.id, "recovery")
 
       # Another failure should not trip the breaker (counter was reset)
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :temporary_failure}
       end)
 
@@ -658,7 +658,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       query_embedding = make_embedding(:uniform)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, query_embedding}
       end)
 
@@ -698,7 +698,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         status: :published
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, make_embedding(:query)}
       end)
 
@@ -718,7 +718,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         status: :published
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :unavailable}
       end)
 
@@ -843,7 +843,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # surface that, not drop it (combined is the DEFAULT search mode).
       for i <- 1..7, do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, make_embedding(:query)}
       end)
 

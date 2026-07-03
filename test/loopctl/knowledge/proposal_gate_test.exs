@@ -50,7 +50,9 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
     end
 
     test "an identical-direction proposal is a duplicate", %{tenant: tenant, existing: existing} do
-      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text -> {:ok, e([1.0])} end)
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, e([1.0])}
+      end)
 
       assessment = ProposalGate.assess(tenant.id, %{"title" => "Supervisors", "body" => "OTP"})
 
@@ -62,7 +64,7 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
 
     test "a high-overlap proposal is low-novelty", %{tenant: tenant} do
       # cos(e([1.0]), e([1.0, 0.426])) ≈ 0.92 — inside [0.88, 0.97).
-      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, e([1.0, 0.426])}
       end)
 
@@ -73,7 +75,9 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
     end
 
     test "an orthogonal proposal is novel (no neighbor clears the floor)", %{tenant: tenant} do
-      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text -> {:ok, e([0.0, 1.0])} end)
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, e([0.0, 1.0])}
+      end)
 
       assessment = ProposalGate.assess(tenant.id, %{"title" => "Billing", "body" => "invoices"})
 
@@ -82,7 +86,9 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
     end
 
     test "falls OPEN (:unknown) when embedding fails — never blocks a write", %{tenant: tenant} do
-      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text -> {:error, :timeout} end)
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :timeout}
+      end)
 
       assessment = ProposalGate.assess(tenant.id, %{"title" => "X", "body" => "Y"})
 

@@ -1182,12 +1182,21 @@ async function llmConfig() {
   return toContent(result);
 }
 
-async function setLlmConfig({ api_key, extraction_model, classification_model, merge_model }) {
+async function setLlmConfig({
+  api_key,
+  extraction_model,
+  classification_model,
+  merge_model,
+  embedding_api_key,
+  embedding_model,
+}) {
   const body = {};
   if (api_key != null) body.api_key = api_key;
   if (extraction_model !== undefined) body.extraction_model = extraction_model;
   if (classification_model !== undefined) body.classification_model = classification_model;
   if (merge_model !== undefined) body.merge_model = merge_model;
+  if (embedding_api_key != null) body.embedding_api_key = embedding_api_key;
+  if (embedding_model !== undefined) body.embedding_model = embedding_model;
   // PATCH (partial-merge) + EXACT user key (review #12, #13).
   const result = await apiCall(
     "PATCH",
@@ -3364,19 +3373,23 @@ const TOOLS = [
   {
     name: "llm_config",
     description:
-      "Get the tenant's BYO Anthropic LLM configuration: the per-operation model " +
-      "choices, whether a key is configured (has_api_key), and a masked last-4 hint. " +
-      "NEVER returns the key itself. Requires user role (LOOPCTL_USER_KEY).",
+      "Get the tenant's BYO Anthropic + embedding configuration: the per-operation " +
+      "model choices, whether each key is configured (has_api_key / has_embedding_key), " +
+      "and masked last-4 hints. NEVER returns a key itself. Requires user role " +
+      "(LOOPCTL_USER_KEY).",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "set_llm_config",
     description:
-      "Set/rotate the tenant's OWN Anthropic API key (stored encrypted, never returned) " +
-      "and the three per-operation models (extraction/classification/merge). loopctl " +
-      "fronts no LLM cost — the tenant's key bills the tenant. Any subset of fields may " +
-      "be sent; omitting api_key leaves the existing key untouched. Model ids are " +
-      "free-form (any model the key permits). Requires user role (LOOPCTL_USER_KEY).",
+      "Set/rotate the tenant's OWN Anthropic API key AND OpenAI embedding key (both " +
+      "stored encrypted, never returned) and the per-operation models " +
+      "(extraction/classification/merge/embedding). loopctl fronts no cost — the " +
+      "tenant's keys bill the tenant. Mandatory BYO for embeddings: without an " +
+      "embedding_api_key the tenant's articles are not vector-searchable. Any subset " +
+      "of fields may be sent; omitting a key leaves the existing key untouched. Model " +
+      "ids are free-form (any model the key permits). Requires user role " +
+      "(LOOPCTL_USER_KEY).",
     inputSchema: {
       type: "object",
       properties: {
@@ -3395,6 +3408,16 @@ const TOOLS = [
         merge_model: {
           type: "string",
           description: "Model id for article merge synthesis (null → server default).",
+        },
+        embedding_api_key: {
+          type: "string",
+          description:
+            "OpenAI-compatible embedding API key (write-only; stored encrypted, never returned).",
+        },
+        embedding_model: {
+          type: "string",
+          description:
+            "Embedding model id (null → server default text-embedding-3-small).",
         },
       },
       required: [],

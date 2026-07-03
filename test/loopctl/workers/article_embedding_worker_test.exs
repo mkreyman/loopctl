@@ -48,7 +48,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         |> Ecto.Changeset.change(%{status: :published})
         |> Loopctl.AdminRepo.update!()
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         assert is_binary(text)
         assert text =~ "Published Article For Perform Test"
         {:ok, embedding}
@@ -86,7 +86,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         |> Ecto.Changeset.change(%{status: :published})
         |> Loopctl.AdminRepo.update!()
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, {:api_error, 500, "Internal Server Error"}}
       end)
 
@@ -157,7 +157,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         assert text =~ "Updated Title"
         {:ok, List.duplicate(0.2, 1536)}
       end)
@@ -172,7 +172,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       %{tenant: tenant} = setup_tenant()
       article = create_published_article(tenant.id)
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         assert text =~ "Updated body content"
         {:ok, List.duplicate(0.3, 1536)}
       end)
@@ -195,7 +195,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       assert draft.embedding == nil
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         assert text =~ "Draft to Publish"
         {:ok, List.duplicate(0.4, 1536)}
       end)
@@ -213,7 +213,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
       # After create (which uses the default stub), set expect with 0 calls.
       # If update_article incorrectly enqueues an embedding job for a
       # tags-only change, Mox will fail because the mock was called.
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _text ->
         {:ok, List.duplicate(0.1, 1536)}
       end)
 
@@ -229,7 +229,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       # After create (which uses the default stub), set expect with 0 calls.
       # Ensures no embedding job is enqueued for metadata-only changes.
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _text ->
         {:ok, List.duplicate(0.1, 1536)}
       end)
 
@@ -262,7 +262,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         |> Ecto.Changeset.change(%{status: :published})
         |> Loopctl.AdminRepo.update!()
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, text ->
         # title + "\n\n" + body should be truncated to 32K total
         assert String.length(text) <= 32_000
         {:ok, List.duplicate(0.1, 1536)}
@@ -330,6 +330,43 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       # Verify the deterministic component increases monotonically
       assert backoffs == Enum.sort(backoffs)
+    end
+  end
+
+  # --- Mandatory BYO: a keyless tenant gets a clean discard, never a crash ---
+
+  describe "mandatory BYO embeddings" do
+    test "discards {:no_embedding_key, id} when the tenant has no embedding key" do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, article} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Keyless Tenant Article",
+          body: "This tenant configured no embedding key.",
+          category: :pattern,
+          status: :draft
+        })
+
+      article =
+        article
+        |> Ecto.Changeset.change(%{status: :published})
+        |> Loopctl.AdminRepo.update!()
+
+      # The embedding client refuses to call the provider for a keyless tenant.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      assert {:discard, {:no_embedding_key, article_id}} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      assert article_id == article.id
+
+      # No embedding was stored (the article stays created, just not vector-searchable).
+      {:ok, loaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert loaded.embedding == nil
     end
   end
 end

@@ -350,6 +350,13 @@ config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestio
 # dedicated LLM tests override with crafted content + usage blocks.
 config :loopctl, :anthropic_req_plug, {Req.Test, Loopctl.Llm.Anthropic}
 
+# Epic 28 (#179) embeddings BYO: route the real tenant-scoped EmbeddingClient
+# through a Req.Test plug so its own dedicated test exercises per-tenant key
+# resolution + usage recording without real OpenAI calls. Everywhere ELSE the
+# embedding client is swapped for Loopctl.MockEmbeddingClient (see above), so this
+# plug only matters when a test drives Loopctl.Knowledge.EmbeddingClient directly.
+config :loopctl, :embedding_req_plug, {Req.Test, Loopctl.Knowledge.EmbeddingClient}
+
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 

@@ -133,4 +133,91 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       refute inspect(body) =~ "bbbb2222"
     end
   end
+
+  # --- BYO embeddings (#294 extended): the SEPARATE OpenAI embedding key/model ---
+
+  describe "embedding config via PATCH/GET" do
+    test "filter_parameters redacts embedding_api_key (the exact param-log redaction)" do
+      secret = "test-openai-LEAKCHECK-#{System.unique_integer([:positive])}"
+
+      filtered =
+        Phoenix.Logger.filter_values(%{"embedding_api_key" => secret, "keep_me" => "visible"})
+
+      # "embedding_api_key" contains the "api_key" discard-substring, so it is filtered.
+      assert filtered["embedding_api_key"] == "[FILTERED]"
+      assert filtered["keep_me"] == "visible"
+      refute inspect(filtered) =~ secret
+    end
+
+    test "PATCH sets the embedding key + model (role user); response never leaks the key",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{
+          embedding_api_key: "test-openai-controller-key",
+          embedding_model: "text-embedding-3-large"
+        })
+        |> json_response(200)
+
+      assert body["has_embedding_key"] == true
+      assert body["embedding_api_key_hint"] == "...-key"
+      assert body["embedding_model"] == "text-embedding-3-large"
+      refute Map.has_key?(body, "embedding_api_key")
+      refute inspect(body) =~ "test-openai-controller-key"
+
+      assert {:ok, %{api_key: "test-openai-controller-key", model: "text-embedding-3-large"}} =
+               Llm.resolve(tenant.id, :embedding)
+    end
+
+    test "a lower role (agent) is rejected with 403 and stores nothing", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{embedding_api_key: "test-openai-x"})
+
+      assert json_response(conn, 403)
+      refute Llm.has_embedding_key?(tenant.id)
+    end
+
+    test "GET reports has_embedding_key + hint, never the embedding key", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-wxyz5678"})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/tenants/me/llm-config")
+        |> json_response(200)
+
+      assert body["has_embedding_key"] == true
+      assert body["embedding_api_key_hint"] == "...5678"
+      refute inspect(body) =~ "test-openai-wxyz5678"
+    end
+
+    test "tenant A never sees tenant B's embedding key", %{conn: conn} do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+      {:ok, _} = Llm.upsert_settings(a.id, %{"embedding_api_key" => "test-openai-aaaa1111"})
+      {:ok, _} = Llm.upsert_settings(b.id, %{"embedding_api_key" => "test-openai-bbbb2222"})
+
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: a.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key_a)
+        |> get(~p"/api/v1/tenants/me/llm-config")
+        |> json_response(200)
+
+      assert body["embedding_api_key_hint"] == "...1111"
+      refute inspect(body) =~ "bbbb2222"
+    end
+  end
 end

@@ -49,7 +49,7 @@ defmodule Loopctl.Knowledge.ProposalGate do
     dup = config(:knowledge_proposal_duplicate_threshold, @default_duplicate_threshold)
     overlap = config(:knowledge_proposal_overlap_threshold, @default_overlap_threshold)
 
-    case @embedding_client.generate_embedding(build_text(attrs)) do
+    case @embedding_client.generate_embedding(tenant_id, build_text(attrs)) do
       {:ok, vector} when is_list(vector) and vector != [] ->
         neighbors =
           VectorSearch.nearest(tenant_id, vector, @neighbors_k,
