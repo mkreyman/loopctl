@@ -66,9 +66,25 @@ defmodule Loopctl.Knowledge.ExportConcurrency do
   """
   @spec acquire(binary()) :: :ok | {:error, :too_many_exports}
   def acquire(tenant_id) when is_binary(tenant_id) do
-    global_max = max_global()
-    tenant_max = max_per_tenant()
+    acquire(tenant_id, max_global(), max_per_tenant())
+  end
 
+  @doc """
+  Like `acquire/1`, but reserves against EXPLICIT `global_max` / `tenant_max` caps
+  instead of the configured ones.
+
+  Production always uses `acquire/1` (which reads `max_global/0` / `max_per_tenant/0`
+  from config). This variant exists for the tracker's OWN unit tests: the async test
+  suite deliberately raises `:export_max_concurrent_global` (see `config/test.exs`) so
+  incidental parallel export tests never collide on the shared, VM-wide global counter
+  — so a test that must PROVE the limiter refuses over-cap acquires passes its own fixed
+  LOW caps here, independent of that (high) suite default. Mirrors the `pool_size/2`
+  unit tests passing explicit knob args (US-27.6b).
+  """
+  @spec acquire(binary(), pos_integer(), pos_integer()) :: :ok | {:error, :too_many_exports}
+  def acquire(tenant_id, global_max, tenant_max)
+      when is_binary(tenant_id) and is_integer(global_max) and global_max > 0 and
+             is_integer(tenant_max) and tenant_max > 0 do
     # Reserve the slots ONLY IF the monitor registration succeeds atomically.
     # Use a GenServer call to atomically (on the server) check the caps, increment
     # the counters IF both pass, and register the monitor — all in one operation.
