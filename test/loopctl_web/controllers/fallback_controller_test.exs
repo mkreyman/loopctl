@@ -11,6 +11,25 @@ defmodule LoopctlWeb.FallbackControllerTest do
     |> FallbackController.call(error)
   end
 
+  # DBErrorLogger emits a single structured line per error, embedding the conn's
+  # request_id (both as Logger metadata and inline). capture_log/1 captures the
+  # GLOBAL, process-wide Logger — including DB-error/vector/slow-query lines from
+  # OTHER async tests running concurrently — so a bare `refute log =~ "embedding
+  # <=>"` (or "0.123", "::vector", "already exists") could be tripped by a
+  # sibling's log. Stamp a per-call unique x-request-id and return ONLY this
+  # call's own line, so every assert/refute inspects our line and no other.
+  defp capture_db_error_log(conn, error) do
+    req_id = "flbk-req-#{System.unique_integer([:positive])}"
+    conn = Plug.Conn.put_resp_header(conn, "x-request-id", req_id)
+
+    log = ExUnit.CaptureLog.capture_log(fn -> call_fallback(conn, error) end)
+
+    log
+    |> String.split("\n")
+    |> Enum.filter(&String.contains?(&1, req_id))
+    |> Enum.join("\n")
+  end
+
   describe "error atom handling" do
     test "renders 404 for :not_found", %{conn: conn} do
       conn = call_fallback(conn, {:error, :not_found})
@@ -323,13 +342,8 @@ defmodule LoopctlWeb.FallbackControllerTest do
   end
 
   describe "structured DB-error log (AC-27.3.3 / .8)" do
-    import ExUnit.CaptureLog
-
     test "logs sqlstate + mapped_code at error level, no SQL/vector leak", %{conn: conn} do
-      log =
-        capture_log(fn ->
-          call_fallback(conn, {:error, pg_error(:query_canceled, "57014")})
-        end)
+      log = capture_db_error_log(conn, {:error, pg_error(:query_canceled, "57014")})
 
       assert log =~ "sqlstate=57014"
       assert log =~ "mapped_code=db_statement_timeout"
@@ -345,7 +359,7 @@ defmodule LoopctlWeb.FallbackControllerTest do
     test "pg_message IS logged for the allowlisted serialization class", %{conn: conn} do
       error = constraint_error(:serialization_failure, "40001", "could not serialize access")
 
-      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+      log = capture_db_error_log(conn, {:error, error})
 
       assert log =~ "sqlstate=40001"
       assert log =~ "could not serialize access"
@@ -365,7 +379,7 @@ defmodule LoopctlWeb.FallbackControllerTest do
           "Key (slug)=(secret-tenant-slug) already exists"
         )
 
-      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+      log = capture_db_error_log(conn, {:error, error})
 
       # Diagnostics still present.
       assert log =~ "sqlstate=23505"
@@ -383,7 +397,7 @@ defmodule LoopctlWeb.FallbackControllerTest do
           "invalid byte sequence 0xDEADBEEF"
         )
 
-      log = capture_log(fn -> call_fallback(conn, {:error, error}) end)
+      log = capture_db_error_log(conn, {:error, error})
 
       assert log =~ "sqlstate=22021"
       assert log =~ "mapped_code=db_invalid_input"

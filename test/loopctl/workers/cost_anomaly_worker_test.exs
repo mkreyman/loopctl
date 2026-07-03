@@ -515,8 +515,14 @@ defmodule Loopctl.Workers.CostAnomalyWorkerTest do
                    })
         end)
 
-      # The clamp ran...
-      assert log =~ "exceeds 90 days; clamping end"
+      # The clamp ran. Scope to the worker-prefixed period range (unique to this
+      # test's inputs) — capture_log sees the global Logger, and a bare
+      # "exceeds 90 days; clamping end" is also emitted by CostRollupWorker and
+      # by sibling async tests, so an unscoped match could come from either.
+      assert log =~
+               "CostAnomalyWorker: period range #{Date.to_iso8601(start_date)}.." <>
+                 "#{Date.to_iso8601(Date.add(start_date, 364))} exceeds 90 days; clamping end"
+
       # ...and the far epic (day 200, outside [start, start+90]) was NOT scanned.
       assert AdminRepo.all(CostAnomaly) == []
     end
