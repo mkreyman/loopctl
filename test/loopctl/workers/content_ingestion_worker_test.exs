@@ -855,6 +855,82 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert :executing in states
     end
 
+    test "a retry writes NO phantom content_ingested audit entries for conflict-skipped chunks (#264 review F1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      job_args = %{
+        "tenant_id" => tenant.id,
+        "content" => multi_chunk_content(3),
+        "content_hash" => "audit_no_phantom",
+        "source_type" => "newsletter"
+      }
+
+      call = :counters.new(1, [])
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        :counters.add(call, 1, 1)
+        n = :counters.get(call, 1)
+        {:ok, [%{title: "Phantom check #{n}", body: "Body #{n}.", category: :pattern}]}
+      end)
+
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 420, args: job_args})
+
+      {:ok, %{data: after_first}} =
+        Loopctl.Audit.list_entries(tenant.id, action: "knowledge.content_ingested")
+
+      # 3 chunks -> 3 real content_ingested audit entries (one per chunk).
+      assert length(after_first) == 3
+
+      # Every audit entry points at a REAL persisted row (no phantom ids).
+      persisted_ids =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter").data
+        |> MapSet.new(& &1.id)
+
+      audited_ids =
+        after_first
+        |> Enum.flat_map(& &1.new_state["article_ids"])
+        |> MapSet.new()
+
+      assert MapSet.subset?(audited_ids, persisted_ids)
+
+      # Retry (identical args): every chunk conflict-skips -> NO new rows AND NO new
+      # content_ingested audit entries (the phantom-audit defect).
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 420, args: job_args})
+
+      {:ok, %{data: after_retry}} =
+        Loopctl.Audit.list_entries(tenant.id, action: "knowledge.content_ingested")
+
+      assert length(after_retry) == 3, "retry wrote phantom audit entries"
+    end
+
+    test "a title collision with an existing article is PERMANENT: discarded, not retried (#264 review F2)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A pre-existing ACTIVE article whose title the extractor will re-emit. The
+      # idempotency conflict target does NOT cover the title index, so insert_all
+      # raises a unique_violation — which must be classified permanent (discard),
+      # not burn all 3 retries.
+      _existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Clash Title", status: :published})
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        {:ok, [%{title: "Clash Title", body: "A different body.", category: :pattern}]}
+      end)
+
+      assert {:discard, {:extraction_failed, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 421,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "small content",
+                   "content_hash" => "title_clash",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert reason =~ "not retryable"
+    end
+
     test "when NO chunk succeeds, the error propagates so Oban retries (nothing persisted)" do
       %{tenant: tenant} = setup_tenant()
 

@@ -84,6 +84,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @max_job_timeout_ms :timer.minutes(6)
   @max_chunks div(@max_job_timeout_ms, @per_chunk_timeout_ms)
 
+  # ON CONFLICT arbiter for the partial `articles_tenant_idempotency_key_idx`
+  # (WHERE idempotency_key IS NOT NULL). A partial index can only be inferred as
+  # the arbiter when the predicate is restated, hence the unsafe_fragment (#264).
+  @idempotency_conflict_target "(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL"
+
   # Content-Type families that are never ingestible UTF-8 text (#263). A PDF /
   # image / archive body handed to the JSON-encoded extractor request raises
   # Jason.EncodeError on the invalid bytes and — because the content hash is
@@ -270,7 +275,10 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
           |> dedup_cross_chunk(seen_titles, remaining)
 
         case insert_articles(ctx, articles, chunk_index) do
-          :ok -> {:ok, length(articles), seen_titles}
+          # Count GENUINELY-inserted rows (insert_all RETURNING), not the attempted
+          # set — a retry that conflict-skips already-persisted articles reports 0,
+          # so the article budget and audit reflect real work (#264 review F1).
+          {:ok, inserted_count} -> {:ok, inserted_count, seen_titles}
           {:error, _} = err -> err
         end
 
@@ -353,16 +361,34 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     end
   end
 
-  # A permanent extractor failure a retry can't fix: a 4xx API error other than
-  # 408 (timeout) / 429 (rate limited), which ARE transient. Everything else
-  # (5xx, request_failed/transport, json_parse_error from a non-deterministic
-  # model response) is treated as transient and retried.
+  # A permanent failure a retry can't fix:
+  #   * a 4xx API error other than 408 (timeout) / 429 (rate limited), which ARE
+  #     transient (5xx / request_failed / json_parse_error are all transient); and
+  #   * a DB CONSTRAINT violation (#264 review F2) — e.g. an extracted title equal
+  #     to an EXISTING different article's title trips the active-title unique
+  #     index (the idempotency conflict target doesn't cover it), which is
+  #     deterministic and would otherwise burn every retry before discard.
+  # A non-constraint DB error (serialization/deadlock/connection) stays transient.
   defp permanent_error?({:api_error, status, _body})
        when is_integer(status) and status >= 400 and status < 500 and status != 408 and
               status != 429,
        do: true
 
+  defp permanent_error?({:insert_failed, _step, %Postgrex.Error{} = error}),
+    do: constraint_violation?(error)
+
+  defp permanent_error?({:insert_failed, _step, %Ecto.Changeset{}}), do: true
+
   defp permanent_error?(_), do: false
+
+  @constraint_violation_codes ~w(
+    unique_violation check_violation not_null_violation
+    foreign_key_violation exclusion_violation
+  )a
+  defp constraint_violation?(%Postgrex.Error{postgres: %{code: code}}),
+    do: code in @constraint_violation_codes
+
+  defp constraint_violation?(_), do: false
 
   defp too_large_message(chunk_count, dropped, inserted, attempted) do
     "document too large: #{chunk_count} chunks exceed the #{@max_chunks}-chunk per-job " <>
@@ -614,128 +640,163 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     is_binary(tag) and String.length(tag) <= @max_tag_length and Regex.match?(@tag_pattern, tag)
   end
 
-  defp insert_articles(_ctx, [], _chunk_index) do
-    :ok
-  end
+  defp insert_articles(_ctx, [], _chunk_index), do: {:ok, 0}
 
   defp insert_articles(ctx, articles, chunk_index) do
-    %{
-      tenant_id: tenant_id,
-      source_id: job_id,
-      source_type: source_type,
-      project_id: project_id,
-      url: url,
-      publish: publish,
-      content_hash: content_hash
-    } = ctx
+    ctx
+    |> build_rows(articles, chunk_index)
+    |> persist_rows(ctx)
+  end
 
-    status = if publish, do: :published, else: :draft
+  # Validate each article via the changeset (insert_all bypasses validation), then
+  # dump the VALID ones to insert_all row maps. Invalid articles are dropped, as
+  # before. id + timestamps are set here because insert_all does not autogenerate.
+  defp build_rows(ctx, articles, chunk_index) do
+    status = if ctx.publish, do: :published, else: :draft
+    # perform/1 already discarded jobs with an invalid project_id; this valid_uuid?
+    # guard is defense in depth so a non-UUID can NEVER dump against the :binary_id
+    # column — it falls back to tenant-wide instead of crashing.
+    project_id = if valid_uuid?(ctx.project_id), do: ctx.project_id, else: nil
+    now = DateTime.utc_now()
 
-    multi =
-      articles
-      |> Enum.with_index()
-      |> Enum.reduce(Multi.new(), fn {attrs, index}, multi ->
-        # normalize_attrs already whitelists keys, but drop :status explicitly so
-        # the server-set status (above) can never be overridden by extractor
-        # output, independent of future normalize_attrs changes. The
-        # idempotency_key is server-derived and set AFTER normalize_attrs so an
-        # extractor-supplied key can never override it (#264, Finding 1).
-        attrs =
-          attrs
-          |> normalize_attrs()
-          |> Map.delete(:status)
-          |> Map.put(:idempotency_key, ingest_idempotency_key(content_hash, chunk_index, index))
+    articles
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {attrs, index} ->
+      # normalize_attrs whitelists keys; :status is dropped and idempotency_key is
+      # server-derived and set AFTER normalize_attrs so extractor output can never
+      # override either (#264 Finding 1). The idempotency_key is deterministic
+      # across retries so on_conflict can no-op a re-inserted (chunk, article).
+      attrs =
+        attrs
+        |> normalize_attrs()
+        |> Map.delete(:status)
+        |> Map.put(:idempotency_key, ingest_idempotency_key(ctx.content_hash, chunk_index, index))
 
-        article = %Article{
-          tenant_id: tenant_id,
-          source_type: source_type,
-          source_id: job_id,
-          status: status
-        }
+      base = %Article{
+        tenant_id: ctx.tenant_id,
+        source_type: ctx.source_type,
+        source_id: ctx.source_id,
+        status: status,
+        project_id: project_id
+      }
 
-        # perform/1 already discarded jobs with an invalid project_id; this
-        # valid_uuid? guard is defense in depth so the raw struct assign can NEVER
-        # dump a non-UUID against the :binary_id column (a pre-existing queued job
-        # replayed through an older path would otherwise raise). A non-UUID here
-        # falls back to tenant-wide rather than crashing.
-        article =
-          if valid_uuid?(project_id) do
-            %{article | project_id: project_id}
-          else
-            article
-          end
+      changeset = Article.create_changeset(base, attrs)
 
-        changeset = Article.create_changeset(article, attrs)
-
-        # on_conflict: :nothing over the partial `articles_tenant_idempotency_key_idx`
-        # (WHERE idempotency_key IS NOT NULL) makes a retry that re-reaches an
-        # already-persisted (content_hash, chunk_index, article_index) a safe NO-OP
-        # instead of a duplicate row (#264, Finding 1).
-        Multi.insert(multi, {:article, index}, changeset,
-          on_conflict: :nothing,
-          conflict_target:
-            {:unsafe_fragment, "(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL"}
+      if changeset.valid? do
+        [changeset_to_row(changeset, now)]
+      else
+        Logger.warning(
+          "ContentIngestionWorker: dropping invalid article: #{inspect(changeset.errors)}"
         )
-      end)
-      |> Audit.log_in_multi(:audit, fn changes ->
-        article_ids =
-          changes
-          |> Enum.filter(fn {key, _} -> match?({:article, _}, key) end)
-          |> Enum.map(fn {_, article} -> article.id end)
 
-        %{
-          tenant_id: tenant_id,
-          entity_type: "article",
-          entity_id: job_id,
-          action: "knowledge.content_ingested",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "worker:content_ingestion",
-          new_state: %{
-            "source_type" => source_type,
-            "url" => url,
-            "article_count" => length(article_ids),
-            "article_ids" => article_ids,
-            # Record whether ingested articles went live (publish opt-in) or were
-            # staged as drafts, so an operator can tell auto-published content
-            # apart from review-staged content in the audit trail.
-            "status" => to_string(status)
-          }
-        }
-      end)
+        []
+      end
+    end)
+  end
 
+  @insert_all_fields ~w(
+    tenant_id title body category status scope slug tags
+    source_type source_id idempotency_key metadata project_id
+  )a
+  defp changeset_to_row(changeset, now) do
+    changeset
+    |> Ecto.Changeset.apply_changes()
+    |> Map.take(@insert_all_fields)
+    |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+  end
+
+  defp persist_rows([], _ctx), do: {:ok, 0}
+
+  # Persist a chunk's validated rows with insert_all + RETURNING so the returned
+  # set reflects ONLY genuinely-inserted rows (conflict-skipped rows are NOT in
+  # RETURNING). Audit + embeddings are built from THOSE real rows — never from the
+  # client-minted changeset ids, which on_conflict :nothing would otherwise leave
+  # pointing at rows that were never inserted (#264 review F1: phantom audit +
+  # leaked embedding jobs on retry).
+  defp persist_rows(rows, ctx) do
+    multi =
+      Multi.new()
+      |> Multi.insert_all(:articles, Article, rows,
+        on_conflict: :nothing,
+        conflict_target: {:unsafe_fragment, @idempotency_conflict_target},
+        returning: [:id]
+      )
+      |> Multi.merge(fn %{articles: {_count, returned}} -> audit_multi(ctx, returned) end)
+
+    run_persist(multi, ctx)
+  rescue
+    # insert_all does not map constraint violations to changeset errors (there is
+    # no changeset) — it RAISES. A title/slug unique collision surfaces here; we
+    # classify it permanent in permanent_error?/1 so it discards instead of
+    # burning every retry (#264 review F2).
+    error in Postgrex.Error ->
+      Logger.warning("ContentIngestionWorker: insert_all raised: #{inspect(error)}")
+      {:error, {:insert_failed, :constraint, error}}
+  end
+
+  defp run_persist(multi, ctx) do
     case AdminRepo.transaction(multi) do
-      {:ok, changes} ->
-        # Published articles need embeddings to be semantically searchable;
-        # enqueue AFTER commit (Oban runs on a separate repo/pool). Drafts get
-        # none. Best-effort: a transient enqueue failure must not fail the job
-        # (the rows are durably committed).
-        if publish, do: enqueue_embeddings(tenant_id, changes)
+      {:ok, %{articles: {_count, returned}}} ->
+        # Published articles need embeddings; enqueue AFTER commit, best-effort,
+        # and ONLY for the rows that were genuinely inserted this run.
+        if ctx.publish, do: enqueue_embeddings(ctx.tenant_id, returned)
 
         Logger.info(
-          "ContentIngestionWorker: extracted #{length(articles)} articles " <>
-            "(source_type=#{source_type}, url=#{url || "inline"}, publish=#{publish})"
+          "ContentIngestionWorker: persisted #{length(returned)} new article(s) " <>
+            "(source_type=#{ctx.source_type}, url=#{ctx.url || "inline"}, publish=#{ctx.publish})"
         )
 
-        :ok
+        {:ok, length(returned)}
 
-      {:error, step, changeset, _completed} ->
+      {:error, step, reason, _completed} ->
         Logger.warning(
-          "ContentIngestionWorker: insert failed at step #{inspect(step)}: " <>
-            "#{inspect(changeset)}"
+          "ContentIngestionWorker: insert failed at step #{inspect(step)}: #{inspect(reason)}"
         )
 
-        {:error, {:insert_failed, step, changeset}}
+        {:error, {:insert_failed, step, reason}}
     end
+  end
+
+  # Conditional audit: write the `knowledge.content_ingested` event ONLY when rows
+  # were genuinely inserted. On a retry where every article conflict-skips, the
+  # returned set is empty and we write NO audit row — never a phantom "ingested"
+  # entry for rows that already existed (#264 review F1, chain-of-custody).
+  defp audit_multi(_ctx, [] = _returned), do: Multi.new()
+
+  defp audit_multi(ctx, returned) do
+    ids = Enum.map(returned, & &1.id)
+    Audit.log_in_multi(Multi.new(), :audit, fn _changes -> ingested_audit_attrs(ctx, ids) end)
+  end
+
+  defp ingested_audit_attrs(ctx, ids) do
+    status = if ctx.publish, do: :published, else: :draft
+
+    %{
+      tenant_id: ctx.tenant_id,
+      entity_type: "article",
+      entity_id: ctx.source_id,
+      action: "knowledge.content_ingested",
+      actor_type: "system",
+      actor_id: nil,
+      actor_label: "worker:content_ingestion",
+      new_state: %{
+        "source_type" => ctx.source_type,
+        "url" => ctx.url,
+        "article_count" => length(ids),
+        "article_ids" => ids,
+        # Record whether ingested articles went live (publish opt-in) or were
+        # staged as drafts, so an operator can tell auto-published content apart
+        # from review-staged content in the audit trail.
+        "status" => to_string(status)
+      }
+    }
   end
 
   # Enqueue an embedding job for each just-inserted (published) article. Runs
   # post-commit and is best-effort: a transient enqueue failure is logged, never
   # raised, so it can't fail/retry the whole ingestion job.
-  defp enqueue_embeddings(tenant_id, changes) do
-    changes
-    |> Enum.filter(fn {key, _} -> match?({:article, _}, key) end)
-    |> Enum.each(fn {_key, article} ->
+  defp enqueue_embeddings(tenant_id, returned) do
+    Enum.each(returned, fn article ->
       %{article_id: article.id, tenant_id: tenant_id}
       |> ArticleEmbeddingWorker.new()
       |> Oban.insert()
