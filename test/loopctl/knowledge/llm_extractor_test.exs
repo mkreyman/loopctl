@@ -37,7 +37,7 @@ defmodule Loopctl.Knowledge.LlmExtractorTest do
 
     {:ok, _} =
       Llm.upsert_settings(tenant.id, %{
-        "api_key" => "sk-ant-review-key-555",
+        "api_key" => "test-anthropic-review-key-555",
         "extraction_model" => "claude-sonnet-4-5"
       })
 

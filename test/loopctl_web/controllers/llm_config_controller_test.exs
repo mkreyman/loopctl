@@ -17,7 +17,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
     # NON-VACUOUS: removing the `config :phoenix, :filter_parameters` entry reverts
     # the api_key to the default (unfiltered) behaviour and fails the first assert.
     test "filter_parameters redacts api_key (the exact param-log redaction)" do
-      secret = "sk-ant-LEAKCHECK-#{System.unique_integer([:positive])}"
+      secret = "test-anthropic-LEAKCHECK-#{System.unique_integer([:positive])}"
 
       filtered = Phoenix.Logger.filter_values(%{"api_key" => secret, "keep_me" => "visible"})
 
@@ -37,7 +37,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
         conn
         |> auth_conn(raw_key)
         |> patch(~p"/api/v1/tenants/me/llm-config", %{
-          api_key: "sk-ant-controller-key",
+          api_key: "test-anthropic-controller-key",
           extraction_model: "claude-opus-4-1",
           classification_model: "claude-sonnet-4-5"
         })
@@ -48,10 +48,10 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       assert body["extraction_model"] == "claude-opus-4-1"
       assert body["classification_model"] == "claude-sonnet-4-5"
       refute Map.has_key?(body, "api_key")
-      refute inspect(body) =~ "sk-ant-controller-key"
+      refute inspect(body) =~ "test-anthropic-controller-key"
 
       # Persisted + resolvable.
-      assert {:ok, %{api_key: "sk-ant-controller-key", model: "claude-opus-4-1"}} =
+      assert {:ok, %{api_key: "test-anthropic-controller-key", model: "claude-opus-4-1"}} =
                Llm.resolve(tenant.id, :extraction)
     end
 
@@ -62,7 +62,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> patch(~p"/api/v1/tenants/me/llm-config", %{api_key: "sk-ant-x"})
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{api_key: "test-anthropic-x"})
 
       assert json_response(conn, 403)
       # Nothing was stored.
@@ -85,7 +85,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
   describe "GET /api/v1/tenants/me/llm-config" do
     test "returns models + has_api_key + masked hint, never the key", %{conn: conn} do
       tenant = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-abcd1234"})
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-abcd1234"})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
       body =
@@ -96,7 +96,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
 
       assert body["has_api_key"] == true
       assert body["api_key_hint"] == "...1234"
-      refute inspect(body) =~ "sk-ant-abcd1234"
+      refute inspect(body) =~ "test-anthropic-abcd1234"
     end
 
     test "reports has_api_key false when unconfigured", %{conn: conn} do
@@ -118,8 +118,8 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
     test "tenant A only sees its own config, never tenant B's key", %{conn: conn} do
       a = fixture(:tenant)
       b = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(a.id, %{"api_key" => "sk-ant-aaaa1111"})
-      {:ok, _} = Llm.upsert_settings(b.id, %{"api_key" => "sk-ant-bbbb2222"})
+      {:ok, _} = Llm.upsert_settings(a.id, %{"api_key" => "test-anthropic-aaaa1111"})
+      {:ok, _} = Llm.upsert_settings(b.id, %{"api_key" => "test-anthropic-bbbb2222"})
 
       {raw_key_a, _} = fixture(:api_key, %{tenant_id: a.id, role: :user})
 

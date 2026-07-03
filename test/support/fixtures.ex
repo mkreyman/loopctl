@@ -285,7 +285,7 @@ defmodule Loopctl.Fixtures do
   # Per-tenant BYO LLM config + usage (Epic 28 residual, #179).
   def build(:tenant_llm_settings, attrs) do
     Enum.into(attrs, %{
-      api_key: "sk-ant-test-#{System.unique_integer([:positive])}",
+      api_key: "test-anthropic-test-#{System.unique_integer([:positive])}",
       extraction_model: nil,
       classification_model: nil,
       merge_model: nil

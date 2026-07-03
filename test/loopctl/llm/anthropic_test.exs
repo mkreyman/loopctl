@@ -12,7 +12,7 @@ defmodule Loopctl.Llm.AnthropicTest do
 
   # A distinctive, per-test key so a hit in captured output is unambiguous and can
   # never be another test's key (avoids cross-test capture_log leakage concerns).
-  @secret "sk-ant-DISTINCTIVE-NEVER-LOG-#{System.unique_integer([:positive])}"
+  @secret "test-anthropic-DISTINCTIVE-NEVER-LOG-#{System.unique_integer([:positive])}"
 
   defp tenant_with_key do
     tenant = fixture(:tenant)

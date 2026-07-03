@@ -10,7 +10,7 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
 
       {:ok, _} =
         Llm.upsert_settings(tenant.id, %{
-          "api_key" => "sk-ant-merge-999",
+          "api_key" => "test-anthropic-merge-999",
           "merge_model" => "claude-opus-4-1"
         })
 
@@ -28,7 +28,7 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
                Synth.synthesize(tenant.id, %{title: "A", body: "a"}, %{title: "B", body: "b"})
 
       assert_received {:req, headers, req_body}
-      assert {"x-api-key", "sk-ant-merge-999"} in headers
+      assert {"x-api-key", "test-anthropic-merge-999"} in headers
       assert req_body["model"] == "claude-opus-4-1"
 
       %{data: [row]} = Llm.usage_summary(tenant.id, [])

@@ -28,7 +28,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractorTest do
 
     {:ok, _} =
       Llm.upsert_settings(tenant.id, %{
-        "api_key" => "sk-ant-tenant-key-777",
+        "api_key" => "test-anthropic-tenant-key-777",
         "extraction_model" => "claude-opus-4-1"
       })
 
@@ -44,7 +44,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractorTest do
 
     # The request used THIS tenant's key + resolved model.
     assert_received {:anthropic_request, headers, req_body}
-    assert {"x-api-key", "sk-ant-tenant-key-777"} in headers
+    assert {"x-api-key", "test-anthropic-tenant-key-777"} in headers
     assert req_body["model"] == "claude-opus-4-1"
 
     # A usage event was recorded with the right tokens/operation/model/source.
@@ -67,7 +67,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractorTest do
 
   test "surfaces an API error and records no usage" do
     tenant = fixture(:tenant)
-    {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-1"})
+    {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-1"})
 
     Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
       conn

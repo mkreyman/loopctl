@@ -14,12 +14,12 @@ defmodule Loopctl.LlmTest do
 
       {:ok, _settings} =
         Llm.upsert_settings(tenant.id, %{
-          "api_key" => "sk-ant-secret-key-1234",
+          "api_key" => "test-anthropic-secret-key-1234",
           "extraction_model" => "claude-opus-4-1",
           "classification_model" => "claude-sonnet-4-5"
         })
 
-      assert {:ok, %{api_key: "sk-ant-secret-key-1234", model: "claude-opus-4-1"}} =
+      assert {:ok, %{api_key: "test-anthropic-secret-key-1234", model: "claude-opus-4-1"}} =
                Llm.resolve(tenant.id, :extraction)
 
       assert {:ok, %{model: "claude-sonnet-4-5"}} = Llm.resolve(tenant.id, :classification)
@@ -30,11 +30,12 @@ defmodule Loopctl.LlmTest do
 
     test "upsert is idempotent per tenant (one row, updates in place)" do
       tenant = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-a"})
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-a"})
       {:ok, _} = Llm.upsert_settings(tenant.id, %{"extraction_model" => "m-x"})
 
       # Both persisted on the single row.
-      assert {:ok, %{api_key: "sk-ant-a", model: "m-x"}} = Llm.resolve(tenant.id, :extraction)
+      assert {:ok, %{api_key: "test-anthropic-a", model: "m-x"}} =
+               Llm.resolve(tenant.id, :extraction)
 
       count =
         from(s in TenantLlmSettings, where: s.tenant_id == ^tenant.id, select: count(s.id))
@@ -48,17 +49,26 @@ defmodule Loopctl.LlmTest do
       b = fixture(:tenant)
 
       {:ok, _} =
-        Llm.upsert_settings(a.id, %{"api_key" => "sk-ant-AAAA", "extraction_model" => "model-a"})
+        Llm.upsert_settings(a.id, %{
+          "api_key" => "test-anthropic-AAAA",
+          "extraction_model" => "model-a"
+        })
 
       {:ok, _} =
-        Llm.upsert_settings(b.id, %{"api_key" => "sk-ant-BBBB", "extraction_model" => "model-b"})
+        Llm.upsert_settings(b.id, %{
+          "api_key" => "test-anthropic-BBBB",
+          "extraction_model" => "model-b"
+        })
 
-      assert {:ok, %{api_key: "sk-ant-AAAA", model: "model-a"}} = Llm.resolve(a.id, :extraction)
-      assert {:ok, %{api_key: "sk-ant-BBBB", model: "model-b"}} = Llm.resolve(b.id, :extraction)
+      assert {:ok, %{api_key: "test-anthropic-AAAA", model: "model-a"}} =
+               Llm.resolve(a.id, :extraction)
+
+      assert {:ok, %{api_key: "test-anthropic-BBBB", model: "model-b"}} =
+               Llm.resolve(b.id, :extraction)
 
       # No cross-tenant leakage in either direction.
-      refute match?({:ok, %{api_key: "sk-ant-BBBB"}}, Llm.resolve(a.id, :extraction))
-      refute match?({:ok, %{api_key: "sk-ant-AAAA"}}, Llm.resolve(b.id, :extraction))
+      refute match?({:ok, %{api_key: "test-anthropic-BBBB"}}, Llm.resolve(a.id, :extraction))
+      refute match?({:ok, %{api_key: "test-anthropic-AAAA"}}, Llm.resolve(b.id, :extraction))
     end
 
     test "resolve/2 returns {:error, :no_api_key} when no key is configured" do
@@ -86,7 +96,7 @@ defmodule Loopctl.LlmTest do
   describe "encryption at rest + redaction" do
     test "the api_key column is ciphertext, not the plaintext key" do
       tenant = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-plaintext-xyz"})
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-plaintext-xyz"})
 
       %{rows: [[raw]]} =
         AdminRepo.query!(
@@ -95,32 +105,35 @@ defmodule Loopctl.LlmTest do
         )
 
       assert is_binary(raw)
-      refute raw == "sk-ant-plaintext-xyz"
-      refute String.contains?(raw, "sk-ant-plaintext-xyz")
+      refute raw == "test-anthropic-plaintext-xyz"
+      refute String.contains?(raw, "test-anthropic-plaintext-xyz")
 
       # ... but it decrypts back on load.
-      assert {:ok, %{api_key: "sk-ant-plaintext-xyz"}} = Llm.resolve(tenant.id, :extraction)
+      assert {:ok, %{api_key: "test-anthropic-plaintext-xyz"}} =
+               Llm.resolve(tenant.id, :extraction)
     end
 
     test "inspect/settings_view never expose the raw key" do
       tenant = fixture(:tenant)
-      {:ok, settings} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-hidden-9999"})
+
+      {:ok, settings} =
+        Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-hidden-9999"})
 
       # redact: true omits the value from inspect entirely.
-      refute inspect(settings) =~ "sk-ant-hidden-9999"
+      refute inspect(settings) =~ "test-anthropic-hidden-9999"
 
       view = Llm.settings_view(settings)
       assert view.has_api_key == true
       assert view.api_key_hint == "...9999"
       refute Map.has_key?(view, :api_key)
-      refute view |> inspect() =~ "sk-ant-hidden-9999"
+      refute view |> inspect() =~ "test-anthropic-hidden-9999"
     end
   end
 
   describe "audit" do
     test "setting a key writes an llm_config.key_set audit event WITHOUT the value" do
       tenant = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-audit-4242"})
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-audit-4242"})
 
       events =
         from(a in AuditLog,
@@ -134,12 +147,12 @@ defmodule Loopctl.LlmTest do
       assert "llm_config.key_set" in actions
 
       # No event's serialized state contains the raw key.
-      refute events |> inspect() =~ "sk-ant-audit-4242"
+      refute events |> inspect() =~ "test-anthropic-audit-4242"
     end
 
     test "a models-only update does not write a key_set event" do
       tenant = fixture(:tenant)
-      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-ant-1"})
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-1"})
       {:ok, _} = Llm.upsert_settings(tenant.id, %{"extraction_model" => "m-y"})
 
       key_set_count =

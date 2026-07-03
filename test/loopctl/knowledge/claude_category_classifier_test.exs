@@ -22,7 +22,7 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifierTest do
 
       {:ok, _} =
         Llm.upsert_settings(tenant.id, %{
-          "api_key" => "sk-ant-classify-777",
+          "api_key" => "test-anthropic-classify-777",
           "classification_model" => "claude-sonnet-4-5"
         })
 
@@ -42,7 +42,7 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifierTest do
                ClaudeCategoryClassifier.classify(tenant.id, "Title", "Body")
 
       assert_received {:req, headers, req_body}
-      assert {"x-api-key", "sk-ant-classify-777"} in headers
+      assert {"x-api-key", "test-anthropic-classify-777"} in headers
       assert req_body["model"] == "claude-sonnet-4-5"
 
       %{data: [row]} = Llm.usage_summary(tenant.id, [])
@@ -69,12 +69,12 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifierTest do
 
       assert {:ok, %{category: :pattern}} =
                ClaudeCategoryClassifier.classify(tenant.id, "T", "B",
-                 api_key: "sk-ant-preresolved",
+                 api_key: "test-anthropic-preresolved",
                  model: "claude-haiku-4-5-20251001"
                )
 
       assert_received {:req, headers, req_body}
-      assert {"x-api-key", "sk-ant-preresolved"} in headers
+      assert {"x-api-key", "test-anthropic-preresolved"} in headers
       assert req_body["model"] == "claude-haiku-4-5-20251001"
     end
   end
