@@ -4,13 +4,30 @@ defmodule LoopctlWeb.CapRecoveryController do
   assigned to. Solves the session-crash problem: if an agent loses
   its cap, it can recover without being stuck.
 
-  Security: only re-mints to the lineage that was originally assigned.
-  Cannot be used to mint caps for stories you don't own.
+  Security (L1 capability layer, chain-of-custody v2):
+
+    * Recovery re-mints ONLY a `start_cap`. A client that supplies any
+      other `cap_type` (e.g. `verify_cap`, `report_cap`,
+      `review_complete_cap`) is rejected with 422 — an agent must never
+      be able to mint a capability to verify/report/review its own work.
+    * The lineage the cap is bound to is DERIVED SERVER-SIDE from the
+      story's recorded implementer dispatch (`implementer_dispatch_id` ->
+      `Dispatch.lineage_path`). A client-supplied `lineage` param is
+      ignored entirely — the cap is always scoped to the lineage that was
+      actually dispatched to work the story.
+    * The caller must own the story (`assigned_agent_id`), and the story
+      must have a recorded dispatch lineage. Otherwise recovery is
+      refused: you cannot recover a cap for a story you weren't
+      dispatched to.
   """
 
   use LoopctlWeb, :controller
 
+  import Ecto.Query
+
   alias Loopctl.Capabilities
+  alias Loopctl.Dispatches
+  alias Loopctl.WorkBreakdown.Story
 
   plug LoopctlWeb.Plugs.RequireRole, role: :agent
 
@@ -18,35 +35,74 @@ defmodule LoopctlWeb.CapRecoveryController do
   def recover(conn, %{"id" => story_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     agent_id = conn.assigns.current_api_key.agent_id
-    lineage = Map.get(params, "lineage", [])
-    cap_type = Map.get(params, "cap_type", "start_cap")
 
-    # Verify the caller owns this story
-    import Ecto.Query
+    with :ok <- validate_start_cap(params),
+         {:ok, story} <- fetch_owned_story(tenant_id, agent_id, story_id),
+         {:ok, lineage} <- recorded_lineage(tenant_id, story),
+         {:ok, cap} <- Capabilities.mint(tenant_id, "start_cap", story.id, lineage) do
+      conn
+      |> put_status(:created)
+      |> json(%{data: Capabilities.serialize(cap)})
+    else
+      {:error, :invalid_cap_type} ->
+        error(conn, 422, "cap recovery only re-mints start_cap")
 
+      {:error, :not_found} ->
+        error(conn, 404, "Story not found or not assigned to you")
+
+      {:error, :no_dispatch_lineage} ->
+        error(
+          conn,
+          422,
+          "No recorded dispatch lineage for this story — cannot recover a cap " <>
+            "for a story you weren't dispatched to"
+        )
+
+      {:error, reason} ->
+        error(conn, 422, "Cannot mint cap: #{inspect(reason)}")
+    end
+  end
+
+  # --- Private ---
+
+  # Recovery only ever re-mints a start_cap. An absent cap_type defaults
+  # to start_cap; anything else is a client trying to forge a higher-trust
+  # capability and is rejected.
+  defp validate_start_cap(params) do
+    case Map.get(params, "cap_type") do
+      nil -> :ok
+      "start_cap" -> :ok
+      _other -> {:error, :invalid_cap_type}
+    end
+  end
+
+  defp fetch_owned_story(tenant_id, agent_id, story_id) do
     story =
-      from(s in Loopctl.WorkBreakdown.Story,
+      from(s in Story,
         where:
           s.id == ^story_id and s.tenant_id == ^tenant_id and s.assigned_agent_id == ^agent_id
       )
       |> Loopctl.AdminRepo.one()
 
-    if story do
-      case Capabilities.mint(tenant_id, cap_type, story_id, lineage) do
-        {:ok, cap} ->
-          conn
-          |> put_status(:created)
-          |> json(%{data: Capabilities.serialize(cap)})
+    if story, do: {:ok, story}, else: {:error, :not_found}
+  end
 
-        {:error, reason} ->
-          conn
-          |> put_status(:unprocessable_entity)
-          |> json(%{error: %{message: "Cannot mint cap: #{inspect(reason)}", status: 422}})
-      end
-    else
-      conn
-      |> put_status(:not_found)
-      |> json(%{error: %{message: "Story not found or not assigned to you", status: 404}})
+  # The canonical lineage is the implementer dispatch's lineage_path,
+  # recorded on the story at claim time. Never trust a client-supplied
+  # lineage — resolve it from the dispatch record server-side.
+  defp recorded_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}),
+    do: {:error, :no_dispatch_lineage}
+
+  defp recorded_lineage(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
+    case Dispatches.get_dispatch(tenant_id, dispatch_id) do
+      {:ok, %{lineage_path: [_ | _] = lineage}} -> {:ok, lineage}
+      _ -> {:error, :no_dispatch_lineage}
     end
+  end
+
+  defp error(conn, status, message) do
+    conn
+    |> put_status(status)
+    |> json(%{error: %{message: message, status: status}})
   end
 end
