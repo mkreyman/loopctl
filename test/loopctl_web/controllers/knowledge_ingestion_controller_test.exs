@@ -261,6 +261,57 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       assert json_response(conn, 202)
     end
+
+    test "returns 422 for a malformed project_id (not enqueued, kbweb-01)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: "Some content",
+          source_type: "newsletter",
+          project_id: "not-a-uuid"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "returns 422 for a non-string (array) project_id (not enqueued)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: "Some content",
+          source_type: "newsletter",
+          project_id: ["x"]
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "an empty-string project_id is accepted as tenant-wide (202)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      expect_one_extracted_article("Blank pid ingest")
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{
+          content: "Blank pid content",
+          source_type: "newsletter",
+          project_id: ""
+        })
+
+      assert json_response(conn, 202)
+    end
   end
 
   # --- POST /api/v1/knowledge/ingest/batch ---
@@ -488,6 +539,29 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         end)
 
       assert tenant_b_jobs == []
+    end
+
+    test "a malformed project_id yields a per-item error while valid items still queue (kbweb-01)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      items = [
+        %{content: "Good item", source_type: "newsletter", project_id: project.id},
+        %{content: "Poison item", source_type: "newsletter", project_id: "not-a-uuid"}
+      ]
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{items: items})
+
+      body = json_response(conn, 200)
+      assert [good, bad] = body["data"]
+      assert good["status"] == "queued"
+      assert bad["status"] == "error"
+      assert bad["error"] =~ "project_id"
     end
   end
 

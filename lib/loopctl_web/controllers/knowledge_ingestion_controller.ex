@@ -15,6 +15,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -331,7 +332,9 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     url = params["url"]
     content = params["content"]
     source_type = params["source_type"]
-    project_id = params["project_id"]
+    # Normalize "" -> nil (absent) so a blank project_id never becomes a truthy
+    # job arg that the worker would try to dump against the :binary_id column.
+    project_id = blank_to_nil(params["project_id"])
     metadata = params["metadata"]
     # Ingested (LLM-extracted) articles stay DRAFT by default — they're
     # lower-trust and meant for review. Opt in with publish: true to have the
@@ -339,7 +342,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # default for ingest). Only true/"true" enables it; anything else is draft.
     publish = params["publish"] == true or params["publish"] == "true"
 
-    with :ok <- validate_content_source(url, content),
+    # Validate project_id at the boundary so a malformed / non-string value is a
+    # clean 422 (or per-item batch error) and NEVER becomes a queued job — a job
+    # carrying a non-UUID project_id would crash the worker on Ecto dump and, since
+    # the uniqueness key excludes project_id, crash-loop as a poison pill.
+    with :ok <- validate_ingest_project_id(project_id),
+         :ok <- validate_content_source(url, content),
          :ok <- validate_source_type(source_type),
          :ok <- validate_url_egress(url) do
       content_hash = compute_content_hash(url || content)
@@ -433,6 +441,22 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
   defp validate_content_source(_url, nil), do: :ok
   defp validate_content_source(nil, _content), do: :ok
+
+  # Ingestion is a WRITE path: a non-UUID project_id becomes a poison-pill job, so
+  # be strict — nil/"" is absent (:ok), a valid UUID is :ok, and anything else
+  # (malformed string OR a non-string list/map from a JSON array/object body) is a
+  # 422. Unlike the read-path helper, non-strings are rejected here rather than
+  # tolerated, since they would still enqueue a crashing job.
+  defp validate_ingest_project_id(value) when is_nil(value) or is_binary(value) do
+    ProjectId.validate(value)
+  end
+
+  defp validate_ingest_project_id(_non_string) do
+    {:error, :unprocessable_entity, "Invalid project_id: must be a valid UUID"}
+  end
+
+  defp blank_to_nil(""), do: nil
+  defp blank_to_nil(value), do: value
 
   defp validate_source_type(nil) do
     {:error, :unprocessable_entity, "'source_type' is required"}

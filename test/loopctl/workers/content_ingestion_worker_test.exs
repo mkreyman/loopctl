@@ -393,6 +393,72 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     end
   end
 
+  describe "perform/1 with an invalid project_id (kbweb-01 poison pill)" do
+    test "a malformed project_id is discarded cleanly (no raise, no crash-loop, nothing inserted)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Discarded BEFORE any extraction, so the extractor is never invoked.
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 201,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Poison pill content",
+            "content_hash" => "poison_malformed",
+            "source_type" => "ingestion",
+            "project_id" => "not-a-uuid"
+          }
+        })
+
+      assert {:discard, {:invalid_project_id, "not-a-uuid"}} = result
+
+      assert %{meta: %{total_count: 0}} =
+               Knowledge.list_articles(tenant.id, source_type: "ingestion")
+    end
+
+    test "a non-string (array/map) project_id is discarded cleanly, not raised" do
+      %{tenant: tenant} = setup_tenant()
+
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 202,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Array poison content",
+            "content_hash" => "poison_array",
+            "source_type" => "ingestion",
+            "project_id" => ["x"]
+          }
+        })
+
+      assert {:discard, {:invalid_project_id, ["x"]}} = result
+    end
+
+    test "an empty-string project_id is treated as tenant-wide (normalized to nil), still ingests" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        {:ok, [%{title: "Blank pid article", body: "Body.", category: :pattern, tags: []}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 203,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "Blank project content",
+                   "content_hash" => "blank_pid",
+                   "source_type" => "ingestion",
+                   "project_id" => ""
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "ingestion")
+      assert length(articles) == 1
+      assert is_nil(hd(articles).project_id)
+    end
+  end
+
   # --- Tenant isolation ---
 
   describe "tenant isolation" do
