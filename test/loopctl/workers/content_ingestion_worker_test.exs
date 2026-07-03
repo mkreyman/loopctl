@@ -934,6 +934,58 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert after_retry == 2
     end
 
+    test "a URL whose content CHANGED between attempts RE-EXTRACTS the new bytes (no false skip, round-4 review)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Two DIFFERENT fetch bodies across the two perform/1 calls with the SAME job
+      # args. The chunk-skip must key on the FETCHED BYTES, not the enqueue-time
+      # content_hash (= sha256(url) for a URL job): keying on the URL would find V1's
+      # chunk-0 titles under the same prefix and SILENTLY skip extracting V2 (stale
+      # content, zero signal). Keying on sha256(bytes) re-extracts the changed bytes.
+      extract_count = :counters.new(1, [])
+      fetch_count = :counters.new(1, [])
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        :counters.add(fetch_count, 1, 1)
+
+        body =
+          if :counters.get(fetch_count, 1) == 1,
+            do: "First version of the page about alpha widgets",
+            else: "Second version of the page about beta gadgets"
+
+        Req.Test.text(conn, body)
+      end)
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       content,
+                                                                       _opts ->
+        :counters.add(extract_count, 1, 1)
+        title = if content =~ "alpha", do: "V1 article", else: "V2 article"
+        {:ok, [%{title: title, body: "Body.", category: :pattern}]}
+      end)
+
+      args = %{
+        "tenant_id" => tenant.id,
+        "url" => "https://example.com/dynamic-page",
+        "content_hash" => "url_change_test",
+        "source_type" => "web_article"
+      }
+
+      # Run 1: fetch V1 → extract "V1 article".
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 430, args: args})
+
+      # Run 2 (retry, IDENTICAL args): fetch V2 (different bytes) → MUST re-extract.
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 430, args: args})
+
+      # The extractor was invoked on BOTH attempts (no false skip on the changed URL).
+      assert :counters.get(extract_count, 1) == 2
+
+      # V2's genuinely-new content was captured (not silently kept as stale V1).
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+      titles = Enum.map(articles, & &1.title)
+      assert "V2 article" in titles
+    end
+
     test "a PERMANENT (4xx) extraction failure is discarded, not retried forever (#264 Finding 2)" do
       %{tenant: tenant} = setup_tenant()
 

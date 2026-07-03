@@ -446,6 +446,51 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert is_nil(row.executed_at)
     end
 
+    test "applies resolutions OLDEST-first and drains the tail across runs (order_by, review round 4)" do
+      tenant = fixture(:tenant)
+
+      # Three high-confidence SUPERSEDE resolutions (no LLM synthesizer needed, so this
+      # is deterministic + fast) created oldest→newest with distinct inserted_at.
+      [ra, rb, rc] =
+        for label <- ["A", "B", "C"] do
+          a = published(tenant.id, "#{label}1")
+          b = published(tenant.id, "#{label}2")
+          conflict_link(tenant.id, a, b, 0.95)
+
+          {:ok, r} =
+            Knowledge.annotate_conflict(tenant.id, %{
+              "source_article_id" => a.id,
+              "target_article_id" => b.id,
+              "disposition" => "supersede",
+              "authoritative_article_id" => a.id,
+              "confidence" => "high"
+            })
+
+          # Distinct inserted_at (the `asc: r.id` tiebreaker also makes the order total).
+          Process.sleep(5)
+          r
+        end
+
+      executed? = fn r ->
+        not is_nil(AdminRepo.get!(Loopctl.Knowledge.ConflictResolution, r.id).executed_at)
+      end
+
+      # Each bounded run makes forward progress OLDEST-first — never re-picking the
+      # same head while the tail starves.
+      assert 1 == Knowledge.execute_conflict_resolutions(tenant.id, limit: 1)
+      assert executed?.(ra)
+      refute executed?.(rb)
+      refute executed?.(rc)
+
+      assert 1 == Knowledge.execute_conflict_resolutions(tenant.id, limit: 1)
+      assert executed?.(rb)
+      refute executed?.(rc)
+
+      # The TAIL (newest) eventually executes — no permanent starvation.
+      assert 1 == Knowledge.execute_conflict_resolutions(tenant.id, limit: 1)
+      assert executed?.(rc)
+    end
+
     test "mandatory BYO: a keyless tenant's merge is marked skipped, not retried forever (review #10)" do
       # A DISTINCT tenant with NO llm settings row (no key configured).
       tenant = fixture(:tenant)

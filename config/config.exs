@@ -221,9 +221,15 @@ config :phoenix, :json_library, Jason
 
 # Redact secrets from Phoenix's request-parameter debug log (Epic 28, #179 review):
 # PATCH /api/v1/tenants/me/llm-config carries a raw `api_key` in its body. This
-# applies in ALL envs so the plaintext key can never surface in a param log even if
-# debug logging is enabled. (Cloak dumps the key before it reaches Ecto, so the SQL
-# log already shows ciphertext — this closes the Phoenix param-log path.)
+# applies in ALL envs so the plaintext key can never surface in the Phoenix
+# "Parameters:" log line even if debug logging is enabled.
+#
+# NOTE (scope): this closes the PHOENIX PARAM-LOG path. Ecto's own :debug SQL-query
+# log still prints the plaintext value of ANY Cloak `Loopctl.Vault.Binary` field
+# (the existing webhook signing secret leaks identically — a pre-existing,
+# codebase-wide Ecto+Cloak logging behaviour, NOT specific to this feature). Prod
+# runs at :info, so :debug SQL logs never emit there; redacting encrypted-field
+# params from Ecto's logger is a separate cross-cutting change.
 config :phoenix,
        :filter_parameters,
        {:discard, ["password", "api_key", "secret", "token", "authorization"]}

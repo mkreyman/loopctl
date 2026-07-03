@@ -1,29 +1,30 @@
 defmodule LoopctlWeb.LlmConfigControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
-  import ExUnit.CaptureLog
-
   alias Loopctl.Llm
 
   defp auth_conn(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
-  describe "secret redaction on the PATCH path (review #5, #10)" do
-    test "the raw api_key never appears in request logs", %{conn: conn} do
-      tenant = fixture(:tenant)
-      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+  describe "secret redaction from Phoenix request-param logs (review #5, #10)" do
+    # The Phoenix "Parameters:" request-log line redacts values via
+    # `Phoenix.Logger.filter_values/1`, which applies the `:filter_parameters` config
+    # (#5). We test that exact function — it IS the param-log redaction path — rather
+    # than a capture_log integration test, because the param line is emitted at :debug
+    # while config/test.exs pins the primary Logger level to :warning, and neither
+    # capture_log's `:level` opt nor `Logger.put_process_level/2` lowers the primary
+    # level (verified empirically), so a capture-based test can't emit that line in an
+    # async test without the forbidden global `Logger.configure/1`. This assertion is
+    # NON-VACUOUS: removing the `config :phoenix, :filter_parameters` entry reverts
+    # the api_key to the default (unfiltered) behaviour and fails the first assert.
+    test "filter_parameters redacts api_key (the exact param-log redaction)" do
       secret = "sk-ant-LEAKCHECK-#{System.unique_integer([:positive])}"
 
-      log =
-        capture_log(fn ->
-          conn
-          |> auth_conn(raw_key)
-          |> patch(~p"/api/v1/tenants/me/llm-config", %{api_key: secret})
-          |> json_response(200)
-        end)
+      filtered = Phoenix.Logger.filter_values(%{"api_key" => secret, "keep_me" => "visible"})
 
-      # Phoenix's :filter_parameters config discards api_key from the param log;
-      # Cloak dumps ciphertext before Ecto, so the SQL log can't leak it either.
-      refute log =~ secret
+      assert filtered["api_key"] == "[FILTERED]"
+      # A non-secret param is untouched (proves we didn't over-filter / vacuously pass).
+      assert filtered["keep_me"] == "visible"
+      refute inspect(filtered) =~ secret
     end
   end
 

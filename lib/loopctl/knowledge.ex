@@ -3470,6 +3470,14 @@ defmodule Loopctl.Knowledge do
         where: is_nil(r.executed_at),
         where: r.disposition in [:supersede, :merge],
         where: r.confidence == :high,
+        # Deterministic OLDEST-first order (review round 4): without it Postgres can
+        # return the same subset in the same arbitrary order every run, so a backlog
+        # that exceeds the wall-clock budget would forever apply the same head rows and
+        # NEVER reach the tail (permanently stuck at executed_at IS NULL, contradicting
+        # the "remainder picked up next run" invariant). Oldest-first guarantees each
+        # budgeted run makes forward progress toward the tail; the `id` tiebreaker keeps
+        # the order TOTAL across equal `inserted_at` so no row is ever indefinitely skipped.
+        order_by: [asc: r.inserted_at, asc: r.id],
         limit: ^limit
       )
       |> AdminRepo.all()

@@ -228,6 +228,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # beyond @max_chunks are ingested up to that bound and the remainder is
   # {:discard}ed cleanly (with a count) rather than silently lost.
   defp ingest_chunks(ctx, content) do
+    # Key the per-chunk idempotency/skip on a hash of the ACTUALLY-RESOLVED bytes
+    # for THIS attempt — NOT the enqueue-time `content_hash` (#179 review round 4).
+    # For a URL job `content_hash` is sha256(url), but the bytes are re-fetched fresh
+    # on every Oban attempt; if the URL's content changed between attempts, keying the
+    # skip on the URL would false-SKIP the new bytes' chunks and silently keep stale
+    # content. Keying on sha256(fetched bytes) SKIPS correctly only when the content
+    # is byte-identical across attempts and RE-EXTRACTS when it genuinely changed.
+    # (For content-only jobs this equals `content_hash`, so their behavior is unchanged.)
+    fetched_hash = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+    ctx = Map.put(ctx, :fetched_hash, fetched_hash)
+
     chunks = ContentChunker.chunk(content)
     chunk_count = length(chunks)
     {processable, dropped} = Enum.split(chunks, @max_chunks)
@@ -727,7 +738,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         attrs
         |> normalize_attrs()
         |> Map.delete(:status)
-        |> Map.put(:idempotency_key, ingest_idempotency_key(ctx.content_hash, chunk_index, index))
+        |> Map.put(:idempotency_key, ingest_idempotency_key(ctx.fetched_hash, chunk_index, index))
 
       base = %Article{
         tenant_id: ctx.tenant_id,
@@ -879,16 +890,18 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     |> Map.new()
   end
 
-  # DETERMINISTIC per-CHUNK idempotency prefix from (content_hash, chunk_index).
-  # The per-article key appends ":<article_index>" (below), so ALL of a chunk's
-  # articles share this prefix — which lets `chunk_already_persisted?/2` detect a
-  # committed chunk via a `LIKE prefix || ':%'` query and SKIP re-extraction on a
-  # retry (#179 review #1: re-extracting an already-persisted chunk re-BILLS the
-  # tenant's Anthropic key). SHA-256 hex keeps it bounded regardless of hash length.
-  defp ingest_chunk_prefix(content_hash, chunk_index) do
+  # DETERMINISTIC per-CHUNK idempotency prefix from (fetched_hash, chunk_index),
+  # where `fetched_hash = sha256(actually-resolved bytes for this attempt)` — NOT the
+  # enqueue-time content_hash (#179 review round 4). The per-article key appends
+  # ":<article_index>" (below), so ALL of a chunk's articles share this prefix — which
+  # lets `persisted_chunk_titles/2` detect a committed chunk via a `LIKE prefix || ':%'`
+  # query and SKIP re-extraction on a retry (round-3 #1: re-extracting an
+  # already-persisted chunk re-BILLS the tenant's Anthropic key) ONLY when the resolved
+  # bytes are byte-identical across attempts. SHA-256 hex keeps it bounded.
+  defp ingest_chunk_prefix(fetched_hash, chunk_index) do
     digest =
       :sha256
-      |> :crypto.hash("#{content_hash}:#{chunk_index}")
+      |> :crypto.hash("#{fetched_hash}:#{chunk_index}")
       |> Base.encode16(case: :lower)
 
     "ingest:" <> digest
@@ -896,11 +909,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   # DETERMINISTIC per-article idempotency key = chunk prefix + ":" + article index.
   # NEVER from the LLM output (which varies across calls, #264 Finding 1). Identical
-  # across Oban retries, so a retry re-reaching the same (chunk, article) slot
-  # conflicts on `articles_tenant_idempotency_key_idx` and no-ops (backstop to the
-  # chunk-skip above).
-  defp ingest_idempotency_key(content_hash, chunk_index, article_index) do
-    ingest_chunk_prefix(content_hash, chunk_index) <> ":" <> Integer.to_string(article_index)
+  # across Oban retries FOR IDENTICAL fetched bytes, so a retry re-reaching the same
+  # (chunk, article) slot conflicts on `articles_tenant_idempotency_key_idx` and no-ops
+  # (backstop to the chunk-skip above).
+  defp ingest_idempotency_key(fetched_hash, chunk_index, article_index) do
+    ingest_chunk_prefix(fetched_hash, chunk_index) <> ":" <> Integer.to_string(article_index)
   end
 
   # Titles of the articles a PRIOR attempt already persisted for this chunk (empty
@@ -908,7 +921,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # prefix; the digest + integer index contain no LIKE wildcards, so the pattern is
   # injection-safe. Used both to SKIP re-extraction and to seed cross-chunk dedup.
   defp persisted_chunk_titles(ctx, chunk_index) do
-    pattern = ingest_chunk_prefix(ctx.content_hash, chunk_index) <> ":%"
+    pattern = ingest_chunk_prefix(ctx.fetched_hash, chunk_index) <> ":%"
 
     from(a in Article,
       where: a.tenant_id == ^ctx.tenant_id and like(a.idempotency_key, ^pattern),
