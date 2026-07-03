@@ -21,6 +21,20 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   exception. The parse is now wrapped so a bad body becomes a structured MCP error
   (`{ error: true, status, body }`) with the HTTP status and a raw-body snippet.
 
+### Internal
+
+- The three fixes above now live in a shared, importable module,
+  `lib/http-helpers.js` (`projectsPath` / `ingestionJobsPath` / `parseJsonResponseBody`),
+  imported by both `index.js` and the test suite so the tests exercise the code the
+  server actually ships instead of a hand-copied mirror. `lib/` is now included in the
+  published tarball.
+- CI now runs the MCP server's own `node --test` unit suite: a new `mcp-server-ci.yml`
+  workflow (on every push/PR touching `mcp-server/**`), and both publish workflows
+  (`mcp-autopublish.yml`, `npm-publish.yml`) run `npm test` as a fail-fast gate before
+  `npm publish`, so a red suite blocks the npm release. `npm test` is scoped to the
+  deterministic unit suite (`test/*.test.js`); the live-network `smoke_test.mjs` is now
+  `npm run test:smoke`.
+
 ## 2.30.0 — 2026-07-01 (toggleable KB curation log)
 
 ### Added

@@ -50,6 +50,15 @@ jobs:
         working-directory: mcp-server
         run: npm install
 
+      # Fail-fast gate: never auto-publish an untested build. The deterministic
+      # node --test unit suite (test/*.test.js) must be green BEFORE npm publish.
+      # NB: this runs `npm test`, which is scoped to the unit suite and does NOT
+      # include the live-network smoke_test.mjs (that would flake in CI).
+      - name: Run MCP server unit tests (gate publish)
+        if: steps.pub.outputs.exists == 'false'
+        working-directory: mcp-server
+        run: npm test
+
       - name: Publish to npm
         if: steps.pub.outputs.exists == 'false'
         working-directory: mcp-server

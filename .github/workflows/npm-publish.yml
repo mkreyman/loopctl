@@ -44,6 +44,13 @@ jobs:
       - if: steps.pub.outputs.exists == 'false'
         run: npm install
 
+      # Fail-fast gate: a red unit suite must block the npm release. `npm test`
+      # runs the deterministic node --test suite (test/*.test.js) only — not the
+      # live-network smoke_test.mjs.
+      - name: Run MCP server unit tests (gate publish)
+        if: steps.pub.outputs.exists == 'false'
+        run: npm test
+
       - if: steps.pub.outputs.exists == 'false'
         run: npm publish --provenance --access public
         env:
