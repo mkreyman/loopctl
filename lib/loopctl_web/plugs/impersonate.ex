@@ -53,8 +53,12 @@ defmodule LoopctlWeb.Plugs.Impersonate do
   end
 
   defp do_impersonate(conn) do
+    # Normalize the header FIRST so a malformed value can never reach (and blow
+    # up) the `with` chain. An absent, empty, or whitespace-only header — and any
+    # other non-normalizable shape — resolves to `nil`, which is treated exactly
+    # like an absent header: no impersonation, clean pass-through (never a 500).
     with %{current_api_key: %{role: :superadmin} = api_key} <- conn.assigns,
-         [tenant_id] when tenant_id != "" <- get_req_header(conn, "x-impersonate-tenant"),
+         tenant_id when is_binary(tenant_id) <- impersonate_tenant_id(conn),
          {:ok, tenant} <- lookup_tenant(tenant_id) do
       # Set RLS context for the impersonated tenant
       Repo.put_tenant_id(tenant.id)
@@ -81,28 +85,35 @@ defmodule LoopctlWeb.Plugs.Impersonate do
       |> assign(:impersonated_tenant_id, tenant.id)
       |> assign(:effective_role, effective_role)
     else
-      # Not superadmin, or no header — pass through silently
-      %{current_api_key: %{role: _role}} ->
-        conn
-
-      # No current_api_key at all — pass through (RequireAuth will catch)
-      %{} ->
-        conn
-
-      # Header present but tenant not found
+      # Superadmin supplied a header pointing at a tenant that does not exist.
       {:error, :not_found} ->
         conn
         |> put_status(:not_found)
         |> Phoenix.Controller.json(%{error: %{status: 404, message: "Tenant not found"}})
         |> halt()
 
-      # Empty header list (no header present)
-      [] ->
+      # Everything else — non-superadmin key, no/empty/whitespace header
+      # (tenant_id resolved to `nil`), or no current_api_key at all — is a clean
+      # non-impersonated pass-through.
+      _ ->
         conn
+    end
+  end
 
-      # Empty header value (X-Impersonate-Tenant: "") — treat as if no header
-      [""] ->
-        conn
+  # Reads the X-Impersonate-Tenant header and normalizes it to a trimmed,
+  # non-empty tenant identifier, or `nil` when the header is absent, empty,
+  # whitespace-only, or otherwise unusable. An empty header therefore results
+  # in NO impersonation — it never impersonates tenant "" or a default tenant.
+  defp impersonate_tenant_id(conn) do
+    case get_req_header(conn, "x-impersonate-tenant") do
+      [value | _] when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
     end
   end
 
