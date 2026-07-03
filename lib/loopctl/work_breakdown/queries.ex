@@ -313,9 +313,21 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
   defp apply_epic_filter(query, opts) do
     case Keyword.get(opts, :epic_id) do
-      nil -> query
-      "" -> query
-      epic_id -> where(query, [s], s.epic_id == ^epic_id)
+      nil ->
+        query
+
+      "" ->
+        query
+
+      epic_id ->
+        # `epic_id` is a :binary_id column; a non-UUID value would raise
+        # Ecto.Query.CastError. Treat a malformed value as "matches nothing",
+        # consistent with apply_project_filter/2 above (defense in depth).
+        if valid_uuid?(epic_id) do
+          where(query, [s], s.epic_id == ^epic_id)
+        else
+          where(query, [s], false)
+        end
     end
   end
 

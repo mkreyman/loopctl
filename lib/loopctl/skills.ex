@@ -534,9 +534,24 @@ defmodule Loopctl.Skills do
   end
 
   defp import_single_skill(tenant_id, params, actor_label) do
-    case AdminRepo.get_by(Skill, name: params.name, tenant_id: tenant_id) do
-      nil -> import_create_skill(tenant_id, params, actor_label)
-      existing -> import_update_skill(tenant_id, existing, params, actor_label)
+    # Defense in depth: import_create_skill sets `project_id` DIRECTLY on the
+    # %Skill{} struct (it is NOT in Skill.create_changeset's cast list), so a
+    # non-nil, non-UUID value dumps to Ecto.ChangeError on insert -> unhandled
+    # 500. The controller validates each item and 422s first, but a malformed
+    # value reaching here must return a clean changeset error (rolls the whole
+    # import Multi back — no partial insert) instead of raising.
+    if is_nil(params.project_id) or valid_uuid?(params.project_id) do
+      case AdminRepo.get_by(Skill, name: params.name, tenant_id: tenant_id) do
+        nil -> import_create_skill(tenant_id, params, actor_label)
+        existing -> import_update_skill(tenant_id, existing, params, actor_label)
+      end
+    else
+      changeset =
+        %Skill{}
+        |> Skill.create_changeset(%{"name" => params.name})
+        |> Ecto.Changeset.add_error(:project_id, "must be a valid UUID")
+
+      {:error, changeset}
     end
   end
 

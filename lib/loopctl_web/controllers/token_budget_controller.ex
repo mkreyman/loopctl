@@ -16,6 +16,7 @@ defmodule LoopctlWeb.TokenBudgetController do
   alias Loopctl.TokenUsage
   alias Loopctl.TokenUsage.Formatting
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -214,22 +215,17 @@ defmodule LoopctlWeb.TokenBudgetController do
     tenant_id = api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
-    case TokenUsage.create_budget(tenant_id, params, audit_opts) do
-      {:ok, budget} ->
-        spend = TokenUsage.get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
+    # `scope_id` (a project/epic/story UUID) is set uncast on the %Budget{}
+    # struct, so a malformed value would raise Ecto.Query.CastError on the
+    # existence check (or dump on insert). Validate its UUID format at the
+    # boundary for a clean 422 before any DB work.
+    with :ok <- ProjectId.validate(params["scope_id"]),
+         {:ok, budget} <- TokenUsage.create_budget(tenant_id, params, audit_opts) do
+      spend = TokenUsage.get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
 
-        conn
-        |> put_status(:created)
-        |> json(%{token_budget: format_budget_with_spend(budget, spend)})
-
-      {:error, :not_found} ->
-        {:error, :not_found}
-
-      {:error, :conflict} ->
-        {:error, :conflict}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+      conn
+      |> put_status(:created)
+      |> json(%{token_budget: format_budget_with_spend(budget, spend)})
     end
   end
 

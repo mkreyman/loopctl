@@ -83,6 +83,21 @@ defmodule LoopctlWeb.DependencyGraphControllerTest do
 
       assert json_response(conn, 200)
     end
+
+    test "GET /stories/ready malformed epic_id matches nothing without crashing (200)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories/ready?epic_id=not-a-uuid")
+
+      body = json_response(conn, 200)
+      assert body["data"] == []
+    end
   end
 
   describe "GET /api/v1/stories/ready" do

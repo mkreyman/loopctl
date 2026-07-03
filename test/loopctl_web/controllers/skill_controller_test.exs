@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.SkillControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Skills
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -256,6 +258,52 @@ defmodule LoopctlWeb.SkillControllerTest do
         |> get(~p"/api/v1/skills")
 
       assert json_response(conn, 200)
+    end
+  end
+
+  describe "POST /api/v1/skills/import project_id hardening" do
+    test "a malformed project_id in the import array returns 422, no partial insert", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills/import", %{
+          "skills" => [
+            %{"name" => "loopctl:ok", "prompt_text" => "p", "project_id" => project.id},
+            %{"name" => "loopctl:bad", "prompt_text" => "p", "project_id" => "not-a-uuid"}
+          ]
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+
+      # No partial insert: neither skill was created (whole import rejected).
+      {:ok, result} = Skills.list_skills(tenant.id, [])
+      assert result.data == []
+    end
+
+    test "valid project_ids import successfully", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills/import", %{
+          "skills" => [
+            %{"name" => "loopctl:imp", "prompt_text" => "p", "project_id" => project.id}
+          ]
+        })
+
+      assert json_response(conn, 200)
+      {:ok, result} = Skills.list_skills(tenant.id, [])
+      assert length(result.data) == 1
     end
   end
 end

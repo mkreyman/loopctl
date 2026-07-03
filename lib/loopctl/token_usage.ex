@@ -1261,9 +1261,17 @@ defmodule Loopctl.TokenUsage do
   defp check_entity_exists(nil, _scope_id, _tenant_id), do: :ok
 
   defp check_entity_exists(schema, scope_id, tenant_id) do
-    case AdminRepo.get_by(schema, id: scope_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      _entity -> :ok
+    # `id: scope_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value. The controller 422s a malformed scope_id first; guarding
+    # the cast here makes a malformed value a clean :not_found (never a raised
+    # query error), consistent with a valid-but-nonexistent scope entity.
+    if valid_uuid?(scope_id) do
+      case AdminRepo.get_by(schema, id: scope_id, tenant_id: tenant_id) do
+        nil -> {:error, :not_found}
+        _entity -> :ok
+      end
+    else
+      {:error, :not_found}
     end
   end
 
