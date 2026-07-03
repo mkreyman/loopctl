@@ -833,7 +833,12 @@ defmodule Loopctl.Progress do
         %ReviewRecord{
           tenant_id: tenant_id,
           story_id: story_id,
-          reviewer_agent_id: reviewer_agent_id
+          reviewer_agent_id: reviewer_agent_id,
+          # INVARIANT 2: bind this review to the report generation it reviewed by
+          # snapshotting the story's CURRENT reported_done_at. Programmatic (never
+          # cast from client input). verify_story/4 + bulk_verify later require
+          # this to match the story's reported_done_at at verify time.
+          reviewed_report_at: story.reported_done_at
         }
         |> ReviewRecord.create_changeset(attrs)
 
@@ -1021,7 +1026,7 @@ defmodule Loopctl.Progress do
   the single-story `verify_story/4` path — otherwise bulk verify is a chain-of-custody bypass.
   """
   @spec ensure_verify_allowed(Story.t(), Ecto.UUID.t() | nil) ::
-          :ok | {:error, :self_verify_blocked}
+          :ok | {:error, :self_verify_blocked | :missing_assigned_agent}
   def ensure_verify_allowed(story, orchestrator_agent_id) do
     case validate_not_self_verify(story, orchestrator_agent_id) do
       {:ok, _} -> :ok
@@ -1046,13 +1051,20 @@ defmodule Loopctl.Progress do
   @doc """
   Structural custody guard for the bulk mark-complete (backfill) path.
 
-  Returns `:ok` only when `story` never entered the dispatch lifecycle, matching
-  `backfill_story/4`. Prevents mark-complete from being used to self-verify
-  dispatched work.
+  Returns `:ok` only when `story` never entered the dispatch lifecycle (no
+  dispatch markers) — including a never-dispatched story already at
+  `agent_status: :reported_done` (e.g. imported with
+  `initial_agent_status: "reported_done"`), for which mark-complete is the
+  correct remediation. Matches `backfill_story/4`. Prevents mark-complete from
+  being used to self-verify dispatched work.
   """
   @spec ensure_mark_complete_allowed(Story.t()) ::
           :ok
-          | {:error, :already_verified | :story_rejected | :story_has_dispatch_lineage}
+          | {:error,
+             :already_verified
+             | :story_rejected
+             | :story_has_dispatch_lineage
+             | :story_in_progress}
   def ensure_mark_complete_allowed(story) do
     case guard_backfillable(story) do
       {:ok, _} -> :ok
@@ -1090,7 +1102,11 @@ defmodule Loopctl.Progress do
     * `{:error, :reason_required}` — `reason` missing or blank
     * `{:error, :already_verified}` — story already `:verified` (idempotent no-op)
     * `{:error, :story_rejected}` — story is `:rejected`; investigate instead of papering over
-    * `{:error, :story_has_dispatch_lineage}` — story has an `assigned_agent_id`; use the normal verify flow
+    * `{:error, :story_has_dispatch_lineage}` — story has a dispatch marker
+      (`assigned_agent_id`, `implementer_dispatch_id`, or `verifier_dispatch_id`);
+      use the normal report/review/verify flow
+    * `{:error, :story_in_progress}` — story is mid-lifecycle (e.g. `:contracted`)
+      with no dispatch lineage yet; it is being worked, not pre-existing done work
     * `{:error, %Ecto.Changeset{}}` — persistence error surfaced from Multi step
   """
   @spec backfill_story(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -1105,6 +1121,7 @@ defmodule Loopctl.Progress do
              | :already_verified
              | :story_rejected
              | :story_has_dispatch_lineage
+             | :story_in_progress
              | Ecto.Changeset.t()}
   def backfill_story(tenant_id, story_id, params, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
@@ -1260,22 +1277,29 @@ defmodule Loopctl.Progress do
 
   defp handle_backfill_success(story), do: {:ok, story}
 
-  # Backfill is ONLY for stories that never entered loopctl's dispatch lifecycle.
-  # The refusal conditions are:
+  # Backfill / bulk mark-complete is ONLY for stories that never entered loopctl's
+  # dispatch lifecycle. "Never dispatched" is defined by the ABSENCE of dispatch
+  # markers (assigned_agent_id, implementer_dispatch_id, verifier_dispatch_id) —
+  # NOT by agent_status == :pending. This matters because a story imported with
+  # `initial_agent_status: "reported_done"` (or a prior mark-complete) is
+  # never-dispatched work sitting at agent_status == :reported_done with NULL
+  # dispatch markers; backfill/mark-complete must remain its correct remediation
+  # (it sets verified_status without needing an agent, preserving reported_done_at
+  # provenance). Without this, INVARIANT 1's custody-orphaned guard would strand
+  # such a story — verify/review fail closed AND backfill wrongly refused.
   #
-  #   - verified (nothing to do)
-  #   - rejected (investigate, don't paper over)
-  #   - agent_status is past :pending (contract/claim/start/report all indicate
-  #     an agent engaged with this story)
-  #   - any dispatch lineage field is set (implementer_dispatch_id,
-  #     verifier_dispatch_id). These are the "ever-dispatched" markers that
-  #     force_unclaim_story does NOT clear — relying on assigned_agent_id alone
-  #     is bypassable via force_unclaim → backfill.
+  # Refusal conditions, in order:
+  #   - verified (nothing to do) / rejected (investigate, don't paper over)
+  #   - ANY dispatch marker set — genuine dispatch lineage; use the normal
+  #     report → review → verify flow. These are the "ever-dispatched" markers
+  #     force_unclaim_story does NOT clear, so relying on assigned_agent_id alone
+  #     is bypassable; all three are checked.
+  #   - otherwise, only :pending or :reported_done (never-dispatched) are
+  #     backfillable; a story mid-lifecycle (:contracted with no dispatch yet) is
+  #     being worked, not pre-existing done work — an ACCURATE reason, not a false
+  #     "dispatch lineage" claim.
   defp guard_backfillable(%{verified_status: :verified}), do: {:error, :already_verified}
   defp guard_backfillable(%{verified_status: :rejected}), do: {:error, :story_rejected}
-
-  defp guard_backfillable(%{agent_status: status}) when status != :pending,
-    do: {:error, :story_has_dispatch_lineage}
 
   defp guard_backfillable(%{assigned_agent_id: agent_id}) when not is_nil(agent_id),
     do: {:error, :story_has_dispatch_lineage}
@@ -1286,7 +1310,10 @@ defmodule Loopctl.Progress do
   defp guard_backfillable(%{verifier_dispatch_id: id}) when not is_nil(id),
     do: {:error, :story_has_dispatch_lineage}
 
-  defp guard_backfillable(_story), do: {:ok, :ok}
+  # No dispatch markers from here down.
+  defp guard_backfillable(%{agent_status: :pending}), do: {:ok, :ok}
+  defp guard_backfillable(%{agent_status: :reported_done}), do: {:ok, :ok}
+  defp guard_backfillable(_story), do: {:error, :story_in_progress}
 
   defp apply_backfill_status(story, reason, evidence_url, pr_number) do
     now = DateTime.utc_now()
@@ -1588,6 +1615,18 @@ defmodule Loopctl.Progress do
   defp validate_not_self_verify(story, orchestrator_agent_id) do
     # US-26.2.2 AC-2: use lineage comparison when dispatch IDs are available
     cond do
+      # INVARIANT 1 (fail closed / §2.2 "nil is never permissive"): a story that
+      # is reported_done but not yet verified, with NO assigned agent and NO
+      # dispatch lineage, has no implementer to compare the verifier against — the
+      # checks below would pass VACUOUSLY (a non-nil verifier is never == a nil
+      # implementer). Reject rather than allow a custody-orphaned verify. (The DB
+      # CHECK stories_reported_done_requires_agent makes this state unreachable;
+      # this is the defense-in-depth backstop. Backfilled stories are already
+      # verified and never reach here.)
+      custody_orphaned?(story) ->
+        log_custody_orphaned(story, orchestrator_agent_id, "verify")
+        {:error, :missing_assigned_agent}
+
       # Lineage-based check (preferred): compare dispatch lineage paths
       not is_nil(story.implementer_dispatch_id) and not is_nil(story.verifier_dispatch_id) ->
         impl = get_dispatch_lineage(story.tenant_id, story.implementer_dispatch_id)
@@ -1613,6 +1652,36 @@ defmodule Loopctl.Progress do
       {:ok, dispatch} -> dispatch.lineage_path
       {:error, _} -> []
     end
+  end
+
+  # INVARIANT 1: a story is "custody orphaned" when it is reported_done and still
+  # unverified but carries no provenance for who did the work — no assigned agent
+  # and no implementer dispatch lineage. Such a story cannot be legitimately
+  # verified or reviewed (there is no implementer to separate the verifier/reviewer
+  # from), so the self-* guards fail closed on it. The DB CHECK constraint makes
+  # this state unreachable in practice; this predicate is the code-level backstop.
+  defp custody_orphaned?(%Story{
+         agent_status: :reported_done,
+         verified_status: :unverified,
+         assigned_agent_id: nil,
+         implementer_dispatch_id: nil
+       }),
+       do: true
+
+  defp custody_orphaned?(_story), do: false
+
+  # Observability for INVARIANT 1: emit a warning (no tenant halt, unlike the
+  # byzantine self_verify path) whenever the custody-orphaned guard fires, so
+  # operators can distinguish a broken import batch (recoverable via
+  # backfill/mark-complete) from a probing attempt. Includes story + tenant +
+  # calling identity.
+  defp log_custody_orphaned(%Story{} = story, caller_agent_id, operation) do
+    Logger.warning(
+      "custody_orphaned_blocked: #{operation} blocked — reported_done story has no " <>
+        "assigned agent or dispatch lineage (custody chain broken) " <>
+        "story_id=#{story.id} tenant_id=#{story.tenant_id} " <>
+        "caller_agent_id=#{inspect(caller_agent_id)}"
+    )
   end
 
   defp validate_verifiable(story) do
@@ -1651,7 +1720,20 @@ defmodule Loopctl.Progress do
 
     query =
       if reported_done_at do
-        where(query, [r], r.completed_at > ^reported_done_at)
+        # Primary structural guard (INVARIANT 2): the review must have reviewed
+        # THIS report generation — reviewed_report_at is snapshotted from
+        # reported_done_at at review-creation time. If the story was re-reported
+        # since, the snapshot no longer matches and the review no longer qualifies
+        # (a fresh review of the new generation is required). Legacy pre-migration
+        # reviews have reviewed_report_at IS NULL and are grandfathered as matching
+        # (see migration 20260702130200). Secondary guard (kept): the review must
+        # have completed after the report (completed_at > reported_done_at).
+        query
+        |> where(
+          [r],
+          is_nil(r.reviewed_report_at) or r.reviewed_report_at == ^reported_done_at
+        )
+        |> where([r], r.completed_at > ^reported_done_at)
       else
         query
       end
@@ -2045,15 +2127,26 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # nil reviewer_agent_id: this is a human operator (user-role key with no agent).
-  # Humans are structurally different from the assigned implementing agent, so
-  # nil cannot equal any agent_id — pass through. The controller enforces that
-  # agent/orchestrator-role keys must provide a real reviewer_agent_id.
-  defp validate_not_self_review(_story, nil), do: :ok
-
   defp validate_not_self_review(story, reviewer_agent_id) do
-    # US-26.2.2 AC-2: use lineage when available, fallback to agent_id
     cond do
+      # INVARIANT 1 (fail closed): reviewing a custody-orphaned reported_done story
+      # is illegitimate — there is no known implementer, so the reviewer cannot be
+      # proven distinct and the check below would pass vacuously. Fires regardless
+      # of reviewer identity (including nil human reviewers). Backstops the DB
+      # CHECK stories_reported_done_requires_agent.
+      custody_orphaned?(story) ->
+        log_custody_orphaned(story, reviewer_agent_id, "review")
+        {:error, :missing_assigned_agent}
+
+      # nil reviewer_agent_id: this is a human operator (user-role key with no
+      # agent). Humans are structurally different from the assigned implementing
+      # agent, so nil cannot equal any agent_id — pass through. The controller
+      # enforces that agent/orchestrator-role keys must provide a real
+      # reviewer_agent_id.
+      is_nil(reviewer_agent_id) ->
+        :ok
+
+      # US-26.2.2 AC-2: use lineage when available, fallback to agent_id
       not is_nil(story.implementer_dispatch_id) ->
         # Same fallback pattern as self_report — full lineage comparison
         # will be wired when reviewer dispatch tracking is added

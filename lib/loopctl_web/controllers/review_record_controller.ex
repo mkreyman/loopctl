@@ -129,6 +129,9 @@ defmodule LoopctlWeb.ReviewRecordController do
       {:error, :self_review_blocked} ->
         {:error, :self_review_blocked}
 
+      {:error, :missing_assigned_agent} ->
+        {:error, :missing_assigned_agent}
+
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end

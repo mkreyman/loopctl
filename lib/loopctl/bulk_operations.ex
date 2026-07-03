@@ -515,7 +515,10 @@ defmodule Loopctl.BulkOperations do
     story
     |> Ecto.Changeset.change(%{
       agent_status: :reported_done,
-      reported_done_at: now,
+      # Preserve an existing reported_done_at (e.g. a story imported with
+      # initial_agent_status="reported_done" carries pre-loopctl-done provenance);
+      # only stamp `now` when there is none. Matches backfill_story's behavior.
+      reported_done_at: story.reported_done_at || now,
       verified_status: :verified,
       verified_at: now,
       rejected_at: nil,
@@ -811,11 +814,25 @@ defmodule Loopctl.BulkOperations do
   defp format_reason(:self_verify_blocked),
     do: "cannot verify your own implemented work (chain-of-custody)"
 
+  defp format_reason(:missing_assigned_agent),
+    do:
+      "story is reported_done with no assigned agent or dispatch lineage; its " <>
+        "custody chain is broken, so it cannot be verified. If this is " <>
+        "never-dispatched / pre-existing work, use mark-complete (bulk) or backfill " <>
+        "instead, which record it as done without an agent"
+
   defp format_reason(:review_not_conducted),
     do: "no independent review record exists for this story since it was reported done"
 
   defp format_reason(:story_has_dispatch_lineage),
-    do: "story has dispatch lineage; use the normal verify flow, not mark-complete"
+    do:
+      "story has dispatch lineage (an assigned agent or dispatch id); use the normal " <>
+        "report → review → verify flow, not mark-complete"
+
+  defp format_reason(:story_in_progress),
+    do:
+      "story is mid-lifecycle (being worked) with no dispatch lineage yet; it is not " <>
+        "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
 

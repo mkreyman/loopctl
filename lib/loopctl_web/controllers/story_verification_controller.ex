@@ -279,10 +279,16 @@ defmodule LoopctlWeb.StoryVerificationController do
   end
 
   defp backfill_error_message(:story_has_dispatch_lineage) do
-    "Story has loopctl dispatch lineage (non-pending agent_status, assigned_agent_id, " <>
-      "implementer_dispatch_id, or verifier_dispatch_id is set). " <>
+    "Story has loopctl dispatch lineage (assigned_agent_id, implementer_dispatch_id, " <>
+      "or verifier_dispatch_id is set). " <>
       "Backfill is only for work completed OUTSIDE the loopctl dispatch lifecycle. " <>
       "Use the normal report_story → review_complete → verify_story flow instead."
+  end
+
+  defp backfill_error_message(:story_in_progress) do
+    "Story is mid-lifecycle (e.g. contracted) with no dispatch lineage yet — it is " <>
+      "being worked, not pre-existing done work. Let the report → review → verify " <>
+      "flow run, or force_unclaim it back to pending first if it was abandoned."
   end
 
   @doc """
@@ -304,6 +310,9 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :self_verify_blocked} ->
           {:error, :self_verify_blocked}
+
+        {:error, :missing_assigned_agent} ->
+          {:error, :missing_assigned_agent}
 
         {:error, :reason_required} ->
           {:error, :unprocessable_entity, "reason is required and cannot be blank"}
