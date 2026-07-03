@@ -16,10 +16,21 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
 
   alias Loopctl.Knowledge.ExportConcurrency, as: EC
 
+  # This unit test proves the limiter with its OWN fixed LOW caps via `EC.acquire/3`,
+  # INDEPENDENT of the (deliberately high) `:export_max_concurrent_global` the async
+  # suite sets in `config/test.exs` to stop incidental parallel export tests colliding
+  # on the shared global counter. So we saturate a LOGICAL cap of #{2} — never the
+  # configured one — and hold at most #{2} shared-global slots, which can't starve those
+  # cap-64 incidental exports. Mirrors the `pool_size/2` unit tests passing explicit knob
+  # args (US-27.6b).
+  @global 2
+  @per_tenant 1
+
   defp tid, do: Ecto.UUID.generate()
 
-  # Acquire (retrying on transient global-cap contention from concurrent async tests)
-  # and hold the slot in a kept-alive process until released. Returns the pid.
+  # Acquire against the test's explicit low caps (retrying on transient global-counter
+  # contention from concurrent async tests) and hold the slot in a kept-alive process
+  # until released. Returns the pid.
   defp hold(tenant_id) do
     parent = self()
 
@@ -43,7 +54,7 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
   defp retry_acquire(_t, 0), do: flunk("could not acquire export slot")
 
   defp retry_acquire(t, attempts) do
-    case EC.acquire(t) do
+    case EC.acquire(t, @global, @per_tenant) do
       :ok ->
         :ok
 
@@ -62,12 +73,13 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
       # Default per-tenant cap is 1 (config). The first acquire on a tenant
       # succeeds; a second concurrent one (from another process) is refused.
       t = tid()
-      assert :ok = EC.acquire(t)
+      assert :ok = EC.acquire(t, @global, @per_tenant)
       assert EC.tenant_count(t) == 1
 
       # A second acquirer for the SAME tenant, from another process, is over the
       # per-tenant cap of 1.
-      assert {:error, :too_many_exports} = from_other_process(fn -> EC.acquire(t) end)
+      assert {:error, :too_many_exports} =
+               from_other_process(fn -> EC.acquire(t, @global, @per_tenant) end)
 
       assert :ok = EC.release(t)
       assert EC.tenant_count(t) == 0
@@ -75,30 +87,30 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
 
     test "release/1 frees the slot so a later acquire succeeds" do
       t = tid()
-      assert :ok = EC.acquire(t)
+      assert :ok = EC.acquire(t, @global, @per_tenant)
       assert :ok = EC.release(t)
       # After release, another process can acquire again.
-      assert :ok = from_other_process(fn -> EC.acquire(t) end)
+      assert :ok = from_other_process(fn -> EC.acquire(t, @global, @per_tenant) end)
       from_other_process(fn -> EC.release(t) end)
     end
 
     test "global cap bounds total in-flight exports across tenants" do
-      # Global cap default is 2. Hold the global cap with `max_global` DIFFERENT
-      # tenants (each within its per-tenant cap of 1). Once saturated, a fresh tenant
-      # is refused on the GLOBAL cap (its per-tenant count is 0). Because the GLOBAL
-      # counter is shared with concurrent async tests, we retry the saturation+refusal
-      # invariant until it holds (a transient concurrent holder just delays it).
-      holders = for _ <- 1..EC.max_global(), do: hold(tid())
+      # Explicit logical global cap of `@global` (2). Hold it with `@global` DIFFERENT
+      # tenants (each within its per-tenant cap of 1). Once saturated, a fresh tenant is
+      # refused on the GLOBAL cap (its per-tenant count is 0). Because the GLOBAL counter
+      # is shared with concurrent async tests, we retry the saturation+refusal invariant
+      # until it holds (a transient concurrent holder just delays it).
+      holders = for _ <- 1..@global, do: hold(tid())
 
       t_extra = tid()
 
       assert eventually(fn ->
                # Saturated by our holders (+ possibly others) AND a 0-count tenant is
                # refused purely on the global cap.
-               EC.global_count() >= EC.max_global() and
+               EC.global_count() >= @global and
                  match?(
                    {:error, :too_many_exports},
-                   from_other_process(fn -> EC.acquire(t_extra) end)
+                   from_other_process(fn -> EC.acquire(t_extra, @global, @per_tenant) end)
                  ) and
                  EC.tenant_count(t_extra) == 0
              end),
@@ -113,9 +125,10 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
       # exactly 1 — the refused acquire undid BOTH its global and tenant increments
       # (a partial reservation would leave tenant_count at 2 or the global leaked).
       t = tid()
-      assert :ok = EC.acquire(t)
+      assert :ok = EC.acquire(t, @global, @per_tenant)
 
-      assert {:error, :too_many_exports} = from_other_process(fn -> EC.acquire(t) end)
+      assert {:error, :too_many_exports} =
+               from_other_process(fn -> EC.acquire(t, @global, @per_tenant) end)
 
       # The refused per-tenant acquire must have left the tenant counter at 1 (not 2),
       # proving it undid its increment. (We assert the isolated per-tenant counter,
@@ -133,7 +146,7 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
       # Acquire in a process that then dies WITHOUT releasing.
       {:ok, pid} =
         Task.start(fn ->
-          :ok = EC.acquire(t)
+          :ok = EC.acquire(t, @global, @per_tenant)
           # Signal acquired, then block until killed.
           receive do
             :stop -> :ok
@@ -162,11 +175,11 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
       # admitting MORE than max_global.
       #
       # We detect it via the CAP BEHAVIOR (robust to concurrent global activity):
-      # SATURATE the global cap with `max_global` held tenants, then have one EXTRA
+      # SATURATE the explicit global cap with `@global` held tenants, then have one EXTRA
       # tenant acquire → release → exit-immediately (release racing its :DOWN). If the
       # decrement were doubled, the global would drop below the held count and a fresh
       # tenant would be wrongly ADMITTED. It must STAY refused.
-      holders = for _ <- 1..EC.max_global(), do: hold(tid())
+      holders = for _ <- 1..@global, do: hold(tid())
 
       b = tid()
       parent = self()
@@ -177,7 +190,7 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
           # a holder's slot is momentarily free, OR just attempt once; either way the
           # decrement (if it happened) must not over-free. To make the race exist we
           # need b to have ACQUIRED, so retry until it does (a holder briefly yields).
-          case EC.acquire(b) do
+          case EC.acquire(b, @global, @per_tenant) do
             :ok ->
               :ok = EC.release(b)
               send(parent, :b_done)
@@ -198,13 +211,13 @@ defmodule Loopctl.Knowledge.ExportConcurrencyTest do
       t_fresh = tid()
 
       assert eventually(fn ->
-               EC.global_count() >= EC.max_global() and
+               EC.global_count() >= @global and
                  match?(
                    {:error, :too_many_exports},
-                   from_other_process(fn -> EC.acquire(t_fresh) end)
+                   from_other_process(fn -> EC.acquire(t_fresh, @global, @per_tenant) end)
                  )
              end),
-             "global was under-counted: a fresh tenant was admitted though #{EC.max_global()} " <>
+             "global was under-counted: a fresh tenant was admitted though #{@global} " <>
                "holders are live — the cap-bypass double-decrement regressed"
 
       Enum.each(holders, &release/1)
