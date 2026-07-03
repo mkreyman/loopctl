@@ -12,8 +12,14 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
+
+  # Mandatory BYO (Epic 28, #179): extraction runs on the tenant's OWN Anthropic
+  # key. Reject up front with a clear 422 so we never enqueue a job that can only
+  # {:discard} for a missing key.
+  @no_api_key_message "Configure your Anthropic API key (PUT /api/v1/tenants/me/llm-config) before ingesting content."
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 
@@ -109,6 +115,12 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
+    with :ok <- require_llm_key(tenant_id) do
+      handle_create(conn, tenant_id, params)
+    end
+  end
+
+  defp handle_create(conn, tenant_id, params) do
     case enqueue_item(tenant_id, params) do
       {:ok, :queued, %{job: job, content_hash: content_hash, source_type: source_type}} ->
         conn
@@ -187,9 +199,19 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     items = params["items"]
 
-    with :ok <- validate_batch_items(items) do
+    with :ok <- require_llm_key(tenant_id),
+         :ok <- validate_batch_items(items) do
       results = process_batch_items(tenant_id, items)
       json(conn, LoopctlWeb.KnowledgeIngestionJSON.batch(results))
+    end
+  end
+
+  # Mandatory BYO gate shared by single + batch ingest.
+  defp require_llm_key(tenant_id) do
+    if Llm.has_api_key?(tenant_id) do
+      :ok
+    else
+      {:error, :unprocessable_entity, @no_api_key_message}
     end
   end
 

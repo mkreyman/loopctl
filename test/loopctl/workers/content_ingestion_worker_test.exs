@@ -9,6 +9,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
   defp setup_tenant do
     tenant = fixture(:tenant)
+    # Mandatory BYO (Epic 28, #179): configure a tenant Anthropic key so the
+    # worker's has_api_key? gate passes and extraction proceeds.
+    fixture(:tenant_llm_settings, %{tenant_id: tenant.id})
     %{tenant: tenant}
   end
 
@@ -23,13 +26,41 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     end)
   end
 
+  # --- Mandatory BYO (Epic 28, #179) ---
+
+  describe "perform/1 mandatory BYO enforcement" do
+    test "discards cleanly (no crash, no retry) when the tenant has no Anthropic key" do
+      # A tenant WITHOUT an llm settings row (no key configured).
+      tenant = fixture(:tenant)
+
+      # The extractor must never be called — we discard before any LLM work.
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _t, _c, _o ->
+        flunk("extractor should not run without a tenant key")
+      end)
+
+      assert {:discard, {:no_api_key, _reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 1,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "some content",
+                   "content_hash" => "nokey123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert articles == []
+    end
+  end
+
   # --- Success: extracts articles from inline content ---
 
   describe "perform/1 with inline content" do
     test "extracts articles and inserts them as drafts" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn content, opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, content, opts ->
         assert content == "Some raw content about Elixir patterns"
         assert opts[:source_type] == "newsletter"
 
@@ -77,7 +108,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "publishes extracted articles when publish: true is set" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{
@@ -122,7 +155,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         Req.Test.html(conn, "<html><body><h1>Title</h1><p>Content here</p></body></html>")
       end)
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, content, _opts ->
         # HTML should be stripped
         assert content =~ "Title"
         assert content =~ "Content here"
@@ -208,7 +241,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "filters out articles with invalid categories" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{title: "Valid", body: "Valid body.", category: :pattern},
@@ -235,7 +270,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "filters out articles with empty title" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{title: "Valid", body: "Body.", category: :convention},
@@ -262,7 +299,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "filters out articles with body exceeding 100KB" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{title: "Valid", body: "Short body.", category: :pattern},
@@ -289,7 +328,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "enforces max 10 articles limit" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         articles =
           for i <- 1..12 do
             %{
@@ -324,7 +365,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "returns :ok when extractor returns empty list" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok, []}
       end)
 
@@ -350,7 +393,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "propagates error when extractor fails" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:error, {:api_error, 500, "Internal Server Error"}}
       end)
 
@@ -374,7 +419,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       %{tenant: tenant} = setup_tenant()
       project = fixture(:project, %{tenant_id: tenant.id})
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{
@@ -448,7 +495,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "an empty-string project_id is treated as tenant-wide (normalized to nil), still ingests" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok, [%{title: "Blank pid article", body: "Body.", category: :pattern, tags: []}]}
       end)
 
@@ -477,7 +526,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       %{tenant: tenant_a} = setup_tenant()
       %{tenant: tenant_b} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{
@@ -515,7 +566,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "logs knowledge.content_ingested audit event" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok,
          [
            %{
@@ -566,7 +619,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       end)
 
       # The extractor must NEVER be reached — the guard short-circuits first.
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _content,
+                                                                       _opts ->
         flunk("extractor must not be called for binary content")
       end)
 
@@ -597,7 +652,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         |> Plug.Conn.send_resp(200, binary_body)
       end)
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _content,
+                                                                       _opts ->
         flunk("extractor must not be called for non-UTF-8 content")
       end)
 
@@ -618,7 +675,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "direct non-UTF-8 inline content is discarded cleanly" do
       %{tenant: tenant} = setup_tenant()
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _content,
+                                                                       _opts ->
         flunk("extractor must not be called for non-UTF-8 inline content")
       end)
 
@@ -641,7 +700,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         Req.Test.html(conn, "<html><body><p>Perfectly valid text</p></body></html>")
       end)
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, content, _opts ->
         assert content =~ "Perfectly valid text"
 
         {:ok, [%{title: "Valid web", body: "Body.", category: :finding, tags: ["web"]}]}
@@ -672,7 +731,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       # 4 sections -> 4 chunks. The extractor returns a distinct article per call.
       counter = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         :counters.add(counter, 1, 1)
         n = :counters.get(counter, 1)
 
@@ -704,7 +765,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       # failed chunk instead of marking the job :completed and losing it forever.
       counter = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         :counters.add(counter, 1, 1)
         n = :counters.get(counter, 1)
 
@@ -746,7 +809,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       # non-determinism) so the idempotency guarantee can't depend on the output.
       call = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         :counters.add(call, 1, 1)
         n = :counters.get(call, 1)
 
@@ -794,7 +859,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       chunk_counter = :counters.new(1, [])
       run = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         idx = rem(:counters.get(chunk_counter, 1), 3) + 1
         :counters.add(chunk_counter, 1, 1)
         run_no = :counters.get(run, 1)
@@ -828,7 +895,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "a PERMANENT (4xx) extraction failure is discarded, not retried forever (#264 Finding 2)" do
       %{tenant: tenant} = setup_tenant()
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         {:error, {:api_error, 400, "bad request"}}
       end)
 
@@ -867,7 +936,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       call = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         :counters.add(call, 1, 1)
         n = :counters.get(call, 1)
         {:ok, [%{title: "Phantom check #{n}", body: "Body #{n}.", category: :pattern}]}
@@ -913,7 +984,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       _existing =
         fixture(:article, %{tenant_id: tenant.id, title: "Clash Title", status: :published})
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         {:ok, [%{title: "Clash Title", body: "A different body.", category: :pattern}]}
       end)
 
@@ -934,7 +1007,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "when NO chunk succeeds, the error propagates so Oban retries (nothing persisted)" do
       %{tenant: tenant} = setup_tenant()
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         {:error, {:request_failed, :timeout}}
       end)
 
@@ -955,7 +1030,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "a tiny single-chunk input still ingests" do
       %{tenant: tenant} = setup_tenant()
 
-      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
         {:ok, [%{title: "Tiny", body: "Small.", category: :pattern}]}
       end)
 
@@ -1018,7 +1095,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       # 14 sections -> 14 chunks, above the 12-chunk per-job budget. Each chunk
       # yields one article; the first 12 persist, the rest are discarded.
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                       _chunk,
+                                                                       _opts ->
         {:ok,
          [
            %{

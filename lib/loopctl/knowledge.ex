@@ -3558,6 +3558,7 @@ defmodule Loopctl.Knowledge do
 
   defp do_merge(tenant_id, r, a, b) do
     case merge_synthesizer().synthesize(
+           tenant_id,
            %{title: a.title, body: a.body},
            %{title: b.title, body: b.body}
          ) do

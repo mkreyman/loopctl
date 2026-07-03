@@ -48,6 +48,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
+  alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -134,7 +135,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # malformed / non-string project_id would raise Ecto.ChangeError on insert and,
     # because the uniqueness key excludes project_id, crash-loop as a poison pill.
     # DISCARD such a job (no retry) BEFORE any fetch/LLM work rather than raising.
+    # Mandatory BYO (Epic 28, #179): the tenant must have its own Anthropic key.
+    # {:discard} up front (no fetch, no LLM work, no retry-loop) when it doesn't —
+    # the controller boundary 422s before enqueue, this is defense in depth.
     with :ok <- validate_project_id(project_id),
+         :ok <- require_tenant_llm_key(tenant_id),
          {:ok, content} <- resolve_content(url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
@@ -150,6 +155,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       }
 
       ingest_chunks(ctx, content)
+    end
+  end
+
+  # Mandatory BYO: without a tenant Anthropic key, extraction can never succeed —
+  # {:discard} cleanly (no infinite retry) rather than burning 3 attempts on a
+  # deterministic no-key failure.
+  defp require_tenant_llm_key(tenant_id) do
+    if Llm.has_api_key?(tenant_id) do
+      :ok
+    else
+      {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
     end
   end
 
@@ -266,7 +282,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # persistence reintroduces that need — a cross-chunk title collision would
   # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
   defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
-    case @content_extractor.extract_from_content(chunk, source_type: ctx.source_type) do
+    case @content_extractor.extract_from_content(ctx.tenant_id, chunk,
+           source_type: ctx.source_type
+         ) do
       {:ok, extracted} ->
         {articles, seen_titles} =
           extracted
@@ -378,6 +396,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     do: constraint_violation?(error)
 
   defp permanent_error?({:insert_failed, _step, %Ecto.Changeset{}}), do: true
+
+  # Mandatory BYO: a missing tenant key is deterministic (a retry can't fix it).
+  # The top-level gate normally discards before any chunk runs; this backstops the
+  # case where the key is removed mid-job between chunks.
+  defp permanent_error?(:no_api_key), do: true
 
   defp permanent_error?(_), do: false
 

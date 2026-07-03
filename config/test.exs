@@ -322,6 +322,13 @@ config :loopctl, :enforce_witness_header, false
 # DI: Use Req.Test plug for content ingestion URL fetching in tests
 config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
 
+# Epic 28 (#179): route the tenant-scoped Anthropic client (Loopctl.Llm.Anthropic)
+# through a Req.Test plug so the real Claude extractor/classifier/merge modules —
+# including per-tenant key resolution and usage recording — are exercised without
+# real API calls. DataCase default-stubs it to an empty-articles response; the
+# dedicated LLM tests override with crafted content + usage blocks.
+config :loopctl, :anthropic_req_plug, {Req.Test, Loopctl.Llm.Anthropic}
+
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}
 

@@ -108,14 +108,17 @@ defmodule Loopctl.DataCase do
       {:ok, []}
     end)
 
-    # Default stub for content extractor -- returns empty list (no articles)
-    Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+    # Default stub for content extractor -- returns empty list (no articles).
+    # tenant_id is threaded first (Epic 28 BYO); tests that assert threading match on it.
+    Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
       {:ok, []}
     end)
 
     # Default stub for category classifier -- zero confidence, so the
     # reclassification backfill is a no-op unless a test sets its own verdict.
-    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _title, _body ->
+    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _title, _body ->
       {:ok, %{category: :pattern, confidence: 0.0}}
     end)
 
@@ -200,7 +203,21 @@ defmodule Loopctl.DataCase do
 
     # Merge synthesizer defaults to "no backend" so the conflict executor no-ops on
     # :merge rows unless a test opts in with a real merged result.
-    Mox.stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _a, _b -> {:error, :not_configured} end)
+    Mox.stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _tenant_id, _a, _b ->
+      {:error, :not_configured}
+    end)
+
+    # Epic 28 (#179): default Req.Test stub for the shared tenant-scoped Anthropic
+    # client. Returns an empty-articles Messages response with a zero-usage block so
+    # any incidental call to a REAL Claude module (only when a tenant key is
+    # configured) is intercepted without a real API call. Dedicated LLM tests
+    # override this to return crafted content + usage.
+    Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+      Req.Test.json(conn, %{
+        "content" => [%{"type" => "text", "text" => "[]"}],
+        "usage" => %{"input_tokens" => 0, "output_tokens" => 0}
+      })
+    end)
 
     # ArticleLinkingWorker similarity lookup: default to NO candidates so unrelated tests
     # (and the inline-Oban embedding→linking cascade an article create/publish triggers)

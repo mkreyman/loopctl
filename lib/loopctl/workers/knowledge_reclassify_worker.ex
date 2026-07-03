@@ -104,6 +104,21 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   end
 
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id} = args}) do
+    if Loopctl.Llm.has_api_key?(tenant_id) do
+      run_tenant(tenant_id, args)
+    else
+      # Mandatory BYO (Epic 28, #179): no tenant Anthropic key → nothing to do.
+      # Skip cleanly (no snooze/retry loop) rather than failing every classify call.
+      Logger.info(
+        "KnowledgeReclassifyWorker: tenant=#{tenant_id} has no Anthropic key configured; " <>
+          "skipping reclassification (BYO required)."
+      )
+
+      :ok
+    end
+  end
+
+  defp run_tenant(tenant_id, args) do
     run_mode = Map.get(args, "run_mode", "dry_run")
 
     batch_size =
@@ -124,7 +139,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     processed_so_far = Map.get(args, "processed", 0)
 
     batch = fetch_batch(tenant_id, cursor, batch_size)
-    tally = process_batch(batch, run_mode, min_confidence)
+    tally = process_batch(tenant_id, batch, run_mode, min_confidence)
 
     if upstream_unavailable?(batch, tally) do
       # A mostly/entirely failed batch means the classifier upstream (Anthropic,
@@ -205,7 +220,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   # batch isn't 100 serial round-trips. Writes stay SERIAL (in the reduce, on the
   # worker process) so the small BYPASSRLS admin pool is never hit by N
   # concurrent updates.
-  defp process_batch(batch, run_mode, min_confidence) do
+  defp process_batch(tenant_id, batch, run_mode, min_confidence) do
     max_concurrency =
       Application.get_env(
         :loopctl,
@@ -215,7 +230,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
 
     batch
     |> Task.async_stream(
-      fn article -> {article, @classifier.classify(article.title, article.body)} end,
+      fn article -> {article, @classifier.classify(tenant_id, article.title, article.body)} end,
       max_concurrency: max_concurrency,
       timeout: @classify_timeout_ms,
       on_timeout: :kill_task,

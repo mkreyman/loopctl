@@ -24,6 +24,6 @@ defmodule Loopctl.Knowledge.MergeSynthesizerBehaviour do
   backend is unavailable, so the executor leaves the resolution for retry rather than
   drafting garbage.
   """
-  @callback synthesize(a :: article(), b :: article()) ::
-              {:ok, article()} | {:error, term()}
+  @callback synthesize(tenant_id :: Ecto.UUID.t(), a :: article(), b :: article()) ::
+              {:ok, article()} | {:error, :no_api_key} | {:error, term()}
 end

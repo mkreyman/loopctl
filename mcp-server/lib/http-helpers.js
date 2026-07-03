@@ -54,6 +54,21 @@ export function ingestionJobsPath({ limit, offset, since_days } = {}) {
 }
 
 /**
+ * Path for `knowledge_llm_usage`, honoring from/to/limit/offset (Epic 28, #179).
+ *
+ * @param {{ from?: string, to?: string, limit?: number, offset?: number }} [args]
+ * @returns {string}
+ */
+export function llmUsagePath({ from, to, limit, offset } = {}) {
+  return `/api/v1/knowledge/llm-usage${buildQuery([
+    ["from", from],
+    ["to", to],
+    ["limit", limit],
+    ["offset", offset],
+  ])}`;
+}
+
+/**
  * Defensively parse the raw text body of a JSON-content-type HTTP response
  * (#249, mcp-03).
  *

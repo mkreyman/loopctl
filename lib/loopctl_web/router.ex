@@ -117,6 +117,11 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me", TenantController, :show
     patch "/tenants/me", TenantController, :update
+
+    # Per-tenant BYO Anthropic LLM config (Epic 28 residual, #179). Role :user —
+    # the PUT stores a tenant secret (enforced by the controller's RequireRole).
+    get "/tenants/me/llm-config", LlmConfigController, :show
+    put "/tenants/me/llm-config", LlmConfigController, :update
     post "/tenants/:id/rotate-audit-key/challenge", TenantAuditKeyController, :challenge
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
     post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap
@@ -340,6 +345,9 @@ defmodule LoopctlWeb.Router do
     post "/knowledge/ingest", KnowledgeIngestionController, :create
     post "/knowledge/ingest/batch", KnowledgeIngestionController, :create_batch
     get "/knowledge/ingestion-jobs", KnowledgeIngestionController, :index
+
+    # Per-tenant LLM token-usage summary (Epic 28 residual, #179). Role: orchestrator+.
+    get "/knowledge/llm-usage", LlmUsageController, :index
 
     # Knowledge Analytics (article usage tracking — orchestrator+)
     get "/knowledge/analytics/top-articles",

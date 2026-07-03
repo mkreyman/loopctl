@@ -15,6 +15,6 @@ defmodule Loopctl.Knowledge.ClassifierBehaviour do
 
   @type result :: %{required(:category) => atom(), required(:confidence) => float()}
 
-  @callback classify(title :: String.t(), body :: String.t()) ::
-              {:ok, result()} | {:error, term()}
+  @callback classify(tenant_id :: Ecto.UUID.t(), title :: String.t(), body :: String.t()) ::
+              {:ok, result()} | {:error, :no_api_key} | {:error, term()}
 end

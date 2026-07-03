@@ -360,7 +360,7 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
          ctx do
       %{tenant: t, a: a, b: b} = ctx
 
-      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _a, _b ->
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _tenant_id, _a, _b ->
         {:ok, %{title: "Parsing XML in Elixir (xmerl)", body: "Merged body covering both."}}
       end)
 

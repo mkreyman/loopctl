@@ -1,5 +1,5 @@
 defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
-  use ExUnit.Case, async: true
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Knowledge.ClaudeMergeSynthesizer, as: Synth
 
@@ -26,11 +26,13 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
     end
   end
 
-  describe "synthesize/2 without a configured backend" do
-    test "returns :not_configured rather than a placeholder" do
-      # No :anthropic_provider api_key in :test → graceful degrade.
-      assert {:error, :not_configured} =
-               Synth.synthesize(%{title: "A", body: "a"}, %{title: "B", body: "b"})
+  describe "synthesize/3 without a configured backend" do
+    test "returns :no_api_key rather than a placeholder (mandatory BYO)" do
+      # The tenant has no configured key → graceful degrade, no live HTTP call.
+      tenant = fixture(:tenant)
+
+      assert {:error, :no_api_key} =
+               Synth.synthesize(tenant.id, %{title: "A", body: "a"}, %{title: "B", body: "b"})
     end
   end
 end
