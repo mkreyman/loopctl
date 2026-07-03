@@ -267,16 +267,11 @@ config :loopctl, :bulk_delete_frozen_max, 3
 #   releases the connection between pages and that max in-flight ≤ chunk_size).
 # - max_links_per_article 5: a "dense hub" of >5 links is bounded with ~6 neighbors
 #   instead of 100+.
-# - export_max_concurrent_global 128: raise from prod default (2) so incidental OKF
-#   export tests in async parallelism don't collide on the global cap. The cap MECHANISM
-#   is proven by ExportConcurrencyTest.global_cap_bounds_total_in_flight_exports, which
-#   dynamically reads max_global() and asserts the behavior against it, so raising this
-#   config knob does NOT silence that test. Prod stays at 2 (config/runtime.exs).
-# - export_max_concurrent_per_tenant: defaults to prod value (1) — per-tenant isolation
-#   is still enforced.
+# (The `:export_max_concurrent_global` cap is raised in the SCALE-gated block above, so
+# it is NOT overridden here — the nightly scale leg keeps the prod default so TC-27.16.5
+# can still prove the cap refuses over-budget exports.)
 config :loopctl, :export_chunk_size, 3
 config :loopctl, :export_max_links_per_article, 5
-config :loopctl, :export_max_concurrent_global, 128
 
 # US-27.16 (#3): small decompression-bomb caps so the bomb-defense test runs cheaply
 # — a ~1KB gzip that inflates past these is rejected without materializing it.
