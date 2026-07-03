@@ -854,16 +854,21 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       }
 
       # Run 1: chunks 1 & 3 succeed, chunk 2 fails transiently.
-      # Run 2 (retry): every chunk succeeds. The already-persisted chunks 1 & 3
-      # no-op on conflict; only chunk 2 productively adds a row.
-      chunk_counter = :counters.new(1, [])
+      # Run 2 (retry): chunk 2 is re-extracted; chunks 1 & 3 are SKIPPED (already
+      # persisted — no re-BILL, #179 review #1). The per-chunk verdict keys off the
+      # chunk's CONTENT (its "Section N"), NOT a global call counter, precisely so it
+      # stays correct when the retry re-invokes the extractor for ONLY the failed chunk.
       run = :counters.new(1, [])
 
-      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
-                                                                       _chunk,
-                                                                       _opts ->
-        idx = rem(:counters.get(chunk_counter, 1), 3) + 1
-        :counters.add(chunk_counter, 1, 1)
+      section_no = fn chunk ->
+        case Regex.run(~r/Section (\d+)/, chunk) do
+          [_, n] -> String.to_integer(n)
+          _ -> 0
+        end
+      end
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, chunk, _opts ->
+        idx = section_no.(chunk)
         run_no = :counters.get(run, 1)
 
         if idx == 2 and run_no == 0 do
@@ -890,6 +895,43 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       # 3 total: chunks 1 & 3 unchanged (idempotent no-op), chunk 2 newly added.
       assert after_run2 == 3, "expected only the failed chunk to be added, got #{after_run2}"
+    end
+
+    test "a retry does NOT re-invoke the extractor for chunks already persisted (no re-bill, review #1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      job_args = %{
+        "tenant_id" => tenant.id,
+        "content" => multi_chunk_content(2),
+        "content_hash" => "no_rebill",
+        "source_type" => "newsletter"
+      }
+
+      # First attempt: both chunks succeed (a distinct title per chunk content).
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, chunk, _opts ->
+        n = :erlang.phash2(chunk)
+        {:ok, [%{title: "Article #{n}", body: "Body #{n}.", category: :pattern}]}
+      end)
+
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 420, args: job_args})
+
+      %{meta: %{total_count: after_first}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert after_first == 2
+
+      # Retry (SAME args): every chunk is already durably persisted, so the extractor
+      # (the TENANT-BILLED Anthropic call) must NOT be invoked even once.
+      Mox.expect(Loopctl.MockContentExtractor, :extract_from_content, 0, fn _t, _c, _o ->
+        flunk("extractor must not be re-invoked for already-persisted chunks (re-bill)")
+      end)
+
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 420, args: job_args})
+
+      %{meta: %{total_count: after_retry}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert after_retry == 2
     end
 
     test "a PERMANENT (4xx) extraction failure is discarded, not retried forever (#264 Finding 2)" do

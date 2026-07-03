@@ -2615,7 +2615,7 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "LlmConfigUpdateRequest",
       description:
-        "Request body for `PUT /api/v1/tenants/me/llm-config`. Sets the tenant's " <>
+        "Request body for `PATCH /api/v1/tenants/me/llm-config`. Sets the tenant's " <>
           "OWN Anthropic API key (encrypted at rest, never returned) and the " <>
           "granular per-operation model choices. Any subset of fields may be sent; " <>
           "omitting `api_key` leaves the existing key untouched. Model ids are " <>
@@ -2693,15 +2693,34 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "LlmUsageMeta",
       description:
-        "Offset/limit pagination metadata for the LLM usage summary. Advance " <>
-          "`offset` by `limit` to enumerate `total_count` grouped rows.",
+        "Offset/limit pagination metadata for the LLM usage summary, plus the " <>
+          "EFFECTIVE date window actually applied. Advance `offset` by `limit` to " <>
+          "enumerate `total_count` grouped rows. When `from` is omitted it defaults " <>
+          "to a 90-day lookback (echoed here so callers can detect the truncation).",
       type: :object,
       properties: %{
         limit: %Schema{type: :integer, description: "Effective page size (rows returned)"},
         offset: %Schema{type: :integer, description: "Rows skipped"},
-        total_count: %Schema{type: :integer, description: "Total grouped rows across all pages"}
+        total_count: %Schema{type: :integer, description: "Total grouped rows across all pages"},
+        from: %Schema{
+          type: :string,
+          format: :"date-time",
+          description: "Effective lower bound applied (defaults to now − 90 days when omitted)"
+        },
+        to: %Schema{
+          type: :string,
+          format: :"date-time",
+          nullable: true,
+          description: "Effective upper bound applied (null = open-ended / now)"
+        }
       },
-      example: %{limit: 50, offset: 0, total_count: 3}
+      example: %{
+        limit: 50,
+        offset: 0,
+        total_count: 3,
+        from: "2026-04-04T00:00:00Z",
+        to: nil
+      }
     })
   end
 

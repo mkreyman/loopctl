@@ -186,7 +186,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 |---|---|
 | `llm_config` | Get the tenant's BYO Anthropic LLM config: per-operation models, `has_api_key`, and a masked last-4 hint. Never returns the key. Requires **user** key. |
 | `set_llm_config` | Set/rotate the tenant's OWN Anthropic API key (stored encrypted, never returned) + the three per-operation models (`extraction_model`/`classification_model`/`merge_model`). Any subset; omitting `api_key` leaves it untouched. Requires **user** key. |
-| `knowledge_llm_usage` | Per-tenant LLM token-usage summary, grouped by operation + model + source_type + day over an optional `from`/`to` range, with `limit`/`offset` pagination. Record-only (no budget enforcement). Requires orchestrator key. |
+| `knowledge_llm_usage` | Per-tenant LLM token-usage summary, grouped by operation + model + source_type + day over an optional `from`/`to` range (defaults to a 90-day lookback; effective window echoed in `meta.from`/`meta.to`), with `limit`/`offset` pagination. Record-only (no budget enforcement). Requires orchestrator key. |
 
 ### Knowledge Analytics Tools (orchestrator key)
 

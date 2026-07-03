@@ -3401,8 +3401,10 @@ const TOOLS = [
     description:
       "Per-tenant LLM token-usage summary, grouped by operation + model + source_type + " +
       "day over an optional date range, newest day first, with offset/limit pagination " +
-      "over meta.total_count. Record-only — there is no budget enforcement. Requires " +
-      "orchestrator role.",
+      "over meta.total_count. When `from` is omitted it defaults to a 90-day lookback; the " +
+      "EFFECTIVE window is echoed in meta.from/meta.to so you can detect that older usage " +
+      "was excluded (pass an explicit `from` to widen it). Record-only — there is no budget " +
+      "enforcement. Requires orchestrator role.",
     inputSchema: {
       type: "object",
       properties: {

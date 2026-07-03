@@ -36,6 +36,53 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
     end
   end
 
+  describe "permanent-error handling (review #3)" do
+    test "a title-collision insert DISCARDS (permanent), not a blind 3x retry" do
+      %{tenant: tenant} = setup_tenant()
+      # Pre-existing active article whose title the extraction will collide with
+      # (the partial unique index articles_tenant_title_active_idx covers drafts).
+      _existing = fixture(:article, %{tenant_id: tenant.id, title: "Colliding Title"})
+      review = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:ok, [%{title: "Colliding Title", body: "Body.", category: :pattern, tags: []}]}
+      end)
+
+      assert {:discard, {:insert_failed, _step, _changeset}} =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
+               })
+    end
+
+    test "a permanent 4xx extractor error DISCARDS, not retries" do
+      %{tenant: tenant} = setup_tenant()
+      review = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:error, {:api_error, 400, "bad extraction_model"}}
+      end)
+
+      assert {:discard, {:api_error, 400, _}} =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
+               })
+    end
+
+    test "a transient error still RETRIES (returns {:error, _})" do
+      %{tenant: tenant} = setup_tenant()
+      review = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:error, {:request_failed, :timeout}}
+      end)
+
+      assert {:error, {:request_failed, :timeout}} =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
+               })
+    end
+  end
+
   # --- TC-21.1.1: Worker extracts articles from review successfully ---
 
   describe "perform/1 success" do

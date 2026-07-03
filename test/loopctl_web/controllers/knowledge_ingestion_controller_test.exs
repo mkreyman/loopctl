@@ -18,6 +18,15 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     t
   end
 
+  # A verb+path pair (as printed in a remediation string) is a real router route.
+  defp route_registered?(verb, path) do
+    wanted = verb |> String.downcase() |> String.to_existing_atom()
+
+    Enum.any?(LoopctlWeb.Router.__routes__(), fn route ->
+      route.verb == wanted and route.path == path
+    end)
+  end
+
   # Oban runs :inline in tests, so the ingestion worker executes within the
   # request; stub the extractor to yield exactly one article so we can assert the
   # resulting article's status (draft by default, published with publish: true).
@@ -48,6 +57,13 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       assert body["error"]["code"] == "no_api_key"
       assert body["error"]["message"] =~ "Anthropic API key"
+
+      # The remediation string must name a verb+path ACTUALLY registered in the
+      # router (review #7 — catches PUT/PATCH drift between the copy and the route).
+      [verb, path] = String.split(body["error"]["remediation"]["configure"], " ", parts: 2)
+
+      assert route_registered?(verb, path),
+             "422 remediation names #{verb} #{path}, which is not a registered route"
     end
 
     test "POST /knowledge/ingest/batch with a keyless tenant -> 422 code no_api_key", %{

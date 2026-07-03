@@ -33,7 +33,9 @@ defmodule LoopctlWeb.LlmUsageController do
       from: [
         in: :query,
         type: :string,
-        description: "Optional ISO 8601 lower bound (inclusive) on occurred_at",
+        description:
+          "Optional ISO 8601 lower bound (inclusive) on occurred_at. Defaults to a " <>
+            "90-day lookback when omitted; the effective window is echoed in `meta.from`/`meta.to`.",
         required: false
       ],
       to: [

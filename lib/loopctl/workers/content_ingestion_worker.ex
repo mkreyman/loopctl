@@ -43,6 +43,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   require Logger
 
+  import Ecto.Query, only: [from: 2]
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -255,6 +257,37 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
+    case persisted_chunk_titles(ctx, chunk_index) do
+      [] ->
+        extract_reduce_chunk(ctx, chunk, chunk_index, remaining, acc)
+
+      titles ->
+        # This chunk's articles were durably committed by a PRIOR attempt (#179
+        # review #1). SKIP re-extraction entirely — a whole-job Oban retry must
+        # NEVER re-call (and re-BILL) the tenant's Anthropic key for a chunk that
+        # already succeeded. Seed cross-chunk dedup with the persisted titles and
+        # count them toward the article budget so the run stays consistent.
+        seen =
+          Enum.reduce(titles, acc.seen_titles, fn t, s ->
+            MapSet.put(s, normalize_persisted_title(t))
+          end)
+
+        Logger.info(
+          "ContentIngestionWorker: chunk #{chunk_index} already persisted " <>
+            "(#{length(titles)} article(s)); skipping re-extraction (no re-bill)"
+        )
+
+        {:cont,
+         %{
+           acc
+           | inserted: acc.inserted + length(titles),
+             persisted: acc.persisted + 1,
+             seen_titles: seen
+         }}
+    end
+  end
+
+  defp extract_reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
     acc = %{acc | attempted: acc.attempted + 1}
 
     case extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, acc.seen_titles) do
@@ -846,18 +879,45 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     |> Map.new()
   end
 
-  # DETERMINISTIC per-article idempotency key from (content_hash, chunk_index,
-  # article_index_within_chunk) — NEVER from the LLM output, which varies across
-  # calls (#264, Finding 1). Identical across Oban retries (all three inputs are
-  # deterministic), so a retry re-reaching the same (chunk, article) slot conflicts
-  # on `articles_tenant_idempotency_key_idx` and no-ops instead of duplicating.
-  # SHA-256 hex keeps the key bounded (67 chars) regardless of content_hash length.
-  defp ingest_idempotency_key(content_hash, chunk_index, article_index) do
+  # DETERMINISTIC per-CHUNK idempotency prefix from (content_hash, chunk_index).
+  # The per-article key appends ":<article_index>" (below), so ALL of a chunk's
+  # articles share this prefix — which lets `chunk_already_persisted?/2` detect a
+  # committed chunk via a `LIKE prefix || ':%'` query and SKIP re-extraction on a
+  # retry (#179 review #1: re-extracting an already-persisted chunk re-BILLS the
+  # tenant's Anthropic key). SHA-256 hex keeps it bounded regardless of hash length.
+  defp ingest_chunk_prefix(content_hash, chunk_index) do
     digest =
       :sha256
-      |> :crypto.hash("#{content_hash}:#{chunk_index}:#{article_index}")
+      |> :crypto.hash("#{content_hash}:#{chunk_index}")
       |> Base.encode16(case: :lower)
 
     "ingest:" <> digest
+  end
+
+  # DETERMINISTIC per-article idempotency key = chunk prefix + ":" + article index.
+  # NEVER from the LLM output (which varies across calls, #264 Finding 1). Identical
+  # across Oban retries, so a retry re-reaching the same (chunk, article) slot
+  # conflicts on `articles_tenant_idempotency_key_idx` and no-ops (backstop to the
+  # chunk-skip above).
+  defp ingest_idempotency_key(content_hash, chunk_index, article_index) do
+    ingest_chunk_prefix(content_hash, chunk_index) <> ":" <> Integer.to_string(article_index)
+  end
+
+  # Titles of the articles a PRIOR attempt already persisted for this chunk (empty
+  # list = not yet persisted). Keyed on the deterministic per-chunk idempotency
+  # prefix; the digest + integer index contain no LIKE wildcards, so the pattern is
+  # injection-safe. Used both to SKIP re-extraction and to seed cross-chunk dedup.
+  defp persisted_chunk_titles(ctx, chunk_index) do
+    pattern = ingest_chunk_prefix(ctx.content_hash, chunk_index) <> ":%"
+
+    from(a in Article,
+      where: a.tenant_id == ^ctx.tenant_id and like(a.idempotency_key, ^pattern),
+      select: a.title
+    )
+    |> AdminRepo.all()
+  end
+
+  defp normalize_persisted_title(title) do
+    (title || "") |> String.trim() |> String.downcase()
   end
 end

@@ -219,6 +219,15 @@ config :tailwind,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# Redact secrets from Phoenix's request-parameter debug log (Epic 28, #179 review):
+# PATCH /api/v1/tenants/me/llm-config carries a raw `api_key` in its body. This
+# applies in ALL envs so the plaintext key can never surface in a param log even if
+# debug logging is enabled. (Cloak dumps the key before it reaches Ecto, so the SQL
+# log already shows ciphertext — this closes the Phoenix param-log path.)
+config :phoenix,
+       :filter_parameters,
+       {:discard, ["password", "api_key", "secret", "token", "authorization"]}
+
 # Override phoenix_ecto's Plug.Exception impls:
 # - CastError (default: 400 -> our: 404): an invalid UUID in a URL path means
 #   the resource cannot exist, hence 404 (see LoopctlWeb.Plugs.CastErrorHandler).

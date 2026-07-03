@@ -326,7 +326,7 @@ defmodule LoopctlWeb.FallbackController do
         status: 422,
         code: "no_api_key",
         message: message,
-        remediation: %{configure: "PUT /api/v1/tenants/me/llm-config"}
+        remediation: %{configure: "PATCH /api/v1/tenants/me/llm-config"}
       }
     })
   end

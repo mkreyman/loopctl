@@ -51,7 +51,14 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
       }
     end
 
-    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: source_type}) do
+    # Explicit client budget UNDER the worker's @per_chunk_timeout_ms (30s) Oban
+    # budget (review #9) — the highest-max_tokens (64k) site, so don't rely on the
+    # shared default. 25s + no internal retry keeps the whole request inside the
+    # per-chunk budget; the worker retries the whole (idempotent) job on transients.
+    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: source_type},
+           receive_timeout: 25_000,
+           max_retries: 0
+         ) do
       {:ok, text} -> parse_articles(text)
       {:error, :no_api_key} -> {:error, :no_api_key}
       {:error, _} = err -> err

@@ -3450,9 +3450,19 @@ defmodule Loopctl.Knowledge do
   `:dismiss` needs no execution (recorded complete on annotate). Bounded per run via
   `opts[:limit]`. Returns the count applied.
   """
+  # Default wall-clock budget for ONE executor run. `:merge` rows each make an LLM
+  # synthesis call (up to ~110s worst case with the merge client's 55s x 1-retry
+  # budget), so an unbounded 200-row loop could pin a shared `:knowledge` queue slot
+  # for hours and starve other tenants' ingestion/review/reclassify jobs (review #4).
+  # A run applies rows until this budget elapses; the remainder (still
+  # `executed_at IS NULL`) is picked up by the next nightly run. Config-overridable.
+  @default_execute_budget_ms 120_000
+
   @spec execute_conflict_resolutions(Ecto.UUID.t(), keyword()) :: non_neg_integer()
   def execute_conflict_resolutions(tenant_id, opts \\ []) do
     limit = Keyword.get(opts, :limit, 200)
+    budget_ms = Keyword.get(opts, :budget_ms, execute_budget_ms())
+    deadline = System.monotonic_time(:millisecond) + budget_ms
 
     rows =
       from(r in ConflictResolution,
@@ -3464,9 +3474,26 @@ defmodule Loopctl.Knowledge do
       )
       |> AdminRepo.all()
 
-    Enum.reduce(rows, 0, fn r, count ->
-      if apply_resolution(tenant_id, r), do: count + 1, else: count
+    Enum.reduce_while(rows, 0, fn r, count ->
+      if System.monotonic_time(:millisecond) >= deadline do
+        Logger.info(
+          "ConflictExecutor: tenant=#{tenant_id} hit the #{budget_ms}ms execute budget " <>
+            "after #{count} resolution(s); remainder left for the next run."
+        )
+
+        {:halt, count}
+      else
+        {:cont, if(apply_resolution(tenant_id, r), do: count + 1, else: count)}
+      end
     end)
+  end
+
+  defp execute_budget_ms do
+    Application.get_env(
+      :loopctl,
+      :knowledge_conflict_execute_budget_ms,
+      @default_execute_budget_ms
+    )
   end
 
   # kb-02 FIX B (TOCTOU): the flag is checked at annotate time, but a :user may DELETE
@@ -3579,13 +3606,42 @@ defmodule Loopctl.Knowledge do
       {:ok, %{title: title, body: body}} ->
         create_merged_draft(tenant_id, r, a, title, body)
 
-      # No backend / unparseable → leave unexecuted so a later run (or config) retries;
-      # NEVER draft a placeholder.
       {:error, reason} ->
-        Logger.warning("ConflictExecutor: merge synthesis failed for #{r.id}: #{inspect(reason)}")
-        false
+        handle_merge_error(r, reason)
     end
   end
+
+  # PERMANENT synthesis errors (non-408/429 4xx, unparseable output) must NOT be
+  # left to retry every nightly run — that re-bills the tenant's paid Anthropic
+  # call each time (review #6). Mark them executed with a distinct queryable
+  # `failed` result. TRANSIENT errors (5xx/408/429/request_failed) are left
+  # unexecuted so a later run legitimately retries. NEVER draft a placeholder.
+  defp handle_merge_error(%ConflictResolution{} = r, reason) do
+    if permanent_merge_error?(reason) do
+      Logger.warning(
+        "ConflictExecutor: merge synthesis PERMANENTLY failed for #{r.id} " <>
+          "(#{inspect(reason)}); marking failed (not retrying)."
+      )
+
+      mark_resolution_executed(r, %{"action" => "failed", "reason" => inspect(reason)})
+    else
+      Logger.warning(
+        "ConflictExecutor: merge synthesis transiently failed for #{r.id} " <>
+          "(#{inspect(reason)}); leaving for retry."
+      )
+    end
+
+    false
+  end
+
+  defp permanent_merge_error?(:unparseable_merge), do: true
+
+  defp permanent_merge_error?({:api_error, status, _body})
+       when is_integer(status) and status >= 400 and status < 500 and status != 408 and
+              status != 429,
+       do: true
+
+  defp permanent_merge_error?(_), do: false
 
   defp create_merged_draft(tenant_id, r, source_a, title, body) do
     attrs = %{

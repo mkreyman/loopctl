@@ -240,7 +240,13 @@ defmodule Loopctl.Llm do
     limit = opts |> Keyword.get(:limit, @default_summary_limit) |> clamp_limit()
     offset = opts |> Keyword.get(:offset, 0) |> max_zero()
 
-    base = usage_base_query(tenant_id, opts)
+    # The EFFECTIVE window actually applied (review #8): `from` defaults to a
+    # 90-day lookback when omitted, so echo it in meta — otherwise a caller can't
+    # tell that older usage was silently excluded. `to` is nil = open-ended (now).
+    effective_from = Keyword.get(opts, :from) || default_from()
+    effective_to = Keyword.get(opts, :to)
+
+    base = usage_base_query(tenant_id, effective_from, effective_to)
 
     grouped =
       from(e in base,
@@ -285,7 +291,16 @@ defmodule Loopctl.Llm do
       |> HeavyRead.all(rows_query, HeavyRead.opts(:llm_usage))
       |> Enum.map(&normalize_summary_row/1)
 
-    %{data: rows, meta: %{limit: limit, offset: offset, total_count: total}}
+    %{
+      data: rows,
+      meta: %{
+        limit: limit,
+        offset: offset,
+        total_count: total,
+        from: effective_from,
+        to: effective_to
+      }
+    }
   end
 
   # --- Private ---
@@ -296,10 +311,10 @@ defmodule Loopctl.Llm do
   # bounded range efficient).
   @default_lookback_days 90
 
-  defp usage_base_query(tenant_id, opts) do
+  defp usage_base_query(tenant_id, effective_from, effective_to) do
     from(e in UsageEvent, where: e.tenant_id == ^tenant_id)
-    |> maybe_from(Keyword.get(opts, :from) || default_from())
-    |> maybe_to(Keyword.get(opts, :to))
+    |> maybe_from(effective_from)
+    |> maybe_to(effective_to)
   end
 
   defp default_from,

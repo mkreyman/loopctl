@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.31.1 — 2026-07-03 (usage-window doc clarity — Epic 28, #179 review)
+
+### Changed
+
+- **`knowledge_llm_usage`** docs now state the 90-day default lookback when `from` is
+  omitted and that the EFFECTIVE window is echoed in `meta.from`/`meta.to`, so callers
+  can detect that older usage was excluded and widen the window explicitly.
+
 ## 2.31.0 — 2026-07-03 (per-tenant BYO Anthropic LLM config + usage — Epic 28, #179)
 
 ### Added

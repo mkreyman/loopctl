@@ -106,6 +106,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     :ok
   end
 
+  # Hard wall-clock backstop for a shared `:knowledge` queue slot (review #4).
+  # `Knowledge.execute_conflict_resolutions/2` is itself budget-bounded (~2 min),
+  # and orphan re-link only ENQUEUES cheap jobs, so a healthy per-tenant run is
+  # well under this; without it, an Oban default of `:infinity` would let a
+  # pathological run pin a slot indefinitely (concurrency 5) and starve other
+  # tenants' ingestion/review jobs.
+  @impl Oban.Worker
+  def timeout(_job), do: :timer.minutes(10)
+
   # --- Private ---
 
   # Orphans split two ways:

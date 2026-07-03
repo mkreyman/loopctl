@@ -1,9 +1,31 @@
 defmodule LoopctlWeb.LlmConfigControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.Llm
 
   defp auth_conn(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  describe "secret redaction on the PATCH path (review #5, #10)" do
+    test "the raw api_key never appears in request logs", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      secret = "sk-ant-LEAKCHECK-#{System.unique_integer([:positive])}"
+
+      log =
+        capture_log(fn ->
+          conn
+          |> auth_conn(raw_key)
+          |> patch(~p"/api/v1/tenants/me/llm-config", %{api_key: secret})
+          |> json_response(200)
+        end)
+
+      # Phoenix's :filter_parameters config discards api_key from the param log;
+      # Cloak dumps ciphertext before Ecto, so the SQL log can't leak it either.
+      refute log =~ secret
+    end
+  end
 
   describe "PATCH /api/v1/tenants/me/llm-config" do
     test "sets the api_key + models (role user); response never leaks the key", %{conn: conn} do

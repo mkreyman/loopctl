@@ -424,6 +424,28 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert is_nil(row.executed_at)
     end
 
+    test "respects the wall-clock budget: budget_ms 0 applies nothing, leaves rows for next run (review #4)",
+         ctx do
+      %{tenant: t, a: a, b: b} = ctx
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(t.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      # With a zero budget, the executor halts BEFORE applying the first row, so
+      # nothing is executed and the (high-confidence) resolution stays for the next
+      # run — the bound that prevents a 200-row loop pinning a shared slot for hours.
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id, budget_ms: 0)
+
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
+      assert is_nil(row.executed_at)
+    end
+
     test "mandatory BYO: a keyless tenant's merge is marked skipped, not retried forever (review #10)" do
       # A DISTINCT tenant with NO llm settings row (no key configured).
       tenant = fixture(:tenant)
