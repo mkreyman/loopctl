@@ -97,6 +97,10 @@ defmodule LoopctlWeb.Plugs.Impersonate do
       # non-impersonated pass-through.
       _ ->
         conn
+
+      # Empty header value (X-Impersonate-Tenant: "") — treat as if no header
+      [""] ->
+        conn
     end
   end
 

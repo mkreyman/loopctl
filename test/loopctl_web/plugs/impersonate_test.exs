@@ -198,5 +198,20 @@ defmodule LoopctlWeb.Plugs.ImpersonateTest do
       assert result.assigns.current_api_key.id == api_key.id
       assert result.assigns.current_api_key.role == :superadmin
     end
+
+    test "passes through on empty impersonation header without crashing", %{conn: conn} do
+      {raw_key, _} = fixture(:api_key, %{role: :superadmin})
+
+      # Empty header should not cause WithClauseError
+      result =
+        conn
+        |> impersonate_conn("")
+        |> resolve_and_auth(raw_key)
+        |> Impersonate.call([])
+
+      # Should pass through without halting or crashing
+      refute result.halted
+      refute Map.get(result.assigns, :impersonating)
+    end
   end
 end
