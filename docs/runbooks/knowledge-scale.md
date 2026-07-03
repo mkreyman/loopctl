@@ -113,7 +113,7 @@ it fires, the request fast-fails as the structured **504 `db_statement_timeout`*
 
 **Per-endpoint override (optional):** to give one endpoint a tighter (or looser) bound,
 set `:heavy_read_statement_timeout_overrides` (ms) in config — keys
-`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`, `:vector_search`:
+`:suggested_links`, `:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge`, `:novelty`, `:vector_search`:
 
 ```elixir
 config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
@@ -124,7 +124,7 @@ dedicated heavy pool (justified by the 8-conn sizing). Leave the map empty unles
 endpoint needs a bound different from the `HEAVY_READ_STATEMENT_TIMEOUT_MS` default.
 
 **Heavy-read endpoints** (those using `HeavyRead.all/one`): `:suggested_links`,
-`:semantic_search`, `:distant_pairs`, `:novelty`, `:enumeration`. The enumeration endpoint
+`:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge`, `:novelty`, `:enumeration`. The enumeration endpoint
 (`:knowledge_search_controller` list mode, `list_filtered/2`) now routes through HeavyRead to
 inherit the per-read SET LOCAL statement_timeout and optional per-endpoint override (matching
 the other endpoints). Enumeration pages up to `limit: 1000` rows per request.
@@ -180,8 +180,13 @@ fast-read budget is now slightly more contended per the same concurrency. The pe
 latency/throughput risk, not a deadlock — but per the "verify against prod scale" practice,
 re-check heavy-read p95 + pool queue-wait under load after deploy (the #172 incident proves
 this pool is the real contention point). Measured prod baselines at ~77k (deployed fix):
-`suggested_links` ~59ms, semantic ~45ms, novelty ~1.4s, distant_pairs ~7.9s (the slowest —
-within the 10s cap but worth watching as the corpus grows).
+`suggested_links` ~59ms, semantic ~45ms, novelty ~1.4s. `distant_pairs` was the slowest at
+~7.9s until #202/#203: its cost was an exact `total_count` `count(*)` query — a full
+O(candidates²) pass over the sampled self-join that could NOT early-terminate. That count is
+now removed (the endpoint returns `count`/`has_more`, no exact total), leaving only the
+ordered `LIMIT limit+1` page, which early-terminates in a few ms (local 1.5k-corpus profile:
+count pass ~2.3s vs page ~6–18ms). Confirm the new prod p95 (<2s Theme 2 target) via
+`fly ssh`/EXPLAIN ANALYZE after deploy per the "verify against prod scale" practice.
 
 ## Keyset pagination index (US-27.9a)
 

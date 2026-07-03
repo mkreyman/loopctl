@@ -151,8 +151,24 @@ defmodule Loopctl.Knowledge do
   # cross product); a random walk takes at most @max_walk_length steps. The
   # candidate cap is operator-tunable via `config :loopctl, :max_pair_candidates`.
   @max_pair_candidates 1000
+  # `bridge_path: true` adds a per-pair link-graph EXISTS (direct link OR a shared
+  # published neighbor) to the band filter. In-band ("distant") pairs are usually
+  # graph-DISTANT, so few bridge — the paginated `LIMIT limit+1` page then cannot
+  # early-terminate and evaluates the (expensive 2-hop) EXISTS over the whole in-band
+  # set, which is O(candidates²) work (#202/#203). So the bridge branch uses a SMALLER
+  # sample cap to keep it under the Theme 2 <2s budget; operator-tunable via
+  # `config :loopctl, :max_bridge_pair_candidates`. The non-bridge path keeps the full
+  # 1000 cap (it early-terminates in a few ms regardless).
+  @max_bridge_pair_candidates 500
   @default_pair_limit 20
   @max_pair_limit 100
+  # Upper bound on `:offset` (#202/#203 review, MED-5). A deep offset defeats the page's
+  # early termination — Postgres must produce `offset + limit + 1` matching pairs before
+  # returning — so an unbounded offset lets a caller force near-full O(candidates²)
+  # evaluation of the cross-join. Clamp it (analogous to `limit`'s `min(@max_pair_limit)`);
+  # operator-tunable via `config :loopctl, :max_pair_offset`. 10_000 ≫ any real page depth
+  # at the default limit (500 pages) yet ≪ the ~500k max pairs at the 1000 candidate cap.
+  @max_pair_offset 10_000
   @default_walk_length 4
   @max_walk_length 25
   # Novelty scoring embeds each idea concurrently (bounded) so a 50-idea batch
@@ -4417,7 +4433,10 @@ defmodule Loopctl.Knowledge do
   Samples at most #{@max_pair_candidates} embedded published articles (bounding the
   O(n²) self-join), returns distinct unordered pairs ordered deterministically for
   pagination. With `bridge_path: true` only pairs that are also connected in the
-  link graph (directly, or via a shared neighbor — ≤2 hops) are returned.
+  link graph (directly, or via a shared neighbor — ≤2 hops) are returned; that branch
+  samples a smaller #{@max_bridge_pair_candidates}-article slice, because its per-pair
+  graph EXISTS defeats the page's early termination and would otherwise blow the <2s
+  budget on band-distant (rarely-bridged) pairs.
 
   ## Parameters
 
@@ -4427,17 +4446,22 @@ defmodule Loopctl.Knowledge do
 
   ## Returns
 
-  - `{:ok, %{pairs: [...], total_count: integer, has_more: boolean}}`
+  - `{:ok, %{pairs: [...], has_more: boolean}}` — `has_more` is a `limit + 1`
+    look-ahead flag. NO exact total-pair count is returned: an exact count cannot
+    early-terminate (it must evaluate the `<=>` for every one of the
+    O(candidates²) sampled pairs), and profiling at prod scale (#202/#203) showed
+    that full count pass — not the paginated read — was the entire latency cost.
+    Page with `has_more` instead.
   - `{:error, :invalid_distance}` when the band is outside 0.0–2.0 or min > max
   """
   @spec distant_pairs(Ecto.UUID.t(), keyword()) ::
-          {:ok, %{pairs: [map()], total_count: integer(), has_more: boolean()}}
+          {:ok, %{pairs: [map()], has_more: boolean()}}
           | {:error, :invalid_distance}
   def distant_pairs(tenant_id, opts \\ []) do
     min_d = Keyword.get(opts, :min_distance, 0.3)
     max_d = Keyword.get(opts, :max_distance, 0.7)
     limit = opts |> Keyword.get(:limit, @default_pair_limit) |> max(1) |> min(@max_pair_limit)
-    offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    offset = opts |> Keyword.get(:offset, 0) |> max(0) |> min(max_pair_offset())
     bridge? = Keyword.get(opts, :bridge_path, false) == true
     vis = Keyword.get(opts, :visibility_agent_id)
 
@@ -4453,24 +4477,61 @@ defmodule Loopctl.Knowledge do
 
   defp validate_distance_band(_, _), do: {:error, :invalid_distance}
 
-  # Operator-tunable cap on the sampled candidate set (bounds the O(n²) self-join).
+  # Operator-tunable cap on the sampled candidate set (bounds the O(n²) self-join). The
+  # bridge branch uses a smaller cap because its per-pair link-graph EXISTS defeats the
+  # page's early termination (see @max_bridge_pair_candidates).
   defp max_pair_candidates do
     Application.get_env(:loopctl, :max_pair_candidates, @max_pair_candidates)
   end
 
+  defp max_bridge_pair_candidates do
+    Application.get_env(:loopctl, :max_bridge_pair_candidates, @max_bridge_pair_candidates)
+  end
+
+  # The COMPILE-TIME default caps (the module-attribute constants, config-independent). The
+  # OpenAPI operation doc interpolates these so the numbers in the description can never drift
+  # from the code (#202/#203 review, LOW-9). Public (`@doc false`) only so the controller can
+  # reference them at compile time.
+  @doc false
+  def default_max_pair_candidates, do: @max_pair_candidates
+
+  @doc false
+  def default_max_bridge_pair_candidates, do: @max_bridge_pair_candidates
+
+  # Operator-tunable upper bound on the `:offset` (#202/#203 MED-5).
+  defp max_pair_offset do
+    Application.get_env(:loopctl, :max_pair_offset, @max_pair_offset)
+  end
+
+  # #202/#203 MED-7 invariant: the effective bridge cap NEVER exceeds the general cap, so a
+  # misconfigured larger bridge cap can't make `bridge_path` slower than the non-bridge path
+  # it is meant to bound. Pure + public (`@doc false`) so the clamp is unit-testable without
+  # `Application.put_env` (config-based DI — no put_env in tests).
+  @doc false
+  def effective_bridge_candidate_cap(bridge_cap, general_cap)
+      when is_integer(bridge_cap) and is_integer(general_cap),
+      do: min(bridge_cap, general_cap)
+
+  # The sample cap for THIS request: the (clamped) smaller bridge cap when `bridge_path` is
+  # on, else the full cap.
+  defp pair_candidate_cap(true),
+    do: effective_bridge_candidate_cap(max_bridge_pair_candidates(), max_pair_candidates())
+
+  defp pair_candidate_cap(false), do: max_pair_candidates()
+
   # Column-to-column self-join: `(a.embedding <=> b.embedding) BETWEEN $min AND $max` over
-  # a `LIMIT max_pair_candidates()` SAMPLED subquery. There is NO `$const` target vector
-  # here (both operands are stored columns), so pgvector's HNSW index cannot apply BY
+  # a `LIMIT pair_candidate_cap(bridge?)` SAMPLED subquery. There is NO `$const` target
+  # vector here (both operands are stored columns), so pgvector's HNSW index cannot apply BY
   # NATURE — this is NOT (and must not become) a `VectorSearch.nearest/4` call (US-27.7b —
-  # registered in `Loopctl.Knowledge.CosineLintExceptions`). It is bounded by the
-  # `max_pair_candidates()` sample LIMIT (NOT an O(n²) scan over the whole 80k corpus) and
-  # stays tenant-scoped (`a.tenant_id`/`b.tenant_id` filtered) via HeavyRead's structural guard.
+  # registered in `Loopctl.Knowledge.CosineLintExceptions`). It is bounded by the sample
+  # LIMIT (NOT an O(n²) scan over the whole 80k corpus) and stays tenant-scoped
+  # (`a.tenant_id`/`b.tenant_id` filtered) via HeavyRead's structural guard.
   defp do_distant_pairs(tenant_id, min_d, max_d, limit, offset, bridge?, vis) do
     candidates =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
         order_by: a.id,
-        limit: ^max_pair_candidates(),
+        limit: ^pair_candidate_cap(bridge?),
         select: %{
           id: a.id,
           tenant_id: a.tenant_id,
@@ -4481,16 +4542,19 @@ defmodule Loopctl.Knowledge do
       )
       |> maybe_filter_by_visibility(vis)
 
-    # Build the base query for counting total pairs
-    count_query =
-      from(a in subquery(candidates),
-        join: b in subquery(candidates),
-        on: a.id < b.id,
-        where: fragment("(? <=> ?) BETWEEN ? AND ?", a.embedding, b.embedding, ^min_d, ^max_d),
-        select: count()
-      )
-
-    # Build the paginated query for fetching pairs
+    # ONE query: the paginated pairs with a `limit + 1` look-ahead. The `<=>` band
+    # filter over the sampled cross-join is the whole cost, and this ordered
+    # `LIMIT (limit + 1)` lets Postgres STOP as soon as it has produced one more pair
+    # than the page needs (early termination on the id-ordered nested loop) rather
+    # than materializing every matching pair.
+    #
+    # There is deliberately NO companion `count(*)` query. An EXACT total-pair count
+    # cannot early-terminate — it must evaluate the `<=>` for every one of the
+    # O(candidates²) sampled pairs — and profiling at prod scale (#202/#203) showed
+    # that full count pass, NOT the paginated read, was the entire ~7.85s cost (the
+    # ordered `LIMIT limit+1` page returns in a few ms). Dropping it is what brings
+    # the endpoint under the Epic 27 Theme 2 <2s target; `has_more` (the limit + 1
+    # look-ahead) gives pagination everything it needs without that pass.
     pairs_query =
       from(a in subquery(candidates),
         join: b in subquery(candidates),
@@ -4506,27 +4570,28 @@ defmodule Loopctl.Knowledge do
         }
       )
 
-    # Fetch count and paginated pairs through Loopctl.HeavyRead (US-27.11): the
+    # Fetch the page (+1 look-ahead) through Loopctl.HeavyRead (US-27.11): the
     # dedicated heavy-read pool with a per-read SET LOCAL statement_timeout (US-27.13),
-    # isolated from the small AdminRepo pool so this O(n²) self-join can't starve light
-    # admin ops. No SHARED transaction across the two reads — each is its own short
-    # SET LOCAL transaction, so the count may shift between them (acceptable, by design). Both
-    # queries filter `a.tenant_id`/`b.tenant_id`, satisfying the wrapper's guard.
-    total_count =
-      count_query
-      |> maybe_filter_bridge_path(bridge?, vis)
-      |> then(&HeavyRead.one(tenant_id, &1, heavy_read_opts(:distant_pairs)))
+    # isolated from the small AdminRepo pool so this self-join can't starve light admin
+    # ops. A SINGLE short read now (the exact-count companion read was removed in
+    # #202/#203). The query filters `a.tenant_id`/`b.tenant_id`, satisfying the
+    # wrapper's structural tenant guard.
+    #
+    # The bridge branch reads under its OWN endpoint key (`:distant_pairs_bridge`) so its
+    # slower per-pair-EXISTS reads carry a distinct `statement_timeout` backstop + slow-query
+    # telemetry tag, separate from the fast non-bridge path (#202/#203 review, HIGH-4).
+    endpoint = if bridge?, do: :distant_pairs_bridge, else: :distant_pairs
 
     pairs_with_lookahead =
       pairs_query
       |> maybe_filter_bridge_path(bridge?, vis)
-      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(:distant_pairs)))
+      |> then(&HeavyRead.all(tenant_id, &1, heavy_read_opts(endpoint)))
 
-    # Detect has_more by fetching limit+1; only return limit
+    # Detect has_more by fetching limit+1; only return limit.
     has_more = length(pairs_with_lookahead) > limit
     pairs = Enum.take(pairs_with_lookahead, limit)
 
-    %{pairs: pairs, total_count: total_count, has_more: has_more}
+    %{pairs: pairs, has_more: has_more}
   end
 
   # Bridge filter: keep only pairs connected within ≤2 hops in the link graph —

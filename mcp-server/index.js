@@ -2487,10 +2487,14 @@ const TOOLS = [
     description:
       "Find distant-but-bridgeable article pairs in the optimal-novelty embedding band " +
       "(cosine distance min..max, default 0.3–0.7) — the creative sweet spot (neither banal " +
-      "nor nonsense). Returns { data: [{a, b, distance}], meta:{count} }. With bridge_path:true, " +
-      "only pairs also connected in the link graph (≤2 hops) are returned. Samples up to 1000 " +
-      "embedded published articles; paginate via limit/offset. For computational-creativity " +
-      "ideation (remote-associates generator).",
+      "nor nonsense). Returns { data: [{a, b, distance}], meta:{count, has_more, total_count} }. " +
+      "Paginate via meta.has_more (a limit+1 look-ahead) — NOT total_count, which is DEPRECATED " +
+      "and always null here: unlike sibling offset/limit tools, an exact total is an " +
+      "O(candidates²) cost (the pair set is a column-to-column self-join), so it was removed for " +
+      "latency (loopctl #202/#203). With bridge_path:true, only pairs also connected in the link " +
+      "graph (≤2 hops) are returned — that branch samples a smaller candidate slice, so it may " +
+      "return fewer pairs. Samples up to 1000 embedded published articles (500 for bridge_path). " +
+      "For computational-creativity ideation (remote-associates generator).",
     inputSchema: {
       type: "object",
       properties: {

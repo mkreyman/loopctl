@@ -103,7 +103,14 @@ config :loopctl, :heavy_read_statement_timeout_overrides, %{
   # generous 5s override keeps it from tripping the aggressive 250ms pool default
   # under parallel contention (same rationale as :change_feed). No test asserts an
   # :llm_usage timeout, so this cannot mask a real one.
-  llm_usage: 5_000
+  llm_usage: 5_000,
+  # distant_pairs (esp. the bridge branch) can legitimately run ~1s at the :scale_nightly
+  # 80k corpus — well above the 250ms pool default — so give it generous headroom here or the
+  # server-side timeout would cancel the scale bridge case before it completes. The <2s
+  # Theme-2 target is asserted SEPARATELY (wall-clock) in distant_pairs_novelty_scale_test.exs;
+  # prod carries the tighter 4s backstop (config/config.exs).
+  distant_pairs: 5_000,
+  distant_pairs_bridge: 5_000
 }
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).
@@ -256,10 +263,18 @@ config :loopctl, :full_content_byte_budget, 100_000
 # be exercised with ~11 nodes instead of 100+ (production default is 100).
 config :loopctl, :max_graph_nodes, 10
 
-# Distant-pairs candidate cap — small in tests so the O(n²) self-join sampling
-# cap can be exercised with ~26 articles instead of 1000+ (production default is
-# 1000). Keep comfortably above the article count of any non-truncation test.
-config :loopctl, :max_pair_candidates, 25
+# Distant-pairs candidate caps — small in the DEFAULT async suite so the O(candidates²)
+# sample cap (and the bridge branch's SMALLER cap) can be exercised with a handful of articles
+# instead of 1000+/500. The bridge cap (10) is kept < the general cap (25) so the bridge-branch
+# invariant genuinely binds in the unit test. The SCALE gate (SCALE_NIGHTLY/SCALE_TESTS) leaves
+# the PROD defaults (general 1000, bridge 500) so the :scale_nightly distant_pairs cases are
+# prod-shaped — the bridge latency proof needs the REAL 500 cap (a small cap would make it
+# trivially fast and prove nothing). Mirrors the vector_pool_* pattern above. Config-based DI —
+# NO Application.put_env in any test body.
+unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
+  config :loopctl, :max_pair_candidates, 25
+  config :loopctl, :max_bridge_pair_candidates, 10
+end
 
 # US-27.12: low frozen-set bound so the oversized re-confirm-on-drift bulk-delete
 # path is exercisable with a handful of rows instead of 1001 (production default

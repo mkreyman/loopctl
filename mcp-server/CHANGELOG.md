@@ -5,13 +5,36 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.31.1 — 2026-07-03 (usage-window doc clarity — Epic 28, #179 review)
+## 2.31.1 — 2026-07-03 (usage-window doc clarity + distant_pairs latency — Epic 28 #179 review, loopctl #202/#203)
 
 ### Changed
 
 - **`knowledge_llm_usage`** docs now state the 90-day default lookback when `from` is
   omitted and that the EFFECTIVE window is echoed in `meta.from`/`meta.to`, so callers
   can detect that older usage was excluded and widen the window explicitly.
+- **`knowledge_distant_pairs`** (`GET /api/v1/knowledge/pairs`) latency fix
+  (loopctl #202/#203): the endpoint no longer runs an exact-`total_count`
+  `count(*)` query — a full O(candidates²) pass over the sampled self-join that
+  could not early-terminate and was ~99% of the ~7.85s prod-scale latency. It now
+  returns the paginated page (a `limit+1` look-ahead) alone, well under the Epic 27
+  Theme 2 <2s target.
+
+### Deprecated
+
+- **`meta.total_count`** on `knowledge_distant_pairs` is **deprecated and now
+  always `null`.** The key is retained (not dropped) for a backward-compat window
+  so existing clients get `null` rather than a missing key, but an exact total is
+  no longer computed — it is an O(candidates²) cost. **Paginate via `meta.has_more`
+  instead.** (This differs from every sibling offset/limit endpoint, whose
+  `total_count` stays exact; the self-join's cost is what makes it special.)
+
+### Behavior change
+
+- **`bridge_path=true`** now samples a smaller candidate slice (default 500 vs the
+  general 1000) so its per-pair link-graph EXISTS check stays within the <2s budget
+  — so a `bridge_path=true` request may surface **fewer pairs** than before for the
+  same band. Operator-tunable via `max_bridge_pair_candidates`. `:offset` is also
+  now clamped to an operator-tunable ceiling (default 10_000) to bound deep-page cost.
 
 ## 2.31.0 — 2026-07-03 (per-tenant BYO Anthropic LLM config + usage — Epic 28, #179)
 
