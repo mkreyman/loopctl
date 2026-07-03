@@ -294,4 +294,179 @@ defmodule Loopctl.LlmTest do
       refute "ancient" in models
     end
   end
+
+  # --- BYO embeddings (#294 extended): a SEPARATE OpenAI embedding key + model ---
+
+  describe "embedding config: resolve(:embedding) + has_embedding_key?/1" do
+    test "resolves the tenant's embedding key + model, defaulting the model when nil" do
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{
+          "embedding_api_key" => "test-openai-embed-key-1234",
+          "embedding_model" => "text-embedding-3-large"
+        })
+
+      assert {:ok, %{api_key: "test-openai-embed-key-1234", model: "text-embedding-3-large"}} =
+               Llm.resolve(tenant.id, :embedding)
+
+      assert Llm.has_embedding_key?(tenant.id)
+
+      # embedding_model left nil -> server default.
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"embedding_model" => nil})
+
+      assert {:ok, %{model: "text-embedding-3-small"}} = Llm.resolve(tenant.id, :embedding)
+    end
+
+    test "the Anthropic key and the embedding key are INDEPENDENT" do
+      tenant = fixture(:tenant)
+
+      # Only an Anthropic key -> LLM ops resolve, embedding does NOT.
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-only"})
+      assert {:ok, %{api_key: "test-anthropic-only"}} = Llm.resolve(tenant.id, :extraction)
+      assert {:error, :no_api_key} = Llm.resolve(tenant.id, :embedding)
+      refute Llm.has_embedding_key?(tenant.id)
+
+      # Add an embedding key -> both resolve, each to its OWN key.
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-embed"})
+      assert {:ok, %{api_key: "test-anthropic-only"}} = Llm.resolve(tenant.id, :extraction)
+      assert {:ok, %{api_key: "test-openai-embed"}} = Llm.resolve(tenant.id, :embedding)
+    end
+
+    test "resolve(:embedding) returns {:error, :no_api_key} with no key configured" do
+      tenant = fixture(:tenant)
+      assert {:error, :no_api_key} = Llm.resolve(tenant.id, :embedding)
+
+      # A models-only row is still "no key".
+      {:ok, _} = Llm.upsert_settings(tenant.id, %{"embedding_model" => "text-embedding-3-small"})
+      assert {:error, :no_api_key} = Llm.resolve(tenant.id, :embedding)
+      refute Llm.has_embedding_key?(tenant.id)
+    end
+
+    test "resolve(:embedding) is tenant-scoped — A and B each get their own key" do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+
+      {:ok, _} = Llm.upsert_settings(a.id, %{"embedding_api_key" => "test-openai-AAAA"})
+      {:ok, _} = Llm.upsert_settings(b.id, %{"embedding_api_key" => "test-openai-BBBB"})
+
+      assert {:ok, %{api_key: "test-openai-AAAA"}} = Llm.resolve(a.id, :embedding)
+      assert {:ok, %{api_key: "test-openai-BBBB"}} = Llm.resolve(b.id, :embedding)
+
+      refute match?({:ok, %{api_key: "test-openai-BBBB"}}, Llm.resolve(a.id, :embedding))
+      refute match?({:ok, %{api_key: "test-openai-AAAA"}}, Llm.resolve(b.id, :embedding))
+    end
+
+    test "rejects a blank embedding_api_key and an implausible embedding_model" do
+      tenant = fixture(:tenant)
+
+      assert {:error, cs1} = Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "  "})
+      assert %{embedding_api_key: _} = errors_on(cs1)
+
+      assert {:error, cs2} =
+               Llm.upsert_settings(tenant.id, %{"embedding_model" => "bad model!"})
+
+      assert %{embedding_model: _} = errors_on(cs2)
+    end
+  end
+
+  describe "embedding config: encryption at rest + redaction + audit" do
+    test "the embedding_api_key column is ciphertext, not the plaintext key" do
+      tenant = fixture(:tenant)
+
+      {:ok, settings} =
+        Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-plaintext-zzz"})
+
+      %{rows: [[raw]]} =
+        AdminRepo.query!(
+          "SELECT embedding_api_key FROM tenant_llm_settings WHERE tenant_id = $1",
+          [Ecto.UUID.dump!(tenant.id)]
+        )
+
+      assert is_binary(raw)
+      refute String.contains?(raw, "test-openai-plaintext-zzz")
+
+      # redact: true keeps it out of inspect; it decrypts back on load.
+      refute inspect(settings) =~ "test-openai-plaintext-zzz"
+      assert {:ok, %{api_key: "test-openai-plaintext-zzz"}} = Llm.resolve(tenant.id, :embedding)
+    end
+
+    test "settings_view exposes has_embedding_key + last-4 hint, NEVER the key" do
+      tenant = fixture(:tenant)
+
+      {:ok, settings} =
+        Llm.upsert_settings(tenant.id, %{
+          "embedding_api_key" => "test-openai-hidden-9977",
+          "embedding_model" => "text-embedding-3-small"
+        })
+
+      view = Llm.settings_view(settings)
+      assert view.has_embedding_key == true
+      assert view.embedding_api_key_hint == "...9977"
+      assert view.embedding_model == "text-embedding-3-small"
+      refute Map.has_key?(view, :embedding_api_key)
+      refute view |> inspect() =~ "test-openai-hidden-9977"
+    end
+
+    test "settings_view/1 for a keyless tenant reports has_embedding_key: false" do
+      assert %{has_embedding_key: false, embedding_api_key_hint: nil} = Llm.settings_view(nil)
+    end
+
+    test "setting an embedding key writes llm_config.embedding_key_set WITHOUT the value" do
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{"embedding_api_key" => "test-openai-audit-5150"})
+
+      events =
+        from(a in AuditLog,
+          where: a.tenant_id == ^tenant.id and a.entity_type == "llm_config",
+          select: a
+        )
+        |> AdminRepo.all()
+
+      actions = Enum.map(events, & &1.action)
+      assert "llm_config.embedding_key_set" in actions
+      refute events |> inspect() =~ "test-openai-audit-5150"
+    end
+  end
+
+  describe "embedding usage in the shared ledger" do
+    test "record_usage/2 accepts operation :embedding and usage_summary groups it" do
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.record_usage(tenant.id, %{
+          operation: :embedding,
+          model: "text-embedding-3-small",
+          input_tokens: 42,
+          output_tokens: 0
+        })
+
+      %{data: rows} = Llm.usage_summary(tenant.id, [])
+      embedding = Enum.find(rows, &(&1.operation == :embedding))
+
+      assert embedding.model == "text-embedding-3-small"
+      assert embedding.input_tokens == 42
+      assert embedding.output_tokens == 0
+      assert embedding.event_count == 1
+    end
+
+    test "embedding usage is tenant-isolated (A cannot see B's embedding usage)" do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.record_usage(b.id, %{
+          operation: :embedding,
+          model: "text-embedding-3-small",
+          input_tokens: 7,
+          output_tokens: 0
+        })
+
+      assert %{data: []} = Llm.usage_summary(a.id, [])
+      %{data: rows_b} = Llm.usage_summary(b.id, [])
+      assert Enum.any?(rows_b, &(&1.operation == :embedding))
+    end
+  end
 end

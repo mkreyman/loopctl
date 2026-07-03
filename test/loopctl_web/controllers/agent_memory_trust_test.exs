@@ -604,7 +604,9 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
       # Agent A's private proposal; agent B scoring an idea sees no comparable prior.
       private_embedded(ctx.conn, ctx.raw_a, ctx.tenant.id, "Proposal", [1.0, 0.0], ["proposal"])
 
-      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _ -> {:ok, e([1.0, 0.0])} end)
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _ ->
+        {:ok, e([1.0, 0.0])}
+      end)
 
       b_meta =
         ctx.conn

@@ -127,7 +127,7 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :service_unavailable}
       end)
 
@@ -145,7 +145,7 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, [1.0 | List.duplicate(0.0, 1535)]}
       end)
 
@@ -176,7 +176,7 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
         tags: ["ecto"]
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :service_unavailable}
       end)
 

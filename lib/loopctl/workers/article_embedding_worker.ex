@@ -12,9 +12,13 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   1. Fetch the article by `article_id` + `tenant_id`
   2. If article was deleted, return `:ok` (no-op)
   3. Build embedding text: `"{title}\\n\\n{body}"` truncated to 32K chars
-  4. Call `@embedding_client.generate_embedding/1`
+  4. Call `@embedding_client.generate_embedding/2` (threads `tenant_id`)
   5. On success, store via `Knowledge.update_embedding/3`
-  6. On failure, return `{:error, reason}` for Oban retry
+  6. On `{:error, :no_api_key}` (mandatory BYO — the tenant has no embedding key),
+     `{:discard, {:no_embedding_key, article_id}}` — a CLEAN skip: no crash, no
+     retry, no operator-key fallback. The article stays created; it is simply not
+     vector-searchable until the tenant configures a key.
+  7. On any other failure, return `{:error, reason}` for Oban retry
 
   ## Retry Strategy
 
@@ -73,11 +77,37 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   defp generate_and_store(article, tenant_id, article_id) do
     text = build_embedding_text(article)
 
-    with {:ok, embedding} <- @embedding_client.generate_embedding(text),
-         {:ok, _article} <- Knowledge.update_embedding(tenant_id, article_id, embedding) do
-      enqueue_linking(article_id, tenant_id)
-      :ok
+    case @embedding_client.generate_embedding(tenant_id, text) do
+      {:ok, embedding} ->
+        with {:ok, _article} <- Knowledge.update_embedding(tenant_id, article_id, embedding) do
+          enqueue_linking(article_id, tenant_id)
+          :ok
+        end
+
+      {:error, :no_api_key} ->
+        skip_no_embedding_key(tenant_id, article_id)
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  # Mandatory BYO: the tenant has no embedding key. Cleanly DISCARD (no retry, no
+  # crash, no operator-key fallback) with a distinct, queryable reason + a
+  # telemetry signal so the keyless-tenant volume is observable.
+  defp skip_no_embedding_key(tenant_id, article_id) do
+    :telemetry.execute(
+      [:loopctl, :embedding, :skipped_no_key],
+      %{count: 1},
+      %{tenant_id: tenant_id, article_id: article_id}
+    )
+
+    Logger.debug(
+      "ArticleEmbeddingWorker: tenant=#{tenant_id} article=#{article_id} skipped — no " <>
+        "embedding API key configured (mandatory BYO)."
+    )
+
+    {:discard, {:no_embedding_key, article_id}}
   end
 
   defp enqueue_linking(article_id, tenant_id) do

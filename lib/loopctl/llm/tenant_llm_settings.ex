@@ -1,23 +1,30 @@
 defmodule Loopctl.Llm.TenantLlmSettings do
   @moduledoc """
-  Schema for the `tenant_llm_settings` table — a tenant's BYO Anthropic
-  configuration (Epic 28 residual, #179).
+  Schema for the `tenant_llm_settings` table — a tenant's BYO Anthropic + embedding
+  configuration (Epic 28 residual, #179; embeddings closes the operator-funded
+  embedding-spend gap).
 
-  Each tenant has at most ONE row (unique `tenant_id`). It holds the tenant's own
-  Anthropic API key, encrypted at rest via Cloak (`Loopctl.Vault.Binary`,
-  AES-256-GCM) and `redact: true` so it never appears in `inspect/1` or log output.
-  The three per-operation model fields let a tenant pick a different model for
-  extraction, classification, and merge; each is a free-form, plausible model id
-  (NOT restricted to an allow-list) or NULL to fall back to the server default.
+  Each tenant has at most ONE row (unique `tenant_id`). It holds two SEPARATE,
+  encrypted secrets:
+
+    * `api_key`           — the tenant's own **Anthropic** key (knowledge LLM work).
+    * `embedding_api_key` — the tenant's own **OpenAI-compatible embedding** key
+      (article vector embeddings + semantic search).
+
+  Both are encrypted at rest via Cloak (`Loopctl.Vault.Binary`, AES-256-GCM) and
+  `redact: true` so neither ever appears in `inspect/1` or log output. The
+  per-operation model fields (`extraction_model` / `classification_model` /
+  `merge_model` for Anthropic; `embedding_model` for embeddings) let a tenant pick
+  a different model per operation; each is a free-form, plausible model id (NOT
+  restricted to an allow-list) or NULL to fall back to the server default.
 
   ## Security invariants
 
-  - `api_key` is NEVER placed in a `cast/3` list — it is set programmatically via
-    `put_change/3` so a stray param can't overwrite it and it never lands in the
-    changeset's `params` echoed by error rendering.
-  - `api_key` is `redact: true` — `inspect(%TenantLlmSettings{})` shows
-    `**redacted**`.
-  - No serializer ever returns the key (only `has_api_key?` + a last-4 hint).
+  - `api_key` / `embedding_api_key` are NEVER placed in a `cast/3` list — they are
+    set programmatically via `put_change/3` so a stray param can't overwrite them
+    and they never land in the changeset's `params` echoed by error rendering.
+  - Both are `redact: true` — `inspect(%TenantLlmSettings{})` shows `**redacted**`.
+  - No serializer ever returns a key (only `has_*_key` + a last-4 hint).
   """
 
   use Loopctl.Schema
@@ -39,10 +46,15 @@ defmodule Loopctl.Llm.TenantLlmSettings do
     field :classification_model, :string
     field :merge_model, :string
 
+    # BYO embeddings: the tenant's OWN OpenAI-compatible key + model, SEPARATE from
+    # the Anthropic key above.
+    field :embedding_api_key, Loopctl.Vault.Binary, redact: true
+    field :embedding_model, :string
+
     timestamps()
   end
 
-  @model_fields [:extraction_model, :classification_model, :merge_model]
+  @model_fields [:extraction_model, :classification_model, :merge_model, :embedding_model]
 
   @doc """
   Changeset for the per-operation model fields ONLY.
@@ -63,30 +75,43 @@ defmodule Loopctl.Llm.TenantLlmSettings do
   end
 
   @doc """
-  Sets the encrypted `api_key` on a changeset via `put_change/3` (never `cast`),
-  validating it's a non-empty, bounded string. A `nil`/absent value leaves the
-  existing key untouched; a blank string is rejected.
+  Sets the encrypted Anthropic `api_key` on a changeset via `put_change/3` (never
+  `cast`), validating it's a non-empty, bounded string. A `nil`/absent value leaves
+  the existing key untouched; a blank string is rejected.
   """
   @spec put_api_key(Ecto.Changeset.t(), String.t() | nil) :: Ecto.Changeset.t()
-  def put_api_key(changeset, nil), do: changeset
+  def put_api_key(changeset, value), do: put_secret_key(changeset, :api_key, value)
 
-  def put_api_key(changeset, api_key) when is_binary(api_key) do
-    trimmed = String.trim(api_key)
+  @doc """
+  Sets the encrypted `embedding_api_key` (the tenant's OpenAI embedding key) on a
+  changeset via `put_change/3` (never `cast`) — same non-empty/bounded validation
+  and never-cast handling as `put_api_key/2`.
+  """
+  @spec put_embedding_api_key(Ecto.Changeset.t(), String.t() | nil) :: Ecto.Changeset.t()
+  def put_embedding_api_key(changeset, value),
+    do: put_secret_key(changeset, :embedding_api_key, value)
+
+  # Shared validator for the two encrypted secret fields: never cast, set via
+  # put_change/3, reject blank/oversized, leave untouched on nil.
+  defp put_secret_key(changeset, _field, nil), do: changeset
+
+  defp put_secret_key(changeset, field, value) when is_binary(value) do
+    trimmed = String.trim(value)
 
     cond do
       trimmed == "" ->
-        add_error(changeset, :api_key, "must not be blank")
+        add_error(changeset, field, "must not be blank")
 
       String.length(trimmed) > @max_api_key_length ->
-        add_error(changeset, :api_key, "is too long (max #{@max_api_key_length} characters)")
+        add_error(changeset, field, "is too long (max #{@max_api_key_length} characters)")
 
       true ->
-        put_change(changeset, :api_key, trimmed)
+        put_change(changeset, field, trimmed)
     end
   end
 
-  def put_api_key(changeset, _other),
-    do: add_error(changeset, :api_key, "must be a string")
+  defp put_secret_key(changeset, field, _other),
+    do: add_error(changeset, field, "must be a string")
 
   # Keep ONLY the model fields (string- or atom-keyed) so the api_key can never
   # reach `cast/3`/`changeset.params` (review #15).

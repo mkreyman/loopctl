@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.32.0 — 2026-07-03 (per-tenant BYO for embeddings — Epic 28 #179)
+
+### Added
+
+- **`set_llm_config`** now accepts `embedding_api_key` (the tenant's OWN
+  OpenAI-compatible embedding key, stored encrypted, never returned) and
+  `embedding_model` (free-form; null → server default `text-embedding-3-small`).
+  Mandatory BYO: without an `embedding_api_key` the tenant's articles are created
+  but are NOT vector-searchable until a key is configured — this closes the
+  previously ungated, operator-funded embedding-spend path.
+- **`llm_config`** response now also reports `has_embedding_key` +
+  `embedding_api_key_hint` (masked last-4) + `embedding_model`. No key is ever
+  returned.
+
 ## 2.31.1 — 2026-07-03 (usage-window doc clarity + distant_pairs latency — Epic 28 #179 review, loopctl #202/#203)
 
 ### Changed

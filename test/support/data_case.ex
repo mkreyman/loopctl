@@ -98,8 +98,9 @@ defmodule Loopctl.DataCase do
       {:ok, 0}
     end)
 
-    # Default stub for embedding client -- returns a 1536-dim vector of 0.1
-    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+    # Default stub for embedding client -- returns a 1536-dim vector of 0.1.
+    # tenant_id is threaded first (BYO embeddings, #294 extended).
+    Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
       {:ok, List.duplicate(0.1, 1536)}
     end)
 

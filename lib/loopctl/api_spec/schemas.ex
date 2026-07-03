@@ -2616,10 +2616,10 @@ defmodule Loopctl.ApiSpec.Schemas do
       title: "LlmConfigUpdateRequest",
       description:
         "Request body for `PATCH /api/v1/tenants/me/llm-config`. Sets the tenant's " <>
-          "OWN Anthropic API key (encrypted at rest, never returned) and the " <>
-          "granular per-operation model choices. Any subset of fields may be sent; " <>
-          "omitting `api_key` leaves the existing key untouched. Model ids are " <>
-          "free-form (any model the key permits) — not restricted to an allow-list.",
+          "OWN Anthropic API key and OpenAI embedding key (both encrypted at rest, " <>
+          "never returned) and the granular per-operation model choices. Any subset " <>
+          "of fields may be sent; omitting a key leaves the existing key untouched. " <>
+          "Model ids are free-form (any model the key permits) — not an allow-list.",
       type: :object,
       properties: %{
         api_key: %Schema{
@@ -2641,13 +2641,28 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           nullable: true,
           description: "Model id for article merge synthesis (null → server default)"
+        },
+        embedding_api_key: %Schema{
+          type: :string,
+          writeOnly: true,
+          description:
+            "OpenAI-compatible embedding API key (write-only; stored encrypted, never " <>
+              "returned). Mandatory BYO — without it the tenant's articles are not " <>
+              "vector-searchable."
+        },
+        embedding_model: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Embedding model id (null → server default `text-embedding-3-small`)"
         }
       },
       example: %{
         api_key: "sk-ant-...",
         extraction_model: "claude-haiku-4-5-20251001",
         classification_model: "claude-sonnet-4-5-20250929",
-        merge_model: "claude-haiku-4-5-20251001"
+        merge_model: "claude-haiku-4-5-20251001",
+        embedding_api_key: "sk-...",
+        embedding_model: "text-embedding-3-small"
       }
     })
   end
@@ -2659,8 +2674,9 @@ defmodule Loopctl.ApiSpec.Schemas do
     OpenApiSpex.schema(%{
       title: "LlmConfigResponse",
       description:
-        "The tenant's LLM configuration. NEVER includes the API key itself — only " <>
-          "whether one is set (`has_api_key`) and a last-4 hint (`api_key_hint`).",
+        "The tenant's LLM configuration. NEVER includes any API key itself — only " <>
+          "whether each key is set (`has_api_key` / `has_embedding_key`) and masked " <>
+          "last-4 hints (`api_key_hint` / `embedding_api_key_hint`).",
       type: :object,
       properties: %{
         has_api_key: %Schema{
@@ -2674,14 +2690,27 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         extraction_model: %Schema{type: :string, nullable: true},
         classification_model: %Schema{type: :string, nullable: true},
-        merge_model: %Schema{type: :string, nullable: true}
+        merge_model: %Schema{type: :string, nullable: true},
+        has_embedding_key: %Schema{
+          type: :boolean,
+          description: "Whether an OpenAI embedding key is configured"
+        },
+        embedding_api_key_hint: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Masked last-4 hint for the embedding key; never the full key"
+        },
+        embedding_model: %Schema{type: :string, nullable: true}
       },
       example: %{
         has_api_key: true,
         api_key_hint: "...aB3d",
         extraction_model: "claude-haiku-4-5-20251001",
         classification_model: "claude-sonnet-4-5-20250929",
-        merge_model: nil
+        merge_model: nil,
+        has_embedding_key: true,
+        embedding_api_key_hint: "...Xy9z",
+        embedding_model: "text-embedding-3-small"
       }
     })
   end

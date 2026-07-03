@@ -1,14 +1,25 @@
 defmodule Loopctl.Llm do
   @moduledoc """
-  Per-tenant BYO Anthropic LLM configuration + usage tracking (Epic 28 residual, #179).
+  Per-tenant BYO LLM + embedding configuration + usage tracking (Epic 28 residual,
+  #179; embeddings closes the operator-funded embedding-spend gap).
 
-  loopctl is multi-tenant and **BYO-key**: every tenant supplies its OWN Anthropic
-  API key and pays Anthropic directly. loopctl fronts no LLM cost — there is no
-  markup, price table, or billing. A tenant with no configured key CANNOT run
-  tenant knowledge-LLM work (ingest/classify/merge): `resolve/2` returns
+  loopctl is multi-tenant and **BYO-key**: every tenant supplies its OWN keys and
+  pays the provider directly. loopctl fronts no cost — there is no markup, price
+  table, or billing. Two SEPARATE keys are configured per tenant:
+
+    * an **Anthropic** key for knowledge LLM work (ingest/classify/merge), and
+    * an **OpenAI-compatible embedding** key for article vector embeddings +
+      semantic search.
+
+  A tenant with no Anthropic key CANNOT run tenant knowledge-LLM work:
+  `resolve(tenant_id, :extraction | :classification | :merge)` returns
   `{:error, :no_api_key}` and callers fail cleanly (a 422 at the API boundary; the
-  Oban worker `{:discard}`s). There is intentionally NO global-system-key fallback
-  for tenant LLM work.
+  Oban worker `{:discard}`s). A tenant with no embedding key gets NO embeddings:
+  `resolve(tenant_id, :embedding)` returns `{:error, :no_api_key}`, the embedding
+  client refuses to call the provider, and `ArticleEmbeddingWorker` cleanly
+  `{:discard}`s `{:no_embedding_key, _}` (the article is still created — it is just
+  not vector-searchable until a key is set). There is intentionally NO
+  global-system-key fallback for either path.
 
   ## Repo strategy
 
@@ -43,15 +54,21 @@ defmodule Loopctl.Llm do
 
   # Server default model per operation when the tenant left that field nil. A key
   # is still MANDATORY — the default only fills the model, never the key. Haiku is
-  # the cheap sensible default; a tenant overrides per-operation as they wish.
+  # the cheap sensible default; a tenant overrides per-operation as they wish. The
+  # embedding default is OpenAI's cheap small embedding model.
   @default_model "claude-haiku-4-5-20251001"
+  @default_embedding_model "text-embedding-3-small"
   @default_models %{
     extraction: @default_model,
     classification: @default_model,
-    merge: @default_model
+    merge: @default_model,
+    embedding: @default_embedding_model
   }
 
-  @type operation :: :extraction | :classification | :merge
+  # Operations backed by the Anthropic `api_key`.
+  @llm_operations [:extraction, :classification, :merge]
+
+  @type operation :: :extraction | :classification | :merge | :embedding
   @type resolved :: %{api_key: String.t(), model: String.t()}
 
   # --- Settings ---
@@ -70,12 +87,13 @@ defmodule Loopctl.Llm do
   @doc """
   Upserts the tenant's LLM settings (one row per tenant).
 
-  `attrs` may carry any of `api_key`, `extraction_model`, `classification_model`,
-  `merge_model` (string or atom keys). `tenant_id` is set programmatically. The
-  api_key (when present) is stored encrypted and NEVER cast from params. When an
-  api_key is set/rotated, an `llm_config.key_set` audit event is written WITHOUT
-  the value; every upsert writes an `llm_config.updated` event listing which
-  model fields changed.
+  `attrs` may carry any of `api_key`, `embedding_api_key`, `extraction_model`,
+  `classification_model`, `merge_model`, `embedding_model` (string or atom keys).
+  `tenant_id` is set programmatically. Both secret keys (when present) are stored
+  encrypted and NEVER cast from params. When a key is set/rotated, an
+  `llm_config.key_set` / `llm_config.embedding_key_set` audit event is written
+  WITHOUT the value; every upsert writes an `llm_config.updated` event listing
+  which model fields changed.
 
   Returns `{:ok, settings}` or `{:error, changeset}`.
   """
@@ -84,20 +102,23 @@ defmodule Loopctl.Llm do
   def upsert_settings(tenant_id, attrs) when is_binary(tenant_id) and is_map(attrs) do
     attrs = normalize_keys(attrs)
     api_key = Map.get(attrs, :api_key)
+    embedding_api_key = Map.get(attrs, :embedding_api_key)
     existing = get_settings(tenant_id)
 
     changeset =
       (existing || %TenantLlmSettings{tenant_id: tenant_id})
       |> TenantLlmSettings.models_changeset(attrs)
       |> TenantLlmSettings.put_api_key(api_key)
+      |> TenantLlmSettings.put_embedding_api_key(embedding_api_key)
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
 
     key_set? = not is_nil(api_key)
+    embedding_key_set? = not is_nil(embedding_api_key)
 
     Multi.new()
     |> Multi.insert_or_update(:settings, changeset)
     |> Multi.merge(fn %{settings: settings} ->
-      audit_multi(tenant_id, settings, changeset, key_set?)
+      audit_multi(tenant_id, settings, changeset, key_set?, embedding_key_set?)
     end)
     |> AdminRepo.transaction()
     |> case do
@@ -107,16 +128,28 @@ defmodule Loopctl.Llm do
   end
 
   @doc """
-  Resolves the tenant's API key + per-operation model for an LLM call.
+  Resolves the tenant's API key + per-operation model for a provider call.
 
-  Returns `{:ok, %{api_key: decrypted, model: model}}` or `{:error, :no_api_key}`
-  when the tenant has no key configured (mandatory BYO — no fallback). When the
-  tenant left the per-operation model nil, the server default for that operation
-  is used.
+  For the Anthropic operations (`:extraction`, `:classification`, `:merge`) this
+  resolves the `api_key`; for `:embedding` it resolves the SEPARATE
+  `embedding_api_key`. Returns `{:ok, %{api_key: decrypted, model: model}}` or
+  `{:error, :no_api_key}` when the tenant has no key configured for that path
+  (mandatory BYO — no fallback). When the tenant left the per-operation model nil,
+  the server default for that operation is used.
   """
   @spec resolve(Ecto.UUID.t(), operation()) :: {:ok, resolved()} | {:error, :no_api_key}
+  def resolve(tenant_id, :embedding) when is_binary(tenant_id) do
+    case get_settings(tenant_id) do
+      %TenantLlmSettings{embedding_api_key: key} = settings when is_binary(key) and key != "" ->
+        {:ok, %{api_key: key, model: model_for(settings, :embedding)}}
+
+      _ ->
+        {:error, :no_api_key}
+    end
+  end
+
   def resolve(tenant_id, operation)
-      when is_binary(tenant_id) and operation in [:extraction, :classification, :merge] do
+      when is_binary(tenant_id) and operation in @llm_operations do
     case get_settings(tenant_id) do
       %TenantLlmSettings{api_key: key} = settings when is_binary(key) and key != "" ->
         {:ok, %{api_key: key, model: model_for(settings, operation)}}
@@ -134,6 +167,16 @@ defmodule Loopctl.Llm do
   @spec has_api_key?(Ecto.UUID.t()) :: boolean()
   def has_api_key?(tenant_id) when is_binary(tenant_id) do
     match?({:ok, _}, resolve(tenant_id, :extraction))
+  end
+
+  @doc """
+  Whether the tenant has a usable embedding API key configured. Used by
+  `ArticleEmbeddingWorker` (discard) to enforce mandatory BYO for embeddings
+  WITHOUT holding the plaintext key.
+  """
+  @spec has_embedding_key?(Ecto.UUID.t()) :: boolean()
+  def has_embedding_key?(tenant_id) when is_binary(tenant_id) do
+    match?({:ok, _}, resolve(tenant_id, :embedding))
   end
 
   @doc """
@@ -174,7 +217,7 @@ defmodule Loopctl.Llm do
 
   @doc """
   A safe view of the tenant's settings for API responses: the model choices,
-  `has_api_key`, and a `api_key_hint` (last 4 chars) — NEVER the key itself.
+  `has_api_key` / `has_embedding_key`, and last-4 hints — NEVER a key itself.
   """
   @spec settings_view(TenantLlmSettings.t() | nil) :: map()
   def settings_view(nil) do
@@ -183,7 +226,10 @@ defmodule Loopctl.Llm do
       api_key_hint: nil,
       extraction_model: nil,
       classification_model: nil,
-      merge_model: nil
+      merge_model: nil,
+      has_embedding_key: false,
+      embedding_api_key_hint: nil,
+      embedding_model: nil
     }
   end
 
@@ -193,7 +239,10 @@ defmodule Loopctl.Llm do
       api_key_hint: api_key_hint(s.api_key),
       extraction_model: s.extraction_model,
       classification_model: s.classification_model,
-      merge_model: s.merge_model
+      merge_model: s.merge_model,
+      has_embedding_key: has_key?(s.embedding_api_key),
+      embedding_api_key_hint: api_key_hint(s.embedding_api_key),
+      embedding_model: s.embedding_model
     }
   end
 
@@ -349,6 +398,9 @@ defmodule Loopctl.Llm do
   defp model_for(%TenantLlmSettings{} = s, :merge),
     do: s.merge_model || default_model(:merge)
 
+  defp model_for(%TenantLlmSettings{} = s, :embedding),
+    do: s.embedding_model || default_model(:embedding)
+
   defp default_model(operation), do: Map.fetch!(@default_models, operation)
 
   defp has_key?(key), do: is_binary(key) and key != ""
@@ -361,9 +413,9 @@ defmodule Loopctl.Llm do
 
   # Accept both atom- and string-keyed attrs; whitelist to the known keys so an
   # attacker can't smuggle e.g. tenant_id in.
-  @known_attr_keys ~w(api_key extraction_model classification_model merge_model
-                      operation model input_tokens output_tokens source_type
-                      article_id occurred_at)a
+  @known_attr_keys ~w(api_key embedding_api_key extraction_model classification_model
+                      merge_model embedding_model operation model input_tokens
+                      output_tokens source_type article_id occurred_at)a
   defp normalize_keys(attrs) do
     Enum.reduce(@known_attr_keys, %{}, fn key, acc ->
       case fetch_attr(attrs, key) do
@@ -386,45 +438,62 @@ defmodule Loopctl.Llm do
   defp max_zero(n) when is_integer(n) and n > 0, do: n
   defp max_zero(_), do: 0
 
-  # Audit the config change WITHOUT the key value. Always record `llm_config.updated`
-  # with the changed model fields; additionally record `llm_config.key_set` when the
-  # api_key was set/rotated (value never included).
-  defp audit_multi(tenant_id, settings, changeset, key_set?) do
+  # Audit the config change WITHOUT any key value. Always record `llm_config.updated`
+  # with the changed model fields; additionally record `llm_config.key_set` /
+  # `llm_config.embedding_key_set` when the respective key was set/rotated (value
+  # never included — only its last-4 hint).
+  defp audit_multi(tenant_id, settings, changeset, key_set?, embedding_key_set?) do
     changed_models =
       changeset.changes
-      |> Map.take([:extraction_model, :classification_model, :merge_model])
+      |> Map.take([:extraction_model, :classification_model, :merge_model, :embedding_model])
       |> Map.new(fn {k, v} -> {Atom.to_string(k), v} end)
 
-    multi =
-      Audit.log_in_multi(Multi.new(), :audit_updated, fn _ ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "llm_config",
-          entity_id: settings.id,
-          action: "llm_config.updated",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "llm_config",
-          new_state: %{"changed_models" => changed_models, "api_key_set" => key_set?}
+    Multi.new()
+    |> Audit.log_in_multi(:audit_updated, fn _ ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "llm_config",
+        entity_id: settings.id,
+        action: "llm_config.updated",
+        actor_type: "system",
+        actor_id: nil,
+        actor_label: "llm_config",
+        new_state: %{
+          "changed_models" => changed_models,
+          "api_key_set" => key_set?,
+          "embedding_api_key_set" => embedding_key_set?
         }
-      end)
+      }
+    end)
+    |> maybe_audit_key_set(tenant_id, settings, key_set?, :api_key)
+    |> maybe_audit_key_set(tenant_id, settings, embedding_key_set?, :embedding_api_key)
+  end
 
-    if key_set? do
-      Audit.log_in_multi(multi, :audit_key_set, fn _ ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "llm_config",
-          entity_id: settings.id,
-          action: "llm_config.key_set",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "llm_config",
-          # NEVER the key value — only that a key was set + its last-4 hint.
-          new_state: %{"api_key_hint" => api_key_hint(settings.api_key)}
-        }
-      end)
-    else
-      multi
-    end
+  defp maybe_audit_key_set(multi, _tenant_id, _settings, false, _field), do: multi
+
+  defp maybe_audit_key_set(multi, tenant_id, settings, true, field) do
+    {step, action, hint_key, value} =
+      case field do
+        :api_key ->
+          {:audit_key_set, "llm_config.key_set", "api_key_hint", settings.api_key}
+
+        :embedding_api_key ->
+          {:audit_embedding_key_set, "llm_config.embedding_key_set", "embedding_api_key_hint",
+           settings.embedding_api_key}
+      end
+
+    Audit.log_in_multi(multi, step, fn _ ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "llm_config",
+        entity_id: settings.id,
+        action: action,
+        actor_type: "system",
+        actor_id: nil,
+        actor_label: "llm_config",
+        # NEVER the key value — only that a key was set + its last-4 hint.
+        new_state: %{hint_key => api_key_hint(value)}
+      }
+    end)
   end
 end

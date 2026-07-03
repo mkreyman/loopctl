@@ -594,7 +594,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   end
 
   defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
-    case Knowledge.generate_embedding(q) do
+    case Knowledge.generate_embedding(tenant_id, q) do
       {:ok, embedding} -> Knowledge.search_semantic(tenant_id, embedding, opts)
       {:error, _} -> {:error, :embedding_unavailable}
     end

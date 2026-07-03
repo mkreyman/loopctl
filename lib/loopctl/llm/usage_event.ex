@@ -3,16 +3,18 @@ defmodule Loopctl.Llm.UsageEvent do
   Schema for the `llm_usage_events` table — one immutable row per successful
   tenant LLM operation (Epic 28 residual, #179).
 
-  Records the operation, the model used, and the Anthropic-reported token counts.
-  This is a RECORD-ONLY ledger backing the per-tenant usage-summary API; there is
-  NO budget enforcement anywhere in the system.
+  Records the operation, the model used, and the provider-reported token counts
+  (Anthropic `input_tokens`/`output_tokens` for LLM ops; OpenAI
+  `prompt_tokens`/`total_tokens` as `input_tokens` with `output_tokens: 0` for
+  `:embedding`). This is a RECORD-ONLY ledger backing the per-tenant usage-summary
+  API; there is NO budget enforcement anywhere in the system.
   """
 
   use Loopctl.Schema
 
   @type t :: %__MODULE__{}
 
-  @operations [:extraction, :classification, :merge]
+  @operations [:extraction, :classification, :merge, :embedding]
 
   schema "llm_usage_events" do
     tenant_field()
@@ -26,7 +28,7 @@ defmodule Loopctl.Llm.UsageEvent do
     field :occurred_at, :utc_datetime_usec
   end
 
-  @doc "The valid operation atoms (extraction | classification | merge)."
+  @doc "The valid operation atoms (extraction | classification | merge | embedding)."
   @spec operations() :: [atom()]
   def operations, do: @operations
 

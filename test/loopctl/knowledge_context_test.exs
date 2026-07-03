@@ -290,7 +290,7 @@ defmodule Loopctl.KnowledgeContextTest do
         tags: ["embfallback"]
       })
 
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _text ->
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:error, :service_unavailable}
       end)
 

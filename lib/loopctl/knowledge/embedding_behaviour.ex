@@ -3,8 +3,10 @@ defmodule Loopctl.Knowledge.EmbeddingBehaviour do
   Behaviour for embedding generation clients.
 
   Implementations convert text into vector embeddings for semantic search.
-  The default implementation (`Loopctl.Knowledge.EmbeddingClient`) calls
-  the OpenAI embeddings API via Req.
+  The default implementation (`Loopctl.Knowledge.EmbeddingClient`) resolves the
+  TENANT's OWN OpenAI embedding key + model (mandatory BYO — no operator-funded
+  fallback) and calls the OpenAI-compatible embeddings API via Req, recording an
+  `:embedding` usage event on success.
 
   ## Config-based DI
 
@@ -21,5 +23,6 @@ defmodule Loopctl.Knowledge.EmbeddingBehaviour do
       config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
   """
 
-  @callback generate_embedding(text :: String.t()) :: {:ok, [float()]} | {:error, term()}
+  @callback generate_embedding(tenant_id :: Ecto.UUID.t(), text :: String.t()) ::
+              {:ok, [float()]} | {:error, :no_api_key} | {:error, term()}
 end
