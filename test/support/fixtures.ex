@@ -19,6 +19,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Llm.TenantLlmSettings
+  alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
@@ -278,6 +280,28 @@ defmodule Loopctl.Fixtures do
       },
       Enum.into(attrs, %{})
     )
+  end
+
+  # Per-tenant BYO LLM config + usage (Epic 28 residual, #179).
+  def build(:tenant_llm_settings, attrs) do
+    Enum.into(attrs, %{
+      api_key: "test-anthropic-test-#{System.unique_integer([:positive])}",
+      extraction_model: nil,
+      classification_model: nil,
+      merge_model: nil
+    })
+  end
+
+  def build(:llm_usage_event, attrs) do
+    Enum.into(attrs, %{
+      operation: :extraction,
+      model: "claude-haiku-4-5-20251001",
+      input_tokens: 100,
+      output_tokens: 50,
+      source_type: "newsletter",
+      article_id: nil,
+      occurred_at: DateTime.utc_now()
+    })
   end
 
   def build(:webhook_event, attrs) do
@@ -1046,6 +1070,56 @@ defmodule Loopctl.Fixtures do
       |> ReviewRecord.create_changeset(data)
 
     AdminRepo.insert!(changeset)
+  end
+
+  # --- Per-tenant BYO LLM config + usage (Epic 28 residual, #179) ---
+
+  # Inserts a tenant_llm_settings row (auto-creating a tenant if needed). The
+  # `api_key` defaults to a plausible test key so `Loopctl.Llm.has_api_key?/1`
+  # returns true and the mandatory-BYO gate passes.
+  def fixture(:tenant_llm_settings, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, attrs}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:tenant_llm_settings, Map.delete(attrs, :tenant_id))
+    api_key = Map.get(data, :api_key)
+
+    %TenantLlmSettings{tenant_id: tenant_id}
+    |> TenantLlmSettings.models_changeset(data)
+    |> TenantLlmSettings.put_api_key(api_key)
+    |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+    |> AdminRepo.insert!()
+  end
+
+  # Inserts an llm_usage_events row (auto-creating a tenant if needed).
+  def fixture(:llm_usage_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, attrs}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:llm_usage_event, Map.delete(attrs, :tenant_id))
+
+    %LlmUsageEvent{tenant_id: tenant_id}
+    |> LlmUsageEvent.create_changeset(data)
+    |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+    |> AdminRepo.insert!()
   end
 
   def fixture(:webhook, attrs) do

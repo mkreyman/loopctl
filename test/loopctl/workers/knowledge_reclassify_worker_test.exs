@@ -26,8 +26,16 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   defp reload(id), do: AdminRepo.get!(Article, id)
 
+  # Mandatory BYO (Epic 28, #179): the reclassify worker skips a tenant with no
+  # Anthropic key. Every reclassify test needs a keyed tenant.
+  defp tenant_with_key do
+    t = fixture(:tenant, %{})
+    fixture(:tenant_llm_settings, %{tenant_id: t.id})
+    t
+  end
+
   defp verdict(category, confidence) do
-    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _title, _body ->
+    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _title, _body, _opts ->
       {:ok, %{category: category, confidence: confidence}}
     end)
   end
@@ -48,7 +56,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "dry_run mode" do
     test "classifies but writes nothing; audit tallies what would change" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
       b = published(tenant.id, :pattern)
       verdict(:playbook, 0.9)
@@ -69,7 +77,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "commit mode write-on-confident-change" do
     test "rewrites category and records provenance when confident and different" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
       verdict(:playbook, 0.9)
 
@@ -82,7 +90,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
     end
 
     test "leaves the article alone when confidence is below threshold" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
       verdict(:playbook, 0.5)
 
@@ -95,7 +103,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
     end
 
     test "no-op when the proposed category equals the current one" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :pattern)
       verdict(:pattern, 0.99)
 
@@ -108,7 +116,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
     end
 
     test "always moves a retired convention row off convention when confident" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
       verdict(:insight, 0.8)
 
@@ -118,13 +126,13 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
     end
 
     test "a few errored classifications (below the snooze rate) leave those articles alone but proceed" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       # 3 articles: one errors (33% < 50% snooze rate), two classify fine.
       bad = published(tenant.id, :convention)
       good_a = published(tenant.id, :convention)
       good_b = published(tenant.id, :convention)
 
-      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn title, _body ->
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, title, _body, _opts ->
         if title == bad.title,
           do: {:error, :unparseable_classification},
           else: {:ok, %{category: :playbook, confidence: 0.9}}
@@ -143,11 +151,11 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "outage resilience" do
     test "snoozes and retries the same cursor when the whole batch fails (upstream down)" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
 
       # Every classify errors -> 100% error rate -> upstream is unreachable.
-      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _t, _b ->
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _t, _b, _opts ->
         {:error, :econnrefused}
       end)
 
@@ -162,7 +170,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "cost ceiling + batch chaining" do
     test "stops after max_per_run, leaving the remainder for the next kick" do
-      tenant = fixture(:tenant)
+      tenant = tenant_with_key()
       a = published(tenant.id, :convention)
       b = published(tenant.id, :convention)
       c = published(tenant.id, :convention)
@@ -184,8 +192,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "all_tenants fan-out" do
     test "reclassifies each active tenant, skipping suspended ones" do
-      active_a = fixture(:tenant)
-      active_b = fixture(:tenant)
+      active_a = tenant_with_key()
+      active_b = tenant_with_key()
       suspended = fixture(:tenant, %{status: :suspended})
 
       a = published(active_a.id, :convention)
@@ -206,8 +214,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
 
   describe "tenant isolation" do
     test "only the caller tenant's articles are touched" do
-      tenant_a = fixture(:tenant)
-      tenant_b = fixture(:tenant)
+      tenant_a = tenant_with_key()
+      tenant_b = tenant_with_key()
       a = published(tenant_a.id, :convention)
       b = published(tenant_b.id, :convention)
       verdict(:playbook, 0.9)
@@ -217,6 +225,42 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorkerTest do
       assert reload(a.id).category == :playbook
       assert reload(b.id).category == :convention
       assert [] == reclassify_audits(tenant_b.id)
+    end
+  end
+
+  describe "mandatory BYO (Epic 28, #179)" do
+    test "skips a tenant with no Anthropic key; the classifier is never called (review #8)" do
+      # A tenant WITHOUT an llm settings row (no key configured).
+      tenant = fixture(:tenant)
+      a = published(tenant.id, :convention)
+
+      expect(Loopctl.MockCategoryClassifier, :classify, 0, fn _t, _ti, _b, _o ->
+        flunk("classifier must not run without a tenant key")
+      end)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+      # Nothing changed, no audit (no work done).
+      assert reload(a.id).category == :convention
+      assert [] == reclassify_audits(tenant.id)
+    end
+
+    test "a batch of PERMANENT classify errors advances without snoozing forever (review #4)" do
+      tenant = tenant_with_key()
+      a = published(tenant.id, :convention)
+
+      # A 401 (bad key) is a PERMANENT error — a retry can't fix it, so the worker
+      # must NOT snooze (which would loop every 60s forever); it advances instead.
+      Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _t, _ti, _b, _o ->
+        {:error, {:api_error, 401, %{}}}
+      end)
+
+      assert :ok = run(tenant.id, %{"run_mode" => "commit"})
+
+      # Article left unchanged, but the batch is audited (advanced, not paused).
+      assert reload(a.id).category == :convention
+      assert [entry] = reclassify_audits(tenant.id)
+      assert entry.new_state["batch"]["permanent_errors"] == 1
+      assert entry.new_state["batch"]["transient_errors"] == 0
     end
   end
 end

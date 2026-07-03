@@ -2,10 +2,12 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   @moduledoc """
   Anthropic Claude-backed implementation of `Loopctl.Knowledge.ClassifierBehaviour`.
 
-  Reuses the shared `:anthropic_provider` config (same key as the extractors).
-  When no API key is configured it returns `{:error, :not_configured}` so the
-  reclassification backfill degrades gracefully (it never mutates data with a
-  placeholder verdict) in environments without Anthropic access.
+  Per-tenant BYO (Epic 28 residual, #179): the Anthropic key + classification
+  model are resolved via `Loopctl.Llm.resolve(tenant_id, :classification)`. When
+  the tenant has no key it returns `{:error, :no_api_key}` so the reclassification
+  backfill degrades gracefully (it never mutates data with a placeholder verdict).
+  Token usage is recorded after a successful call via the shared
+  `Loopctl.Llm.Anthropic` client.
 
   Only ACTIVE categories are ever returned — the model is never offered the
   retired `convention`, so a reclassification can only move an article ONTO the
@@ -17,6 +19,7 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   require Logger
 
   alias Loopctl.Knowledge.Categories
+  alias Loopctl.Llm.Anthropic
 
   @system_prompt """
   You classify one knowledge-base article into exactly one category. Allowed \
@@ -34,52 +37,33 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   @max_body_chars 16_000
 
   @impl true
-  def classify(title, body) do
-    config = Application.get_env(:loopctl, :anthropic_provider, %{})
-    api_key = config[:api_key] || ""
+  def classify(tenant_id, title, body, opts \\ []) do
+    user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
 
-    if api_key == "" do
-      {:error, :not_configured}
-    else
-      call_anthropic(title, body, config)
+    body_fun = fn _model ->
+      %{
+        max_tokens: 100,
+        system: @system_prompt,
+        messages: [%{role: "user", content: user_content}]
+      }
+    end
+
+    case classify_via(tenant_id, opts, body_fun) do
+      {:ok, text} -> parse_text(text)
+      {:error, :no_api_key} -> {:error, :no_api_key}
+      {:error, _} = err -> err
     end
   end
 
-  defp call_anthropic(title, body, config) do
-    base_url = config[:base_url] || "https://api.anthropic.com/v1"
+  # Use pre-resolved credentials when the caller supplied them (batched callers
+  # resolve once — review #19); otherwise resolve per call.
+  defp classify_via(tenant_id, opts, body_fun) do
+    case {opts[:api_key], opts[:model]} do
+      {api_key, model} when is_binary(api_key) and is_binary(model) ->
+        Anthropic.call(tenant_id, :classification, api_key, model, body_fun)
 
-    # Classification can use a STRONGER model than content extraction without
-    # changing extraction: :knowledge_classifier_model wins, else the shared
-    # provider model, else Haiku. Set ANTHROPIC_CLASSIFIER_MODEL in prod to
-    # override (e.g. a Sonnet id) for the one-time 77k reclassification.
-    model =
-      Application.get_env(:loopctl, :knowledge_classifier_model) ||
-        config[:model] || "claude-haiku-4-5-20251001"
-
-    user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
-
-    req_body = %{
-      model: model,
-      max_tokens: 100,
-      system: @system_prompt,
-      messages: [%{role: "user", content: user_content}]
-    }
-
-    case Req.post("#{base_url}/messages",
-           json: req_body,
-           headers: [
-             {"x-api-key", config[:api_key]},
-             {"anthropic-version", "2023-06-01"}
-           ]
-         ) do
-      {:ok, %{status: 200, body: resp}} ->
-        parse_text(get_in(resp, ["content", Access.at(0), "text"]))
-
-      {:ok, %{status: status}} ->
-        {:error, {:http_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      _ ->
+        Anthropic.message(tenant_id, :classification, body_fun)
     end
   end
 

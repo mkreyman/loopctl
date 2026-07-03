@@ -12,7 +12,8 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   1. Check for duplicate extraction (source_type + source_id)
   2. Load the review record by `review_record_id` + `tenant_id`
   3. Build context map from the review record
-  4. Call `@extractor.extract_articles/1` via compile-time DI
+  4. Call `@extractor.extract_articles/2` (tenant_id + context) via compile-time DI,
+     using the tenant's BYO Anthropic key (Epic 28, #179)
   5. Validate extractor output (max 5 articles, body max 100KB, etc.)
   6. Insert valid articles in one Ecto.Multi with source_type: "review_finding"
   7. Log audit event "knowledge.articles_extracted"
@@ -39,6 +40,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Llm
 
   @extractor Application.compile_env(
                :loopctl,
@@ -59,15 +61,25 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   def perform(%Oban.Job{
         args: %{"review_record_id" => review_record_id, "tenant_id" => tenant_id}
       }) do
-    if already_extracted?(tenant_id, review_record_id) do
-      Logger.info(
-        "ReviewKnowledgeWorker: skipping duplicate extraction " <>
-          "(review_record_id=#{review_record_id})"
-      )
+    cond do
+      already_extracted?(tenant_id, review_record_id) ->
+        Logger.info(
+          "ReviewKnowledgeWorker: skipping duplicate extraction " <>
+            "(review_record_id=#{review_record_id})"
+        )
 
-      :ok
-    else
-      extract_from_review(tenant_id, review_record_id)
+        :ok
+
+      # Mandatory BYO (Epic 28, #179): review-knowledge extraction runs on the
+      # tenant's OWN Anthropic key. Without one, {:discard} cleanly (no crash, no
+      # retry loop, no operator-billed spend) rather than falling back to a global
+      # key. Defense in depth — the extractor also returns {:error, :no_api_key}.
+      not Llm.has_api_key?(tenant_id) ->
+        Llm.record_blocked(tenant_id, :extraction)
+        {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
+
+      true ->
+        extract_from_review(tenant_id, review_record_id)
     end
   end
 
@@ -92,13 +104,65 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   end
 
   defp extract_from_review(tenant_id, review_record_id) do
-    with {:ok, review_record} <- load_review_record(tenant_id, review_record_id),
-         context <- build_context(review_record, tenant_id),
-         {:ok, raw_articles} <- @extractor.extract_articles(context) do
-      articles = validate_and_filter(raw_articles)
-      insert_articles(tenant_id, review_record_id, articles)
+    result =
+      with {:ok, review_record} <- load_review_record(tenant_id, review_record_id),
+           context <- build_context(review_record, tenant_id),
+           {:ok, raw_articles} <- extract(tenant_id, context) do
+        articles = validate_and_filter(raw_articles)
+        insert_articles(tenant_id, review_record_id, articles)
+      end
+
+    # PERMANENT failures (non-408/429 4xx from a bad extraction_model, a
+    # title-collision insert) must NOT retry 3x — each retry burns the TENANT's
+    # paid Anthropic call (review #3). Mirror ContentIngestionWorker.permanent_error?/1.
+    classify_result(result)
+  end
+
+  defp classify_result({:error, reason} = err) do
+    if permanent_error?(reason), do: {:discard, reason}, else: err
+  end
+
+  defp classify_result(other), do: other
+
+  # Backstop for a key removed between the perform/1 gate and here: map
+  # {:error, :no_api_key} to a clean {:discard} rather than an infinite retry.
+  defp extract(tenant_id, context) do
+    case @extractor.extract_articles(tenant_id, context) do
+      {:error, :no_api_key} ->
+        {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
+
+      other ->
+        other
     end
   end
+
+  # A permanent failure a retry can't fix (mirrors ContentIngestionWorker):
+  #   * a 4xx api_error other than 408 (timeout) / 429 (rate limited);
+  #   * an insert that failed on a changeset (e.g. the active-title unique index
+  #     `articles_tenant_title_active_idx` — review findings recur, so title
+  #     collisions with an existing article are plausible and deterministic); or
+  #   * an insert that raised a constraint Postgrex.Error.
+  # Everything else (5xx / request_failed / json_parse_error / serialization) is transient.
+  defp permanent_error?({:api_error, status, _body})
+       when is_integer(status) and status >= 400 and status < 500 and status != 408 and
+              status != 429,
+       do: true
+
+  defp permanent_error?({:insert_failed, _step, %Ecto.Changeset{}}), do: true
+
+  defp permanent_error?({:insert_failed, _step, %Postgrex.Error{} = error}),
+    do: constraint_violation?(error)
+
+  defp permanent_error?(_), do: false
+
+  @constraint_violation_codes ~w(
+    unique_violation check_violation not_null_violation
+    foreign_key_violation exclusion_violation
+  )a
+  defp constraint_violation?(%Postgrex.Error{postgres: %{code: code}}),
+    do: code in @constraint_violation_codes
+
+  defp constraint_violation?(_), do: false
 
   defp load_review_record(tenant_id, review_record_id) do
     case AdminRepo.get_by(ReviewRecord, id: review_record_id, tenant_id: tenant_id) do

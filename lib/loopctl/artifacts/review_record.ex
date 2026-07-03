@@ -92,6 +92,11 @@ defmodule Loopctl.Artifacts.ReviewRecord do
     ])
     |> validate_required([:review_type, :completed_at])
     |> validate_length(:review_type, min: 1)
+    # Bound the summary length (Epic 28, #179 review). The summary is fed verbatim
+    # into the BYO review-knowledge LLM extraction, so an unbounded summary is an
+    # unbounded per-call token (cost) surface. 16k chars is generous for a real
+    # review summary while capping the extraction input.
+    |> validate_length(:summary, max: 16_000)
     |> validate_number(:findings_count, greater_than_or_equal_to: 0)
     |> validate_number(:fixes_count, greater_than_or_equal_to: 0)
     |> validate_number(:disproved_count, greater_than_or_equal_to: 0)

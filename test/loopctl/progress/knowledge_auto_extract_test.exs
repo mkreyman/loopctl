@@ -7,6 +7,9 @@ defmodule Loopctl.Progress.KnowledgeAutoExtractTest do
 
   defp setup_story(tenant_attrs \\ %{}) do
     tenant = fixture(:tenant, tenant_attrs)
+    # Mandatory BYO (Epic 28, #179): the ReviewKnowledgeWorker gates on
+    # has_api_key? — configure a tenant key so the auto-extract worker proceeds.
+    fixture(:tenant_llm_settings, %{tenant_id: tenant.id})
     project = fixture(:project, %{tenant_id: tenant.id})
     epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
@@ -32,7 +35,7 @@ defmodule Loopctl.Progress.KnowledgeAutoExtractTest do
       # The mock extractor is stubbed by default to return {:ok, []}.
       # If the worker is enqueued (inline mode), it will call extract_articles.
       # We verify it's called (meaning the worker was enqueued).
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -55,7 +58,7 @@ defmodule Loopctl.Progress.KnowledgeAutoExtractTest do
       %{tenant: tenant, story: story, reviewer: reviewer} =
         setup_story(%{settings: %{"knowledge_auto_extract" => true}})
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -82,7 +85,7 @@ defmodule Loopctl.Progress.KnowledgeAutoExtractTest do
 
       # The extractor should NOT be called because auto_extract is disabled.
       # Using expect with count 0 will fail if the mock is called.
-      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 

@@ -23,14 +23,23 @@ defmodule Loopctl.Knowledge.ContentExtractorBehaviour do
 
   ## Parameters
 
+  - `tenant_id` -- the tenant whose BYO Anthropic key + extraction model to use.
+    The implementation resolves the tenant's key via `Loopctl.Llm.resolve/2` and
+    records token usage after a successful call.
   - `content` -- raw text content to extract knowledge from
   - `opts` -- keyword list of options (e.g., `source_type: "newsletter"`)
 
   ## Returns
 
   - `{:ok, articles}` -- list of article attribute maps
+  - `{:error, :no_api_key}` -- the tenant has no Anthropic key configured
+    (mandatory BYO); the caller must fail cleanly (422 / `{:discard}`)
   - `{:error, reason}` -- extraction failure (triggers Oban retry)
   """
-  @callback extract_from_content(content :: String.t(), opts :: keyword()) ::
-              {:ok, [article_attrs()]} | {:error, term()}
+  @callback extract_from_content(
+              tenant_id :: Ecto.UUID.t(),
+              content :: String.t(),
+              opts :: keyword()
+            ) ::
+              {:ok, [article_attrs()]} | {:error, :no_api_key} | {:error, term()}
 end

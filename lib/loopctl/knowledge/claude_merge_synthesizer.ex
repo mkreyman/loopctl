@@ -3,14 +3,19 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
   Anthropic Claude-backed `MergeSynthesizerBehaviour`. Combines two overlapping
   knowledge articles into one, preserving every distinct fact and reconciling wording.
 
-  Reuses the shared `:anthropic_provider` config (same key as the classifier/extractors).
-  With no API key it returns `{:error, :not_configured}`, so the merge executor degrades
-  gracefully (leaves the `:merge` resolution unexecuted) rather than drafting a placeholder.
+  Per-tenant BYO (Epic 28 residual, #179): the Anthropic key + merge model are
+  resolved via `Loopctl.Llm.resolve(tenant_id, :merge)`. With no key it returns
+  `{:error, :no_api_key}`, so the merge executor degrades gracefully (leaves the
+  `:merge` resolution unexecuted) rather than drafting a placeholder. Token usage
+  is recorded after a successful call via the shared `Loopctl.Llm.Anthropic`
+  client.
   """
 
   @behaviour Loopctl.Knowledge.MergeSynthesizerBehaviour
 
   require Logger
+
+  alias Loopctl.Llm.Anthropic
 
   @system_prompt """
   You merge TWO overlapping knowledge-base articles into ONE. Preserve every distinct \
@@ -24,50 +29,28 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
   @max_body_chars 12_000
 
   @impl true
-  def synthesize(a, b) do
-    config = Application.get_env(:loopctl, :anthropic_provider, %{})
-    api_key = config[:api_key] || ""
-
-    if api_key == "" do
-      {:error, :not_configured}
-    else
-      call_anthropic(a, b, config)
-    end
-  end
-
-  defp call_anthropic(a, b, config) do
-    base_url = config[:base_url] || "https://api.anthropic.com/v1"
-
-    model =
-      Application.get_env(:loopctl, :knowledge_merge_model) ||
-        config[:model] || "claude-haiku-4-5-20251001"
-
+  def synthesize(tenant_id, a, b) do
     user_content =
       "ARTICLE A\nTitle: #{a.title}\n\nBody:\n#{clip(a.body)}\n\n" <>
         "ARTICLE B\nTitle: #{b.title}\n\nBody:\n#{clip(b.body)}"
 
-    req_body = %{
-      model: model,
-      max_tokens: 2000,
-      system: @system_prompt,
-      messages: [%{role: "user", content: user_content}]
-    }
+    body_fun = fn _model ->
+      %{
+        max_tokens: 2000,
+        system: @system_prompt,
+        messages: [%{role: "user", content: user_content}]
+      }
+    end
 
-    case Req.post("#{base_url}/messages",
-           json: req_body,
-           headers: [
-             {"x-api-key", config[:api_key]},
-             {"anthropic-version", "2023-06-01"}
-           ]
+    # Merge is a larger synthesis with no tight outer timeout; give it a slightly
+    # longer bounded client budget (review #5).
+    case Anthropic.message(tenant_id, :merge, body_fun, %{},
+           receive_timeout: 55_000,
+           max_retries: 1
          ) do
-      {:ok, %{status: 200, body: resp}} ->
-        parse_text(get_in(resp, ["content", Access.at(0), "text"]))
-
-      {:ok, %{status: status}} ->
-        {:error, {:http_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, text} -> parse_text(text)
+      {:error, :no_api_key} -> {:error, :no_api_key}
+      {:error, _} = err -> err
     end
   end
 

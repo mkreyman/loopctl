@@ -2605,4 +2605,157 @@ defmodule Loopctl.ApiSpec.Schemas do
       }
     })
   end
+
+  # ---------- Per-tenant BYO LLM config + usage (Epic 28 residual, #179) ----------
+
+  defmodule LlmConfigUpdateRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "LlmConfigUpdateRequest",
+      description:
+        "Request body for `PATCH /api/v1/tenants/me/llm-config`. Sets the tenant's " <>
+          "OWN Anthropic API key (encrypted at rest, never returned) and the " <>
+          "granular per-operation model choices. Any subset of fields may be sent; " <>
+          "omitting `api_key` leaves the existing key untouched. Model ids are " <>
+          "free-form (any model the key permits) — not restricted to an allow-list.",
+      type: :object,
+      properties: %{
+        api_key: %Schema{
+          type: :string,
+          writeOnly: true,
+          description: "Anthropic API key (write-only; stored encrypted, never returned)"
+        },
+        extraction_model: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Model id for knowledge extraction (null → server default)"
+        },
+        classification_model: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Model id for category classification (null → server default)"
+        },
+        merge_model: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Model id for article merge synthesis (null → server default)"
+        }
+      },
+      example: %{
+        api_key: "sk-ant-...",
+        extraction_model: "claude-haiku-4-5-20251001",
+        classification_model: "claude-sonnet-4-5-20250929",
+        merge_model: "claude-haiku-4-5-20251001"
+      }
+    })
+  end
+
+  defmodule LlmConfigResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "LlmConfigResponse",
+      description:
+        "The tenant's LLM configuration. NEVER includes the API key itself — only " <>
+          "whether one is set (`has_api_key`) and a last-4 hint (`api_key_hint`).",
+      type: :object,
+      properties: %{
+        has_api_key: %Schema{
+          type: :boolean,
+          description: "Whether an Anthropic key is configured"
+        },
+        api_key_hint: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Masked last-4 hint (e.g. \"...aB3d\"); never the full key"
+        },
+        extraction_model: %Schema{type: :string, nullable: true},
+        classification_model: %Schema{type: :string, nullable: true},
+        merge_model: %Schema{type: :string, nullable: true}
+      },
+      example: %{
+        has_api_key: true,
+        api_key_hint: "...aB3d",
+        extraction_model: "claude-haiku-4-5-20251001",
+        classification_model: "claude-sonnet-4-5-20250929",
+        merge_model: nil
+      }
+    })
+  end
+
+  defmodule LlmUsageMeta do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "LlmUsageMeta",
+      description:
+        "Offset/limit pagination metadata for the LLM usage summary, plus the " <>
+          "EFFECTIVE date window actually applied. Advance `offset` by `limit` to " <>
+          "enumerate `total_count` grouped rows. When `from` is omitted it defaults " <>
+          "to a 90-day lookback (echoed here so callers can detect the truncation).",
+      type: :object,
+      properties: %{
+        limit: %Schema{type: :integer, description: "Effective page size (rows returned)"},
+        offset: %Schema{type: :integer, description: "Rows skipped"},
+        total_count: %Schema{type: :integer, description: "Total grouped rows across all pages"},
+        from: %Schema{
+          type: :string,
+          format: :"date-time",
+          description: "Effective lower bound applied (defaults to now − 90 days when omitted)"
+        },
+        to: %Schema{
+          type: :string,
+          format: :"date-time",
+          nullable: true,
+          description: "Effective upper bound applied (null = open-ended / now)"
+        }
+      },
+      example: %{
+        limit: 50,
+        offset: 0,
+        total_count: 3,
+        from: "2026-04-04T00:00:00Z",
+        to: nil
+      }
+    })
+  end
+
+  defmodule LlmUsageResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "LlmUsageResponse",
+      description:
+        "Per-tenant LLM token-usage summary, grouped by operation + model + " <>
+          "source_type + day over an optional date range. Record-only — there is " <>
+          "no budget enforcement.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :array,
+          items: %Schema{
+            type: :object,
+            properties: %{
+              day: %Schema{type: :string, format: :"date-time"},
+              operation: %Schema{
+                type: :string,
+                enum: ["extraction", "classification", "merge"]
+              },
+              model: %Schema{type: :string},
+              source_type: %Schema{type: :string, nullable: true},
+              input_tokens: %Schema{type: :integer},
+              output_tokens: %Schema{type: :integer},
+              event_count: %Schema{type: :integer}
+            }
+          }
+        },
+        meta: LlmUsageMeta
+      }
+    })
+  end
 end

@@ -314,6 +314,23 @@ defmodule LoopctlWeb.FallbackController do
     |> json(%{error: %{status: 422, message: message}})
   end
 
+  # Epic 28 (#179): mandatory BYO — a tenant knowledge-LLM operation was blocked
+  # because the tenant has no Anthropic key configured. Carries a machine-readable
+  # `code` so clients can distinguish this from other 422s and prompt the user to
+  # configure a key.
+  def call(conn, {:error, :no_api_key_configured, message}) when is_binary(message) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "no_api_key",
+        message: message,
+        remediation: %{configure: "PATCH /api/v1/tenants/me/llm-config"}
+      }
+    })
+  end
+
   # US-27.3: shared DB-error rendering for both Postgrex.Error and
   # DBConnection.ConnectionError. `DBError.map/1` returns the pinned status,
   # safe client message, and the real SQLSTATE for the log. A non-DB error

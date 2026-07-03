@@ -27,6 +27,7 @@ import {
   buildQuery,
   projectsPath,
   ingestionJobsPath,
+  llmUsagePath,
   parseJsonResponseBody,
 } from "../lib/http-helpers.js";
 
@@ -112,6 +113,79 @@ describe("#248 mcp-02: knowledge_ingestion_jobs pagination (real ingestionJobsPa
       INDEX_SRC,
       /case "knowledge_ingestion_jobs":\s*\n\s*return await knowledgeIngestionJobs\(args\);/,
       "the knowledge_ingestion_jobs dispatch case must call knowledgeIngestionJobs(args)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Epic 28 (#179): per-tenant BYO LLM config + usage tools
+// ---------------------------------------------------------------------------
+
+describe("#179 BYO LLM: knowledge_llm_usage pagination (real llmUsagePath)", () => {
+  test("forwards from, to, limit, and offset", () => {
+    const url = new URL(
+      `https://x${llmUsagePath({ from: "2026-01-01T00:00:00Z", to: "2026-02-01T00:00:00Z", limit: 10, offset: 20 })}`,
+    );
+    assert.equal(url.pathname, "/api/v1/knowledge/llm-usage");
+    assert.equal(url.searchParams.get("from"), "2026-01-01T00:00:00Z");
+    assert.equal(url.searchParams.get("to"), "2026-02-01T00:00:00Z");
+    assert.equal(url.searchParams.get("limit"), "10");
+    assert.equal(url.searchParams.get("offset"), "20");
+  });
+
+  test("omits params when none are supplied", () => {
+    assert.equal(llmUsagePath(), "/api/v1/knowledge/llm-usage");
+    assert.equal(llmUsagePath({}), "/api/v1/knowledge/llm-usage");
+  });
+
+  test("index.js knowledgeLlmUsage uses llmUsagePath(args) + orch key, dispatch passes args", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function knowledgeLlmUsage\(args = \{\}\) \{[\s\S]*?llmUsagePath\(args\)[\s\S]*?LOOPCTL_ORCH_KEY/,
+      "knowledgeLlmUsage must delegate to llmUsagePath(args) on the orch key",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "knowledge_llm_usage":\s*\n\s*return await knowledgeLlmUsage\(args\);/,
+      "the knowledge_llm_usage dispatch case must call knowledgeLlmUsage(args)",
+    );
+  });
+});
+
+describe("#179 BYO LLM: llm_config / set_llm_config use the USER key", () => {
+  test("llm_config GETs the config with the EXACT user key (review #12)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function llmConfig\(\) \{[\s\S]*?"\/api\/v1\/tenants\/me\/llm-config"[\s\S]*?LOOPCTL_USER_KEY[\s\S]*?exactKey: true/,
+      "llmConfig must GET /tenants/me/llm-config with the EXACT user key (exactKey:true)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "llm_config":\s*\n\s*return await llmConfig\(\);/,
+      "the llm_config dispatch case must call llmConfig()",
+    );
+  });
+
+  test("set_llm_config PATCHes with the EXACT user key (review #12, #13)", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function setLlmConfig\(\{[\s\S]*?"PATCH",\s*\n\s*"\/api\/v1\/tenants\/me\/llm-config",[\s\S]*?LOOPCTL_USER_KEY[\s\S]*?exactKey: true/,
+      "setLlmConfig must PATCH /tenants/me/llm-config with the EXACT user key (exactKey:true)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /case "set_llm_config":\s*\n\s*return await setLlmConfig\(args\);/,
+      "the set_llm_config dispatch case must call setLlmConfig(args)",
+    );
+  });
+
+  test("apiCall exactKey mode bypasses the global LOOPCTL_API_KEY override", () => {
+    // exactKey:true must use the passed key verbatim (not resolveKey), so a secret
+    // op never runs under a non-user global override (review #12).
+    assert.match(
+      INDEX_SRC,
+      /const key = exactKey \? keyOverride : resolveKey\(keyOverride\);/,
+      "apiCall must use the exact key (not resolveKey) when exactKey is true",
     );
   });
 });

@@ -1,7 +1,43 @@
 defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
-  use ExUnit.Case, async: true
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Knowledge.ClaudeMergeSynthesizer, as: Synth
+  alias Loopctl.Llm
+
+  describe "synthesize/3 end-to-end (Req.Test seam, review #11)" do
+    test "uses the tenant's key + merge model and records usage" do
+      tenant = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.upsert_settings(tenant.id, %{
+          "api_key" => "test-anthropic-merge-999",
+          "merge_model" => "claude-opus-4-1"
+        })
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(self(), {:req, conn.req_headers, JSON.decode!(body)})
+
+        Req.Test.json(conn, %{
+          "content" => [%{"type" => "text", "text" => ~s({"title":"Merged","body":"Both."})}],
+          "usage" => %{"input_tokens" => 30, "output_tokens" => 15}
+        })
+      end)
+
+      assert {:ok, %{title: "Merged", body: "Both."}} =
+               Synth.synthesize(tenant.id, %{title: "A", body: "a"}, %{title: "B", body: "b"})
+
+      assert_received {:req, headers, req_body}
+      assert {"x-api-key", "test-anthropic-merge-999"} in headers
+      assert req_body["model"] == "claude-opus-4-1"
+
+      %{data: [row]} = Llm.usage_summary(tenant.id, [])
+      assert row.operation == :merge
+      assert row.model == "claude-opus-4-1"
+      assert row.input_tokens == 30
+      assert row.output_tokens == 15
+    end
+  end
 
   describe "parse_text/1" do
     test "parses a clean JSON object" do
@@ -26,11 +62,13 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizerTest do
     end
   end
 
-  describe "synthesize/2 without a configured backend" do
-    test "returns :not_configured rather than a placeholder" do
-      # No :anthropic_provider api_key in :test → graceful degrade.
-      assert {:error, :not_configured} =
-               Synth.synthesize(%{title: "A", body: "a"}, %{title: "B", body: "b"})
+  describe "synthesize/3 without a configured backend" do
+    test "returns :no_api_key rather than a placeholder (mandatory BYO)" do
+      # The tenant has no configured key → graceful degrade, no live HTTP call.
+      tenant = fixture(:tenant)
+
+      assert {:error, :no_api_key} =
+               Synth.synthesize(tenant.id, %{title: "A", body: "a"}, %{title: "B", body: "b"})
     end
   end
 end

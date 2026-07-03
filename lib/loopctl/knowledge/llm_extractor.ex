@@ -7,18 +7,14 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   extracts reusable knowledge articles about patterns, conventions, or
   decisions that would help future code reviews.
 
-  ## Configuration
+  ## Per-tenant BYO (Epic 28, #179)
 
-  Uses the `:anthropic_provider` config key (shared with `ClaudeContentExtractor`):
-
-      config :loopctl, :anthropic_provider, %{
-        api_key: "sk-ant-...",
-        base_url: "https://api.anthropic.com/v1",
-        model: "claude-haiku-4-5-20251001"
-      }
-
-  When no API key is configured, falls back to returning an empty list
-  (graceful degradation for dev/test environments without Anthropic access).
+  The Anthropic key + extraction model are resolved PER TENANT via
+  `Loopctl.Llm.resolve(tenant_id, :extraction)` — each tenant supplies its own
+  key and pays Anthropic directly. A tenant with no key gets `{:error,
+  :no_api_key}` (mandatory BYO — no global-system-key fallback). Token usage is
+  recorded after a successful call. The shared `Loopctl.Llm.Anthropic` client
+  owns the resolve → POST → record_usage flow.
   """
 
   @behaviour Loopctl.Knowledge.ExtractorBehaviour
@@ -26,6 +22,12 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   require Logger
 
   alias Loopctl.Knowledge.Categories
+  alias Loopctl.Llm.Anthropic
+
+  # This review-extraction call has no tight outer Oban timeout, but keep the
+  # client budget bounded (review #5).
+  @receive_timeout 55_000
+  @max_retries 1
 
   @system_prompt """
   You are a code review knowledge extractor. Given a code review context \
@@ -40,52 +42,24 @@ defmodule Loopctl.Knowledge.LlmExtractor do
   """
 
   @impl true
-  def extract_articles(context) do
-    config = Application.get_env(:loopctl, :anthropic_provider, %{})
-    api_key = config[:api_key] || ""
-
-    if api_key == "" do
-      Logger.debug("LlmExtractor: no Anthropic API key configured, returning empty list")
-      {:ok, []}
-    else
-      call_anthropic(context, config)
-    end
-  end
-
-  defp call_anthropic(context, config) do
-    base_url = config[:base_url] || "https://api.anthropic.com/v1"
-    model = config[:model] || "claude-haiku-4-5-20251001"
-
+  def extract_articles(tenant_id, context) do
     user_message = build_user_message(context)
 
-    body = %{
-      model: model,
-      max_tokens: 16_384,
-      system: @system_prompt,
-      messages: [%{role: "user", content: user_message}]
-    }
+    body_fun = fn _model ->
+      %{
+        max_tokens: 16_384,
+        system: @system_prompt,
+        messages: [%{role: "user", content: user_message}]
+      }
+    end
 
-    case Req.post("#{base_url}/messages",
-           json: body,
-           headers: [
-             {"x-api-key", config[:api_key]},
-             {"anthropic-version", "2023-06-01"}
-           ],
-           retry: :transient,
-           max_retries: 2,
-           receive_timeout: 60_000
+    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: "review_finding"},
+           receive_timeout: @receive_timeout,
+           max_retries: @max_retries
          ) do
-      {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]}}} ->
-        parse_articles(text)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        Logger.warning("LlmExtractor: API error (status=#{status}, body=#{inspect(resp_body)})")
-
-        {:error, {:api_error, status, resp_body}}
-
-      {:error, reason} ->
-        Logger.warning("LlmExtractor: request failed (error=#{inspect(reason)})")
-        {:error, {:request_failed, reason}}
+      {:ok, text} -> parse_articles(text)
+      {:error, :no_api_key} -> {:error, :no_api_key}
+      {:error, _} = err -> err
     end
   end
 

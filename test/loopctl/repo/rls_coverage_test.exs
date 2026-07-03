@@ -48,6 +48,9 @@ defmodule Loopctl.Repo.RlsCoverageTest do
     table_names = Enum.map(rows, fn [name, _rls, _count] -> name end)
     assert "stories" in table_names
     assert "audit_pending_violations" in table_names
+    # Epic 28 (#179): both BYO-LLM tables carry tenant_id and must be RLS-enforced.
+    assert "tenant_llm_settings" in table_names
+    assert "llm_usage_events" in table_names
 
     offenders =
       for [name, rls, policy_count] <- rows,

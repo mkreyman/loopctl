@@ -5,15 +5,14 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   Calls the Anthropic Messages API to extract structured knowledge articles
   from raw content (web articles, newsletters, skill templates, etc.).
 
-  ## Configuration
+  ## Per-tenant BYO (Epic 28 residual, #179)
 
-  Set the following in runtime config (via `ANTHROPIC_API_KEY` env var):
-
-      config :loopctl, :anthropic_provider, %{
-        api_key: "sk-ant-...",
-        base_url: "https://api.anthropic.com/v1",
-        model: "claude-haiku-4-5-20251001"
-      }
+  The Anthropic key + extraction model are resolved PER TENANT via
+  `Loopctl.Llm.resolve(tenant_id, :extraction)` — each tenant supplies its own
+  key and pays Anthropic directly. A tenant with no key gets `{:error,
+  :no_api_key}` (mandatory BYO — no global fallback). Token usage is recorded
+  after a successful call. The shared `Loopctl.Llm.Anthropic` client owns the
+  resolve → POST → record_usage flow.
   """
 
   @behaviour Loopctl.Knowledge.ContentExtractorBehaviour
@@ -21,6 +20,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   require Logger
 
   alias Loopctl.Knowledge.Categories
+  alias Loopctl.Llm.Anthropic
 
   @system_prompt """
   You are a knowledge extraction assistant. Given raw content (web article, \
@@ -35,51 +35,33 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
   """
 
   @impl true
-  def extract_from_content(content, opts \\ []) do
-    config = Application.get_env(:loopctl, :anthropic_provider, %{})
-    api_key = config[:api_key] || ""
-    base_url = config[:base_url] || "https://api.anthropic.com/v1"
-    model = config[:model] || "claude-haiku-4-5-20251001"
-
+  def extract_from_content(tenant_id, content, opts \\ []) do
     source_type = Keyword.get(opts, :source_type, "unknown")
 
-    body = %{
-      model: model,
-      max_tokens: 64_000,
-      system: @system_prompt,
-      messages: [
-        %{
-          role: "user",
-          content: "Source type: #{source_type}\n\nContent:\n#{content}"
-        }
-      ]
-    }
+    body_fun = fn _model ->
+      %{
+        max_tokens: 64_000,
+        system: @system_prompt,
+        messages: [
+          %{
+            role: "user",
+            content: "Source type: #{source_type}\n\nContent:\n#{content}"
+          }
+        ]
+      }
+    end
 
-    case Req.post("#{base_url}/messages",
-           json: body,
-           headers: [
-             {"x-api-key", api_key},
-             {"anthropic-version", "2023-06-01"}
-           ],
-           retry: :transient,
-           max_retries: 2,
-           receive_timeout: 60_000
+    # Explicit client budget UNDER the worker's @per_chunk_timeout_ms (30s) Oban
+    # budget (review #9) — the highest-max_tokens (64k) site, so don't rely on the
+    # shared default. 25s + no internal retry keeps the whole request inside the
+    # per-chunk budget; the worker retries the whole (idempotent) job on transients.
+    case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: source_type},
+           receive_timeout: 25_000,
+           max_retries: 0
          ) do
-      {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]}}} ->
-        parse_articles(text)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        Logger.warning(
-          "ClaudeContentExtractor: API error " <>
-            "(status=#{status}, body=#{inspect(resp_body)})"
-        )
-
-        {:error, {:api_error, status, resp_body}}
-
-      {:error, reason} ->
-        Logger.warning("ClaudeContentExtractor: request failed (error=#{inspect(reason)})")
-
-        {:error, {:request_failed, reason}}
+      {:ok, text} -> parse_articles(text)
+      {:error, :no_api_key} -> {:error, :no_api_key}
+      {:error, _} = err -> err
     end
   end
 

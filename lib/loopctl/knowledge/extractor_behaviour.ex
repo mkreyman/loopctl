@@ -6,8 +6,9 @@ defmodule Loopctl.Knowledge.ExtractorBehaviour do
   (story, review type, findings, summary) and return a list of
   article attribute maps suitable for `Article.create_changeset/2`.
 
-  The default production implementation (`LlmExtractor`) is a stub
-  that returns an empty list until LLM integration is built.
+  The default production implementation (`LlmExtractor`) calls the Anthropic
+  Messages API using the TENANT's own BYO key (Epic 28, #179) and records token
+  usage — there is no global-system-key fallback.
   """
 
   @type context :: %{
@@ -30,10 +31,13 @@ defmodule Loopctl.Knowledge.ExtractorBehaviour do
         }
 
   @doc """
-  Extracts knowledge article attribute maps from review context.
+  Extracts knowledge article attribute maps from review context, using the
+  tenant's BYO Anthropic key + extraction model.
 
   Returns `{:ok, articles}` with a list of article attribute maps,
-  or `{:error, reason}` on failure (triggers Oban retry).
+  `{:error, :no_api_key}` when the tenant has no key configured (mandatory BYO),
+  or `{:error, reason}` on other failures (triggers Oban retry).
   """
-  @callback extract_articles(context()) :: {:ok, [article_attrs()]} | {:error, term()}
+  @callback extract_articles(tenant_id :: Ecto.UUID.t(), context()) ::
+              {:ok, [article_attrs()]} | {:error, :no_api_key} | {:error, term()}
 end

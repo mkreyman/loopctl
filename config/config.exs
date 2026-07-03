@@ -226,6 +226,21 @@ config :tailwind,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# Redact secrets from Phoenix's request-parameter debug log (Epic 28, #179 review):
+# PATCH /api/v1/tenants/me/llm-config carries a raw `api_key` in its body. This
+# applies in ALL envs so the plaintext key can never surface in the Phoenix
+# "Parameters:" log line even if debug logging is enabled.
+#
+# NOTE (scope): this closes the PHOENIX PARAM-LOG path. Ecto's own :debug SQL-query
+# log still prints the plaintext value of ANY Cloak `Loopctl.Vault.Binary` field
+# (the existing webhook signing secret leaks identically — a pre-existing,
+# codebase-wide Ecto+Cloak logging behaviour, NOT specific to this feature). Prod
+# runs at :info, so :debug SQL logs never emit there; redacting encrypted-field
+# params from Ecto's logger is a separate cross-cutting change.
+config :phoenix,
+       :filter_parameters,
+       {:discard, ["password", "api_key", "secret", "token", "authorization"]}
+
 # Override phoenix_ecto's Plug.Exception impls:
 # - CastError (default: 400 -> our: 404): an invalid UUID in a URL path means
 #   the resource cannot exist, hence 404 (see LoopctlWeb.Plugs.CastErrorHandler).
@@ -337,7 +352,8 @@ config :loopctl, :knowledge_proposal_overlap_threshold, 0.88
 config :loopctl, :knowledge_conflict_threshold, 0.93
 
 # Merge synthesizer (#4 step 2): the LLM that combines two articles a grounded agent
-# marked `:merge` into ONE draft. Reuses the shared :anthropic_provider key; drafts only.
+# marked `:merge` into ONE draft. Resolves the tenant's BYO Anthropic key per-tenant
+# via Loopctl.Llm.resolve/2 (Epic 28, #179); drafts only.
 config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
 # Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).

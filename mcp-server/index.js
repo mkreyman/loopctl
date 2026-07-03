@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import {
   projectsPath,
   ingestionJobsPath,
+  llmUsagePath,
   parseJsonResponseBody,
 } from "./lib/http-helpers.js";
 
@@ -57,12 +58,22 @@ function resolveKey(keyOverride) {
   );
 }
 
-async function apiCall(method, path, body, keyOverride) {
+async function apiCall(method, path, body, keyOverride, { exactKey = false } = {}) {
   const url = `${getBaseUrl()}${path}`;
-  const key = resolveKey(keyOverride);
+  // Secret-managing tools pass exactKey:true so the request uses the EXACT
+  // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
+  // LOOPCTL_API_KEY override — a secret op must never silently run under a
+  // non-user global key (review #12).
+  const key = exactKey ? keyOverride : resolveKey(keyOverride);
 
   if (!key) {
-    return { error: true, status: 0, body: "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY." };
+    return {
+      error: true,
+      status: 0,
+      body: exactKey
+        ? "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
+        : "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY.",
+    };
   }
 
   const headers = {
@@ -1150,6 +1161,50 @@ async function knowledgeIngestionJobs(args = {}) {
   const result = await apiCall(
     "GET",
     ingestionJobsPath(args),
+    null,
+    process.env.LOOPCTL_ORCH_KEY,
+  );
+  return toContent(result);
+}
+
+// --- Per-tenant BYO LLM config + usage (Epic 28 residual, #179) ---
+
+async function llmConfig() {
+  // Reading/writing the tenant LLM config touches a stored secret → EXACT user
+  // key only (bypass the global LOOPCTL_API_KEY override; fail fast if unset).
+  const result = await apiCall(
+    "GET",
+    "/api/v1/tenants/me/llm-config",
+    null,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function setLlmConfig({ api_key, extraction_model, classification_model, merge_model }) {
+  const body = {};
+  if (api_key != null) body.api_key = api_key;
+  if (extraction_model !== undefined) body.extraction_model = extraction_model;
+  if (classification_model !== undefined) body.classification_model = classification_model;
+  if (merge_model !== undefined) body.merge_model = merge_model;
+  // PATCH (partial-merge) + EXACT user key (review #12, #13).
+  const result = await apiCall(
+    "PATCH",
+    "/api/v1/tenants/me/llm-config",
+    body,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function knowledgeLlmUsage(args = {}) {
+  // Query-string building lives in lib/http-helpers.js so the test suite exercises
+  // the same from/to/limit/offset logic the server ships.
+  const result = await apiCall(
+    "GET",
+    llmUsagePath(args),
     null,
     process.env.LOOPCTL_ORCH_KEY,
   );
@@ -3305,6 +3360,76 @@ const TOOLS = [
     },
   },
 
+  // Per-tenant BYO LLM config + usage (Epic 28 residual, #179)
+  {
+    name: "llm_config",
+    description:
+      "Get the tenant's BYO Anthropic LLM configuration: the per-operation model " +
+      "choices, whether a key is configured (has_api_key), and a masked last-4 hint. " +
+      "NEVER returns the key itself. Requires user role (LOOPCTL_USER_KEY).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "set_llm_config",
+    description:
+      "Set/rotate the tenant's OWN Anthropic API key (stored encrypted, never returned) " +
+      "and the three per-operation models (extraction/classification/merge). loopctl " +
+      "fronts no LLM cost — the tenant's key bills the tenant. Any subset of fields may " +
+      "be sent; omitting api_key leaves the existing key untouched. Model ids are " +
+      "free-form (any model the key permits). Requires user role (LOOPCTL_USER_KEY).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        api_key: {
+          type: "string",
+          description: "Anthropic API key (write-only; stored encrypted, never returned).",
+        },
+        extraction_model: {
+          type: "string",
+          description: "Model id for knowledge extraction (null → server default).",
+        },
+        classification_model: {
+          type: "string",
+          description: "Model id for category classification (null → server default).",
+        },
+        merge_model: {
+          type: "string",
+          description: "Model id for article merge synthesis (null → server default).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_llm_usage",
+    description:
+      "Per-tenant LLM token-usage summary, grouped by operation + model + source_type + " +
+      "day over an optional date range, newest day first, with offset/limit pagination " +
+      "over meta.total_count. When `from` is omitted it defaults to a 90-day lookback; the " +
+      "EFFECTIVE window is echoed in meta.from/meta.to so you can detect that older usage " +
+      "was excluded (pass an explicit `from` to widen it). Record-only — there is no budget " +
+      "enforcement. Requires orchestrator role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: {
+          type: "string",
+          description: "Optional ISO 8601 lower bound (inclusive) on occurred_at.",
+        },
+        to: {
+          type: "string",
+          description: "Optional ISO 8601 upper bound (inclusive) on occurred_at.",
+        },
+        limit: {
+          type: "integer",
+          description: "Rows per page (default 50, clamped to 200).",
+        },
+        offset: { type: "integer", description: "Rows to skip (default 0)." },
+      },
+      required: [],
+    },
+  },
+
   // Knowledge Analytics Tools (orchestrator key)
   {
     name: "knowledge_curation_log",
@@ -3779,6 +3904,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_ingestion_jobs":
       return await knowledgeIngestionJobs(args);
+
+    // Per-tenant BYO LLM config + usage (Epic 28, #179)
+    case "llm_config":
+      return await llmConfig();
+
+    case "set_llm_config":
+      return await setLlmConfig(args);
+
+    case "knowledge_llm_usage":
+      return await knowledgeLlmUsage(args);
 
     // Knowledge Analytics Tools
     case "knowledge_curation_log":

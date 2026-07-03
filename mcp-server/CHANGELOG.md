@@ -5,10 +5,13 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## Unreleased
+## 2.31.1 — 2026-07-03 (usage-window doc clarity + distant_pairs latency — Epic 28 #179 review, loopctl #202/#203)
 
 ### Changed
 
+- **`knowledge_llm_usage`** docs now state the 90-day default lookback when `from` is
+  omitted and that the EFFECTIVE window is echoed in `meta.from`/`meta.to`, so callers
+  can detect that older usage was excluded and widen the window explicitly.
 - **`knowledge_distant_pairs`** (`GET /api/v1/knowledge/pairs`) latency fix
   (loopctl #202/#203): the endpoint no longer runs an exact-`total_count`
   `count(*)` query — a full O(candidates²) pass over the sampled self-join that
@@ -32,6 +35,24 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   — so a `bridge_path=true` request may surface **fewer pairs** than before for the
   same band. Operator-tunable via `max_bridge_pair_candidates`. `:offset` is also
   now clamped to an operator-tunable ceiling (default 10_000) to bound deep-page cost.
+
+## 2.31.0 — 2026-07-03 (per-tenant BYO Anthropic LLM config + usage — Epic 28, #179)
+
+### Added
+
+- **`llm_config`** / **`set_llm_config`** — get / set-rotate the tenant's OWN Anthropic
+  API key (stored encrypted, never returned — only `has_api_key` + a last-4 hint) and the
+  three per-operation models. Both require a **user-role** key: they use `LOOPCTL_USER_KEY`
+  EXACTLY, bypassing the global `LOOPCTL_API_KEY` override and failing fast if it's unset,
+  so a secret-management call never runs under a non-user global key.
+- **`knowledge_llm_usage`** — per-tenant LLM token-usage summary (grouped by operation +
+  model + source_type + day, optional `from`/`to`, offset/limit pagination). Orchestrator key.
+
+### Note
+
+- Ingesting content now requires the tenant to have configured an Anthropic key
+  (`set_llm_config`); `knowledge_ingest`/`knowledge_ingest_batch` return a `422` with
+  `code: "no_api_key"` otherwise (mandatory BYO, server #179).
 
 ## 2.30.1 — 2026-07-02 (arg-forwarding + apiCall robustness fixes)
 

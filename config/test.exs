@@ -98,6 +98,12 @@ config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 config :loopctl, :heavy_read_statement_timeout_overrides, %{
   suggested_links: 5_000,
   change_feed: 5_000,
+  # Epic 28 (#179): the per-tenant LLM usage summary (GET /knowledge/llm-usage)
+  # routes through HeavyRead. On the small sandbox dataset it's sub-ms, but a
+  # generous 5s override keeps it from tripping the aggressive 250ms pool default
+  # under parallel contention (same rationale as :change_feed). No test asserts an
+  # :llm_usage timeout, so this cannot mask a real one.
+  llm_usage: 5_000,
   # distant_pairs (esp. the bridge branch) can legitimately run ~1s at the :scale_nightly
   # 80k corpus — well above the 250ms pool default — so give it generous headroom here or the
   # server-side timeout would cancel the scale bridge case before it completes. The <2s
@@ -336,6 +342,13 @@ config :loopctl, :enforce_witness_header, false
 
 # DI: Use Req.Test plug for content ingestion URL fetching in tests
 config :loopctl, :ingestion_req_plug, {Req.Test, Loopctl.Workers.ContentIngestionWorker}
+
+# Epic 28 (#179): route the tenant-scoped Anthropic client (Loopctl.Llm.Anthropic)
+# through a Req.Test plug so the real Claude extractor/classifier/merge modules —
+# including per-tenant key resolution and usage recording — are exercised without
+# real API calls. DataCase default-stubs it to an empty-articles response; the
+# dedicated LLM tests override with crafted content + usage blocks.
+config :loopctl, :anthropic_req_plug, {Req.Test, Loopctl.Llm.Anthropic}
 
 # DI: Use Req.Test plug for webhook delivery in tests
 config :loopctl, :webhook_req_plug, {Req.Test, Loopctl.Webhooks.ReqDelivery}

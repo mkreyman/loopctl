@@ -43,11 +43,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   require Logger
 
+  import Ecto.Query, only: [from: 2]
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
+  alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -134,7 +137,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # malformed / non-string project_id would raise Ecto.ChangeError on insert and,
     # because the uniqueness key excludes project_id, crash-loop as a poison pill.
     # DISCARD such a job (no retry) BEFORE any fetch/LLM work rather than raising.
+    # Mandatory BYO (Epic 28, #179): the tenant must have its own Anthropic key.
+    # {:discard} up front (no fetch, no LLM work, no retry-loop) when it doesn't —
+    # the controller boundary 422s before enqueue, this is defense in depth.
     with :ok <- validate_project_id(project_id),
+         :ok <- require_tenant_llm_key(tenant_id),
          {:ok, content} <- resolve_content(url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
@@ -150,6 +157,18 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       }
 
       ingest_chunks(ctx, content)
+    end
+  end
+
+  # Mandatory BYO: without a tenant Anthropic key, extraction can never succeed —
+  # {:discard} cleanly (no infinite retry) rather than burning 3 attempts on a
+  # deterministic no-key failure.
+  defp require_tenant_llm_key(tenant_id) do
+    if Llm.has_api_key?(tenant_id) do
+      :ok
+    else
+      Llm.record_blocked(tenant_id, :extraction)
+      {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
     end
   end
 
@@ -209,6 +228,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # beyond @max_chunks are ingested up to that bound and the remainder is
   # {:discard}ed cleanly (with a count) rather than silently lost.
   defp ingest_chunks(ctx, content) do
+    # Key the per-chunk idempotency/skip on a hash of the ACTUALLY-RESOLVED bytes
+    # for THIS attempt — NOT the enqueue-time `content_hash` (#179 review round 4).
+    # For a URL job `content_hash` is sha256(url), but the bytes are re-fetched fresh
+    # on every Oban attempt; if the URL's content changed between attempts, keying the
+    # skip on the URL would false-SKIP the new bytes' chunks and silently keep stale
+    # content. Keying on sha256(fetched bytes) SKIPS correctly only when the content
+    # is byte-identical across attempts and RE-EXTRACTS when it genuinely changed.
+    # (For content-only jobs this equals `content_hash`, so their behavior is unchanged.)
+    fetched_hash = :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower)
+    ctx = Map.put(ctx, :fetched_hash, fetched_hash)
+
     chunks = ContentChunker.chunk(content)
     chunk_count = length(chunks)
     {processable, dropped} = Enum.split(chunks, @max_chunks)
@@ -238,6 +268,37 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
+    case persisted_chunk_titles(ctx, chunk_index) do
+      [] ->
+        extract_reduce_chunk(ctx, chunk, chunk_index, remaining, acc)
+
+      titles ->
+        # This chunk's articles were durably committed by a PRIOR attempt (#179
+        # review #1). SKIP re-extraction entirely — a whole-job Oban retry must
+        # NEVER re-call (and re-BILL) the tenant's Anthropic key for a chunk that
+        # already succeeded. Seed cross-chunk dedup with the persisted titles and
+        # count them toward the article budget so the run stays consistent.
+        seen =
+          Enum.reduce(titles, acc.seen_titles, fn t, s ->
+            MapSet.put(s, normalize_persisted_title(t))
+          end)
+
+        Logger.info(
+          "ContentIngestionWorker: chunk #{chunk_index} already persisted " <>
+            "(#{length(titles)} article(s)); skipping re-extraction (no re-bill)"
+        )
+
+        {:cont,
+         %{
+           acc
+           | inserted: acc.inserted + length(titles),
+             persisted: acc.persisted + 1,
+             seen_titles: seen
+         }}
+    end
+  end
+
+  defp extract_reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
     acc = %{acc | attempted: acc.attempted + 1}
 
     case extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, acc.seen_titles) do
@@ -266,7 +327,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # persistence reintroduces that need — a cross-chunk title collision would
   # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
   defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
-    case @content_extractor.extract_from_content(chunk, source_type: ctx.source_type) do
+    case @content_extractor.extract_from_content(ctx.tenant_id, chunk,
+           source_type: ctx.source_type
+         ) do
       {:ok, extracted} ->
         {articles, seen_titles} =
           extracted
@@ -378,6 +441,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     do: constraint_violation?(error)
 
   defp permanent_error?({:insert_failed, _step, %Ecto.Changeset{}}), do: true
+
+  # Mandatory BYO: a missing tenant key is deterministic (a retry can't fix it).
+  # The top-level gate normally discards before any chunk runs; this backstops the
+  # case where the key is removed mid-job between chunks.
+  defp permanent_error?(:no_api_key), do: true
 
   defp permanent_error?(_), do: false
 
@@ -670,7 +738,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         attrs
         |> normalize_attrs()
         |> Map.delete(:status)
-        |> Map.put(:idempotency_key, ingest_idempotency_key(ctx.content_hash, chunk_index, index))
+        |> Map.put(:idempotency_key, ingest_idempotency_key(ctx.fetched_hash, chunk_index, index))
 
       base = %Article{
         tenant_id: ctx.tenant_id,
@@ -822,18 +890,47 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     |> Map.new()
   end
 
-  # DETERMINISTIC per-article idempotency key from (content_hash, chunk_index,
-  # article_index_within_chunk) — NEVER from the LLM output, which varies across
-  # calls (#264, Finding 1). Identical across Oban retries (all three inputs are
-  # deterministic), so a retry re-reaching the same (chunk, article) slot conflicts
-  # on `articles_tenant_idempotency_key_idx` and no-ops instead of duplicating.
-  # SHA-256 hex keeps the key bounded (67 chars) regardless of content_hash length.
-  defp ingest_idempotency_key(content_hash, chunk_index, article_index) do
+  # DETERMINISTIC per-CHUNK idempotency prefix from (fetched_hash, chunk_index),
+  # where `fetched_hash = sha256(actually-resolved bytes for this attempt)` — NOT the
+  # enqueue-time content_hash (#179 review round 4). The per-article key appends
+  # ":<article_index>" (below), so ALL of a chunk's articles share this prefix — which
+  # lets `persisted_chunk_titles/2` detect a committed chunk via a `LIKE prefix || ':%'`
+  # query and SKIP re-extraction on a retry (round-3 #1: re-extracting an
+  # already-persisted chunk re-BILLS the tenant's Anthropic key) ONLY when the resolved
+  # bytes are byte-identical across attempts. SHA-256 hex keeps it bounded.
+  defp ingest_chunk_prefix(fetched_hash, chunk_index) do
     digest =
       :sha256
-      |> :crypto.hash("#{content_hash}:#{chunk_index}:#{article_index}")
+      |> :crypto.hash("#{fetched_hash}:#{chunk_index}")
       |> Base.encode16(case: :lower)
 
     "ingest:" <> digest
+  end
+
+  # DETERMINISTIC per-article idempotency key = chunk prefix + ":" + article index.
+  # NEVER from the LLM output (which varies across calls, #264 Finding 1). Identical
+  # across Oban retries FOR IDENTICAL fetched bytes, so a retry re-reaching the same
+  # (chunk, article) slot conflicts on `articles_tenant_idempotency_key_idx` and no-ops
+  # (backstop to the chunk-skip above).
+  defp ingest_idempotency_key(fetched_hash, chunk_index, article_index) do
+    ingest_chunk_prefix(fetched_hash, chunk_index) <> ":" <> Integer.to_string(article_index)
+  end
+
+  # Titles of the articles a PRIOR attempt already persisted for this chunk (empty
+  # list = not yet persisted). Keyed on the deterministic per-chunk idempotency
+  # prefix; the digest + integer index contain no LIKE wildcards, so the pattern is
+  # injection-safe. Used both to SKIP re-extraction and to seed cross-chunk dedup.
+  defp persisted_chunk_titles(ctx, chunk_index) do
+    pattern = ingest_chunk_prefix(ctx.fetched_hash, chunk_index) <> ":%"
+
+    from(a in Article,
+      where: a.tenant_id == ^ctx.tenant_id and like(a.idempotency_key, ^pattern),
+      select: a.title
+    )
+    |> AdminRepo.all()
+  end
+
+  defp normalize_persisted_title(title) do
+    (title || "") |> String.trim() |> String.downcase()
   end
 end

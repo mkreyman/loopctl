@@ -9,20 +9,86 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
+  # Mandatory BYO (Epic 28, #179): ingest requires the tenant to have configured an
+  # Anthropic key. Every existing ingest test needs a keyed tenant; the dedicated
+  # "no key -> 422" test creates a keyless tenant directly.
+  defp keyed_tenant do
+    t = fixture(:tenant, %{})
+    fixture(:tenant_llm_settings, %{tenant_id: t.id})
+    t
+  end
+
+  # A verb+path pair (as printed in a remediation string) is a real router route.
+  defp route_registered?(verb, path) do
+    wanted = verb |> String.downcase() |> String.to_existing_atom()
+
+    Enum.any?(LoopctlWeb.Router.__routes__(), fn route ->
+      route.verb == wanted and route.path == path
+    end)
+  end
+
   # Oban runs :inline in tests, so the ingestion worker executes within the
   # request; stub the extractor to yield exactly one article so we can assert the
   # resulting article's status (draft by default, published with publish: true).
   defp expect_one_extracted_article(title) do
-    expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+    expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id, _content, _opts ->
       {:ok, [%{title: title, body: "Body for #{title}.", category: :pattern, tags: ["t"]}]}
     end)
+  end
+
+  # --- Mandatory BYO gate at the HTTP boundary (Epic 28, #179 — review #7) ---
+
+  describe "mandatory BYO 422 gate" do
+    test "POST /knowledge/ingest with a keyless tenant -> 422 code no_api_key", %{conn: conn} do
+      # A tenant WITHOUT an llm settings row (no key configured).
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # The extractor must never run — we reject before enqueuing.
+      expect(Loopctl.MockContentExtractor, :extract_from_content, 0, fn _t, _c, _o ->
+        flunk("extractor must not run without a tenant key")
+      end)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{content: "x", source_type: "newsletter"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "no_api_key"
+      assert body["error"]["message"] =~ "Anthropic API key"
+
+      # The remediation string must name a verb+path ACTUALLY registered in the
+      # router (review #7 — catches PUT/PATCH drift between the copy and the route).
+      [verb, path] = String.split(body["error"]["remediation"]["configure"], " ", parts: 2)
+
+      assert route_registered?(verb, path),
+             "422 remediation names #{verb} #{path}, which is not a registered route"
+    end
+
+    test "POST /knowledge/ingest/batch with a keyless tenant -> 422 code no_api_key", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "x", source_type: "newsletter"}]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "no_api_key"
+    end
   end
 
   # --- POST /api/v1/knowledge/ingest ---
 
   describe "POST /api/v1/knowledge/ingest" do
     test "queues ingestion job with URL", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -41,7 +107,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "queues ingestion job with inline content", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -58,7 +124,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "extracted articles default to draft", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       expect_one_extracted_article("Drafted by ingest")
 
@@ -72,7 +138,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "publish: true publishes the extracted articles", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       expect_one_extracted_article("Published by ingest")
 
@@ -90,7 +156,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 when both url and content provided", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -107,7 +173,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 when neither url nor content provided", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -122,7 +188,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 when source_type missing", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -140,7 +206,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     # private / loopback / cloud-metadata address is rejected 4xx up front, before
     # any job is enqueued or fetched.
     test "returns 422 for a URL targeting the cloud metadata endpoint", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -156,7 +222,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 for a decimal-encoded loopback URL", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -171,7 +237,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 for a v4-in-v6 NAT64-embedded metadata URL", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -186,7 +252,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 with a distinct message when the host cannot be resolved", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       expect(Loopctl.MockDnsResolver, :resolve, fn _host -> {:error, :nxdomain} end)
@@ -205,7 +271,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "agent role is rejected (requires orchestrator)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
       conn =
@@ -220,7 +286,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "user role is allowed (higher than orchestrator)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
       conn =
@@ -246,7 +312,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "includes project_id in job args when provided", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       project = fixture(:project, %{tenant_id: tenant.id})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -263,7 +329,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 for a malformed project_id (not enqueued, kbweb-01)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -280,7 +346,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 for a non-string (array) project_id (not enqueued)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -297,7 +363,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "an empty-string project_id is accepted as tenant-wide (202)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       expect_one_extracted_article("Blank pid ingest")
 
@@ -318,7 +384,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
   describe "POST /api/v1/knowledge/ingest/batch" do
     test "queues all three items successfully", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       items = [
@@ -340,7 +406,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns per-item results for duplicate items within the same batch", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       items = [
@@ -375,7 +441,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 when batch exceeds 50 items", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       items =
@@ -393,7 +459,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "returns 422 when items is empty", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -405,7 +471,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "mixed valid and invalid items produce per-item results", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       items = [
@@ -430,7 +496,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "agent role is rejected (requires orchestrator)", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
       conn =
@@ -449,7 +515,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     # item to a validation_timeout error instead of hanging the whole batch.
     test "bounds the batch when the resolver hangs (validation_timeout, no hang)",
          %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       # Resolver never returns → each item's pin exceeds the per-item deadline and
@@ -480,7 +546,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     @tag :capture_log
     test "a raising item yields validation_failed; other items still return 200",
          %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       # One host makes the resolver raise; everything else resolves public.
@@ -510,8 +576,8 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "tenant isolation: tenant A cannot see tenant B's batch jobs", %{conn: conn} do
-      tenant_a = fixture(:tenant)
-      tenant_b = fixture(:tenant)
+      tenant_a = keyed_tenant()
+      tenant_b = keyed_tenant()
       {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
       {raw_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})
 
@@ -543,7 +609,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
     test "a malformed project_id yields a per-item error while valid items still queue (kbweb-01)",
          %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       project = fixture(:project, %{tenant_id: tenant.id})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -569,7 +635,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
   describe "GET /api/v1/knowledge/ingestion-jobs" do
     test "returns empty list for new tenant", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       conn =
@@ -582,7 +648,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "lists recent ingestion jobs", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       # Create an ingestion job (inline mode will execute immediately)
@@ -605,7 +671,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
     test "paginates with limit/offset + meta, and never caps or rejects (no hard 50)",
          %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       # Insert ingestion-job rows directly (deterministic — no inline-cascade or
@@ -655,7 +721,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "agent role is rejected", %{conn: conn} do
-      tenant = fixture(:tenant)
+      tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
       conn =
@@ -676,8 +742,8 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
   describe "tenant isolation" do
     test "tenant A cannot see tenant B's ingestion jobs", %{conn: conn} do
-      tenant_a = fixture(:tenant)
-      tenant_b = fixture(:tenant)
+      tenant_a = keyed_tenant()
+      tenant_b = keyed_tenant()
       {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
       {raw_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})
 
