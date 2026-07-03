@@ -75,8 +75,10 @@ defmodule Loopctl.HeavyRead do
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
   `[timeout, telemetry_options, statement_timeout]` shape can't drift between callers.
-  Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`, `:novelty`,
-  `:enumeration`, `:change_feed`, `:vector_search` (the shared kNN helper path).
+  Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`,
+  `:distant_pairs_bridge` (the slower `bridge_path=true` branch — its own key so its
+  statement_timeout/slow-query telemetry are distinct), `:novelty`, `:enumeration`,
+  `:change_feed`, `:vector_search` (the shared kNN helper path).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do

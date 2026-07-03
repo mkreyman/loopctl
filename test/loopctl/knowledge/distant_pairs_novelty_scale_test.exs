@@ -21,9 +21,10 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   The bounds are checked under the planner's NATURAL choice (no enable_seqscan=off) against
   the committed, ANALYZEd ~80k corpus from `Loopctl.Knowledge.ScaleSeed`:
 
-    * distant_pairs: EXPLAIN on the ACTUAL count + pairs SQL the request path emits (captured
-      via `PlanAssertions.capture_repo_queries/1`), asserting the `Limit ≤ max_pair_candidates`
-      sample cap dominates every `articles` scan.
+    * distant_pairs: EXPLAIN on the ACTUAL pairs SQL the request path emits (captured via
+      `PlanAssertions.capture_repo_queries/1` — a SINGLE `LIMIT limit+1` page query post
+      #202/#203; the old companion `count(*)` full-pass is gone), asserting the
+      `Limit ≤ max_pair_candidates` sample cap dominates every `articles` scan.
     * novelty: EXPLAIN ANALYZE on `novelty_distance_query/4` (the MIN runs inside a
       `Task.async_stream`, off the test process, so capture can't see it — the builder emits
       the identical SQL+params), asserting ACTUAL `articles` rows stay bounded.
@@ -37,6 +38,7 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.PlanAssertions
   alias Loopctl.Tenants.Tenant
@@ -46,10 +48,16 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   @moduletag :scale_nightly
   @moduletag timeout: :timer.minutes(30)
 
-  # The operator-tunable candidate cap (config/test.exs sets it to 25). The sampled
-  # candidate subquery — and therefore every `articles` base-table scan in distant_pairs —
-  # must read no more than this (with generous headroom for the planner's row estimate).
-  @max_pair_candidates Application.compile_env(:loopctl, :max_pair_candidates, 1_000)
+  # The operator-tunable candidate caps, read at RUNTIME (not `compile_env`): config/test.exs
+  # sets them CONDITIONALLY (small in the async suite, PROD defaults under the SCALE gate), so a
+  # `compile_env` module attribute would raise the compile-vs-runtime mismatch guard when the
+  # suite is compiled in one mode and run in the other. Under the SCALE gate these resolve to the
+  # PROD defaults (general 1000, bridge 500) so the cases are prod-shaped; every `articles`
+  # base-table scan in distant_pairs must read no more than the applicable cap.
+  defp max_pair_candidates, do: Application.get_env(:loopctl, :max_pair_candidates, 1_000)
+
+  defp max_bridge_pair_candidates,
+    do: Application.get_env(:loopctl, :max_bridge_pair_candidates, 500)
 
   # The tag ScaleSeed stamps on ~2% of rows (one of 50). Used as the novelty prior_tag so
   # the `tags &&` residual is genuinely selective at 80k.
@@ -99,6 +107,11 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
     on_exit(fn ->
       try do
         unboxed(fn ->
+          # Delete links BEFORE articles: article_links has `on_delete: :restrict`, so
+          # deleting the seeded (linked) articles first raises an FK violation, which the
+          # rescue would swallow — leaving the whole ~80k committed corpus behind to
+          # pollute later runs of the shared test DB (a slow `find_orphan_articles` etc.).
+          AdminRepo.delete_all(from(l in ArticleLink, where: l.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(a in Article, where: a.tenant_id == ^tenant.id))
           AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
         end)
@@ -120,27 +133,73 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
           {:ok, _} = Knowledge.distant_pairs(tenant.id)
         end)
 
-      # BOTH emitted queries (the count and the paginated pairs) are the self-join with the
-      # `<=>` BETWEEN band; assert the bound on EACH.
+      # Post-#202/#203 the request path emits exactly ONE self-join carrying the `<=>`
+      # BETWEEN band — the paginated `LIMIT limit+1` page. The old companion `count(*)`
+      # query (a SECOND full O(candidates²) pass that could not early-terminate and was
+      # the entire prod-scale cost) is gone; asserting exactly 1 here is the scale-side
+      # regression guard against its reintroduction.
       between_queries =
         Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
 
-      assert length(between_queries) == 2
+      assert length(between_queries) == 1
 
       for {sql, params} <- between_queries do
         # No Seq Scan over the corpus: the candidate subquery is reached via an Index Scan.
         assert :ok = PlanAssertions.refute_seq_scan({sql, params})
 
         # The genuine bound is the `ORDER BY id LIMIT max_pair_candidates()` on the sampled
-        # candidate subquery — verified at 80k the candidate `Index Scan` is dominated by a
-        # `Limit rows=25` (actual consumed ≤25, ~1.7ms / ~1657 buffers — NOT an O(n²) corpus
-        # read; the scan node's pre-LIMIT `Plan Rows ≈ corpus` is just an estimate, so
-        # `assert_scan_rows_below` does NOT fit this shape). A regression that dropped the
-        # sample LIMIT leaves the scan with no dominating `Limit ≤ cap`, tripping this.
+        # candidate subquery — at 80k the candidate `Index Scan` is dominated by a
+        # `Limit rows ≤ cap` (actual consumed ≤ cap — NOT an O(n²) corpus read; the scan node's
+        # pre-LIMIT `Plan Rows ≈ corpus` is just an estimate, so `assert_scan_rows_below` does
+        # NOT fit this shape). A regression that dropped the sample LIMIT leaves the scan with
+        # no dominating `Limit ≤ cap`, tripping this.
         assert :ok =
                  PlanAssertions.assert_article_scans_capped_by_limit(
                    {sql, params},
-                   @max_pair_candidates
+                   max_pair_candidates()
+                 )
+      end
+    end)
+  end
+
+  # #202/#203 HIGH-2/HIGH-4: the bridge branch is the PR's main <2s mitigation (the smaller
+  # bridge candidate cap). Prove at PROD scale (80k, PROD 500 cap under the SCALE gate) that
+  # `bridge_path: true` (a) stays a SINGLE bounded band pass capped by max_bridge_pair_candidates
+  # (NOT the general cap — the bridge dispatch actually took effect) and (b) meets the Theme-2
+  # <2s wall-clock target. A revert of the bridge-branch dispatch (falling back to the 1000 cap)
+  # would blow both the cap assertion and the wall-clock budget.
+  test "distant_pairs(bridge_path: true) is bounded by the bridge cap AND under <2s at 80k",
+       %{tenant: tenant} do
+    unboxed(fn ->
+      # Wall-clock: the actual Theme-2 <2s claim at prod scale (not just the 1.5k local bench).
+      {elapsed_us, result} =
+        :timer.tc(fn -> Knowledge.distant_pairs(tenant.id, bridge_path: true) end)
+
+      assert {:ok, %{pairs: _, has_more: _}} = result
+
+      elapsed_ms = elapsed_us / 1_000
+
+      assert elapsed_ms < 2_000,
+             "bridge_path distant_pairs took #{Float.round(elapsed_ms, 1)}ms at 80k — over the " <>
+               "Epic 27 Theme 2 <2s target. Lower max_bridge_pair_candidates."
+
+      # Structural: exactly ONE band pass, no Seq Scan, and capped by the BRIDGE cap (500 under
+      # the SCALE gate) — proving the bridge dispatch selected the smaller sample.
+      captured =
+        PlanAssertions.capture_repo_queries(fn ->
+          {:ok, _} = Knowledge.distant_pairs(tenant.id, bridge_path: true)
+        end)
+
+      between = Enum.filter(captured, fn {sql, _} -> sql =~ ~r/BETWEEN/i end)
+      assert length(between) == 1
+
+      for {sql, params} <- between do
+        assert :ok = PlanAssertions.refute_seq_scan({sql, params})
+
+        assert :ok =
+                 PlanAssertions.assert_article_scans_capped_by_limit(
+                   {sql, params},
+                   max_bridge_pair_candidates()
                  )
       end
     end)
