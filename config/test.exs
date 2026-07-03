@@ -75,10 +75,30 @@ config :loopctl, :enable_local_test_runner, false
 # query in the SAME test. Keep timeout assertions on the dedicated pool to avoid that.
 config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 
-# US-27.4: TC-27.4.1 integration test — set a low statement_timeout override
-# for suggested_links to make timeout tests fast and deterministic. Harmless
-# for normal tests (the timeout is much longer than any real query).
-config :loopctl, :heavy_read_statement_timeout_overrides, %{suggested_links: 5_000}
+# Per-endpoint statement_timeout overrides (HeavyRead.opts/1). An endpoint listed here
+# uses its own SET LOCAL statement_timeout instead of the aggressive 250ms pool-wide
+# default (`:heavy_read_statement_timeout_ms` above). Two distinct reasons an endpoint
+# appears here:
+#
+#   * :suggested_links (US-27.4, TC-27.4.1) — a generous 5s so the integration test's
+#     real query never times out; the timeout MECHANISM is proven elsewhere by tests
+#     that pass an EXPLICIT low per-call `statement_timeout` (heavy_read_statement_timeout_test.exs,
+#     suggest_links_controller "override -> real 57014 -> 504") and by :semantic_search
+#     inheriting the 250ms default (slow_query_logger_test.exs).
+#
+#   * :change_feed — the keyset change-feed read behind `GET /api/v1/changes`
+#     (Audit.list_changes/3 -> HeavyRead.opts(:change_feed)). On the small sandbox
+#     dataset this read is sub-millisecond, but under 24-way parallel DB contention it
+#     intermittently exceeded the 250ms default and 57014'd (HTTP 504), flaking
+#     INCIDENTAL callers of GET /changes (update_last_seen_test.exs and friends) that
+#     don't intend to test the timeout at all. 5s is generous enough to never trip under
+#     contention yet still finite (prod-scale plan/index is guarded separately by
+#     by_source_change_feed_plan_scale_test.exs / keyset_plan_scale_test.exs). No test
+#     asserts a :change_feed timeout, so this override cannot mask a real one.
+config :loopctl, :heavy_read_statement_timeout_overrides, %{
+  suggested_links: 5_000,
+  change_feed: 5_000
+}
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).
 # In the DEFAULT async suite we shrink floor/cap to 6 so the under-fill detection can be
