@@ -5,7 +5,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
 
   defp auth_conn(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
-  describe "PUT /api/v1/tenants/me/llm-config" do
+  describe "PATCH /api/v1/tenants/me/llm-config" do
     test "sets the api_key + models (role user); response never leaks the key", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -13,7 +13,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       body =
         conn
         |> auth_conn(raw_key)
-        |> put(~p"/api/v1/tenants/me/llm-config", %{
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{
           api_key: "sk-ant-controller-key",
           extraction_model: "claude-opus-4-1",
           classification_model: "claude-sonnet-4-5"
@@ -39,7 +39,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> put(~p"/api/v1/tenants/me/llm-config", %{api_key: "sk-ant-x"})
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{api_key: "sk-ant-x"})
 
       assert json_response(conn, 403)
       # Nothing was stored.
@@ -53,7 +53,7 @@ defmodule LoopctlWeb.LlmConfigControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> put(~p"/api/v1/tenants/me/llm-config", %{extraction_model: "bad model!"})
+        |> patch(~p"/api/v1/tenants/me/llm-config", %{extraction_model: "bad model!"})
 
       assert json_response(conn, 422)
     end

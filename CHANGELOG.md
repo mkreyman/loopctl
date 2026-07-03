@@ -2,6 +2,33 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-03 — per-tenant BYO Anthropic LLM config + usage (Epic 28, #179)
+
+### Added
+
+- **Per-tenant BYO Anthropic config** — `GET` / `PATCH /api/v1/tenants/me/llm-config`
+  (role `:user`): each tenant supplies its OWN Anthropic API key (encrypted at rest,
+  never returned — only `has_api_key` + a last-4 hint) and picks a model per operation
+  (`extraction_model` / `classification_model` / `merge_model`). loopctl fronts no LLM
+  cost. Setting/rotating a key writes an audit event (without the value).
+- **Per-tenant LLM usage tracking** — `GET /api/v1/knowledge/llm-usage`
+  (role `:orchestrator`): token usage grouped by operation + model + source_type + day
+  over an optional date range, with offset/limit pagination (default 90-day lookback).
+  Record-only — no budget enforcement.
+
+### Changed — BREAKING (mandatory BYO)
+
+- **Tenant knowledge-LLM work now REQUIRES a per-tenant Anthropic key.** Content
+  ingestion, category classification, article merge, and review-finding extraction all
+  resolve the tenant's OWN key via `Loopctl.Llm.resolve/2` — there is **no**
+  global-system-key fallback. The global `ANTHROPIC_API_KEY` / `:anthropic_provider`
+  config path was removed.
+- With no key configured, `POST /knowledge/ingest[/batch]` returns **422** with
+  `code: "no_api_key"` and a remediation hint; the Oban workers `{:discard}` cleanly
+  (no crash, no retry loop). A `[:loopctl, :llm, :blocked]` telemetry event and an
+  `llm.blocked_no_api_key` audit entry are emitted when a tenant is blocked.
+  (Single-tenant today; no grace period — the operator sets a key.)
+
 ## [Unreleased] — 2026-06-30 — docs sync + agents'-KB endpoints backfill
 
 ### Added

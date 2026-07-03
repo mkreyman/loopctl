@@ -3,15 +3,24 @@ defmodule Loopctl.Llm.Anthropic do
   Shared Anthropic Messages API call for tenant-scoped LLM operations
   (Epic 28 residual, #179).
 
-  Centralizes the mandatory-BYO + usage-tracking flow for the three LLM call
-  sites (extraction/classification/merge):
+  Centralizes the mandatory-BYO + usage-tracking flow for the four LLM call
+  sites (content extraction / classification / merge / review extraction):
 
     1. `Loopctl.Llm.resolve(tenant_id, operation)` — get the tenant's key + the
        per-operation model, or `{:error, :no_api_key}` (no global fallback).
     2. POST the Messages request with THAT key (`x-api-key`) + THAT model.
     3. On a 200, capture the response `usage` (`input_tokens`/`output_tokens`) and
-       `Loopctl.Llm.record_usage/2`.
+       `Loopctl.Llm.record_usage/2` — BEST-EFFORT (a usage-recording failure never
+       fails an already-billed Anthropic call; see `record_usage_safe/5`).
     4. Return the assistant text for the caller to parse.
+
+  ## Timeout budget (review #5)
+
+  Callers pass `receive_timeout` / `max_retries` in `req_opts` so the client's
+  worst-case wall-clock stays strictly BELOW the caller's outer budget (the Oban
+  job/`Task.async_stream` timeout). This prevents the outer supervisor from
+  killing an in-flight request mid-way (which the client can neither observe nor
+  retry). The defaults here are conservative; every real caller overrides them.
 
   The API key is NEVER logged. HTTP is injectable for tests via the
   `:anthropic_req_plug` config (a `Req.Test` plug), so the whole flow — including
@@ -25,19 +34,21 @@ defmodule Loopctl.Llm.Anthropic do
   @base_url "https://api.anthropic.com/v1"
   @anthropic_version "2023-06-01"
 
+  # Conservative defaults; callers override with budgets that fit their outer
+  # timeout (review #5). retry :transient + max_retries drives Req's retry.
+  @default_receive_timeout 25_000
+  @default_max_retries 0
+
   @type usage_meta :: %{
           optional(:source_type) => String.t() | nil,
           optional(:article_id) => Ecto.UUID.t() | nil
         }
 
   @doc """
-  Resolve the tenant key+model for `operation`, POST a Messages request whose body
-  is built by `body_fun.(model)` (the caller supplies `system`/`messages`/
-  `max_tokens`; this fn injects `model`), record usage on success, and return the
-  assistant text.
+  Resolve the tenant key+model for `operation`, then POST via `call/7`.
 
   Returns:
-    * `{:ok, text}` on a 200 (usage recorded)
+    * `{:ok, text}` on a 200 (usage recorded best-effort)
     * `{:error, :no_api_key}` when the tenant has no key (mandatory BYO)
     * `{:error, {:api_error, status, body}}` on a non-200
     * `{:error, {:request_failed, reason}}` on a transport error
@@ -54,9 +65,32 @@ defmodule Loopctl.Llm.Anthropic do
         {:error, :no_api_key}
 
       {:ok, %{api_key: api_key, model: model}} ->
-        body = model |> body_fun.() |> Map.put(:model, model)
-        post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+        call(tenant_id, operation, api_key, model, body_fun, usage_meta, req_opts)
     end
+  end
+
+  @doc """
+  Like `message/5` but with EXPLICIT pre-resolved `api_key` + `model` — skips the
+  per-call `Loopctl.Llm.resolve/2` DB read. Used to resolve ONCE per batch and
+  thread the resolved credentials through many calls (review #19). The caller is
+  responsible for having resolved the tenant's credentials.
+  """
+  @spec call(
+          Ecto.UUID.t(),
+          Llm.operation(),
+          String.t(),
+          String.t(),
+          (String.t() -> map()),
+          usage_meta(),
+          keyword()
+        ) ::
+          {:ok, String.t()}
+          | {:error, {:api_error, integer(), term()}}
+          | {:error, {:request_failed, term()}}
+  def call(tenant_id, operation, api_key, model, body_fun, usage_meta \\ %{}, req_opts \\ [])
+      when is_binary(api_key) and is_binary(model) and is_function(body_fun, 1) do
+    body = model |> body_fun.() |> Map.put(:model, model)
+    post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
   end
 
   defp post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
@@ -68,8 +102,8 @@ defmodule Loopctl.Llm.Anthropic do
           {"anthropic-version", @anthropic_version}
         ],
         retry: :transient,
-        max_retries: 2,
-        receive_timeout: 60_000
+        max_retries: @default_max_retries,
+        receive_timeout: @default_receive_timeout
       ]
       |> Keyword.merge(req_opts)
       |> maybe_put_plug()
@@ -77,7 +111,7 @@ defmodule Loopctl.Llm.Anthropic do
     # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
     case Req.post("#{@base_url}/messages", opts) do
       {:ok, %{status: 200, body: %{"content" => [%{"text" => text} | _]} = resp}} ->
-        record_usage(tenant_id, operation, model, resp["usage"], usage_meta)
+        record_usage_safe(tenant_id, operation, model, resp["usage"], usage_meta)
         {:ok, text}
 
       {:ok, %{status: 200, body: body}} ->
@@ -97,20 +131,49 @@ defmodule Loopctl.Llm.Anthropic do
     end
   end
 
+  # BEST-EFFORT usage recording (review #3). The Anthropic call has already
+  # SUCCEEDED (and been billed to the tenant) by the time we get here, so a DB
+  # blip / FK race while inserting the usage row must NEVER raise — that would
+  # crash the job, trigger an Oban retry, and RE-BILL the tenant. Mirror
+  # `ContentIngestionWorker.enqueue_embeddings/2`: log-and-continue, always :ok.
+  defp record_usage_safe(tenant_id, operation, model, usage, meta) do
+    record_usage(tenant_id, operation, model, usage, meta)
+  rescue
+    e ->
+      Logger.error(
+        "Loopctl.Llm.Anthropic: usage recording raised (op=#{operation}); " <>
+          "the Anthropic call already succeeded, continuing: #{Exception.message(e)}"
+      )
+
+      :ok
+  end
+
   # Record token usage from the Anthropic `usage` object. A missing/malformed usage
-  # block is logged and skipped — never crashes a successful extraction.
+  # block, or an `{:error, changeset}` from the insert (e.g. a mapped FK violation),
+  # is logged and skipped — never crashes a successful extraction.
   defp record_usage(tenant_id, operation, model, %{} = usage, meta) do
     input = Map.get(usage, "input_tokens", 0)
     output = Map.get(usage, "output_tokens", 0)
 
-    Llm.record_usage(tenant_id, %{
-      operation: operation,
-      model: model,
-      input_tokens: normalize_token(input),
-      output_tokens: normalize_token(output),
-      source_type: Map.get(meta, :source_type),
-      article_id: Map.get(meta, :article_id)
-    })
+    case Llm.record_usage(tenant_id, %{
+           operation: operation,
+           model: model,
+           input_tokens: normalize_token(input),
+           output_tokens: normalize_token(output),
+           source_type: Map.get(meta, :source_type),
+           article_id: Map.get(meta, :article_id)
+         }) do
+      {:ok, _event} ->
+        :ok
+
+      {:error, changeset} ->
+        Logger.error(
+          "Loopctl.Llm.Anthropic: usage record rejected (op=#{operation}): " <>
+            "#{inspect(changeset.errors)}"
+        )
+
+        :ok
+    end
   end
 
   defp record_usage(_tenant_id, operation, _model, _usage, _meta) do

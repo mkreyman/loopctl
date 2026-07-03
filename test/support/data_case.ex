@@ -103,8 +103,9 @@ defmodule Loopctl.DataCase do
       {:ok, List.duplicate(0.1, 1536)}
     end)
 
-    # Default stub for knowledge extractor -- returns empty list (no articles)
-    Mox.stub(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+    # Default stub for knowledge extractor -- returns empty list (no articles).
+    # tenant_id is threaded first (Epic 28 BYO, review #1).
+    Mox.stub(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
       {:ok, []}
     end)
 
@@ -118,7 +119,7 @@ defmodule Loopctl.DataCase do
 
     # Default stub for category classifier -- zero confidence, so the
     # reclassification backfill is a no-op unless a test sets its own verdict.
-    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _title, _body ->
+    Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _title, _body, _opts ->
       {:ok, %{category: :pattern, confidence: 0.0}}
     end)
 

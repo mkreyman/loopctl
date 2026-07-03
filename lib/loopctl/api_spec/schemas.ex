@@ -2686,6 +2686,25 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule LlmUsageMeta do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "LlmUsageMeta",
+      description:
+        "Offset/limit pagination metadata for the LLM usage summary. Advance " <>
+          "`offset` by `limit` to enumerate `total_count` grouped rows.",
+      type: :object,
+      properties: %{
+        limit: %Schema{type: :integer, description: "Effective page size (rows returned)"},
+        offset: %Schema{type: :integer, description: "Rows skipped"},
+        total_count: %Schema{type: :integer, description: "Total grouped rows across all pages"}
+      },
+      example: %{limit: 50, offset: 0, total_count: 3}
+    })
+  end
+
   defmodule LlmUsageResponse do
     @moduledoc false
     require OpenApiSpex
@@ -2716,7 +2735,7 @@ defmodule Loopctl.ApiSpec.Schemas do
             }
           }
         },
-        meta: PaginationMeta
+        meta: LlmUsageMeta
       }
     })
   end

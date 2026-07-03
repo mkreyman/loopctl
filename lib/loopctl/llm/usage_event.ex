@@ -49,5 +49,9 @@ defmodule Loopctl.Llm.UsageEvent do
     |> validate_required([:operation, :model, :occurred_at])
     |> validate_number(:input_tokens, greater_than_or_equal_to: 0)
     |> validate_number(:output_tokens, greater_than_or_equal_to: 0)
+    # A tenant deleted mid-flight (FK race) maps to a clean {:error, changeset}
+    # instead of raising — so best-effort usage recording never crashes an
+    # already-successful (already-billed) Anthropic call (review #3).
+    |> foreign_key_constraint(:tenant_id)
   end
 end

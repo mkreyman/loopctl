@@ -37,7 +37,7 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
   @max_body_chars 16_000
 
   @impl true
-  def classify(tenant_id, title, body) do
+  def classify(tenant_id, title, body, opts \\ []) do
     user_content = "Title: #{title}\n\nBody:\n#{String.slice(body || "", 0, @max_body_chars)}"
 
     body_fun = fn _model ->
@@ -48,10 +48,22 @@ defmodule Loopctl.Knowledge.ClaudeCategoryClassifier do
       }
     end
 
-    case Anthropic.message(tenant_id, :classification, body_fun) do
+    case classify_via(tenant_id, opts, body_fun) do
       {:ok, text} -> parse_text(text)
       {:error, :no_api_key} -> {:error, :no_api_key}
       {:error, _} = err -> err
+    end
+  end
+
+  # Use pre-resolved credentials when the caller supplied them (batched callers
+  # resolve once — review #19); otherwise resolve per call.
+  defp classify_via(tenant_id, opts, body_fun) do
+    case {opts[:api_key], opts[:model]} do
+      {api_key, model} when is_binary(api_key) and is_binary(model) ->
+        Anthropic.call(tenant_id, :classification, api_key, model, body_fun)
+
+      _ ->
+        Anthropic.message(tenant_id, :classification, body_fun)
     end
   end
 

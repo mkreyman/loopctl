@@ -104,21 +104,23 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   end
 
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id} = args}) do
-    if Loopctl.Llm.has_api_key?(tenant_id) do
-      run_tenant(tenant_id, args)
-    else
-      # Mandatory BYO (Epic 28, #179): no tenant Anthropic key → nothing to do.
-      # Skip cleanly (no snooze/retry loop) rather than failing every classify call.
-      Logger.info(
-        "KnowledgeReclassifyWorker: tenant=#{tenant_id} has no Anthropic key configured; " <>
-          "skipping reclassification (BYO required)."
-      )
+    # Resolve the tenant's key + classification model ONCE per kick (review #19):
+    # this both enforces mandatory BYO (Epic 28, #179) AND avoids a per-article
+    # Loopctl.Llm.resolve/2 DB read across the batch — the resolved credentials are
+    # threaded into every classify call.
+    case Loopctl.Llm.resolve(tenant_id, :classification) do
+      {:ok, resolved} ->
+        run_tenant(tenant_id, resolved, args)
 
-      :ok
+      {:error, :no_api_key} ->
+        # No tenant Anthropic key → nothing to do. Skip cleanly (no snooze/retry
+        # loop) rather than failing every classify call.
+        Loopctl.Llm.record_blocked(tenant_id, :classification)
+        :ok
     end
   end
 
-  defp run_tenant(tenant_id, args) do
+  defp run_tenant(tenant_id, resolved, args) do
     run_mode = Map.get(args, "run_mode", "dry_run")
 
     batch_size =
@@ -139,16 +141,15 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     processed_so_far = Map.get(args, "processed", 0)
 
     batch = fetch_batch(tenant_id, cursor, batch_size)
-    tally = process_batch(tenant_id, batch, run_mode, min_confidence)
+    tally = process_batch(tenant_id, resolved, batch, run_mode, min_confidence)
 
-    if upstream_unavailable?(batch, tally) do
-      # A mostly/entirely failed batch means the classifier upstream (Anthropic,
-      # or this host's egress) is unreachable -- NOT that the articles are bad.
-      # Snooze: Oban re-runs THIS SAME job (same cursor) later WITHOUT consuming
-      # an attempt and WITHOUT advancing, so an outage pauses the migration and it
-      # resumes cleanly when connectivity returns -- no articles skipped, no audit
-      # spam. (The migration also runs on the Fly host, so a local outage at the
-      # operator's site never touches it.)
+    if transient_outage?(batch, tally) do
+      # A batch dominated by TRANSIENT errors (connection refused, timeout, 5xx,
+      # 408/429) means the classifier upstream is unreachable -- NOT that the
+      # articles or the tenant's key are bad. Snooze: Oban re-runs THIS SAME job
+      # (same cursor) later WITHOUT consuming an attempt and WITHOUT advancing, so
+      # an outage pauses the migration and resumes cleanly when connectivity
+      # returns -- no articles skipped, no audit spam.
       snooze =
         Application.get_env(
           :loopctl,
@@ -158,12 +159,18 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
 
       Logger.warning(
         "KnowledgeReclassifyWorker: tenant=#{tenant_id} batch failed to classify " <>
-          "(#{tally.errors}/#{tally.processed}); classifier upstream likely unreachable. " <>
-          "Snoozing #{snooze}s and retrying the same cursor (nothing skipped)."
+          "(#{tally.transient_errors}/#{tally.processed} transient); upstream likely " <>
+          "unreachable. Snoozing #{snooze}s and retrying the same cursor (nothing skipped)."
       )
 
       {:snooze, snooze}
     else
+      # PERMANENT errors (4xx auth/bad-request, unparseable) do NOT snooze — a
+      # permanently-misconfigured tenant (bad key / bogus model) would otherwise
+      # snooze every 60s forever (review #4). Log if permanent errors dominate,
+      # then advance normally: those articles stay unchanged and the migration
+      # progresses to completion rather than looping.
+      maybe_warn_permanent(tenant_id, tally)
       log_audit(tenant_id, run_mode, tally, processed_so_far)
       new_processed = processed_so_far + tally.processed
       maybe_chain(batch, tenant_id, args, batch_size, max_per_run, new_processed)
@@ -171,23 +178,37 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     end
   end
 
-  # True when a non-empty batch came back with an error RATE at or above the
-  # configured threshold -- the signal of an upstream/connectivity outage rather
-  # than a few unparseable articles. (With the JSON-parse fix, genuine per-article
-  # errors are rare, so a high rate almost always means the API is unreachable.)
-  defp upstream_unavailable?([], _tally), do: false
+  # Snooze ONLY when TRANSIENT errors dominate the batch (a real outage). Permanent
+  # errors never trigger a snooze, so a misconfigured tenant can't loop forever.
+  defp transient_outage?([], _tally), do: false
+  defp transient_outage?(_batch, %{processed: 0}), do: false
 
-  defp upstream_unavailable?(_batch, %{processed: 0}), do: false
+  defp transient_outage?(_batch, %{processed: processed, transient_errors: transient}) do
+    transient / processed >= snooze_rate()
+  end
 
-  defp upstream_unavailable?(_batch, %{processed: processed, errors: errors}) do
-    rate =
-      Application.get_env(
-        :loopctl,
-        :knowledge_reclassify_snooze_error_rate,
-        @default_snooze_error_rate
+  # When permanent errors dominate a batch, log it once (chain-of-custody breadcrumb
+  # in the standard log stream) so a persistently bad key/model is visible instead of
+  # silently no-oping the whole corpus.
+  defp maybe_warn_permanent(tenant_id, %{processed: processed, permanent_errors: permanent})
+       when processed > 0 do
+    if permanent / processed >= snooze_rate() do
+      Logger.warning(
+        "KnowledgeReclassifyWorker: tenant=#{tenant_id} batch dominated by PERMANENT " <>
+          "classify errors (#{permanent}/#{processed}) — likely a bad key/model. Advancing " <>
+          "without retrying those articles (not an outage; not snoozing)."
       )
+    end
+  end
 
-    errors / processed >= rate
+  defp maybe_warn_permanent(_tenant_id, _tally), do: :ok
+
+  defp snooze_rate do
+    Application.get_env(
+      :loopctl,
+      :knowledge_reclassify_snooze_error_rate,
+      @default_snooze_error_rate
+    )
   end
 
   # --- batch fetch (keyset by id) ---
@@ -220,7 +241,7 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   # batch isn't 100 serial round-trips. Writes stay SERIAL (in the reduce, on the
   # worker process) so the small BYPASSRLS admin pool is never hit by N
   # concurrent updates.
-  defp process_batch(tenant_id, batch, run_mode, min_confidence) do
+  defp process_batch(tenant_id, resolved, batch, run_mode, min_confidence) do
     max_concurrency =
       Application.get_env(
         :loopctl,
@@ -228,9 +249,14 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
         @default_max_concurrency
       )
 
+    # Thread the ONCE-resolved credentials into every classify call (review #19).
+    classify_opts = [api_key: resolved.api_key, model: resolved.model]
+
     batch
     |> Task.async_stream(
-      fn article -> {article, @classifier.classify(tenant_id, article.title, article.body)} end,
+      fn article ->
+        {article, @classifier.classify(tenant_id, article.title, article.body, classify_opts)}
+      end,
       max_concurrency: max_concurrency,
       timeout: @classify_timeout_ms,
       on_timeout: :kill_task,
@@ -240,7 +266,16 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
   end
 
   defp empty_tally do
-    %{processed: 0, changed: 0, unchanged: 0, low_confidence: 0, errors: 0, by_transition: %{}}
+    %{
+      processed: 0,
+      changed: 0,
+      unchanged: 0,
+      low_confidence: 0,
+      errors: 0,
+      transient_errors: 0,
+      permanent_errors: 0,
+      by_transition: %{}
+    }
   end
 
   defp reduce_outcome({:ok, {article, {:ok, verdict}}}, acc, min_confidence, run_mode) do
@@ -249,15 +284,42 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
     classify_outcome(acc, article, proposed, confidence, min_confidence, run_mode)
   end
 
-  defp reduce_outcome({:ok, {_article, {:error, _reason}}}, acc, _min_confidence, _run_mode) do
-    %{acc | processed: acc.processed + 1, errors: acc.errors + 1}
+  defp reduce_outcome({:ok, {_article, {:error, reason}}}, acc, _min_confidence, _run_mode) do
+    # Classify error rate/transient split (review #4): a PERMANENT error (4xx
+    # auth/bad-request, unparseable verdict, no_api_key) must not cause an infinite
+    # snooze; only TRANSIENT errors (timeout/5xx/429/connection) signal an outage.
+    count_error(acc, permanent_classify_error?(reason))
   end
 
-  # A classification task that timed out or crashed -- count it processed+errored;
-  # its article is simply left for a later run (commit writes are idempotent).
+  # A classification task that timed out or crashed -- TRANSIENT (a hung/slow
+  # upstream, retryable). Count it processed+errored; its article is left for a
+  # later run (commit writes are idempotent).
   defp reduce_outcome({:exit, _reason}, acc, _min_confidence, _run_mode) do
-    %{acc | processed: acc.processed + 1, errors: acc.errors + 1}
+    count_error(acc, false)
   end
+
+  defp count_error(acc, permanent?) do
+    acc = %{acc | processed: acc.processed + 1, errors: acc.errors + 1}
+
+    if permanent? do
+      %{acc | permanent_errors: acc.permanent_errors + 1}
+    else
+      %{acc | transient_errors: acc.transient_errors + 1}
+    end
+  end
+
+  # Permanent = a retry can't fix it: a 4xx (other than 408 timeout / 429 rate
+  # limited, which ARE transient), an unparseable verdict, or a missing key.
+  # Everything else (connection/timeout/5xx/request_failed) is transient.
+  defp permanent_classify_error?(:no_api_key), do: true
+  defp permanent_classify_error?(:unparseable_classification), do: true
+
+  defp permanent_classify_error?({:api_error, status, _body})
+       when is_integer(status) and status >= 400 and status < 500 and status != 408 and
+              status != 429,
+       do: true
+
+  defp permanent_classify_error?(_), do: false
 
   defp classify_outcome(acc, article, proposed, confidence, min_confidence, run_mode) do
     current = article.category
@@ -337,6 +399,8 @@ defmodule Loopctl.Workers.KnowledgeReclassifyWorker do
           "unchanged" => tally.unchanged,
           "low_confidence" => tally.low_confidence,
           "errors" => tally.errors,
+          "transient_errors" => tally.transient_errors,
+          "permanent_errors" => tally.permanent_errors,
           "by_transition" => tally.by_transition
         }
       }

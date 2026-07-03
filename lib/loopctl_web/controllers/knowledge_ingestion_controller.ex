@@ -206,12 +206,14 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     end
   end
 
-  # Mandatory BYO gate shared by single + batch ingest.
+  # Mandatory BYO gate shared by single + batch ingest. On a miss, record the block
+  # (log + telemetry + audit, review #2) and return a coded 422.
   defp require_llm_key(tenant_id) do
     if Llm.has_api_key?(tenant_id) do
       :ok
     else
-      {:error, :unprocessable_entity, @no_api_key_message}
+      Llm.record_blocked(tenant_id, :extraction)
+      {:error, :no_api_key_configured, @no_api_key_message}
     end
   end
 

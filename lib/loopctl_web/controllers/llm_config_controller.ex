@@ -2,10 +2,10 @@ defmodule LoopctlWeb.LlmConfigController do
   @moduledoc """
   Per-tenant BYO Anthropic LLM configuration (Epic 28 residual, #179).
 
-  - `GET  /api/v1/tenants/me/llm-config` — the tenant's model choices +
+  - `GET   /api/v1/tenants/me/llm-config` — the tenant's model choices +
     `has_api_key` + a masked last-4 hint. NEVER returns the key itself.
-  - `PUT  /api/v1/tenants/me/llm-config` — set/rotate the api_key and the three
-    per-operation models.
+  - `PATCH /api/v1/tenants/me/llm-config` — set/rotate the api_key and the three
+    per-operation models (partial-merge; omitted fields are left untouched).
 
   Both endpoints require the `:user` role — this endpoint stores a tenant secret,
   so per the security checklist (managing secrets ⇒ `:user`) neither agents nor
@@ -62,7 +62,7 @@ defmodule LoopctlWeb.LlmConfigController do
     json(conn, view)
   end
 
-  @doc "PUT /api/v1/tenants/me/llm-config"
+  @doc "PATCH /api/v1/tenants/me/llm-config"
   def update(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 

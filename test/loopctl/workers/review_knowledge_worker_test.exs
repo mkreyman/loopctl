@@ -9,11 +9,31 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
 
   defp setup_tenant do
     tenant = fixture(:tenant)
+    # Mandatory BYO (Epic 28, #179): the worker gates on has_api_key? — configure
+    # a tenant Anthropic key so review-knowledge extraction proceeds.
+    fixture(:tenant_llm_settings, %{tenant_id: tenant.id})
     %{tenant: tenant}
   end
 
   defp create_review_record(tenant_id, attrs \\ %{}) do
     fixture(:review_record, Map.merge(%{tenant_id: tenant_id}, attrs))
+  end
+
+  describe "mandatory BYO (Epic 28, #179)" do
+    test "discards cleanly when the tenant has no Anthropic key; extractor never called" do
+      # A tenant WITHOUT an llm settings row (no key configured).
+      tenant = fixture(:tenant)
+      review = create_review_record(tenant.id)
+
+      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _tenant_id, _ctx ->
+        flunk("extractor must not run without a tenant key")
+      end)
+
+      assert {:discard, {:no_api_key, _reason}} =
+               ReviewKnowledgeWorker.perform(%Oban.Job{
+                 args: %{"review_record_id" => review.id, "tenant_id" => tenant.id}
+               })
+    end
   end
 
   # --- TC-21.1.1: Worker extracts articles from review successfully ---
@@ -23,7 +43,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn context ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, context ->
         assert context.review_record_id == review_record.id
         assert context.tenant_id == tenant.id
         assert context.story_id == review_record.story_id
@@ -80,7 +100,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       })
 
       # Extractor should NOT be called (verify_on_exit! will catch unexpected calls)
-      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -101,7 +121,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:error, {:llm_error, "API timeout"}}
       end)
 
@@ -122,7 +142,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{
@@ -182,7 +202,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
           }
         end
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok, six_articles}
       end)
 
@@ -204,7 +224,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{title: "Valid", body: "Valid body.", category: :pattern},
@@ -231,7 +251,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{"title" => "Valid string keys", "body" => "Valid body.", "category" => "pattern"},
@@ -262,7 +282,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{title: "Valid", body: "Short body.", category: :pattern},
@@ -293,7 +313,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{title: "Valid", body: "Short body.", category: :pattern},
@@ -324,7 +344,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{title: "Valid tags", body: "Body.", category: :pattern, tags: ["valid-tag"]},
@@ -365,7 +385,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       # Worker runs with tenant_b but tenant_a's review_record_id.
       # The review record lookup is scoped by tenant_id, so it returns not_found.
       # Extractor should NOT be called
-      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -398,7 +418,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -421,7 +441,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       fake_id = Ecto.UUID.generate()
 
       # Extractor should NOT be called
-      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, 0, fn _tenant_id, _ctx ->
         {:ok, []}
       end)
 
@@ -507,7 +527,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       %{tenant: tenant} = setup_tenant()
       review_record = create_review_record(tenant.id)
 
-      expect(Loopctl.MockExtractor, :extract_articles, fn _ctx ->
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
         {:ok,
          [
            %{

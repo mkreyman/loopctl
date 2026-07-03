@@ -42,7 +42,12 @@ defmodule Loopctl.Knowledge.ClaudeMergeSynthesizer do
       }
     end
 
-    case Anthropic.message(tenant_id, :merge, body_fun) do
+    # Merge is a larger synthesis with no tight outer timeout; give it a slightly
+    # longer bounded client budget (review #5).
+    case Anthropic.message(tenant_id, :merge, body_fun, %{},
+           receive_timeout: 55_000,
+           max_retries: 1
+         ) do
       {:ok, text} -> parse_text(text)
       {:error, :no_api_key} -> {:error, :no_api_key}
       {:error, _} = err -> err

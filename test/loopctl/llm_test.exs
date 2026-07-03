@@ -43,6 +43,24 @@ defmodule Loopctl.LlmTest do
       assert count == 1
     end
 
+    test "resolve/2 is tenant-scoped — A and B each get their own key + model (review #17)" do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+
+      {:ok, _} =
+        Llm.upsert_settings(a.id, %{"api_key" => "sk-ant-AAAA", "extraction_model" => "model-a"})
+
+      {:ok, _} =
+        Llm.upsert_settings(b.id, %{"api_key" => "sk-ant-BBBB", "extraction_model" => "model-b"})
+
+      assert {:ok, %{api_key: "sk-ant-AAAA", model: "model-a"}} = Llm.resolve(a.id, :extraction)
+      assert {:ok, %{api_key: "sk-ant-BBBB", model: "model-b"}} = Llm.resolve(b.id, :extraction)
+
+      # No cross-tenant leakage in either direction.
+      refute match?({:ok, %{api_key: "sk-ant-BBBB"}}, Llm.resolve(a.id, :extraction))
+      refute match?({:ok, %{api_key: "sk-ant-AAAA"}}, Llm.resolve(b.id, :extraction))
+    end
+
     test "resolve/2 returns {:error, :no_api_key} when no key is configured" do
       tenant = fixture(:tenant)
       assert {:error, :no_api_key} = Llm.resolve(tenant.id, :extraction)

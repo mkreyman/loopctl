@@ -15,6 +15,19 @@ defmodule Loopctl.Knowledge.ClassifierBehaviour do
 
   @type result :: %{required(:category) => atom(), required(:confidence) => float()}
 
-  @callback classify(tenant_id :: Ecto.UUID.t(), title :: String.t(), body :: String.t()) ::
+  @doc """
+  Classify one article into a single active category.
+
+  `opts` may carry pre-resolved credentials `:api_key` + `:model` so a batched
+  caller can resolve the tenant's key ONCE and thread it through many calls
+  (review #19), avoiding a per-article `Loopctl.Llm.resolve/2` DB read. When
+  absent, the implementation resolves per call.
+  """
+  @callback classify(
+              tenant_id :: Ecto.UUID.t(),
+              title :: String.t(),
+              body :: String.t(),
+              opts :: keyword()
+            ) ::
               {:ok, result()} | {:error, :no_api_key} | {:error, term()}
 end

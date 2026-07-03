@@ -27,6 +27,47 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end)
   end
 
+  # --- Mandatory BYO gate at the HTTP boundary (Epic 28, #179 — review #7) ---
+
+  describe "mandatory BYO 422 gate" do
+    test "POST /knowledge/ingest with a keyless tenant -> 422 code no_api_key", %{conn: conn} do
+      # A tenant WITHOUT an llm settings row (no key configured).
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # The extractor must never run — we reject before enqueuing.
+      expect(Loopctl.MockContentExtractor, :extract_from_content, 0, fn _t, _c, _o ->
+        flunk("extractor must not run without a tenant key")
+      end)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest", %{content: "x", source_type: "newsletter"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "no_api_key"
+      assert body["error"]["message"] =~ "Anthropic API key"
+    end
+
+    test "POST /knowledge/ingest/batch with a keyless tenant -> 422 code no_api_key", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/ingest/batch", %{
+          items: [%{content: "x", source_type: "newsletter"}]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "no_api_key"
+    end
+  end
+
   # --- POST /api/v1/knowledge/ingest ---
 
   describe "POST /api/v1/knowledge/ingest" do

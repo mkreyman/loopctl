@@ -58,12 +58,22 @@ function resolveKey(keyOverride) {
   );
 }
 
-async function apiCall(method, path, body, keyOverride) {
+async function apiCall(method, path, body, keyOverride, { exactKey = false } = {}) {
   const url = `${getBaseUrl()}${path}`;
-  const key = resolveKey(keyOverride);
+  // Secret-managing tools pass exactKey:true so the request uses the EXACT
+  // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
+  // LOOPCTL_API_KEY override — a secret op must never silently run under a
+  // non-user global key (review #12).
+  const key = exactKey ? keyOverride : resolveKey(keyOverride);
 
   if (!key) {
-    return { error: true, status: 0, body: "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY." };
+    return {
+      error: true,
+      status: 0,
+      body: exactKey
+        ? "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
+        : "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY.",
+    };
   }
 
   const headers = {
@@ -1160,12 +1170,14 @@ async function knowledgeIngestionJobs(args = {}) {
 // --- Per-tenant BYO LLM config + usage (Epic 28 residual, #179) ---
 
 async function llmConfig() {
-  // Reading/writing the tenant LLM config touches a stored secret → user key.
+  // Reading/writing the tenant LLM config touches a stored secret → EXACT user
+  // key only (bypass the global LOOPCTL_API_KEY override; fail fast if unset).
   const result = await apiCall(
     "GET",
     "/api/v1/tenants/me/llm-config",
     null,
     process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
   );
   return toContent(result);
 }
@@ -1176,11 +1188,13 @@ async function setLlmConfig({ api_key, extraction_model, classification_model, m
   if (extraction_model !== undefined) body.extraction_model = extraction_model;
   if (classification_model !== undefined) body.classification_model = classification_model;
   if (merge_model !== undefined) body.merge_model = merge_model;
+  // PATCH (partial-merge) + EXACT user key (review #12, #13).
   const result = await apiCall(
-    "PUT",
+    "PATCH",
     "/api/v1/tenants/me/llm-config",
     body,
     process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
   );
   return toContent(result);
 }

@@ -330,7 +330,8 @@ config :loopctl, :knowledge_proposal_overlap_threshold, 0.88
 config :loopctl, :knowledge_conflict_threshold, 0.93
 
 # Merge synthesizer (#4 step 2): the LLM that combines two articles a grounded agent
-# marked `:merge` into ONE draft. Reuses the shared :anthropic_provider key; drafts only.
+# marked `:merge` into ONE draft. Resolves the tenant's BYO Anthropic key per-tenant
+# via Loopctl.Llm.resolve/2 (Epic 28, #179); drafts only.
 config :loopctl, :merge_synthesizer, Loopctl.Knowledge.ClaudeMergeSynthesizer
 # Max `:relates_to`→`:potential_conflict` promotions the nightly lint sweep does per
 # tenant per run (bounds the existing-corpus backfill; it cycles over nights).

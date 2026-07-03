@@ -32,9 +32,12 @@ defmodule Loopctl.Llm do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.HeavyRead
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent
 
@@ -134,6 +137,42 @@ defmodule Loopctl.Llm do
   end
 
   @doc """
+  Records that a tenant LLM `operation` was BLOCKED for a missing BYO key
+  (review #2 — the mandatory-BYO cutover needs observability). Emits a
+  `Logger.warning`, a `[:loopctl, :llm, :blocked]` telemetry event, and an
+  `llm.blocked_no_api_key` audit entry (with tenant_id + operation, never a key).
+  Best-effort: a telemetry/audit failure never propagates to the caller.
+  """
+  @spec record_blocked(Ecto.UUID.t(), operation()) :: :ok
+  def record_blocked(tenant_id, operation) when is_binary(tenant_id) do
+    Logger.warning(
+      "Loopctl.Llm: tenant=#{tenant_id} blocked op=#{operation} — no Anthropic API key " <>
+        "configured (mandatory BYO)."
+    )
+
+    :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{
+      tenant_id: tenant_id,
+      operation: operation
+    })
+
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "llm_config",
+      entity_id: tenant_id,
+      action: "llm.blocked_no_api_key",
+      actor_type: "system",
+      actor_id: nil,
+      actor_label: "llm",
+      new_state: %{"operation" => to_string(operation)}
+    })
+
+    :ok
+  rescue
+    e ->
+      Logger.error("Loopctl.Llm.record_blocked failed: #{Exception.message(e)}")
+      :ok
+  end
+
+  @doc """
   A safe view of the tenant's settings for API responses: the model choices,
   `has_api_key`, and a `api_key_hint` (last 4 chars) — NEVER the key itself.
   """
@@ -222,9 +261,14 @@ defmodule Loopctl.Llm do
         }
       )
 
-    total = grouped |> subquery() |> AdminRepo.aggregate(:count, :day)
+    # This customer-facing aggregate reads the (potentially large) llm_usage_events
+    # table, so route it through HeavyRead (per-read SET LOCAL statement_timeout +
+    # tenant-scope guard) like the other heavy reads (review #9). The grouped
+    # subquery's base carries `e.tenant_id == ^tenant_id`, so the guard passes.
+    total_query = from(g in subquery(grouped), select: count(g.day))
+    total = HeavyRead.one(tenant_id, total_query, HeavyRead.opts(:llm_usage)) || 0
 
-    rows =
+    rows_query =
       from(g in subquery(grouped),
         order_by: [
           desc: g.day,
@@ -235,7 +279,10 @@ defmodule Loopctl.Llm do
         limit: ^limit,
         offset: ^offset
       )
-      |> AdminRepo.all()
+
+    rows =
+      tenant_id
+      |> HeavyRead.all(rows_query, HeavyRead.opts(:llm_usage))
       |> Enum.map(&normalize_summary_row/1)
 
     %{data: rows, meta: %{limit: limit, offset: offset, total_count: total}}
@@ -243,11 +290,20 @@ defmodule Loopctl.Llm do
 
   # --- Private ---
 
+  # Default the lower bound to a 90-day lookback when the caller omits `:from`, so
+  # the aggregate can never unboundedly scan the whole table (review #9). An
+  # explicit `:from`/`:to` is honored (the (tenant_id, occurred_at) index keeps a
+  # bounded range efficient).
+  @default_lookback_days 90
+
   defp usage_base_query(tenant_id, opts) do
     from(e in UsageEvent, where: e.tenant_id == ^tenant_id)
-    |> maybe_from(Keyword.get(opts, :from))
+    |> maybe_from(Keyword.get(opts, :from) || default_from())
     |> maybe_to(Keyword.get(opts, :to))
   end
+
+  defp default_from,
+    do: DateTime.add(DateTime.utc_now(), -@default_lookback_days * 86_400, :second)
 
   defp maybe_from(query, %DateTime{} = from), do: where(query, [e], e.occurred_at >= ^from)
   defp maybe_from(query, _), do: query

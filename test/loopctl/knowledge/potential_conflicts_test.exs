@@ -350,6 +350,10 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
 
     setup do
       tenant = fixture(:tenant)
+      # Mandatory BYO (Epic 28, #179): the merge executor now gates on has_api_key?
+      # before synthesizing. Configure a key so these merge-path tests reach the
+      # synthesizer (the keyless-skip path has its own dedicated test below).
+      fixture(:tenant_llm_settings, %{tenant_id: tenant.id})
       a = published(tenant.id, "XML in Elixir with xmerl")
       b = published(tenant.id, "How to parse XML documents in Elixir")
       conflict_link(tenant.id, a, b, 0.98)
@@ -418,6 +422,37 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
 
       row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: t.id)
       assert is_nil(row.executed_at)
+    end
+
+    test "mandatory BYO: a keyless tenant's merge is marked skipped, not retried forever (review #10)" do
+      # A DISTINCT tenant with NO llm settings row (no key configured).
+      tenant = fixture(:tenant)
+      a = published(tenant.id, "Alpha article about widgets")
+      b = published(tenant.id, "Beta article about widgets")
+      conflict_link(tenant.id, a, b, 0.98)
+
+      # The synthesizer must NEVER be called without a tenant key.
+      stub(Loopctl.MockMergeSynthesizer, :synthesize, fn _t, _a, _b ->
+        flunk("merge synthesizer must not run without a tenant key")
+      end)
+
+      {:ok, _} =
+        Knowledge.annotate_conflict(tenant.id, %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high"
+        })
+
+      assert 0 == Knowledge.execute_conflict_resolutions(tenant.id)
+
+      # Marked executed with a DISTINCT, queryable "skipped/no_api_key" result —
+      # NOT left unexecuted (which would retry every run forever).
+      row = AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: tenant.id)
+      refute is_nil(row.executed_at)
+      assert row.execution_result["action"] == "skipped"
+      assert row.execution_result["reason"] == "no_api_key"
     end
   end
 end

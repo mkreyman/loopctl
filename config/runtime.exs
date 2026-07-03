@@ -198,22 +198,12 @@ if config_env() == :prod do
     }
   end
 
-  # Anthropic provider for knowledge extraction (content ingestion + review extraction)
-  if anthropic_key = System.get_env("ANTHROPIC_API_KEY") do
-    config :loopctl, :anthropic_provider, %{
-      api_key: anthropic_key,
-      base_url: System.get_env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com/v1",
-      model: System.get_env("ANTHROPIC_EXTRACTION_MODEL") || "claude-haiku-4-5-20251001"
-    }
-  end
-
-  # Optional override for the reclassification classifier model, independent of
-  # the extraction model above. Set ANTHROPIC_CLASSIFIER_MODEL to e.g. a Sonnet id
-  # for a higher-accuracy one-time 77k reclassification; unset = the shared
-  # provider model (Haiku).
-  if classifier_model = System.get_env("ANTHROPIC_CLASSIFIER_MODEL") do
-    config :loopctl, :knowledge_classifier_model, classifier_model
-  end
+  # NOTE (Epic 28, #179): the global `:anthropic_provider` / `:knowledge_classifier_model`
+  # config keys were REMOVED. Tenant knowledge-LLM work (content extraction,
+  # classification, merge synthesis, review extraction) now resolves each tenant's
+  # OWN Anthropic key + per-operation model via `Loopctl.Llm.resolve/2` (mandatory
+  # BYO — no global-system-key fallback). There is intentionally no global
+  # ANTHROPIC_API_KEY path for tenant LLM work.
 
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

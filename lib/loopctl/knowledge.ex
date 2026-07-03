@@ -3545,6 +3545,20 @@ defmodule Loopctl.Knowledge do
   end
 
   defp apply_merge(tenant_id, %ConflictResolution{} = r) do
+    # Mandatory BYO (Epic 28, #179): merge synthesis runs on the tenant's OWN
+    # Anthropic key. Without one, DON'T silently retry every run — mark the
+    # resolution executed with a DISTINCT, queryable "skipped/no_api_key" marker
+    # (not a false "merged" state) and record the block (review #10).
+    if Loopctl.Llm.has_api_key?(tenant_id) do
+      merge_source_articles(tenant_id, r)
+    else
+      Loopctl.Llm.record_blocked(tenant_id, :merge)
+      mark_resolution_executed(r, %{"action" => "skipped", "reason" => "no_api_key"})
+      false
+    end
+  end
+
+  defp merge_source_articles(tenant_id, %ConflictResolution{} = r) do
     a = AdminRepo.get_by(Article, id: r.source_article_id, tenant_id: tenant_id)
     b = AdminRepo.get_by(Article, id: r.target_article_id, tenant_id: tenant_id)
 

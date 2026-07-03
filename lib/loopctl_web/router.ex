@@ -119,9 +119,10 @@ defmodule LoopctlWeb.Router do
     patch "/tenants/me", TenantController, :update
 
     # Per-tenant BYO Anthropic LLM config (Epic 28 residual, #179). Role :user —
-    # the PUT stores a tenant secret (enforced by the controller's RequireRole).
+    # the PATCH stores a tenant secret (enforced by the controller's RequireRole).
+    # PATCH (partial-merge) mirrors the sibling PATCH /tenants/me.
     get "/tenants/me/llm-config", LlmConfigController, :show
-    put "/tenants/me/llm-config", LlmConfigController, :update
+    patch "/tenants/me/llm-config", LlmConfigController, :update
     post "/tenants/:id/rotate-audit-key/challenge", TenantAuditKeyController, :challenge
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
     post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap

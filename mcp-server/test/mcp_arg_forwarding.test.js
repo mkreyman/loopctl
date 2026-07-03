@@ -153,11 +153,11 @@ describe("#179 BYO LLM: knowledge_llm_usage pagination (real llmUsagePath)", () 
 });
 
 describe("#179 BYO LLM: llm_config / set_llm_config use the USER key", () => {
-  test("llm_config GETs the config on the user key", () => {
+  test("llm_config GETs the config with the EXACT user key (review #12)", () => {
     assert.match(
       INDEX_SRC,
-      /async function llmConfig\(\) \{[\s\S]*?"\/api\/v1\/tenants\/me\/llm-config"[\s\S]*?LOOPCTL_USER_KEY/,
-      "llmConfig must GET /tenants/me/llm-config on the user key (it touches a secret)",
+      /async function llmConfig\(\) \{[\s\S]*?"\/api\/v1\/tenants\/me\/llm-config"[\s\S]*?LOOPCTL_USER_KEY[\s\S]*?exactKey: true/,
+      "llmConfig must GET /tenants/me/llm-config with the EXACT user key (exactKey:true)",
     );
     assert.match(
       INDEX_SRC,
@@ -166,16 +166,26 @@ describe("#179 BYO LLM: llm_config / set_llm_config use the USER key", () => {
     );
   });
 
-  test("set_llm_config PUTs on the user key and forwards api_key + models", () => {
+  test("set_llm_config PATCHes with the EXACT user key (review #12, #13)", () => {
     assert.match(
       INDEX_SRC,
-      /async function setLlmConfig\(\{[\s\S]*?"PUT",\s*\n\s*"\/api\/v1\/tenants\/me\/llm-config",[\s\S]*?LOOPCTL_USER_KEY/,
-      "setLlmConfig must PUT /tenants/me/llm-config on the user key",
+      /async function setLlmConfig\(\{[\s\S]*?"PATCH",\s*\n\s*"\/api\/v1\/tenants\/me\/llm-config",[\s\S]*?LOOPCTL_USER_KEY[\s\S]*?exactKey: true/,
+      "setLlmConfig must PATCH /tenants/me/llm-config with the EXACT user key (exactKey:true)",
     );
     assert.match(
       INDEX_SRC,
       /case "set_llm_config":\s*\n\s*return await setLlmConfig\(args\);/,
       "the set_llm_config dispatch case must call setLlmConfig(args)",
+    );
+  });
+
+  test("apiCall exactKey mode bypasses the global LOOPCTL_API_KEY override", () => {
+    // exactKey:true must use the passed key verbatim (not resolveKey), so a secret
+    // op never runs under a non-user global override (review #12).
+    assert.match(
+      INDEX_SRC,
+      /const key = exactKey \? keyOverride : resolveKey\(keyOverride\);/,
+      "apiCall must use the exact key (not resolveKey) when exactKey is true",
     );
   });
 });

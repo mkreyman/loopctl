@@ -52,7 +52,10 @@ defmodule Loopctl.Llm.TenantLlmSettings do
   @spec models_changeset(t(), map()) :: Ecto.Changeset.t()
   def models_changeset(settings, attrs) do
     settings
-    |> cast(attrs, @model_fields)
+    # Cast ONLY the model fields — never let the raw api_key transit through
+    # `cast/3` into `changeset.params` (review #15), where it could surface in a
+    # logged/rendered changeset. The key is set separately via put_api_key/2.
+    |> cast(model_attrs(attrs), @model_fields)
     |> validate_models()
     # A concurrent first-insert race yields a clean {:error, changeset} (422)
     # instead of an Ecto.ConstraintError (500) on the unique tenant_id index.
@@ -84,6 +87,15 @@ defmodule Loopctl.Llm.TenantLlmSettings do
 
   def put_api_key(changeset, _other),
     do: add_error(changeset, :api_key, "must be a string")
+
+  # Keep ONLY the model fields (string- or atom-keyed) so the api_key can never
+  # reach `cast/3`/`changeset.params` (review #15).
+  @model_string_keys Enum.map(@model_fields, &Atom.to_string/1)
+  defp model_attrs(attrs) when is_map(attrs) do
+    Map.take(attrs, @model_fields ++ @model_string_keys)
+  end
+
+  defp model_attrs(_), do: %{}
 
   defp validate_models(changeset) do
     Enum.reduce(@model_fields, changeset, fn field, acc ->

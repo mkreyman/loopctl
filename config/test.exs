@@ -97,7 +97,13 @@ config :loopctl, :heavy_read_repo, Loopctl.AdminRepo
 #     asserts a :change_feed timeout, so this override cannot mask a real one.
 config :loopctl, :heavy_read_statement_timeout_overrides, %{
   suggested_links: 5_000,
-  change_feed: 5_000
+  change_feed: 5_000,
+  # Epic 28 (#179): the per-tenant LLM usage summary (GET /knowledge/llm-usage)
+  # routes through HeavyRead. On the small sandbox dataset it's sub-ms, but a
+  # generous 5s override keeps it from tripping the aggressive 250ms pool default
+  # under parallel contention (same rationale as :change_feed). No test asserts an
+  # :llm_usage timeout, so this cannot mask a real one.
+  llm_usage: 5_000
 }
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).

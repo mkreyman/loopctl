@@ -165,6 +165,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     if Llm.has_api_key?(tenant_id) do
       :ok
     else
+      Llm.record_blocked(tenant_id, :extraction)
       {:discard, {:no_api_key, "tenant has no Anthropic API key configured (BYO required)"}}
     end
   end
