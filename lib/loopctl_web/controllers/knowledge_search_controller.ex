@@ -20,6 +20,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
+  alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -400,7 +401,8 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp validate_mode(_), do: {:ok, "combined"}
 
   defp build_opts(params) do
-    with {:ok, category} <- validate_category(params["category"]),
+    with :ok <- ProjectId.validate(params["project_id"]),
+         {:ok, category} <- validate_category(params["category"]),
          {:ok, match} <- TagMatch.parse(params) do
       opts =
         []

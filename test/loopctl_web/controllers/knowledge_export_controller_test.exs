@@ -435,4 +435,81 @@ defmodule LoopctlWeb.KnowledgeExportControllerTest do
              )
     end
   end
+
+  describe "GET /api/v1/knowledge/export project_id validation (kbweb-01)" do
+    test "a malformed project_id returns 422 BEFORE any chunked body commits a 200", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/export", %{project_id: "not-a-uuid"})
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+      assert body["error"]["message"] =~ "project_id"
+    end
+
+    test "a valid project_id streams a 200 archive scoped to that project", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        title: "Scoped Export Pattern",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/export", %{project_id: project.id})
+
+      assert conn.status == 200
+      files = export_files(conn)
+      assert has_slug?(files, "pattern/scoped-export-pattern")
+    end
+
+    test "an absent project_id streams a 200 tenant-wide archive", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Tenant Wide Export",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/export")
+
+      assert conn.status == 200
+      files = export_files(conn)
+      assert has_slug?(files, "pattern/tenant-wide-export")
+    end
+
+    test "the project-scoped path with a malformed project_id returns 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/projects/not-a-uuid/knowledge/export")
+
+      body = json_response(conn, 422)
+      assert body["error"]["message"] =~ "project_id"
+    end
+  end
 end

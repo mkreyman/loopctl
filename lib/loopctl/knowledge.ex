@@ -4966,7 +4966,16 @@ defmodule Loopctl.Knowledge do
   defp maybe_filter_by_project_id(query, nil), do: query
 
   defp maybe_filter_by_project_id(query, project_id) do
-    where(query, [a], a.project_id == ^project_id)
+    # Defense in depth: `project_id` is a `:binary_id` column, so a non-UUID
+    # value would make `Ecto.UUID.dump/1` fail and raise `Ecto.Query.CastError`
+    # (an unhandled 500). Callers validate at the API boundary and 422 first, but
+    # a malformed value reaching here must not crash — treat it as "matches
+    # nothing", consistent with a valid-but-nonexistent project.
+    if valid_uuid?(project_id) do
+      where(query, [a], a.project_id == ^project_id)
+    else
+      where(query, [a], false)
+    end
   end
 
   defp maybe_filter_by_category(query, nil), do: query
@@ -5930,11 +5939,21 @@ defmodule Loopctl.Knowledge do
   end
 
   defp published_base_query(tenant_id, project_id) do
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id,
-      where: a.status == :published,
-      where: is_nil(a.project_id) or a.project_id == ^project_id
-    )
+    base =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published
+      )
+
+    # Defense in depth: a non-UUID project_id would raise Ecto.Query.CastError on
+    # the `== ^project_id` binary_id comparison. Callers 422 before reaching here;
+    # a malformed value that slips through scopes to tenant-wide articles only
+    # (nil project) rather than crashing.
+    if valid_uuid?(project_id) do
+      where(base, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+    else
+      where(base, [a], is_nil(a.project_id))
+    end
   end
 
   defp find_stale_articles(base, stale_days) do

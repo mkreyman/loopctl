@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeContextController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
@@ -132,7 +133,8 @@ defmodule LoopctlWeb.KnowledgeContextController do
     api_key_id = conn.assigns.current_api_key.id
     role = conn.assigns.current_api_key.role
 
-    with {:ok, query} <- validate_query(params) do
+    with :ok <- ProjectId.validate(params["project_id"]),
+         {:ok, query} <- validate_query(params) do
       opts =
         params
         |> build_opts(role)

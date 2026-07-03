@@ -20,6 +20,7 @@ defmodule LoopctlWeb.ArticleController do
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -451,7 +452,8 @@ defmodule LoopctlWeb.ArticleController do
 
     # Validate enum-typed filters up front: an unknown value is a client error
     # (400 with the allowed values), not a 404/500 from an Ecto.Enum cast failure.
-    with :ok <- validate_enum(params["status"], @valid_statuses, "status"),
+    with :ok <- ProjectId.validate(params["project_id"]),
+         :ok <- validate_enum(params["status"], @valid_statuses, "status"),
          :ok <- validate_enum(params["category"], @valid_categories, "category"),
          {:ok, effective_limit} <- Pagination.validate_limit(params),
          {:ok, match} <- TagMatch.parse(params) do
@@ -475,6 +477,12 @@ defmodule LoopctlWeb.ArticleController do
       result = Knowledge.list_articles(tenant_id, opts)
       json(conn, ArticleJSON.index(%{articles: result.data, meta: result.meta}))
     else
+      # ProjectId.validate/1 returns {:error, :unprocessable_entity, message};
+      # delegate it to the FallbackController (422). Matched before the enum
+      # clause below because that one also has a 3-element error shape.
+      {:error, :unprocessable_entity, _message} = error ->
+        error
+
       {:error, field, allowed} ->
         conn
         |> put_status(:bad_request)

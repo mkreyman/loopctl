@@ -473,12 +473,25 @@ defmodule Loopctl.Knowledge.StreamingExport do
   def base_query(tenant_id, project_id) do
     query = from(a in Article, where: a.tenant_id == ^tenant_id and a.status == :published)
 
-    if project_id do
-      where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
-    else
-      query
+    cond do
+      is_nil(project_id) ->
+        query
+
+      # Defense in depth: `project_id` is a `:binary_id` column, so a non-UUID
+      # value would raise Ecto.Query.CastError on the `== ^project_id` comparison
+      # — and here it would do so AFTER `send_chunked` already committed a 200,
+      # truncating the archive. The controller 422s before streaming; a malformed
+      # value that still reaches here scopes to tenant-wide articles only.
+      valid_uuid?(project_id) ->
+        where(query, [a], is_nil(a.project_id) or a.project_id == ^project_id)
+
+      true ->
+        where(query, [a], is_nil(a.project_id))
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   # The `(inserted_at, id)` keyset seek, shared with the article/index/change-feed
   # keysets via Loopctl.KeysetSeek (the load-bearing type/2 annotations live there).
