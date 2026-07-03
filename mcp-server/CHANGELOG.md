@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.30.1 — 2026-07-02 (arg-forwarding + apiCall robustness fixes)
+
+### Fixed
+
+- **`list_projects`** now forwards `page`/`page_size` (#247, mcp-01). The dispatch
+  called `listProjects()` with no arguments, so the pagination the tool schema
+  advertised was silently dropped — a caller asking for `page: 2` always got page 1.
+- **`knowledge_ingestion_jobs`** now forwards `limit`/`offset`/`since_days` (#248,
+  mcp-02). Same dropped-args class as mcp-01: the dispatch called the handler with no
+  arguments, so pagination and the recency window were ignored.
+- **`apiCall`** no longer throws on a malformed JSON body (#249, mcp-03). A response
+  carrying `Content-Type: application/json` but an empty or truncated body (e.g. a
+  transient Fly edge 502/503) made the unguarded `response.json()` throw an unhandled
+  exception. The parse is now wrapped so a bad body becomes a structured MCP error
+  (`{ error: true, status, body }`) with the HTTP status and a raw-body snippet.
+
 ## 2.30.0 — 2026-07-01 (toggleable KB curation log)
 
 ### Added
