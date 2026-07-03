@@ -236,6 +236,17 @@ defmodule Loopctl.TokenUsage.Analytics do
   """
   @spec project_metrics(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, map()} | {:error, :not_found}
   def project_metrics(tenant_id, project_id) do
+    if valid_uuid?(project_id) do
+      compute_project_metrics(tenant_id, project_id)
+    else
+      # `project_id` is a :binary_id column; a non-UUID path segment would raise
+      # Ecto.Query.CastError (an unhandled 500) on the existence check below. A
+      # malformed value is a clean :not_found (-> 404), matching Projects.get_project.
+      {:error, :not_found}
+    end
+  end
+
+  defp compute_project_metrics(tenant_id, project_id) do
     # Verify project exists
     project_query =
       from(p in Loopctl.Projects.Project,
@@ -632,15 +643,29 @@ defmodule Loopctl.TokenUsage.Analytics do
 
   defp apply_project_filter(query, opts) do
     case Keyword.get(opts, :project_id) do
-      nil -> query
-      pid -> where(query, [r], r.project_id == ^pid)
+      nil ->
+        query
+
+      pid ->
+        # Defense in depth: a non-UUID :binary_id value would raise
+        # Ecto.Query.CastError (500). Callers 422 at the boundary; a malformed
+        # value here matches nothing rather than crashing.
+        if valid_uuid?(pid) do
+          where(query, [r], r.project_id == ^pid)
+        else
+          where(query, [r], false)
+        end
     end
   end
 
   defp maybe_filter_epic_project(query, nil), do: query
 
   defp maybe_filter_epic_project(query, project_id) do
-    where(query, [e], e.project_id == ^project_id)
+    if valid_uuid?(project_id) do
+      where(query, [e], e.project_id == ^project_id)
+    else
+      where(query, [e], false)
+    end
   end
 
   # Batch-fetch primary model per agent by total token count (AC-21.4.1).
@@ -1118,10 +1143,23 @@ defmodule Loopctl.TokenUsage.Analytics do
 
   defp apply_model_project_filter(query, opts) do
     case Keyword.get(opts, :project_id) do
-      nil -> query
-      pid -> where(query, [r, _s], r.project_id == ^pid)
+      nil ->
+        query
+
+      pid ->
+        # Defense in depth: a non-UUID :binary_id value would raise
+        # Ecto.Query.CastError (500). Callers 422 at the boundary; a malformed
+        # value here matches nothing rather than crashing.
+        if valid_uuid?(pid) do
+          where(query, [r, _s], r.project_id == ^pid)
+        else
+          where(query, [r, _s], false)
+        end
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp apply_model_agent_filter(query, opts) do
     case Keyword.get(opts, :agent_id) do

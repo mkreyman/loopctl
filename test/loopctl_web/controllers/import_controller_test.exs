@@ -452,4 +452,31 @@ defmodule LoopctlWeb.ImportControllerTest do
       assert story.reported_done_at != nil
     end
   end
+
+  describe "GET /api/v1/projects/:id/export project_id hardening" do
+    test "malformed project_id path segment returns 404, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/not-a-uuid/export")
+
+      assert json_response(conn, 404)
+    end
+
+    test "valid project_id exports normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/#{project.id}/export")
+
+      assert json_response(conn, 200)
+    end
+  end
 end

@@ -180,4 +180,82 @@ defmodule LoopctlWeb.SkillControllerTest do
       assert body["version"]["prompt_text"] == "V1 prompt"
     end
   end
+
+  describe "skills project_id hardening" do
+    test "POST /skills with malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills", %{
+          "name" => "loopctl:x",
+          "prompt_text" => "p",
+          "project_id" => "not-a-uuid"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "POST /skills with valid project_id creates (201)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills", %{
+          "name" => "loopctl:y",
+          "prompt_text" => "p",
+          "project_id" => project.id
+        })
+
+      body = json_response(conn, 201)
+      assert body["skill"]["project_id"] == project.id
+    end
+
+    test "GET /skills with malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills?project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "GET /skills with valid project_id filters normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:skill, %{tenant_id: tenant.id, project_id: project.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills?project_id=#{project.id}")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 1
+    end
+
+    test "GET /skills absent project_id lists normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:skill, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills")
+
+      assert json_response(conn, 200)
+    end
+  end
 end

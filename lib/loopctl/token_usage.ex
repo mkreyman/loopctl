@@ -1600,10 +1600,21 @@ defmodule Loopctl.TokenUsage do
   defp apply_anomaly_filter(query, :project_id, "", _tenant_id), do: query
 
   defp apply_anomaly_filter(query, :project_id, project_id, _tenant_id) do
-    query
-    |> join(:inner, [a], s in Story, on: a.story_id == s.id)
-    |> where([_a, s], s.project_id == ^project_id)
+    # `project_id` is a :binary_id column; a non-UUID value would raise
+    # Ecto.Query.CastError (an unhandled 500). Callers validate at the API
+    # boundary and 422 first, but a malformed value reaching here must not
+    # crash — treat it as "matches nothing" (defense in depth).
+    if valid_uuid?(project_id) do
+      query
+      |> join(:inner, [a], s in Story, on: a.story_id == s.id)
+      |> where([_a, s], s.project_id == ^project_id)
+    else
+      where(query, [a], false)
+    end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp format_anomaly(%CostAnomaly{} = anomaly) do
     story_title =

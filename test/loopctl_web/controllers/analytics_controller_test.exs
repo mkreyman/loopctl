@@ -445,4 +445,95 @@ defmodule LoopctlWeb.AnalyticsControllerTest do
       assert body["data"] == []
     end
   end
+
+  describe "analytics project_id hardening" do
+    test "GET /analytics/agents malformed project_id returns 422, not 500", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.orch_key)
+        |> get(~p"/api/v1/analytics/agents?project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "GET /analytics/agents valid project_id filters normally (200)", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.orch_key)
+        |> get(~p"/api/v1/analytics/agents?project_id=#{ctx.project.id}")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /analytics/agents absent project_id lists normally (200)", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.orch_key)
+        |> get(~p"/api/v1/analytics/agents")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /analytics/epics malformed project_id returns 422, not 500", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/analytics/epics?project_id=not-a-uuid")
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "GET /analytics/models malformed project_id returns 422, not 500", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/analytics/models?project_id=not-a-uuid")
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "GET /analytics/model-mix non-string project_id[] is tolerated (no 500)", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.orch_key)
+        |> get("/api/v1/analytics/model-mix?project_id[]=x")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /analytics/projects/:id malformed path segment returns 404, not 500", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/analytics/projects/not-a-uuid")
+
+      assert json_response(conn, 404)
+    end
+
+    test "GET /analytics/projects/:id valid project returns 200", %{conn: conn} do
+      ctx = setup_analytics_context()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/analytics/projects/#{ctx.project.id}")
+
+      assert json_response(conn, 200)
+    end
+  end
 end

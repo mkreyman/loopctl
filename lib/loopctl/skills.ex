@@ -708,7 +708,21 @@ defmodule Loopctl.Skills do
   end
 
   defp filter_project_id(query, nil), do: query
-  defp filter_project_id(query, id), do: where(query, [s], s.project_id == ^id)
+
+  defp filter_project_id(query, id) do
+    # `project_id` is a :binary_id column; a non-UUID value would raise
+    # Ecto.Query.CastError (an unhandled 500). Callers validate at the API
+    # boundary and 422 first, but a malformed value reaching here must not
+    # crash — treat it as "matches nothing" (defense in depth).
+    if valid_uuid?(id) do
+      where(query, [s], s.project_id == ^id)
+    else
+      where(query, [s], false)
+    end
+  end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp filter_status(query, nil), do: query
 

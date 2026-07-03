@@ -204,6 +204,17 @@ defmodule Loopctl.WorkBreakdown.Queries do
   @spec get_dependency_graph(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, map()} | {:error, :not_found}
   def get_dependency_graph(tenant_id, project_id) do
+    if valid_uuid?(project_id) do
+      build_dependency_graph(tenant_id, project_id)
+    else
+      # `project_id` is a :binary_id column; a non-UUID path segment would raise
+      # Ecto.Query.CastError (an unhandled 500) on the existence check below. A
+      # malformed value is a clean :not_found (-> 404), matching Projects.get_project.
+      {:error, :not_found}
+    end
+  end
+
+  defp build_dependency_graph(tenant_id, project_id) do
     # Verify the project exists
     project_exists =
       from(p in Project,
@@ -278,11 +289,27 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
   defp apply_project_filter(query, opts) do
     case Keyword.get(opts, :project_id) do
-      nil -> query
-      "" -> query
-      project_id -> where(query, [s], s.project_id == ^project_id)
+      nil ->
+        query
+
+      "" ->
+        query
+
+      project_id ->
+        # `project_id` is a :binary_id column; a non-UUID value would raise
+        # Ecto.Query.CastError (an unhandled 500). Callers validate at the API
+        # boundary and 422 first, but a malformed value reaching here must not
+        # crash — treat it as "matches nothing" (defense in depth).
+        if valid_uuid?(project_id) do
+          where(query, [s], s.project_id == ^project_id)
+        else
+          where(query, [s], false)
+        end
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp apply_epic_filter(query, opts) do
     case Keyword.get(opts, :epic_id) do

@@ -368,7 +368,22 @@ defmodule Loopctl.Audit do
   defp filter_by(query, :action, val), do: where(query, [a], a.action == ^val)
   defp filter_by(query, :actor_type, val), do: where(query, [a], a.actor_type == ^val)
   defp filter_by(query, :actor_id, val), do: where(query, [a], a.actor_id == ^val)
-  defp filter_by(query, :project_id, val), do: where(query, [a], a.project_id == ^val)
+
+  defp filter_by(query, :project_id, val) do
+    # `project_id` is a :binary_id column; a non-UUID value would make
+    # Ecto.UUID.dump/1 fail and raise Ecto.Query.CastError (an unhandled 500).
+    # Callers validate at the API boundary and 422 first, but a malformed value
+    # reaching here must not crash — treat it as "matches nothing", consistent
+    # with a valid-but-nonexistent project (defense in depth).
+    if valid_uuid?(val) do
+      where(query, [a], a.project_id == ^val)
+    else
+      where(query, [a], false)
+    end
+  end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp filter_from(query, nil), do: query
   defp filter_from(query, from), do: where(query, [a], a.inserted_at >= ^from)

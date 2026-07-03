@@ -11,6 +11,7 @@ defmodule LoopctlWeb.AuditController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Audit
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -49,7 +50,8 @@ defmodule LoopctlWeb.AuditController do
   project_id, from, to, page, page_size.
   """
   def index(conn, params) do
-    with {:ok, tenant_id} <- require_tenant(conn) do
+    with {:ok, tenant_id} <- require_tenant(conn),
+         :ok <- ProjectId.validate(params["project_id"]) do
       opts =
         []
         |> maybe_put(:entity_type, params["entity_type"])
