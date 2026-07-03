@@ -435,10 +435,12 @@ network (`fly.toml [metrics]`). The series appear in **`fly-metrics.net` Grafana
 > **Scope (AC-27.15.4 — USER-signed-off):** metric emission + the Prometheus reporter +
 > the **ScaleAlerts firing webhook** ship in this story. The PromQL expressions below are
 > **query bodies** for an **OPTIONAL self-hosted** Grafana/Alertmanager (they require your
-> own Grafana — fly-metrics.net cannot install or run them). Bespoke Grafana **dashboard
-> JSON** + an external **Alertmanager** wiring are a recorded **backlog follow-up** —
-> tracked in **GitHub issue #196**, not silently dropped. loopctl has no Sentry; the
-> ScaleAlerts webhook is the durable firing signal. To inspect `/metrics` locally, set
+> own Grafana — fly-metrics.net cannot install or run them). The bespoke Grafana
+> **dashboard JSON** (issue #196) now ships as
+> [`docs/observability/scale-metrics-dashboard.json`](../observability/scale-metrics-dashboard.md)
+> (import into fly-metrics.net Grafana — **visualization only**); an external
+> **Alertmanager** wiring remains an optional self-hosted follow-up. loopctl has no Sentry;
+> the ScaleAlerts webhook is the durable firing signal. To inspect `/metrics` locally, set
 > `config :loopctl, :metrics_reporter_enabled, true` in `config/dev.exs`.
 
 ### Surface & security
