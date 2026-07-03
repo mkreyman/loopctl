@@ -1,191 +1,185 @@
 defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
   @moduledoc """
-  US-27.14 / TC-27.14.1 — integration test for the HNSW index-name reconcile.
+  US-27.14 / TC-27.14.1 — behaviour test for the HNSW index-name reconcile.
 
-  Exercises the REAL migration modules (`AddEmbeddingHnswIndex` and
-  `ReconcileHnswIndexName`) against the live AdminRepo connection, proving:
+  Exercises the capability-based (`amname = 'hnsw'`) detection / create / drop /
+  reconcile SQL that the two HNSW migrations run — `AddEmbeddingHnswIndex`
+  (`up`/`down`) and `ReconcileHnswIndexName` (`up`) — proving:
 
-    * the OLD migration's fixed `down/0` drops WHICHEVER hnsw index is present
-      (by `amname='hnsw'`, not a hard-coded name) — so a rollback against a DB
-      where the index lives under a non-migration name (prod's
-      `articles_embedding_hnsw_idx`, or any out-of-band name) actually drops it
-      instead of silently no-opping; and
-    * the reconcile migration is idempotent and renames any non-canonical hnsw
-      index up to the canonical `articles_embedding_hnsw_idx`.
+    * the drop-step drops WHICHEVER hnsw index is present (by `amname='hnsw'`,
+      not a hard-coded name), and drops ALL of them (never `LIMIT 1`), so a
+      rollback against a DB where the index lives under a non-migration name
+      leaves none orphaned;
+    * the create-step is capability-guarded — with any hnsw index already
+      present it does NOT create a second, redundant one;
+    * the reconcile step is idempotent and renames any non-canonical hnsw index
+      up to the canonical `<table>_embedding_hnsw_idx`; and
+    * the tightened idempotency guard matches only an hnsw index of the
+      canonical NAME, so an unrelated relation squatting that name cannot
+      short-circuit reconciliation — the RENAME instead surfaces the conflict.
 
-  Runs inside the SQL sandbox transaction so the index DDL it performs is
-  fully rolled back at the end of each test, leaving the shared test DB's
-  canonical index intact for every other test (the index DDL here is
-  non-concurrent, so it runs happily inside a transaction). It does NOT touch
-  `schema_migrations`; it invokes the migration modules' `up/0` / `down/0`
-  directly via `Ecto.Migration.Runner.run/8`.
+  ## Isolation — no shared global state
 
-  Scope of what this exercises: `Runner.run/8` starts the runner Agent and
-  calls `perform_operation/3` — it executes the migrations' SQL and detection
-  logic, which is what this test validates. It does NOT manage transactions or
-  consult `@disable_ddl_transaction` / `@disable_migration_lock`; that logic
-  lives one layer up in `Ecto.Migrator.run_maybe_in_transaction/4`, which this
-  test deliberately bypasses. Consequently the old `AddEmbeddingHnswIndex`
-  migration's `@disable_ddl_transaction true` is NOT honored here: its DDL runs
-  on the sandbox connection INSIDE the test transaction (which is exactly what
-  makes the test safe and self-cleaning), rather than outside a transaction as
-  it would under the real migrator. This test therefore proves the SQL /
-  detection behavior, not the disable-ddl-transaction behavior.
+  This SQL is the single source of truth in `Loopctl.Repo.HnswIndex`,
+  parameterized by table name. The production migrations call it with
+  `"articles"` (targeting the live, shared `articles_embedding_hnsw_idx`); this
+  test calls it against a PER-TEST, UNIQUELY-NAMED THROWAWAY table it creates in
+  its own sandbox transaction. Index DDL — unlike row data — is NOT isolated by
+  the Ecto SQL sandbox at the object level, so a test that dropped / renamed the
+  shared `articles_embedding_hnsw_idx` would be mutating global state that every
+  other embedding test depends on. Operating on a throwaway table removes that
+  coupling entirely: the CREATE/DROP/RENAME here only ever touch this test's own
+  object, so the test is `async: true` and can never race the async embedding
+  tests over the canonical index. (An empty throwaway table also builds its
+  hnsw index instantly, so there is no multi-second index-build timing race.)
 
-  `async: false` because it mutates a shared, table-level index whose name
-  other (async) tests assert on — the sandbox isolates the data, but the
-  index rename must not race those assertions.
+  The two migration modules are thin `execute(Loopctl.Repo.HnswIndex.<...>)`
+  wrappers over the exact SQL exercised here; their production path against
+  `public.articles` is smoke-covered every run by `mix ecto.reset` (which runs
+  the real migrations) and by `Loopctl.KnowledgeEmbeddingTest`, which asserts the
+  canonical index exists on `articles`.
   """
-  use ExUnit.Case, async: false
-
-  # Building a real HNSW index (CREATE INDEX ... USING hnsw) over the test corpus
-  # legitimately takes ~60-70s on a loaded machine — over ExUnit's 60s default — which
-  # intermittently RED-flaked `mix precommit` and the CI Test job. Give the index DDL
-  # ample headroom so this is a deterministic pass, not a timing race. (Test-infra only.)
-  @moduletag timeout: :timer.minutes(5)
+  use ExUnit.Case, async: true
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
-
-  # Migration files in priv/repo/migrations are not compiled into the app, so
-  # load the two we exercise by path (idempotent — guarded against re-loading
-  # when the test module is recompiled).
-  @migrations_path "priv/repo/migrations"
-  unless Code.ensure_loaded?(Loopctl.Repo.Migrations.AddEmbeddingHnswIndex) do
-    Code.require_file("#{@migrations_path}/20260410022906_add_embedding_hnsw_index.exs")
-  end
-
-  unless Code.ensure_loaded?(Loopctl.Repo.Migrations.ReconcileHnswIndexName) do
-    Code.require_file("#{@migrations_path}/20260624120000_reconcile_hnsw_index_name.exs")
-  end
-
-  alias Loopctl.Repo.Migrations.AddEmbeddingHnswIndex
-  alias Loopctl.Repo.Migrations.ReconcileHnswIndexName
-
-  @canonical "articles_embedding_hnsw_idx"
-  @noncanonical "articles_embedding_idx"
+  alias Loopctl.Repo.HnswIndex
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo, shared: true)
+    pid = Sandbox.start_owner!(AdminRepo, shared: false)
     on_exit(fn -> Sandbox.stop_owner(pid) end)
-    :ok
+
+    # A per-test, uniquely-named throwaway table with a pgvector embedding
+    # column. Created inside this test's sandbox transaction, so it is invisible
+    # to every other test and rolled back on exit — nothing to drop explicitly.
+    table = "hnsw_reconcile_test_#{System.unique_integer([:positive])}"
+
+    AdminRepo.query!("CREATE TABLE #{table} (id bigserial PRIMARY KEY, embedding vector(1536))")
+
+    %{
+      table: table,
+      migration: HnswIndex.migration_index_name(table),
+      canonical: HnswIndex.canonical_index_name(table)
+    }
   end
 
-  defp hnsw_index_names do
+  # Names of all hnsw-access-method indexes on `table`, schema-qualified to public.
+  defp hnsw_index_names(table) do
     AdminRepo.query!("""
     SELECT i.relname
     FROM pg_index x
     JOIN pg_class i ON i.oid = x.indexrelid
     JOIN pg_class t ON t.oid = x.indrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
     JOIN pg_am    am ON am.oid = i.relam
-    WHERE t.relname = 'articles' AND am.amname = 'hnsw'
+    WHERE t.relname = '#{table}' AND n.nspname = 'public' AND am.amname = 'hnsw'
     """).rows
     |> List.flatten()
   end
 
-  defp run_migration(module, op) do
-    Runner.run(AdminRepo, [], 0, module, :forward, op, op, log: false)
+  defp create_hnsw_index(table, name) do
+    AdminRepo.query!("CREATE INDEX #{name} ON #{table} USING hnsw (embedding vector_cosine_ops)")
   end
 
-  test "down-migration drops the actually-present HNSW index (non-migration name)" do
-    # Precondition: a DB where the hnsw index exists under a NON-migration
-    # name — i.e. exactly prod's situation. Rename the canonical test index
-    # to a foreign name so the only hnsw index is not what the old migration
-    # hard-coded.
-    AdminRepo.query!("ALTER INDEX #{@canonical} RENAME TO articles_embedding_out_of_band_idx")
+  test "drop-step drops the actually-present HNSW index (non-migration name)", ctx do
+    %{table: table, migration: migration, canonical: canonical} = ctx
 
-    assert hnsw_index_names() == ["articles_embedding_out_of_band_idx"]
+    # An hnsw index present under an out-of-band name — exactly prod's situation
+    # (the live index was created outside the migration's name).
+    out_of_band = "#{table}_out_of_band_idx"
+    create_hnsw_index(table, out_of_band)
+    assert hnsw_index_names(table) == [out_of_band]
 
-    # The FIXED down-step must drop it by amname, not silently no-op on a
-    # hard-coded `articles_embedding_idx`.
-    run_migration(AddEmbeddingHnswIndex, :down)
+    # The amname-based drop must drop it, not no-op against a hard-coded name.
+    AdminRepo.query!(HnswIndex.drop_all_sql(table))
 
-    assert hnsw_index_names() == [],
-           "down-migration must drop the present hnsw index, not no-op against a foreign name"
+    assert hnsw_index_names(table) == [],
+           "drop-step must drop the present hnsw index, not no-op against a foreign name"
 
-    # And the up-step recreates it (under the old migration's name), which the
-    # reconcile migration then renames to the canonical name.
-    run_migration(AddEmbeddingHnswIndex, :up)
-    assert hnsw_index_names() == [@noncanonical]
+    # The create-step recreates it (under the old migration's name), which the
+    # reconcile step then renames to the canonical name.
+    AdminRepo.query!(HnswIndex.create_if_absent_sql(table))
+    assert hnsw_index_names(table) == [migration]
 
-    run_migration(ReconcileHnswIndexName, :up)
-    assert hnsw_index_names() == [@canonical]
+    AdminRepo.query!(HnswIndex.reconcile_sql(table))
+    assert hnsw_index_names(table) == [canonical]
   end
 
-  test "old up-step does not create a duplicate hnsw index from the prod drift state (AC-27.14.2)" do
-    # Reproduce prod's drift: the single hnsw index lives under the out-of-band
-    # name `articles_embedding_hnsw_idx`, NOT the migration's `articles_embedding_idx`.
-    assert hnsw_index_names() == [@canonical]
+  test "create-step does not create a duplicate hnsw index from the drift state (AC-27.14.2)",
+       ctx do
+    %{table: table, canonical: canonical} = ctx
 
-    # The amname-aware up-guard must see the existing hnsw index and SKIP, so
-    # no second redundant hnsw index is created. (The old name-based guard
-    # `indexname = 'articles_embedding_idx'` would have created a duplicate.)
-    run_migration(AddEmbeddingHnswIndex, :up)
+    # Drift state: the single hnsw index lives under the out-of-band canonical
+    # name, NOT the migration's `<table>_embedding_idx`.
+    create_hnsw_index(table, canonical)
+    assert hnsw_index_names(table) == [canonical]
 
-    assert hnsw_index_names() == [@canonical],
-           "up-step must not create a duplicate hnsw index when one already exists under a different name"
+    # The amname-aware create-guard must see the existing hnsw index and SKIP,
+    # so no second redundant hnsw index is created.
+    AdminRepo.query!(HnswIndex.create_if_absent_sql(table))
+
+    assert hnsw_index_names(table) == [canonical],
+           "create-step must not create a duplicate hnsw index when one already exists under a different name"
   end
 
-  test "down-step drops ALL hnsw indexes, leaving none orphaned (AC-27.14.2)" do
-    # Force the (normally unreachable) two-index state to prove the down-step
+  test "drop-step drops ALL hnsw indexes, leaving none orphaned (AC-27.14.2)", ctx do
+    %{table: table, migration: migration, canonical: canonical} = ctx
+
+    # Force the (normally unreachable) two-index state to prove the drop-step
     # iterates over every hnsw index rather than dropping only one (LIMIT 1).
-    AdminRepo.query!(
-      "CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops)"
-    )
+    create_hnsw_index(table, canonical)
+    create_hnsw_index(table, migration)
+    assert Enum.sort(hnsw_index_names(table)) == Enum.sort([canonical, migration])
 
-    assert Enum.sort(hnsw_index_names()) == Enum.sort([@canonical, @noncanonical])
+    AdminRepo.query!(HnswIndex.drop_all_sql(table))
 
-    run_migration(AddEmbeddingHnswIndex, :down)
-
-    assert hnsw_index_names() == [],
-           "down-step must drop every hnsw index, leaving none orphaned"
+    assert hnsw_index_names(table) == [],
+           "drop-step must drop every hnsw index, leaving none orphaned"
   end
 
-  test "reconcile migration renames a non-canonical hnsw index to the canonical name" do
-    # Simulate a fresh test DB: only the old migration's name is present.
-    AdminRepo.query!("ALTER INDEX #{@canonical} RENAME TO #{@noncanonical}")
-    assert hnsw_index_names() == [@noncanonical]
+  test "reconcile renames a non-canonical hnsw index to the canonical name", ctx do
+    %{table: table, migration: migration, canonical: canonical} = ctx
 
-    run_migration(ReconcileHnswIndexName, :up)
-    assert hnsw_index_names() == [@canonical]
+    # Fresh-DB shape: only the old migration's name is present.
+    create_hnsw_index(table, migration)
+    assert hnsw_index_names(table) == [migration]
+
+    AdminRepo.query!(HnswIndex.reconcile_sql(table))
+    assert hnsw_index_names(table) == [canonical]
   end
 
-  test "reconcile migration is idempotent — re-running it is a no-op" do
-    assert hnsw_index_names() == [@canonical]
+  test "reconcile is idempotent — re-running it is a no-op", ctx do
+    %{table: table, canonical: canonical} = ctx
+
+    create_hnsw_index(table, canonical)
+    assert hnsw_index_names(table) == [canonical]
 
     # Already canonical: first run is a no-op...
-    run_migration(ReconcileHnswIndexName, :up)
-    assert hnsw_index_names() == [@canonical]
+    AdminRepo.query!(HnswIndex.reconcile_sql(table))
+    assert hnsw_index_names(table) == [canonical]
 
     # ...and a second run is also a no-op (the guard short-circuits).
-    run_migration(ReconcileHnswIndexName, :up)
-    assert hnsw_index_names() == [@canonical]
+    AdminRepo.query!(HnswIndex.reconcile_sql(table))
+    assert hnsw_index_names(table) == [canonical]
   end
 
-  test "guard does not treat a non-hnsw object squatting the canonical name as 'already reconciled'" do
-    # Failure mode the tightened idempotency guard fixes: a bare
-    # `pg_class.relname = 'articles_embedding_hnsw_idx'` check matches ANY
-    # relation of that name (table, view, sequence, or an index of another AM)
-    # and RETURNs early, silently reporting success while the real hnsw index
-    # still sits under a non-canonical name — leaving the very drift this
-    # migration exists to remove.
-    #
-    # Set up exactly that: the real hnsw index lives under the non-canonical
-    # name, and an UNRELATED table squats the canonical name. Postgres puts
-    # tables and indexes in the same relation namespace, so reconciliation
-    # legitimately cannot complete (the RENAME target is occupied). The CORRECT
-    # behavior is to surface that conflict by raising — NOT to short-circuit at
-    # the guard and report a false success. The old bare-relname guard would
-    # have hidden the drift by returning early; the amname='hnsw' guard does
-    # not, so the migration proceeds to the RENAME and raises on the collision.
-    AdminRepo.query!("ALTER INDEX #{@canonical} RENAME TO #{@noncanonical}")
-    AdminRepo.query!("CREATE TABLE #{@canonical} (id int)")
+  test "guard does not treat a non-hnsw object squatting the canonical name as reconciled",
+       ctx do
+    %{table: table, migration: migration, canonical: canonical} = ctx
 
-    assert hnsw_index_names() == [@noncanonical]
+    # The real hnsw index lives under the non-canonical name, and an UNRELATED
+    # table squats the canonical name. Postgres puts tables and indexes in the
+    # same relation namespace, so the RENAME target is occupied and
+    # reconciliation legitimately cannot complete. The CORRECT behaviour is to
+    # surface that conflict by RAISING — not to short-circuit at the guard and
+    # report a false success (which a bare `relname` guard would have done).
+    create_hnsw_index(table, migration)
+    AdminRepo.query!("CREATE TABLE #{canonical} (id int)")
+
+    assert hnsw_index_names(table) == [migration]
 
     assert_raise Postgrex.Error, fn ->
-      run_migration(ReconcileHnswIndexName, :up)
+      AdminRepo.query!(HnswIndex.reconcile_sql(table))
     end
   end
 end

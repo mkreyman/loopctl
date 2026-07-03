@@ -38,6 +38,41 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.WorkBreakdown.StoryDependency
 
+  # Persistent-term key holding the VM-global :atomics counter that backs
+  # `next_story_number/0`. The counter is initialized once, single-threaded, in
+  # `test/test_helper.exs` before any (async) test runs — see that file.
+  @story_number_counter {__MODULE__, :story_number_counter}
+
+  @doc """
+  Returns a VM-globally-unique story `number` of the form `"MAJOR.MINOR"` where
+  both parts are non-negative integers `< 10000` (satisfying `Story`'s
+  number-format validation).
+
+  Every call returns a distinct `(MAJOR, MINOR)` pair, so fixture-generated
+  story numbers can never collide with one another *within any
+  `(tenant_id, project_id)`* — structurally eliminating the intermittent
+  `stories_tenant_id_project_id_number_index` fixture flake.
+
+  The old scheme (`number: "1.\#{rem(seq, 9999) + 1}"`) was non-injective: it
+  truncated an unbounded `System.unique_integer/1` into only 9999 minor buckets
+  under a fixed major of `1`. Two stories in the same project collided whenever
+  their seqs were congruent mod 9999 (or once a project exceeded 9999 stories),
+  and a default minor of `1` collided with any test that inserted an explicit
+  `"1.1"` in the same project.
+
+  `MAJOR` starts at `1000` and only advances every 9000 numbers, so generated
+  numbers never collide with the small, explicitly hard-coded numbers (`"1.1"`,
+  `"2.3"`, `"72.3"`, …) that individual tests insert directly. The pair space
+  covers 9000 × 9000 ≈ 81M distinct numbers — far beyond any suite.
+  """
+  @spec next_story_number() :: String.t()
+  def next_story_number do
+    n = :atomics.add_get(:persistent_term.get(@story_number_counter), 1, 1)
+    major = 1000 + div(n - 1, 9000)
+    minor = rem(n - 1, 9000) + 1
+    "#{major}.#{minor}"
+  end
+
   @doc """
   Builds a data map for the given type without database insertion.
   Useful for changeset tests and unit tests that don't need persistence.
@@ -176,12 +211,10 @@ defmodule Loopctl.Fixtures do
 
   def build(:story, attrs) do
     seq = System.unique_integer([:positive])
-    # Keep minor part under 10000 to satisfy sort_key validation
-    minor = rem(seq, 9999) + 1
 
     Map.merge(
       %{
-        number: "1.#{minor}",
+        number: next_story_number(),
         title: "Story #{seq}",
         description: "Test story description",
         acceptance_criteria: [],

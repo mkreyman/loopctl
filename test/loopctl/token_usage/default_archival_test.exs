@@ -73,11 +73,10 @@ defmodule Loopctl.TokenUsage.DefaultArchivalTest do
 
   defp repo_story(tenant_id, project_id, epic_id) do
     seq = System.unique_integer([:positive])
-    minor = rem(seq, 9999) + 1
 
     %Story{tenant_id: tenant_id, project_id: project_id, epic_id: epic_id}
     |> Story.create_changeset(%{
-      number: "1.#{minor}",
+      number: Loopctl.Fixtures.next_story_number(),
       title: "Story #{seq}",
       description: "test",
       acceptance_criteria: [],
