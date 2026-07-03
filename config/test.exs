@@ -120,6 +120,25 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
   # unaffected. The SCALE gate keeps the prod defaults. Config-based DI — no put_env.
   config :loopctl, :semantic_result_pool_floor, 2
   config :loopctl, :semantic_result_pool_cap, 5
+
+  # US-27.16: the streaming-export concurrency cap (`Loopctl.Knowledge.ExportConcurrency`).
+  # The GLOBAL cap (`:export_max_concurrent_global`, prod default 2 — sized to the heavy-read
+  # pool's export reservation) is a SINGLE VM-wide ETS counter shared by EVERY async test that
+  # makes a real export request. In the DEFAULT suite (max_cases ~24) three-plus incidental
+  # OKF/Obsidian export tests — each its OWN tenant, so the PER-TENANT cap of 1 is never the
+  # constraint — run concurrently and contend on that one global counter of 2, so the 3rd+
+  # intermittently got a spurious 429 instead of 200 (a shared-global-state flake, NOT a real
+  # over-cap). Raise the GLOBAL cap well above max_cases so incidental parallel exports never
+  # collide; the PER-TENANT cap stays at the prod default (1) because it is NEVER the incidental
+  # constraint (distinct tenants) and the controller's dedicated 429 test saturates it directly.
+  #
+  # This cannot mask a real limiter regression: the DEDICATED limit tests set their OWN explicit
+  # LOW caps and so are independent of this value — `export_concurrency_test.exs` calls
+  # `ExportConcurrency.acquire/3` with fixed caps, `knowledge_export_controller_test.exs` trips
+  # the per-tenant cap (unchanged at 1), and the nightly `streaming_export_scale_test.exs`
+  # (TC-27.16.5) runs OUTSIDE this SCALE gate so it keeps the prod default (2) and still proves
+  # the cap refuses over-budget exports.
+  config :loopctl, :export_max_concurrent_global, 64
 end
 
 # We don't run a server during test. If one is required,
@@ -248,10 +267,16 @@ config :loopctl, :bulk_delete_frozen_max, 3
 #   releases the connection between pages and that max in-flight ≤ chunk_size).
 # - max_links_per_article 5: a "dense hub" of >5 links is bounded with ~6 neighbors
 #   instead of 100+.
-# - concurrency caps default to prod values (global 2, per-tenant 1) — the cap test
-#   asserts against those.
+# - export_max_concurrent_global 128: raise from prod default (2) so incidental OKF
+#   export tests in async parallelism don't collide on the global cap. The cap MECHANISM
+#   is proven by ExportConcurrencyTest.global_cap_bounds_total_in_flight_exports, which
+#   dynamically reads max_global() and asserts the behavior against it, so raising this
+#   config knob does NOT silence that test. Prod stays at 2 (config/runtime.exs).
+# - export_max_concurrent_per_tenant: defaults to prod value (1) — per-tenant isolation
+#   is still enforced.
 config :loopctl, :export_chunk_size, 3
 config :loopctl, :export_max_links_per_article, 5
+config :loopctl, :export_max_concurrent_global, 128
 
 # US-27.16 (#3): small decompression-bomb caps so the bomb-defense test runs cheaply
 # — a ~1KB gzip that inflates past these is rejected without materializing it.
