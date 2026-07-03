@@ -234,9 +234,21 @@ defmodule Loopctl.QualityAssurance do
 
     base =
       from(r in UiTestRun,
-        where: r.tenant_id == ^tenant_id and r.project_id == ^project_id,
+        where: r.tenant_id == ^tenant_id,
         order_by: [desc: r.started_at]
       )
+
+    # `project_id` is a :binary_id column; a non-UUID value would raise
+    # Ecto.Query.CastError (an unhandled 500). Callers validate at the API
+    # boundary and 422 first, but a malformed value reaching here must not
+    # crash — scope to nothing, consistent with a nonexistent project (defense
+    # in depth).
+    base =
+      if valid_uuid?(project_id) do
+        where(base, [r], r.project_id == ^project_id)
+      else
+        where(base, [r], false)
+      end
 
     base =
       if status do
@@ -282,4 +294,7 @@ defmodule Loopctl.QualityAssurance do
 
   defp require_in_progress(%UiTestRun{status: :in_progress}), do: :ok
   defp require_in_progress(%UiTestRun{}), do: {:error, :run_not_in_progress}
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 end

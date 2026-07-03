@@ -11,6 +11,7 @@ defmodule LoopctlWeb.CostAnomalyController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.TokenUsage
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -101,26 +102,28 @@ defmodule LoopctlWeb.CostAnomalyController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
-      |> maybe_add_opt(:project_id, params["project_id"])
-      |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
-      |> maybe_add_opt(:resolved, parse_bool(params["resolved"]))
-      |> maybe_add_opt(:page, parse_int(params["page"]))
-      |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        []
+        |> maybe_add_opt(:anomaly_type, params["anomaly_type"])
+        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:include_archived, parse_bool(params["include_archived"]))
+        |> maybe_add_opt(:resolved, parse_bool(params["resolved"]))
+        |> maybe_add_opt(:page, parse_int(params["page"]))
+        |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
-    {:ok, result} = TokenUsage.list_anomalies(tenant_id, opts)
+      {:ok, result} = TokenUsage.list_anomalies(tenant_id, opts)
 
-    json(conn, %{
-      data: result.data,
-      meta: %{
-        page: result.page,
-        page_size: result.page_size,
-        total_count: result.total,
-        total_pages: ceil_div(result.total, result.page_size)
-      }
-    })
+      json(conn, %{
+        data: result.data,
+        meta: %{
+          page: result.page,
+          page_size: result.page_size,
+          total_count: result.total,
+          total_pages: ceil_div(result.total, result.page_size)
+        }
+      })
+    end
   end
 
   @doc """

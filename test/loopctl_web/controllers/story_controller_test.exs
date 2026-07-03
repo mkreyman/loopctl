@@ -565,4 +565,48 @@ defmodule LoopctlWeb.StoryControllerTest do
       assert body["meta"]["limit"] == 3
     end
   end
+
+  describe "GET /api/v1/stories project_id/epic_id hardening" do
+    test "malformed project_id returns 422, not 404/500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories?project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "valid project_id lists normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories?project_id=#{project.id}")
+
+      assert json_response(conn, 200)
+    end
+
+    test "malformed epic_id filter matches nothing without crashing (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories?project_id=#{project.id}&epic_id=not-a-uuid")
+
+      body = json_response(conn, 200)
+      assert body["data"] == []
+    end
+  end
 end

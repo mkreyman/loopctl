@@ -18,6 +18,7 @@ defmodule LoopctlWeb.AnalyticsController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.TokenUsage.Analytics
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -274,14 +275,17 @@ defmodule LoopctlWeb.AnalyticsController do
   """
   def agents(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = build_opts(params, [:project_id, :since, :until, :page, :page_size])
 
-    {:ok, result} = Analytics.agent_metrics(tenant_id, opts)
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts = build_opts(params, [:project_id, :since, :until, :page, :page_size])
 
-    json(conn, %{
-      data: result.data,
-      meta: pagination_meta(result)
-    })
+      {:ok, result} = Analytics.agent_metrics(tenant_id, opts)
+
+      json(conn, %{
+        data: result.data,
+        meta: pagination_meta(result)
+      })
+    end
   end
 
   @doc """
@@ -291,14 +295,17 @@ defmodule LoopctlWeb.AnalyticsController do
   """
   def epics(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = build_opts(params, [:project_id, :page, :page_size])
 
-    {:ok, result} = Analytics.epic_metrics(tenant_id, opts)
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts = build_opts(params, [:project_id, :page, :page_size])
 
-    json(conn, %{
-      data: result.data,
-      meta: pagination_meta(result)
-    })
+      {:ok, result} = Analytics.epic_metrics(tenant_id, opts)
+
+      json(conn, %{
+        data: result.data,
+        meta: pagination_meta(result)
+      })
+    end
   end
 
   @doc """
@@ -321,14 +328,17 @@ defmodule LoopctlWeb.AnalyticsController do
   """
   def models(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = build_opts(params, [:project_id, :since, :until, :page, :page_size])
 
-    {:ok, result} = Analytics.model_metrics(tenant_id, opts)
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts = build_opts(params, [:project_id, :since, :until, :page, :page_size])
 
-    json(conn, %{
-      data: result.data,
-      meta: pagination_meta(result)
-    })
+      {:ok, result} = Analytics.model_metrics(tenant_id, opts)
+
+      json(conn, %{
+        data: result.data,
+        meta: pagination_meta(result)
+      })
+    end
   end
 
   @doc """
@@ -339,15 +349,17 @@ defmodule LoopctlWeb.AnalyticsController do
   def trends(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      build_opts(params, [:project_id, :since, :until, :page, :page_size, :granularity])
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        build_opts(params, [:project_id, :since, :until, :page, :page_size, :granularity])
 
-    {:ok, result} = Analytics.trend_metrics(tenant_id, opts)
+      {:ok, result} = Analytics.trend_metrics(tenant_id, opts)
 
-    json(conn, %{
-      data: result.data,
-      meta: pagination_meta(result)
-    })
+      json(conn, %{
+        data: result.data,
+        meta: pagination_meta(result)
+      })
+    end
   end
 
   @doc """
@@ -357,11 +369,14 @@ defmodule LoopctlWeb.AnalyticsController do
   """
   def model_mix(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = build_opts(params, [:project_id, :agent_id, :since, :until])
 
-    {:ok, result} = Analytics.model_mix(tenant_id, opts)
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts = build_opts(params, [:project_id, :agent_id, :since, :until])
 
-    json(conn, %{data: result})
+      {:ok, result} = Analytics.model_mix(tenant_id, opts)
+
+      json(conn, %{data: result})
+    end
   end
 
   @doc """
@@ -373,7 +388,8 @@ defmodule LoopctlWeb.AnalyticsController do
     tenant_id = conn.assigns.current_api_key.tenant_id
     opts = build_opts(params, [:project_id, :since, :until])
 
-    with {:ok, profile} <- Analytics.agent_model_profile(tenant_id, agent_id, opts) do
+    with :ok <- ProjectId.validate(params["project_id"]),
+         {:ok, profile} <- Analytics.agent_model_profile(tenant_id, agent_id, opts) do
       json(conn, %{data: profile})
     end
   end

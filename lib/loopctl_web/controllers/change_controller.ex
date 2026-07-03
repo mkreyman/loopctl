@@ -17,6 +17,7 @@ defmodule LoopctlWeb.ChangeController do
   alias Loopctl.Audit
   alias Loopctl.Audit.ChangesCursor
   alias Loopctl.Knowledge
+  alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
@@ -98,6 +99,7 @@ defmodule LoopctlWeb.ChangeController do
   """
   def index(conn, params) do
     with {:ok, tenant_id} <- require_tenant(conn),
+         :ok <- ProjectId.validate(params["project_id"]),
          {:ok, since, cursor_opt} <- resolve_seek(tenant_id, params) do
       limit = parse_limit(params["limit"])
 

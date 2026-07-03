@@ -17,6 +17,7 @@ defmodule LoopctlWeb.UiTestController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.QualityAssurance
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -130,14 +131,11 @@ defmodule LoopctlWeb.UiTestController do
 
     opts = Keyword.merge(audit_opts, agent_id: api_key.agent_id)
 
-    case QualityAssurance.start_ui_test(tenant_id, project_id, run_params, opts) do
-      {:ok, run} ->
-        conn
-        |> put_status(:created)
-        |> json(%{ui_test_run: run})
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+    with :ok <- ProjectId.validate(project_id),
+         {:ok, run} <- QualityAssurance.start_ui_test(tenant_id, project_id, run_params, opts) do
+      conn
+      |> put_status(:created)
+      |> json(%{ui_test_run: run})
     end
   end
 
@@ -150,22 +148,24 @@ defmodule LoopctlWeb.UiTestController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:status, params["status"])
-      |> maybe_add_opt(:limit, parse_int(params["limit"]))
-      |> maybe_add_opt(:offset, parse_int(params["offset"]))
+    with :ok <- ProjectId.validate(project_id) do
+      opts =
+        []
+        |> maybe_add_opt(:status, params["status"])
+        |> maybe_add_opt(:limit, parse_int(params["limit"]))
+        |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
-    {:ok, result} = QualityAssurance.list_ui_tests(tenant_id, project_id, opts)
+      {:ok, result} = QualityAssurance.list_ui_tests(tenant_id, project_id, opts)
 
-    json(conn, %{
-      data: result.data,
-      meta: %{
-        total: result.total,
-        limit: result.limit,
-        offset: result.offset
-      }
-    })
+      json(conn, %{
+        data: result.data,
+        meta: %{
+          total: result.total,
+          limit: result.limit,
+          offset: result.offset
+        }
+      })
+    end
   end
 
   @doc """

@@ -1,6 +1,8 @@
 defmodule LoopctlWeb.SkillControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Skills
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -178,6 +180,130 @@ defmodule LoopctlWeb.SkillControllerTest do
       body = json_response(conn, 200)
       assert body["version"]["version"] == 1
       assert body["version"]["prompt_text"] == "V1 prompt"
+    end
+  end
+
+  describe "skills project_id hardening" do
+    test "POST /skills with malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills", %{
+          "name" => "loopctl:x",
+          "prompt_text" => "p",
+          "project_id" => "not-a-uuid"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "POST /skills with valid project_id creates (201)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills", %{
+          "name" => "loopctl:y",
+          "prompt_text" => "p",
+          "project_id" => project.id
+        })
+
+      body = json_response(conn, 201)
+      assert body["skill"]["project_id"] == project.id
+    end
+
+    test "GET /skills with malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills?project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "GET /skills with valid project_id filters normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:skill, %{tenant_id: tenant.id, project_id: project.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills?project_id=#{project.id}")
+
+      body = json_response(conn, 200)
+      assert length(body["data"]) == 1
+    end
+
+    test "GET /skills absent project_id lists normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:skill, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/skills")
+
+      assert json_response(conn, 200)
+    end
+  end
+
+  describe "POST /api/v1/skills/import project_id hardening" do
+    test "a malformed project_id in the import array returns 422, no partial insert", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills/import", %{
+          "skills" => [
+            %{"name" => "loopctl:ok", "prompt_text" => "p", "project_id" => project.id},
+            %{"name" => "loopctl:bad", "prompt_text" => "p", "project_id" => "not-a-uuid"}
+          ]
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+
+      # No partial insert: neither skill was created (whole import rejected).
+      {:ok, result} = Skills.list_skills(tenant.id, [])
+      assert result.data == []
+    end
+
+    test "valid project_ids import successfully", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/skills/import", %{
+          "skills" => [
+            %{"name" => "loopctl:imp", "prompt_text" => "p", "project_id" => project.id}
+          ]
+        })
+
+      assert json_response(conn, 200)
+      {:ok, result} = Skills.list_skills(tenant.id, [])
+      assert length(result.data) == 1
     end
   end
 end

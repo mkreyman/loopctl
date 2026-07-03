@@ -228,11 +228,23 @@ defmodule Loopctl.Orchestrator do
   end
 
   defp get_project(tenant_id, project_id) do
-    case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      project -> {:ok, project}
+    # `id: project_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value. save_state/get_state/get_state_history all gate on this
+    # function first, so guarding the cast here makes a malformed
+    # `/orchestrator/state/:project_id` segment a clean :not_found (-> 404),
+    # never a 500. Matches Projects.get_project.
+    if valid_uuid?(project_id) do
+      case AdminRepo.get_by(Project, id: project_id, tenant_id: tenant_id) do
+        nil -> {:error, :not_found}
+        project -> {:ok, project}
+      end
+    else
+      {:error, :not_found}
     end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp insert_state(tenant_id, project_id, attrs, actor_id, actor_label) do
     changeset =

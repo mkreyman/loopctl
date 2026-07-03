@@ -397,4 +397,50 @@ defmodule LoopctlWeb.UiTestControllerTest do
       assert json_response(conn, 200)
     end
   end
+
+  describe "ui-tests project_id hardening" do
+    test "GET malformed project_id path segment returns 422, not 500", %{conn: conn} do
+      ctx = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/projects/not-a-uuid/ui-tests")
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "GET valid project_id lists normally (200)", %{conn: conn} do
+      ctx = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> get(~p"/api/v1/projects/#{ctx.project.id}/ui-tests")
+
+      assert json_response(conn, 200)
+    end
+
+    test "POST malformed project_id path segment returns 422, not 500", %{conn: conn} do
+      ctx = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> post(~p"/api/v1/projects/not-a-uuid/ui-tests", %{"guide_reference" => "g"})
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "POST valid project_id creates a run (201)", %{conn: conn} do
+      ctx = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(ctx.agent_key)
+        |> post(~p"/api/v1/projects/#{ctx.project.id}/ui-tests", %{"guide_reference" => "g"})
+
+      assert json_response(conn, 201)
+    end
+  end
 end

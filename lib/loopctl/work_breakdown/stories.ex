@@ -287,7 +287,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     base_query =
       Story
-      |> where([s], s.tenant_id == ^tenant_id and s.project_id == ^project_id)
+      |> where([s], s.tenant_id == ^tenant_id)
+      |> scope_by_project(project_id)
       |> apply_project_filters(opts)
 
     total = AdminRepo.aggregate(base_query, :count, :id)
@@ -330,7 +331,31 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
   defp filter_by_epic_id(query, nil), do: query
   defp filter_by_epic_id(query, ""), do: query
-  defp filter_by_epic_id(query, epic_id), do: where(query, [s], s.epic_id == ^epic_id)
+
+  defp filter_by_epic_id(query, epic_id) do
+    # `epic_id` is a :binary_id column; a non-UUID value would raise
+    # Ecto.Query.CastError (500 -> global handler 404). Treat a malformed value
+    # as "matches nothing", consistent with a nonexistent epic (defense in depth).
+    if valid_uuid?(epic_id) do
+      where(query, [s], s.epic_id == ^epic_id)
+    else
+      where(query, [s], false)
+    end
+  end
+
+  # `project_id` is mandatory here (stories are scoped to a project). A non-UUID
+  # value would raise Ecto.Query.CastError; scope to nothing instead, matching a
+  # valid-but-nonexistent project. The controller 422s a malformed value first.
+  defp scope_by_project(query, project_id) do
+    if valid_uuid?(project_id) do
+      where(query, [s], s.project_id == ^project_id)
+    else
+      where(query, [s], false)
+    end
+  end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp filter_by_agent_status(query, nil), do: query
   defp filter_by_agent_status(query, ""), do: query

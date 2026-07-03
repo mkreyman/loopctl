@@ -234,4 +234,64 @@ defmodule LoopctlWeb.ChangeControllerTest do
       assert Map.has_key?(entry, "inserted_at")
     end
   end
+
+  describe "GET /api/v1/changes project_id hardening" do
+    test "malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+      create_audit_entry(tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/changes?since=#{past}&project_id=not-a-uuid")
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "valid project_id filters normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+      create_audit_entry(tenant.id, %{project_id: project.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/changes?since=#{past}&project_id=#{project.id}")
+
+      assert json_response(conn, 200)
+    end
+
+    test "absent project_id lists normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+      create_audit_entry(tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/changes?since=#{past}")
+
+      assert json_response(conn, 200)
+    end
+
+    test "non-string project_id[] list param is tolerated (no 500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      past = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+      create_audit_entry(tenant.id)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/changes?since=#{past}&project_id[]=x")
+
+      assert json_response(conn, 200)
+    end
+  end
 end

@@ -19,6 +19,7 @@ defmodule LoopctlWeb.SkillController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Skills
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -295,14 +296,12 @@ defmodule LoopctlWeb.SkillController do
     tenant_id = api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
-    case Skills.create_skill(tenant_id, params, audit_opts) do
-      {:ok, %{skill: skill, version: version}} ->
-        conn
-        |> put_status(:created)
-        |> json(%{skill: skill_json(skill), version: version_json(version)})
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, changeset}
+    with :ok <- ProjectId.validate(params["project_id"]),
+         {:ok, %{skill: skill, version: version}} <-
+           Skills.create_skill(tenant_id, params, audit_opts) do
+      conn
+      |> put_status(:created)
+      |> json(%{skill: skill_json(skill), version: version_json(version)})
     end
   end
 
@@ -310,27 +309,29 @@ defmodule LoopctlWeb.SkillController do
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts = [
-      page: parse_int(params["page"]),
-      page_size: parse_int(params["page_size"]),
-      project_id: params["project_id"],
-      status: params["status"],
-      name_pattern: params["name"]
-    ]
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts = [
+        page: parse_int(params["page"]),
+        page_size: parse_int(params["page_size"]),
+        project_id: params["project_id"],
+        status: params["status"],
+        name_pattern: params["name"]
+      ]
 
-    opts = Enum.reject(opts, fn {_k, v} -> is_nil(v) end)
+      opts = Enum.reject(opts, fn {_k, v} -> is_nil(v) end)
 
-    {:ok, result} = Skills.list_skills(tenant_id, opts)
+      {:ok, result} = Skills.list_skills(tenant_id, opts)
 
-    json(conn, %{
-      data: Enum.map(result.data, &skill_json/1),
-      meta: %{
-        page: result.page,
-        page_size: result.page_size,
-        total_count: result.total,
-        total_pages: ceil_div(result.total, result.page_size)
-      }
-    })
+      json(conn, %{
+        data: Enum.map(result.data, &skill_json/1),
+        meta: %{
+          page: result.page,
+          page_size: result.page_size,
+          total_count: result.total,
+          total_pages: ceil_div(result.total, result.page_size)
+        }
+      })
+    end
   end
 
   @doc "GET /api/v1/skills/:id"
@@ -455,12 +456,37 @@ defmodule LoopctlWeb.SkillController do
     tenant_id = api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
 
-    {:ok, summary} = Skills.import_skills(tenant_id, skills_data, audit_opts)
-    json(conn, summary)
+    with :ok <- validate_import_project_ids(skills_data),
+         {:ok, summary} <- Skills.import_skills(tenant_id, skills_data, audit_opts) do
+      json(conn, summary)
+    end
   end
 
   def import_skills(_conn, _params) do
     {:error, :bad_request, "Request body must contain a 'skills' array"}
+  end
+
+  # Reject the whole import if ANY item carries a malformed project_id: each
+  # item's project_id is set uncast on the %Skill{} struct, so a bad value would
+  # otherwise dump to Ecto.ChangeError on insert (an unhandled 500). Naming the
+  # offending index gives the caller a clean, actionable 422 and guarantees no
+  # partial insert (validated before the import Multi runs).
+  defp validate_import_project_ids(skills_data) do
+    skills_data
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {skill_data, index}, :ok ->
+      project_id = if is_map(skill_data), do: skill_data["project_id"], else: nil
+
+      case ProjectId.validate(project_id) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, :unprocessable_entity, _msg} ->
+          {:halt,
+           {:error, :unprocessable_entity,
+            "Invalid project_id at skills[#{index}]: must be a valid UUID"}}
+      end
+    end)
   end
 
   @doc "GET /api/v1/skills/:id/stats"

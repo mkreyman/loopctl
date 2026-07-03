@@ -20,6 +20,7 @@ defmodule LoopctlWeb.StoryController do
   alias Loopctl.WorkBreakdown.Epics
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -334,26 +335,28 @@ defmodule LoopctlWeb.StoryController do
   def index_by_project(conn, %{"project_id" => project_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    limit = parse_int(params["limit"]) || parse_int(params["page_size"])
+    with :ok <- ProjectId.validate(project_id) do
+      limit = parse_int(params["limit"]) || parse_int(params["page_size"])
 
-    opts =
-      []
-      |> maybe_add_opt(:agent_status, params["agent_status"])
-      |> maybe_add_opt(:verified_status, params["verified_status"])
-      |> maybe_add_opt(:epic_id, params["epic_id"])
-      |> maybe_add_opt(:limit, limit)
-      |> maybe_add_opt(:offset, parse_int(params["offset"]))
+      opts =
+        []
+        |> maybe_add_opt(:agent_status, params["agent_status"])
+        |> maybe_add_opt(:verified_status, params["verified_status"])
+        |> maybe_add_opt(:epic_id, params["epic_id"])
+        |> maybe_add_opt(:limit, limit)
+        |> maybe_add_opt(:offset, parse_int(params["offset"]))
 
-    {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)
+      {:ok, result} = Stories.list_stories_by_project(tenant_id, project_id, opts)
 
-    json(conn, %{
-      data: Enum.map(result.data, &story_json/1),
-      meta: %{
-        total_count: result.total,
-        limit: result.limit,
-        offset: result.offset
-      }
-    })
+      json(conn, %{
+        data: Enum.map(result.data, &story_json/1),
+        meta: %{
+          total_count: result.total,
+          limit: result.limit,
+          offset: result.offset
+        }
+      })
+    end
   end
 
   def index_by_project(conn, _params) do

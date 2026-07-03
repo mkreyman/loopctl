@@ -582,4 +582,55 @@ defmodule LoopctlWeb.OrchestratorStateControllerTest do
       assert Enum.at(body["data"], 0)["state_data"] == %{"main_data" => true}
     end
   end
+
+  describe "orchestrator state project_id hardening" do
+    test "PUT malformed project_id segment returns 404, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: agent.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> put("/api/v1/orchestrator/state/not-a-uuid", %{
+          "state_key" => "main",
+          "state_data" => %{"a" => 1},
+          "version" => 0
+        })
+
+      assert json_response(conn, 404)
+    end
+
+    test "GET malformed project_id segment returns 404, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: agent.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/orchestrator/state/not-a-uuid")
+
+      assert json_response(conn, 404)
+    end
+
+    test "GET history malformed project_id segment returns 404, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      {raw_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: agent.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/orchestrator/state/not-a-uuid/history")
+
+      assert json_response(conn, 404)
+    end
+  end
 end

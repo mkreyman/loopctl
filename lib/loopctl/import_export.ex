@@ -146,6 +146,18 @@ defmodule Loopctl.ImportExport do
   @spec export_project(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, map()} | {:error, :not_found}
   def export_project(tenant_id, project_id) do
+    if valid_uuid?(project_id) do
+      do_export_project(tenant_id, project_id)
+    else
+      # `project_id` is a :binary_id column; a non-UUID path segment would raise
+      # Ecto.Query.CastError (an unhandled 500) on the lookup below. A malformed
+      # value is a clean :not_found (-> 404), matching Projects.get_project and
+      # the sibling import_project path.
+      {:error, :not_found}
+    end
+  end
+
+  defp do_export_project(tenant_id, project_id) do
     project =
       Loopctl.Projects.Project
       |> where([p], p.id == ^project_id and p.tenant_id == ^tenant_id)
@@ -1554,4 +1566,7 @@ defmodule Loopctl.ImportExport do
   end
 
   defp normalize_ac_item(item), do: item
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 end

@@ -586,4 +586,37 @@ defmodule LoopctlWeb.TokenBudgetControllerTest do
       assert json_response(conn, 404)
     end
   end
+
+  describe "POST /api/v1/token-budgets scope_id hardening" do
+    test "malformed project scope_id returns 422, not 500", %{conn: conn} do
+      %{user_key: user_key} = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-budgets", %{
+          "scope_type" => "project",
+          "scope_id" => "not-a-uuid",
+          "budget_millicents" => 1000
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["status"] == 422
+    end
+
+    test "valid project scope_id creates a budget (201)", %{conn: conn} do
+      %{project: project, user_key: user_key} = setup_project_with_keys()
+
+      conn =
+        conn
+        |> auth_conn(user_key)
+        |> post(~p"/api/v1/token-budgets", %{
+          "scope_type" => "project",
+          "scope_id" => project.id,
+          "budget_millicents" => 1000
+        })
+
+      assert json_response(conn, 201)
+    end
+  end
 end

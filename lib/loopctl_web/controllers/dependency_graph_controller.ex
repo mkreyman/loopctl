@@ -12,6 +12,7 @@ defmodule LoopctlWeb.DependencyGraphController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.WorkBreakdown.Queries
+  alias LoopctlWeb.Helpers.ProjectId
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -79,24 +80,26 @@ defmodule LoopctlWeb.DependencyGraphController do
   def ready(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:project_id, params["project_id"])
-      |> maybe_add_opt(:epic_id, params["epic_id"])
-      |> maybe_add_opt(:page, parse_int(params["page"]))
-      |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        []
+        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:epic_id, params["epic_id"])
+        |> maybe_add_opt(:page, parse_int(params["page"]))
+        |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
-    {:ok, result} = Queries.list_ready_stories(tenant_id, opts)
+      {:ok, result} = Queries.list_ready_stories(tenant_id, opts)
 
-    json(conn, %{
-      data: Enum.map(result.data, &story_json/1),
-      meta: %{
-        page: result.page,
-        page_size: result.page_size,
-        total_count: result.total,
-        total_pages: ceil_div(result.total, result.page_size)
-      }
-    })
+      json(conn, %{
+        data: Enum.map(result.data, &story_json/1),
+        meta: %{
+          page: result.page,
+          page_size: result.page_size,
+          total_count: result.total,
+          total_pages: ceil_div(result.total, result.page_size)
+        }
+      })
+    end
   end
 
   @doc """
@@ -107,29 +110,31 @@ defmodule LoopctlWeb.DependencyGraphController do
   def blocked(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      []
-      |> maybe_add_opt(:project_id, params["project_id"])
-      |> maybe_add_opt(:page, parse_int(params["page"]))
-      |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
+    with :ok <- ProjectId.validate(params["project_id"]) do
+      opts =
+        []
+        |> maybe_add_opt(:project_id, params["project_id"])
+        |> maybe_add_opt(:page, parse_int(params["page"]))
+        |> maybe_add_opt(:page_size, parse_int(params["page_size"]))
 
-    {:ok, result} = Queries.list_blocked_stories(tenant_id, opts)
+      {:ok, result} = Queries.list_blocked_stories(tenant_id, opts)
 
-    json(conn, %{
-      data:
-        Enum.map(result.data, fn item ->
-          %{
-            story: story_json(item.story),
-            blocking_dependencies: item.blocking_dependencies
-          }
-        end),
-      meta: %{
-        page: result.page,
-        page_size: result.page_size,
-        total_count: result.total,
-        total_pages: ceil_div(result.total, result.page_size)
-      }
-    })
+      json(conn, %{
+        data:
+          Enum.map(result.data, fn item ->
+            %{
+              story: story_json(item.story),
+              blocking_dependencies: item.blocking_dependencies
+            }
+          end),
+        meta: %{
+          page: result.page,
+          page_size: result.page_size,
+          total_count: result.total,
+          total_pages: ceil_div(result.total, result.page_size)
+        }
+      })
+    end
   end
 
   @doc """

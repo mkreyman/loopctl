@@ -7,6 +7,99 @@ defmodule LoopctlWeb.DependencyGraphControllerTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
+  describe "dependency-graph project_id hardening" do
+    test "GET /stories/ready malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories/ready?project_id=not-a-uuid")
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "GET /stories/ready valid project_id filters normally (200)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories/ready?project_id=#{project.id}")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /stories/blocked malformed project_id returns 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories/blocked?project_id=not-a-uuid")
+
+      assert json_response(conn, 422)["error"]["status"] == 422
+    end
+
+    test "GET /stories/ready non-string project_id[] is tolerated (no 500)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/stories/ready?project_id[]=x")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /projects/:id/dependency_graph malformed segment returns 404, not 500", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/not-a-uuid/dependency_graph")
+
+      assert json_response(conn, 404)
+    end
+
+    test "GET /projects/:id/dependency_graph valid project returns 200", %{conn: conn} do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/projects/#{project.id}/dependency_graph")
+
+      assert json_response(conn, 200)
+    end
+
+    test "GET /stories/ready malformed epic_id matches nothing without crashing (200)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/stories/ready?epic_id=not-a-uuid")
+
+      body = json_response(conn, 200)
+      assert body["data"] == []
+    end
+  end
+
   describe "GET /api/v1/stories/ready" do
     test "returns ready stories with no dependencies", %{conn: conn} do
       tenant = fixture(:tenant)

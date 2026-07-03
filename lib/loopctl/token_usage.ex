@@ -1261,9 +1261,17 @@ defmodule Loopctl.TokenUsage do
   defp check_entity_exists(nil, _scope_id, _tenant_id), do: :ok
 
   defp check_entity_exists(schema, scope_id, tenant_id) do
-    case AdminRepo.get_by(schema, id: scope_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_found}
-      _entity -> :ok
+    # `id: scope_id` on a :binary_id column raises Ecto.Query.CastError for a
+    # non-UUID value. The controller 422s a malformed scope_id first; guarding
+    # the cast here makes a malformed value a clean :not_found (never a raised
+    # query error), consistent with a valid-but-nonexistent scope entity.
+    if valid_uuid?(scope_id) do
+      case AdminRepo.get_by(schema, id: scope_id, tenant_id: tenant_id) do
+        nil -> {:error, :not_found}
+        _entity -> :ok
+      end
+    else
+      {:error, :not_found}
     end
   end
 
@@ -1600,10 +1608,21 @@ defmodule Loopctl.TokenUsage do
   defp apply_anomaly_filter(query, :project_id, "", _tenant_id), do: query
 
   defp apply_anomaly_filter(query, :project_id, project_id, _tenant_id) do
-    query
-    |> join(:inner, [a], s in Story, on: a.story_id == s.id)
-    |> where([_a, s], s.project_id == ^project_id)
+    # `project_id` is a :binary_id column; a non-UUID value would raise
+    # Ecto.Query.CastError (an unhandled 500). Callers validate at the API
+    # boundary and 422 first, but a malformed value reaching here must not
+    # crash — treat it as "matches nothing" (defense in depth).
+    if valid_uuid?(project_id) do
+      query
+      |> join(:inner, [a], s in Story, on: a.story_id == s.id)
+      |> where([_a, s], s.project_id == ^project_id)
+    else
+      where(query, [a], false)
+    end
   end
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+  defp valid_uuid?(_), do: false
 
   defp format_anomaly(%CostAnomaly{} = anomaly) do
     story_title =
