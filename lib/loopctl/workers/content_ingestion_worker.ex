@@ -25,10 +25,21 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   Unique per `content_hash` + `tenant_id` within a 3600-second window.
   """
 
+  # `unique` deliberately EXCLUDES `:completed` (and `:discarded`/`:cancelled`)
+  # from its states (#264, Finding 2): the default set includes `:completed`, so a
+  # legitimate resubmission of UNDER-captured content within the hour would be
+  # absorbed as a duplicate ({:ok, :already_queued}) and silently do no new work.
+  # Excluding `:completed` lets an operator re-ingest; per-article inserts are
+  # idempotent (deterministic idempotency_key + on_conflict), so a resubmission of
+  # already-captured content re-runs safely without creating duplicate rows.
   use Oban.Worker,
     queue: :knowledge,
     max_attempts: 3,
-    unique: [keys: [:content_hash, :tenant_id], period: 3600]
+    unique: [
+      keys: [:content_hash, :tenant_id],
+      period: 3600,
+      states: [:scheduled, :available, :executing, :retryable]
+    ]
 
   require Logger
 
@@ -122,6 +133,10 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
          {:ok, content} <- resolve_content(url, raw_content) do
       ctx = %{
         tenant_id: tenant_id,
+        # content_hash seeds the DETERMINISTIC per-article idempotency_key (#264,
+        # Finding 1) so an Oban retry that re-walks already-persisted chunks
+        # no-ops instead of inserting duplicate rows.
+        content_hash: content_hash,
         source_id: source_id,
         source_type: source_type,
         project_id: project_id,
@@ -200,52 +215,62 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       )
     end
 
+    acc0 = %{inserted: 0, persisted: 0, attempted: 0, errors: [], seen_titles: MapSet.new()}
+
     processable
-    |> Enum.reduce_while(%{inserted: 0, persisted: 0, errors: []}, fn chunk, acc ->
+    |> Enum.with_index()
+    |> Enum.reduce_while(acc0, fn {chunk, chunk_index}, acc ->
       remaining = @max_articles - acc.inserted
 
       if remaining <= 0 do
         # Article cap reached — stop early; we have the full @max_articles set.
         {:halt, acc}
       else
-        reduce_chunk(ctx, chunk, remaining, acc)
+        reduce_chunk(ctx, chunk, chunk_index, remaining, acc)
       end
     end)
-    |> finalize_ingest(chunk_count, length(processable), dropped)
+    |> finalize_ingest(chunk_count, dropped)
   end
 
-  defp reduce_chunk(ctx, chunk, remaining, acc) do
-    case extract_and_persist_chunk(ctx, chunk, remaining) do
-      {:ok, count} ->
-        {:cont, %{acc | inserted: acc.inserted + count, persisted: acc.persisted + 1}}
+  defp reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
+    acc = %{acc | attempted: acc.attempted + 1}
+
+    case extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, acc.seen_titles) do
+      {:ok, count, seen_titles} ->
+        {:cont,
+         %{
+           acc
+           | inserted: acc.inserted + count,
+             persisted: acc.persisted + 1,
+             seen_titles: seen_titles
+         }}
 
       {:error, reason} ->
-        # Persist what earlier chunks produced; record the error and keep going.
+        # Persist what earlier chunks produced; record the error and keep going —
+        # finalize_ingest surfaces it as retryable (Finding 2).
         {:cont, %{acc | errors: [reason | acc.errors]}}
     end
   end
 
   # Extract + validate + persist ONE chunk in its own transaction, so its
   # article(s) are durably committed before the next chunk's LLM call runs.
-  defp extract_and_persist_chunk(ctx, chunk, remaining) do
+  #
+  # `seen_titles` carries the normalized titles already persisted by EARLIER
+  # chunks so a title extracted from two different chunks isn't inserted twice
+  # (the pre-#264 flow deduped across the whole accumulated set; per-chunk
+  # persistence reintroduces that need — a cross-chunk title collision would
+  # otherwise abort the whole chunk on the `articles_tenant_title_active_idx`).
+  defp extract_and_persist_chunk(ctx, chunk, chunk_index, remaining, seen_titles) do
     case @content_extractor.extract_from_content(chunk, source_type: ctx.source_type) do
       {:ok, extracted} ->
-        articles =
+        {articles, seen_titles} =
           extracted
           |> dedup_articles()
           |> validate_and_filter()
-          |> Enum.take(remaining)
+          |> dedup_cross_chunk(seen_titles, remaining)
 
-        case insert_articles(
-               ctx.tenant_id,
-               ctx.source_id,
-               ctx.source_type,
-               ctx.project_id,
-               articles,
-               ctx.url,
-               ctx.publish
-             ) do
-          :ok -> {:ok, length(articles)}
+        case insert_articles(ctx, articles, chunk_index) do
+          :ok -> {:ok, length(articles), seen_titles}
           {:error, _} = err -> err
         end
 
@@ -254,38 +279,95 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     end
   end
 
-  # Decide the job's return value from the incremental run:
-  #   * dropped chunks (document > @max_chunks) → {:discard} (no retry) with a
-  #     clear count; whatever was persisted stays committed.
-  #   * any articles persisted → :ok (partial success is success — never retry
-  #     and risk re-inserting the already-committed chunks).
-  #   * nothing persisted but chunks errored → {:error, first} so Oban retries a
-  #     genuinely-transient failure (safe: nothing was committed yet).
-  #   * nothing persisted, no errors → :ok (legitimately nothing reusable).
+  # Drop articles whose normalized title was already persisted by an earlier
+  # chunk, cap at `remaining`, and return the kept articles plus the updated
+  # seen-title set. Titles are non-blank here (validate_and_filter dropped blanks).
+  defp dedup_cross_chunk(articles, seen_titles, remaining) do
+    {kept_rev, seen} =
+      Enum.reduce(articles, {[], seen_titles}, fn article, {kept, seen} ->
+        title = normalized_title(article)
+
+        cond do
+          length(kept) >= remaining -> {kept, seen}
+          MapSet.member?(seen, title) -> {kept, seen}
+          true -> {[article | kept], MapSet.put(seen, title)}
+        end
+      end)
+
+    {Enum.reverse(kept_rev), seen}
+  end
+
+  defp normalized_title(article) do
+    (Map.get(article, :title) || Map.get(article, "title") || "")
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  # Decide the job's return value from the incremental run. Because per-article
+  # inserts are idempotent (deterministic idempotency_key + on_conflict, Finding
+  # 1), a retry never duplicates already-committed chunks — so we can safely
+  # surface a partial failure as retryable:
+  #
+  #   * ANY transient chunk error → {:error, first} so Oban retries the whole job;
+  #     the retry no-ops the persisted chunks and productively re-attempts only
+  #     the failed one(s). Returning :ok here (the old behavior) would mark the
+  #     job :completed and permanently lose the failed chunk (Finding 2).
+  #   * ONLY permanent errors (4xx that a retry can't fix) → {:discard} so it
+  #     doesn't retry forever; whatever persisted stays committed.
+  #   * dropped chunks (document > @max_chunks) → {:discard} with an ACCURATE
+  #     attempted-chunk count (Finding 3).
+  #   * otherwise → :ok.
   defp finalize_ingest(
-         %{inserted: inserted, persisted: persisted, errors: errors},
+         %{inserted: inserted, persisted: persisted, attempted: attempted, errors: errors},
          chunk_count,
-         processed_count,
          dropped
        ) do
     cond do
+      errors != [] ->
+        finalize_errors(errors, inserted, persisted, attempted)
+
       dropped != [] ->
         {:discard,
-         {:document_too_large,
-          "document too large: #{chunk_count} chunks exceed the #{@max_chunks}-chunk per-job " <>
-            "budget (cap #{div(@max_job_timeout_ms, 1000)}s); persisted #{inserted} article(s) " <>
-            "from #{persisted} of #{processed_count} processed chunk(s), " <>
-            "#{length(dropped)} chunk(s) not processed"}}
-
-      inserted > 0 ->
-        :ok
-
-      errors != [] ->
-        {:error, errors |> Enum.reverse() |> List.first()}
+         {:document_too_large, too_large_message(chunk_count, dropped, inserted, attempted)}}
 
       true ->
         :ok
     end
+  end
+
+  defp finalize_errors(errors, inserted, persisted, attempted) do
+    first = errors |> Enum.reverse() |> List.first()
+
+    if Enum.all?(errors, &permanent_error?/1) do
+      # No transient error a retry could clear — {:discard} (no infinite retry);
+      # whatever persisted stays committed.
+      {:discard,
+       {:extraction_failed,
+        "extraction permanently failed on #{length(errors)} chunk(s) " <>
+          "(first: #{inspect(first)}); persisted #{inserted} article(s) from " <>
+          "#{persisted} of #{attempted} attempted chunk(s) — not retryable"}}
+    else
+      # At least one transient error — retry the whole (idempotent) job so the
+      # failed chunk(s) get re-attempted; persisted chunks no-op on conflict.
+      {:error, first}
+    end
+  end
+
+  # A permanent extractor failure a retry can't fix: a 4xx API error other than
+  # 408 (timeout) / 429 (rate limited), which ARE transient. Everything else
+  # (5xx, request_failed/transport, json_parse_error from a non-deterministic
+  # model response) is treated as transient and retried.
+  defp permanent_error?({:api_error, status, _body})
+       when is_integer(status) and status >= 400 and status < 500 and status != 408 and
+              status != 429,
+       do: true
+
+  defp permanent_error?(_), do: false
+
+  defp too_large_message(chunk_count, dropped, inserted, attempted) do
+    "document too large: #{chunk_count} chunks exceed the #{@max_chunks}-chunk per-job " <>
+      "budget (cap #{div(@max_job_timeout_ms, 1000)}s); persisted #{inserted} article(s) " <>
+      "from #{attempted} attempted chunk(s), #{length(dropped)} chunk(s) not processed"
   end
 
   # When content is split into chunks, the same article may be extracted
@@ -532,11 +614,21 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     is_binary(tag) and String.length(tag) <= @max_tag_length and Regex.match?(@tag_pattern, tag)
   end
 
-  defp insert_articles(_tenant_id, _job_id, _source_type, _project_id, [], _url, _publish) do
+  defp insert_articles(_ctx, [], _chunk_index) do
     :ok
   end
 
-  defp insert_articles(tenant_id, job_id, source_type, project_id, articles, url, publish) do
+  defp insert_articles(ctx, articles, chunk_index) do
+    %{
+      tenant_id: tenant_id,
+      source_id: job_id,
+      source_type: source_type,
+      project_id: project_id,
+      url: url,
+      publish: publish,
+      content_hash: content_hash
+    } = ctx
+
     status = if publish, do: :published, else: :draft
 
     multi =
@@ -545,8 +637,14 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       |> Enum.reduce(Multi.new(), fn {attrs, index}, multi ->
         # normalize_attrs already whitelists keys, but drop :status explicitly so
         # the server-set status (above) can never be overridden by extractor
-        # output, independent of future normalize_attrs changes.
-        attrs = normalize_attrs(attrs) |> Map.delete(:status)
+        # output, independent of future normalize_attrs changes. The
+        # idempotency_key is server-derived and set AFTER normalize_attrs so an
+        # extractor-supplied key can never override it (#264, Finding 1).
+        attrs =
+          attrs
+          |> normalize_attrs()
+          |> Map.delete(:status)
+          |> Map.put(:idempotency_key, ingest_idempotency_key(content_hash, chunk_index, index))
 
         article = %Article{
           tenant_id: tenant_id,
@@ -569,7 +667,15 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
         changeset = Article.create_changeset(article, attrs)
 
-        Multi.insert(multi, {:article, index}, changeset)
+        # on_conflict: :nothing over the partial `articles_tenant_idempotency_key_idx`
+        # (WHERE idempotency_key IS NOT NULL) makes a retry that re-reaches an
+        # already-persisted (content_hash, chunk_index, article_index) a safe NO-OP
+        # instead of a duplicate row (#264, Finding 1).
+        Multi.insert(multi, {:article, index}, changeset,
+          on_conflict: :nothing,
+          conflict_target:
+            {:unsafe_fragment, "(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL"}
+        )
       end)
       |> Audit.log_in_multi(:audit, fn changes ->
         article_ids =
@@ -653,5 +759,20 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     end)
     |> Enum.reject(&is_nil/1)
     |> Map.new()
+  end
+
+  # DETERMINISTIC per-article idempotency key from (content_hash, chunk_index,
+  # article_index_within_chunk) — NEVER from the LLM output, which varies across
+  # calls (#264, Finding 1). Identical across Oban retries (all three inputs are
+  # deterministic), so a retry re-reaching the same (chunk, article) slot conflicts
+  # on `articles_tenant_idempotency_key_idx` and no-ops instead of duplicating.
+  # SHA-256 hex keeps the key bounded (67 chars) regardless of content_hash length.
+  defp ingest_idempotency_key(content_hash, chunk_index, article_index) do
+    digest =
+      :sha256
+      |> :crypto.hash("#{content_hash}:#{chunk_index}:#{article_index}")
+      |> Base.encode16(case: :lower)
+
+    "ingest:" <> digest
   end
 end

@@ -695,12 +695,13 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert length(articles) == 4
     end
 
-    test "partial progress: earlier chunks are PERSISTED even when a later chunk fails" do
+    test "partial progress: earlier chunks persist AND a transient later failure is retryable (#264 Finding 2)" do
       %{tenant: tenant} = setup_tenant()
 
-      # First chunk succeeds (and is persisted immediately); the next chunk
-      # simulates a failure (timeout/LLM error). With incremental persistence the
-      # first chunk's article must survive.
+      # First chunk succeeds (persisted immediately); the second simulates a
+      # transient failure. The earlier chunk's article MUST survive AND the job
+      # must return {:error} (retryable) — not :ok — so Oban re-attempts the
+      # failed chunk instead of marking the job :completed and losing it forever.
       counter = :counters.new(1, [])
 
       Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
@@ -714,7 +715,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
         end
       end)
 
-      assert :ok =
+      assert {:error, {:request_failed, :timeout}} =
                ContentIngestionWorker.perform(%Oban.Job{
                  id: 401,
                  args: %{
@@ -725,9 +726,133 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
                  }
                })
 
+      # The earlier chunk's article is durably committed despite the later failure.
       %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
       assert length(articles) == 1
       assert hd(articles).title == "Survivor"
+    end
+
+    test "an Oban retry (SAME args) after partial persistence does NOT duplicate rows (#264 Finding 1)" do
+      %{tenant: tenant} = setup_tenant()
+
+      job_args = %{
+        "tenant_id" => tenant.id,
+        "content" => multi_chunk_content(4),
+        "content_hash" => "retry_idempotent",
+        "source_type" => "newsletter"
+      }
+
+      # A distinct article per chunk; titles/bodies vary per CALL (simulating LLM
+      # non-determinism) so the idempotency guarantee can't depend on the output.
+      call = :counters.new(1, [])
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        :counters.add(call, 1, 1)
+        n = :counters.get(call, 1)
+
+        {:ok,
+         [
+           %{
+             title: "Article #{n}",
+             body: "Body #{n} at #{System.unique_integer()}.",
+             category: :pattern
+           }
+         ]}
+      end)
+
+      # First run persists all 4 chunks.
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 410, args: job_args})
+
+      %{meta: %{total_count: after_first}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert after_first == 4
+
+      # Simulate Oban re-invoking perform/1 with IDENTICAL args (a retry / redeploy
+      # after the chunks were already committed). It must NOT double the rows.
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 410, args: job_args})
+
+      %{meta: %{total_count: after_retry}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert after_retry == 4, "retry duplicated rows: #{after_first} -> #{after_retry}"
+    end
+
+    test "retry re-attempts ONLY the previously-failed chunk without duplicating the others (#264)" do
+      %{tenant: tenant} = setup_tenant()
+
+      job_args = %{
+        "tenant_id" => tenant.id,
+        "content" => multi_chunk_content(3),
+        "content_hash" => "retry_failed_chunk",
+        "source_type" => "newsletter"
+      }
+
+      # Run 1: chunks 1 & 3 succeed, chunk 2 fails transiently.
+      # Run 2 (retry): every chunk succeeds. The already-persisted chunks 1 & 3
+      # no-op on conflict; only chunk 2 productively adds a row.
+      chunk_counter = :counters.new(1, [])
+      run = :counters.new(1, [])
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        idx = rem(:counters.get(chunk_counter, 1), 3) + 1
+        :counters.add(chunk_counter, 1, 1)
+        run_no = :counters.get(run, 1)
+
+        if idx == 2 and run_no == 0 do
+          {:error, {:request_failed, :timeout}}
+        else
+          {:ok, [%{title: "Chunk #{idx}", body: "Body #{idx}.", category: :pattern}]}
+        end
+      end)
+
+      # Run 1 → retryable error, chunks 1 & 3 persisted (2 rows).
+      assert {:error, _} = ContentIngestionWorker.perform(%Oban.Job{id: 411, args: job_args})
+
+      %{meta: %{total_count: after_run1}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert after_run1 == 2
+
+      # Advance to run 2 (all chunks succeed).
+      :counters.add(run, 1, 1)
+      assert :ok = ContentIngestionWorker.perform(%Oban.Job{id: 411, args: job_args})
+
+      %{meta: %{total_count: after_run2}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      # 3 total: chunks 1 & 3 unchanged (idempotent no-op), chunk 2 newly added.
+      assert after_run2 == 3, "expected only the failed chunk to be added, got #{after_run2}"
+    end
+
+    test "a PERMANENT (4xx) extraction failure is discarded, not retried forever (#264 Finding 2)" do
+      %{tenant: tenant} = setup_tenant()
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        {:error, {:api_error, 400, "bad request"}}
+      end)
+
+      assert {:discard, {:extraction_failed, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 412,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(3),
+                   "content_hash" => "permanent_fail",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert reason =~ "not retryable"
+    end
+
+    test "unique config excludes :completed so under-captured content can be resubmitted (#264 Finding 2)" do
+      states =
+        ContentIngestionWorker.__opts__() |> Keyword.fetch!(:unique) |> Keyword.fetch!(:states)
+
+      refute :completed in states
+      assert :available in states
+      assert :executing in states
     end
 
     test "when NO chunk succeeds, the error propagates so Oban retries (nothing persisted)" do
