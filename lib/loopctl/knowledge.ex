@@ -51,6 +51,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.KeysetSeek
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.KbCuration
@@ -951,6 +952,69 @@ defmodule Loopctl.Knowledge do
   def list_system_articles_grouped do
     list_system_articles()
     |> Enum.group_by(& &1.category)
+  end
+
+  @featured_article_limit 16
+
+  @doc """
+  Returns the most-viewed published system articles for the public wiki
+  landing page.
+
+  View counts are derived by LEFT JOINing `article_access_events` onto each
+  article and counting the events, so an article with zero reads still
+  appears (with a `view_count` of `0`). Ranking is:
+
+  1. `view_count` descending — the most-read articles lead the grid
+  2. `inserted_at` descending — newest articles win ties (this is also what
+     "pads with newest" when few articles have any views yet)
+  3. `id` ascending — a stable final tiebreaker so paging/ordering is
+     deterministic across rows that are otherwise equal
+
+  View counts are aggregated across ALL tenants: system articles are globally
+  visible, so their popularity is a global signal. The query runs through
+  `AdminRepo` (BYPASSRLS) because system articles carry no `tenant_id`.
+
+  Returns up to #{@featured_article_limit} maps, each with `:id`, `:title`,
+  `:slug`, `:category`, `:snippet` (first 100 chars of body), and
+  `:view_count`. Bodies are truncated in Elixir so full article bodies are
+  never loaded into the LiveView.
+  """
+  @spec list_featured_articles() :: [map()]
+  def list_featured_articles do
+    from(a in Article,
+      left_join: e in ArticleAccessEvent,
+      on: e.article_id == a.id,
+      where: a.scope == :system and a.status == :published,
+      group_by: a.id,
+      order_by: [desc: count(e.id), desc: a.inserted_at, asc: a.id],
+      limit: @featured_article_limit,
+      select: %{
+        id: a.id,
+        title: a.title,
+        slug: a.slug,
+        category: a.category,
+        body: a.body,
+        view_count: count(e.id)
+      }
+    )
+    |> AdminRepo.all()
+    |> Enum.map(fn %{body: body} = row ->
+      row
+      |> Map.put(:snippet, article_snippet(body))
+      |> Map.delete(:body)
+    end)
+  end
+
+  # First 100 chars of the body, with an ellipsis when truncated. nil bodies
+  # (should not happen for published articles, but be defensive) become "".
+  defp article_snippet(nil), do: ""
+
+  defp article_snippet(body) when is_binary(body) do
+    if String.length(body) > 100 do
+      String.slice(body, 0, 100) <> "…"
+    else
+      body
+    end
   end
 
   @doc """

@@ -1,8 +1,9 @@
 defmodule LoopctlWeb.WikiIndexLive do
   @moduledoc """
-  US-26.0.3 — Public wiki index listing all system articles.
+  US-26.0.3 / kbweb-01 — Public wiki landing page.
 
-  Displays system articles grouped by category with keyword search.
+  Shows a grid of the most-viewed featured system articles by default and
+  switches to a keyword search result list as soon as the visitor types.
   No authentication required.
   """
 
@@ -12,33 +13,14 @@ defmodule LoopctlWeb.WikiIndexLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    grouped = Knowledge.list_system_articles_grouped()
-
-    # Order known categories first, then append any other category actually present
-    # so no article is ever silently hidden from the index.
-    preferred = [
-      :pattern,
-      :decision,
-      :finding,
-      :reference,
-      :playbook,
-      :insight,
-      :entity,
-      :idea,
-      :quote,
-      :question
-    ]
-
-    present = Map.keys(grouped)
-    category_order = Enum.filter(preferred, &(&1 in present)) ++ (present -- preferred)
+    featured = Knowledge.list_featured_articles()
 
     {:ok,
      socket
      |> assign(:page_title, "loopctl Wiki")
-     |> assign(:grouped_articles, grouped)
+     |> assign(:featured_articles, featured)
      |> assign(:search_query, "")
-     |> assign(:search_results, nil)
-     |> assign(:category_order, category_order)}
+     |> assign(:search_results, nil)}
   end
 
   @impl true
@@ -81,7 +63,7 @@ defmodule LoopctlWeb.WikiIndexLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <section class="mx-auto w-full max-w-4xl px-6 py-16" id="wiki-index">
+    <section class="mx-auto w-full max-w-5xl px-6 py-16" id="wiki-index">
       <header class="mb-8">
         <h1 class="font-display text-2xl font-semibold text-slate-100">loopctl Wiki</h1>
         <p class="mt-2 text-sm text-slate-400">
@@ -123,25 +105,30 @@ defmodule LoopctlWeb.WikiIndexLive do
           </p>
         </div>
       <% else %>
-        <div id="wiki-categories" class="space-y-8">
-          <%= for category <- @category_order, articles = Map.get(@grouped_articles, category, []), articles != [] do %>
-            <section id={"category-#{category}"}>
-              <h2 class="mb-3 font-mono text-xs font-semibold uppercase tracking-wide text-slate-400">
-                {category}
-              </h2>
-              <ul class="space-y-2">
-                <li :for={article <- articles} class="flex items-center gap-3">
-                  <.link
-                    navigate={~p"/wiki/#{article.slug}"}
-                    class="text-accent-400 hover:text-accent-300 text-sm"
-                  >
-                    {article.title}
-                  </.link>
-                </li>
-              </ul>
-            </section>
-          <% end %>
-          <p :if={@grouped_articles == %{}} class="text-sm text-slate-500">
+        <div id="featured-articles">
+          <h2 class="mb-4 font-mono text-xs font-semibold uppercase tracking-wide text-slate-400">
+            Featured articles
+          </h2>
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+            <.link
+              :for={article <- @featured_articles}
+              id={"featured-#{article.id}"}
+              navigate={~p"/wiki/#{article.slug}"}
+              class="flex flex-col rounded-md border border-slate-700 bg-slate-900 p-4 transition-colors hover:border-accent-500"
+            >
+              <h3 class="text-sm font-medium text-slate-200">{article.title}</h3>
+              <p class="mt-2 flex-1 text-xs text-slate-400">{article.snippet}</p>
+              <div class="mt-3 flex items-center justify-between gap-2">
+                <span class="rounded-full bg-slate-800 px-2 py-0.5 font-mono text-xs text-slate-600">
+                  {article.category}
+                </span>
+                <span class="font-mono text-xs text-slate-500">
+                  {article.view_count} views
+                </span>
+              </div>
+            </.link>
+          </div>
+          <p :if={@featured_articles == []} class="text-sm text-slate-500">
             No system articles published yet.
           </p>
         </div>

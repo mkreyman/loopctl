@@ -13,7 +13,7 @@ defmodule Loopctl.Knowledge.SystemArticlesTest do
 
   setup :verify_on_exit!
 
-  defp create_system_article(attrs \\ %{}) do
+  defp create_system_article(attrs) do
     base = %{
       title: "System Article #{System.unique_integer([:positive])}",
       body: "System article body content for testing.",
@@ -148,6 +148,65 @@ defmodule Loopctl.Knowledge.SystemArticlesTest do
       grouped = Knowledge.list_system_articles_grouped()
       assert Map.has_key?(grouped, :pattern)
       assert Map.has_key?(grouped, :convention)
+    end
+  end
+
+  describe "list_featured_articles/0" do
+    test "returns published system articles with a view_count and snippet" do
+      article = create_system_article(%{slug: "feat-basic", title: "Featured Basic"})
+
+      featured = Knowledge.list_featured_articles()
+      row = Enum.find(featured, &(&1.id == article.id))
+
+      assert row
+      assert row.title == "Featured Basic"
+      assert row.slug == "feat-basic"
+      assert row.view_count == 0
+      assert is_binary(row.snippet)
+      refute Map.has_key?(row, :body)
+    end
+
+    test "ranks more-viewed articles ahead of unviewed ones" do
+      hot = create_system_article(%{slug: "feat-hot", title: "Hot Article"})
+      _cold = create_system_article(%{slug: "feat-cold", title: "Cold Article"})
+
+      for _ <- 1..5, do: fixture(:article_access_event, %{article_id: hot.id})
+
+      featured = Knowledge.list_featured_articles()
+      hot_row = Enum.find(featured, &(&1.id == hot.id))
+
+      assert hot_row.view_count == 5
+
+      # The hot article outranks every zero-view article in the result.
+      hot_index = Enum.find_index(featured, &(&1.id == hot.id))
+      zero_indexes = for {r, i} <- Enum.with_index(featured), r.view_count == 0, do: i
+      assert Enum.all?(zero_indexes, &(hot_index < &1))
+    end
+
+    test "excludes draft system articles" do
+      create_system_article(%{slug: "feat-draft", title: "Draft Featured", status: :draft})
+
+      featured = Knowledge.list_featured_articles()
+      refute Enum.any?(featured, &(&1.slug == "feat-draft"))
+    end
+
+    test "returns at most 16 articles" do
+      for n <- 1..20 do
+        create_system_article(%{slug: "feat-cap-#{n}", title: "Cap Article #{n}"})
+      end
+
+      assert length(Knowledge.list_featured_articles()) <= 16
+    end
+
+    test "truncates the snippet to 100 chars with an ellipsis for long bodies" do
+      long_body = String.duplicate("x", 250)
+      article = create_system_article(%{slug: "feat-long", body: long_body})
+
+      row = Knowledge.list_featured_articles() |> Enum.find(&(&1.id == article.id))
+
+      assert String.ends_with?(row.snippet, "…")
+      # 100 sliced chars + the ellipsis
+      assert String.length(row.snippet) == 101
     end
   end
 

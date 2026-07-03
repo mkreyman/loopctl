@@ -48,13 +48,43 @@ defmodule LoopctlWeb.WikiLiveTest do
     # Note: empty state test removed because seed migration installs
     # system articles that are visible via AdminRepo across all tests.
 
-    test "groups articles by category", %{conn: conn} do
+    test "renders category badges in the featured grid", %{conn: conn} do
       create_system_article(%{slug: "cat-pattern", title: "A Pattern", category: :pattern})
       create_system_article(%{slug: "cat-conv", title: "A Convention", category: :convention})
 
       {:ok, _view, html} = live(conn, ~p"/wiki")
+      assert html =~ "Featured articles"
       assert html =~ "pattern"
       assert html =~ "convention"
+    end
+
+    test "landing page shows a grid of at least 8 featured articles with view counts",
+         %{conn: conn} do
+      # 10 freshly-inserted system articles are the newest rows, so they sit
+      # at the top of the featured ranking (0-view articles are ordered by
+      # inserted_at desc) and all fit within the 16-article grid.
+      articles =
+        for n <- 1..10 do
+          create_system_article(%{
+            slug: "featured-#{n}",
+            title: "Featured Article #{n}"
+          })
+        end
+
+      # Give the first article real view events so its count is non-zero and
+      # it ranks ahead of the zero-view articles.
+      hot = hd(articles)
+      for _ <- 1..3, do: fixture(:article_access_event, %{article_id: hot.id})
+
+      {:ok, _view, html} = live(conn, ~p"/wiki")
+
+      # At least 8 of the 10 titles render in the grid.
+      present = Enum.count(articles, fn a -> html =~ a.title end)
+      assert present >= 8
+
+      # View counts render, including the hot article's non-zero count.
+      assert html =~ "3 views"
+      assert html =~ "0 views"
     end
   end
 
