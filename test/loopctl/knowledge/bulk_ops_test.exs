@@ -629,4 +629,87 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
              ]
     end
   end
+
+  # --- #266: HARD delete by explicit id-list must purge ARCHIVED tombstones ---
+
+  describe "hard delete by article_ids reaches archived rows (#266)" do
+    test "two-phase flow: create -> archive -> dry-run reports would_affect:1 + mints a token" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      article_id = article.id
+
+      # A previously-active row that has been archived (a tombstone) must still be
+      # previewable for a HARD delete via its explicit id — otherwise the natural
+      # archive-then-purge flow is impossible.
+      assert {:ok, %{would_affect: 1, token: token_id, frozen_ids: [^article_id]}} =
+               BulkOps.preview(tenant.id, :delete, {:ids, [article.id]}, audit_opts())
+
+      assert is_binary(token_id)
+
+      # And the tokened delete PURGES the archived row.
+      assert {:ok, %{affected: 1}} =
+               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+
+      refute AdminRepo.get(Article, article.id)
+    end
+
+    test "resolve_delete_selector includes archived AND active id-list rows" do
+      tenant = fixture(:tenant)
+      archived = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      superseded = fixture(:article, %{tenant_id: tenant.id, status: :superseded})
+
+      {:ok, ids} =
+        BulkOps.resolve_delete_selector(
+          tenant.id,
+          {:ids, [archived.id, published.id, superseded.id]}
+        )
+
+      assert Enum.sort(ids) ==
+               Enum.sort([archived.id, published.id, superseded.id])
+    end
+
+    test "the ACTIVE-only resolve_selector still excludes archived id-list rows (unchanged)" do
+      tenant = fixture(:tenant)
+      archived = fixture(:article, %{tenant_id: tenant.id, status: :archived})
+      published = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      # Archive/unpublish semantics are untouched: the active-only resolver still
+      # skips the archived row.
+      assert {:ok, [published_id]} =
+               BulkOps.resolve_selector(tenant.id, {:ids, [archived.id, published.id]})
+
+      assert published_id == published.id
+    end
+
+    test "an active row still purges via the id-list token path" do
+      tenant = fixture(:tenant)
+      active = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      assert {:ok, %{would_affect: 1, token: token_id}} =
+               BulkOps.preview(tenant.id, :delete, {:ids, [active.id]}, audit_opts())
+
+      assert {:ok, %{affected: 1}} =
+               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+
+      refute AdminRepo.get(Article, active.id)
+    end
+
+    test "tenant isolation: cannot purge another tenant's archived row by id" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      theirs = fixture(:article, %{tenant_id: tenant_b.id, status: :archived})
+
+      # tenant_a previewing tenant_b's archived id resolves to nothing.
+      assert {:ok, %{would_affect: 0, token: nil}} =
+               BulkOps.preview(tenant_a.id, :delete, {:ids, [theirs.id]}, audit_opts())
+
+      # And a direct delete over the foreign id purges nothing.
+      assert {:ok, %{affected: 0}} =
+               BulkOps.delete(tenant_a.id, [theirs.id], audit_opts())
+
+      assert AdminRepo.get(Article, theirs.id)
+    end
+  end
 end

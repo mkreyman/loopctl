@@ -564,7 +564,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
     with true <- is_binary(confirm_hash) || :missing_confirm_hash,
          {:ok, selector} <- bulk_delete_selector(params),
-         {:ok, ids} <- BulkOps.resolve_selector(tenant_id, selector),
+         {:ok, ids} <- BulkOps.resolve_delete_selector(tenant_id, selector),
          ^confirm_hash <- BulkOps.confirm_hash(tenant_id, ids),
          {:ok, %{affected: affected}} <- BulkOps.delete(tenant_id, ids, audit_opts) do
       json(conn, %{

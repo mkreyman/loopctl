@@ -48,6 +48,44 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   @max_articles 10
   @max_body_length 100_000
+
+  # --- Multi-chunk timeout budget (#264) ---
+  #
+  # A real ~87KB newsletter chunks into ~11 pieces, each 7–13s of LLM
+  # extraction. The old flat 30s timeout killed every such job (Oban.TimeoutError
+  # → discarded after 3 attempts with ZERO articles persisted). We now:
+  #
+  #   * persist each chunk's articles as it completes (partial progress survives
+  #     a later timeout/failure — see ingest_chunks/2), and
+  #   * scale the job timeout by chunk count with a hard cap.
+  #
+  # Concrete values:
+  #   * @per_chunk_timeout_ms = 30s — ~2x+ headroom over the observed 7–13s so a
+  #     healthy chunk is never falsely timed out under tail latency/variance.
+  #   * @max_job_timeout_ms   = 6 min — the ABSOLUTE ceiling a single job may hold
+  #     a :knowledge slot (concurrency 5), independent of chunk count. Bounds abuse
+  #     (GHSA-j7m9-ffmr-pwhm) while comfortably covering a realistic large doc.
+  #   * @max_chunks = cap / per_chunk = 12 — a document chunking to MORE than this
+  #     (>~96KB) can't be guaranteed within the cap, so we ingest the first
+  #     @max_chunks (persisted incrementally) and {:discard} the rest cleanly with
+  #     a count, rather than crash-looping or silently losing everything.
+  @per_chunk_timeout_ms :timer.seconds(30)
+  @max_job_timeout_ms :timer.minutes(6)
+  @max_chunks div(@max_job_timeout_ms, @per_chunk_timeout_ms)
+
+  # Content-Type families that are never ingestible UTF-8 text (#263). A PDF /
+  # image / archive body handed to the JSON-encoded extractor request raises
+  # Jason.EncodeError on the invalid bytes and — because the content hash is
+  # deterministic — every retry fails identically (a permanent crash-loop). We
+  # detect and {:discard} these BEFORE the content reaches the extractor.
+  @binary_application_content_types ~w(
+    application/pdf application/octet-stream application/zip application/gzip
+    application/x-gzip application/x-tar application/x-bzip2 application/x-7z-compressed
+    application/x-rar-compressed application/msword application/vnd.ms-excel
+    application/vnd.ms-powerpoint application/x-protobuf application/wasm
+    application/java-archive application/x-shockwave-flash
+  )
+  @binary_content_type_prefixes ~w(image/ audio/ video/ font/)
   # Single source of truth: the canonical taxonomy (avoids drift).
   @valid_categories Loopctl.Knowledge.Categories.all()
   @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
@@ -81,10 +119,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # because the uniqueness key excludes project_id, crash-loop as a poison pill.
     # DISCARD such a job (no retry) BEFORE any fetch/LLM work rather than raising.
     with :ok <- validate_project_id(project_id),
-         {:ok, content} <- resolve_content(url, raw_content),
-         {:ok, raw_articles} <- extract_with_chunking(content, source_type) do
-      articles = validate_and_filter(raw_articles)
-      insert_articles(tenant_id, source_id, source_type, project_id, articles, url, publish)
+         {:ok, content} <- resolve_content(url, raw_content) do
+      ctx = %{
+        tenant_id: tenant_id,
+        source_id: source_id,
+        source_type: source_type,
+        project_id: project_id,
+        url: url,
+        publish: publish
+      }
+
+      ingest_chunks(ctx, content)
     end
   end
 
@@ -109,50 +154,137 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
-  # Hard per-job wall-clock cap (backstop to the bounded DNS resolve + Req
-  # receive_timeout). A hostile/slow endpoint can't pin a :knowledge queue slot
-  # indefinitely (worker-01 / GHSA-j7m9-ffmr-pwhm).
+  # Per-job wall-clock cap that SCALES with chunk count (#264), floored at one
+  # chunk and hard-capped at @max_job_timeout_ms. A hostile/slow endpoint still
+  # can't pin a :knowledge queue slot beyond the cap (worker-01 /
+  # GHSA-j7m9-ffmr-pwhm), while a legitimate multi-chunk document now gets enough
+  # wall-clock to finish. For a URL job the fetched size is unknown until fetch,
+  # so we grant the full capped budget; perform/1 self-limits to @max_chunks and
+  # persists incrementally, so the cap is a backstop, not the mechanism.
   @impl Oban.Worker
-  def timeout(_job), do: :timer.seconds(30)
+  def timeout(%Oban.Job{args: args}) do
+    args
+    |> chunk_count_for_timeout()
+    |> max(1)
+    |> Kernel.*(@per_chunk_timeout_ms)
+    |> min(@max_job_timeout_ms)
+  end
+
+  defp chunk_count_for_timeout(%{"content" => content})
+       when is_binary(content) and content != "" do
+    content |> ContentChunker.chunk() |> length()
+  end
+
+  defp chunk_count_for_timeout(%{"url" => url}) when is_binary(url) and url != "" do
+    @max_chunks
+  end
+
+  defp chunk_count_for_timeout(_), do: 1
 
   # --- Private ---
 
-  defp extract_with_chunking(content, source_type) do
+  # Ingest a document chunk-by-chunk, PERSISTING each chunk's articles as it
+  # completes (#264). A timeout or mid-run failure therefore keeps the articles
+  # already extracted instead of discarding everything. Documents that chunk
+  # beyond @max_chunks are ingested up to that bound and the remainder is
+  # {:discard}ed cleanly (with a count) rather than silently lost.
+  defp ingest_chunks(ctx, content) do
     chunks = ContentChunker.chunk(content)
+    chunk_count = length(chunks)
+    {processable, dropped} = Enum.split(chunks, @max_chunks)
 
-    if length(chunks) > 1 do
+    if chunk_count > 1 do
       Logger.info(
-        "ContentIngestionWorker: splitting #{byte_size(content)} bytes into #{length(chunks)} chunks"
+        "ContentIngestionWorker: #{byte_size(content)} bytes -> #{chunk_count} chunks " <>
+          "(processing #{length(processable)}, deferring #{length(dropped)})"
       )
     end
 
-    {articles, errors} =
-      Enum.reduce(chunks, {[], []}, fn chunk, {arts, errs} ->
-        case @content_extractor.extract_from_content(chunk, source_type: source_type) do
-          {:ok, extracted} -> {arts ++ extracted, errs}
-          {:error, reason} -> {arts, [reason | errs]}
-        end
-      end)
+    processable
+    |> Enum.reduce_while(%{inserted: 0, persisted: 0, errors: []}, fn chunk, acc ->
+      remaining = @max_articles - acc.inserted
 
+      if remaining <= 0 do
+        # Article cap reached — stop early; we have the full @max_articles set.
+        {:halt, acc}
+      else
+        reduce_chunk(ctx, chunk, remaining, acc)
+      end
+    end)
+    |> finalize_ingest(chunk_count, length(processable), dropped)
+  end
+
+  defp reduce_chunk(ctx, chunk, remaining, acc) do
+    case extract_and_persist_chunk(ctx, chunk, remaining) do
+      {:ok, count} ->
+        {:cont, %{acc | inserted: acc.inserted + count, persisted: acc.persisted + 1}}
+
+      {:error, reason} ->
+        # Persist what earlier chunks produced; record the error and keep going.
+        {:cont, %{acc | errors: [reason | acc.errors]}}
+    end
+  end
+
+  # Extract + validate + persist ONE chunk in its own transaction, so its
+  # article(s) are durably committed before the next chunk's LLM call runs.
+  defp extract_and_persist_chunk(ctx, chunk, remaining) do
+    case @content_extractor.extract_from_content(chunk, source_type: ctx.source_type) do
+      {:ok, extracted} ->
+        articles =
+          extracted
+          |> dedup_articles()
+          |> validate_and_filter()
+          |> Enum.take(remaining)
+
+        case insert_articles(
+               ctx.tenant_id,
+               ctx.source_id,
+               ctx.source_type,
+               ctx.project_id,
+               articles,
+               ctx.url,
+               ctx.publish
+             ) do
+          :ok -> {:ok, length(articles)}
+          {:error, _} = err -> err
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Decide the job's return value from the incremental run:
+  #   * dropped chunks (document > @max_chunks) → {:discard} (no retry) with a
+  #     clear count; whatever was persisted stays committed.
+  #   * any articles persisted → :ok (partial success is success — never retry
+  #     and risk re-inserting the already-committed chunks).
+  #   * nothing persisted but chunks errored → {:error, first} so Oban retries a
+  #     genuinely-transient failure (safe: nothing was committed yet).
+  #   * nothing persisted, no errors → :ok (legitimately nothing reusable).
+  defp finalize_ingest(
+         %{inserted: inserted, persisted: persisted, errors: errors},
+         chunk_count,
+         processed_count,
+         dropped
+       ) do
     cond do
-      articles != [] ->
-        # Got some articles — partial success is fine, log errors
-        if errors != [] do
-          Logger.warning(
-            "ContentIngestionWorker: #{length(errors)} of #{length(chunks)} chunks failed"
-          )
-        end
+      dropped != [] ->
+        {:discard,
+         {:document_too_large,
+          "document too large: #{chunk_count} chunks exceed the #{@max_chunks}-chunk per-job " <>
+            "budget (cap #{div(@max_job_timeout_ms, 1000)}s); persisted #{inserted} article(s) " <>
+            "from #{persisted} of #{processed_count} processed chunk(s), " <>
+            "#{length(dropped)} chunk(s) not processed"}}
 
-        {:ok, articles |> dedup_articles() |> Enum.take(@max_articles)}
+      inserted > 0 ->
+        :ok
 
       errors != [] ->
-        # All chunks failed — propagate the first error so Oban retries
-        {:error, List.first(errors)}
+        {:error, errors |> Enum.reverse() |> List.first()}
 
       true ->
-        # All chunks succeeded but extracted no articles — legitimately
-        # nothing reusable in the content.
-        {:ok, []}
+        :ok
     end
   end
 
@@ -196,7 +328,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp resolve_content(nil, content) when is_binary(content) and content != "" do
-    {:ok, content}
+    # Direct-content path: no Content-Type to consult, so the UTF-8 validity
+    # check is the whole guard (#263). Non-UTF-8 inline content (a PDF/binary
+    # posted directly) would raise Jason.EncodeError inside the extractor's JSON
+    # request and crash-loop; {:discard} it cleanly instead.
+    ensure_utf8_text(content)
   end
 
   defp resolve_content(url, _content) when is_binary(url) do
@@ -235,8 +371,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       |> maybe_add_plug()
 
     case Req.get(req_opts) do
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        {:ok, strip_html(body)}
+      {:ok, %{status: status} = resp} when status in 200..299 ->
+        handle_fetched_body(resp.body, Req.Response.get_header(resp, "content-type"))
 
       {:ok, %{status: status}} ->
         Logger.warning(
@@ -254,6 +390,58 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
         {:error, {:url_fetch_error, reason}}
     end
+  end
+
+  # Guard a fetched body BEFORE it reaches strip_html (which runs regex over the
+  # bytes) or the JSON-encoded extractor request (#263). A binary Content-Type,
+  # or a body that isn't valid UTF-8 (a mislabeled binary), is discarded cleanly
+  # so Oban never retries a deterministically-failing PDF/binary crash-loop.
+  defp handle_fetched_body(body, content_type_values) do
+    content_type = List.first(List.wrap(content_type_values))
+
+    cond do
+      is_binary(content_type) and binary_content_type?(content_type) ->
+        unsupported_content_discard("Content-Type \"#{content_type}\"")
+
+      is_binary(body) and not String.valid?(body) ->
+        unsupported_content_discard("fetched body")
+
+      true ->
+        {:ok, strip_html(body)}
+    end
+  end
+
+  # UTF-8 guard for the direct-content path (#263). There is no Content-Type to
+  # consult here, so validity is the whole check. Returns {:ok, content} for
+  # ingestible text, or {:discard, {:unsupported_content, msg}} — which Oban
+  # DISCARDS (no infinite retry) and never raises — for non-UTF-8 (PDF/binary).
+  defp ensure_utf8_text(content) when is_binary(content) do
+    if String.valid?(content) do
+      {:ok, content}
+    else
+      unsupported_content_discard("content")
+    end
+  end
+
+  defp binary_content_type?(content_type) do
+    normalized =
+      content_type
+      |> String.downcase()
+      |> String.split(";", parts: 2)
+      |> List.first()
+      |> String.trim()
+
+    String.starts_with?(normalized, @binary_content_type_prefixes) or
+      normalized in @binary_application_content_types
+  end
+
+  defp unsupported_content_discard(what) do
+    reason =
+      "#{what} is not UTF-8 text (looks like PDF/binary); " <>
+        "PDF/binary text extraction is not supported on this endpoint"
+
+    Logger.warning("ContentIngestionWorker: discarding job — #{reason}")
+    {:discard, {:unsupported_content, reason}}
   end
 
   defp derive_source_id(content_hash) do

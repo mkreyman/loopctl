@@ -12,6 +12,17 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     %{tenant: tenant}
   end
 
+  # Build a document that ContentChunker splits into exactly `sections` chunks.
+  # Each section body is ~5.5KB — under the 8KB threshold (so it is never
+  # force-split) but large enough that two adjacent sections (~11KB) can't merge
+  # into one chunk. Net: one chunk per section.
+  defp multi_chunk_content(sections) do
+    1..sections
+    |> Enum.map_join("\n\n", fn i ->
+      "# Section #{i}\n\n" <> String.duplicate("word#{i} ", 900)
+    end)
+  end
+
   # --- Success: extracts articles from inline content ---
 
   describe "perform/1 with inline content" do
@@ -535,6 +546,307 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert log.entity_type == "article"
       assert log.new_state["source_type"] == "newsletter"
       assert log.new_state["article_count"] == 1
+    end
+  end
+
+  # --- #263: PDF / non-UTF-8 binary content is discarded, never crash-looped ---
+
+  describe "perform/1 unsupported (PDF/binary) content (#263)" do
+    test "URL returning application/pdf is discarded cleanly (no Jason.EncodeError, no retry)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # A real PDF magic header + a non-UTF-8 byte (0xE2 as a lone byte). Handing
+      # this to the JSON-encoded extractor request would raise Jason.EncodeError.
+      pdf_bytes = <<0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x34, 0x0A, 0xE2, 0x00, 0xFF>>
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/pdf")
+        |> Plug.Conn.send_resp(200, pdf_bytes)
+      end)
+
+      # The extractor must NEVER be reached — the guard short-circuits first.
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        flunk("extractor must not be called for binary content")
+      end)
+
+      assert {:discard, {:unsupported_content, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 300,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://example.com/report.pdf",
+                   "content_hash" => "pdf_url",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      assert reason =~ "application/pdf"
+      assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+    end
+
+    test "a mislabeled body (text/plain header, non-UTF-8 bytes) is discarded via the String.valid? backstop" do
+      %{tenant: tenant} = setup_tenant()
+
+      # Content-Type lies (text/plain) but the bytes are invalid UTF-8.
+      binary_body = <<0xFF, 0xFE, 0x00, 0xE2, 0x82>>
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/plain")
+        |> Plug.Conn.send_resp(200, binary_body)
+      end)
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        flunk("extractor must not be called for non-UTF-8 content")
+      end)
+
+      assert {:discard, {:unsupported_content, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 301,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://example.com/mislabeled",
+                   "content_hash" => "mislabeled_url",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      assert reason =~ "UTF-8"
+    end
+
+    test "direct non-UTF-8 inline content is discarded cleanly" do
+      %{tenant: tenant} = setup_tenant()
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        flunk("extractor must not be called for non-UTF-8 inline content")
+      end)
+
+      assert {:discard, {:unsupported_content, _reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 302,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => <<0x25, 0x50, 0x44, 0x46, 0xE2, 0x00>>,
+                   "content_hash" => "pdf_inline",
+                   "source_type" => "ingestion"
+                 }
+               })
+    end
+
+    test "a normal UTF-8 URL body still ingests (guard does not over-block)" do
+      %{tenant: tenant} = setup_tenant()
+
+      Req.Test.stub(ContentIngestionWorker, fn conn ->
+        Req.Test.html(conn, "<html><body><p>Perfectly valid text</p></body></html>")
+      end)
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn content, _opts ->
+        assert content =~ "Perfectly valid text"
+
+        {:ok, [%{title: "Valid web", body: "Body.", category: :finding, tags: ["web"]}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 303,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "url" => "https://example.com/ok",
+                   "content_hash" => "ok_url",
+                   "source_type" => "web_article"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "web_article")
+      assert article.title == "Valid web"
+    end
+  end
+
+  # --- #264: multi-chunk documents ingest; partial progress survives failure ---
+
+  describe "perform/1 multi-chunk ingestion (#264)" do
+    test "every chunk's articles are persisted (one article per chunk)" do
+      %{tenant: tenant} = setup_tenant()
+
+      # 4 sections -> 4 chunks. The extractor returns a distinct article per call.
+      counter = :counters.new(1, [])
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        :counters.add(counter, 1, 1)
+        n = :counters.get(counter, 1)
+
+        {:ok, [%{title: "Chunk article #{n}", body: "Body #{n}.", category: :pattern}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 400,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(4),
+                   "content_hash" => "multi_chunk_ok",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      # 4 chunks -> 4 articles, all persisted.
+      assert length(articles) == 4
+    end
+
+    test "partial progress: earlier chunks are PERSISTED even when a later chunk fails" do
+      %{tenant: tenant} = setup_tenant()
+
+      # First chunk succeeds (and is persisted immediately); the next chunk
+      # simulates a failure (timeout/LLM error). With incremental persistence the
+      # first chunk's article must survive.
+      counter = :counters.new(1, [])
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        :counters.add(counter, 1, 1)
+        n = :counters.get(counter, 1)
+
+        if n == 1 do
+          {:ok, [%{title: "Survivor", body: "Persisted before the failure.", category: :pattern}]}
+        else
+          {:error, {:request_failed, :timeout}}
+        end
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 401,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(3),
+                   "content_hash" => "partial_progress",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert length(articles) == 1
+      assert hd(articles).title == "Survivor"
+    end
+
+    test "when NO chunk succeeds, the error propagates so Oban retries (nothing persisted)" do
+      %{tenant: tenant} = setup_tenant()
+
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        {:error, {:request_failed, :timeout}}
+      end)
+
+      assert {:error, {:request_failed, :timeout}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 402,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(3),
+                   "content_hash" => "all_fail",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert %{data: []} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+    end
+
+    test "a tiny single-chunk input still ingests" do
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _content, _opts ->
+        {:ok, [%{title: "Tiny", body: "Small.", category: :pattern}]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 403,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "just a little text",
+                   "content_hash" => "tiny",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert length(articles) == 1
+    end
+  end
+
+  # --- #264: the job timeout scales with chunk count (bounded by the cap) ---
+
+  describe "timeout/1 scales with chunk count (#264)" do
+    test "a single-chunk job gets the base 30s budget" do
+      job = %Oban.Job{args: %{"content" => "small", "content_hash" => "t", "source_type" => "x"}}
+      assert ContentIngestionWorker.timeout(job) == :timer.seconds(30)
+    end
+
+    test "a multi-chunk job gets a larger, chunk-scaled budget" do
+      small = %Oban.Job{args: %{"content" => "small", "source_type" => "x"}}
+
+      big = %Oban.Job{
+        args: %{"content" => multi_chunk_content(4), "source_type" => "x"}
+      }
+
+      big_timeout = ContentIngestionWorker.timeout(big)
+
+      assert big_timeout > ContentIngestionWorker.timeout(small)
+      # 4 chunks * 30s = 120s, still under the cap.
+      assert big_timeout == 4 * :timer.seconds(30)
+    end
+
+    test "the timeout is hard-capped for a very large document" do
+      # 40 sections -> ~40 chunks; 40 * 30s = 1200s would blow past the cap, so
+      # the timeout must clamp to the 6-minute ceiling.
+      huge = %Oban.Job{args: %{"content" => multi_chunk_content(40), "source_type" => "x"}}
+      assert ContentIngestionWorker.timeout(huge) == :timer.minutes(6)
+    end
+
+    test "a URL job (unknown size pre-fetch) is granted the full capped budget" do
+      job = %Oban.Job{args: %{"url" => "https://example.com/x", "source_type" => "x"}}
+      assert ContentIngestionWorker.timeout(job) == :timer.minutes(6)
+    end
+  end
+
+  # --- #264: an oversized document is discarded cleanly with partial progress ---
+
+  describe "perform/1 oversized document (#264)" do
+    test "a document exceeding the per-job chunk budget persists what fits, then discards cleanly" do
+      %{tenant: tenant} = setup_tenant()
+
+      # 14 sections -> 14 chunks, above the 12-chunk per-job budget. Each chunk
+      # yields one article; the first 12 persist, the rest are discarded.
+      Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _chunk, _opts ->
+        {:ok,
+         [
+           %{
+             title: "Oversized #{System.unique_integer([:positive])}",
+             body: "Body.",
+             category: :pattern
+           }
+         ]}
+      end)
+
+      assert {:discard, {:document_too_large, reason}} =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 404,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => multi_chunk_content(14),
+                   "content_hash" => "oversized",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      assert reason =~ "too large"
+
+      # The @max_articles cap (10) bounds what actually persists, but the point is
+      # that partial work IS committed rather than everything lost.
+      %{meta: %{total_count: total}} =
+        Knowledge.list_articles(tenant.id, source_type: "newsletter")
+
+      assert total > 0
     end
   end
 

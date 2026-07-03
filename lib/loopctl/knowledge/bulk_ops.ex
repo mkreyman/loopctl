@@ -226,7 +226,7 @@ defmodule Loopctl.Knowledge.BulkOps do
   end
 
   def preview(tenant_id, :delete, selector, _audit_opts) do
-    with {:ok, ids} <- resolve_selector(tenant_id, selector) do
+    with {:ok, ids} <- resolve_delete_selector(tenant_id, selector) do
       sorted = Enum.sort(ids)
       preview_delete_result(tenant_id, sorted)
     end
@@ -346,7 +346,7 @@ defmodule Loopctl.Knowledge.BulkOps do
     do: {:error, :invalid_nonce}
 
   defp delete_with_reconfirm_valid(tenant_id, nonce_id, selector, confirm_hash_value, audit_opts) do
-    with {:ok, ids} <- resolve_selector(tenant_id, selector) do
+    with {:ok, ids} <- resolve_delete_selector(tenant_id, selector) do
       sorted = Enum.sort(ids)
 
       if confirm_hash(tenant_id, sorted) != confirm_hash_value do
@@ -454,6 +454,32 @@ defmodule Loopctl.Knowledge.BulkOps do
 
   def resolve_selector(_tenant_id, _selector) do
     {:error, :bad_request, "Unsupported selector. Use {:ids, [..]}, {:tag, _}, or {:source, _}."}
+  end
+
+  @doc """
+  Resolve a selector for a HARD delete (#266).
+
+  A hard delete PURGES tombstones, so for an EXPLICIT `{:ids, [..]}` selector it
+  must reach `:archived`/`:superseded` rows too — otherwise the natural two-phase
+  "archive → then hard-purge" flow is impossible (archiving first makes the row
+  unreachable by `resolve_selector/2`, whose id-list path is active-only). The
+  id-list is explicit user intent, so widening it to all lifecycle statuses is
+  safe and expected.
+
+  The tag/source selectors deliberately DELEGATE to `resolve_selector/2` (still
+  active-only): a broad tag/query purge that silently swept archived rows would
+  be a surprise-purge. Only the explicit id-list is widened.
+
+  Same bounds/tenant-scoping/return shape as `resolve_selector/2`.
+  """
+  @spec resolve_delete_selector(Ecto.UUID.t(), selector()) ::
+          {:ok, [Ecto.UUID.t()]} | {:error, :too_many} | {:error, :bad_request, String.t()}
+  def resolve_delete_selector(tenant_id, {:ids, ids}) when is_list(ids) do
+    resolve_ids_selector(tenant_id, ids, :all)
+  end
+
+  def resolve_delete_selector(tenant_id, selector) do
+    resolve_selector(tenant_id, selector)
   end
 
   # --- transition (archive / unpublish) ---
@@ -636,24 +662,33 @@ defmodule Loopctl.Knowledge.BulkOps do
   defp maybe_put_source_type(map, st) when is_binary(st), do: Map.put(map, "source_type", st)
   defp maybe_put_source_type(map, _), do: map
 
-  # The :ids selector resolves to active (draft/published), tenant-scoped ids,
-  # capped at 5000 — consistent with archive/unpublish and list_archivable_ids.
-  # Foreign / cross-tenant ids are filtered out by the tenant_id AND id IN guard.
-  defp resolve_ids_selector(tenant_id, ids) do
+  # The :ids selector resolves tenant-scoped ids, capped at 5000. Foreign /
+  # cross-tenant ids are filtered out by the tenant_id AND id IN guard.
+  #
+  # `status_scope`:
+  #   * `:active` (default) — draft/published only, for archive/unpublish and the
+  #     active-only `resolve_selector/2`. Matches list_archivable_ids.
+  #   * `:all` — every lifecycle status, for a HARD delete by explicit id-list
+  #     (#266): a purge targets archived/superseded tombstones too.
+  defp resolve_ids_selector(tenant_id, ids, status_scope \\ :active) do
     queryable = sanitize_ids(ids)
 
     matched =
       from(a in Article,
-        where:
-          a.tenant_id == ^tenant_id and a.id in ^queryable and
-            a.status in ^@archivable_statuses,
+        where: a.tenant_id == ^tenant_id and a.id in ^queryable,
         select: a.id,
         limit: ^(bulk_max() + 1)
       )
+      |> scope_ids_statuses(status_scope)
       |> AdminRepo.all()
 
     if length(matched) > bulk_max(), do: {:error, :too_many}, else: {:ok, matched}
   end
+
+  defp scope_ids_statuses(query, :all), do: query
+
+  defp scope_ids_statuses(query, :active),
+    do: from(a in query, where: a.status in ^@archivable_statuses)
 
   defp mint_token!(tenant_id, ids) do
     expires_at = DateTime.add(DateTime.utc_now(), token_ttl_seconds(), :second)
