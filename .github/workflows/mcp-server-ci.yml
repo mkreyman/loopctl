@@ -1,0 +1,42 @@
+name: MCP Server CI
+
+# The main ci.yml is Elixir-only and never touches mcp-server/, so the npm
+# package's own test suite was never run in CI — and the auto-publish workflow
+# ships it to npm on a version bump WITHOUT testing. This job closes that gap:
+# it runs the deterministic node --test unit suite on every push/PR that touches
+# mcp-server/**, so a red suite is caught before merge (and, via the publish
+# gates in mcp-autopublish.yml / npm-publish.yml, before an npm release).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'mcp-server/**'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'mcp-server/**'
+
+jobs:
+  test:
+    name: Node unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm test` == `node --test test/*.test.js` — the deterministic unit suite.
+      # It mocks fetch / exercises pure helpers, so no network is needed. It does
+      # NOT run smoke_test.mjs, which is a live-network test that depends on server
+      # witness state and would flake CI (run it manually via `npm run test:smoke`).
+      - name: Run unit tests
+        run: npm test

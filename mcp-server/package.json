@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js",
+    "test:smoke": "node smoke_test.mjs"
   },
   "keywords": [
     "mcp",
@@ -33,6 +34,7 @@
   },
   "files": [
     "index.js",
+    "lib",
     "README.md",
     "LICENSE"
   ],

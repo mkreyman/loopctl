@@ -13,6 +13,11 @@ import {
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import {
+  projectsPath,
+  ingestionJobsPath,
+  parseJsonResponseBody,
+} from "./lib/http-helpers.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -109,26 +114,15 @@ async function apiCall(method, path, body, keyOverride) {
   if (contentType.includes("application/json")) {
     // A JSON content-type is no guarantee of a well-formed body: a transient Fly
     // edge 502/503 or a truncated/empty response can arrive with the JSON header.
-    // Read the raw text and parse defensively so a malformed body becomes a
-    // structured MCP error instead of an unhandled throw from response.json().
+    // Read the raw text and parse defensively (shared with the test suite via
+    // lib/http-helpers.js) so a malformed body becomes a structured MCP error
+    // instead of an unhandled throw from response.json().
     const raw = await response.text();
-    if (raw.trim() === "") {
-      return {
-        error: true,
-        status: response.status,
-        body: `invalid/empty JSON response from server (HTTP ${response.status}): empty body`,
-      };
+    const outcome = parseJsonResponseBody(raw, response.status);
+    if (outcome.error) {
+      return outcome;
     }
-    try {
-      responseBody = JSON.parse(raw);
-    } catch {
-      const snippet = raw.length > 200 ? `${raw.slice(0, 200)}... (truncated)` : raw;
-      return {
-        error: true,
-        status: response.status,
-        body: `invalid/empty JSON response from server (HTTP ${response.status}): ${snippet}`,
-      };
-    }
+    responseBody = outcome.parsed;
   } else {
     const text = await response.text();
     try {
@@ -210,12 +204,10 @@ async function getTenant() {
   return toContent(result);
 }
 
-async function listProjects({ page, page_size } = {}) {
-  const params = new URLSearchParams();
-  if (page != null) params.set("page", String(page));
-  if (page_size != null) params.set("page_size", String(page_size));
-  const query = params.toString() ? `?${params}` : "";
-  const result = await apiCall("GET", `/api/v1/projects${query}`);
+async function listProjects(args = {}) {
+  // Query-string building lives in lib/http-helpers.js so the test suite exercises
+  // the same page/page_size logic the server ships (#247, mcp-01).
+  const result = await apiCall("GET", projectsPath(args));
   return toContent(result);
 }
 
@@ -1152,15 +1144,12 @@ async function knowledgeIngestBatch({ items, project_id, publish }) {
   return toContent(result);
 }
 
-async function knowledgeIngestionJobs({ limit, offset, since_days } = {}) {
-  const params = new URLSearchParams();
-  if (limit != null) params.set("limit", String(limit));
-  if (offset != null) params.set("offset", String(offset));
-  if (since_days != null) params.set("since_days", String(since_days));
-  const query = params.toString() ? `?${params}` : "";
+async function knowledgeIngestionJobs(args = {}) {
+  // Query-string building lives in lib/http-helpers.js so the test suite exercises
+  // the same limit/offset/since_days logic the server ships (#248, mcp-02).
   const result = await apiCall(
     "GET",
-    `/api/v1/knowledge/ingestion-jobs${query}`,
+    ingestionJobsPath(args),
     null,
     process.env.LOOPCTL_ORCH_KEY,
   );
