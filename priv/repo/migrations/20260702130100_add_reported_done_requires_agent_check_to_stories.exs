@@ -1,4 +1,18 @@
 defmodule Loopctl.Repo.Migrations.AddReportedDoneRequiresAgentCheckToStories do
+  use Ecto.Migration
+
+  # Run each ALTER in its OWN auto-committed transaction. This is REQUIRED for the
+  # NOT VALID / VALIDATE split to actually help: inside a single Ecto-wrapped
+  # transaction Postgres would hold the ADD-CONSTRAINT lock until COMMIT, i.e.
+  # through the whole VALIDATE scan — an ACCESS-EXCLUSIVE-equivalent write block on
+  # `stories` (the hottest table). With the DDL transaction disabled, ADD
+  # CONSTRAINT ... NOT VALID commits first (fast, catalog-only, no scan), THEN
+  # VALIDATE CONSTRAINT runs on its own taking only SHARE UPDATE EXCLUSIVE
+  # (concurrent reads AND writes allowed). Same repo pattern as the CONCURRENTLY
+  # index migrations (e.g. 20260625120000_add_articles_source_keyset_index).
+  @disable_ddl_transaction true
+  @disable_migration_lock true
+
   @moduledoc """
   Chain-of-custody INVARIANT 1 (L2 structural, docs/chain-of-custody-v2.md
   §2.1/§2.2). The threat: the self-verify guard (`validate_not_self_verify/2`)
@@ -35,31 +49,27 @@ defmodule Loopctl.Repo.Migrations.AddReportedDoneRequiresAgentCheckToStories do
   Pre-flight: dev (`loopctl_dev`) and test (`loopctl_test`) both have 0 stories, so
   the constraint applies cleanly; no legacy backfill needed.
 
-  Production-safe locking: added `NOT VALID` first (a fast catalog-only change that
-  does NOT scan the table), then `VALIDATE CONSTRAINT` in a separate statement —
-  which takes only a `SHARE UPDATE EXCLUSIVE` lock (concurrent reads AND writes
-  allowed) instead of the `ACCESS EXCLUSIVE` full-table lock a plain
-  `ADD CONSTRAINT ... CHECK` would hold for the whole scan. Behavior is identical
-  on the empty dev/test tables; this is purely the safe form for a populated
-  production `stories` table.
+  Online-safe locking: `@disable_ddl_transaction true` (see the module attribute
+  note) makes `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT` each run in
+  their own auto-committed transaction, so VALIDATE holds only a SHARE UPDATE
+  EXCLUSIVE lock — concurrent reads and writes to `stories` continue during the
+  scan. Behavior is identical on the empty dev/test tables; this is the
+  production-safe form.
 
-  Reversible: the `execute/2` up/down pairs drop the constraint on rollback
-  (the VALIDATE step's down is a no-op — dropping the constraint removes it whole).
+  Reversible: `down` drops the constraint (idempotent `IF EXISTS`).
   """
-  use Ecto.Migration
 
   @check "agent_status <> 'reported_done' OR implementer_dispatch_id IS NULL OR assigned_agent_id IS NOT NULL"
 
-  def change do
+  def up do
     execute(
-      "ALTER TABLE stories ADD CONSTRAINT stories_reported_done_requires_agent CHECK (#{@check}) NOT VALID",
-      "ALTER TABLE stories DROP CONSTRAINT stories_reported_done_requires_agent"
+      "ALTER TABLE stories ADD CONSTRAINT stories_reported_done_requires_agent CHECK (#{@check}) NOT VALID"
     )
 
-    execute(
-      "ALTER TABLE stories VALIDATE CONSTRAINT stories_reported_done_requires_agent",
-      # Down no-op: the ADD's down (above) drops the constraint entirely on rollback.
-      "SELECT 1"
-    )
+    execute("ALTER TABLE stories VALIDATE CONSTRAINT stories_reported_done_requires_agent")
+  end
+
+  def down do
+    execute("ALTER TABLE stories DROP CONSTRAINT IF EXISTS stories_reported_done_requires_agent")
   end
 end

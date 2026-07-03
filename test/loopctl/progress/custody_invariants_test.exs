@@ -13,6 +13,8 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
   """
   use Loopctl.DataCase, async: true
 
+  import ExUnit.CaptureLog
+
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
@@ -195,6 +197,40 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
                Progress.verify_story(tenant.id, story.id, %{"summary" => "x"},
                  orchestrator_agent_id: orchestrator.id
                )
+    end
+
+    test "the guard emits an operator warning (story_id + tenant_id) so a broken import is visible" do
+      tenant = fixture(:tenant)
+      epic = fixture(:epic, %{tenant_id: tenant.id})
+      story = imported_orphan(tenant, epic, now_usec())
+      orchestrator = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
+
+      verify_log =
+        capture_log(fn ->
+          assert {:error, :missing_assigned_agent} =
+                   Progress.verify_story(tenant.id, story.id, %{"summary" => "x"},
+                     orchestrator_agent_id: orchestrator.id
+                   )
+        end)
+
+      assert verify_log =~ "custody_orphaned_blocked"
+      assert verify_log =~ "verify"
+      assert verify_log =~ story.id
+      assert verify_log =~ tenant.id
+
+      # …and on the review path too.
+      review_log =
+        capture_log(fn ->
+          assert {:error, :missing_assigned_agent} =
+                   Progress.record_review(tenant.id, story.id, review_params("x"),
+                     reviewer_agent_id: reviewer.id
+                   )
+        end)
+
+      assert review_log =~ "custody_orphaned_blocked"
+      assert review_log =~ "review"
+      assert review_log =~ story.id
     end
 
     test "record_review fails closed on a custody-orphaned story" do
