@@ -4,35 +4,23 @@ defmodule Loopctl.Repo.Migrations.AddEmbeddingHnswIndex do
   @disable_ddl_transaction true
   @disable_migration_lock true
 
+  # The capability-based (amname='hnsw') detection/create/drop SQL lives in
+  # `Loopctl.Repo.HnswIndex`, parameterized by table name, so the migration
+  # behaviour can be exercised in isolation against a per-test throwaway table
+  # (see test/loopctl/repo/reconcile_hnsw_index_migration_test.exs) instead of
+  # the shared, sandbox-uninsolated `articles_embedding_hnsw_idx`. For the
+  # default `"articles"` these emit the same SQL this migration always ran.
+
   def up do
-    # Only create the HNSW index if the embedding column exists (pgvector was
-    # enabled). AC-27.14.2: the existence guard is capability-based (ANY hnsw
-    # index on articles already present), symmetric with down/0's amname-based
+    # AC-27.14.2: the existence guard is capability-based (ANY hnsw index on
+    # articles already present), symmetric with down/0's amname-based
     # detection — NOT a hard-coded `indexname = 'articles_embedding_idx'`
     # check. The old name-based guard only saw the migration's own name, so
     # from prod's drift state {articles_embedding_hnsw_idx} this up-step would
-    # create a SECOND, redundant hnsw index. By skipping when any hnsw index on
-    # articles(embedding) exists (detected by am.amname='hnsw', the same
-    # pg_index/pg_am join down/0 and the reconcile migration use), the two-index
-    # state can never arise.
-    execute("""
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'articles' AND column_name = 'embedding') THEN
-        IF NOT EXISTS (
-          SELECT 1
-          FROM pg_index x
-          JOIN pg_class i ON i.oid = x.indexrelid
-          JOIN pg_class t ON t.oid = x.indrelid
-          JOIN pg_namespace n ON n.oid = t.relnamespace
-          JOIN pg_am    am ON am.oid = i.relam
-          WHERE t.relname = 'articles' AND n.nspname = 'public' AND am.amname = 'hnsw'
-        ) THEN
-          CREATE INDEX articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops);
-        END IF;
-      END IF;
-    END $$;
-    """)
+    # create a SECOND, redundant hnsw index. Skipping when any hnsw index on
+    # articles(embedding) exists (detected by am.amname='hnsw') means the
+    # two-index state can never arise.
+    execute(Loopctl.Repo.HnswIndex.create_if_absent_sql("articles"))
   end
 
   def down do
@@ -44,22 +32,6 @@ defmodule Loopctl.Repo.Migrations.AddEmbeddingHnswIndex do
     # orphaned. Iterating over EVERY hnsw index (rather than `LIMIT 1`) means
     # that even if multiple hnsw indexes somehow coexist, the down-step leaves
     # none orphaned.
-    execute("""
-    DO $$
-    DECLARE idx text;
-    BEGIN
-      FOR idx IN
-        SELECT i.relname
-        FROM pg_index x
-        JOIN pg_class i ON i.oid = x.indexrelid
-        JOIN pg_class t ON t.oid = x.indrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        JOIN pg_am    am ON am.oid = i.relam
-        WHERE t.relname = 'articles' AND n.nspname = 'public' AND am.amname = 'hnsw'
-      LOOP
-        EXECUTE format('DROP INDEX IF EXISTS %I', idx);
-      END LOOP;
-    END $$;
-    """)
+    execute(Loopctl.Repo.HnswIndex.drop_all_sql("articles"))
   end
 end

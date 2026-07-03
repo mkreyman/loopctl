@@ -2,6 +2,15 @@ ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 
+# VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.
+# Initialized once here, single-threaded, before any (async) test runs, so the
+# counter is a single shared source of guaranteed-unique story numbers — no
+# lazy-init race. `:atomics.add_get/3` is atomic across all test processes.
+:persistent_term.put(
+  {Loopctl.Fixtures, :story_number_counter},
+  :atomics.new(1, signed: false)
+)
+
 # audit_log is time-partitioned. The create_audit_log migration seeds partitions for a
 # window anchored to WHEN IT RAN (its month + 3). A fresh CI DB migrated today therefore
 # has no partition for the FIXED past-dated rows many tests insert (e.g. ~U[2026-06-24]),
