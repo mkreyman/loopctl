@@ -99,7 +99,15 @@ defmodule Loopctl.CapabilitiesTest do
       {:ok, cap} = Capabilities.mint(tenant.id, "start_cap", story.id, lineage)
 
       assert {:ok, consumed} = Capabilities.consume(cap)
-      assert consumed.consumed_at != nil
+      # consume/1 returns a freshly-built struct; assert a DateTime via a match
+      # (not `!= nil`, which the 1.19 type-checker flags as an always-true
+      # comparison since consumed_at is typed non-null on the {:ok, _} path) and
+      # re-read the row so we verify the update was actually PERSISTED, not just
+      # that the returned struct carries the timestamp.
+      assert %DateTime{} = consumed.consumed_at
+
+      persisted = Loopctl.AdminRepo.get!(Loopctl.Capabilities.CapabilityToken, cap.id)
+      assert %DateTime{} = persisted.consumed_at
     end
 
     test "rejects replay (double consume)" do
