@@ -173,9 +173,12 @@ defmodule Loopctl.TenantsTest do
     test "does not log when slug is unchanged or absent (rls-02 observability)" do
       tenant = fixture(:tenant, %{slug: "steady-slug"})
 
-      # slug absent
+      # slug absent. Scope the refute to THIS tenant's id: the log message is
+      # global-Logger process-wide, so an unscoped "attempted slug mutation"
+      # substring would spuriously match a SIBLING async test's slug-mutation
+      # warning (e.g. the rls-02 test above) captured concurrently.
       log_absent = capture_log(fn -> Tenants.update_tenant(tenant, %{name: "Renamed"}) end)
-      refute log_absent =~ "attempted slug mutation"
+      refute log_absent =~ "attempted slug mutation ignored for tenant #{tenant.id}"
 
       # slug present but identical
       log_same =
@@ -183,7 +186,7 @@ defmodule Loopctl.TenantsTest do
           Tenants.update_tenant(tenant, %{slug: "steady-slug", name: "Renamed Again"})
         end)
 
-      refute log_same =~ "attempted slug mutation"
+      refute log_same =~ "attempted slug mutation ignored for tenant #{tenant.id}"
     end
 
     # rls-03: a colliding email must produce a clean changeset error, not a

@@ -180,7 +180,9 @@ defmodule Loopctl.Knowledge.AttributionTest do
             )
         end)
 
-      assert log =~ "invalid project_id dropped"
+      # Scope to THIS tenant's id — capture_log sees the global Logger, so a bare
+      # "invalid project_id dropped" could match a concurrent async test's warning.
+      assert log =~ "invalid project_id dropped tenant_id=#{tenant.id}"
 
       [event] = AdminRepo.all(ArticleAccessEvent)
       assert event.tenant_id == tenant.id
@@ -206,7 +208,8 @@ defmodule Loopctl.Knowledge.AttributionTest do
             )
         end)
 
-      assert log =~ "invalid story_id dropped"
+      # Scope to THIS tenant's id (global Logger is shared across async tests).
+      assert log =~ "invalid story_id dropped tenant_id=#{tenant.id}"
 
       [event] = AdminRepo.all(ArticleAccessEvent)
       assert is_nil(event.project_id)
@@ -273,7 +276,8 @@ defmodule Loopctl.Knowledge.AttributionTest do
                    )
         end)
 
-      assert log =~ "cross-tenant project_id dropped"
+      # Scope to tenant_a's id (global Logger is shared across async tests).
+      assert log =~ "cross-tenant project_id dropped tenant_id=#{tenant_a.id}"
 
       # Event was still inserted, but with NULL attribution columns.
       events = AdminRepo.all(ArticleAccessEvent)
@@ -308,7 +312,8 @@ defmodule Loopctl.Knowledge.AttributionTest do
                    )
         end)
 
-      assert log =~ "cross-tenant story_id dropped"
+      # Scope to tenant_a's id (global Logger is shared across async tests).
+      assert log =~ "cross-tenant story_id dropped tenant_id=#{tenant_a.id}"
 
       [event] = AdminRepo.all(ArticleAccessEvent)
       assert event.tenant_id == tenant_a.id
@@ -336,8 +341,10 @@ defmodule Loopctl.Knowledge.AttributionTest do
                    )
         end)
 
-      assert log =~ "cross-tenant project_id dropped"
-      assert log =~ "api_key_id="
+      # Scope to tenant_a's id + the caller's api_key id (both unique to this
+      # test) so the global-Logger capture can't be satisfied by a sibling.
+      assert log =~ "cross-tenant project_id dropped tenant_id=#{tenant_a.id}"
+      assert log =~ "api_key_id=#{inspect(api_key_a.id)}"
       assert log =~ api_key_a.id
     end
   end

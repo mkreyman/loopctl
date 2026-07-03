@@ -27,6 +27,16 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
     AdminRepo.all(from(c in CapabilityToken, where: c.story_id == ^story_id))
   end
 
+  # capture_log/1 captures the GLOBAL, process-wide Logger — including lines from
+  # OTHER async tests running concurrently. Keep only the captured line(s) carrying
+  # this test's unique story.id so marker assertions can't be satisfied by a sibling.
+  defp forgery_line(log, story_id) do
+    log
+    |> String.split("\n")
+    |> Enum.filter(&String.contains?(&1, story_id))
+    |> Enum.join("\n")
+  end
+
   defp audit_entries(story_id, action) do
     AdminRepo.all(
       from(a in AuditLog,
@@ -262,8 +272,14 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
           assert %{"error" => %{"status" => 422}} = json_response(conn, 422)
         end)
 
-      assert log =~ "cap_recovery_forgery_attempt"
-      assert log =~ "rejected_cap_type=\"verify_cap\""
+      # Scope marker assertions to THIS story's log line: capture_log sees the
+      # global process-wide Logger, so bare "cap_recovery_forgery_attempt" /
+      # "rejected_cap_type=..." substrings could match a SIBLING async test's
+      # warning captured concurrently. `forgery_line/2` keeps only the line
+      # carrying this story.id (the message emits both on one line).
+      forgery_line = forgery_line(log, story.id)
+      assert forgery_line =~ "cap_recovery_forgery_attempt"
+      assert forgery_line =~ "rejected_cap_type=\"verify_cap\""
       assert log =~ story.id
 
       # Surfaces in GET /stories/:id/history (Audit.entity_history reads this table)

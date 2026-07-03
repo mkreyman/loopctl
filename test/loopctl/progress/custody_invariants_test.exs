@@ -24,6 +24,17 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
   alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Story
 
+  # capture_log/1 captures the GLOBAL, process-wide Logger — including log lines
+  # emitted by OTHER tests running concurrently in the async suite. Keep only the
+  # captured line(s) carrying this test's unique story.id so marker assertions
+  # can never be satisfied (or tripped) by a sibling's log line.
+  defp custody_line(log, story_id) do
+    log
+    |> String.split("\n")
+    |> Enum.filter(&String.contains?(&1, story_id))
+    |> Enum.join("\n")
+  end
+
   # A story that has been genuinely reported_done: assigned agent + reported_done_at.
   defp reported_story(reported_done_at \\ nil) do
     tenant = fixture(:tenant)
@@ -214,10 +225,14 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
                    )
         end)
 
-      assert verify_log =~ "custody_orphaned_blocked"
-      assert verify_log =~ "verify"
-      assert verify_log =~ story.id
-      assert verify_log =~ tenant.id
+      # Scope every marker assertion to THIS story's log line: capture_log sees
+      # the global process-wide Logger, so a bare "custody_orphaned_blocked" /
+      # "verify" substring could match a SIBLING async test's warning captured
+      # concurrently. `custody_line/2` keeps only the line carrying this story.id.
+      verify_line = custody_line(verify_log, story.id)
+      assert verify_line =~ "custody_orphaned_blocked"
+      assert verify_line =~ "verify"
+      assert verify_line =~ tenant.id
 
       # …and on the review path too.
       review_log =
@@ -228,9 +243,9 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
                    )
         end)
 
-      assert review_log =~ "custody_orphaned_blocked"
-      assert review_log =~ "review"
-      assert review_log =~ story.id
+      review_line = custody_line(review_log, story.id)
+      assert review_line =~ "custody_orphaned_blocked"
+      assert review_line =~ "review"
     end
 
     test "record_review fails closed on a custody-orphaned story" do
