@@ -104,6 +104,54 @@ defmodule LoopctlWeb.Plugs.ImpersonateTest do
       refute Map.get(result.assigns, :impersonating)
     end
 
+    test "passes through when impersonation header is empty (auth-01)", %{conn: conn} do
+      {raw_key, api_key} = fixture(:api_key, %{role: :superadmin})
+
+      result =
+        conn
+        |> impersonate_conn("")
+        |> resolve_and_auth(raw_key)
+        |> Impersonate.call([])
+
+      # Empty header must behave exactly like an absent header: no 500, no
+      # impersonation, and NOT impersonating tenant "" or a default tenant.
+      refute result.halted
+      refute Map.get(result.assigns, :impersonating)
+      refute Map.has_key?(result.assigns, :impersonated_tenant_id)
+      assert result.assigns.current_api_key.id == api_key.id
+      assert result.assigns.current_api_key.role == :superadmin
+    end
+
+    test "passes through when impersonation header is whitespace-only (auth-01)", %{conn: conn} do
+      {raw_key, _api_key} = fixture(:api_key, %{role: :superadmin})
+
+      result =
+        conn
+        |> impersonate_conn("   ")
+        |> resolve_and_auth(raw_key)
+        |> Impersonate.call([])
+
+      refute result.halted
+      refute Map.get(result.assigns, :impersonating)
+      refute Map.has_key?(result.assigns, :impersonated_tenant_id)
+      assert result.assigns.current_api_key.role == :superadmin
+    end
+
+    test "non-superadmin with empty impersonation header passes through", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+
+      result =
+        conn
+        |> impersonate_conn("")
+        |> resolve_and_auth(raw_key)
+        |> Impersonate.call([])
+
+      refute result.halted
+      refute Map.get(result.assigns, :impersonating)
+      assert result.assigns.current_tenant.id == tenant_a.id
+    end
+
     test "applies X-Effective-Role when present", %{conn: conn} do
       {raw_key, _} = fixture(:api_key, %{role: :superadmin})
       tenant = fixture(:tenant)
