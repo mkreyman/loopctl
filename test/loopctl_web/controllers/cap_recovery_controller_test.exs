@@ -10,8 +10,10 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities.CapabilityToken
   alias Loopctl.Dispatches.Dispatch
 
@@ -25,15 +27,29 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
     AdminRepo.all(from(c in CapabilityToken, where: c.story_id == ^story_id))
   end
 
-  defp insert_dispatch(tenant_id, agent_id, story_id, lineage) do
+  defp audit_entries(story_id, action) do
+    AdminRepo.all(
+      from(a in AuditLog,
+        where: a.entity_id == ^story_id and a.action == ^action
+      )
+    )
+  end
+
+  defp insert_dispatch(tenant_id, agent_id, story_id, lineage, extra) do
+    attrs =
+      Map.merge(
+        %{
+          role: :agent,
+          agent_id: agent_id,
+          story_id: story_id,
+          lineage_path: lineage,
+          expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+        },
+        extra
+      )
+
     %Dispatch{tenant_id: tenant_id}
-    |> Dispatch.changeset(%{
-      role: :agent,
-      agent_id: agent_id,
-      story_id: story_id,
-      lineage_path: lineage,
-      expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
-    })
+    |> Dispatch.changeset(attrs)
     |> AdminRepo.insert!()
   end
 
@@ -59,15 +75,24 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
     epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
     agent = fixture(:agent, %{tenant_id: tenant.id})
 
+    role = Map.get(opts, :role, :agent)
+
     {raw_key, _api_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      fixture(:api_key, %{tenant_id: tenant.id, role: role, agent_id: agent.id})
 
     story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
     lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
 
     {story, recorded_lineage} =
       if Map.get(opts, :with_dispatch, true) do
-        dispatch = insert_dispatch(tenant.id, agent.id, story.id, lineage)
+        dispatch =
+          insert_dispatch(
+            tenant.id,
+            agent.id,
+            story.id,
+            lineage,
+            Map.get(opts, :dispatch_attrs, %{})
+          )
 
         story =
           story
@@ -203,6 +228,94 @@ defmodule LoopctlWeb.CapRecoveryControllerTest do
 
       assert %{"error" => %{"status" => 404}} = json_response(conn, 404)
       assert caps_for(foreign_story.id) == []
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — exact_role gate" do
+    test "rejects an orchestrator key linked to the same agent_id with 403", %{conn: conn} do
+      # An orchestrator identity can be linked to the same agent_id as an
+      # implementer. The exact_role: :agent gate (matching claim/start) must
+      # not let it walk this custody endpoint via role hierarchy.
+      %{raw_key: orch_key, story: story} = setup_ctx(%{role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(orch_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 403}} = json_response(conn, 403)
+      assert caps_for(story.id) == []
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — forgery-attempt observability" do
+    test "logs a warning and writes an audit entry on a forged cap_type", %{conn: conn} do
+      %{raw_key: raw_key, story: story, agent: agent} = setup_ctx()
+
+      log =
+        capture_log(fn ->
+          conn =
+            conn
+            |> auth_conn(raw_key)
+            |> post("/api/v1/stories/#{story.id}/recover-cap", %{"cap_type" => "verify_cap"})
+
+          assert %{"error" => %{"status" => 422}} = json_response(conn, 422)
+        end)
+
+      assert log =~ "cap_recovery_forgery_attempt"
+      assert log =~ "rejected_cap_type=\"verify_cap\""
+      assert log =~ story.id
+
+      # Surfaces in GET /stories/:id/history (Audit.entity_history reads this table)
+      assert [entry] = audit_entries(story.id, "cap_recovery_forgery_attempt")
+      assert entry.entity_type == "story"
+      assert entry.metadata["rejected_cap_type"] == "verify_cap"
+      assert entry.metadata["caller_agent_id"] == agent.id
+      assert caps_for(story.id) == []
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/recover-cap — dispatch activeness" do
+    test "rejects recovery when the implementer dispatch is revoked", %{conn: conn} do
+      %{raw_key: raw_key, story: story} =
+        setup_ctx(%{dispatch_attrs: %{revoked_at: DateTime.utc_now()}})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 422, "message" => message}} = json_response(conn, 422)
+      assert message =~ "revoked"
+      assert caps_for(story.id) == []
+    end
+
+    test "rejects recovery when the implementer dispatch is expired", %{conn: conn} do
+      %{raw_key: raw_key, story: story} =
+        setup_ctx(%{
+          dispatch_attrs: %{expires_at: DateTime.add(DateTime.utc_now(), -60, :second)}
+        })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"error" => %{"status" => 422}} = json_response(conn, 422)
+      assert caps_for(story.id) == []
+    end
+
+    test "mints as usual when the implementer dispatch is active", %{conn: conn} do
+      %{raw_key: raw_key, story: story, lineage: lineage} = setup_ctx()
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post("/api/v1/stories/#{story.id}/recover-cap", %{})
+
+      assert %{"data" => data} = json_response(conn, 201)
+      assert data["typ"] == "start_cap"
+      assert data["issued_to_lineage"] == lineage
     end
   end
 end
