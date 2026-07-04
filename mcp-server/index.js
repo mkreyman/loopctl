@@ -10,7 +10,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path, { dirname, join } from "node:path";
@@ -54,17 +54,34 @@ const SERVER_VERSION = JSON.parse(
 //     tool call succeeds. The witness plug halts before the operation runs, so
 //     retrying a witness 412 is side-effect-safe even for POSTs.
 //
-// The state file location defaults to a per-server file under the OS temp dir and
-// can be overridden with LOOPCTL_STH_STATE_PATH. All file I/O degrades gracefully
-// (missing/corrupt/unwritable → in-memory cache + the transparent retry above).
-const STH_STATE_PATH = resolveSthStatePath({ env: process.env, os, path });
+// The state file location defaults to a per-(server + key) file under the OS temp
+// dir and can be overridden with LOOPCTL_STH_STATE_PATH. All file I/O degrades
+// gracefully (missing/corrupt/unwritable/symlinked → in-memory cache + the
+// transparent retry above). The write is atomic + symlink-safe (temp + rename).
+const WITNESS_FS = { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync };
 
-const witnessClient = createWitnessClient({
-  statePath: STH_STATE_PATH,
-  readFileSync,
-  writeFileSync,
-  timeoutMs: 30_000,
-});
+// One witness client PER API KEY (#298 review HIGH-2): the STH is per-tenant and
+// each key resolves to a tenant server-side, so distinct keys must NOT share an
+// in-memory cache or a state file (a collision causes spurious 409s + false
+// divergence telemetry). The state file is keyed by sha256(serverUrl + ":" + key)
+// — a non-secret hash; the key never hits disk in plaintext.
+const witnessClients = new Map();
+
+function witnessClientFor(apiKey) {
+  let client = witnessClients.get(apiKey);
+  if (!client) {
+    const statePath = resolveSthStatePath({ env: process.env, os, path, apiKey });
+    client = createWitnessClient({
+      statePath,
+      fs: WITNESS_FS,
+      getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined,
+      pid: process.pid,
+      timeoutMs: 30_000,
+    });
+    witnessClients.set(apiKey, client);
+  }
+  return client;
+}
 
 function getBaseUrl() {
   return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
@@ -119,7 +136,7 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false } = {
   // attempt's Response; we keep body parsing / error shaping here.
   let response;
   try {
-    response = await witnessClient.send({ url, method, headers, serializedBody });
+    response = await witnessClientFor(key).send({ url, method, headers, serializedBody });
   } catch (err) {
     if (err.name === "TimeoutError") {
       return { error: true, status: 0, body: "Request timed out after 30s" };

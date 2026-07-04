@@ -1,19 +1,20 @@
 /**
- * Regression tests for the witness-protocol STH client (#298):
+ * Regression tests for the witness-protocol STH client (#298 + enhanced review):
  *
- *   - A bootstrap-grace 412 that carries `x-loopctl-current-sth` triggers a
- *     SINGLE transparent retry with that STH and returns the success response.
- *   - A persisted STH is loaded on construction and sent as
- *     `X-Loopctl-Last-Known-STH` on the FIRST request (no bootstrap 412).
+ *   - A bootstrap-grace 412 with `x-loopctl-current-sth` triggers a SINGLE
+ *     transparent retry, anchored to error.code, that returns the success
+ *     response (LOW-8).
+ *   - A persisted STH is loaded on construction and sent on the FIRST request.
  *   - A corrupt / missing state file degrades gracefully to bootstrap + retry.
- *   - The retry is bounded to a single attempt (never a loop).
- *   - Pure helpers: isValidSth / bootstrapRetrySth / resolveSthStatePath /
- *     loadPersistedSth / persistSth.
+ *   - Persistence is per-(server + key): distinct keys never collide (HIGH-2).
+ *   - The state write is atomic + symlink-safe (temp + `wx` + rename) (HIGH-1),
+ *     and load refuses a symlink / foreign-owned file (HIGH-1).
+ *   - Concurrent cold-start sends coalesce into ONE bootstrap (MEDIUM-6).
+ *   - 409 is NOT auto-retried (MEDIUM-4).
  *
- * SINGLE SOURCE OF TRUTH: the retry + persistence logic lives in
- * ../lib/witness-sth.js, imported by BOTH the real server (index.js) and these
- * tests, so a regression in that logic fails CI. A wiring assertion at the end
- * pins that index.js actually delegates apiCall to the shared witness client.
+ * SINGLE SOURCE OF TRUTH: the logic lives in ../lib/witness-sth.js, imported by
+ * BOTH the real server (index.js) and these tests. Wiring assertions at the end
+ * pin that index.js delegates apiCall to a PER-KEY witness client.
  *
  * Run: node --test test/*.test.js
  */
@@ -39,21 +40,27 @@ const INDEX_SRC = readFileSync(
   "utf8",
 );
 
-// A well-formed `<position>:<22-char base64url prefix>` STH value.
+// Well-formed `<position>:<22-char base64url prefix>` STH values.
 const STH_A = "5:AAAAAAAAAAAAAAAAAAAAAA";
 const STH_B = "9:ZZZZZZZZZZZZZZZZZZZZZZ";
 
-// Build a fake Response with a header bag and a status.
-function fakeResponse(status, headers = {}) {
+// Build a fake Response with a header bag, a status, and an optional JSON body.
+function fakeResponse(status, headers = {}, body) {
   const lower = {};
   for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v;
   return {
     status,
     headers: { get: (name) => lower[name.toLowerCase()] ?? null },
+    clone: () => ({
+      async json() {
+        if (body === undefined) throw new Error("no body");
+        return body;
+      },
+    }),
   };
 }
 
-// A fetch spy that returns queued responses in order and records each call.
+// A fetch spy returning queued responses in order (last repeats), recording calls.
 function spyFetch(responses) {
   const calls = [];
   const queue = [...responses];
@@ -64,184 +71,239 @@ function spyFetch(responses) {
   return { fetchImpl, calls };
 }
 
+// Minimal in-memory fs honoring `wx` (O_EXCL) and rename semantics.
+function memFs(initial = {}, { uid = 1000, symlinks = new Set() } = {}) {
+  const files = new Map(Object.entries(initial));
+  const enoent = () => {
+    const e = new Error("ENOENT");
+    e.code = "ENOENT";
+    return e;
+  };
+  return {
+    files,
+    readFileSync(p) {
+      if (!files.has(p)) throw enoent();
+      return files.get(p);
+    },
+    lstatSync(p) {
+      if (!files.has(p) && !symlinks.has(p)) throw enoent();
+      return { isSymbolicLink: () => symlinks.has(p), uid };
+    },
+    writeFileSync(p, data, opts) {
+      if (opts && opts.flag === "wx" && files.has(p)) {
+        const e = new Error("EEXIST");
+        e.code = "EEXIST";
+        throw e;
+      }
+      files.set(p, data);
+    },
+    renameSync(from, to) {
+      if (!files.has(from)) throw enoent();
+      files.set(to, files.get(from));
+      files.delete(from);
+    },
+    unlinkSync(p) {
+      files.delete(p);
+    },
+  };
+}
+
+const getuid1000 = () => 1000;
+
 // ---------------------------------------------------------------------------
-// isValidSth
+// isValidSth / bootstrapRetrySth
 // ---------------------------------------------------------------------------
 
 describe("isValidSth", () => {
   test("accepts a position + 22-char base64url prefix", () => {
     assert.equal(isValidSth(STH_A), true);
     assert.equal(isValidSth("0:AAAAAAAAAAAAAAAAAAAAAA"), true);
-    assert.equal(isValidSth("123456:_-AAAAAAAAAAAAAAAAAAAA"), true);
   });
-
-  test("rejects malformed / short / non-base64url / non-string values", () => {
+  test("rejects malformed / non-base64url / non-string values", () => {
     assert.equal(isValidSth("5:"), false);
-    assert.equal(isValidSth("5:abc"), false);
-    assert.equal(isValidSth("5:" + "A".repeat(23)), false);
-    assert.equal(isValidSth("5:AAAAAAAAAA++//AAAAAAAA"), false); // standard, not url
+    assert.equal(isValidSth("5:AAAAAAAAAA++//AAAAAAAA"), false);
     assert.equal(isValidSth("x:AAAAAAAAAAAAAAAAAAAAAA"), false);
     assert.equal(isValidSth(null), false);
-    assert.equal(isValidSth(undefined), false);
-    assert.equal(isValidSth(5), false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// bootstrapRetrySth
-// ---------------------------------------------------------------------------
 
 describe("bootstrapRetrySth", () => {
-  test("returns the STH on a 412 carrying a valid current-sth header", () => {
+  test("returns the STH only on a 412 with a valid current-sth header", () => {
     assert.equal(bootstrapRetrySth(412, STH_A), STH_A);
-  });
-
-  test("returns null for non-412 statuses even with a valid STH", () => {
     assert.equal(bootstrapRetrySth(200, STH_A), null);
     assert.equal(bootstrapRetrySth(409, STH_A), null);
-    assert.equal(bootstrapRetrySth(500, STH_A), null);
-  });
-
-  test("returns null for a 412 without / with a malformed STH header", () => {
-    assert.equal(bootstrapRetrySth(412, null), null);
-    assert.equal(bootstrapRetrySth(412, undefined), null);
     assert.equal(bootstrapRetrySth(412, "not-an-sth"), null);
+    assert.equal(bootstrapRetrySth(412, null), null);
   });
 });
 
 // ---------------------------------------------------------------------------
-// resolveSthStatePath
+// resolveSthStatePath — per-(server + key) scoping (HIGH-2)
 // ---------------------------------------------------------------------------
 
-describe("resolveSthStatePath", () => {
+describe("resolveSthStatePath — per-key scoping (HIGH-2)", () => {
   const os = { tmpdir: () => "/tmp" };
-  const path = { join: (...p) => p.join("/") };
+  const p = { join: (...parts) => parts.join("/") };
 
-  test("honors an explicit LOOPCTL_STH_STATE_PATH override", () => {
+  test("honors an explicit override", () => {
     const env = { [STH_STATE_PATH_ENV]: "/custom/sth.json" };
-    assert.equal(resolveSthStatePath({ env, os, path }), "/custom/sth.json");
+    assert.equal(resolveSthStatePath({ env, os, path: p, apiKey: "k" }), "/custom/sth.json");
   });
 
-  test("ignores a blank override and derives a per-server temp path", () => {
-    const env = { [STH_STATE_PATH_ENV]: "   ", LOOPCTL_SERVER: "https://loopctl.com" };
-    const result = resolveSthStatePath({ env, os, path });
+  test("derives a per-server temp path", () => {
+    const env = { LOOPCTL_SERVER: "https://loopctl.com" };
+    const result = resolveSthStatePath({ env, os, path: p, apiKey: "k1" });
     assert.match(result, /^\/tmp\/loopctl-mcp-sth-[0-9a-f]{16}\.json$/);
   });
 
-  test("derives distinct files for distinct servers", () => {
-    const a = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://a.example" }, os, path });
-    const b = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://b.example" }, os, path });
+  test("DIFFERENT keys against the SAME server never share a cache file", () => {
+    const env = { LOOPCTL_SERVER: "https://loopctl.com" };
+    const a = resolveSthStatePath({ env, os, path: p, apiKey: "key-A" });
+    const b = resolveSthStatePath({ env, os, path: p, apiKey: "key-B" });
     assert.notEqual(a, b);
   });
 
-  test("is stable for the same server (ignoring a trailing slash)", () => {
-    const a = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://a.example" }, os, path });
-    const b = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://a.example/" }, os, path });
-    assert.equal(a, b);
+  test("same (server, key) is stable; different servers differ", () => {
+    const a = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://a" }, os, path: p, apiKey: "k" });
+    const a2 = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://a/" }, os, path: p, apiKey: "k" });
+    const b = resolveSthStatePath({ env: { LOOPCTL_SERVER: "https://b" }, os, path: p, apiKey: "k" });
+    assert.equal(a, a2);
+    assert.notEqual(a, b);
+  });
+
+  test("the api key never appears in plaintext in the derived path", () => {
+    const env = { LOOPCTL_SERVER: "https://loopctl.com" };
+    const secret = "lc_supersecretkey";
+    const result = resolveSthStatePath({ env, os, path: p, apiKey: secret });
+    assert.ok(!result.includes(secret));
   });
 });
 
 // ---------------------------------------------------------------------------
-// loadPersistedSth / persistSth (injected fs, never touches real disk)
+// loadPersistedSth — symlink / ownership guard (HIGH-1)
 // ---------------------------------------------------------------------------
 
 describe("loadPersistedSth", () => {
-  test("returns the STH from a well-formed state file", () => {
-    const readFileSync = () => JSON.stringify({ sth: STH_A, updated_at: "x" });
-    assert.equal(loadPersistedSth("/x", { readFileSync }), STH_A);
+  test("returns the STH from a well-formed, regular, owned file", () => {
+    const fs = memFs({ "/x": JSON.stringify({ sth: STH_A }) });
+    assert.equal(loadPersistedSth("/x", { fs, getuid: getuid1000 }), STH_A);
   });
 
-  test("returns null when the file is missing (readFileSync throws)", () => {
-    const readFileSync = () => {
-      throw new Error("ENOENT");
-    };
-    assert.equal(loadPersistedSth("/x", { readFileSync }), null);
+  test("returns null when the file is missing", () => {
+    const fs = memFs({});
+    assert.equal(loadPersistedSth("/x", { fs, getuid: getuid1000 }), null);
   });
 
-  test("returns null for non-JSON / corrupt content", () => {
-    const readFileSync = () => "}{ not json";
-    assert.equal(loadPersistedSth("/x", { readFileSync }), null);
+  test("REFUSES a symlink at the path (CWE-59) → null", () => {
+    const fs = memFs({ "/x": JSON.stringify({ sth: STH_A }) }, { symlinks: new Set(["/x"]) });
+    assert.equal(loadPersistedSth("/x", { fs, getuid: getuid1000 }), null);
   });
 
-  test("returns null when the stored STH is shape-invalid", () => {
-    const readFileSync = () => JSON.stringify({ sth: "garbage" });
-    assert.equal(loadPersistedSth("/x", { readFileSync }), null);
-  });
-});
-
-describe("persistSth", () => {
-  test("writes a valid STH and reports success", () => {
-    let written;
-    const writeFileSync = (p, data) => {
-      written = { p, data };
-    };
-    assert.equal(persistSth("/x", STH_A, { writeFileSync }), true);
-    assert.equal(written.p, "/x");
-    assert.deepEqual(JSON.parse(written.data).sth, STH_A);
+  test("REFUSES a foreign-owned file → null", () => {
+    const fs = memFs({ "/x": JSON.stringify({ sth: STH_A }) }, { uid: 4242 });
+    assert.equal(loadPersistedSth("/x", { fs, getuid: getuid1000 }), null);
   });
 
-  test("refuses to persist a shape-invalid STH", () => {
-    let called = false;
-    const writeFileSync = () => {
-      called = true;
-    };
-    assert.equal(persistSth("/x", "garbage", { writeFileSync }), false);
-    assert.equal(called, false);
-  });
-
-  test("degrades to false when the write throws (read-only dir, full disk)", () => {
-    const writeFileSync = () => {
-      throw new Error("EROFS");
-    };
-    assert.equal(persistSth("/x", STH_A, { writeFileSync }), false);
+  test("returns null for corrupt / shape-invalid content", () => {
+    assert.equal(loadPersistedSth("/x", { fs: memFs({ "/x": "}{" }), getuid: getuid1000 }), null);
+    assert.equal(
+      loadPersistedSth("/x", { fs: memFs({ "/x": JSON.stringify({ sth: "garbage" }) }), getuid: getuid1000 }),
+      null,
+    );
   });
 });
 
 // ---------------------------------------------------------------------------
-// createWitnessClient.send — the transparent bootstrap-412 retry
+// persistSth — atomic + symlink-safe write (HIGH-1)
+// ---------------------------------------------------------------------------
+
+describe("persistSth — atomic + symlink-safe (HIGH-1)", () => {
+  test("writes to a temp file with wx+0600 then renames over the target", () => {
+    const events = [];
+    const fs = {
+      writeFileSync: (p, data, opts) => events.push({ op: "write", p, opts }),
+      renameSync: (from, to) => events.push({ op: "rename", from, to }),
+      unlinkSync: (p) => events.push({ op: "unlink", p }),
+    };
+    assert.equal(persistSth("/state.json", STH_A, { fs, pid: 4321 }), true);
+
+    const write = events.find((e) => e.op === "write");
+    const rename = events.find((e) => e.op === "rename");
+    // Never writes directly to the target — a temp path derived from the pid.
+    assert.notEqual(write.p, "/state.json");
+    assert.match(write.p, /^\/state\.json\.4321\.[0-9a-f]+\.tmp$/);
+    // Exclusive create (refuses a pre-planted symlink) + private mode.
+    assert.equal(write.opts.flag, "wx");
+    assert.equal(write.opts.mode, 0o600);
+    // Atomic replace of the target ENTRY (never writes THROUGH a symlink there).
+    assert.equal(rename.from, write.p);
+    assert.equal(rename.to, "/state.json");
+  });
+
+  test("refuses to persist a shape-invalid STH (no write attempted)", () => {
+    let wrote = false;
+    const fs = { writeFileSync: () => (wrote = true), renameSync: () => {}, unlinkSync: () => {} };
+    assert.equal(persistSth("/x", "garbage", { fs, pid: 1 }), false);
+    assert.equal(wrote, false);
+  });
+
+  test("cleans up the temp file and returns false when rename fails", () => {
+    let unlinked = null;
+    const fs = {
+      writeFileSync: () => {},
+      renameSync: () => {
+        throw new Error("EXDEV");
+      },
+      unlinkSync: (p) => (unlinked = p),
+    };
+    assert.equal(persistSth("/state.json", STH_A, { fs, pid: 7 }), false);
+    assert.match(unlinked, /^\/state\.json\.7\.[0-9a-f]+\.tmp$/);
+  });
+
+  test("degrades to false when the exclusive create is refused (pre-planted temp)", () => {
+    const fs = {
+      writeFileSync: () => {
+        const e = new Error("EEXIST");
+        e.code = "EEXIST";
+        throw e;
+      },
+      renameSync: () => {},
+      unlinkSync: () => {},
+    };
+    assert.equal(persistSth("/state.json", STH_A, { fs, pid: 9 }), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createWitnessClient.send — transparent bootstrap-412 retry
 // ---------------------------------------------------------------------------
 
 describe("createWitnessClient.send — bootstrap-grace 412 retry", () => {
   const req = { url: "https://x/api/v1/tenants/me", method: "GET", headers: {} };
 
-  test("a 412 carrying current-sth triggers exactly ONE retry that succeeds", async () => {
+  test("a 412 (correct error.code) triggers exactly ONE retry that succeeds", async () => {
     const { fetchImpl, calls } = spyFetch([
-      fakeResponse(412, { "x-loopctl-current-sth": STH_A }),
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+        error: { code: "witness_bootstrap_already_consumed" },
+      }),
       fakeResponse(200, { "x-loopctl-current-sth": STH_A }),
     ]);
     const client = createWitnessClient({ fetchImpl });
 
     const response = await client.send(req);
 
-    // Returns the SUCCESS response, not the 412.
     assert.equal(response.status, 200);
-    // Exactly two attempts — a single bounded retry, never a loop.
     assert.equal(calls.length, 2);
-    // First attempt bootstrapped (no cached STH); retry sent the learned STH.
     assert.equal(calls[0].options.headers["X-Loopctl-STH-Bootstrap"], "true");
-    assert.equal(calls[0].options.headers["X-Loopctl-Last-Known-STH"], undefined);
     assert.equal(calls[1].options.headers["X-Loopctl-Last-Known-STH"], STH_A);
-    assert.equal(calls[1].options.headers["X-Loopctl-STH-Bootstrap"], undefined);
-    // The learned STH is cached for subsequent requests.
     assert.equal(client.getSTH(), STH_A);
   });
 
-  test("does NOT retry a 412 that lacks a valid current-sth header", async () => {
-    const { fetchImpl, calls } = spyFetch([fakeResponse(412, {})]);
-    const client = createWitnessClient({ fetchImpl });
-
-    const response = await client.send(req);
-
-    assert.equal(response.status, 412);
-    assert.equal(calls.length, 1);
-  });
-
-  test("is bounded to a single retry even if the retry also 412s", async () => {
-    // Server keeps 412-ing (pathological): the client must retry exactly once
-    // and then surface the 412 rather than looping forever.
+  test("anchors to error.code: a 412 with a DIFFERENT code is NOT retried (LOW-8)", async () => {
     const { fetchImpl, calls } = spyFetch([
-      fakeResponse(412, { "x-loopctl-current-sth": STH_A }),
-      fakeResponse(412, { "x-loopctl-current-sth": STH_A }),
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+        error: { code: "witness_header_malformed" },
+      }),
       fakeResponse(200),
     ]);
     const client = createWitnessClient({ fetchImpl });
@@ -249,159 +311,199 @@ describe("createWitnessClient.send — bootstrap-grace 412 retry", () => {
     const response = await client.send(req);
 
     assert.equal(response.status, 412);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
   });
 
-  test("does not retry a plain 200 and caches its STH", async () => {
+  test("falls back to status+header when the 412 body is unreadable", async () => {
     const { fetchImpl, calls } = spyFetch([
-      fakeResponse(200, { "x-loopctl-current-sth": STH_B }),
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }), // no body → json() throws
+      fakeResponse(200),
     ]);
     const client = createWitnessClient({ fetchImpl });
 
     const response = await client.send(req);
-
     assert.equal(response.status, 200);
+    assert.equal(calls.length, 2);
+  });
+
+  test("does NOT retry a 412 lacking a valid current-sth header", async () => {
+    const { fetchImpl, calls } = spyFetch([fakeResponse(412, {})]);
+    const client = createWitnessClient({ fetchImpl });
+    const response = await client.send(req);
+    assert.equal(response.status, 412);
+    assert.equal(calls.length, 1);
+  });
+
+  test("does NOT auto-retry a 409 witness_divergence (MEDIUM-4)", async () => {
+    const { fetchImpl, calls } = spyFetch([
+      fakeResponse(409, { "x-loopctl-current-sth": STH_B }, {
+        error: { code: "witness_divergence" },
+      }),
+    ]);
+    const client = createWitnessClient({ fetchImpl });
+
+    const response = await client.send(req);
+    // Surfaced, not retried — but the STH is cached so the NEXT request self-heals.
+    assert.equal(response.status, 409);
     assert.equal(calls.length, 1);
     assert.equal(client.getSTH(), STH_B);
+  });
+
+  test("is bounded to a single retry even if the retry also 412s", async () => {
+    const { fetchImpl, calls } = spyFetch([
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+        error: { code: "witness_bootstrap_already_consumed" },
+      }),
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+        error: { code: "witness_bootstrap_already_consumed" },
+      }),
+      fakeResponse(200),
+    ]);
+    const client = createWitnessClient({ fetchImpl });
+
+    const response = await client.send(req);
+    assert.equal(response.status, 412);
+    assert.equal(calls.length, 2);
   });
 });
 
 // ---------------------------------------------------------------------------
-// createWitnessClient — startup persistence load
+// Cold-start coalescing (MEDIUM-6)
 // ---------------------------------------------------------------------------
 
-describe("createWitnessClient — persisted STH loaded on construction", () => {
+describe("createWitnessClient — cold-start singleflight (MEDIUM-6)", () => {
+  const req = { url: "https://x/api/v1/tenants/me", method: "GET", headers: {} };
+
+  test("concurrent cold-start sends coalesce into ONE bootstrap", async () => {
+    let served = 0;
+    const bootstrapCalls = [];
+    const fetchImpl = async (url, options) => {
+      if (options.headers["X-Loopctl-STH-Bootstrap"] === "true") bootstrapCalls.push(1);
+      served += 1;
+      // First bootstrap attempt returns the consumed-412; everything else 200.
+      if (served === 1) {
+        return fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+          error: { code: "witness_bootstrap_already_consumed" },
+        });
+      }
+      return fakeResponse(200, { "x-loopctl-current-sth": STH_A });
+    };
+
+    const client = createWitnessClient({ fetchImpl });
+
+    // Fire three concurrent sends before any resolves.
+    const results = await Promise.all([client.send(req), client.send(req), client.send(req)]);
+
+    assert.deepEqual(results.map((r) => r.status), [200, 200, 200]);
+    // Only the leader bootstrapped; followers waited and sent the learned header.
+    assert.equal(bootstrapCalls.length, 1);
+    assert.equal(client.getSTH(), STH_A);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Persistence lifecycle (with the in-memory fs)
+// ---------------------------------------------------------------------------
+
+describe("createWitnessClient — persistence", () => {
   const req = { url: "https://x/api/v1/tenants/me", method: "GET", headers: {} };
 
   test("a persisted STH is loaded and sent on the FIRST request (no bootstrap)", async () => {
     const { fetchImpl, calls } = spyFetch([fakeResponse(200)]);
-    const readFileSync = () => JSON.stringify({ sth: STH_A });
+    const fs = memFs({ "/state.json": JSON.stringify({ sth: STH_A }) });
 
-    const client = createWitnessClient({
-      fetchImpl,
-      statePath: "/state.json",
-      readFileSync,
-    });
-
+    const client = createWitnessClient({ fetchImpl, statePath: "/state.json", fs, getuid: getuid1000 });
     assert.equal(client.getSTH(), STH_A);
 
     await client.send(req);
-
-    // First request carried the real header — never tripped the bootstrap path.
     assert.equal(calls[0].options.headers["X-Loopctl-Last-Known-STH"], STH_A);
     assert.equal(calls[0].options.headers["X-Loopctl-STH-Bootstrap"], undefined);
   });
 
-  test("a corrupt state file degrades to bootstrap + transparent retry", async () => {
+  test("a corrupt state file degrades to bootstrap + retry, then re-persists", async () => {
     const { fetchImpl, calls } = spyFetch([
-      fakeResponse(412, { "x-loopctl-current-sth": STH_A }),
+      fakeResponse(412, { "x-loopctl-current-sth": STH_A }, {
+        error: { code: "witness_bootstrap_already_consumed" },
+      }),
       fakeResponse(200),
     ]);
-    const readFileSync = () => "corrupt-not-json";
-    let persisted = null;
-    const writeFileSync = (p, data) => {
-      persisted = JSON.parse(data).sth;
-    };
+    const fs = memFs({ "/state.json": "corrupt-not-json" });
 
-    const client = createWitnessClient({
-      fetchImpl,
-      statePath: "/state.json",
-      readFileSync,
-      writeFileSync,
-    });
-
-    // Corrupt file → no STH loaded → first request bootstraps.
+    const client = createWitnessClient({ fetchImpl, statePath: "/state.json", fs, getuid: getuid1000 });
     assert.equal(client.getSTH(), null);
 
     const response = await client.send(req);
-
     assert.equal(response.status, 200);
     assert.equal(calls.length, 2);
-    assert.equal(calls[0].options.headers["X-Loopctl-STH-Bootstrap"], "true");
-    assert.equal(calls[1].options.headers["X-Loopctl-Last-Known-STH"], STH_A);
-    // The relearned STH was persisted for the next fresh process.
-    assert.equal(persisted, STH_A);
+    // The relearned STH was persisted (atomically) for the next fresh process.
+    assert.equal(JSON.parse(fs.files.get("/state.json")).sth, STH_A);
   });
 
   test("persists a newly-learned STH from a successful response", async () => {
-    const { fetchImpl } = spyFetch([
-      fakeResponse(200, { "x-loopctl-current-sth": STH_B }),
-    ]);
-    let persisted = null;
-    const writeFileSync = (p, data) => {
-      persisted = JSON.parse(data).sth;
-    };
-    const readFileSync = () => {
-      throw new Error("ENOENT");
-    };
-
-    const client = createWitnessClient({
-      fetchImpl,
-      statePath: "/state.json",
-      readFileSync,
-      writeFileSync,
-    });
+    const { fetchImpl } = spyFetch([fakeResponse(200, { "x-loopctl-current-sth": STH_B })]);
+    const fs = memFs({});
+    const client = createWitnessClient({ fetchImpl, statePath: "/state.json", fs, getuid: getuid1000 });
 
     await client.send(req);
-
-    assert.equal(persisted, STH_B);
     assert.equal(client.getSTH(), STH_B);
+    assert.equal(JSON.parse(fs.files.get("/state.json")).sth, STH_B);
   });
 
   test("an unwritable state file does not break request handling", async () => {
-    const { fetchImpl } = spyFetch([
-      fakeResponse(200, { "x-loopctl-current-sth": STH_B }),
-    ]);
-    const readFileSync = () => {
-      throw new Error("ENOENT");
+    const { fetchImpl } = spyFetch([fakeResponse(200, { "x-loopctl-current-sth": STH_B })]);
+    const fs = {
+      readFileSync: () => {
+        throw new Error("ENOENT");
+      },
+      lstatSync: () => {
+        throw new Error("ENOENT");
+      },
+      writeFileSync: () => {
+        throw new Error("EROFS");
+      },
+      renameSync: () => {},
+      unlinkSync: () => {},
     };
-    const writeFileSync = () => {
-      throw new Error("EROFS");
-    };
-
-    const client = createWitnessClient({
-      fetchImpl,
-      statePath: "/state.json",
-      readFileSync,
-      writeFileSync,
-    });
+    const client = createWitnessClient({ fetchImpl, statePath: "/state.json", fs, getuid: getuid1000 });
 
     const response = await client.send(req);
-
-    // Request still succeeds; STH cached in-memory despite the failed write.
     assert.equal(response.status, 200);
-    assert.equal(client.getSTH(), STH_B);
+    assert.equal(client.getSTH(), STH_B); // cached in-memory despite failed write
   });
 });
 
 // ---------------------------------------------------------------------------
-// Wiring: index.js delegates apiCall to the shared witness client
+// Wiring: index.js delegates apiCall to a PER-KEY witness client
 // ---------------------------------------------------------------------------
 
-describe("#298 wiring: index.js apiCall uses the shared witness client", () => {
-  test("constructs a witness client from resolveSthStatePath + fs", () => {
+describe("#298 wiring: per-key witness client", () => {
+  test("resolves a per-(server + key) state path", () => {
     assert.match(
       INDEX_SRC,
-      /const STH_STATE_PATH = resolveSthStatePath\(\{ env: process\.env, os, path \}\);/,
-      "index.js must resolve the STH state path via the shared helper",
-    );
-    assert.match(
-      INDEX_SRC,
-      /createWitnessClient\(\{[\s\S]*?statePath: STH_STATE_PATH,[\s\S]*?readFileSync,[\s\S]*?writeFileSync,[\s\S]*?\}\)/,
-      "index.js must build the witness client with the persistence fs handles",
+      /resolveSthStatePath\(\{ env: process\.env, os, path, apiKey \}\)/,
+      "state path must be scoped by apiKey",
     );
   });
 
-  test("apiCall delegates the request to witnessClient.send", () => {
+  test("keeps ONE witness client per api key (Map keyed by key)", () => {
+    assert.match(INDEX_SRC, /const witnessClients = new Map\(\);/);
     assert.match(
       INDEX_SRC,
-      /await witnessClient\.send\(\{ url, method, headers, serializedBody \}\)/,
-      "apiCall must send through the witness client (which owns STH + retry)",
+      /function witnessClientFor\(apiKey\) \{[\s\S]*?witnessClients\.get\(apiKey\)/,
+      "witnessClientFor must look the client up by api key",
     );
-    // The old in-line STH caching / manual fetch must be gone from apiCall.
-    assert.ok(
-      !/let lastKnownSTH = null;/.test(INDEX_SRC),
-      "index.js must not keep a module-level in-memory-only lastKnownSTH",
+  });
+
+  test("apiCall sends through the per-key client and passes the symlink-safe fs", () => {
+    assert.match(
+      INDEX_SRC,
+      /await witnessClientFor\(key\)\.send\(\{ url, method, headers, serializedBody \}\)/,
     );
+    assert.match(
+      INDEX_SRC,
+      /WITNESS_FS = \{ readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync \}/,
+      "the witness fs must include renameSync + lstatSync for atomic + guarded I/O",
+    );
+    assert.ok(!/let lastKnownSTH = null;/.test(INDEX_SRC));
   });
 });

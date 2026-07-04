@@ -24,6 +24,19 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
     one-time grace (custody-03): the request is still rejected — we only make the
     already-present resync path reliable and self-documenting.
 
+  ## Pipeline ordering (deliberate)
+
+  This plug runs AFTER `RateLimiter` and `UpdateLastSeen` in the `:authenticated`
+  pipeline. A client's transparent bootstrap-412 retry is therefore a second HTTP
+  request that costs one extra rate-limit tick and one extra `last_seen` write.
+  This is accepted, not a bug: (a) the retry fires AT MOST ONCE per fresh process
+  cold-start (once the STH is cached, no more bootstraps), and with client-side STH
+  persistence the common fresh-process path sends a real header and never retries;
+  (b) reordering this plug ahead of `RateLimiter` would remove rate-limiting from
+  its own DB work (the bootstrap-consume UPDATE + STH lookup), widening a DoS
+  surface — a worse trade than a rare +1 tick. Any HTTP client retry costs a tick;
+  keeping the limiter first protects the DB.
+
   ## Custody safety (private advisories)
 
   This plug operates on **raw, unauthenticated client input** and therefore
@@ -156,11 +169,23 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   defp compare_against_server_sth(conn, tenant_id, position, sig_prefix) do
     case AuditChain.get_sth_at_position(tenant_id, position) do
       nil ->
-        # custody-02: NO pass-through. The server is the SOLE source of STHs, so
-        # a position beyond the tenant's latest sealed STH is not something an
-        # honest agent can know (its cached position is always <= latest sealed).
-        # Treat it as resync-required, never a silent bypass.
-        resync_required(conn, tenant_id, position, sig_prefix, "future_position")
+        # #298 fresh-tenant zero-STH pass-through: when the tenant has sealed NO
+        # STH yet (the ~60s window between a new tenant's first audit entry and the
+        # ComputeSthWorker cron sealing its first STH), the bootstrap grace hands
+        # out the all-zero placeholder `0:<zero_prefix>` — which the server ITSELF
+        # issued. A client echoing exactly that placeholder while nothing is sealed
+        # is NOT a future-position divergence (there is nothing to diverge from), so
+        # let it through. This closes the zero-STH 409 loop the 412-only client
+        # retry could never recover from. The moment a real STH is sealed,
+        # get_latest_sth/1 is non-nil and this branch no longer applies.
+        if zero_sth_placeholder?(position, sig_prefix) and no_sealed_sth?(tenant_id) do
+          conn
+        else
+          # custody-02: otherwise NO pass-through. A position beyond the tenant's
+          # latest sealed STH is not something an honest agent can know (its cached
+          # position is always <= latest sealed). Resync-required, never a bypass.
+          resync_required(conn, tenant_id, position, sig_prefix, "future_position")
+        end
 
       sth ->
         server_prefix = server_sig_prefix(sth.signature)
@@ -230,40 +255,67 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   end
 
   defp atomic_consume_bootstrap(conn, id, tenant_id) do
-    # Read the STH the client will cache BEFORE consuming the one-time grace.
-    # This lookup is read-only and idempotent, so doing it first means a
-    # transient read failure raises here — with the grace NOT yet consumed
-    # (rescued to a retryable missing_header) — instead of AFTER the UPDATE has
-    # already burned the grace, which would permanently strand the key.
+    # LOW-9: the rescue is NARROWED to consume_grace/2 — ONLY the STH read + the
+    # conditional UPDATE. So a raise means the grace was NOT committed (the read
+    # failed, or the UPDATE rolled back), and the pure response builders
+    # (grant_bootstrap_grace / bootstrap_already_consumed) are outside the guard.
+    case consume_grace(id, tenant_id) do
+      # Winner: grant the grace with the STH we already read.
+      {:ok, 1, sth_value} ->
+        grant_bootstrap_grace(conn, sth_value)
+
+      # Already consumed: hand the client the STH we ALREADY read (no second DB
+      # round-trip) — so the already-consumed 412 can never be a 500 and ALWAYS
+      # carries a valid `x-loopctl-current-sth` for the client's one-shot retry.
+      {:ok, 0, sth_value} ->
+        bootstrap_already_consumed(conn, sth_value)
+
+      {:error, exception} ->
+        Logger.warning(
+          "ValidateWitnessHeader: atomic bootstrap consume failed for " <>
+            "api_key=#{id}: #{sanitized_db_error(exception)}"
+        )
+
+        recover_consume_error(conn, id, tenant_id)
+    end
+  end
+
+  # The ONLY rescue-guarded step: read the STH the client will cache, then flip the
+  # one-time grace column iff still NULL. The STH read runs FIRST so a transient
+  # read failure never burns the grace. Returns {:ok, count, sth} or {:error, ex}.
+  defp consume_grace(id, tenant_id) do
     sth_value = current_sth_value(tenant_id)
 
     {count, _} =
       from(a in ApiKey, where: a.id == ^id and is_nil(a.sth_bootstrap_consumed_at))
       |> AdminRepo.update_all(set: [sth_bootstrap_consumed_at: DateTime.utc_now()])
 
-    case count do
-      # Winner: grant the grace. Only pure response-header setting remains after
-      # the committed UPDATE, so nothing here can fail and strand the client.
-      1 -> grant_bootstrap_grace(conn, sth_value)
-      # Already consumed: hand the client the STH we ALREADY read above (never a
-      # second DB round-trip). Because that read is inside this rescue-guarded
-      # block, a transient failure would have already fallen through to a clean
-      # retryable `missing_header` 412 — so the already-consumed 412 can never be
-      # a 500 and ALWAYS carries a valid `x-loopctl-current-sth` for the client's
-      # one-shot retry (#298).
-      0 -> bootstrap_already_consumed(conn, sth_value)
+    {:ok, count, sth_value}
+  rescue
+    exception -> {:error, exception}
+  end
+
+  # A raise inside consume_grace means the grace was NOT committed, so
+  # `missing_header` (retryable) is the safe default. Defensively re-check with a
+  # FRESH read: if a prior request already burned the grace, return the
+  # already-consumed 412 (with a never-raising STH lookup) instead of inviting yet
+  # another bootstrap attempt. Any failure of that safety read falls back to
+  # missing_header.
+  defp recover_consume_error(conn, id, tenant_id) do
+    if bootstrap_already_consumed_row?(id) do
+      bootstrap_already_consumed(conn, safe_current_sth_value(tenant_id))
+    else
+      missing_header(conn)
+    end
+  end
+
+  defp bootstrap_already_consumed_row?(id) do
+    case AdminRepo.get(ApiKey, id) do
+      %ApiKey{sth_bootstrap_consumed_at: %DateTime{}} -> true
+      _ -> false
     end
   rescue
-    exception ->
-      # Fail closed on a DB error BEFORE the grace is consumed (the STH read or
-      # the UPDATE itself): never grant an unbounded/repeatable grace, and never
-      # burn the one-time grace on a transient failure — this path is retryable.
-      Logger.warning(
-        "ValidateWitnessHeader: atomic bootstrap consume failed for " <>
-          "api_key=#{id}: #{sanitized_db_error(exception)}"
-      )
-
-      missing_header(conn)
+    _ -> false
   end
 
   defp grant_bootstrap_grace(conn, sth_value) do
@@ -392,6 +444,27 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
       sth -> "#{sth.chain_position}:#{server_sig_prefix(sth.signature)}"
     end
   end
+
+  # current_sth_value/1 that can never raise — used only in the DB-error RECOVERY
+  # path (recover_consume_error) where the STH read may itself be flaky. Falls back
+  # to the all-zero placeholder so the already-consumed 412 still carries a
+  # shape-valid resync header instead of turning into a 500.
+  defp safe_current_sth_value(tenant_id) do
+    current_sth_value(tenant_id)
+  rescue
+    _ -> @zero_sth
+  end
+
+  # True only for the exact all-zero STH placeholder the bootstrap grace issues
+  # while the tenant has no sealed STH: chain position 0 and the fixed zero prefix.
+  # Constant-time compare against the fixed-length server constant (sig_prefix is
+  # already length/charset validated upstream).
+  defp zero_sth_placeholder?(0, sig_prefix),
+    do: Plug.Crypto.secure_compare(sig_prefix, @zero_sth_prefix)
+
+  defp zero_sth_placeholder?(_position, _sig_prefix), do: false
+
+  defp no_sealed_sth?(tenant_id), do: is_nil(AuditChain.get_latest_sth(tenant_id))
 
   defp valid_sig_prefix?(prefix) do
     String.length(prefix) == @sig_prefix_length and

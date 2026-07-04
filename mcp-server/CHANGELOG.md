@@ -5,6 +5,42 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.33.1 — 2026-07-03 (witness STH cache hardening — #298 enhanced review)
+
+### Security
+
+- **Symlink / file-clobber (CWE-59) closed.** The STH state file is now written
+  atomically and symlink-safely: to a private `0600` temp file opened with
+  `O_EXCL` (`wx`), then `rename`d over the target — so a pre-planted symlink at the
+  cache path is *replaced*, never followed, and can no longer be used to clobber an
+  arbitrary victim-owned file on a shared `/tmp`. Loads `lstat` the path and refuse
+  a symlinked or foreign-owned file. This also fixes the torn-file race on a killed
+  mid-write.
+- **Per-(server + key) cache scoping.** The state file AND the in-memory client are
+  now keyed by `sha256(serverUrl + ":" + apiKey)`, so two keys/tenants on one host
+  no longer share (and clobber) a cache — which previously caused spurious `409
+  witness_divergence` responses and false divergence telemetry. Only a non-secret
+  hash of the key appears in the filename; the key itself never hits disk.
+
+### Fixed
+
+- **Fresh-tenant zero-STH 409 loop (server-side).** A brand-new tenant has a ~60s
+  window before its first STH is sealed; the bootstrap handed out the all-zero STH
+  placeholder, which the client echoed and the server then rejected `409
+  witness_divergence` (unrecoverable, since the client retry is 412-only). The
+  server now treats the zero placeholder as a pass-through while no STH is sealed
+  (nothing to diverge from) — gated strictly on there being no sealed STH.
+- **Cold-start bootstrap coalescing.** Concurrent tool calls at process start now
+  share ONE bootstrap (singleflight) instead of each firing their own.
+
+### Changed
+
+- The transparent retry now anchors to the response `error.code`
+  (`witness_bootstrap_already_consumed`), not just the status + header shape.
+- `409 witness_divergence` is explicitly NOT auto-retried (the genuine-fork/resync
+  signal); the client caches the server's STH so the next request self-heals.
+- `LOOPCTL_STH_STATE_PATH` documentation clarified; cache is per-(server + key).
+
 ## 2.33.0 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry — #298)
 
 ### Fixed

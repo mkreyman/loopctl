@@ -265,20 +265,29 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
       assert remediation["retry"]["max_retries"] == 1
     end
 
-    test "the already-consumed 412 carries the zero STH header even when the tenant has no STH" do
-      # Guarantee holds on the no-STH branch too: current_sth_value/1 falls back to
-      # the all-zero STH, so the header is ALWAYS present and shape-valid — the
-      # retry path can never be stranded by a header-less 412.
+    test "the already-consumed 412 reuses the read STH — no second audit_signed_tree_heads query (#298 review MEDIUM-7)" do
+      # The PR's central efficiency + no-500 claim: the already-consumed 412 hands
+      # back the STH read ONCE in consume_grace, never re-querying it. Count the
+      # audit_signed_tree_heads reads during the 412 request: exactly one.
       {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      _server_prefix = insert_sth(api_key.tenant_id, 3)
 
       _ = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
       reloaded = AdminRepo.get!(ApiKey, api_key.id)
 
-      conn = reloaded |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+      sth_queries =
+        capture_admin_sth_queries(fn ->
+          conn = reloaded |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
 
-      assert conn.status == 412
-      assert [sth] = get_resp_header(conn, "x-loopctl-current-sth")
-      assert sth =~ ~r/\A\d+:[A-Za-z0-9_-]{22}\z/
+          assert conn.status == 412
+
+          assert Jason.decode!(conn.resp_body)["error"]["code"] ==
+                   "witness_bootstrap_already_consumed"
+        end)
+
+      assert length(sth_queries) == 1,
+             "already-consumed 412 must read the STH exactly once (reuse, not re-query), " <>
+               "got #{length(sth_queries)}"
     end
 
     test "consumed-grace 412 emits a distinct telemetry event for the operator" do
@@ -396,6 +405,98 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
       assert conn.halted
       assert conn.status == 412
       assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_header_malformed"
+    end
+  end
+
+  describe "FIX #298 review HIGH-3 — fresh-tenant zero-STH placeholder does not 409-loop" do
+    # base64url(no padding) of 16 zero bytes — the all-zero placeholder the
+    # bootstrap grace issues while a tenant has no sealed STH yet.
+    @zero_prefix Base.url_encode64(:binary.copy(<<0>>, 16), padding: false)
+
+    test "echoing the zero-STH placeholder PASSES when the tenant has no sealed STH" do
+      # A new tenant has a ~60s window (before ComputeSthWorker seals its first
+      # STH) where the bootstrap hands out `0:<zero_prefix>`. A subsequent request
+      # echoing exactly that must NOT 409 — there is nothing to diverge from, and
+      # the 412-only client retry could never recover from a 409 here.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+
+      conn =
+        base_conn()
+        |> put_req_header("x-loopctl-last-known-sth", "0:#{@zero_prefix}")
+        |> with_api_key(api_key)
+        |> ValidateWitnessHeader.call(@enforce)
+
+      refute conn.halted
+      assert is_nil(conn.status)
+    end
+
+    test "the zero-STH placeholder is NOT a free pass once a real STH is sealed" do
+      # Discriminating: once the tenant has a sealed STH, the zero placeholder no
+      # longer matches (get_sth_at_position finds the real STH) → genuine 409. The
+      # pass-through is gated strictly on there being NO sealed STH.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      insert_sth(api_key.tenant_id, 5)
+
+      conn =
+        base_conn()
+        |> put_req_header("x-loopctl-last-known-sth", "0:#{@zero_prefix}")
+        |> with_api_key(api_key)
+        |> ValidateWitnessHeader.call(@enforce)
+
+      assert conn.halted
+      assert conn.status == 409
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_divergence"
+    end
+
+    test "a non-zero position with no sealed STH still resyncs (only the zero placeholder passes)" do
+      # The pass-through is scoped to position 0 + the zero prefix. A client that
+      # claims some other position while nothing is sealed cannot have gotten it
+      # from us → resync, never a bypass.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+
+      conn =
+        base_conn()
+        |> put_req_header("x-loopctl-last-known-sth", "7:#{@other_prefix}")
+        |> with_api_key(api_key)
+        |> ValidateWitnessHeader.call(@enforce)
+
+      assert conn.halted
+      assert conn.status == 409
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "witness_divergence"
+    end
+  end
+
+  # Captures the SQL of every audit_signed_tree_heads query the AdminRepo runs
+  # inside `fun`, scoped to self() so concurrent async tests don't leak in.
+  defp capture_admin_sth_queries(fun) do
+    test_pid = self()
+    handler_id = "sth-query-capture-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :admin_repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid and String.contains?(query, "audit_signed_tree_heads") do
+          send(test_pid, {:sth_query, query})
+        end
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+
+    drain_sth_queries([])
+  end
+
+  defp drain_sth_queries(acc) do
+    receive do
+      {:sth_query, q} -> drain_sth_queries([q | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end
