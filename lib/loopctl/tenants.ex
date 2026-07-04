@@ -469,9 +469,18 @@ defmodule Loopctl.Tenants do
     end)
   end
 
-  # Short, non-reversible label for the audit entry so we can tell
-  # authenticators apart in human-readable logs.
-  defp fingerprint(credential_id) when is_binary(credential_id) do
+  @doc """
+  Short, non-reversible label for an authenticator's `credential_id`, used in
+  audit-entry `new_state`/`old_state` payloads so authenticators can be told
+  apart in human-readable logs without ever persisting the raw credential id.
+
+  Public (US-26.7.2) so BOTH the signup ceremony (`signup/1`, above) and the
+  opt-in trust-tier upgrade ceremony (`Loopctl.Tenants.Enrollment`) compute
+  the identical fingerprint — a single source of truth so the two ceremonies
+  can't drift.
+  """
+  @spec fingerprint(binary()) :: String.t()
+  def fingerprint(credential_id) when is_binary(credential_id) do
     :crypto.hash(:sha256, credential_id)
     |> Base.encode16(case: :lower)
     |> String.slice(0, 16)

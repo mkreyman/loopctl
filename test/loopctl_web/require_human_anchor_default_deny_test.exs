@@ -47,6 +47,24 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # provisioning ever became lazy.
                {:post, "/api/v1/tenants/:id/bootstrap-audit-key"},
 
+               # US-26.7.2 — opt-in WebAuthn trust-tier upgrade ceremony. `challenge`
+               # and `create` ARE the upgrade path itself: an agent-rooted caller
+               # (zero authenticators) is the INTENDED audience for a first
+               # enrollment, so gating them behind RequireHumanAnchor would make the
+               # tier unreachable from the tier it's meant to lift a tenant out of.
+               # A SUBSEQUENT (backup) enrollment on an already-human_anchored tenant
+               # is instead gated by a FRESH `add_authenticator` WebAuthn assertion
+               # from an existing authenticator (Loopctl.WebAuthn.Reauth) — a
+               # STRONGER control than the tier gate, since a stolen role:user key
+               # alone can never satisfy it (AC-26.7.2.3's critical
+               # anti-soft-recovery-backdoor gate). `revoke-challenge` + the DELETE
+               # are likewise gated by a fresh `revoke_authenticator` assertion, not
+               # the tier — mirroring rotate-audit-key's exemption above.
+               {:post, "/api/v1/tenants/:id/authenticators/challenge"},
+               {:post, "/api/v1/tenants/:id/authenticators"},
+               {:post, "/api/v1/tenants/:id/authenticators/revoke-challenge"},
+               {:delete, "/api/v1/tenants/:id/authenticators/:auth_id"},
+
                # /api_keys management — explicitly excluded (AC-26.7.1.7).
                {:post, "/api/v1/api_keys"},
                {:delete, "/api/v1/api_keys/:id"},

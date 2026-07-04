@@ -372,6 +372,10 @@ config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 # signup LiveView is served from. Overridden in dev and prod as needed.
 config :loopctl, :webauthn,
   rp_id: "loopctl.com",
+  # US-26.7.2: rp_name is served by the stateless enrollment-challenge API
+  # endpoint (POST /tenants/:id/authenticators/challenge) so the relying
+  # party display name comes from server config, not a hard-coded JS client.
+  rp_name: "loopctl",
   origin: "https://loopctl.com",
   user_verification: "preferred"
 

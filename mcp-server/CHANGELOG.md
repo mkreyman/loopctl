@@ -5,6 +5,27 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.36.0 — 2026-07-04 (US-26.7.2 — opt-in WebAuthn trust-tier upgrade ceremony)
+
+### Added
+
+- **`request_authenticator_challenge` / `enroll_authenticator` / `request_authenticator_revoke_challenge` / `revoke_authenticator`.**
+  Four thin tools driving the new opt-in WebAuthn trust-tier upgrade ceremony
+  (`agent_rooted` -> `human_anchored`) added server-side in US-26.7.2. An
+  agent-rooted (KB-tier) tenant created via `signup` can now enroll a
+  hardware authenticator to unlock the work-breakdown / chain-of-custody
+  surface WITHOUT creating a new tenant or losing its knowledge base. All
+  four require the exact `LOOPCTL_USER_KEY` (user role) bound to the target
+  `tenant_id` and are explicit that they are **not headless**: completing
+  enrollment/revocation requires an interactive WebAuthn client (a browser
+  or native FIDO2 library) with a human physically touching the hardware
+  authenticator — an agent alone cannot produce a valid attestation or
+  assertion. Enrolling a SECOND (backup) authenticator on an
+  already-`human_anchored` tenant additionally requires a fresh assertion
+  from an existing authenticator (`reauth_assertion`), and revoking a
+  tenant's last remaining authenticator is refused server-side (no
+  auto-downgrade).
+
 ## 2.34.0 — 2026-07-03 (smooth agent BYO-LLM onboarding — self-healing remediation + self-documenting tools)
 
 ### Added

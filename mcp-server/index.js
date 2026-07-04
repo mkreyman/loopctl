@@ -1690,6 +1690,71 @@ async function signup({ name, slug, email }) {
   return toContent(result);
 }
 
+// US-26.7.2: opt-in WebAuthn trust-tier upgrade ceremony (agent_rooted ->
+// human_anchored) + authenticator revocation. All four require the EXACT
+// user-role key (LOOPCTL_USER_KEY) + ownership of `tenant_id` — mirroring
+// set_llm_config's exactKey:true pattern, since these mutate the tenant's
+// root of trust. NOT headless: completing enrollment/revocation requires an
+// INTERACTIVE WebAuthn client (a browser or a native FIDO2 library) with a
+// human present to touch the hardware authenticator — an agent alone cannot
+// produce a valid attestation or assertion, by design (see
+// docs/chain-of-custody-v2.md §9).
+async function requestAuthenticatorChallenge({ tenant_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/tenants/${tenant_id}/authenticators/challenge`,
+    {},
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function enrollAuthenticator({
+  tenant_id,
+  challenge_id,
+  attestation_object,
+  client_data_json,
+  credential_id,
+  friendly_name,
+  reauth_assertion,
+}) {
+  const body = { challenge_id, attestation_object, client_data_json, credential_id };
+  if (friendly_name != null) body.friendly_name = friendly_name;
+  if (reauth_assertion != null) body.reauth_assertion = reauth_assertion;
+
+  const result = await apiCall(
+    "POST",
+    `/api/v1/tenants/${tenant_id}/authenticators`,
+    body,
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function requestAuthenticatorRevokeChallenge({ tenant_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/tenants/${tenant_id}/authenticators/revoke-challenge`,
+    {},
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
+async function revokeAuthenticator({ tenant_id, authenticator_id, webauthn_assertion }) {
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/tenants/${tenant_id}/authenticators/${authenticator_id}`,
+    { webauthn_assertion },
+    process.env.LOOPCTL_USER_KEY,
+    { exactKey: true },
+  );
+  return toContent(result);
+}
+
 // US-26: Signed Tree Head retrieval
 async function getSth({ tenant_id }) {
   const result = await apiCall("GET", `/api/v1/audit/sth/${tenant_id}`);
@@ -3893,6 +3958,114 @@ const TOOLS = [
     },
   },
   {
+    name: "request_authenticator_challenge",
+    description:
+      "Step 1 of the opt-in WebAuthn trust-tier upgrade ceremony (US-26.7.2): issues a " +
+      "registration challenge for enrolling a hardware authenticator against an EXISTING " +
+      "agent_rooted (KB-tier) tenant, promoting it to human_anchored on success. " +
+      "IMPORTANT: completing this ceremony requires an INTERACTIVE WebAuthn client " +
+      "(a browser calling navigator.credentials.create(), or a native FIDO2 library) " +
+      "with a HUMAN present to physically touch the authenticator — an agent alone " +
+      "cannot produce a valid attestation, by design. Use this tool to fetch the " +
+      "challenge/rp/user/pubKeyCredParams payload, drive the WebAuthn ceremony in your " +
+      "interactive client, then call enroll_authenticator with the result. If the " +
+      "tenant is already human_anchored, the response includes reauth_required: true " +
+      "plus a reauth_challenge — enroll_authenticator will need a fresh assertion from " +
+      "an EXISTING authenticator too (see enroll_authenticator's description). Requires " +
+      "LOOPCTL_USER_KEY (user role) bound to tenant_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Tenant UUID to enroll an authenticator for." },
+      },
+      required: ["tenant_id"],
+    },
+  },
+  {
+    name: "enroll_authenticator",
+    description:
+      "Step 2 of the opt-in WebAuthn trust-tier upgrade ceremony: completes enrollment " +
+      "with the attestation produced by navigator.credentials.create() against the " +
+      "challenge from request_authenticator_challenge. On a tenant's FIRST enrollment " +
+      "(zero prior authenticators) this call FLIPS the tenant from agent_rooted to " +
+      "human_anchored, unlocking the work-breakdown / chain-of-custody surface " +
+      "(projects, stories, dispatch, ...). On a SUBSEQUENT (backup) enrollment for an " +
+      "already human_anchored tenant, `reauth_assertion` (a fresh WebAuthn assertion " +
+      "from an EXISTING enrolled authenticator, from the challenge's reauth_challenge) " +
+      "is REQUIRED — omitting it when required returns 401 reauth_required. All " +
+      "binary fields are base64url encoded. Requires LOOPCTL_USER_KEY (user role) " +
+      "bound to tenant_id. Cannot be completed by an agent alone — see " +
+      "request_authenticator_challenge.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Tenant UUID." },
+        challenge_id: {
+          type: "string",
+          description: "challenge_id from request_authenticator_challenge.",
+        },
+        attestation_object: { type: "string", description: "Base64url attestation object." },
+        client_data_json: { type: "string", description: "Base64url raw client data JSON." },
+        credential_id: { type: "string", description: "Base64url credential id." },
+        friendly_name: {
+          type: "string",
+          description: "Operator-supplied label (1..120 chars, default \"Authenticator\").",
+        },
+        reauth_assertion: {
+          type: "object",
+          description:
+            "Required ONLY when enrolling a backup authenticator on an already " +
+            "human_anchored tenant: a fresh assertion (challenge_id, credential_id, " +
+            "authenticator_data, signature, client_data_json — all base64url) from an " +
+            "EXISTING enrolled authenticator, bound to the reauth_challenge returned by " +
+            "request_authenticator_challenge.",
+        },
+      },
+      required: ["tenant_id", "challenge_id", "attestation_object", "client_data_json", "credential_id"],
+    },
+  },
+  {
+    name: "request_authenticator_revoke_challenge",
+    description:
+      "Issues a fresh-assertion challenge to authorize revoking one of a tenant's " +
+      "enrolled WebAuthn authenticators. Requires an INTERACTIVE WebAuthn client + " +
+      "human touch to produce the assertion revoke_authenticator needs — an agent " +
+      "alone cannot authorize a revocation. Requires LOOPCTL_USER_KEY (user role) " +
+      "bound to tenant_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Tenant UUID." },
+      },
+      required: ["tenant_id"],
+    },
+  },
+  {
+    name: "revoke_authenticator",
+    description:
+      "Revokes an enrolled authenticator using the assertion from " +
+      "request_authenticator_revoke_challenge (navigator.credentials.get() against an " +
+      "EXISTING authenticator — human touch required). Refuses (409 last_authenticator) " +
+      "to remove a human_anchored tenant's LAST authenticator — there is no " +
+      "auto-downgrade; losing every authenticator is a fatal, human-recovery-only event " +
+      "(docs/chain-of-custody-v2.md §9.3). Requires LOOPCTL_USER_KEY (user role) bound " +
+      "to tenant_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tenant_id: { type: "string", description: "Tenant UUID." },
+        authenticator_id: { type: "string", description: "UUID of the authenticator to revoke." },
+        webauthn_assertion: {
+          type: "object",
+          description:
+            "The assertion (challenge_id, credential_id, authenticator_data, signature, " +
+            "client_data_json — all base64url) bound to the revoke-challenge.",
+        },
+      },
+      required: ["tenant_id", "authenticator_id", "webauthn_assertion"],
+    },
+  },
+  {
     name: "get_sth",
     description: "Get the latest Signed Tree Head for a tenant's audit chain. Public — no auth required.",
     inputSchema: {
@@ -4181,6 +4354,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "signup":
       return await signup(args);
+
+    case "request_authenticator_challenge":
+      return await requestAuthenticatorChallenge(args);
+
+    case "enroll_authenticator":
+      return await enrollAuthenticator(args);
+
+    case "request_authenticator_revoke_challenge":
+      return await requestAuthenticatorRevokeChallenge(args);
+
+    case "revoke_authenticator":
+      return await revokeAuthenticator(args);
 
     case "get_sth":
       return await getSth(args);

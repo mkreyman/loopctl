@@ -45,6 +45,12 @@ defmodule LoopctlWeb.OpenApiTest do
       # US-26.7.1 (#10) — the public agent-rooted self-signup endpoint must stay
       # registered in the OpenAPI spec (it's the API tenant-creation path).
       assert "/api/v1/signup" in paths
+      # US-26.7.2 — the opt-in WebAuthn trust-tier upgrade ceremony endpoints
+      # must be registered.
+      assert "/api/v1/tenants/{id}/authenticators/challenge" in paths
+      assert "/api/v1/tenants/{id}/authenticators" in paths
+      assert "/api/v1/tenants/{id}/authenticators/revoke-challenge" in paths
+      assert "/api/v1/tenants/{id}/authenticators/{auth_id}" in paths
     end
   end
 

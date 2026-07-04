@@ -481,6 +481,183 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule AuthenticatorChallengeResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuthenticatorChallengeResponse",
+      description:
+        "Step 1 of the opt-in WebAuthn enrollment ceremony (US-26.7.2). Returns the " <>
+          "publicKey creation options a browser WebAuthn client needs to call " <>
+          "navigator.credentials.create(). If the tenant is already human_anchored, " <>
+          "also includes a fresh-assertion (reauth) challenge for an EXISTING " <>
+          "authenticator (`reauth_required: true`) — a subsequent enrollment must " <>
+          "prove possession of an already-enrolled device before adding a backup.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          required: [:challenge_id, :challenge, :expires_at, :rp, :user, :pub_key_cred_params],
+          properties: %{
+            challenge_id: %Schema{
+              type: :string,
+              format: :uuid,
+              description: "Opaque single-use handle for the stored registration challenge"
+            },
+            challenge: %Schema{
+              type: :string,
+              description:
+                "Base64url-encoded challenge bytes to feed into navigator.credentials.create()"
+            },
+            expires_at: %Schema{type: :string, format: :"date-time"},
+            rp: %Schema{
+              type: :object,
+              properties: %{
+                id: %Schema{type: :string, description: "Relying party id"},
+                name: %Schema{type: :string, description: "Relying party display name"}
+              }
+            },
+            user: %Schema{
+              type: :object,
+              properties: %{
+                id: %Schema{
+                  type: :string,
+                  description: "Base64url opaque per-tenant WebAuthn user handle"
+                },
+                name: %Schema{type: :string},
+                display_name: %Schema{type: :string}
+              }
+            },
+            pub_key_cred_params: %Schema{
+              type: :array,
+              items: %Schema{type: :object},
+              description: "Accepted public key algorithms (ES256, RS256)"
+            },
+            reauth_required: %Schema{
+              type: :boolean,
+              description: "true when this is a subsequent (backup) enrollment"
+            },
+            reauth_challenge: %Schema{
+              type: :object,
+              nullable: true,
+              description: "Present only when reauth_required is true",
+              properties: %{
+                challenge_id: %Schema{type: :string, format: :uuid},
+                challenge: %Schema{type: :string},
+                allowed_credentials: %Schema{type: :array, items: %Schema{type: :string}},
+                rp_id: %Schema{type: :string},
+                expires_at: %Schema{type: :string, format: :"date-time"}
+              }
+            }
+          }
+        }
+      }
+    })
+  end
+
+  defmodule EnrollAuthenticatorRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EnrollAuthenticatorRequest",
+      description:
+        "Step 2 of the opt-in WebAuthn enrollment ceremony. Carries the WebAuthn " <>
+          "attestation produced by navigator.credentials.create(), keyed to the " <>
+          "challenge_id from step 1. All binary fields are base64url encoded. " <>
+          "`reauth_assertion` is REQUIRED (and verified) when the tenant is already " <>
+          "human_anchored — a fresh assertion from an existing authenticator.",
+      type: :object,
+      required: [:challenge_id, :attestation_object, :client_data_json, :credential_id],
+      properties: %{
+        challenge_id: %Schema{type: :string, format: :uuid},
+        attestation_object: %Schema{type: :string, description: "Base64url attestation object"},
+        client_data_json: %Schema{type: :string, description: "Base64url raw client data JSON"},
+        credential_id: %Schema{type: :string, description: "Base64url credential id"},
+        friendly_name: %Schema{
+          type: :string,
+          description: "Operator-supplied label (1..120 chars, default \"Authenticator\")"
+        },
+        reauth_assertion: WebAuthnAssertion
+      }
+    })
+  end
+
+  defmodule AuthenticatorEnrollResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "AuthenticatorEnrollResponse",
+      description: "Result of a successful authenticator enrollment.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant_id: %Schema{type: :string, format: :uuid},
+            trust_tier: %Schema{type: :string, enum: ["agent_rooted", "human_anchored"]},
+            upgraded: %Schema{
+              type: :boolean,
+              description: "true iff THIS call flipped the tenant to human_anchored"
+            },
+            authenticator: %Schema{
+              type: :object,
+              properties: %{
+                id: %Schema{type: :string, format: :uuid},
+                friendly_name: %Schema{type: :string},
+                attestation_format: %Schema{type: :string},
+                inserted_at: %Schema{type: :string, format: :"date-time"}
+              }
+            }
+          }
+        }
+      }
+    })
+  end
+
+  defmodule RevokeAuthenticatorRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RevokeAuthenticatorRequest",
+      description:
+        "Carries the WebAuthn assertion verified against the STORED " <>
+          "revoke_authenticator challenge before the target authenticator is deleted.",
+      type: :object,
+      required: [:webauthn_assertion],
+      properties: %{
+        webauthn_assertion: WebAuthnAssertion
+      }
+    })
+  end
+
+  defmodule RevokeAuthenticatorResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RevokeAuthenticatorResponse",
+      description: "Result of a successful authenticator revocation.",
+      type: :object,
+      required: [:data],
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant_id: %Schema{type: :string, format: :uuid},
+            authenticator_id: %Schema{type: :string, format: :uuid},
+            revoked: %Schema{type: :boolean}
+          }
+        }
+      }
+    })
+  end
+
   # ---------- API Keys ----------
 
   defmodule ApiKeyCreateRequest do
