@@ -7,6 +7,8 @@ defmodule Loopctl.Tenants.AuditKeyTest do
 
   import Loopctl.Fixtures
 
+  alias Loopctl.AdminRepo
+  alias Loopctl.Secrets
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants
 
@@ -225,6 +227,75 @@ defmodule Loopctl.Tenants.AuditKeyTest do
     test "rotation without existing key returns error" do
       tenant = fixture(:tenant)
       assert {:error, :no_existing_key} = Tenants.rotate_audit_key(tenant.id, <<>>)
+    end
+
+    # Review #2 — rotate OVERWRITES the deterministic secret with the NEW key.
+    # A post-write rollback must RESTORE the OLD private key (not delete) so the
+    # DB's rolled-back OLD public key still verifies.
+    test "post-write failure RESTORES the old secret value (review #2)" do
+      slug = "rotate-restore-#{System.unique_integer([:positive])}"
+      tenant = fixture(:tenant, %{slug: slug})
+      old_priv = :crypto.strong_rand_bytes(32)
+      old_pub = :crypto.strong_rand_bytes(32)
+      test_pid = self()
+
+      tenant =
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: old_pub)
+        |> AdminRepo.update!()
+
+      # Pre-rotation read of the OLD private key (the lexical value used to restore).
+      Mox.expect(Loopctl.MockSecrets, :get, fn _name -> {:ok, old_priv} end)
+
+      # :set is called TWICE, in order:
+      #   1. :store_new_secret writes the NEW key — then we blow up a LATER step
+      #      by deleting the tenant so :update_tenant raises StaleEntryError.
+      #   2. compensation RESTORES the OLD private key.
+      Mox.expect(Loopctl.MockSecrets, :set, fn _name, new_priv ->
+        assert new_priv != old_priv
+        AdminRepo.query!("DELETE FROM tenants WHERE slug = $1", [slug])
+        :ok
+      end)
+
+      Mox.expect(Loopctl.MockSecrets, :set, fn name, restored ->
+        send(test_pid, {:restored, name, restored})
+        :ok
+      end)
+
+      assert_raise Ecto.StaleEntryError, fn ->
+        Tenants.rotate_audit_key(tenant.id, :crypto.strong_rand_bytes(64))
+      end
+
+      secret_name = Secrets.audit_key_secret_name(slug)
+      # Restored with the OLD private key, NOT deleted.
+      assert_received {:restored, ^secret_name, ^old_priv}
+    end
+  end
+
+  describe "bootstrap_audit_key/1 (review #2)" do
+    test "post-write failure DELETES the just-written secret" do
+      slug = "bootstrap-del-#{System.unique_integer([:positive])}"
+      tenant = fixture(:tenant, %{slug: slug})
+      test_pid = self()
+
+      # store_secret writes the key, then we blow up :set_public_key by deleting
+      # the tenant row (bootstrap means NO prior key existed → compensate by delete).
+      Mox.expect(Loopctl.MockSecrets, :set, fn _name, _priv ->
+        AdminRepo.query!("DELETE FROM tenants WHERE slug = $1", [slug])
+        :ok
+      end)
+
+      Mox.expect(Loopctl.MockSecrets, :delete, fn name ->
+        send(test_pid, {:deleted, name})
+        :ok
+      end)
+
+      assert_raise Ecto.StaleEntryError, fn ->
+        Tenants.bootstrap_audit_key(tenant.id)
+      end
+
+      secret_name = Secrets.audit_key_secret_name(slug)
+      assert_received {:deleted, ^secret_name}
     end
   end
 end

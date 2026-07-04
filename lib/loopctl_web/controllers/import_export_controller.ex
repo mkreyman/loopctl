@@ -22,6 +22,10 @@ defmodule LoopctlWeb.ImportExportController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:export_project]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  # NOT applied to :export_project — export is a read-only KB-tier-safe op.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:import_project]
+
   tags(["Import/Export"])
 
   operation(:import_project,

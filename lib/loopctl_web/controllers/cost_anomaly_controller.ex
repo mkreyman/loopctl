@@ -18,6 +18,9 @@ defmodule LoopctlWeb.CostAnomalyController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:index]
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:update]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update]
+
   tags(["Token Efficiency"])
 
   operation(:index,

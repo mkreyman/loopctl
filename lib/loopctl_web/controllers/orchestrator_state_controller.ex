@@ -18,6 +18,9 @@ defmodule LoopctlWeb.OrchestratorStateController do
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: [:orchestrator, :superadmin]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:save, :show, :history]
+
   tags(["Orchestrator"])
 
   operation(:save,

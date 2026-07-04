@@ -21,6 +21,9 @@ defmodule LoopctlWeb.EpicDependencyController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :delete]
+
   tags(["Dependencies"])
 
   operation(:create,

@@ -42,6 +42,9 @@ defmodule LoopctlWeb.CapRecoveryController do
 
   plug LoopctlWeb.Plugs.RequireRole, exact_role: :agent
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:recover]
+
   @doc "POST /api/v1/stories/:id/recover-cap"
   def recover(conn, %{"id" => story_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id

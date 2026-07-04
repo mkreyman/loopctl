@@ -125,6 +125,13 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           enum: ["active", "suspended", "deactivated", "pending_enrollment"]
         },
+        trust_tier: %Schema{
+          type: :string,
+          enum: ["human_anchored", "agent_rooted"],
+          description:
+            "US-26.7.1 — human_anchored (WebAuthn signup) unlocks the work-breakdown " <>
+              "/ chain-of-custody surface; agent_rooted (self-signup) is KB-tier only."
+        },
         inserted_at: %Schema{type: :string, format: :"date-time"},
         updated_at: %Schema{type: :string, format: :"date-time"}
       },
@@ -135,6 +142,7 @@ defmodule Loopctl.ApiSpec.Schemas do
         email: "admin@example.com",
         settings: %{},
         status: "active",
+        trust_tier: "human_anchored",
         inserted_at: "2026-01-15T10:00:00Z",
         updated_at: "2026-01-15T10:00:00Z"
       }
@@ -174,6 +182,73 @@ defmodule Loopctl.ApiSpec.Schemas do
         email: "admin@example.com",
         settings: %{},
         token_data_retention_days: 90
+      }
+    })
+  end
+
+  defmodule SelfSignupRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "SelfSignupRequest",
+      description:
+        "Request body for `POST /api/v1/signup` (US-26.7.1). Creates an " <>
+          "agent-rooted (KB-tier) tenant with no WebAuthn ceremony. Only " <>
+          "`name`, `slug`, and `email` are accepted — any other field " <>
+          "(`trust_tier`, `role`, `tenant_id`, `agent_id`, ...) is ignored.",
+      type: :object,
+      required: [:name, :slug, :email],
+      properties: %{
+        name: %Schema{type: :string, description: "Tenant display name", maxLength: 120},
+        slug: %Schema{type: :string, description: "URL-safe unique slug", maxLength: 64},
+        email: %Schema{type: :string, format: :email, description: "Contact email"}
+      },
+      example: %{
+        name: "Stranger Agent Co",
+        slug: "stranger-agent-co",
+        email: "agent@stranger.example"
+      }
+    })
+  end
+
+  defmodule SelfSignupResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "SelfSignupResponse",
+      description:
+        "Response for `POST /api/v1/signup`. `raw_key` (role `user`, tenant-bound) " <>
+          "is returned exactly once — it is never persisted in plaintext and cannot " <>
+          "be retrieved again.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            tenant: TenantResponse,
+            raw_key: %Schema{type: :string, description: "One-time root API key (role: user)"},
+            next_action: %Schema{type: :object, additionalProperties: true}
+          }
+        }
+      },
+      example: %{
+        data: %{
+          tenant: %{
+            id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            name: "Stranger Agent Co",
+            slug: "stranger-agent-co",
+            email: "agent@stranger.example",
+            trust_tier: "agent_rooted",
+            status: "active"
+          },
+          raw_key: "lc_...",
+          next_action: %{
+            message: "Configure your BYO LLM keys, then start ingesting/searching the wiki.",
+            configure_llm: "PATCH /api/v1/tenants/me/llm-config"
+          }
+        }
       }
     })
   end

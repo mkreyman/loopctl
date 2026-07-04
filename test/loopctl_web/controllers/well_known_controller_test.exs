@@ -25,6 +25,9 @@ defmodule LoopctlWeb.WellKnownControllerTest do
       assert body["discovery_bootstrap_url"] =~ "loopctl.com/wiki/agent-bootstrap"
       assert body["required_agent_pattern_url"] =~ "loopctl.com/wiki/agent-pattern"
       assert body["system_articles_endpoint"] =~ "loopctl.com/api/v1/articles/system"
+      # US-26.7.1: a stranger agent discovering loopctl cold can find the
+      # public, agent-rooted self-signup path.
+      assert body["signup_endpoint"] =~ "loopctl.com/api/v1/signup"
       assert is_binary(body["contact"])
     end
 

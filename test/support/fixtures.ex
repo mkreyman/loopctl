@@ -88,7 +88,11 @@ defmodule Loopctl.Fixtures do
         slug: "test-tenant-#{System.unique_integer([:positive])}",
         email: "test-#{System.unique_integer([:positive])}@example.com",
         settings: %{},
-        status: :active
+        status: :active,
+        # US-26.7.1: default fixtures to the trusted, human-anchored tier so the
+        # large existing custody-test surface is unaffected. Pass
+        # `trust_tier: :agent_rooted` explicitly to get a KB-tier tenant.
+        trust_tier: :human_anchored
       },
       Enum.into(attrs, %{})
     )
@@ -459,6 +463,7 @@ defmodule Loopctl.Fixtures do
     data = build(:tenant, attrs)
     status = Map.get(data, :status, :active)
     audit_pub_key = Map.get(data, :audit_signing_public_key)
+    trust_tier = Map.get(data, :trust_tier, :human_anchored)
 
     tenant =
       %Tenant{}
@@ -476,13 +481,21 @@ defmodule Loopctl.Fixtures do
       end
 
     # Set audit_signing_public_key if provided (not in create_changeset cast)
-    if audit_pub_key do
-      tenant
-      |> Ecto.Changeset.change(audit_signing_public_key: audit_pub_key)
-      |> AdminRepo.update!()
-    else
-      tenant
-    end
+    tenant =
+      if audit_pub_key do
+        tenant
+        |> Ecto.Changeset.change(audit_signing_public_key: audit_pub_key)
+        |> AdminRepo.update!()
+      else
+        tenant
+      end
+
+    # US-26.7.1: trust_tier is excluded from create_changeset's cast (never
+    # settable from a public changeset) — set it programmatically here,
+    # mirroring the audit_signing_public_key post-insert pattern above.
+    tenant
+    |> Ecto.Changeset.change(trust_tier: trust_tier)
+    |> AdminRepo.update!()
   end
 
   def fixture(:root_authenticator, attrs) do

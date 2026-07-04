@@ -42,6 +42,9 @@ defmodule LoopctlWeb.OpenApiTest do
       assert "/health" in paths
       assert "/api/v1/projects" in paths
       assert "/api/v1/stories/{id}" in paths
+      # US-26.7.1 (#10) — the public agent-rooted self-signup endpoint must stay
+      # registered in the OpenAPI spec (it's the API tenant-creation path).
+      assert "/api/v1/signup" in paths
     end
   end
 

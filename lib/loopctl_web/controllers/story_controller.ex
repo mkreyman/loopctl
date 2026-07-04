@@ -32,6 +32,10 @@ defmodule LoopctlWeb.StoryController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index, :show, :index_by_project]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor
+       when action in [:create, :create_in_project, :update, :delete]
+
   tags(["Stories"])
 
   operation(:create,

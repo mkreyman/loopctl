@@ -1,0 +1,203 @@
+{
+  "id": "US-26.7.1",
+  "title": "Capability-Tiered Trust: Agent-Rooted Self-Signup (KB tier) vs Human-Anchored Custody tier",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "high",
+  "phase": "capability_tiers",
+  "story": {
+    "as_a": "an autonomous agent that wants to use loopctl purely as a knowledge base (ingest / search / curate on my own BYO LLM keys), with no human operator and no hardware authenticator",
+    "i_want_to": "create my own tenant and obtain a working key entirely through an API call or an MCP tool, and immediately use the full knowledge surface, without a WebAuthn signup ceremony",
+    "so_that": "onboarding to the second-brain KB is frictionless for any stranger agent, while the higher-stakes work-breakdown / chain-of-custody surface stays reserved for human-anchored tenants who have enrolled a hardware authenticator"
+  },
+  "rationale": "loopctl was born to enforce a supervised code workflow where implementer, reviewer, and verifier are different agents rooted in a human operator (the WebAuthn L0 anchor at signup). But the platform now serves a second, dominant use case: an agent-native knowledge base. These two use cases were wrongly forced to share ONE trust model, so today the ONLY way to create a tenant is the WebAuthn LiveView at /signup (confirmed: Loopctl.Tenants.signup/1 is called only from signup_live.ex; Tenants.create_tenant/1 is test-only; there is no API or MCP path). That makes agent-native KB onboarding impossible without a human pressing a hardware key.\n\nThe resolution is to attach trust to the CAPABILITY, not to tenant genesis. The KB surface (ingest/search/context/curate, article CRUD, BYO-key config) is low-stakes: an agent managing its own knowledge on its own keys can only harm itself, and — critically — the chain-of-custody protections that matter (the 409 self_report/self_review/self_verify guards and dispatch-lineage self-checks) do NOT depend on the L0 anchor; they enforce implementer!=verifier regardless of how the tenant was created (verified in the spec-review pass against story_status_controller.ex, story_verification_controller.ex, review_record_controller.ex, and progress.ex:1025-1026). L0's real job is rooting the per-tenant audit chain to a human so that Signed Tree Heads are externally attestable to a real person — which matters for the work-custody surface, not for a tenant curating its own notes.\n\nTherefore: open a lightweight, rate-limited, agent-rooted self-signup path (API + MCP) that yields a tenant on the KB tier, and gate the work-breakdown / chain-of-custody surface behind a new capability check (RequireHumanAnchor) that is keyed on the TENANT's trust_tier (deliberately orthogonal to role — because role cannot express 'KB-yes, custody-no', and because a role check would let a tenant self-mint a higher-role key to escape the gate). Existing tenants (human-anchored via the WebAuthn ceremony) are unaffected; only the new agent-rooted tier is restricted. This does NOT weaken L0 for the operations that depend on it — it scopes WHERE the tier boundary sits. The reciprocal opt-in upgrade flow (an agent-rooted tenant enrolling a WebAuthn authenticator post-signup to become human-anchored and unlock custody) is a dependent fast-follow (US-26.7.2).\n\nThis story was hardened by a pre-implementation enhanced-review pass that found 5 critical tier-gate bypasses in the first draft (missing action aliases and whole custody controllers, action-atom vs URL-prose mismatches that compile to no-op guards, and an un-rolled-back external secret write). The corrections below — exact action atoms, the full custody-controller enumeration, and a DEFAULT-DENY router-walk guard test — are the direct product of that review.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.7.1.1",
+      "description": "A `trust_tier` column (Ecto.Enum, values `:human_anchored | :agent_rooted`) is added to `tenants` via migration. The database default is the RESTRICTIVE value `:agent_rooted` (honoring 'nil/unknown is never permissive'), NOT NULL. A backfill in the SAME migration, using plain `execute/1` (no AdminRepo/Repo distinction applies inside a migration; `tenants` carries no RLS policy — verified against 20260327051838_create_rls_infrastructure.exs and 20260412180651_add_custody_halted_at_to_tenants.exs), runs `UPDATE tenants SET trust_tier='human_anchored' WHERE id IN (SELECT DISTINCT tenant_id FROM tenant_root_authenticators)`, so every existing tenant with an enrolled authenticator (incl. the single prod tenant) becomes human_anchored and any without stays agent_rooted. `trust_tier` is NEVER in a public changeset `cast`; each signup path sets it explicitly on the struct.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.2",
+      "description": "The existing WebAuthn ceremony `Loopctl.Tenants.signup/1` explicitly sets `trust_tier: :human_anchored` on the inserted tenant; its genesis audit entry is unchanged (`actor_type: \"human\"`, `actor_label: \"human:webauthn\"`). An existing-behavior test proves a WebAuthn-signed tenant is `:human_anchored` and can still perform custody operations.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.3",
+      "description": "A new context function `Loopctl.Tenants.self_signup/1` creates an AGENT-ROOTED tenant in a single Ecto.Multi that mirrors the trusted parts of the ceremony WITHOUT authenticators: insert tenant (`trust_tier: :agent_rooted`), generate + store the Ed25519 audit signing keypair (private via Loopctl.Secrets, public onto the tenant), activate the tenant, and write a genesis audit entry with `actor_type: \"agent\"` and `actor_label: \"agent:self-signup\"`. It then mints a `role: :user`, `agent_id: nil` root API key bound to the tenant (so the tenant can call PATCH /tenants/me/llm-config and register its own agent identity). The raw key is returned exactly once and never persisted in plaintext.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.4",
+      "description": "TRANSACTIONAL SECRET SAFETY (spec-review CRITICAL): because `Loopctl.Secrets.set/2` is an EXTERNAL Fly.io write that `AdminRepo.transaction/1` cannot roll back, any failure occurring AFTER a successful `Secrets.set/2` (in `set_public_key`, `activate`, or `audit_genesis`) must trigger a compensating `Loopctl.Secrets.delete/1` of the just-written key before returning `{:error, ...}`, so no orphaned Ed25519 private key is left in Fly with no owning tenant row. This compensation is added to the SHARED helper (`with_secret_compensation/3`, keyed on lexical secret_name — no process dictionary) so it also fixes the identical latent flaw in the existing `signup/1` path. Regression tests prove full cleanup (tenant, root api_key, audit entry, AND secret) for a mid-Multi failure in BOTH `self_signup/1` and `signup/1`. REVIEW EXTENSIONS: (review #1) a FAILED compensating delete/restore is never swallowed — it emits `[:loopctl, :secrets, :orphan_cleanup_failed]` telemetry AND enqueues a durable, retryable `Loopctl.Workers.OrphanedSecretCleanupWorker` (delete, or restore with a Cloak-encrypted value) so cleanup actually happens; (review #2) the SAME machinery is extended to the pre-existing `bootstrap_audit_key/1` (DELETE compensation — no prior key existed) and `rotate_audit_key/2` (RESTORE compensation — rotation overwrites the deterministic secret with the NEW key, so a post-write rollback restores the OLD private key rather than deleting, preventing silent signature-verification breakage).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.5",
+      "description": "A public (no-auth) JSON endpoint `POST /api/v1/signup` (distinct from the `/signup` HTML LiveView — different pipeline, path, and method; no route collision) calls `self_signup/1` and returns the created tenant summary plus the one-time `raw_key` (role `user`, tenant-bound) and a `next_action` block pointing at PATCH /tenants/me/llm-config and the KB tools. It is NOT behind the `:authenticated` pipeline. It is rate-limited per client IP using the existing config-resolved Hammer limiter (reuse the `Loopctl.RateLimiter` behaviour used by signup_live.ex; derive the IP via `Loopctl.RemoteIp`, preferring the unspoofable fly-client-ip), with a conservative cap (<= 5 tenants per IP per hour). Over-limit returns 429 with a clear retry message. Oversized fields are rejected before the DB call. The operation is registered in OpenApiSpex so /openapi stays accurate.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.6",
+      "description": "A new plug `LoopctlWeb.Plugs.RequireHumanAnchor` gates the custody tier. It reads the TENANT's trust_tier and is keyed on tenant, never on role. Behavior: (a) the superadmin-exempt case is a LEADING PATTERN-MATCH on `current_tenant: nil` (mirroring SetTenant's `%{assigns: %{current_api_key: %{tenant_id: nil}}}` convention) so it never crashes on a nil tenant AND so an IMPERSONATING superadmin is correctly routed through the impersonated tenant's trust_tier (Impersonate reassigns current_tenant before controller plugs) — do NOT implement the exemption as `role == :superadmin`; (b) `trust_tier: :human_anchored` passes through; (c) `trust_tier: :agent_rooted` halts with `403` and body `%{error: %{status: 403, code: \"custody_tier_required\", message: <text>, remediation: %{...}}}` — the SAME nested envelope every other error uses (fallback_controller.ex:133-194; the MCP client at mcp-server/index.js reads `error.remediation`), with remediation text naming the enrollment upgrade path and linking the `chain-of-custody` / `tenant-signup` wiki slugs. The plug is placed AFTER role resolution so `current_tenant` is populated, and composes with `RequireRole` (both must pass).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.7",
+      "description": "RequireHumanAnchor is applied per-controller (mirroring RequireRole) to the WORK-BREAKDOWN / CHAIN-OF-CUSTODY surface, using EXACT Elixir action atoms (diffed against each controller's real `when action in [...]` clause — URL/verb prose is forbidden because a non-matching atom compiles to a silent no-op guard). The complete gated set is: StoryController `[:create, :create_in_project, :update, :delete]`; StoryStatusController `[:contract, :claim, :start, :report, :report_done, :request_review, :unclaim]`; StoryVerificationController `[:verify, :reject, :force_unclaim, :backfill, :verify_all]`; ReviewRecordController `[:create]` (NOT :review_complete); EpicController `[:create, :update, :delete]`; EpicDependencyController `[:create, :delete]`; StoryDependencyController `[:create, :delete]`; DispatchController `[:create]`; OrchestratorStateController `[:save, :show, :history]`; SkillResultController `[:create]`; ProjectController `[:create, :update, :delete]`; TokenUsageController `[:create, :delete, :correct]` (NOT :correction); TokenBudgetController `[:create, :update, :delete]`; CostAnomalyController `[:update]`; BulkOperationsController `[:claim, :verify, :reject, :mark_complete]`; CapRecoveryController `[:recover]`; ImportExportController `[:import_project]` (NOT :export_project); ArtifactReportController `[:create]` (implementation evidence submission — added during review); SkillController `[:create, :update, :delete, :create_version, :import_skills]` (skill DEFINITIONS are work-breakdown metadata — added during review #4; NOT :cost_performance, a read). Verify each atom against the controller source before adding the plug. It is NOT applied to any knowledge/article/wiki/article_link route, to PATCH/GET /tenants/me/llm-config, to /api_keys management, to AgentController (register/index/show — an agent-rooted tenant MUST be able to register + list its own agent identity for KB attribution, per AC-26.7.1.8), to WebhookController (tenant-account integration config, SSRF-bounded by UrlGuard.pin) or UiTestController (unreachable — nested under a project, and ProjectController.create is itself tier-gated), to read-only index/show/list/export or audit/changes reads, to public/discovery routes, or to /health.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.8",
+      "description": "An agent-rooted tenant retains the FULL KB surface without a human anchor: ingest (POST /knowledge/ingest, batch), search, context, index, stats, graph, novelty, export/OKF/lint, publish/unpublish/archive, create/update/DELETE its own articles and article_links, view analytics/curation-log, configure its BYO LLM keys (PATCH /tenants/me/llm-config), mint/rotate its own scoped API keys, and REGISTER + list its own agent identity (POST /agents/register, GET /agents) — the latter is required so an agent-role key can carry an agent_id and pass ArticleController's `agent_identity_required` (article_controller.ex:306) check when writing attributed agent memory. A test exercises a representative agent-rooted KB happy-path end to end (self-signup -> configure key -> register agent -> ingest/search -> create then DELETE an article) and asserts none of them 403.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.9",
+      "description": "DEFAULT-DENY GUARD TEST (the completeness guarantee, not just enumeration): a test walks `LoopctlWeb.Router.__routes__/0`, keeps every route on the `:authenticated` pipeline whose method mutates (POST/PUT/PATCH/DELETE), SUBTRACTS an explicit, reviewed KB-tier/account allowlist (the knowledge/article/article_link mutations, /tenants/me/llm-config, /api_keys, /agents register, plus any genuinely tenant-neutral route), and asserts that every REMAINING route returns `403 custody_tier_required` when called by an agent-rooted tenant (using a key of whatever role that route requires — self-mint it if needed — to isolate the tier gate from the role gate). Any NEW custody route added later that is neither gated nor allowlisted FAILS this test — the surface fails closed. This test is the authoritative check that AC-26.7.1.7's enumeration is complete and that no action-atom typo produced a no-op guard.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.10",
+      "description": "MCP server (`mcp-server/`) gains a `signup` tool that POSTs to `/api/v1/signup` and returns the tenant + one-time raw_key with clear next-step guidance (configure BYO LLM keys, then ingest/search). The tool description states plainly that it creates an agent-rooted KB-tier tenant and that custody operations require a human-anchored tenant. The README first-time-setup section documents both the raw-API and the MCP signup path, and that the returned key is shown once. The MCP client handles the witness/STH bootstrap for the first AUTHENTICATED call after signup (reuse the existing auto-bootstrap; the public signup POST itself carries no witness header). The package version is bumped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.11",
+      "description": "Discovery + docs. (a) `GET /.well-known/loopctl` (@discovery_body in well_known_controller.ex) gains a `signup_endpoint` field advertising `POST /api/v1/signup`, with a test asserting it is surfaced — so a stranger agent discovering loopctl cold can find the signup path. (b) `docs/chain-of-custody-v2.md` is updated to introduce the two trust tiers (agent-rooted KB tier vs human-anchored custody tier) and the capability-not-genesis principle; document `POST /api/v1/signup`; and CORRECT §9.2's stale six-bullet list explicitly: keep `POST /tenants/:id/rotate-audit-key` (still requires a FRESH per-op WebAuthn assertion via WebAuthn.Reauth) and `DELETE /projects/:id` (now tier-gated); annotate `POST /tenants/:id/authenticators` + `DELETE /tenants/:id/authenticators/:id` as deferred to US-26.7.2; and REMOVE `POST /tenants/:id/override` and `POST /tenants/:id/budgets` (no such routes exist — the real halt-clear is `POST /api/v1/admin/tenants/:id/clear-halt`). No doc claim may overstate what the code enforces.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.12",
+      "description": "Adversarial + isolation coverage: (a) an agent-rooted tenant cannot read/write another tenant's data (RLS; key is tenant-bound); (b) an agent-rooted tenant is blocked (403 custody_tier_required) on a representative custody op from EACH gated controller group — INCLUDING `POST /projects/:project_id/stories` (the create_in_project route), a bulk op (`POST /stories/bulk/verify`), cap-recovery, and project import — not only the epic-scoped or singular equivalents; (c) the self-signup body cannot set `trust_tier`, `role`, `tenant_id`, or `agent_id` to privileged values (mass-assignment closed) — a body carrying `trust_tier: human_anchored`/`role: superadmin`/etc. still yields an agent_rooted tenant with a role:user key; (d) the returned user key cannot mint a superadmin key; (e) rate-limit denial (429) is proven; (f) THE KEY-MINTING BYPASS IS CLOSED: an agent-rooted tenant that self-mints an orchestrator- or agent-role key is STILL blocked on custody ops, because the gate is keyed on tenant trust_tier not on key role — assert this explicitly with a self-minted orchestrator key against create_in_project.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.1.13",
+      "description": "`test/support/fixtures.ex` `fixture(:tenant, ...)` defaults `trust_tier: :human_anchored` (trusted test setup, so the large existing custody-test surface is unaffected) and accepts an explicit `trust_tier: :agent_rooted` override. Because `trust_tier` is excluded from `Tenant.create_changeset/2`'s cast, the fixture sets it via a post-insert `Ecto.Changeset.change/2` + `AdminRepo.update!/1`, exactly mirroring the existing `audit_signing_public_key` post-insert pattern already in the same fixture (fixtures.ex:478-485). Every new test file is `async: true` via DataCase/ConnCase, follows config-based DI (no Application.put_env), and includes a tenant-isolation case. `mix precommit` passes clean (compile, format, credo --strict, dialyzer, full suite green).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.7.1.1",
+      "name": "self_signup/1 creates an activated agent-rooted tenant with agent genesis and a user key",
+      "type": "unit",
+      "preconditions": ["No tenant exists for the chosen slug"],
+      "steps": ["Call Loopctl.Tenants.self_signup(%{name: ..., slug: ...})"],
+      "expected_results": [
+        "{:ok, %{tenant: tenant, raw_key: raw_key}} returned",
+        "tenant.trust_tier == :agent_rooted and tenant is active",
+        "tenant.audit_signing_public_key set; private key retrievable via Loopctl.Secrets",
+        "Genesis audit entry at chain_position 0 with actor_type \"agent\", actor_label \"agent:self-signup\"",
+        "raw_key resolves to a role: :user, agent_id: nil api_key bound to tenant; only its hash is stored"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.2",
+      "name": "self_signup/1 AND signup/1 roll back fully — including deleting the external secret — on a mid-Multi failure",
+      "type": "unit",
+      "preconditions": ["Force a failure in a step AFTER Secrets.set succeeds (e.g. audit_genesis) via the injected dependency"],
+      "steps": ["Call each of self_signup/1 and signup/1 with the failing dependency"],
+      "expected_results": [
+        "{:error, _} returned",
+        "No tenant, no root api_key, no audit entry remain",
+        "The Fly secret written by Secrets.set has been deleted (compensating Secrets.delete ran) — no orphaned private key"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.3",
+      "name": "POST /api/v1/signup returns a working KB-tier key end to end",
+      "type": "integration",
+      "preconditions": ["Public endpoint, no Authorization header"],
+      "steps": [
+        "POST /api/v1/signup with a valid name/slug body",
+        "Use the returned raw_key to PATCH /tenants/me/llm-config, POST /agents/register, GET /knowledge/search, and create then DELETE an article"
+      ],
+      "expected_results": [
+        "201 with data.raw_key present and data.tenant.trust_tier == \"agent_rooted\"",
+        "All follow-up KB + config + agent-register calls succeed (no 403)",
+        "The first authenticated call negotiates the witness/STH bootstrap for the fresh tenant"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.4",
+      "name": "Default-deny router walk: every non-allowlisted authenticated mutating route 403s for an agent-rooted tenant",
+      "type": "integration",
+      "preconditions": ["tenant = self-signup (agent_rooted); a KB-tier/account allowlist is defined in the test"],
+      "steps": [
+        "Enumerate Router.__routes__, keep :authenticated POST/PUT/PATCH/DELETE routes, subtract the allowlist",
+        "Call each remaining route with a role-appropriate (self-minted if needed) key of the agent-rooted tenant"
+      ],
+      "expected_results": [
+        "Every remaining route returns 403 with error.code \"custody_tier_required\"",
+        "Explicitly includes POST /projects/:project_id/stories, POST /stories/bulk/verify, POST /stories/:id/recover-cap, POST /projects/:id/import"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.5",
+      "name": "Human-anchored tenant is unaffected (regression guard)",
+      "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant) => human_anchored, with appropriate role keys"],
+      "steps": ["Perform custody ops with correctly-separated identities"],
+      "expected_results": ["RequireHumanAnchor passes; ops succeed or fail only on existing role/409/lineage rules, never on the tier gate"]
+    },
+    {
+      "id": "TC-26.7.1.6",
+      "name": "Superadmin exemption: no-impersonation passes without crash; impersonating an agent-rooted tenant is blocked",
+      "type": "integration",
+      "preconditions": ["A superadmin key (tenant_id nil)"],
+      "steps": [
+        "Hit a gated action with the superadmin key and no impersonation",
+        "Hit the same action while impersonating an agent-rooted tenant"
+      ],
+      "expected_results": [
+        "No impersonation: RequireHumanAnchor passes (nil current_tenant pattern-match), no crash",
+        "Impersonating agent-rooted: 403 custody_tier_required (routes through impersonated tenant's tier)"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.7",
+      "name": "Key-minting bypass is closed and mass-assignment is rejected",
+      "type": "integration",
+      "preconditions": ["tenant = self-signup (agent_rooted) holding its role:user key"],
+      "steps": [
+        "Self-mint an orchestrator-role key via POST /api_keys, then call POST /projects/:project_id/stories with it",
+        "Attempt a signup body with trust_tier: human_anchored, role: superadmin, tenant_id, agent_id",
+        "Rate-limit: exceed the per-IP signup cap"
+      ],
+      "expected_results": [
+        "The orchestrator-key custody call still returns 403 custody_tier_required (gate keyed on tenant, not role)",
+        "The privileged signup-body fields are ignored: tenant is agent_rooted, key is role user; no superadmin key mintable",
+        "Over-limit signup returns 429 with a retry message"
+      ]
+    },
+    {
+      "id": "TC-26.7.1.8",
+      "name": "Tenant isolation for an agent-rooted tenant",
+      "type": "integration",
+      "preconditions": ["tenant A (agent_rooted) and tenant B (any) each with data"],
+      "steps": ["Use tenant A's key to attempt to read/write tenant B's articles and stories"],
+      "expected_results": ["RLS blocks all cross-tenant access; A sees only its own data"]
+    }
+  ],
+  "technical_notes": [
+    "Router: `POST /api/v1/signup` goes in the existing PUBLIC (no `:authenticated`) `scope \"/api/v1\"` group alongside audit_public_key / articles/system. Keep the HTML `/signup` LiveView (browser pipeline) untouched — no collision (different method+pipeline).",
+    "Do NOT add a new pipeline or move the ~150 authenticated routes. Apply RequireHumanAnchor per-controller exactly like RequireRole, using the EXACT action atoms in AC-26.7.1.7. Cross-check each against the controller's real `when action in [...]` clause — a wrong atom (e.g. :review_complete, :correction) compiles to a silent no-op guard and leaves the route ungated with no failure. AC-26.7.1.9's default-deny router walk is the backstop that catches any such gap.",
+    "The tier gate is keyed on `current_tenant.trust_tier`, deliberately orthogonal to role: a role-based gate would be trivially escaped by a tenant self-minting a higher-role key (ApiKeyController.create only blocks superadmin; a role:user caller can mint an orchestrator key today). Tenant-keying is what makes the /api_keys carve-out safe.",
+    "self_signup/1 shares the keypair-generation + genesis-audit + activation helpers with signup/1 (extract a private helper) but MUST NOT insert authenticators and MUST use the agent actor_type/actor_label. Reuse Loopctl.Secrets.set/2 + Audit.log_in_multi/3.",
+    "SECRET COMPENSATION (AC-26.7.1.4): Secrets.set/2 is an external Fly write not covered by AdminRepo.transaction rollback. Wrap the keypair helper so any error after a successful set triggers Secrets.delete/1 (already exists) for the deterministic slug-derived secret name before returning the error. Add this to the shared helper so signup/1 is fixed too.",
+    "Migration: add the column with `default: :agent_rooted, null: false`; backfill via plain `execute/1` UPDATE (no AdminRepo/Repo distinction inside migrations; `tenants` has no RLS). Confirm the single existing prod tenant lands on human_anchored (it has an authenticator).",
+    "Fixtures: default fixture(:tenant) to :human_anchored so existing custody tests are unaffected; set it via post-insert Ecto.Changeset.change/2 + AdminRepo.update!/1 (trust_tier is not in create_changeset's cast) — mirror the existing audit_signing_public_key pattern in fixtures.ex:478-485. Add an explicit agent_rooted path for the new tests (or a self_signup-based fixture).",
+    "Error body: build the 403 via the same nested envelope as FallbackController (`%{error: %{status, code, message, remediation}}`) so the MCP client's generic `error.remediation` reader surfaces it. Remediation is a small secret-free map pointing at the chain-of-custody / tenant-signup wiki slugs; do NOT reuse Loopctl.Llm.Remediation (LLM-specific).",
+    "Rate limiting: reuse the config-resolved Loopctl.RateLimiter behaviour already used by signup_live.ex (a bucket like `api_signup:ip:<ip>`); resolve IP via Loopctl.RemoteIp. The :authenticated-pipeline RateLimiter plug does NOT run on this public route, so the Hammer per-IP bucket is the control.",
+    "MCP: add the `signup` tool in mcp-server/index.js; bump the package version; keep the description honest about KB-vs-custody tiers. No witness header on the signup POST.",
+    "Discovery: add `signup_endpoint` to @discovery_body (and @schema_body if present) in well_known_controller.ex with a test.",
+    "OUT OF SCOPE (fast-follow US-26.7.2, needs sign-off): the reciprocal opt-in WebAuthn enrollment endpoint that upgrades an agent_rooted tenant to human_anchored (`POST /tenants/:id/authenticators` registration ceremony via API), plus DELETE authenticator + recovery. Referenced by §9.2 annotations in this story's doc update.",
+    "TenantAuditKeyController.bootstrap stays role:user + ownership only (not tier-gated): self_signup and signup/1 BOTH pre-provision an audit key, so bootstrap immediately 409s (key_already_exists) for every current and future tenant — the gap is unreachable today. Note this rationale in the doc rather than adding a redundant gate."
+  ],
+  "dependencies": ["US-26.0.1", "US-26.1.1"],
+  "estimated_hours": 18
+}

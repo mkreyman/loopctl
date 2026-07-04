@@ -16,6 +16,22 @@ defmodule LoopctlWeb.TenantAuditKeyController do
 
   Both steps require `user` role (enforced by the router pipeline + the
   `RequireRole` plug) AND tenant ownership (checked here).
+
+  ## Not tier-gated (US-26.7.1 #5)
+
+  None of these actions carry `RequireHumanAnchor`, deliberately:
+
+    * `rotate` / `challenge` are gated by a FRESH per-operation WebAuthn
+      assertion via `Loopctl.WebAuthn.Reauth` — a STRONGER control than the
+      trust tier. An agent-rooted tenant has no enrolled authenticator, so
+      `challenge` returns 422 `no_authenticators` and `rotate` can never
+      present a valid assertion.
+    * `bootstrap` is UNREACHABLE for every current and future tenant: both
+      signup paths (`Loopctl.Tenants.signup/1` and `self_signup/1`)
+      mandatorily pre-provision the audit key, so `bootstrap_audit_key/1`
+      immediately returns 409 `key_already_exists`. Adding a redundant tier
+      gate would gate an already-closed door. The precondition is guarded by
+      the `always has a non-nil audit signing public key` regression test.
   """
 
   use LoopctlWeb, :controller

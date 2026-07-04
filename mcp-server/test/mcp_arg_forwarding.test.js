@@ -118,6 +118,45 @@ describe("#248 mcp-02: knowledge_ingestion_jobs pagination (real ingestionJobsPa
 });
 
 // ---------------------------------------------------------------------------
+// US-26.7.1: public agent-rooted self-signup tool
+// ---------------------------------------------------------------------------
+
+describe("US-26.7.1: signup tool (agent-rooted, KB-tier self-signup)", () => {
+  test("TOOLS declares a signup tool requiring name/slug/email", () => {
+    assert.match(INDEX_SRC, /name: "signup",/, "TOOLS must declare a \"signup\" tool");
+    assert.match(
+      INDEX_SRC,
+      /required: \["name", "slug", "email"\],/,
+      "the signup tool must require name, slug, and email",
+    );
+  });
+
+  test("signup() calls publicApiCall (no API key) against POST /api/v1/signup", () => {
+    assert.match(
+      INDEX_SRC,
+      /async function signup\(\{ name, slug, email \}\) \{[\s\S]*?publicApiCall\(\s*"POST",\s*"\/api\/v1\/signup"/,
+      "signup() must delegate to publicApiCall (not apiCall — no key exists yet) against POST /api/v1/signup",
+    );
+  });
+
+  test("the signup dispatch case calls signup(args)", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "signup":\s*\n\s*return await signup\(args\);/,
+      "the signup dispatch case must call signup(args)",
+    );
+  });
+
+  test("publicApiCall never attaches an Authorization header", () => {
+    const match = INDEX_SRC.match(
+      /async function publicApiCall\(method, path, body\) \{[\s\S]*?\n}\n/,
+    );
+    assert.ok(match, "publicApiCall must be defined");
+    assert.doesNotMatch(match[0], /Authorization/, "publicApiCall must not send an Authorization header");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Epic 28 (#179): per-tenant BYO LLM config + usage tools
 // ---------------------------------------------------------------------------
 
