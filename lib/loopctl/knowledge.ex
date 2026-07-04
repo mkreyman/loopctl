@@ -4931,6 +4931,8 @@ defmodule Loopctl.Knowledge do
   - `tenant_id` -- the tenant UUID
   - `article_id` -- the article UUID
   - `embedding_vector` -- a list of floats matching the configured dimension
+  - `content_hash` -- optional SHA-256 hex of the embedded text; stored as the
+    idempotency key so a retry can skip re-calling the paid provider (review #12)
 
   ## Returns
 
@@ -4938,15 +4940,15 @@ defmodule Loopctl.Knowledge do
   - `{:error, changeset}` on dimension mismatch
   - `{:error, :not_found}` if the article does not exist in this tenant
   """
-  @spec update_embedding(Ecto.UUID.t(), Ecto.UUID.t(), list(number())) ::
+  @spec update_embedding(Ecto.UUID.t(), Ecto.UUID.t(), list(number()), String.t() | nil) ::
           {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
-  def update_embedding(tenant_id, article_id, embedding_vector) do
+  def update_embedding(tenant_id, article_id, embedding_vector, content_hash \\ nil) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
       nil ->
         {:error, :not_found}
 
       article ->
-        changeset = Article.embedding_changeset(article, embedding_vector)
+        changeset = Article.embedding_changeset(article, embedding_vector, content_hash)
 
         multi =
           Multi.new()
@@ -5675,7 +5677,7 @@ defmodule Loopctl.Knowledge do
       |> Keyword.put(:_skip_record_access, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
-    embedding_result = try_generate_embedding(tenant_id, query_string)
+    embedding_result = try_generate_embedding(tenant_id, query_string, [])
 
     case {keyword_result, embedding_result} do
       {{:ok, kw}, {:ok, embedding}} ->
@@ -5833,71 +5835,137 @@ defmodule Loopctl.Knowledge do
     :ok
   end
 
+  # Reset ONLY the given tenant's breaker state. Preferred over
+  # `reset_circuit_breaker/0` in async tests: the breaker is tenant-scoped, so a
+  # global `delete_all_objects` would race concurrent tests and wipe each other's
+  # per-tenant counts.
+  @doc false
+  def reset_circuit_breaker(tenant_id) when is_binary(tenant_id) do
+    if :ets.whereis(@circuit_breaker_table) != :undefined do
+      :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
+      :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
+      :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
+    end
+
+    :ok
+  end
+
+  # Task.yield budget for a query embedding. Kept STRICTLY ABOVE the embedding
+  # client's own worst-case (single-attempt receive_timeout, no client retries —
+  # see EmbeddingClient) so a slow-but-valid embed completes inside the yield and is
+  # never killed-then-miscounted as a breaker failure (review #10).
+  @embedding_yield_ms 5_000
+
   @doc """
-  Generate an embedding for the given text with circuit breaker and timeout protection.
+  Generate an embedding for the given text with a PER-TENANT circuit breaker and
+  timeout protection.
 
   Resolves the TENANT's OWN embedding key (mandatory BYO) via the configured
   embedding client, wrapped with:
-  - Circuit breaker (opens after #{@failure_threshold} failures within #{@failure_window_seconds}s)
-  - 5-second Task.async timeout
-  - Crash rescue handler
+  - A tenant-scoped circuit breaker (opens for a tenant after #{@failure_threshold}
+    COUNTABLE failures within #{@failure_window_seconds}s — so a failing tenant only
+    degrades ITSELF, never other tenants; review #1).
+  - A `#{@embedding_yield_ms}`ms `Task.async` timeout (review #10).
+  - A crash rescue handler.
 
-  Returns `{:ok, embedding}` or `{:error, reason}`. A keyless tenant yields
-  `{:error, :no_api_key}` WITHOUT tripping the (global) circuit breaker — it is a
-  per-tenant config gap, not a provider outage, so it must not degrade embeddings
-  for tenants that DO have a key.
+  Returns `{:ok, embedding}` or `{:error, reason}`. Two error classes are EXEMPT
+  from the breaker: `{:error, :no_api_key}` (a per-tenant config gap) and 4xx
+  provider responses (per-tenant credential/quota problems — 401/403/429). Only
+  5xx / transport / timeout / crash failures count toward opening the breaker
+  (review #1). This is the single guarded entry point — the embedding worker and
+  the proposal gate route through it too (review #4) so circuit-open is both
+  respected AND contributed to.
+
+  `opts`:
+    * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
   """
-  def generate_embedding(tenant_id, query_string) when is_binary(tenant_id) do
-    try_generate_embedding(tenant_id, query_string)
+  @spec generate_embedding(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, [float()]} | {:error, term()}
+  def generate_embedding(tenant_id, query_string, opts \\ []) when is_binary(tenant_id) do
+    try_generate_embedding(tenant_id, query_string, opts)
   end
 
-  defp try_generate_embedding(tenant_id, query_string) do
+  defp try_generate_embedding(tenant_id, query_string, opts) do
     ensure_circuit_breaker_table()
 
-    if circuit_open?() do
+    if circuit_open?(tenant_id) do
       {:error, :circuit_open}
     else
-      task =
-        Task.async(fn ->
-          try do
-            embedding_client().generate_embedding(tenant_id, query_string)
-          rescue
-            e -> {:error, {:embedding_crash, Exception.message(e)}}
-          end
-        end)
-
-      case Task.yield(task, 5_000) || Task.shutdown(task) do
-        {:ok, {:ok, embedding}} ->
-          record_success()
-          {:ok, embedding}
-
-        # A missing tenant key is a config gap, not a provider failure — do NOT
-        # record it against the shared circuit breaker.
-        {:ok, {:error, :no_api_key}} ->
-          {:error, :no_api_key}
-
-        {:ok, {:error, reason}} ->
-          record_failure()
-          {:error, reason}
-
-        nil ->
-          record_failure()
-          {:error, :timeout}
-      end
+      timeout = Keyword.get(opts, :timeout, @embedding_yield_ms)
+      run_embedding_task(tenant_id, query_string, timeout)
     end
   end
 
-  defp circuit_open? do
-    case :ets.lookup(@circuit_breaker_table, :circuit_open_until) do
-      [{:circuit_open_until, open_until}] ->
+  defp run_embedding_task(tenant_id, query_string, timeout) do
+    task =
+      Task.async(fn ->
+        try do
+          embedding_client().generate_embedding(tenant_id, query_string)
+        rescue
+          e -> {:error, {:embedding_crash, Exception.message(e)}}
+        end
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {:ok, embedding}} ->
+        record_success(tenant_id)
+        {:ok, embedding}
+
+      # A missing tenant key is a config gap, not a provider failure — do NOT
+      # record it against the (now tenant-scoped) circuit breaker.
+      {:ok, {:error, :no_api_key}} ->
+        {:error, :no_api_key}
+
+      {:ok, {:error, reason} = err} ->
+        maybe_record_failure(tenant_id, reason)
+        err
+
+      _ ->
+        # nil (yield timeout) or an abnormal task exit — a provider/infra failure.
+        record_failure(tenant_id)
+        {:error, :timeout}
+    end
+  end
+
+  defp maybe_record_failure(tenant_id, reason) do
+    if breaker_countable?(reason), do: record_failure(tenant_id)
+    :ok
+  end
+
+  # Only systemic provider/infra failures count toward the breaker. A 4xx is a
+  # per-tenant credential/quota problem (401/403/429) and must NEVER contribute —
+  # otherwise one tenant's bad key would open the breaker and degrade every tenant
+  # sharing it (review #1). Mirrors the `:no_api_key` exemption.
+  defp breaker_countable?({:api_error, status, _}) when is_integer(status) and status >= 500,
+    do: true
+
+  defp breaker_countable?({:api_error, status, _}) when is_integer(status), do: false
+
+  defp breaker_countable?({:api_error, status}) when is_integer(status) and status >= 500,
+    do: true
+
+  defp breaker_countable?({:api_error, _status}), do: false
+  defp breaker_countable?({:request_failed, _}), do: true
+  defp breaker_countable?({:embedding_crash, _}), do: true
+  defp breaker_countable?(:timeout), do: true
+  defp breaker_countable?(:circuit_open), do: false
+  # Unknown/other transport-ish failures: count (conservative — a real outage).
+  defp breaker_countable?(_), do: true
+
+  defp circuit_open?(tenant_id) do
+    key = {tenant_id, :open_until}
+
+    case :ets.lookup(@circuit_breaker_table, key) do
+      [{^key, open_until}] ->
         now = System.monotonic_time(:second)
 
         if now < open_until do
           true
         else
-          # Cooldown expired, reset
-          :ets.delete(@circuit_breaker_table, :circuit_open_until)
-          :ets.delete(@circuit_breaker_table, :failures)
+          # Cooldown expired — clear this tenant's breaker state.
+          :ets.delete(@circuit_breaker_table, key)
+          :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
+          :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
           false
         end
 
@@ -5906,33 +5974,50 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp record_failure do
+  defp record_failure(tenant_id) do
     ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
+    maybe_reset_window(tenant_id, now)
 
-    failures =
-      case :ets.lookup(@circuit_breaker_table, :failures) do
-        [{:failures, existing}] -> existing
-        [] -> []
-      end
-
-    # Keep only failures within the window
-    recent = Enum.filter(failures, fn t -> now - t < @failure_window_seconds end)
-    updated = [now | recent]
-    :ets.insert(@circuit_breaker_table, {:failures, updated})
-
-    if length(updated) >= @failure_threshold do
-      :ets.insert(
+    # Atomic increment (review #13): concurrent failures for the same tenant can no
+    # longer read-modify-write over each other and undercount.
+    count =
+      :ets.update_counter(
         @circuit_breaker_table,
-        {:circuit_open_until, now + @cooldown_seconds}
+        {tenant_id, :failures},
+        {2, 1},
+        {{tenant_id, :failures}, 0}
       )
+
+    if count >= @failure_threshold do
+      :ets.insert(@circuit_breaker_table, {{tenant_id, :open_until}, now + @cooldown_seconds})
+    end
+
+    :ok
+  end
+
+  # Reset the tenant's rolling window (and its counter) once the window has elapsed,
+  # so sparse failures over a long span never accumulate to the threshold.
+  defp maybe_reset_window(tenant_id, now) do
+    key = {tenant_id, :window_start}
+
+    case :ets.lookup(@circuit_breaker_table, key) do
+      [{^key, ws}] when now - ws < @failure_window_seconds ->
+        :ok
+
+      _ ->
+        :ets.insert(@circuit_breaker_table, {key, now})
+        :ets.insert(@circuit_breaker_table, {{tenant_id, :failures}, 0})
+        :ok
     end
   end
 
-  defp record_success do
+  defp record_success(tenant_id) do
     ensure_circuit_breaker_table()
-    :ets.insert(@circuit_breaker_table, {:failures, []})
-    :ets.delete(@circuit_breaker_table, :circuit_open_until)
+    :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
+    :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
+    :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
+    :ok
   end
 
   defp ensure_circuit_breaker_table do

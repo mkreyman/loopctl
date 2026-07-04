@@ -30,6 +30,7 @@ defmodule Loopctl.Llm.Anthropic do
   require Logger
 
   alias Loopctl.Llm
+  alias Loopctl.Llm.ProviderError
 
   @base_url "https://api.anthropic.com/v1"
   @anthropic_version "2023-06-01"
@@ -118,9 +119,12 @@ defmodule Loopctl.Llm.Anthropic do
         Logger.warning("Loopctl.Llm.Anthropic: 200 with unexpected shape (op=#{operation})")
         {:error, {:api_error, 200, redact_body(body)}}
 
-      {:ok, %{status: status, body: body}} ->
+      {:ok, %{status: status, body: _body}} ->
         Logger.warning("Loopctl.Llm.Anthropic: API error (op=#{operation}, status=#{status})")
-        {:error, {:api_error, status, body}}
+        # SANITIZE the provider error body (review #11): it can echo a masked key
+        # fragment, and callers surface it as an Oban `{:error, reason}` persisted
+        # into oban_jobs.errors. Drop the body; keep only the status.
+        {:error, ProviderError.sanitize({:api_error, status, nil})}
 
       {:error, reason} ->
         Logger.warning(

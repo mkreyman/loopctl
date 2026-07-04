@@ -141,6 +141,38 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["error"]["message"] =~ "Embedding service unavailable"
     end
 
+    test "semantic mode degrades to keyword-only for a KEYLESS tenant (no 503) (review #8)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      Loopctl.Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Keyword Findable Article",
+        body: "Content about pagination that keyword search can find.",
+        category: :pattern,
+        status: :published,
+        tags: ["pagination"]
+      })
+
+      # Mandatory BYO: the embedding client reports the tenant has no key.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "pagination", mode: "semantic"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["search_mode"] == "keyword_only"
+    end
+
     test "semantic mode labels total_count as ranked_corpus", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -165,7 +197,7 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
-      Loopctl.Knowledge.reset_circuit_breaker()
+      Loopctl.Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,

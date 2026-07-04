@@ -180,6 +180,28 @@ defmodule Loopctl.Llm do
   end
 
   @doc """
+  Whether a (sanitized) provider error is PERMANENT — it will never succeed on
+  retry, so a worker should `{:discard}` rather than burn its Oban attempts on it
+  (review #5). A 4xx response is a bad/revoked key or malformed request (permanent)
+  EXCEPT 408 (request timeout) and 429 (rate limit), which are transient. Everything
+  else (5xx, transport, timeout, crash) is transient.
+  """
+  @spec permanent_provider_error?(term()) :: boolean()
+  def permanent_provider_error?({:api_error, status, _}) when status in [408, 429], do: false
+
+  def permanent_provider_error?({:api_error, status, _})
+      when is_integer(status) and status >= 400 and status < 500,
+      do: true
+
+  def permanent_provider_error?({:api_error, status}) when status in [408, 429], do: false
+
+  def permanent_provider_error?({:api_error, status})
+      when is_integer(status) and status >= 400 and status < 500,
+      do: true
+
+  def permanent_provider_error?(_other), do: false
+
+  @doc """
   Records that a tenant LLM `operation` was BLOCKED for a missing BYO key
   (review #2 — the mandatory-BYO cutover needs observability). Emits a
   `Logger.warning`, a `[:loopctl, :llm, :blocked]` telemetry event, and an

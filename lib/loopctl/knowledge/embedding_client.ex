@@ -33,8 +33,16 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   require Logger
 
   alias Loopctl.Llm
+  alias Loopctl.Llm.ProviderError
 
   @default_base_url "https://api.openai.com/v1"
+
+  # Kept STRICTLY BELOW `Knowledge`'s Task.yield budget (review #10): a single
+  # attempt, no client-side retries. The embedding endpoint is fast; job-level retry
+  # is Oban's responsibility for the worker, and the query path fast-fails to
+  # keyword search. This guarantees a valid embed returns before the guard kills it.
+  @receive_timeout 4_000
+  @max_retries 0
 
   @impl true
   def generate_embedding(tenant_id, text) when is_binary(tenant_id) do
@@ -57,8 +65,8 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
         # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
         headers: [{"authorization", "Bearer #{api_key}"}],
         retry: :transient,
-        max_retries: 2,
-        receive_timeout: 30_000
+        max_retries: @max_retries,
+        receive_timeout: @receive_timeout
       ]
       |> maybe_put_plug()
 
@@ -69,14 +77,17 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
       {:ok, %{status: status, body: body}} ->
         Logger.warning("Loopctl.Knowledge.EmbeddingClient: API error (status=#{status})")
-        {:error, {:api_error, status, body}}
+        # SANITIZE: the provider error body can echo a masked key fragment (review
+        # #3). Drop it — keep only the status — so it never reaches the caller / an
+        # Oban `{:error, reason}` persisted into oban_jobs.errors.
+        {:error, ProviderError.sanitize({:api_error, status, body})}
 
       {:error, reason} ->
         Logger.warning(
-          "Loopctl.Knowledge.EmbeddingClient: request failed (error=#{inspect(reason)})"
+          "Loopctl.Knowledge.EmbeddingClient: request failed (#{ProviderError.log_tag({:request_failed, reason})})"
         )
 
-        {:error, reason}
+        {:error, {:request_failed, reason}}
     end
   end
 
