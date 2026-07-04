@@ -2614,7 +2614,11 @@ const TOOLS = [
       "list mode or knowledge_stats. " +
       "Pass story_id when working on a loopctl story so reads attribute correctly. " +
       "When you knowledge_get a result and it carries `potential_conflicts`, resolve it if it's " +
-      "material to your task (see knowledge_get / the conflict-resolution wiki playbook).",
+      "material to your task (see knowledge_get / the conflict-resolution wiki playbook). " +
+      "If semantic ranking is unavailable the search transparently degrades to keyword-only " +
+      "(meta.fallback: true, meta.search_mode: 'keyword_only') and now reports meta.fallback_reason " +
+      "— a stable tag naming WHY (e.g. no_embedding_key, embedding_circuit_open, " +
+      "embedding_provider_error_<status>, embedding_timeout).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2703,7 +2707,10 @@ const TOOLS = [
       "memory, scope to a memory_type/agent/conversation via the memory_types/agents/" +
       "conversation_id filters (articles whose metadata carries those keys). NOTE (#163): for " +
       "an agent key, another agent's private/owner memories are never returned (results AND " +
-      "linked refs) regardless of the agents= filter — visibility is enforced, not advisory.",
+      "linked refs) regardless of the agents= filter — visibility is enforced, not advisory. " +
+      "If semantic ranking is unavailable this degrades to keyword-only (meta.fallback: true) and " +
+      "now reports meta.fallback_reason — a stable tag naming WHY (e.g. no_embedding_key, " +
+      "embedding_circuit_open, embedding_provider_error_<status>, embedding_timeout).",
     inputSchema: {
       type: "object",
       properties: {

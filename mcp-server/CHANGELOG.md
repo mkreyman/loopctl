@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.33.1 — 2026-07-03 (witness STH cache hardening — #298 enhanced review)
+## 2.33.1 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry + cache hardening — #298)
 
 ### Security
 
@@ -41,9 +41,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   signal); the client caches the server's STH so the next request self-heals.
 - `LOOPCTL_STH_STATE_PATH` documentation clarified; cache is per-(server + key).
 
-## 2.33.0 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry — #298)
-
-### Fixed
+### Added — STH persistence + transparent bootstrap-412 retry (the base feature)
 
 - **Fresh MCP processes no longer fail their first tool call with `412
   witness_bootstrap_already_consumed` (#298).** The witness protocol's one-time
@@ -71,6 +69,22 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (absolute path). Dispatch-based (v2) clients that mint a fresh ephemeral key per
   dispatch are unaffected by the 412 (each fresh key gets its own clean bootstrap)
   and do not need this.
+
+## 2.33.0 — 2026-07-03 (surface semantic→keyword fallback_reason — #297)
+
+### Changed
+
+- **`knowledge_search`** / **`knowledge_context`** tool descriptions now note that
+  when semantic ranking is unavailable the call transparently degrades to
+  keyword-only (`meta.fallback: true`, `meta.search_mode: "keyword_only"`) and
+  reports a new `meta.fallback_reason` — a stable, non-sensitive tag naming WHY
+  (`no_embedding_key`, `embedding_circuit_open`, `embedding_provider_error_<status>`,
+  `embedding_timeout`, `embedding_request_failed`, `embedding_crash`,
+  `embedding_error`). The reason never leaks an api key or provider body. Combined
+  mode additionally reports `meta.semantic_result_count`, so a `0` with
+  `fallback: false` (embedding worked but ranking returned nothing) is
+  distinguishable from an embedding-failure fallback. Observability only — the
+  fallback behavior is unchanged.
 
 ## 2.32.0 — 2026-07-03 (per-tenant BYO for embeddings — Epic 28 #179)
 

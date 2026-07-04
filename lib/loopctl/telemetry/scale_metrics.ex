@@ -118,8 +118,34 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         description: "Vector-search recall under-fill events, by endpoint.",
         tags: [:endpoint, :tenant_id],
         tag_values: &scale_tags/1
+      ),
+
+      # 4. Semantic-fallback counter (#297), by REASON only. Turns the silent
+      #    semantic→keyword degradation into an alertable trend. `reason` is a
+      #    BOUNDED, sanitized tag set (no api key / provider body / raw query ever
+      #    reaches it), so this needs NO tenant_id label — the reason dimension is
+      #    fixed and small, and per-tenant attribution stays in the 7-day logs
+      #    (which carry tenant_id). NO tenant label = no multi-tenant cardinality
+      #    bomb (AC-27.15.3).
+      counter("loopctl.knowledge.semantic_fallback.count",
+        event_name: [:loopctl, :knowledge, :semantic_fallback],
+        measurement: :count,
+        description: "Semantic search degraded to keyword-only / contributed nothing, by reason.",
+        tags: [:reason],
+        tag_values: &semantic_fallback_tags/1
       )
     ]
+  end
+
+  @doc """
+  `tag_values` for the semantic-fallback counter (#297). Emits ONLY the bounded
+  `reason` label (never `tenant_id` — the reason set is fixed and small, so no cap
+  gate is needed). Defaults a missing reason to `"unknown"` so the label is never
+  blank.
+  """
+  @spec semantic_fallback_tags(map()) :: map()
+  def semantic_fallback_tags(metadata) do
+    %{reason: Map.get(metadata, :reason, "unknown")}
   end
 
   @doc """

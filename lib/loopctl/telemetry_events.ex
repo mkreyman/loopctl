@@ -103,6 +103,36 @@ defmodule Loopctl.TelemetryEvents do
   """
   def db_error, do: [:loopctl, :db, :error]
 
+  @doc """
+  Semantic search silently degraded so semantic ranking did NOT contribute (#297).
+
+  Covers BOTH silent-degradation causes the issue conflated:
+
+    * an embedding-generation FAILURE that forced a keyword-only fallback
+      (`fallback: true` in the response meta), and
+    * an embedding SUCCESS whose semantic ranking returned zero rows
+      (`reason: "semantic_empty"`, a recall/HNSW problem, `fallback: false`).
+
+  Fires once per degraded request. Turns a silent 200 into an alertable signal.
+
+  ## Payload (id-only — NEVER the raw query text, an api key, or a provider body)
+
+    * `measurements`: `%{count: 1, query_len, semantic_result_count}` where
+        - `count` is a pure increment (the Prometheus counter's measurement).
+        - `query_len` is `byte_size(query)` — the query LENGTH only, never its text.
+        - `semantic_result_count` is how many rows the semantic half contributed
+          (`0` for an embed failure or a `semantic_empty` recall miss).
+    * `metadata`: `%{tenant_id, reason}` where `reason` is a BOUNDED, sanitized tag
+      (`no_embedding_key` | `embedding_circuit_open` | `embedding_timeout` |
+      `embedding_provider_error_<status>` | `embedding_request_failed` |
+      `embedding_crash` | `embedding_error` | `semantic_empty`) — sanitized through
+      `Loopctl.Llm.ProviderError.sanitize/1`, so no key/body ever reaches the label.
+
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by `reason`
+  ONLY (no `tenant_id` label — keeps cardinality bounded to the fixed reason set).
+  """
+  def knowledge_semantic_fallback, do: [:loopctl, :knowledge, :semantic_fallback]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -115,7 +145,8 @@ defmodule Loopctl.TelemetryEvents do
       webhook_delivery_exception(),
       audit_log_write(),
       vector_search_under_fill(),
-      db_error()
+      db_error(),
+      knowledge_semantic_fallback()
     ]
   end
 end
