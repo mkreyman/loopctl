@@ -628,7 +628,8 @@ work-custody surface, not for a tenant curating its own wiki notes.
 
 An `agent_rooted` tenant can later enroll a WebAuthn authenticator to
 upgrade to `human_anchored` and unlock the custody surface — that reciprocal
-opt-in ceremony is a dependent fast-follow (US-26.7.2), not yet implemented.
+opt-in ceremony (US-26.7.2) is `POST /tenants/:id/authenticators/challenge`
+then `POST /tenants/:id/authenticators`; see §9.2 below.
 
 `POST /api/v1/signup` — public (no auth), rate-limited per client IP
 (<= 5/hour). Accepts `name`, `slug`, `email`; returns the created tenant
