@@ -25,6 +25,9 @@ defmodule LoopctlWeb.EpicController do
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:index, :show, :progress]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
+
   tags(["Epics"])
 
   operation(:create,

@@ -89,6 +89,7 @@ defmodule LoopctlWeb.TenantController do
       email: tenant.email,
       settings: tenant.settings,
       status: tenant.status,
+      trust_tier: tenant.trust_tier,
       token_data_retention_days: tenant.token_data_retention_days,
       inserted_at: tenant.inserted_at,
       updated_at: tenant.updated_at

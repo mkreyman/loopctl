@@ -189,6 +189,75 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false } = {
   return responseBody;
 }
 
+/**
+ * Unauthenticated request helper for genuinely public endpoints (currently
+ * only POST /api/v1/signup). No Authorization header is sent — the public
+ * signup POST carries no witness header either (US-26.7.1), so this
+ * bypasses `witnessClientFor` entirely and calls `fetch` directly. Response
+ * parsing mirrors `apiCall`'s so callers can pass the result straight to
+ * `toContent`/`toContentCompact`.
+ */
+async function publicApiCall(method, path, body) {
+  const url = `${getBaseUrl()}${path}`;
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  const serializedBody =
+    body !== undefined && body !== null ? JSON.stringify(body) : undefined;
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: serializedBody,
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    if (err.name === "TimeoutError") {
+      return { error: true, status: 0, body: "Request timed out after 30s" };
+    }
+    const cause = err.cause?.message ? ` (${err.cause.message})` : "";
+    return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
+  }
+
+  if (response.status === 204) {
+    return { ok: true };
+  }
+
+  let responseBody;
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const raw = await response.text();
+    const outcome = parseJsonResponseBody(raw, response.status);
+    if (outcome.error) {
+      return outcome;
+    }
+    responseBody = outcome.parsed;
+  } else {
+    const text = await response.text();
+    try {
+      responseBody = JSON.parse(text);
+    } catch {
+      responseBody = text;
+    }
+  }
+
+  if (!response.ok) {
+    let errorBody = responseBody;
+    if (typeof errorBody === "string" && errorBody.length > 500) {
+      errorBody = errorBody
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 500) + "... (truncated)";
+    }
+    return { error: true, status: response.status, body: errorBody };
+  }
+
+  return responseBody;
+}
+
 function toContent(result) {
   const isErr = result && result.error === true;
   return {
@@ -1608,6 +1677,16 @@ async function createDispatch({
   if (story_id) body.story_id = story_id;
 
   const result = await apiCall("POST", "/api/v1/dispatches", body);
+  return toContent(result);
+}
+
+// US-26.7.1: public, agent-rooted (KB-tier) self-signup. No API key required —
+// this creates the tenant AND the key. The resulting tenant is KB-tier only
+// (knowledge ingest/search/curate on the caller's own BYO LLM keys); the
+// work-breakdown / chain-of-custody surface requires a separate,
+// human-anchored WebAuthn signup ceremony at https://loopctl.com/signup.
+async function signup({ name, slug, email }) {
+  const result = await publicApiCall("POST", "/api/v1/signup", { name, slug, email });
   return toContent(result);
 }
 
@@ -3789,6 +3868,31 @@ const TOOLS = [
 
   // Chain of Custody v2 tools
   {
+    name: "signup",
+    description:
+      "Create a NEW agent-rooted (KB-tier) tenant and mint its one-time root API key — " +
+      "entirely through this call, no human operator and no hardware authenticator required. " +
+      "Public — no existing API key needed to call this tool. The returned tenant can " +
+      "immediately use the FULL knowledge-wiki surface (ingest/search/context/curate, BYO " +
+      "LLM key config, agent registration) but CANNOT perform work-breakdown / " +
+      "chain-of-custody operations (create projects/epics/stories, claim/verify/report, " +
+      "dispatch, etc.) — those require a separate, human-anchored tenant created via the " +
+      "WebAuthn ceremony at https://loopctl.com/signup. Rate-limited per client IP " +
+      "(<= 5 signups/hour). The raw_key in the response is shown ONCE — save it immediately " +
+      "(e.g. as LOOPCTL_USER_KEY) since it cannot be retrieved again. Next steps after " +
+      "signup: configure your BYO LLM keys with set_llm_config, then register an agent " +
+      "identity, then ingest/search the wiki.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Tenant display name.", maxLength: 120 },
+        slug: { type: "string", description: "URL-safe unique tenant slug.", maxLength: 64 },
+        email: { type: "string", description: "Contact email for the tenant." },
+      },
+      required: ["name", "slug", "email"],
+    },
+  },
+  {
     name: "get_sth",
     description: "Get the latest Signed Tree Head for a tenant's audit chain. Public — no auth required.",
     inputSchema: {
@@ -4074,6 +4178,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "signup":
+      return await signup(args);
 
     case "get_sth":
       return await getSth(args);

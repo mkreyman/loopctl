@@ -31,6 +31,10 @@ defmodule LoopctlWeb.StoryVerificationController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :orchestrator] when action in [:index, :backfill]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor
+       when action in [:verify, :reject, :force_unclaim, :backfill, :verify_all]
+
   tags(["Progress"])
 
   operation(:verify,

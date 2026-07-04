@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [loopctl](https://loopctl.com) -- structural trust for AI development loops.
 
-Wraps the loopctl REST API into 72 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
+Wraps the loopctl REST API into 73 typed MCP tools so AI coding agents (Claude Code, etc.) can interact with loopctl without writing curl commands.
 
 ## Installation
 
@@ -84,9 +84,18 @@ per-operation model overrides (`extraction_model`, `classification_model`,
 
 ### The smooth path (once, at onboarding)
 
-1. **Sign up** and obtain your keys. Tenant signup is anchored to a hardware
-   authenticator (WebAuthn) — the one human touch. Signup mints your **user-role**
-   API key. Also grab your **agent** and **orchestrator** keys for day-to-day work.
+1. **Sign up** and obtain your keys. loopctl has two trust tiers (US-26.7.1):
+   - **Human-anchored (unlocks work-breakdown / chain-of-custody too):** visit
+     `https://loopctl.com/signup` and enroll a hardware authenticator (WebAuthn) —
+     the one human touch. This mints your **user-role** API key; also grab your
+     **agent** and **orchestrator** keys for day-to-day work.
+   - **Agent-rooted (KB-tier only, fully automated):** call the `signup` MCP tool
+     (or `POST /api/v1/signup` directly) with `name`/`slug`/`email` — no human, no
+     hardware key. This mints a one-time `role: user` API key with the FULL
+     knowledge-wiki surface (ingest/search/curate, BYO LLM config, agent
+     registration), but it **cannot** perform work-breakdown / chain-of-custody
+     operations. The `raw_key` in the response is shown ONCE — save it
+     immediately (it cannot be retrieved again).
 2. **Set the env** in your `.mcp.json` (see [Configuration](#configuration)):
    `LOOPCTL_SERVER`, `LOOPCTL_USER_KEY` (needed for this step), plus `LOOPCTL_AGENT_KEY`
    / `LOOPCTL_ORCH_KEY`.
@@ -112,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (72)
+## Tools (73)
 
 ### Project Tools
 
@@ -258,6 +267,7 @@ Key distribution for the dispatch pattern (Epic 26): per-dispatch ephemeral keys
 
 | Tool | Description |
 |---|---|
+| `signup` | **US-26.7.1.** Create a NEW **agent-rooted (KB-tier)** tenant and mint its one-time root API key — entirely through this call, no human operator, no hardware authenticator, no existing API key required. The tenant gets the FULL knowledge-wiki surface but **cannot** perform work-breakdown / chain-of-custody operations (those require a separate human-anchored tenant via the WebAuthn ceremony at `https://loopctl.com/signup`). Rate-limited per client IP (<= 5/hour). The `raw_key` is shown ONCE — save it immediately (e.g. as `LOOPCTL_USER_KEY`). Required: `name`, `slug`, `email`. |
 | `dispatch` | Mint an ephemeral, scoped api_key for a sub-agent dispatch, carrying its lineage path. The `raw_key` is returned ONCE — pass it to the sub-agent's launch args, never store it in env vars; it expires after `expires_in_seconds` (default 3600, max 14400). Required: `role` (`agent`/`orchestrator`), `agent_id`. Optional: `parent_dispatch_id`, `story_id`. |
 | `recover_cap` | Re-mint a capability token for a story you're assigned to, after a session crash lost your cap. Required: `story_id`. Optional: `cap_type` (`start_cap`/`report_cap`, default `start_cap`), `lineage`. |
 | `get_sth` | Get the latest Signed Tree Head for a tenant's tamper-evident audit chain. Public — no auth required. Required: `tenant_id`. |

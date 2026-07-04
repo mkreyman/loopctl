@@ -88,12 +88,16 @@ defmodule LoopctlWeb.Router do
 
   # US-26.0.2 — Public endpoint for tenant audit key (no auth required)
   # US-26.0.3 — Public system article endpoints (no auth required)
+  # US-26.7.1 — Public agent-rooted self-signup (no auth required — there is
+  # no key yet). Distinct from the HTML `/signup` LiveView above: different
+  # pipeline (`:api` JSON, not `:browser`), different path, different method.
   scope "/api/v1", LoopctlWeb do
     pipe_through [:api]
 
     get "/tenants/:id/audit_public_key", TenantAuditKeyController, :show
     get "/articles/system", SystemArticleController, :index
     get "/audit/sth/:tenant_id", AuditSthController, :show
+    post "/signup", SignupController, :create
   end
 
   scope "/swaggerui" do

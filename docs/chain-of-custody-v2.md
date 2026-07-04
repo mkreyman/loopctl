@@ -595,9 +595,50 @@ At no point does the agent need prior knowledge of loopctl's internals. Every st
 
 ## 9. Tenant signup ceremony
 
-Tenant creation is a human-gated ceremony that establishes the root of trust for the tenant's entire lifetime.
+### 9.0 Two trust tiers: capability, not genesis (US-26.7.1)
 
-### 9.1 Flow
+Loopctl serves two use cases that were originally forced to share one trust
+model: (1) a supervised code workflow where implementer, reviewer, and
+verifier must be different agents rooted in a human operator, and (2) an
+agent-native knowledge base where a stranger agent manages its own notes on
+its own BYO LLM keys with no human involved at all. Trust attaches to the
+**capability**, not to how the tenant came into existence:
+
+- **`human_anchored`** — created via the WebAuthn ceremony below (§9.1).
+  Unlocks the full work-breakdown / chain-of-custody surface (projects,
+  epics, stories, dispatch, orchestrator state, token budgets, bulk
+  operations, ...).
+- **`agent_rooted`** — created via `POST /api/v1/signup` (or the `signup`
+  MCP tool), no human, no hardware authenticator. Retains the FULL
+  knowledge-wiki surface (ingest, search, context, curate, article
+  CRUD, BYO LLM config, its own agent registration) but is blocked from the
+  work-breakdown / chain-of-custody surface by
+  `LoopctlWeb.Plugs.RequireHumanAnchor`, a gate keyed on the TENANT's
+  `trust_tier` — deliberately orthogonal to API-key role, since role alone
+  cannot express "KB-yes, custody-no" and a role-only gate would be
+  escapable by a tenant self-minting a higher-role key.
+
+This does not weaken L0 for the operations that actually depend on it: the
+chain-of-custody guards (`409 self_report_blocked` / `self_review_blocked` /
+`self_verify_blocked`, dispatch-lineage self-checks) enforce
+implementer != verifier regardless of how the tenant was created. L0's job
+is rooting the per-tenant audit chain to a real human so Signed Tree Heads
+are externally attestable to a person — that only matters for the
+work-custody surface, not for a tenant curating its own wiki notes.
+
+An `agent_rooted` tenant can later enroll a WebAuthn authenticator to
+upgrade to `human_anchored` and unlock the custody surface — that reciprocal
+opt-in ceremony is a dependent fast-follow (US-26.7.2), not yet implemented.
+
+`POST /api/v1/signup` — public (no auth), rate-limited per client IP
+(<= 5/hour). Accepts `name`, `slug`, `email`; returns the created tenant
+(`trust_tier: "agent_rooted"`) plus a one-time `role: user`, tenant-bound
+`raw_key`. Distinct from the `/signup` HTML ceremony below (different
+pipeline, path, and method).
+
+### 9.1 Flow (human-anchored ceremony)
+
+Tenant creation via this path is a human-gated ceremony that establishes the root of trust for the tenant's entire lifetime.
 
 1. Operator visits `https://loopctl.com/signup` (a LiveView in the existing landing page application)
 2. Operator provides tenant metadata (name, slug, contact email)
@@ -625,14 +666,58 @@ Tenant creation is a human-gated ceremony that establishes the root of trust for
 
 Any endpoint that modifies the root trust requires a fresh WebAuthn assertion:
 
-- `POST /tenants/:id/authenticators` — enroll an additional authenticator
-- `DELETE /tenants/:id/authenticators/:id` — revoke an authenticator
-- `POST /tenants/:id/rotate-audit-key` — rotate the audit signing key
-- `POST /tenants/:id/override` — break-glass override of a halted custody operation
-- `DELETE /projects/:id` — delete a project
-- `POST /tenants/:id/budgets` — raise a token budget
+- `POST /tenants/:id/rotate-audit-key` — rotate the audit signing key. Requires a
+  FRESH per-operation WebAuthn assertion via the challenge-bound
+  `Loopctl.WebAuthn.Reauth` ceremony (`POST /tenants/:id/rotate-audit-key/challenge`
+  then `POST /tenants/:id/rotate-audit-key`), not just an active session.
+- `DELETE /projects/:id` — delete a project. Now additionally tier-gated
+  (US-26.7.1): requires a `human_anchored` tenant on top of the existing
+  `role: :user` requirement.
+- `POST /tenants/:id/authenticators` — enroll an additional authenticator, and
+  `DELETE /tenants/:id/authenticators/:id` — revoke an authenticator. Both are
+  **deferred to US-26.7.2** (the reciprocal opt-in WebAuthn-enrollment upgrade
+  path for an `agent_rooted` tenant) — these routes do not exist yet.
 
-The operator's CLI prompts for the hardware touch at the moment of the operation. Agents cannot perform these operations — attempting to do so returns a 401 with remediation text pointing at the break-glass workflow.
+Corrections to a stale prior version of this list: `POST /tenants/:id/override`
+and `POST /tenants/:id/budgets` never existed as routes and have been removed
+from this list. The real halt-clear operation is
+`POST /api/v1/admin/tenants/:id/clear-halt` (superadmin-only break-glass; see
+§L6 and the Epic 17 admin routes).
+
+The operator's CLI prompts for the hardware touch at the moment of a
+reauth-gated operation. Agents cannot perform these operations — attempting to
+do so is blocked by role/tier enforcement with remediation text.
+
+#### Tier-gate allowlist rationale (US-26.7.1, reviewed)
+
+`RequireHumanAnchor` gates the work-breakdown / chain-of-custody surface. A
+`DEFAULT-DENY` router-walk test (`require_human_anchor_default_deny_test.exs`)
+asserts every authenticated mutating route either is tier-gated OR is on an
+explicit, reviewed allowlist. The allowlist decisions:
+
+- **SkillController mutations** (`create`/`update`/`delete`/`create_version`/
+  `import_skills`) ARE tier-gated (added during review): skill definitions are
+  work-breakdown metadata. `cost_performance` (a read) is not gated.
+- **ArtifactReportController `create`** IS tier-gated: artifact reports are
+  implementation evidence against a story.
+- **WebhookController** is NOT tier-gated: webhook subscriptions are
+  tenant-account integration config (delivery endpoints), analogous to the
+  KB-tier-open BYO LLM config. Their SSRF blast radius is independently bounded
+  by `UrlGuard.pin` (egress allowlist + DNS-rebinding defense) regardless of
+  tier.
+- **UiTestController** is NOT tier-gated: every route is nested under
+  `/projects/:project_id/...`, and `ProjectController.create` IS tier-gated, so
+  an agent-rooted tenant has no project to attach a UI test run to — the surface
+  is unreachable for it.
+- **`POST /tenants/:id/bootstrap-audit-key`** is NOT tier-gated because it is
+  UNREACHABLE: both signup paths (`Loopctl.Tenants.signup/1` and
+  `self_signup/1`) mandatorily pre-provision the audit key, so
+  `bootstrap_audit_key/1` always returns 409 `key_already_exists` for every
+  current and future tenant. A regression test asserts a freshly created tenant
+  always has a non-nil `audit_signing_public_key`, so this exemption fails loud
+  if provisioning ever became lazy. `rotate-audit-key` (challenge + rotate) is
+  gated by a fresh per-op WebAuthn assertion (`WebAuthn.Reauth`), a stronger
+  control than the tier.
 
 ### 9.3 Recovery
 

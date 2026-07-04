@@ -38,6 +38,12 @@ defmodule LoopctlWeb.SkillController do
        [role: :agent]
        when action in [:index, :show, :list_versions, :get_version, :stats, :version_results]
 
+  # US-26.7.1 (#4) — skill DEFINITIONS are work-breakdown metadata: an
+  # agent-rooted (KB-tier) tenant must not create/update/delete them. Mutating
+  # actions only; `:cost_performance` and the read actions above stay open.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor
+       when action in [:create, :update, :delete, :create_version, :import_skills]
+
   tags(["Skills"])
 
   operation(:create,

@@ -22,6 +22,9 @@ defmodule LoopctlWeb.ReviewRecordController do
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: [:orchestrator, :user]] when action in [:create]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
+
   tags(["Progress"])
 
   operation(:create,

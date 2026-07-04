@@ -22,6 +22,9 @@ defmodule LoopctlWeb.TokenUsageController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:create, :index]
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete, :correct]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :delete, :correct]
+
   tags(["Token Efficiency"])
 
   operation(:create,

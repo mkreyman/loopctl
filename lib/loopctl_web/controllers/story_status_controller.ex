@@ -31,6 +31,10 @@ defmodule LoopctlWeb.StoryStatusController do
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: :agent] when action in [:claim, :start, :request_review, :unclaim]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor
+       when action in [:contract, :claim, :start, :report, :request_review, :unclaim]
+
   tags(["Progress"])
 
   operation(:contract,

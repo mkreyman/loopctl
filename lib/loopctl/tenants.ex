@@ -15,11 +15,13 @@ defmodule Loopctl.Tenants do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Auth
   alias Loopctl.Secrets
   alias Loopctl.TenantKeys
   alias Loopctl.Tenants.AuditKeyHistory
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.Workers.OrphanedSecretCleanupWorker
 
   @max_authenticators_per_signup 5
   @pending_enrollment_ttl_seconds 15 * 60
@@ -98,53 +100,33 @@ defmodule Loopctl.Tenants do
     # does not stumble over the mixed-key map.
     tenant_attrs = Map.drop(attrs, [:authenticators, "authenticators"])
 
+    # US-26.7.1 (#9) — keypair + deterministic secret name are ordinary lexical
+    # variables here, so `with_secret_compensation/3` reads them directly on
+    # both the tuple AND the raised-exception paths (no process dictionary).
+    # secret_name is derived from the SAME normalized slug the changeset
+    # produces, so it matches the inserted `tenant.slug`.
+    {pub, priv} = generate_ed25519_keypair()
+    secret_name = signup_secret_name(tenant_attrs)
+
     multi =
       Multi.new()
       |> Multi.insert(:tenant, Tenant.signup_changeset(tenant_attrs))
       |> insert_authenticators(authenticators)
-      |> Multi.run(:generate_audit_keypair, fn _repo, %{tenant: tenant} ->
-        {pub, priv} = generate_ed25519_keypair()
-        secret_name = Secrets.audit_key_secret_name(tenant.slug)
+      |> append_keypair_and_genesis(
+        secret_name,
+        priv,
+        pub,
+        "human",
+        "human:webauthn",
+        &signup_new_state/2
+      )
 
-        case Secrets.set(secret_name, priv) do
-          :ok ->
-            {:ok, %{public_key: pub, private_key: priv, secret_name: secret_name}}
-
-          {:error, reason} ->
-            {:error, {:audit_key_storage_failed, reason}}
-        end
-      end)
-      |> Multi.update(:set_public_key, fn %{tenant: tenant, generate_audit_keypair: keypair} ->
-        Ecto.Changeset.change(tenant, audit_signing_public_key: keypair.public_key)
-      end)
-      |> Multi.update(:activate, fn %{set_public_key: tenant} ->
-        Tenant.activate_after_enrollment_changeset(tenant)
-      end)
-      |> Audit.log_in_multi(:audit_genesis, fn %{
-                                                 activate: tenant,
-                                                 authenticators: auths,
-                                                 generate_audit_keypair: keypair
-                                               } ->
-        %{
-          tenant_id: tenant.id,
-          entity_type: "tenant",
-          entity_id: tenant.id,
-          action: "tenant_created",
-          actor_type: "human",
-          actor_id: nil,
-          actor_label: "human:webauthn",
-          new_state: %{
-            "name" => tenant.name,
-            "slug" => tenant.slug,
-            "email" => tenant.email,
-            "authenticator_count" => length(auths),
-            "authenticator_fingerprints" => Enum.map(auths, &fingerprint(&1.credential_id)),
-            "audit_signing_public_key" => Base.encode64(keypair.public_key)
-          }
-        }
+    result =
+      with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
+        AdminRepo.transaction(multi)
       end)
 
-    case AdminRepo.transaction(multi) do
+    case result do
       {:ok, %{activate: tenant, authenticators: authenticators}} ->
         {:ok, %{tenant: tenant, root_authenticators: authenticators}}
 
@@ -160,6 +142,276 @@ defmodule Loopctl.Tenants do
       {:error, _step, reason, _changes} ->
         {:error, reason}
     end
+  end
+
+  defp signup_new_state(%{activate: tenant, authenticators: auths}, pub) do
+    %{
+      "name" => tenant.name,
+      "slug" => tenant.slug,
+      "email" => tenant.email,
+      "authenticator_count" => length(auths),
+      "authenticator_fingerprints" => Enum.map(auths, &fingerprint(&1.credential_id)),
+      "audit_signing_public_key" => Base.encode64(pub)
+    }
+  end
+
+  @doc """
+  US-26.7.1 — agent-rooted self-signup: creates a tenant WITHOUT a WebAuthn
+  ceremony, entirely through this single API call. The tenant lands on the
+  KB tier (`trust_tier: :agent_rooted`) — it retains the full knowledge-wiki
+  surface but is blocked (via `LoopctlWeb.Plugs.RequireHumanAnchor`) from the
+  work-breakdown / chain-of-custody surface until it opts into a WebAuthn
+  enrollment ceremony (US-26.7.2, out of scope here).
+
+  Mirrors the trusted parts of `signup/1` (ed25519 audit keypair generation
+  + storage, activation, genesis audit entry via the shared
+  `append_keypair_and_genesis/6` helper — including the transactional secret
+  compensation in `with_secret_compensation/3`) but does NOT insert any
+  `RootAuthenticator`, and stamps `actor_type: "agent"` /
+  `actor_label: "agent:self-signup"` on the genesis entry instead of the
+  human/webauthn label. It then mints a `role: :user`, `agent_id: nil` root
+  API key bound to the tenant so the caller can immediately configure its
+  own BYO LLM keys (`PATCH /tenants/me/llm-config`) and register its own
+  agent identity (`POST /agents/register`).
+
+  `attrs` accepts `:name`, `:slug`, `:email` (identical validation to
+  `signup/1`). Any other key (`trust_tier`, `role`, `tenant_id`, `agent_id`,
+  ...) is silently ignored — `Tenant.self_signup_changeset/2`'s cast list is
+  `[:name, :slug, :email]`, so mass-assignment is structurally closed.
+
+  ## Returns
+
+  - `{:ok, %{tenant: %Tenant{}, raw_key: String.t()}}` — `raw_key` is
+    returned exactly once and is never persisted in plaintext.
+  - `{:error, :slug_taken} | {:error, :email_taken}`
+  - `{:error, %Ecto.Changeset{}}` — validation failure
+  - `{:error, term()}` — keypair storage or root-key-minting failure
+  """
+  @spec self_signup(map()) ::
+          {:ok, %{tenant: Tenant.t(), raw_key: String.t()}}
+          | {:error, :slug_taken}
+          | {:error, :email_taken}
+          | {:error, Ecto.Changeset.t()}
+          | {:error, term()}
+  def self_signup(attrs) when is_map(attrs) do
+    # US-26.7.1 (#9) — lexical keypair + deterministic secret name (see do_signup/2).
+    {pub, priv} = generate_ed25519_keypair()
+    secret_name = signup_secret_name(attrs)
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:tenant, Tenant.self_signup_changeset(attrs))
+      |> append_keypair_and_genesis(
+        secret_name,
+        priv,
+        pub,
+        "agent",
+        "agent:self-signup",
+        &self_signup_new_state/2
+      )
+      |> Multi.run(:root_api_key, fn _repo, %{activate: tenant} ->
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "root",
+          role: :user,
+          agent_id: nil
+        })
+      end)
+
+    result =
+      with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
+        AdminRepo.transaction(multi)
+      end)
+
+    case result do
+      {:ok, %{activate: tenant, root_api_key: {raw_key, _api_key}}} ->
+        {:ok, %{tenant: tenant, raw_key: raw_key}}
+
+      {:error, :tenant, %Ecto.Changeset{} = changeset, _changes} ->
+        signup_changeset_error(changeset)
+
+      {:error, _step, %Ecto.Changeset{} = changeset, _changes} ->
+        {:error, changeset}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
+  end
+
+  defp self_signup_new_state(%{activate: tenant}, pub) do
+    %{
+      "name" => tenant.name,
+      "slug" => tenant.slug,
+      "email" => tenant.email,
+      "trust_tier" => "agent_rooted",
+      "audit_signing_public_key" => Base.encode64(pub)
+    }
+  end
+
+  # US-26.7.1 — the deterministic audit-key secret name for a signup, derived
+  # from the SAME normalized slug the changeset will insert. A missing/invalid
+  # slug yields a placeholder name that is never written: the `:tenant` insert
+  # fails (required/format) BEFORE the `:store_secret` step runs.
+  defp signup_secret_name(attrs) do
+    slug = Tenant.normalized_slug(attrs) || "__invalid__"
+    Secrets.audit_key_secret_name(slug)
+  end
+
+  # US-26.7.1 (AC-26.7.1.4) — shared secret-write + activation + genesis audit
+  # Multi steps, appended onto a Multi that has already inserted a `:tenant`
+  # step. `secret_name`/`priv`/`pub` are LEXICAL (generated by the caller
+  # before the Multi), so the compensation in `with_secret_compensation/3` can
+  # reference them on both the tuple and raised-exception paths without a
+  # process dictionary. Used by BOTH `signup/1` and `self_signup/1`.
+  #
+  # `:store_secret` runs AFTER `:tenant` (and, for signup, `:authenticators`)
+  # so a duplicate-slug / validation failure never reaches the external write —
+  # the compensation `write_step` guard keys on this step name.
+  defp append_keypair_and_genesis(
+         multi,
+         secret_name,
+         priv,
+         pub,
+         actor_type,
+         actor_label,
+         new_state_fun
+       ) do
+    multi
+    |> Multi.run(:store_secret, fn _repo, _changes ->
+      case Secrets.set(secret_name, priv) do
+        :ok -> {:ok, :stored}
+        {:error, reason} -> {:error, {:audit_key_storage_failed, reason}}
+      end
+    end)
+    |> Multi.update(:set_public_key, fn %{tenant: tenant} ->
+      Ecto.Changeset.change(tenant, audit_signing_public_key: pub)
+    end)
+    |> Multi.update(:activate, fn %{set_public_key: tenant} ->
+      Tenant.activate_after_enrollment_changeset(tenant)
+    end)
+    |> Audit.log_in_multi(:audit_genesis, fn changes ->
+      tenant = changes.activate
+
+      %{
+        tenant_id: tenant.id,
+        entity_type: "tenant",
+        entity_id: tenant.id,
+        action: "tenant_created",
+        actor_type: actor_type,
+        actor_id: nil,
+        actor_label: actor_label,
+        new_state: new_state_fun.(changes, pub)
+      }
+    end)
+  end
+
+  # US-26.7.1 (AC-26.7.1.4 / review #1, #2, #9) — TRANSACTIONAL SECRET SAFETY.
+  # `Secrets.set/2` is an EXTERNAL Fly.io write that `AdminRepo.transaction/1`
+  # cannot roll back. `run_txn` performs the transaction; `write_step` is the
+  # Multi step whose SUCCESS means the external secret was written. On failure:
+  #
+  #   * tuple `{:error, step, reason, changes}` — compensate ONLY when the
+  #     `write_step` succeeded (its key is present in `changes`), so an upstream
+  #     failure (duplicate slug, validation, authenticator) writes nothing and
+  #     compensates nothing.
+  #   * raised exception — the Multi discards `changes`, so we compensate
+  #     defensively using the lexical `compensation`. This is safe: a
+  #     duplicate-slug collision (the ONLY case where the deterministic secret
+  #     name could belong to ANOTHER tenant) is ALWAYS a mapped
+  #     `unique_constraint` TUPLE, never a raise, so a raise can never target a
+  #     live tenant's secret.
+  #
+  # `compensation` is `{:delete, secret_name}` (signup/bootstrap: no prior key)
+  # or `{:restore, secret_name, old_value}` (rotate: put the OLD private key
+  # back so the DB's rolled-back OLD public key still verifies).
+  defp with_secret_compensation(compensation, write_step, run_txn) do
+    case run_txn.() do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, _step, _reason, changes} = error ->
+        if Map.has_key?(changes, write_step), do: run_compensation(compensation)
+        error
+    end
+  rescue
+    exception ->
+      run_compensation(compensation)
+      reraise exception, __STACKTRACE__
+  end
+
+  defp run_compensation({:delete, secret_name}), do: delete_secret(secret_name)
+
+  defp run_compensation({:restore, secret_name, old_value}),
+    do: restore_secret(secret_name, old_value)
+
+  defp delete_secret(secret_name) do
+    case Secrets.delete(secret_name) do
+      :ok -> :ok
+      # Already gone — nothing to clean up (a defensive rescue-branch delete of
+      # a secret that was never written lands here).
+      {:error, :not_found} -> :ok
+      {:error, reason} -> handle_compensation_failure(:delete, secret_name, nil, reason)
+    end
+  end
+
+  defp restore_secret(_secret_name, nil) do
+    # No old value to restore (the pre-rotation read failed). Nothing we can
+    # auto-recover — surface it loudly rather than swallow.
+    :telemetry.execute(
+      [:loopctl, :secrets, :orphan_cleanup_failed],
+      %{count: 1},
+      %{op: :restore, secret_name: nil, reason: :old_value_unavailable}
+    )
+
+    Logger.error(
+      "Cannot restore audit-key secret after a failed rotation: the old private key " <>
+        "value was unavailable. Manual intervention required."
+    )
+
+    :ok
+  end
+
+  defp restore_secret(secret_name, old_value) when is_binary(old_value) do
+    case Secrets.set(secret_name, old_value) do
+      :ok -> :ok
+      {:error, reason} -> handle_compensation_failure(:restore, secret_name, old_value, reason)
+    end
+  end
+
+  # A FAILED compensating delete/restore must NEVER be swallowed: (a) emit a
+  # dedicated telemetry event so monitoring can page, (b) Logger.error, and
+  # (c) enqueue a durable, retryable Oban job so cleanup actually happens
+  # rather than being best-effort-once.
+  defp handle_compensation_failure(op, secret_name, value, reason) do
+    :telemetry.execute(
+      [:loopctl, :secrets, :orphan_cleanup_failed],
+      %{count: 1},
+      %{op: op, secret_name: secret_name, reason: reason}
+    )
+
+    Logger.error(
+      "Compensating audit-key secret #{op} failed for #{secret_name}: #{inspect(reason)}. " <>
+        "Enqueued a retry; a private key may be orphaned in Fly until it succeeds."
+    )
+
+    enqueue_secret_cleanup(op, secret_name, value)
+    :ok
+  end
+
+  defp enqueue_secret_cleanup(:delete, secret_name, _value) do
+    %{"op" => "delete", "secret_name" => secret_name}
+    |> OrphanedSecretCleanupWorker.new()
+    |> Oban.insert()
+  end
+
+  defp enqueue_secret_cleanup(:restore, secret_name, value) do
+    %{
+      "op" => "restore",
+      "secret_name" => secret_name,
+      "value" => OrphanedSecretCleanupWorker.encode_secret_value(value)
+    }
+    |> OrphanedSecretCleanupWorker.new()
+    |> Oban.insert()
   end
 
   defp insert_authenticators(multi, authenticators) do
@@ -283,7 +535,16 @@ defmodule Loopctl.Tenants do
         }
       end)
 
-    case AdminRepo.transaction(multi) do
+    # US-26.7.1 (#2) — bootstrap means NO prior key existed, so a post-`:store_secret`
+    # failure compensates by DELETING the just-written secret (same machinery as
+    # signup). `write_step: :store_secret` (the first step here) so the guard is
+    # only satisfied once the external write actually happened.
+    result =
+      with_secret_compensation({:delete, secret_name}, :store_secret, fn ->
+        AdminRepo.transaction(multi)
+      end)
+
+    case result do
       {:ok, %{set_public_key: tenant}} -> {:ok, tenant}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
@@ -318,6 +579,19 @@ defmodule Loopctl.Tenants do
     now = DateTime.utc_now()
     {new_pub, new_priv} = generate_ed25519_keypair()
     secret_name = Secrets.audit_key_secret_name(tenant.slug)
+
+    # US-26.7.1 (#2) — RESTORE semantics. Rotation OVERWRITES the same
+    # deterministic secret name with the NEW private key. If a step AFTER the
+    # write fails, the DB rolls back to the OLD public key while Fly holds the
+    # NEW private key = silent signature-verification breakage. So read the OLD
+    # private value BEFORE the Multi and, on any post-write failure, RESTORE it
+    # (not delete). `nil` when the old value can't be read (edge) — restore_secret/2
+    # surfaces that loudly rather than deleting and losing signing entirely.
+    old_priv =
+      case Secrets.get(secret_name) do
+        {:ok, value} -> value
+        {:error, _reason} -> nil
+      end
 
     multi =
       Multi.new()
@@ -358,7 +632,12 @@ defmodule Loopctl.Tenants do
         }
       end)
 
-    case AdminRepo.transaction(multi) do
+    result =
+      with_secret_compensation({:restore, secret_name, old_priv}, :store_new_secret, fn ->
+        AdminRepo.transaction(multi)
+      end)
+
+    case result do
       {:ok, %{update_tenant: updated_tenant}} ->
         TenantKeys.invalidate(tenant.id)
         {:ok, updated_tenant}

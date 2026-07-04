@@ -25,6 +25,10 @@ defmodule LoopctlWeb.ArtifactReportController do
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent] when action in [:index]
 
+  # US-26.7.1 — artifact reports are evidence submitted against a story's
+  # implementation; part of the work-breakdown / chain-of-custody surface.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
+
   tags(["Artifacts"])
 
   operation(:create,

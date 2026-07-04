@@ -13,6 +13,10 @@ defmodule Loopctl.Tenants.Tenant do
   - `settings` — jsonb map for tenant-level configuration
   - `status` — `:active`, `:suspended`, or `:deactivated`
   - `default_story_budget_millicents` — nullable tenant-wide default budget for stories
+  - `trust_tier` — `:human_anchored` (WebAuthn signup ceremony, unlocks the
+    work-breakdown / chain-of-custody surface) or `:agent_rooted` (self-signup,
+    KB-tier only). US-26.7.1. NEVER cast from user input — every signup path
+    (`signup/1`, `self_signup/1`) sets it programmatically on the struct.
   """
 
   use Loopctl.Schema, tenant_scoped: false
@@ -20,6 +24,7 @@ defmodule Loopctl.Tenants.Tenant do
   @type t :: %__MODULE__{}
 
   @statuses [:active, :suspended, :deactivated, :pending_enrollment]
+  @trust_tiers [:human_anchored, :agent_rooted]
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   @email_format ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/
   @min_retention_days 30
@@ -40,6 +45,9 @@ defmodule Loopctl.Tenants.Tenant do
     field :audit_key_rotated_at, :utc_datetime_usec
     # US-26.5.2: custody halt on witness divergence
     field :custody_halted_at, :utc_datetime_usec
+    # US-26.7.1: capability tier — NEVER in any public changeset cast; the
+    # RESTRICTIVE value (:agent_rooted) is both the schema and DB default.
+    field :trust_tier, Ecto.Enum, values: @trust_tiers, default: :agent_rooted
 
     has_many :root_authenticators, Loopctl.Tenants.RootAuthenticator, foreign_key: :tenant_id
     has_many :audit_key_history, Loopctl.Tenants.AuditKeyHistory, foreign_key: :tenant_id
@@ -65,6 +73,33 @@ defmodule Loopctl.Tenants.Tenant do
     |> validate_email()
     |> put_change(:status, :pending_enrollment)
     |> put_change(:settings, %{})
+    |> put_change(:trust_tier, :human_anchored)
+    |> unique_constraint(:slug)
+    |> unique_constraint(:email, name: :tenants_email_index)
+  end
+
+  @doc """
+  US-26.7.1 — changeset for the agent-rooted self-signup path (no WebAuthn
+  ceremony, no human operator). Mirrors `signup_changeset/2`'s validation and
+  `:pending_enrollment` status (flipped to `:active` by
+  `activate_after_enrollment_changeset/1` once the audit keypair is
+  generated) but sets `trust_tier: :agent_rooted` instead of
+  `:human_anchored`. `trust_tier` is set programmatically here, never cast
+  from `attrs` — the cast list is identical to `signup_changeset/2`
+  ([:name, :slug, :email]), so a body carrying `trust_tier`, `role`,
+  `tenant_id`, or `agent_id` has no effect (mass-assignment closed).
+  """
+  @spec self_signup_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def self_signup_changeset(tenant \\ %__MODULE__{}, attrs) do
+    tenant
+    |> cast(normalize_signup_attrs(attrs), [:name, :slug, :email])
+    |> validate_required([:name, :slug, :email])
+    |> validate_length(:name, min: 1, max: 120)
+    |> validate_slug(min: 2, max: 64)
+    |> validate_email()
+    |> put_change(:status, :pending_enrollment)
+    |> put_change(:settings, %{})
+    |> put_change(:trust_tier, :agent_rooted)
     |> unique_constraint(:slug)
     |> unique_constraint(:email, name: :tenants_email_index)
   end
@@ -148,6 +183,26 @@ defmodule Loopctl.Tenants.Tenant do
   @spec status_changeset(%__MODULE__{}, atom()) :: Ecto.Changeset.t()
   def status_changeset(tenant, status) when status in @statuses do
     change(tenant, status: status)
+  end
+
+  @doc """
+  US-26.7.1 — returns the normalized (trimmed + downcased) slug from a signup
+  attrs map (string- or atom-keyed), or `nil` when absent/non-binary.
+
+  Public so `Loopctl.Tenants` can derive the deterministic audit-key secret
+  name (`Loopctl.Secrets.audit_key_secret_name/1`) as an ordinary lexical
+  variable BEFORE the signup `Ecto.Multi` — without duplicating the
+  normalization rule and without a process-dictionary bridge for the
+  compensation path. Applies the SAME `String.trim/1 |> String.downcase/1`
+  the signup changesets use, so the derived name matches the inserted
+  `tenant.slug` exactly.
+  """
+  @spec normalized_slug(map()) :: String.t() | nil
+  def normalized_slug(attrs) when is_map(attrs) do
+    case Map.get(attrs, :slug) || Map.get(attrs, "slug") do
+      slug when is_binary(slug) -> slug |> String.trim() |> String.downcase()
+      _ -> nil
+    end
   end
 
   defp validate_slug(changeset, opts \\ []) do

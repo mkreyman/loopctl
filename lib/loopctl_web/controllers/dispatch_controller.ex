@@ -12,6 +12,9 @@ defmodule LoopctlWeb.DispatchController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :index]
 
+  # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
+
   @doc "POST /api/v1/dispatches"
   def create(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id

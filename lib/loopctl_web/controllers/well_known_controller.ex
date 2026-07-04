@@ -37,6 +37,10 @@ defmodule LoopctlWeb.WellKnownController do
     discovery_bootstrap_url: "#{@base_url}/wiki/agent-bootstrap",
     required_agent_pattern_url: "#{@base_url}/wiki/agent-pattern",
     system_articles_endpoint: "#{@base_url}/api/v1/articles/system",
+    # US-26.7.1 — public, agent-rooted (KB-tier) self-signup: no WebAuthn
+    # ceremony required. A stranger agent discovering loopctl cold can POST
+    # here to obtain a working tenant + key.
+    signup_endpoint: "#{@base_url}/api/v1/signup",
     contact: "operator@loopctl.com"
   }
 
@@ -76,7 +80,8 @@ defmodule LoopctlWeb.WellKnownController do
                    "audit_signing_key_url",
                    "capability_scheme_url",
                    "chain_of_custody_spec_url",
-                   "system_articles_endpoint"
+                   "system_articles_endpoint",
+                   "signup_endpoint"
                  ],
                  properties: %{
                    spec_version: %{type: "string"},
@@ -94,6 +99,7 @@ defmodule LoopctlWeb.WellKnownController do
                    discovery_bootstrap_url: %{type: "string", format: "uri"},
                    required_agent_pattern_url: %{type: "string", format: "uri"},
                    system_articles_endpoint: %{type: "string", format: "uri"},
+                   signup_endpoint: %{type: "string", format: "uri"},
                    contact: %{type: "string"}
                  }
                })
