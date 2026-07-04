@@ -5,6 +5,71 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.33.1 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry + cache hardening — #298)
+
+### Security
+
+- **Symlink / file-clobber (CWE-59) closed.** The STH state file is now written
+  atomically and symlink-safely: to a private `0600` temp file opened with
+  `O_EXCL` (`wx`), then `rename`d over the target — so a pre-planted symlink at the
+  cache path is *replaced*, never followed, and can no longer be used to clobber an
+  arbitrary victim-owned file on a shared `/tmp`. Loads `lstat` the path and refuse
+  a symlinked or foreign-owned file. This also fixes the torn-file race on a killed
+  mid-write.
+- **Per-(server + key) cache scoping.** The state file AND the in-memory client are
+  now keyed by `sha256(serverUrl + ":" + apiKey)`, so two keys/tenants on one host
+  no longer share (and clobber) a cache — which previously caused spurious `409
+  witness_divergence` responses and false divergence telemetry. Only a non-secret
+  hash of the key appears in the filename; the key itself never hits disk.
+
+### Fixed
+
+- **Fresh-tenant zero-STH 409 loop (server-side).** A brand-new tenant has a ~60s
+  window before its first STH is sealed; the bootstrap handed out the all-zero STH
+  placeholder, which the client echoed and the server then rejected `409
+  witness_divergence` (unrecoverable, since the client retry is 412-only). The
+  server now treats the zero placeholder as a pass-through while no STH is sealed
+  (nothing to diverge from) — gated strictly on there being no sealed STH.
+- **Cold-start bootstrap coalescing.** Concurrent tool calls at process start now
+  share ONE bootstrap (singleflight) instead of each firing their own.
+
+### Changed
+
+- The transparent retry now anchors to the response `error.code`
+  (`witness_bootstrap_already_consumed`), not just the status + header shape.
+- `409 witness_divergence` is explicitly NOT auto-retried (the genuine-fork/resync
+  signal); the client caches the server's STH so the next request self-heals.
+- `LOOPCTL_STH_STATE_PATH` documentation clarified; cache is per-(server + key).
+
+### Added — STH persistence + transparent bootstrap-412 retry (the base feature)
+
+- **Fresh MCP processes no longer fail their first tool call with `412
+  witness_bootstrap_already_consumed` (#298).** The witness protocol's one-time
+  bootstrap grace is consumed once per API key; every subsequent fresh process
+  (a new Claude session, a standalone script, a CI run) reusing a long-lived
+  env-var key (`LOOPCTL_AGENT_KEY`, `LOOPCTL_ORCH_KEY`, …) previously started with
+  no Signed Tree Head (STH) and tripped that 412. Two client-side fixes:
+  - **Transparent retry:** any `412` carrying an `x-loopctl-current-sth` header is
+    now caught, the STH is cached, and the SAME request is retried exactly ONCE
+    with `X-Loopctl-Last-Known-STH` — so the tool call succeeds instead of
+    surfacing the 412. Bounded to a single retry (never a loop). Safe because the
+    server's witness plug halts BEFORE the operation runs, so the rejected request
+    had no side effect.
+  - **Cross-process persistence:** the learned STH is cached to a small state file
+    so a FRESH process loads it and sends a real header on its first request,
+    avoiding the 412 entirely. Location defaults to a per-server file under the OS
+    temp dir (`loopctl-mcp-sth-<hash>.json`) and can be overridden with
+    `LOOPCTL_STH_STATE_PATH`. All file I/O degrades gracefully: a missing,
+    corrupt, or unwritable state file falls back to in-memory caching + the
+    transparent retry above.
+
+### Added
+
+- **`LOOPCTL_STH_STATE_PATH`** env var to override the STH state-file location
+  (absolute path). Dispatch-based (v2) clients that mint a fresh ephemeral key per
+  dispatch are unaffected by the 412 (each fresh key gets its own clean bootstrap)
+  and do not need this.
+
 ## 2.33.0 — 2026-07-03 (surface semantic→keyword fallback_reason — #297)
 
 ### Changed

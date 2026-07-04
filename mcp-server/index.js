@@ -10,15 +10,20 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync } from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import path, { dirname, join } from "node:path";
 import {
   projectsPath,
   ingestionJobsPath,
   llmUsagePath,
   parseJsonResponseBody,
 } from "./lib/http-helpers.js";
+import {
+  createWitnessClient,
+  resolveSthStatePath,
+} from "./lib/witness-sth.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -32,11 +37,51 @@ const SERVER_VERSION = JSON.parse(
 // HTTP helper — witness protocol state
 // ---------------------------------------------------------------------------
 
-// The witness protocol requires clients to echo back the last-known Signed
-// Tree Head (STH) on every authenticated request. On the very first request
-// we send X-Loopctl-STH-Bootstrap: true to receive the current STH without
-// needing one already. After that we cache and send X-Loopctl-Last-Known-STH.
-let lastKnownSTH = null;
+// The witness protocol requires clients to echo back the last-known Signed Tree
+// Head (STH) on every authenticated request. The mechanics live in
+// ./lib/witness-sth.js (shared with the test suite):
+//
+//   * On the very first request from a caller that has never seen an STH we send
+//     `X-Loopctl-STH-Bootstrap: true` to receive the current STH in the
+//     `x-loopctl-current-sth` response header.
+//   * That STH is cached AND persisted to a small per-server state file, so a
+//     FRESH MCP process (new Claude session) loads it and sends a real
+//     `X-Loopctl-Last-Known-STH` on its first request — never tripping the
+//     one-time bootstrap-grace 412 (`witness_bootstrap_already_consumed`, #298).
+//   * If a request still hits that bootstrap-grace 412 (state file missing or
+//     corrupt), the client caches the STH from the 412's `x-loopctl-current-sth`
+//     header and RETRIES the SAME request exactly ONCE — transparently — so the
+//     tool call succeeds. The witness plug halts before the operation runs, so
+//     retrying a witness 412 is side-effect-safe even for POSTs.
+//
+// The state file location defaults to a per-(server + key) file under the OS temp
+// dir and can be overridden with LOOPCTL_STH_STATE_PATH. All file I/O degrades
+// gracefully (missing/corrupt/unwritable/symlinked → in-memory cache + the
+// transparent retry above). The write is atomic + symlink-safe (temp + rename).
+const WITNESS_FS = { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync };
+
+// One witness client PER API KEY (#298 review HIGH-2): the STH is per-tenant and
+// each key resolves to a tenant server-side, so distinct keys must NOT share an
+// in-memory cache or a state file (a collision causes spurious 409s + false
+// divergence telemetry). The state file is keyed by sha256(serverUrl + ":" + key)
+// — a non-secret hash; the key never hits disk in plaintext.
+const witnessClients = new Map();
+
+function witnessClientFor(apiKey) {
+  let client = witnessClients.get(apiKey);
+  if (!client) {
+    const statePath = resolveSthStatePath({ env: process.env, os, path, apiKey });
+    client = createWitnessClient({
+      statePath,
+      fs: WITNESS_FS,
+      getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined,
+      pid: process.pid,
+      timeoutMs: 30_000,
+    });
+    witnessClients.set(apiKey, client);
+  }
+  return client;
+}
 
 function getBaseUrl() {
   return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
@@ -82,38 +127,22 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false } = {
     Accept: "application/json",
   };
 
-  // Witness protocol: send cached STH or request bootstrap
-  if (lastKnownSTH) {
-    headers["X-Loopctl-Last-Known-STH"] = lastKnownSTH;
-  } else {
-    headers["X-Loopctl-STH-Bootstrap"] = "true";
-  }
+  const serializedBody =
+    body !== undefined && body !== null ? JSON.stringify(body) : undefined;
 
-  const options = {
-    method,
-    headers,
-    signal: AbortSignal.timeout(30_000),
-  };
-
-  if (body !== undefined && body !== null) {
-    options.body = JSON.stringify(body);
-  }
-
+  // The witness client injects the STH header, caches + persists any STH the
+  // server returns, and transparently retries a bootstrap-grace 412 ONCE (see
+  // ./lib/witness-sth.js and the module comment above). It returns the final
+  // attempt's Response; we keep body parsing / error shaping here.
   let response;
   try {
-    response = await fetch(url, options);
+    response = await witnessClientFor(key).send({ url, method, headers, serializedBody });
   } catch (err) {
     if (err.name === "TimeoutError") {
       return { error: true, status: 0, body: "Request timed out after 30s" };
     }
     const cause = err.cause?.message ? ` (${err.cause.message})` : "";
     return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
-  }
-
-  // Witness protocol: cache the STH from response for subsequent requests
-  const sthHeader = response.headers.get("x-loopctl-current-sth");
-  if (sthHeader) {
-    lastKnownSTH = sthHeader;
   }
 
   if (response.status === 204) {
