@@ -211,8 +211,8 @@ defmodule Loopctl.Llm do
   @spec record_blocked(Ecto.UUID.t(), operation()) :: :ok
   def record_blocked(tenant_id, operation) when is_binary(tenant_id) do
     Logger.warning(
-      "Loopctl.Llm: tenant=#{tenant_id} blocked op=#{operation} — no Anthropic API key " <>
-        "configured (mandatory BYO)."
+      "Loopctl.Llm: tenant=#{tenant_id} blocked op=#{operation} — no " <>
+        "#{blocked_credential(operation)} configured (mandatory BYO)."
     )
 
     :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{
@@ -236,6 +236,12 @@ defmodule Loopctl.Llm do
       Logger.error("Loopctl.Llm.record_blocked failed: #{Exception.message(e)}")
       :ok
   end
+
+  # The two BYO credentials are SEPARATE — name the right one in the block log so an
+  # operator isn't misled into checking the Anthropic key for an embedding block
+  # (review MED #3). The structured audit already carries the exact operation.
+  defp blocked_credential(:embedding), do: "embedding API key"
+  defp blocked_credential(_anthropic_op), do: "Anthropic API key"
 
   @doc """
   A safe view of the tenant's settings for API responses: the model choices,

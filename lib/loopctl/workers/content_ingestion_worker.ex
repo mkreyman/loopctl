@@ -51,6 +51,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ContentChunker
   alias Loopctl.Llm
+  alias Loopctl.Llm.ProviderError
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -407,7 +408,11 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp finalize_errors(errors, inserted, persisted, attempted) do
-    first = errors |> Enum.reverse() |> List.first()
+    # Sanitize the representative error BEFORE it becomes an Oban reason / log line
+    # (review #5): a provider `{:api_error, _, body}` can echo a masked key fragment,
+    # and these reasons land in oban_jobs.errors (surfaced by list_extraction_errors).
+    # Classification below runs on the RAW errors (it needs the status/Postgrex code).
+    first = errors |> Enum.reverse() |> List.first() |> ProviderError.sanitize()
 
     if Enum.all?(errors, &permanent_error?/1) do
       # No transient error a retry could clear — {:discard} (no infinite retry);

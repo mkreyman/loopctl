@@ -390,25 +390,60 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   # --- Extractor failure ---
 
   describe "perform/1 extractor failure" do
-    test "propagates error when extractor fails" do
+    test "propagates a transient error, sanitized (no provider body reaches the Oban reason)" do
       %{tenant: tenant} = setup_tenant()
+      masked = "sk-ant-...5XX-LEAK"
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
                                                                      _content,
                                                                      _opts ->
-        {:error, {:api_error, 500, "Internal Server Error"}}
+        {:error, {:api_error, 500, "upstream error echoing key #{masked}"}}
       end)
 
-      assert {:error, {:api_error, 500, "Internal Server Error"}} =
-               ContentIngestionWorker.perform(%Oban.Job{
-                 id: 105,
-                 args: %{
-                   "tenant_id" => tenant.id,
-                   "content" => "Failing content",
-                   "content_hash" => "fail_test",
-                   "source_type" => "ingestion"
-                 }
-               })
+      # The 500 is transient -> {:error, _} (Oban retry), but the reason that lands
+      # in oban_jobs.errors is SANITIZED (review #5): status only, never the body.
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 105,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Failing content",
+            "content_hash" => "fail_test",
+            "source_type" => "ingestion"
+          }
+        })
+
+      assert {:error, {:api_error, 500, :provider_error}} = result
+      refute inspect(result) =~ masked
+    end
+
+    test "a permanent 4xx DISCARDS with a sanitized reason (no key fragment)" do
+      %{tenant: tenant} = setup_tenant()
+      masked = "sk-ant-...4XX-LEAK"
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:error, {:api_error, 401, "Invalid x-api-key header: #{masked}"}}
+      end)
+
+      result =
+        ContentIngestionWorker.perform(%Oban.Job{
+          id: 106,
+          args: %{
+            "tenant_id" => tenant.id,
+            "content" => "Failing content",
+            "content_hash" => "fail_test_4xx",
+            "source_type" => "ingestion"
+          }
+        })
+
+      # Permanent -> discard; the extraction_failed message embeds the SANITIZED
+      # `first` error, so no masked key fragment can reach oban_jobs.errors.
+      assert {:discard, {:extraction_failed, message}} = result
+      assert message =~ "api_error"
+      refute message =~ masked
+      refute inspect(result) =~ masked
     end
   end
 

@@ -41,6 +41,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
   alias Loopctl.Llm
+  alias Loopctl.Llm.ProviderError
 
   @extractor Application.compile_env(
                :loopctl,
@@ -118,8 +119,12 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     classify_result(result)
   end
 
-  defp classify_result({:error, reason} = err) do
-    if permanent_error?(reason), do: {:discard, reason}, else: err
+  defp classify_result({:error, reason}) do
+    # Classify on the RAW reason (needs status), but SANITIZE what becomes the Oban
+    # reason (review #5): a provider api_error body can echo a masked key fragment,
+    # and both {:discard,_}/{:error,_} reasons are persisted into oban_jobs.errors.
+    sanitized = ProviderError.sanitize(reason)
+    if permanent_error?(reason), do: {:discard, sanitized}, else: {:error, sanitized}
   end
 
   defp classify_result(other), do: other

@@ -117,18 +117,24 @@ defmodule Loopctl.Llm.Anthropic do
 
       {:ok, %{status: 200, body: body}} ->
         Logger.warning("Loopctl.Llm.Anthropic: 200 with unexpected shape (op=#{operation})")
-        {:error, {:api_error, 200, redact_body(body)}}
+        # A 200 with the wrong shape can STILL be a misconfigured/compromised
+        # endpoint echoing a masked key fragment in an error-shaped body (review
+        # CRIT #1). Sanitize it exactly like a non-200 — never return the raw body.
+        {:error, ProviderError.sanitize({:api_error, 200, body})}
 
-      {:ok, %{status: status, body: _body}} ->
+      {:ok, %{status: status, body: body}} ->
         Logger.warning("Loopctl.Llm.Anthropic: API error (op=#{operation}, status=#{status})")
         # SANITIZE the provider error body (review #11): it can echo a masked key
         # fragment, and callers surface it as an Oban `{:error, reason}` persisted
         # into oban_jobs.errors. Drop the body; keep only the status.
-        {:error, ProviderError.sanitize({:api_error, status, nil})}
+        {:error, ProviderError.sanitize({:api_error, status, body})}
 
       {:error, reason} ->
+        # Never inspect the raw transport reason (review MED #4) — log a value-free
+        # tag, mirroring EmbeddingClient.post.
         Logger.warning(
-          "Loopctl.Llm.Anthropic: request failed (op=#{operation}, error=#{inspect(reason)})"
+          "Loopctl.Llm.Anthropic: request failed (op=#{operation}, " <>
+            "#{ProviderError.log_tag({:request_failed, reason})})"
         )
 
         {:error, {:request_failed, reason}}
@@ -194,7 +200,4 @@ defmodule Loopctl.Llm.Anthropic do
       plug -> Keyword.put(opts, :plug, plug)
     end
   end
-
-  defp redact_body(body) when is_binary(body), do: String.slice(body, 0, 200)
-  defp redact_body(body), do: body
 end

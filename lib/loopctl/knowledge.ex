@@ -5842,9 +5842,7 @@ defmodule Loopctl.Knowledge do
   @doc false
   def reset_circuit_breaker(tenant_id) when is_binary(tenant_id) do
     if :ets.whereis(@circuit_breaker_table) != :undefined do
-      :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
-      :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
-      :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
+      clear_tenant_breaker(tenant_id, System.monotonic_time(:second))
     end
 
     :ok
@@ -5956,37 +5954,43 @@ defmodule Loopctl.Knowledge do
     key = {tenant_id, :open_until}
 
     case :ets.lookup(@circuit_breaker_table, key) do
-      [{^key, open_until}] ->
-        now = System.monotonic_time(:second)
-
-        if now < open_until do
-          true
-        else
-          # Cooldown expired — clear this tenant's breaker state.
-          :ets.delete(@circuit_breaker_table, key)
-          :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
-          :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
-          false
-        end
-
-      [] ->
-        false
+      [{^key, open_until}] -> check_open_until(tenant_id, open_until)
+      [] -> false
     end
   end
 
+  defp check_open_until(tenant_id, open_until) do
+    now = System.monotonic_time(:second)
+
+    if now < open_until do
+      true
+    else
+      # Cooldown expired — clear this tenant's breaker state.
+      clear_tenant_breaker(tenant_id, now)
+      false
+    end
+  end
+
+  # The failure counter is keyed by the WINDOW PERIOD (review #2): each rolling
+  # window is a DISTINCT ETS key, so an expired window is simply a different key —
+  # there is no non-atomic "check the timestamp, then reset the counter in place"
+  # step to race. `update_counter/4` is the sole, atomic mutation, so a burst of
+  # concurrent failures for one tenant counts reliably to the threshold.
   defp record_failure(tenant_id) do
     ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
-    maybe_reset_window(tenant_id, now)
+    period = period_for(now)
 
-    # Atomic increment (review #13): concurrent failures for the same tenant can no
-    # longer read-modify-write over each other and undercount.
+    # Bound ETS growth: the previous window's counter can never grow again, so drop
+    # it. (At most one stale key per tenant survives between failures.)
+    :ets.delete(@circuit_breaker_table, failures_key(tenant_id, period - 1))
+
     count =
       :ets.update_counter(
         @circuit_breaker_table,
-        {tenant_id, :failures},
+        failures_key(tenant_id, period),
         {2, 1},
-        {{tenant_id, :failures}, 0}
+        {failures_key(tenant_id, period), 0}
       )
 
     if count >= @failure_threshold do
@@ -5996,29 +6000,25 @@ defmodule Loopctl.Knowledge do
     :ok
   end
 
-  # Reset the tenant's rolling window (and its counter) once the window has elapsed,
-  # so sparse failures over a long span never accumulate to the threshold.
-  defp maybe_reset_window(tenant_id, now) do
-    key = {tenant_id, :window_start}
-
-    case :ets.lookup(@circuit_breaker_table, key) do
-      [{^key, ws}] when now - ws < @failure_window_seconds ->
-        :ok
-
-      _ ->
-        :ets.insert(@circuit_breaker_table, {key, now})
-        :ets.insert(@circuit_breaker_table, {{tenant_id, :failures}, 0})
-        :ok
-    end
-  end
-
   defp record_success(tenant_id) do
     ensure_circuit_breaker_table()
-    :ets.delete(@circuit_breaker_table, {tenant_id, :failures})
-    :ets.delete(@circuit_breaker_table, {tenant_id, :window_start})
-    :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
+    clear_tenant_breaker(tenant_id, System.monotonic_time(:second))
     :ok
   end
+
+  # Delete ALL of a tenant's breaker state: the open flag + the current and previous
+  # window counters (a failure is always in one of those two periods).
+  defp clear_tenant_breaker(tenant_id, now) do
+    period = period_for(now)
+    :ets.delete(@circuit_breaker_table, {tenant_id, :open_until})
+    :ets.delete(@circuit_breaker_table, failures_key(tenant_id, period))
+    :ets.delete(@circuit_breaker_table, failures_key(tenant_id, period - 1))
+    :ok
+  end
+
+  defp failures_key(tenant_id, period), do: {tenant_id, :failures, period}
+
+  defp period_for(now), do: div(now, @failure_window_seconds)
 
   defp ensure_circuit_breaker_table do
     if :ets.whereis(@circuit_breaker_table) == :undefined do

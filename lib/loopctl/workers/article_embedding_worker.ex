@@ -99,6 +99,10 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
         skip_no_embedding_key(tenant_id, article_id)
 
       {:error, reason} ->
+        # Classify on the raw reason, but the term that becomes an Oban discard/error
+        # reason (-> oban_jobs.errors) is SANITIZED (review #5/#6) — never a raw body.
+        sanitized = ProviderError.sanitize(reason)
+
         if Llm.permanent_provider_error?(reason) do
           # A revoked/invalid tenant key (4xx) will never succeed on retry (review #5).
           Logger.debug(
@@ -106,9 +110,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
               "embedding error (#{ProviderError.log_tag(reason)}); discarding."
           )
 
-          {:discard, {:embedding_permanent_error, reason}}
+          {:discard, {:embedding_permanent_error, sanitized}}
         else
-          {:error, reason}
+          {:error, sanitized}
         end
     end
   end

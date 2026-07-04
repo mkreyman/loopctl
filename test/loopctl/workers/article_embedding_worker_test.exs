@@ -86,14 +86,20 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         |> Ecto.Changeset.change(%{status: :published})
         |> Loopctl.AdminRepo.update!()
 
+      # A transient 5xx whose body echoes a key fragment: the worker retries
+      # ({:error, _}) but the reason that lands in oban_jobs.errors is SANITIZED
+      # (review #5) — the body is dropped, only the status remains.
       expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, {:api_error, 500, "Internal Server Error"}}
+        {:error, {:api_error, 500, "Internal Server Error: key sk-...LEAK"}}
       end)
 
-      assert {:error, {:api_error, 500, "Internal Server Error"}} =
-               ArticleEmbeddingWorker.perform(%Oban.Job{
-                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
-               })
+      result =
+        ArticleEmbeddingWorker.perform(%Oban.Job{
+          args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+        })
+
+      assert {:error, {:api_error, 500, :provider_error}} = result
+      refute inspect(result) =~ "LEAK"
     end
   end
 

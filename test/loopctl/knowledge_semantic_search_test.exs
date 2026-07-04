@@ -727,6 +727,33 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       # ...but B is completely unaffected — its breaker is independent.
       assert {:ok, _vec} = Knowledge.generate_embedding(b.id, "q")
     end
+
+    test "concurrent failures for one tenant reliably open the breaker (atomic window #2)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 500, :provider_error}}
+      end)
+
+      # Fire many failures for the SAME tenant CONCURRENTLY. With a non-atomic
+      # window reset (the pre-fix TOCTOU) a parallel reset-to-0 could wipe an
+      # increment and delay the breaker; the period-keyed atomic counter must count
+      # them all and open reliably.
+      1..12
+      |> Task.async_stream(fn _ -> Knowledge.generate_embedding(tenant.id, "q") end,
+        max_concurrency: 8,
+        timeout: 10_000
+      )
+      |> Stream.run()
+
+      # Even a single successful call now must be short-circuited — the breaker is open.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "q")
+    end
   end
 
   # --- Score normalization edge case ---
