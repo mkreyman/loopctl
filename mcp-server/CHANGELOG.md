@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.33.0 — 2026-07-03 (surface semantic→keyword fallback_reason — #297)
+
+### Changed
+
+- **`knowledge_search`** / **`knowledge_context`** tool descriptions now note that
+  when semantic ranking is unavailable the call transparently degrades to
+  keyword-only (`meta.fallback: true`, `meta.search_mode: "keyword_only"`) and
+  reports a new `meta.fallback_reason` — a stable, non-sensitive tag naming WHY
+  (`no_embedding_key`, `embedding_circuit_open`, `embedding_provider_error_<status>`,
+  `embedding_timeout`, `embedding_request_failed`, `embedding_crash`,
+  `embedding_error`). The reason never leaks an api key or provider body. Combined
+  mode additionally reports `meta.semantic_result_count`, so a `0` with
+  `fallback: false` (embedding worked but ranking returned nothing) is
+  distinguishable from an embedding-failure fallback. Observability only — the
+  fallback behavior is unchanged.
+
 ## 2.32.0 — 2026-07-03 (per-tenant BYO for embeddings — Epic 28 #179)
 
 ### Added

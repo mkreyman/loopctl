@@ -31,12 +31,15 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   @scale_metric_names [
     "loopctl.db.error.count",
     "loopctl.heavy_read_repo.query.duration",
-    "loopctl.knowledge.vector_search.under_fill.count"
+    "loopctl.knowledge.vector_search.under_fill.count",
+    "loopctl.knowledge.semantic_fallback.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
   # set — especially an unbounded `:article_id` or a raw vector/body — is a hard fail.
-  @allowed_tags MapSet.new([:endpoint, :mapped_code, :tenant_id])
+  # `:reason` (#297 semantic-fallback counter) is a BOUNDED, sanitized tag set (never a
+  # key/body/query), so it is a safe dimension.
+  @allowed_tags MapSet.new([:endpoint, :mapped_code, :tenant_id, :reason])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
 
@@ -46,7 +49,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   end
 
   describe "scale_metrics/0 — bounded, safe label set (TC-27.15.2, AC-27.15.3)" do
-    test "exactly the three scale metrics are defined" do
+    test "exactly the expected scale metrics are defined" do
       names = Enum.map(scale_metrics(), &Enum.join(&1.name, "."))
       assert Enum.sort(names) == Enum.sort(@scale_metric_names)
     end
@@ -91,6 +94,23 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert %Telemetry.Metrics.Counter{} = under_fill
       assert :tenant_id in under_fill.tags
       assert :endpoint in under_fill.tags
+    end
+
+    test "the semantic-fallback counter (#297) is tagged by :reason ONLY — never tenant_id" do
+      counter = metric("loopctl.knowledge.semantic_fallback.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.tags == [:reason]
+      refute :tenant_id in counter.tags
+      refute :endpoint in counter.tags
+
+      # `reason` is a fixed, small label set (no cap gate needed); a missing reason
+      # collapses to a bounded sentinel, never blank.
+      assert ScaleMetrics.semantic_fallback_tags(%{reason: "no_embedding_key"}) == %{
+               reason: "no_embedding_key"
+             }
+
+      assert ScaleMetrics.semantic_fallback_tags(%{}) == %{reason: "unknown"}
     end
 
     test "histogram buckets are the documented bounded set" do

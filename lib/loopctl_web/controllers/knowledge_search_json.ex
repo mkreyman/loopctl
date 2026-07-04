@@ -154,6 +154,13 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # exceeds the relevance pool cap, so the tail is unreachable by deeper `offset` —
     # the consumer should switch to list mode for full enumeration.
     |> maybe_put(:pool_capped, meta[:pool_capped])
+    # `fallback_reason` (#297): a stable, non-sensitive tag naming WHY combined/semantic
+    # degraded to keyword_only (present only alongside `fallback: true`).
+    |> maybe_put(:fallback_reason, meta[:fallback_reason])
+    # `semantic_result_count` (#297): rows the semantic half contributed in combined
+    # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
+    # from a keyword_only fallback.
+    |> maybe_put(:semantic_result_count, meta[:semantic_result_count])
     |> maybe_put_fallback(meta[:fallback])
   end
 

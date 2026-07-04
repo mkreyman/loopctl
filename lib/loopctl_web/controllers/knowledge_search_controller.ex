@@ -226,6 +226,30 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                      "Keyset path (include_body only): true when the page was shortened by " <>
                        "the serialized-body byte budget. next_cursor is then recomputed from " <>
                        "the last kept row, so following it returns the dropped rows (no gap)."
+                 },
+                 fallback: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "Relevance modes (combined / semantic): true when embedding generation " <>
+                       "failed and the request silently degraded to keyword_only. Present only " <>
+                       "when it degraded."
+                 },
+                 fallback_reason: %OpenApiSpex.Schema{
+                   type: :string,
+                   description:
+                     "Present only alongside `fallback: true` (#297): a stable, non-sensitive " <>
+                       "tag naming WHY semantic ranking was unavailable (never leaks an api key " <>
+                       "or provider body). One of `no_embedding_key`, `embedding_circuit_open`, " <>
+                       "`embedding_timeout`, `embedding_request_failed`, `embedding_crash`, " <>
+                       "`embedding_error`, or `embedding_provider_error_<status>` (e.g. " <>
+                       "`embedding_provider_error_401`, carrying only the HTTP status)."
+                 },
+                 semantic_result_count: %OpenApiSpex.Schema{
+                   type: :integer,
+                   description:
+                     "Combined mode only (#297): rows the semantic half contributed. `0` with " <>
+                       "no `fallback` means the embedding SUCCEEDED but ranking returned nothing " <>
+                       "(a recall problem) — distinct from a keyword_only fallback."
                  }
                }
              }
@@ -601,7 +625,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       {:error, :no_api_key} ->
         # Mandatory BYO (review #8): a keyless tenant's explicit semantic search must
         # NOT 503. Degrade to keyword-only with `fallback: true`, mirroring combined.
-        semantic_keyword_fallback(tenant_id, q, opts)
+        semantic_keyword_fallback(tenant_id, q, opts, :no_api_key)
 
       {:error, _} ->
         {:error, :embedding_unavailable}
@@ -614,11 +638,24 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   # Keyword-only degrade for a keyless-tenant semantic request: same shape as the
   # combined-search fallback so clients can detect it via `meta.fallback` /
-  # `meta.search_mode`.
-  defp semantic_keyword_fallback(tenant_id, q, opts) do
+  # `meta.search_mode`. Records the reason (#297) so this path is as diagnosable as
+  # combined — `record_semantic_fallback/3` maps it to a stable, non-sensitive tag
+  # and emits telemetry + a warning log.
+  defp semantic_keyword_fallback(tenant_id, q, opts, reason) do
+    fallback_reason = Knowledge.record_semantic_fallback(tenant_id, reason, q)
+
     case Knowledge.search_keyword(tenant_id, q, opts) do
       {:ok, %{meta: meta} = result} ->
-        {:ok, %{result | meta: Map.merge(meta, %{fallback: true, search_mode: "keyword_only"})}}
+        {:ok,
+         %{
+           result
+           | meta:
+               Map.merge(meta, %{
+                 fallback: true,
+                 search_mode: "keyword_only",
+                 fallback_reason: fallback_reason
+               })
+         }}
 
       other ->
         other

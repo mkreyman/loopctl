@@ -229,6 +229,74 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert result["score"] > 0
     end
 
+    test "combined fallback surfaces meta.fallback_reason without leaking the provider body (#297)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      Loopctl.Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Ecto Multi Pattern",
+        body: "Use Ecto.Multi for atomic multi-step database operations.",
+        category: :pattern,
+        status: :published,
+        tags: ["ecto"]
+      })
+
+      fake_key = "sk-SECRET-DEADBEEF-must-not-leak"
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 401, "Incorrect API key provided: #{fake_key}"}}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "Ecto"})
+
+      body = json_response(conn, 200)
+
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["search_mode"] == "keyword_only"
+      assert body["meta"]["fallback_reason"] == "embedding_provider_error_401"
+      refute inspect(body) =~ fake_key
+      refute inspect(body) =~ "Incorrect API key"
+    end
+
+    test "semantic keyless fallback surfaces meta.fallback_reason \"no_embedding_key\" (#297)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      Loopctl.Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Keyword Findable Article",
+        body: "Content about pagination that keyword search can find.",
+        category: :pattern,
+        status: :published,
+        tags: ["pagination"]
+      })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "pagination", mode: "semantic"})
+
+      body = json_response(conn, 200)
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["search_mode"] == "keyword_only"
+      assert body["meta"]["fallback_reason"] == "no_embedding_key"
+    end
+
     test "filters by project_id, category, and tags", %{conn: conn} do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})

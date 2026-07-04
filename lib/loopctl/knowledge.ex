@@ -55,6 +55,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Workers.ArticleEmbeddingWorker
@@ -1528,16 +1529,25 @@ defmodule Loopctl.Knowledge do
       |> Enum.reject(&is_nil/1)
       |> Enum.take(limit * 2)
 
+    # The keyword_only fallback reason (#297) rides in the underlying combined
+    # search meta; carry it into the context meta so `/knowledge/context` is as
+    # diagnosable as `/knowledge/search`. Absent on the success path.
+    fallback_reason = search.meta[:fallback_reason]
+
     if article_ids == [] do
       {:ok,
        %{
          results: [],
-         meta: %{
-           total_count: 0,
-           limit: limit,
-           fallback: fallback?,
-           recency_weight: recency_weight
-         }
+         meta:
+           maybe_put_fallback_reason(
+             %{
+               total_count: 0,
+               limit: limit,
+               fallback: fallback?,
+               recency_weight: recency_weight
+             },
+             fallback_reason
+           )
        }}
     else
       articles = fetch_full_context_articles(tenant_id, article_ids)
@@ -1575,15 +1585,24 @@ defmodule Loopctl.Knowledge do
       {:ok,
        %{
          results: scored,
-         meta: %{
-           total_count: length(scored),
-           limit: limit,
-           fallback: fallback?,
-           recency_weight: recency_weight
-         }
+         meta:
+           maybe_put_fallback_reason(
+             %{
+               total_count: length(scored),
+               limit: limit,
+               fallback: fallback?,
+               recency_weight: recency_weight
+             },
+             fallback_reason
+           )
        }}
     end
   end
+
+  # Only surface `fallback_reason` when the combined search actually degraded — the
+  # success path leaves the key absent (never a stray `nil`).
+  defp maybe_put_fallback_reason(meta, nil), do: meta
+  defp maybe_put_fallback_reason(meta, reason), do: Map.put(meta, :fallback_reason, reason)
 
   defp fetch_full_context_articles(tenant_id, article_ids) do
     from(a in Article,
@@ -5602,7 +5621,13 @@ defmodule Loopctl.Knowledge do
 
   The query embedding is generated on-the-fly via the configured embedding
   client. If embedding generation fails (timeout, error, or circuit breaker),
-  falls back to keyword-only search with `fallback: true` in the response meta.
+  falls back to keyword-only search with `fallback: true` in the response meta,
+  plus a stable, non-sensitive `fallback_reason` tag naming WHY (#297) — e.g.
+  `"no_embedding_key"`, `"embedding_circuit_open"`, `"embedding_provider_error_401"`.
+  When the embedding SUCCEEDS but semantic ranking returns nothing (a recall
+  problem, not an embed failure), the meta carries `semantic_result_count: 0`
+  with `fallback: false` instead. Both cases also emit
+  `[:loopctl, :knowledge, :semantic_fallback]` telemetry + a warning log.
 
   ## Parameters
 
@@ -5683,6 +5708,13 @@ defmodule Loopctl.Knowledge do
       {{:ok, kw}, {:ok, embedding}} ->
         {:ok, semantic} = search_semantic(tenant_id, embedding, sub_opts)
 
+        # Distinguish the OTHER silent-degradation cause (#297): the embedding
+        # SUCCEEDED but semantic ranking returned nothing (a recall/HNSW problem,
+        # NOT an embed failure). Combined does NOT fall back here — keyword still
+        # merges — so this sets no fallback/fallback_reason; it only emits the
+        # alertable signal and the meta carries `semantic_result_count`.
+        maybe_emit_semantic_empty(tenant_id, length(semantic.results), query_string)
+
         {:ok, merged} = merge_results(kw, semantic, keyword_weight, semantic_weight, opts)
 
         maybe_record_search_access(
@@ -5695,8 +5727,12 @@ defmodule Loopctl.Knowledge do
 
         {:ok, merged}
 
-      {{:ok, kw}, {:error, _reason}} ->
-        # Fallback to keyword-only
+      {{:ok, kw}, {:error, reason}} ->
+        # Fallback to keyword-only. Capture the discarded embedding-error reason as
+        # a stable, non-sensitive tag (sanitized via ProviderError so no api key /
+        # provider body leaks), surface it in meta, and emit telemetry + a log so a
+        # silent degradation becomes alertable (#297).
+        fallback_reason = record_semantic_fallback(tenant_id, reason, query_string)
         paginated = paginate_results(kw.results, opts)
 
         maybe_record_search_access(
@@ -5714,6 +5750,7 @@ defmodule Loopctl.Knowledge do
              Map.merge(kw.meta, %{
                fallback: true,
                search_mode: "keyword_only",
+               fallback_reason: fallback_reason,
                total_count: kw.meta.total_count,
                limit: paginated.limit,
                offset: paginated.offset
@@ -5723,6 +5760,99 @@ defmodule Loopctl.Knowledge do
       {kw_error, _} ->
         kw_error
     end
+  end
+
+  # -- Semantic → keyword fallback observability (#297) ------------------------
+  #
+  # #297: at ~77k-article scale every knowledge_search/context silently returned
+  # `fallback: true, search_mode: "keyword_only"` and the discarded embedding-error
+  # `_reason` made the outage UNDIAGNOSABLE. These helpers capture the reason as a
+  # STABLE, non-sensitive tag, surface it in `meta.fallback_reason`, and emit an
+  # alertable telemetry event + log — WITHOUT changing the fallback behavior.
+
+  @doc """
+  Record a semantic→keyword-only degradation and return a stable, non-sensitive
+  `fallback_reason` tag for the response `meta` (#297).
+
+  `reason` is the discarded embedding-generation error term. It is sanitized via
+  `Loopctl.Llm.ProviderError.sanitize/1` FIRST, so no provider response body or api
+  key can ever reach the returned tag, the emitted telemetry, or the log line. The
+  mapping is a BOUNDED set (safe as a Prometheus label):
+
+    * `:no_api_key` → `"no_embedding_key"`
+    * `:circuit_open` → `"embedding_circuit_open"`
+    * `:timeout` → `"embedding_timeout"`
+    * `{:api_error, status, _}` → `"embedding_provider_error_<status>"` (status only)
+    * `{:request_failed, _}` → `"embedding_request_failed"`
+    * `{:embedding_crash, _}` → `"embedding_crash"`
+    * anything else → the generic `"embedding_error"` (the raw term is NEVER inspected)
+
+  Emits `[:loopctl, :knowledge, :semantic_fallback]` telemetry and a
+  `Logger.warning` naming the reason + tenant. The query TEXT never appears in
+  telemetry/logs (only its byte length), matching the other knowledge search
+  telemetry (id-only metadata).
+  """
+  @spec record_semantic_fallback(Ecto.UUID.t(), term(), String.t()) :: String.t()
+  def record_semantic_fallback(tenant_id, reason, query_string) do
+    tag = fallback_reason_tag(reason)
+    emit_semantic_fallback(tenant_id, tag, query_string, 0)
+    tag
+  end
+
+  # The "embed worked but recall is broken" cause of #297: the embedding SUCCEEDED
+  # but semantic ranking returned ZERO rows. Combined search does NOT fall back here
+  # (keyword still merges), so this emits the alertable signal WITHOUT a keyword_only
+  # fallback — callers see it via `meta.semantic_result_count`, operators via the
+  # `reason: "semantic_empty"` telemetry, keeping it distinct from an embed failure.
+  defp maybe_emit_semantic_empty(_tenant_id, count, _query_string) when count > 0, do: :ok
+
+  defp maybe_emit_semantic_empty(tenant_id, 0, query_string) do
+    emit_semantic_fallback(tenant_id, "semantic_empty", query_string, 0)
+    :ok
+  end
+
+  defp fallback_reason_tag(reason) do
+    reason
+    |> ProviderError.sanitize()
+    |> reason_to_tag()
+  end
+
+  defp reason_to_tag(:no_api_key), do: "no_embedding_key"
+  defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
+  defp reason_to_tag(:timeout), do: "embedding_timeout"
+
+  defp reason_to_tag({:api_error, status, _}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
+  defp reason_to_tag({:api_error, status}) when is_integer(status),
+    do: "embedding_provider_error_#{status}"
+
+  defp reason_to_tag({:request_failed, _}), do: "embedding_request_failed"
+  defp reason_to_tag({:embedding_crash, _}), do: "embedding_crash"
+  defp reason_to_tag(_other), do: "embedding_error"
+
+  # Query TEXT is deliberately excluded from telemetry/logs (only `query_len`) — the
+  # sibling knowledge telemetry (`keyset_byte_truncated`, `vector_search.under_fill`)
+  # carries id-only metadata, and this keeps that contract. The Prometheus counter
+  # (`Loopctl.Telemetry.ScaleMetrics`) tags ONLY by `reason` (a small fixed set) — no
+  # `tenant_id` label — so cardinality stays bounded.
+  defp emit_semantic_fallback(tenant_id, tag, query_string, semantic_result_count) do
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.knowledge_semantic_fallback(),
+      %{
+        count: 1,
+        query_len: byte_size(query_string),
+        semantic_result_count: semantic_result_count
+      },
+      %{tenant_id: tenant_id, reason: tag}
+    )
+
+    Logger.warning(
+      "knowledge.semantic_fallback reason=#{tag} tenant_id=#{tenant_id} " <>
+        "query_len=#{byte_size(query_string)} (semantic ranking did not contribute)"
+    )
+
+    :ok
   end
 
   defp merge_results(keyword_result, semantic_result, kw_weight, sem_weight, opts) do
@@ -5768,7 +5898,12 @@ defmodule Loopctl.Knowledge do
          # — combined is the DEFAULT mode, so silently dropping the flag would hide
          # truncation on the most-used path. `maybe_put` keeps the key absent unless the
          # semantic half was actually pool-capped.
-         pool_capped: Map.get(semantic_result.meta, :pool_capped, false)
+         pool_capped: Map.get(semantic_result.meta, :pool_capped, false),
+         # Observability for #297: how many rows the semantic half contributed. A
+         # `0` here with `fallback: false` is the "embed worked but recall is broken"
+         # signal (distinct from an embed-failure keyword_only fallback), so operators
+         # and clients can tell the two silent-degradation causes apart.
+         semantic_result_count: length(semantic_result.results)
        }
      }}
   end
