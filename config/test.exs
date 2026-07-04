@@ -308,6 +308,7 @@ config :loopctl, :okf_max_buffered_export_articles, 2
 # WebAuthn relying party — test fixtures expect localhost
 config :loopctl, :webauthn,
   rp_id: "localhost",
+  rp_name: "loopctl (test)",
   origin: "http://localhost:4002",
   user_verification: "preferred"
 

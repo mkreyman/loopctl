@@ -1,0 +1,137 @@
+{
+  "id": "US-26.7.2",
+  "title": "Trust-Tier Upgrade: Opt-In WebAuthn Enrollment (agent_rooted -> human_anchored)",
+  "epic": { "id": "epic_26", "name": "Chain of Custody v2" },
+  "priority": "high",
+  "phase": "capability_tiers",
+  "story": {
+    "as_a": "an agent-rooted (KB-tier) tenant created via POST /api/v1/signup whose human operator now wants to run supervised work-breakdown / chain-of-custody operations",
+    "i_want_to": "enroll a WebAuthn hardware authenticator against my existing tenant via an API ceremony, which promotes my tenant from agent_rooted to human_anchored",
+    "so_that": "I gain the custody surface RequireHumanAnchor gates, without creating a new tenant or losing my accumulated knowledge base"
+  },
+  "rationale": "US-26.7.1 opened frictionless agent-rooted self-signup for the KB tier and gated the custody surface behind RequireHumanAnchor (keyed on tenant.trust_tier), but deliberately deferred the RECIPROCAL path: how an agent-rooted tenant becomes human_anchored. Today there is no post-signup authenticator-enrollment route at all (docs/chain-of-custody-v2.md §9.2 references POST /tenants/:id/authenticators and DELETE /tenants/:id/authenticators/:id as deferred here; they do not exist). This story adds the opt-in upgrade ceremony so the two tiers are a round-trip.\n\nThe security model is L0 being established: upgrading requires producing a VALID WebAuthn attestation from a real hardware authenticator. An agent cannot forge that, so (owns the tenant's user key) + (produces a verified attestation) is what promotes the tenant. Holding the self-signup user key alone is NOT sufficient.\n\nHARDENED BY SPEC REVIEW (2 critical + 2 high + mediums found and fixed before implementation):\n- CRITICAL: the FIRST authenticator (agent_rooted bootstrap) and a SUBSEQUENT (backup) authenticator must NOT share the same authorization. If a backup could be enrolled on bearer-key ownership alone, an attacker who exfiltrates the tenant's role:user key could graft THEIR OWN hardware onto the tenant's root of trust with no theft of the real device — the exact 'soft recovery back door' docs/chain-of-custody-v2.md §9.3 deliberately rejects. Therefore: FIRST enrollment (agent_rooted, zero authenticators) needs role:user + ownership + a fresh registration attestation (nothing else to assert against — legitimate bootstrap). SUBSEQUENT enrollment (already human_anchored) ADDITIONALLY requires a fresh ASSERTION from an ALREADY-enrolled authenticator (Reauth purpose add_authenticator), mirroring how rotate-audit-key and revoke are gated.\n- CRITICAL: the last-authenticator revoke guard must be race-safe (SELECT ... FOR UPDATE / advisory lock), not an unlocked count — otherwise two concurrent revokes both pass and strip the tenant to zero authenticators (the doc's 'fatal event').\n- HIGH: the challenge must be consumed in its OWN committed transaction BEFORE attestation verification (mirroring Reauth.verify_and_consume), so a failed attestation does not un-burn the challenge; and no DB transaction may be held open across CPU-bound CBOR/COSE verification. Attestation fields are size-capped before decode.\n\nDESIGN DECISIONS (documented): (1) enrollment APPENDS a tenant_trust_upgraded / authenticator_enrolled audit entry; it never rewrites the append-only genesis. (2) FIRST authenticator flips agent_rooted->human_anchored via a GUARDED conditional update (audit tenant_trust_upgraded only if the flip actually happened). (3) revoking the LAST authenticator while human_anchored is FORBIDDEN (409); no auto-downgrade. (4) attestation policy reuses signup's rp_opts/Wax. (5) NOT headless — an interactive WebAuthn client + hardware touch completes it.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.7.2.1",
+      "description": "A persisted, SINGLE-USE, TTL-bound WebAuthn REGISTRATION-challenge store is added for the stateless API. Only the `ReauthChallenge` PERSISTENCE SHAPE may be reused (the schema + the atomic single-use `update_all` consume pattern, web_authn/reauth.ex:191) — NOT `Reauth.issue_challenge/2` itself, which hard-requires an existing enrolled authenticator (list_by_tenant != []) and would make FIRST enrollment impossible. A NEW issuance function calls `Loopctl.WebAuthn.new_registration_challenge/1` directly (no existing-authenticator precondition), persists the challenge tenant+purpose-scoped with TTL ~300s, and consume is a single atomic `update_all` guarded on `used_at IS NULL AND expires_at > now` (0 rows => clean error; no TOCTOU). `tenant_id` is set programmatically, never cast. CLEANUP: whichever storage is chosen (new `webauthn_enrollment_challenges` table or a generalized reauth-challenge store), stale rows MUST be swept — either generalize `Loopctl.Workers.ReauthChallengeCleanupWorker`'s query to cover it or add an equivalent worker — with a regression test. No unbounded-growth table.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.2",
+      "description": "`POST /api/v1/tenants/:id/authenticators/challenge` issues a registration challenge (AC-26.7.2.1) and returns the publicKey creation options a browser WebAuthn client needs: challenge, challenge_id, expires_at, rp {id, name}, user {id, name, displayName}, pubKeyCredParams. rp.name is added to `Loopctl.WebAuthn.rp_opts/0`'s config (config.exs/dev.exs/test.exs currently carry only rp_id/origin) so the server — not a hard-coded JS client — serves it; user.id/name/displayName are derived server-side from the tenant (documented). If the tenant is ALREADY human_anchored, the response ALSO includes a fresh-assertion (reauth) challenge for an existing authenticator (purpose add_authenticator, via Reauth.issue_challenge/2) plus `reauth_required: true`, because a subsequent enrollment must prove possession of an existing device (see AC-26.7.2.3). Auth: the tenant's own role:user key (RequireRole) AND ownership (owns_tenant?/2). Available to an AGENT-ROOTED tenant — NOT tier-gated. Rate-limited (AC-26.7.2.7).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.3",
+      "description": "`POST /api/v1/tenants/:id/authenticators` completes enrollment in a TWO-PHASE shape mirroring Reauth (NOT one Multi spanning the crypto): PHASE 1 — atomically CONSUME the registration challenge in its OWN committed transaction FIRST (so a later failure does not un-burn it); if the tenant is human_anchored, ALSO verify-and-consume the required fresh add_authenticator ASSERTION from an existing authenticator (Reauth.verify_and_consume(:add_authenticator)) — reject 401 if absent/invalid (this is the CRITICAL backup-enrollment gate). PHASE 2 — size-cap each attestation field BEFORE decode (mirror signup's @max_attestation_field_bytes / ensure_attestation_size/1) then verify the attestation via `WebAuthn.verify_registration/3` OUTSIDE any open transaction (CPU-bound CBOR/COSE — no DB connection held). PHASE 3 — only on success, open a DB-only Multi: insert the RootAuthenticator (RootAuthenticators.create/2 shape; store public_key verbatim as the term_to_binary blob verify_registration returns; unique (tenant_id, credential_id)); flip the tier via a GUARDED conditional update `UPDATE tenants SET trust_tier='human_anchored' WHERE id=? AND trust_tier='agent_rooted'` and append `tenant_trust_upgraded` (actor human:webauthn, old->new, authenticator fingerprint) ONLY if 1 row was affected, else append `authenticator_enrolled` (mirrors the guarded-update-then-check-rows idiom in reauth.ex persist_counter/2, closing the concurrent-double-first-enroll race). `friendly_name` is a request param validated 1..120 (default 'Authenticator' if absent). A per-tenant cap (reuse the signup constant 5) is enforced via a guarded/locked count -> 409 when exceeded. Requires role:user + ownership; NOT tier-gated.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.4",
+      "description": "Revoke: `POST /api/v1/tenants/:id/authenticators/revoke-challenge` issues a fresh-assertion challenge (Reauth purpose `revoke_authenticator`), then `DELETE /api/v1/tenants/:id/authenticators/:auth_id` carries the assertion, verified via `Reauth.verify_and_consume(:revoke_authenticator)` (mirrors the rotate-audit-key challenge+verify pair). Auth: role:user + ownership. RACE-SAFE LAST-AUTHENTICATOR GUARD: inside the delete transaction, `SELECT ... FOR UPDATE` the tenant's tenant_root_authenticators rows (mirror audit_chain.ex lock_and_read_previous/1 `lock: \"FOR UPDATE\"`) OR take a per-tenant `pg_try_advisory_xact_lock` (mirror token_usage.ex) BEFORE counting+deleting, so two concurrent revokes cannot both pass — revoking the LAST remaining authenticator while human_anchored returns 409 `last_authenticator` and deletes nothing. No auto-downgrade. Add a tenant-scoped `RootAuthenticators.delete/2` (none exists today) mirroring create/2's shape.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.5",
+      "description": "After a successful FIRST-authenticator enrollment, tenant.trust_tier == :human_anchored and a custody op RequireHumanAnchor previously 403'd now passes (subject to normal role/409/lineage rules). A test proves the round-trip: self-signup (agent_rooted) -> 403 on a custody op -> enroll challenge -> enroll (verify) -> tier human_anchored + a single tenant_trust_upgraded audit entry -> the same custody op now passes.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.6",
+      "description": "The FOUR new routes — `POST .../authenticators/challenge`, `POST .../authenticators`, `POST .../authenticators/revoke-challenge`, `DELETE .../authenticators/:auth_id` — are added to the default-deny guard test's @allowlist (test/loopctl_web/require_human_anchor_default_deny_test.exs) with an explicit written rationale (enroll IS the upgrade path — an agent-rooted caller is intended; revoke + subsequent-enroll are protected by fresh WebAuthn assertions, a stronger control than the tier gate). The route-count floor + representative-route assertions in that test still hold.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.7",
+      "description": "Beyond the blanket RateLimiter plug, the challenge + enroll + revoke-challenge actions consume a tighter per-tenant action budget via the config-resolved `Loopctl.RateLimiter` behaviour (bucket e.g. `enroll:actions:<tenant_id>`), mirroring signup_live.ex ensure_action_budget/1 — WebAuthn verification is abusable and must be bounded. Over-budget returns 429. Tested via the MockRateLimiter DI seam (no Application.put_env).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.8",
+      "description": "Adversarial + isolation + concurrency coverage: (a) a forged/invalid attestation (MockWebAuthn -> {:error,_}) does NOT enroll and does NOT flip the tier, and does NOT un-burn the registration challenge (challenge stays consumed); (b) challenge replay/double-spend blocked; (c) expired challenge rejected; (d) cross-tenant enroll/revoke blocked (ownership + RLS); (e) revoking the last authenticator blocked, INCLUDING a concurrent-revoke race test (two simultaneous DELETEs against a 2-authenticator tenant must not both succeed — the FOR UPDATE/advisory lock holds); (f) SUBSEQUENT enrollment on a human_anchored tenant WITHOUT a valid existing-authenticator assertion is rejected 401 (the critical backup-enrollment gate); (g) a concurrent-double-FIRST-enrollment race writes exactly ONE tenant_trust_upgraded entry (guarded flip); (h) trust_tier never flips on ownership alone (no code path reaches human_anchored without a verified attestation); (i) credential_id unique constraint blocks re-enrolling the same authenticator. Every new test file async:true, config-based DI (no Application.put_env), Mox verify_on_exit!, tenant-isolation case.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.9",
+      "description": "Shared fingerprint helper + MCP + docs. (a) The authenticator-fingerprint algorithm currently private (`fingerprint/1`, tenants.ex:474, used by signup's audit entry) is made a PUBLIC shared function (on Loopctl.Tenants or a small shared helper module) and called by BOTH signup and the new enrollment audit-entry builders, so the two ceremonies can't drift; the enrollment Multi's owning module is named explicitly in the impl. (b) MCP server gains thin tools `request_authenticator_challenge` + `enroll_authenticator` (and revoke) that drive the ceremony from an orchestrator with a browser/human in the loop; tool descriptions state PLAINLY that completing enrollment requires an interactive WebAuthn client + hardware touch (an agent cannot produce the attestation itself) and that first enrollment upgrades the tenant to the custody tier. Package version bumped. (c) docs/chain-of-custody-v2.md §9.2/§9.3: replace the 'deferred to US-26.7.2' annotations with the real enroll/revoke endpoints, the first-vs-subsequent auth distinction, the last-authenticator policy, and the append-not-regenesis upgrade semantics. No doc claim may overstate what the code enforces.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-26.7.2.10",
+      "description": "OpenApiSpex operations registered for all new endpoints (with a regression assertion mirroring the /signup one). `mix precommit` passes clean (compile --warnings-as-errors, format, credo --strict, dialyzer, full suite green). Do NOT weaken L0 for the ops that keep it — this story ADDS the enrollment that establishes L0; the existing audit-key-rotation fresh-assertion gate and the RequireHumanAnchor custody gate are unchanged.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.7.2.1",
+      "name": "Full upgrade round-trip: agent_rooted -> first enroll -> human_anchored -> custody op passes",
+      "type": "integration",
+      "preconditions": ["An agent_rooted tenant from POST /api/v1/signup + its role:user key; MockWebAuthn accepts the attestation"],
+      "steps": ["Custody op (create project) -> 403 custody_tier_required", "POST .../authenticators/challenge", "POST .../authenticators with the attestation", "Retry the custody op"],
+      "expected_results": ["Initial op 403s", "Enroll 201; trust_tier == human_anchored", "Exactly one tenant_trust_upgraded audit entry", "Retried custody op passes the tier gate"]
+    },
+    {
+      "id": "TC-26.7.2.2",
+      "name": "Subsequent (backup) enrollment REQUIRES a fresh assertion from an existing authenticator",
+      "type": "integration",
+      "preconditions": ["A human_anchored tenant with one authenticator"],
+      "steps": ["Request challenge -> response includes reauth_required + an add_authenticator reauth challenge", "Enroll a 2nd authenticator WITHOUT the existing-authenticator assertion", "Enroll a 2nd authenticator WITH a valid existing-authenticator assertion"],
+      "expected_results": ["Without the assertion -> 401 (backup-enrollment gate)", "With it -> 201; a second RootAuthenticator exists; trust_tier stays human_anchored; an authenticator_enrolled (not tenant_trust_upgraded) audit entry"]
+    },
+    {
+      "id": "TC-26.7.2.3",
+      "name": "Forged attestation: no enroll, no flip, challenge stays consumed",
+      "type": "integration",
+      "preconditions": ["An agent_rooted tenant; MockWebAuthn.verify_registration -> {:error, :invalid_attestation}"],
+      "steps": ["Get a challenge", "POST the bad attestation", "Attempt to reuse the same challenge_id"],
+      "expected_results": ["401 webauthn_failed; no authenticator; trust_tier stays agent_rooted; no audit upgrade", "The challenge was consumed in phase 1 and cannot be replayed"]
+    },
+    {
+      "id": "TC-26.7.2.4",
+      "name": "Registration challenge is single-use and TTL-bound",
+      "type": "integration",
+      "preconditions": ["An agent_rooted tenant"],
+      "steps": ["Issue + successfully consume a challenge", "Replay the same challenge_id", "Attempt an expired challenge"],
+      "expected_results": ["Replay rejected", "Expired rejected", "No second authenticator produced"]
+    },
+    {
+      "id": "TC-26.7.2.5",
+      "name": "Revoke requires a fresh assertion, cannot remove the last authenticator, and is race-safe",
+      "type": "integration",
+      "preconditions": ["A human_anchored tenant with one authenticator; then two"],
+      "steps": ["DELETE the only authenticator with a valid assertion", "With two, run two concurrent DELETEs each with a valid assertion", "DELETE with missing/invalid assertion"],
+      "expected_results": ["Last-authenticator DELETE -> 409 last_authenticator (retained, still human_anchored)", "Concurrent DELETEs on a 2-authenticator tenant do NOT both succeed (lock holds; >=1 remains)", "Missing/invalid assertion -> 401"]
+    },
+    {
+      "id": "TC-26.7.2.6",
+      "name": "Cross-tenant enroll/revoke blocked",
+      "type": "integration",
+      "preconditions": ["Tenant A (agent_rooted) and tenant B each with keys"],
+      "steps": ["A's key targets B's tenant id for challenge/enroll/revoke"],
+      "expected_results": ["403 Forbidden for every cross-tenant attempt; B unchanged"]
+    },
+    {
+      "id": "TC-26.7.2.7",
+      "name": "Concurrent double-FIRST enrollment writes exactly one upgrade entry; enroll ceremony is rate-limited",
+      "type": "integration",
+      "preconditions": ["An agent_rooted tenant; MockRateLimiter denies after a low cap"],
+      "steps": ["Two concurrent first-enrollments each with a distinct valid attestation", "Separately, exceed the enroll action budget"],
+      "expected_results": ["trust_tier ends human_anchored with EXACTLY ONE tenant_trust_upgraded entry (guarded flip)", "Over-budget -> 429"]
+    }
+  ],
+  "technical_notes": [
+    "Reuse (recon-verified): Loopctl.WebAuthn.new_registration_challenge/1 + verify_registration/3 + rp_opts/0 (Wax behind DI; MockWebAuthn in test). RootAuthenticators.create/2 + count_by_tenant/1 + list_by_tenant/2 (add delete/2). Reauth.issue_challenge/2 + verify_and_consume/3 for BOTH the subsequent-enroll add_authenticator assertion AND the revoke_authenticator assertion (new purposes). owns_tenant?/2 (tenant_audit_key_controller.ex:369). Audit.log_in_multi/3. Tenant.activate_after_enrollment_changeset/1 is the template for a Multi-only tier change — but the flip must be a GUARDED conditional update, not a blind change/2 (see AC-26.7.2.3).",
+    "TWO-PHASE, never one Multi across crypto (mirror Reauth.verify_and_consume): consume challenge (+ verify add_authenticator assertion when human_anchored) in committed transactions; size-cap + verify attestation OUTSIDE any transaction; then a DB-only Multi for insert + guarded flip + audit. This closes the un-burn-on-failure hole AND the connection-held-across-CBOR hole.",
+    "Registration challenge persistence: reuse ONLY the ReauthChallenge schema + atomic update_all consume SHAPE; back the challenge endpoint with a NEW issuance fn (no existing-authenticator precondition). Ensure a cleanup sweep covers the new storage.",
+    "Guarded tier flip: `UPDATE tenants SET trust_tier='human_anchored' WHERE id=? AND trust_tier='agent_rooted'` returning affected rows; audit tenant_trust_upgraded iff 1 row, else authenticator_enrolled. Mirrors persist_counter/2's guarded-update idiom (reauth.ex:227).",
+    "Race-safe revoke: SELECT ... FOR UPDATE the tenant's authenticator rows (audit_chain.ex:289 pattern) or pg_try_advisory_xact_lock (token_usage.ex:450) before count+delete; 409 last_authenticator if it would reach zero while human_anchored.",
+    "COSE key: verify_registration returns public_key as :erlang.term_to_binary(cose_key) — store verbatim via create_changeset.",
+    "Make fingerprint/1 public/shared so signup and enrollment audit entries can't drift. Name the module that owns the enrollment Multi (a new context, e.g. Loopctl.Tenants.Enrollment, or Loopctl.Tenants) explicitly.",
+    "Add rp.name to Loopctl.WebAuthn.rp_opts/0 config (config.exs/dev.exs/test.exs) so the challenge endpoint serves rp/user/pubKeyCredParams server-side; friendly_name is a validated (1..120) request param.",
+    "Routes next to the rotate-audit-key trio in the authenticated /api/v1 scope, role:user; NOT behind RequireHumanAnchor; all four added to the default-deny allowlist.",
+    "Full workflow: this spec was reviewed BEFORE implementation (2 critical + 2 high + mediums fixed here). Implement, then diff-stage enhanced review, fix all findings, CI-green squash-merge, verify auto-deploy + npm autopublish."
+  ],
+  "dependencies": ["US-26.7.1"],
+  "estimated_hours": 24
+}

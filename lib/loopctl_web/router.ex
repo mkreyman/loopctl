@@ -131,6 +131,19 @@ defmodule LoopctlWeb.Router do
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
     post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap
 
+    # US-26.7.2 — opt-in WebAuthn trust-tier upgrade (agent_rooted -> human_anchored)
+    # + authenticator revocation. Not tier-gated (enroll IS the upgrade path;
+    # revoke + subsequent-enroll are protected by fresh WebAuthn assertions instead —
+    # see require_human_anchor_default_deny_test.exs).
+    post "/tenants/:id/authenticators/challenge", TenantAuthenticatorController, :challenge
+    post "/tenants/:id/authenticators", TenantAuthenticatorController, :create
+
+    post "/tenants/:id/authenticators/revoke-challenge",
+         TenantAuthenticatorController,
+         :revoke_challenge
+
+    delete "/tenants/:id/authenticators/:auth_id", TenantAuthenticatorController, :delete
+
     # US-26.2.1 — Dispatch lineage
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 

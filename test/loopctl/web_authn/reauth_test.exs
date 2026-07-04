@@ -228,6 +228,32 @@ defmodule Loopctl.WebAuthn.ReauthTest do
       {:ok, reloaded} = RootAuthenticators.get_by_credential_id(tenant.id, auth.credential_id)
       assert reloaded.sign_count == 4
     end
+
+    # US-26.7.2 review #2: an oversized assertion field is rejected BEFORE any
+    # base64 decode or CPU-bound verification — and, because the size check in
+    # `fetch_b64/2` precedes `consume_challenge/3` in the `with` chain, WITHOUT
+    # even burning the single-use challenge. Applies to every Reauth caller
+    # (rotate_audit_key, add_authenticator, revoke_authenticator).
+    test "rejects an oversized assertion field before consuming the challenge or verifying" do
+      tenant = fixture(:tenant)
+      auth = fixture(:root_authenticator, tenant_id: tenant.id, sign_count: 0)
+      {:ok, issued} = Reauth.issue_challenge(tenant.id, @purpose)
+
+      # A field an order of magnitude over the 8 KB cap.
+      oversized = Base.url_encode64(:crypto.strong_rand_bytes(64 * 1024), padding: false)
+
+      params =
+        assertion_params(issued.challenge_id, auth.credential_id, %{"signature" => oversized})
+
+      assert {:error, {:field_too_large, "signature"}} =
+               Reauth.verify_and_consume(tenant.id, @purpose, params)
+
+      # Structural proof it was rejected BEFORE verify: `consume_challenge/3`
+      # runs strictly after `fetch_b64/2` and strictly before
+      # `verify_authentication`, so an un-burned challenge means neither ran.
+      stored = AdminRepo.get!(ReauthChallenge, issued.challenge_id)
+      assert is_nil(stored.used_at)
+    end
   end
 
   describe "verify_and_consume/3 — real Wax adapter (end-to-end crypto)" do

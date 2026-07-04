@@ -628,7 +628,8 @@ work-custody surface, not for a tenant curating its own wiki notes.
 
 An `agent_rooted` tenant can later enroll a WebAuthn authenticator to
 upgrade to `human_anchored` and unlock the custody surface — that reciprocal
-opt-in ceremony is a dependent fast-follow (US-26.7.2), not yet implemented.
+opt-in ceremony (US-26.7.2) is `POST /tenants/:id/authenticators/challenge`
+then `POST /tenants/:id/authenticators`; see §9.2 below.
 
 `POST /api/v1/signup` — public (no auth), rate-limited per client IP
 (<= 5/hour). Accepts `name`, `slug`, `email`; returns the created tenant
@@ -673,10 +674,60 @@ Any endpoint that modifies the root trust requires a fresh WebAuthn assertion:
 - `DELETE /projects/:id` — delete a project. Now additionally tier-gated
   (US-26.7.1): requires a `human_anchored` tenant on top of the existing
   `role: :user` requirement.
-- `POST /tenants/:id/authenticators` — enroll an additional authenticator, and
-  `DELETE /tenants/:id/authenticators/:id` — revoke an authenticator. Both are
-  **deferred to US-26.7.2** (the reciprocal opt-in WebAuthn-enrollment upgrade
-  path for an `agent_rooted` tenant) — these routes do not exist yet.
+- `POST /tenants/:id/authenticators/challenge` then `POST /tenants/:id/authenticators`
+  — enroll a WebAuthn authenticator (US-26.7.2). This is the OPT-IN trust-tier
+  upgrade ceremony: a tenant created via `POST /api/v1/signup` (`agent_rooted`,
+  zero authenticators) enrolls a hardware authenticator here to become
+  `human_anchored` and gain the custody surface. Two authorization shapes,
+  deliberately NOT identical:
+  - **FIRST enrollment** (tenant is `agent_rooted`, zero enrolled
+    authenticators): requires `role: :user` + tenant ownership + a fresh
+    registration attestation. Nothing more to assert against — this is the
+    legitimate bootstrap, mirroring the original signup ceremony's trust
+    model (possession of hardware is the proof).
+  - **SUBSEQUENT enrollment** (tenant is already `human_anchored`):
+    ADDITIONALLY requires a fresh assertion (purpose `add_authenticator`)
+    from an ALREADY-enrolled authenticator, verified via the same
+    challenge-bound `Loopctl.WebAuthn.Reauth` ceremony `rotate-audit-key`
+    uses. This is the critical anti-soft-recovery-backdoor gate: without it,
+    a stolen `role: :user` API key alone could graft an attacker's own
+    hardware onto the tenant's root of trust with no theft of the real
+    device — exactly the backdoor §9.3 rejects. Absent/invalid ->
+    401 `reauth_required`/`reauth_failed`.
+
+  Enrollment runs two-phase (mirroring `Reauth.verify_and_consume/3`): the
+  registration challenge (and, when required, the `add_authenticator`
+  assertion) is consumed in its own committed transaction FIRST, so a later
+  attestation failure never un-burns it; the attestation is then verified
+  OUTSIDE any open transaction; only on success does a DB-only `Ecto.Multi`
+  insert the authenticator and GUARD-flip `trust_tier` via a conditional
+  `UPDATE ... WHERE trust_tier = 'agent_rooted'` — appending exactly one
+  `tenant_trust_upgraded` audit entry when the flip actually happened, or
+  `authenticator_enrolled` for a backup. The append-only genesis entry from
+  original signup (or self-signup) is never rewritten.
+
+  The backup-enrollment gate is NOT decided from a pre-lock tier read alone.
+  Phase 3 locks the tenant row (`SELECT ... FOR UPDATE`) and RE-EVALUATES the
+  gate against the freshly-locked, authoritative `trust_tier` before inserting
+  the authenticator: if the locked tier is `human_anchored` and no
+  `add_authenticator` assertion was verified for this request, the transaction
+  aborts `401 reauth_required`. This closes the concurrent double-first-enroll
+  race — two simultaneous first enrollments on an `agent_rooted` tenant do NOT
+  both succeed: the lock winner flips + enrolls, and the loser re-reads
+  `human_anchored` under its own lock and is rejected, so it must retry WITH a
+  fresh existing-authenticator assertion. An attacker holding a stolen
+  `role:user` key cannot win this race to graft an unproven device.
+
+- `POST /tenants/:id/authenticators/revoke-challenge` then
+  `DELETE /tenants/:id/authenticators/:auth_id` — revoke an authenticator
+  (US-26.7.2). Gated by a fresh assertion (purpose `revoke_authenticator`)
+  from an EXISTING authenticator, verified the same way. The delete
+  transaction locks the tenant row (`SELECT ... FOR UPDATE`) before counting
+  the tenant's remaining authenticators, so two concurrent revokes against a
+  2-authenticator tenant cannot both succeed. Revoking the tenant's LAST
+  authenticator while `human_anchored` is refused with 409
+  `last_authenticator` — **no auto-downgrade** to `agent_rooted` is ever
+  performed; see §9.3.
 
 Corrections to a stale prior version of this list: `POST /tenants/:id/override`
 and `POST /tenants/:id/budgets` never existed as routes and have been removed
@@ -718,10 +769,25 @@ explicit, reviewed allowlist. The allowlist decisions:
   if provisioning ever became lazy. `rotate-audit-key` (challenge + rotate) is
   gated by a fresh per-op WebAuthn assertion (`WebAuthn.Reauth`), a stronger
   control than the tier.
+- **`.../authenticators` (challenge/create) and `.../authenticators/:auth_id`
+  (revoke-challenge/delete)** are NOT tier-gated (US-26.7.2): `challenge` and
+  `create` ARE the upgrade path itself — an agent-rooted caller is the
+  intended audience for a first enrollment, so a tier gate would make the
+  tier unreachable from the tier it exists to lift a tenant out of. A
+  SUBSEQUENT (backup) enrollment and every revoke are instead gated by a
+  fresh, per-operation WebAuthn assertion (`WebAuthn.Reauth`), a stronger
+  control than the tier — see §9.2 above.
 
 ### 9.3 Recovery
 
 Loss of all enrolled authenticators is a fatal event for the tenant. Recovery requires contacting the loopctl operator (the root of the root of trust — the human running `loopctl.com` itself) and re-enrolling via an out-of-band channel. This is intentional: recovery is rare, loud, and hard. The alternative — soft recovery via email or password — would create a back door that agents could eventually find and exploit.
+
+This is enforced structurally, not just by convention: `DELETE /tenants/:id/authenticators/:auth_id`
+(US-26.7.2) refuses (409 `last_authenticator`) to remove a `human_anchored`
+tenant's last remaining authenticator, and no code path ever downgrades
+`trust_tier` back to `agent_rooted` once it has been raised. A tenant that
+somehow reaches zero authenticators outside this API (e.g. a manual DB
+operation) has no self-service way back in — by design.
 
 ## 10. Phase plan
 

@@ -84,6 +84,7 @@ config :loopctl, dev_routes: true
 # WebAuthn relying party — localhost for development
 config :loopctl, :webauthn,
   rp_id: "localhost",
+  rp_name: "loopctl (dev)",
   origin: "http://localhost:4000",
   user_verification: "preferred"
 
