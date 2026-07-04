@@ -706,6 +706,18 @@ Any endpoint that modifies the root trust requires a fresh WebAuthn assertion:
   `authenticator_enrolled` for a backup. The append-only genesis entry from
   original signup (or self-signup) is never rewritten.
 
+  The backup-enrollment gate is NOT decided from a pre-lock tier read alone.
+  Phase 3 locks the tenant row (`SELECT ... FOR UPDATE`) and RE-EVALUATES the
+  gate against the freshly-locked, authoritative `trust_tier` before inserting
+  the authenticator: if the locked tier is `human_anchored` and no
+  `add_authenticator` assertion was verified for this request, the transaction
+  aborts `401 reauth_required`. This closes the concurrent double-first-enroll
+  race — two simultaneous first enrollments on an `agent_rooted` tenant do NOT
+  both succeed: the lock winner flips + enrolls, and the loser re-reads
+  `human_anchored` under its own lock and is rejected, so it must retry WITH a
+  fresh existing-authenticator assertion. An attacker holding a stolen
+  `role:user` key cannot win this race to graft an unproven device.
+
 - `POST /tenants/:id/authenticators/revoke-challenge` then
   `DELETE /tenants/:id/authenticators/:auth_id` — revoke an authenticator
   (US-26.7.2). Gated by a fresh assertion (purpose `revoke_authenticator`)

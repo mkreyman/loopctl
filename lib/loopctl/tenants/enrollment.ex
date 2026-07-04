@@ -4,7 +4,7 @@ defmodule Loopctl.Tenants.Enrollment do
   trust-tier upgrade ceremony (agent_rooted -> human_anchored) and for
   authenticator revocation.
 
-  `enroll/2` is PHASE 3 of the enrollment ceremony (AC-26.7.2.3). By the
+  `enroll/3` is PHASE 3 of the enrollment ceremony (AC-26.7.2.3). By the
   time it is called, the caller (`LoopctlWeb.TenantAuthenticatorController`)
   has already, in strictly this order:
 
@@ -21,12 +21,12 @@ defmodule Loopctl.Tenants.Enrollment do
        (`Loopctl.WebAuthn.verify_registration/3`) OUTSIDE any open
        transaction (CPU-bound CBOR/COSE work never holds a DB connection).
 
-  So `enroll/2` performs NO crypto — it is a pure, atomic DB transaction:
+  So `enroll/3` performs NO crypto — it is a pure, atomic DB transaction:
   lock the tenant row, enforce the per-tenant authenticator cap, insert the
   `RootAuthenticator`, GUARD-flip `trust_tier` from `:agent_rooted` to
   `:human_anchored`, and append exactly one audit entry.
 
-  Both `enroll/2` and `revoke/2` open with a `SELECT ... FOR UPDATE` on the
+  Both `enroll/3` and `revoke/2` open with a `SELECT ... FOR UPDATE` on the
   TENANT row itself (mirroring `Loopctl.AuditChain`'s "lock the latest row to
   serialize concurrent appends" idiom, audit_chain.ex:289) — NOT the
   authenticator rows. A tenant's FIRST enrollment has ZERO authenticator
@@ -61,24 +61,44 @@ defmodule Loopctl.Tenants.Enrollment do
           upgraded: boolean()
         }
 
-  @doc "The per-tenant authenticator cap enforced by `enroll/2`."
+  @doc "The per-tenant authenticator cap enforced by `enroll/3`."
   @spec max_authenticators() :: pos_integer()
   def max_authenticators, do: @max_authenticators
 
   @doc """
   PHASE 3 of the enrollment ceremony (AC-26.7.2.3): a DB-only `Ecto.Multi`
-  that locks the tenant row, enforces the per-tenant authenticator cap,
-  inserts the `RootAuthenticator`, GUARD-flips `trust_tier` from
+  that locks the tenant row, RE-CHECKS the backup-enrollment gate against the
+  freshly-locked authoritative tier, enforces the per-tenant authenticator
+  cap, inserts the `RootAuthenticator`, GUARD-flips `trust_tier` from
   `:agent_rooted` to `:human_anchored` via a conditional `UPDATE ... WHERE
   trust_tier = 'agent_rooted'` (a no-op, zero-row update if the tenant is
   already `human_anchored` or a racing transaction already flipped it), and
   appends exactly one audit entry — `tenant_trust_upgraded` when THIS call
-  performed the flip, `authenticator_enrolled` otherwise. This closes the
-  concurrent-double-first-enroll race (AC-26.7.2.8g): whichever transaction's
-  `SELECT ... FOR UPDATE` on the tenant row wins the lock flips the tier and
-  logs the upgrade; the other re-reads the (now `human_anchored`) tenant
-  under its own lock acquisition, so its flip affects zero rows and it logs
-  a plain enrollment instead.
+  performed the flip, `authenticator_enrolled` otherwise.
+
+  `assertion_verified?` records whether PHASE 1 actually verified AND consumed
+  a fresh `add_authenticator` assertion from an EXISTING authenticator for
+  THIS request. The critical invariant — a backup authenticator can only be
+  added to an already-`human_anchored` tenant with proof of possession of an
+  existing device — is enforced HERE, under the lock, NOT only in the
+  controller's pre-lock read:
+
+    * `assert_gate/2` runs AFTER `lock_tenant/2`, against the freshly-locked
+      authoritative `trust_tier`. If the locked tier is `:human_anchored` and
+      `assertion_verified?` is not `true`, the Multi is ABORTED with
+      `{:error, :reauth_required}` BEFORE `Multi.insert(:authenticator, ...)`.
+
+  This closes the concurrent-double-FIRST-enroll race (AC-26.7.2.8g) as a
+  SECURITY property, not just an audit-count one: two concurrent enrollments
+  on an `agent_rooted` tenant each read `agent_rooted` pre-lock and skip the
+  assertion. The one that wins the tenant-row lock flips to `human_anchored`
+  and enrolls (logging `tenant_trust_upgraded`); the loser then acquires the
+  lock, sees `human_anchored` + `assertion_verified? == false`, and is
+  REJECTED `:reauth_required` — it MUST retry with an `add_authenticator`
+  assertion. So an attacker holding a stolen `role:user` key + their own
+  hardware can never graft a second device onto a tenant that a legitimate
+  first-enroll just anchored: exactly one enrollment wins, and every
+  subsequent device must prove possession of an existing one.
 
   `attrs` is the already-verified attestation result, e.g.
   `%{credential_id:, public_key:, attestation_format:, sign_count:,
@@ -86,15 +106,20 @@ defmodule Loopctl.Tenants.Enrollment do
   `:erlang.term_to_binary(cose_key)` blob `WebAuthn.verify_registration/3`
   returns (`RootAuthenticator.create_changeset/2` stores it as-is).
   """
-  @spec enroll(Ecto.UUID.t(), map()) ::
+  @spec enroll(Ecto.UUID.t(), map(), boolean()) ::
           {:ok, enroll_result()}
           | {:error, :not_found}
+          | {:error, :reauth_required}
           | {:error, :too_many_authenticators}
           | {:error, Ecto.Changeset.t()}
-  def enroll(tenant_id, attrs) when is_binary(tenant_id) and is_map(attrs) do
+  def enroll(tenant_id, attrs, assertion_verified?)
+      when is_binary(tenant_id) and is_map(attrs) and is_boolean(assertion_verified?) do
     multi =
       Multi.new()
       |> Multi.run(:tenant, fn repo, _changes -> lock_tenant(repo, tenant_id) end)
+      |> Multi.run(:assert_gate, fn _repo, %{tenant: tenant} ->
+        assert_gate(tenant, assertion_verified?)
+      end)
       |> Multi.run(:check_cap, fn repo, _changes -> check_cap(repo, tenant_id) end)
       |> Multi.insert(:authenticator, fn _changes ->
         RootAuthenticator.create_changeset(%RootAuthenticator{tenant_id: tenant_id}, attrs)
@@ -110,6 +135,9 @@ defmodule Loopctl.Tenants.Enrollment do
       {:error, :tenant, :not_found, _changes} ->
         {:error, :not_found}
 
+      {:error, :assert_gate, :reauth_required, _changes} ->
+        {:error, :reauth_required}
+
       {:error, :check_cap, :too_many_authenticators, _changes} ->
         {:error, :too_many_authenticators}
 
@@ -121,6 +149,13 @@ defmodule Loopctl.Tenants.Enrollment do
     end
   end
 
+  # Under-lock backup-enrollment gate. A first enrollment (locked tier still
+  # `agent_rooted`) needs no assertion — the flip happens later in THIS same
+  # transaction. An already-`human_anchored` tenant needs a verified
+  # `add_authenticator` assertion; without one, abort before the insert.
+  defp assert_gate(%Tenant{trust_tier: :human_anchored}, false), do: {:error, :reauth_required}
+  defp assert_gate(%Tenant{}, _assertion_verified?), do: {:ok, :ok}
+
   @doc """
   Revokes a single authenticator (AC-26.7.2.4). Callers must have already
   verified a fresh `revoke_authenticator` reauth assertion
@@ -128,7 +163,7 @@ defmodule Loopctl.Tenants.Enrollment do
   no crypto, only the race-safe DB delete.
 
   RACE-SAFE LAST-AUTHENTICATOR GUARD: locks the tenant row `FOR UPDATE`
-  (same mechanism as `enroll/2`) before counting the tenant's authenticators,
+  (same mechanism as `enroll/3`) before counting the tenant's authenticators,
   so two concurrent revokes against a 2-authenticator tenant cannot both
   pass — the second waits for the first's transaction to commit, then
   re-counts and sees only 1 remaining. Revoking the LAST authenticator while

@@ -45,6 +45,15 @@ defmodule Loopctl.WebAuthn.Reauth do
   # "rotate" and is expected to touch their authenticator immediately.
   @challenge_ttl_seconds 300
 
+  # crypto-01 / US-26.7.2 review #2: reject an assertion field larger than this
+  # BEFORE base64-decoding it, bounding the per-call decode + CPU-bound verify
+  # cost. Applied uniformly to EVERY base64 field of EVERY assertion this
+  # module verifies — the audit-key `rotate_audit_key` path AND the US-26.7.2
+  # `add_authenticator` / `revoke_authenticator` paths — since all route
+  # through `fetch_b64/2`. A real FIDO2 assertion field is well under 8 KB
+  # (mirrors signup_live.ex's @max_attestation_field_bytes).
+  @max_assertion_field_bytes 8 * 1024
+
   @type issue_result :: %{
           challenge_id: Ecto.UUID.t(),
           challenge: String.t(),
@@ -259,7 +268,16 @@ defmodule Loopctl.WebAuthn.Reauth do
   defp fetch_b64(params, key) do
     case Map.get(params, key) do
       value when is_binary(value) and value != "" ->
-        decode_b64url(value, key)
+        # Size-cap BEFORE decode (review #2): an oversized field is rejected
+        # here, before any base64 decode or CPU-bound signature verification,
+        # and — because this runs BEFORE `consume_challenge/3` in
+        # `verify_and_consume/3`'s `with` chain — WITHOUT even burning the
+        # single-use challenge.
+        if byte_size(value) > @max_assertion_field_bytes do
+          {:error, {:field_too_large, key}}
+        else
+          decode_b64url(value, key)
+        end
 
       _ ->
         {:error, {:missing_field, key}}

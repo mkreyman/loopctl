@@ -213,16 +213,21 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
   defp do_create(conn, tenant_id, params) do
     with :ok <- check_rate_limit(tenant_id),
+         {:ok, friendly_name} <- friendly_name(params),
          {:ok, tenant} <- Tenants.get_tenant(tenant_id),
          {:ok, challenge} <- consume_registration_challenge(tenant_id, params),
-         :ok <- maybe_require_add_authenticator_assertion(tenant, params),
+         {:ok, assertion_verified?} <-
+           maybe_require_add_authenticator_assertion(tenant, params),
          :ok <- ensure_attestation_size(params),
          {:ok, decoded} <- decode_attestation(params),
          {:ok, verified} <- WebAuthn.verify_registration(decoded, challenge, WebAuthn.rp_opts()) do
-      complete_enroll(conn, tenant_id, verified, friendly_name(params))
+      complete_enroll(conn, tenant_id, verified, friendly_name, assertion_verified?)
     else
       {:error, :rate_limited} ->
         rate_limited(conn)
+
+      {:error, :friendly_name_too_long} ->
+        friendly_name_too_long(conn)
 
       {:error, :not_found} ->
         not_found(conn)
@@ -261,12 +266,20 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
   # PHASE 1 (part 2): the CRITICAL backup-enrollment gate. An agent_rooted
   # tenant (zero authenticators — legitimate bootstrap) needs nothing more
-  # than ownership + a fresh registration attestation. An already
-  # human_anchored tenant additionally requires a fresh assertion from an
-  # ALREADY-enrolled authenticator, verified + consumed here — this is what
+  # than ownership + a fresh registration attestation, so no assertion is
+  # verified here (`{:ok, false}`). An already human_anchored tenant
+  # additionally requires a fresh assertion from an ALREADY-enrolled
+  # authenticator, verified + consumed here (`{:ok, true}`) — this is what
   # closes the "stolen role:user key grafts an attacker's own hardware onto
   # the tenant's root of trust" backdoor (docs/chain-of-custody-v2.md §9.3).
-  defp maybe_require_add_authenticator_assertion(%{trust_tier: :agent_rooted}, _params), do: :ok
+  #
+  # The returned boolean is threaded into `Enrollment.enroll/3`, which
+  # RE-ENFORCES this gate under the tenant-row lock against the authoritative
+  # (post-lock) tier — so a tenant that races from agent_rooted to
+  # human_anchored between this pre-lock read and Phase 3 still cannot enroll
+  # a backup without an assertion.
+  defp maybe_require_add_authenticator_assertion(%{trust_tier: :agent_rooted}, _params),
+    do: {:ok, false}
 
   defp maybe_require_add_authenticator_assertion(
          %{trust_tier: :human_anchored, id: tenant_id},
@@ -275,7 +288,7 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
     case Map.get(params, "reauth_assertion") do
       assertion when is_map(assertion) ->
         case Reauth.verify_and_consume(tenant_id, @add_authenticator_purpose, assertion) do
-          {:ok, _verified} -> :ok
+          {:ok, _verified} -> {:ok, true}
           {:error, _reason} -> {:error, :reauth_failed}
         end
 
@@ -321,41 +334,36 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
   defp decode_b64url(_value), do: {:error, :invalid_encoding}
 
+  # AC-26.7.2.3: friendly_name is "validated 1..120" — an over-120-byte name
+  # is REJECTED (422), never silently truncated and persisted. An absent /
+  # blank name defaults to "Authenticator". The byte cap mirrors signup's
+  # @max_friendly_name_bytes; RootAuthenticator.create_changeset/2 re-validates
+  # length 1..120 as defense in depth.
   defp friendly_name(params) do
     case Map.get(params, "friendly_name") do
       value when is_binary(value) ->
-        case value |> String.trim() |> truncate_to(@max_friendly_name_bytes) do
-          "" -> "Authenticator"
-          trimmed -> trimmed
+        trimmed = String.trim(value)
+
+        cond do
+          trimmed == "" -> {:ok, "Authenticator"}
+          byte_size(trimmed) > @max_friendly_name_bytes -> {:error, :friendly_name_too_long}
+          true -> {:ok, trimmed}
         end
 
       _ ->
-        "Authenticator"
+        {:ok, "Authenticator"}
     end
   end
 
-  defp truncate_to(string, max_bytes) when byte_size(string) <= max_bytes, do: string
-
-  defp truncate_to(string, max_bytes) do
-    string |> :binary.part(0, max_bytes) |> snap_utf8()
-  end
-
-  defp snap_utf8(bin) do
-    Enum.find_value(0..3, "", fn n ->
-      candidate = :binary.part(bin, 0, byte_size(bin) - n)
-      if String.valid?(candidate), do: candidate
-    end)
-  end
-
   # PHASE 3: the DB-only Multi (insert + guarded tier flip + audit).
-  defp complete_enroll(conn, tenant_id, verified, friendly_name) do
+  defp complete_enroll(conn, tenant_id, verified, friendly_name, assertion_verified?) do
     attrs =
       verified
       |> Map.take([:credential_id, :public_key, :attestation_format, :sign_count])
       |> Map.put(:friendly_name, friendly_name)
       |> Map.put_new(:sign_count, 0)
 
-    case Enrollment.enroll(tenant_id, attrs) do
+    case Enrollment.enroll(tenant_id, attrs, assertion_verified?) do
       {:ok, %{tenant: tenant, authenticator: auth, upgraded: upgraded}} ->
         conn
         |> put_status(:created)
@@ -375,6 +383,15 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
 
       {:error, :not_found} ->
         not_found(conn)
+
+      # The under-lock backup-enrollment gate rejected this: a concurrent
+      # first-enroll flipped the tenant to human_anchored between the
+      # controller's pre-lock read and Phase 3, so this request now needs an
+      # add_authenticator assertion it didn't supply. Same 401 as the pre-lock
+      # gate — the caller must retry WITH a fresh existing-authenticator
+      # assertion.
+      {:error, :reauth_required} ->
+        reauth_required(conn)
 
       {:error, :too_many_authenticators} ->
         too_many_authenticators(conn)
@@ -580,6 +597,18 @@ defmodule LoopctlWeb.TenantAuthenticatorController do
     conn
     |> put_status(:bad_request)
     |> json(%{error: %{status: 400, message: "Attestation payload too large"}})
+  end
+
+  defp friendly_name_too_long(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "friendly_name_too_long",
+        message: "friendly_name must be at most #{@max_friendly_name_bytes} bytes"
+      }
+    })
   end
 
   defp bad_request(conn, message) do

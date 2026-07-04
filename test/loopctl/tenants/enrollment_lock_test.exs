@@ -26,6 +26,7 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Enrollment
   alias Loopctl.Tenants.RootAuthenticator
+  alias Loopctl.Tenants.RootAuthenticators
   alias Loopctl.Tenants.Tenant
 
   setup do
@@ -109,30 +110,44 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
     assert elapsed_ms >= 150
   end
 
-  test "a concurrent double-first-enroll writes exactly one tenant_trust_upgraded entry" do
+  test "concurrent double-FIRST-enroll: exactly one succeeds, the loser is rejected :reauth_required" do
+    # SECURITY (review #1): both callers are FIRST enrollments (no
+    # add_authenticator assertion, assertion_verified? = false). They both read
+    # agent_rooted pre-lock. The one that wins the tenant-row lock flips to
+    # human_anchored + enrolls; the loser re-locks, sees human_anchored + no
+    # verified assertion, and is REJECTED :reauth_required. This models the
+    # attacker (stolen role:user key + own hardware) racing a legitimate first
+    # enroll: the attacker's device must NOT be grafted on.
     tenant = real_tenant(%{trust_tier: :agent_rooted})
     cleanup(tenant)
 
     task_a =
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
-        Enrollment.enroll(tenant.id, attestation_attrs())
+        Enrollment.enroll(tenant.id, attestation_attrs(), false)
       end)
 
     task_b =
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
-        Enrollment.enroll(tenant.id, attestation_attrs())
+        Enrollment.enroll(tenant.id, attestation_attrs(), false)
       end)
 
-    result_a = Task.await(task_a, 5_000)
-    result_b = Task.await(task_b, 5_000)
+    results = [Task.await(task_a, 5_000), Task.await(task_b, 5_000)]
 
-    assert {:ok, %{authenticator: %RootAuthenticator{}}} = result_a
-    assert {:ok, %{authenticator: %RootAuthenticator{}}} = result_b
+    successes = Enum.count(results, &match?({:ok, %{authenticator: %RootAuthenticator{}}}, &1))
+    rejected = Enum.count(results, &match?({:error, :reauth_required}, &1))
+
+    # Exactly one enrollment wins; the loser is turned away (must retry WITH an
+    # existing-authenticator assertion). NOT both-succeed.
+    assert successes == 1
+    assert rejected == 1
 
     {:ok, final_tenant} = Tenants.get_tenant(tenant.id)
     assert final_tenant.trust_tier == :human_anchored
+
+    # Exactly ONE authenticator was grafted on, and exactly ONE upgrade logged.
+    assert RootAuthenticators.count_by_tenant(tenant.id) == 1
 
     {:ok, upgraded} =
       Audit.list_entries(tenant.id, entity_type: "tenant", action: "tenant_trust_upgraded")
@@ -142,15 +157,16 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
     {:ok, enrolled} =
       Audit.list_entries(tenant.id, entity_type: "tenant", action: "authenticator_enrolled")
 
-    assert enrolled.total == 1
+    assert enrolled.total == 0
   end
 
   test "concurrent revokes on a 2-authenticator tenant do not both succeed" do
     tenant = real_tenant(%{trust_tier: :human_anchored})
     cleanup(tenant)
 
-    {:ok, %{authenticator: auth_a}} = Enrollment.enroll(tenant.id, attestation_attrs())
-    {:ok, %{authenticator: auth_b}} = Enrollment.enroll(tenant.id, attestation_attrs())
+    # Backup enrollment requires a verified assertion (assertion_verified? = true).
+    {:ok, %{authenticator: auth_a}} = Enrollment.enroll(tenant.id, attestation_attrs(), true)
+    {:ok, %{authenticator: auth_b}} = Enrollment.enroll(tenant.id, attestation_attrs(), true)
 
     task_a =
       Task.async(fn ->

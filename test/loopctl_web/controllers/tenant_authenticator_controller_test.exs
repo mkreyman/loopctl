@@ -9,6 +9,7 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
 
   import Loopctl.Fixtures
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Tenants
@@ -543,6 +544,125 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
         })
 
       assert json_response(resp, 429)["error"]["code"] == "rate_limited"
+    end
+  end
+
+  describe "friendly_name validation (AC-26.7.2.3, review #3)" do
+    test "an over-120-byte friendly_name is REJECTED 422, not silently truncated", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      client = authed(conn, raw_key)
+
+      challenge =
+        client
+        |> post(~p"/api/v1/tenants/#{tenant.id}/authenticators/challenge", %{})
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      resp =
+        client
+        |> post(
+          ~p"/api/v1/tenants/#{tenant.id}/authenticators",
+          attestation_body(challenge["challenge_id"], friendly_name: String.duplicate("a", 121))
+        )
+
+      assert json_response(resp, 422)["error"]["code"] == "friendly_name_too_long"
+      # Nothing was enrolled and the tier did NOT flip.
+      assert RootAuthenticators.count_by_tenant(tenant.id) == 0
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      assert reloaded.trust_tier == :agent_rooted
+    end
+
+    test "a 120-byte friendly_name is accepted VERBATIM (proves no truncation)", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+      client = authed(conn, raw_key)
+
+      challenge =
+        client
+        |> post(~p"/api/v1/tenants/#{tenant.id}/authenticators/challenge", %{})
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      name = String.duplicate("b", 120)
+
+      resp =
+        client
+        |> post(
+          ~p"/api/v1/tenants/#{tenant.id}/authenticators",
+          attestation_body(challenge["challenge_id"], friendly_name: name)
+        )
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      assert resp["authenticator"]["friendly_name"] == name
+    end
+  end
+
+  # review #1 regression: the residual double-first-enroll race, at the HTTP
+  # layer. Two concurrent POST .../authenticators against an agent_rooted
+  # tenant, BOTH with NO reauth_assertion (both are first-enroll attempts).
+  # Exactly one must 201 (flip to human_anchored + enroll); the loser must be
+  # rejected 401 reauth_required by the under-lock gate — it must NOT get a
+  # 201 grafting a second, possession-unproven device.
+  describe "concurrent double-first-enroll at the HTTP layer (review #1)" do
+    @tag :capture_log
+    test "exactly one 201; the loser gets 401 reauth_required, never 201", %{conn: _conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, tenant_id: tenant.id, role: :user)
+
+      # Two independent single-use challenges, issued sequentially before the race.
+      issue_challenge = fn ->
+        build_conn()
+        |> authed(raw_key)
+        |> post(~p"/api/v1/tenants/#{tenant.id}/authenticators/challenge", %{})
+        |> json_response(200)
+        |> Map.fetch!("data")
+        |> Map.fetch!("challenge_id")
+      end
+
+      challenge_a = issue_challenge.()
+      challenge_b = issue_challenge.()
+
+      parent = self()
+
+      fire = fn challenge_id ->
+        Task.async(fn ->
+          Sandbox.allow(Loopctl.Repo, parent, self())
+          Sandbox.allow(Loopctl.AdminRepo, parent, self())
+          Mox.allow(Loopctl.MockWebAuthn, parent, self())
+          Mox.allow(Loopctl.MockRateLimiter, parent, self())
+
+          build_conn()
+          |> authed(raw_key)
+          |> post(
+            ~p"/api/v1/tenants/#{tenant.id}/authenticators",
+            attestation_body(challenge_id)
+          )
+        end)
+      end
+
+      task_a = fire.(challenge_a)
+      task_b = fire.(challenge_b)
+
+      result_a = Task.await(task_a, 10_000)
+      result_b = Task.await(task_b, 10_000)
+
+      assert Enum.sort([result_a.status, result_b.status]) == [201, 401]
+
+      loser = Enum.find([result_a, result_b], &(&1.status == 401))
+      assert Jason.decode!(loser.resp_body)["error"]["code"] == "reauth_required"
+
+      # Exactly ONE device was grafted on; the tenant is human_anchored with a
+      # single upgrade entry.
+      assert RootAuthenticators.count_by_tenant(tenant.id) == 1
+      {:ok, reloaded} = Tenants.get_tenant(tenant.id)
+      assert reloaded.trust_tier == :human_anchored
+
+      {:ok, upgraded} =
+        Audit.list_entries(tenant.id, entity_type: "tenant", action: "tenant_trust_upgraded")
+
+      assert upgraded.total == 1
     end
   end
 end

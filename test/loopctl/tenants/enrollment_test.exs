@@ -29,11 +29,13 @@ defmodule Loopctl.Tenants.EnrollmentTest do
   end
 
   describe "enroll/2 — first enrollment" do
-    test "inserts the authenticator and flips agent_rooted -> human_anchored" do
+    test "inserts the authenticator and flips agent_rooted -> human_anchored (no assertion)" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
 
+      # First enrollment: locked tier is agent_rooted, so no add_authenticator
+      # assertion is required -> assertion_verified? = false is legitimate.
       assert {:ok, %{tenant: updated, authenticator: auth, upgraded: true}} =
-               Enrollment.enroll(tenant.id, attestation_attrs())
+               Enrollment.enroll(tenant.id, attestation_attrs(), false)
 
       assert updated.trust_tier == :human_anchored
       assert auth.tenant_id == tenant.id
@@ -50,11 +52,29 @@ defmodule Loopctl.Tenants.EnrollmentTest do
                Tenants.fingerprint(auth.credential_id)
     end
 
-    test "an already human_anchored tenant's first-call enroll does NOT re-flip or re-log an upgrade" do
+    test "a human_anchored tenant enroll WITHOUT a verified assertion is rejected at the enroll/3 layer" do
+      # The backup-enrollment invariant now lives UNDER THE LOCK, not only in
+      # the controller: even calling enroll/3 directly, a human_anchored tenant
+      # with assertion_verified? = false must be rejected :reauth_required and
+      # insert NO authenticator.
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+
+      assert {:error, :reauth_required} =
+               Enrollment.enroll(tenant.id, attestation_attrs(), false)
+
+      assert RootAuthenticators.count_by_tenant(tenant.id) == 0
+
+      {:ok, enrolled} =
+        Audit.list_entries(tenant.id, entity_type: "tenant", action: "authenticator_enrolled")
+
+      assert enrolled.total == 0
+    end
+
+    test "a human_anchored tenant enroll WITH a verified assertion enrolls a backup, no re-flip" do
       tenant = fixture(:tenant, %{trust_tier: :human_anchored})
 
       assert {:ok, %{tenant: updated, upgraded: false}} =
-               Enrollment.enroll(tenant.id, attestation_attrs())
+               Enrollment.enroll(tenant.id, attestation_attrs(), true)
 
       assert updated.trust_tier == :human_anchored
 
@@ -70,18 +90,31 @@ defmodule Loopctl.Tenants.EnrollmentTest do
     end
 
     test "returns {:error, :not_found} for an unknown tenant" do
-      assert {:error, :not_found} = Enrollment.enroll(Ecto.UUID.generate(), attestation_attrs())
+      assert {:error, :not_found} =
+               Enrollment.enroll(Ecto.UUID.generate(), attestation_attrs(), false)
     end
 
     test "rejects re-enrolling the same credential_id for the same tenant" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       credential_id = :crypto.strong_rand_bytes(32)
 
+      # First enroll flips agent_rooted -> human_anchored (no assertion needed).
       assert {:ok, _} =
-               Enrollment.enroll(tenant.id, attestation_attrs(%{credential_id: credential_id}))
+               Enrollment.enroll(
+                 tenant.id,
+                 attestation_attrs(%{credential_id: credential_id}),
+                 false
+               )
 
+      # Re-enroll the SAME credential on the now-human_anchored tenant, with a
+      # verified assertion (assertion_verified? = true) so the request passes
+      # the backup gate and reaches the unique-constraint violation.
       assert {:error, %Ecto.Changeset{} = changeset} =
-               Enrollment.enroll(tenant.id, attestation_attrs(%{credential_id: credential_id}))
+               Enrollment.enroll(
+                 tenant.id,
+                 attestation_attrs(%{credential_id: credential_id}),
+                 true
+               )
 
       assert %{credential_id: [_ | _]} = errors_on(changeset)
     end
@@ -93,8 +126,9 @@ defmodule Loopctl.Tenants.EnrollmentTest do
         fixture(:root_authenticator, tenant_id: tenant.id)
       end
 
+      # assertion_verified? = true so we pass the backup gate and hit the cap.
       assert {:error, :too_many_authenticators} =
-               Enrollment.enroll(tenant.id, attestation_attrs())
+               Enrollment.enroll(tenant.id, attestation_attrs(), true)
     end
   end
 
