@@ -29,6 +29,7 @@ defmodule LoopctlWeb.FallbackController do
   use LoopctlWeb, :controller
 
   alias Ecto.Changeset
+  alias Loopctl.Llm.Remediation
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
 
@@ -316,8 +317,11 @@ defmodule LoopctlWeb.FallbackController do
 
   # Epic 28 (#179): mandatory BYO — a tenant knowledge-LLM operation was blocked
   # because the tenant has no Anthropic key configured. Carries a machine-readable
-  # `code` so clients can distinguish this from other 422s and prompt the user to
-  # configure a key.
+  # `code` PLUS a structured, self-service `remediation` (naming the `set_llm_config`
+  # MCP tool, the REST endpoint, a copy-paste example, and the onboarding docs) so a
+  # stranger agent can provision its own key from the response ALONE — no human
+  # needed. Ingest is always the Anthropic path, so the missing credential is the
+  # `api_key`.
   def call(conn, {:error, :no_api_key_configured, message}) when is_binary(message) do
     conn
     |> put_status(:unprocessable_entity)
@@ -326,7 +330,7 @@ defmodule LoopctlWeb.FallbackController do
         status: 422,
         code: "no_api_key",
         message: message,
-        remediation: %{configure: "PATCH /api/v1/tenants/me/llm-config"}
+        remediation: Remediation.for_credential(:anthropic)
       }
     })
   end

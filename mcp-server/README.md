@@ -62,10 +62,55 @@ Or if installed locally:
 | `LOOPCTL_API_KEY` | Global API key override (if set, always used) | -- |
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (verify, reject, review, import) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
-| `LOOPCTL_USER_KEY` | User role API key. Required ONLY for destructive admin tools like `knowledge_bulk_publish`. Leave unset if you don't use those tools. | -- |
+| `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)) and for destructive admin tools like `knowledge_bulk_publish`. | -- |
 | `LOOPCTL_STH_STATE_PATH` | Absolute path for the witness-protocol STH cache file (see [Witness protocol](#witness-protocol-sth)). Optional. | per-(server + key) file under the OS temp dir |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
+
+## First-time setup — provision your BYO LLM keys
+
+**loopctl is agent-native and strictly BYO (bring-your-own-keys).** loopctl fronts
+**no** LLM cost — the knowledge wiki runs entirely on *your* provider keys, which you
+provision once and which bill you directly. Two SEPARATE keys power two capabilities:
+
+| Key | Provider | Powers | Missing ⇒ |
+|---|---|---|---|
+| `api_key` | Anthropic | knowledge **ingest** — extraction, classification, merge synthesis | `knowledge_ingest` returns **422** (`code: no_api_key`) |
+| `embedding_api_key` | OpenAI-compatible | article **embeddings + semantic search** | `knowledge_search` silently degrades to **keyword-only** (`meta.fallback_reason: no_embedding_key`) |
+
+Both keys are stored **encrypted** and are **never returned** by any tool. You can set
+per-operation model overrides (`extraction_model`, `classification_model`,
+`merge_model`, `embedding_model`); each defaults server-side when omitted.
+
+### The smooth path (once, at onboarding)
+
+1. **Sign up** and obtain your keys. Tenant signup is anchored to a hardware
+   authenticator (WebAuthn) — the one human touch. Signup mints your **user-role**
+   API key. Also grab your **agent** and **orchestrator** keys for day-to-day work.
+2. **Set the env** in your `.mcp.json` (see [Configuration](#configuration)):
+   `LOOPCTL_SERVER`, `LOOPCTL_USER_KEY` (needed for this step), plus `LOOPCTL_AGENT_KEY`
+   / `LOOPCTL_ORCH_KEY`.
+3. **Provision both keys in one call** (uses `LOOPCTL_USER_KEY`):
+
+   ```
+   set_llm_config({ api_key: "sk-ant-...", embedding_api_key: "sk-..." })
+   ```
+
+   Partial-merge: you can set or rotate one key at a time; omitting a key leaves the
+   existing one untouched. Optionally pass model overrides in the same call.
+4. **You're live.** `knowledge_ingest` extracts articles and `knowledge_search`
+   (combined/semantic) ranks by meaning. Check status anytime with
+   `llm_config` (reports `has_api_key` / `has_embedding_key` + masked last-4 hints,
+   never the key).
+
+### Self-healing: you can't get stuck
+
+If you call `knowledge_ingest` or `knowledge_search` **before** provisioning, the
+tool result **leads with an `ACTION REQUIRED` notice** and a machine-readable
+`remediation` object — naming the `set_llm_config` tool, a copy-paste example, the
+REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (or an
+autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
+[`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
 ## Tools (72)
 
@@ -177,7 +222,7 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 | `knowledge_drafts` | List draft (unpublished) knowledge articles with pagination. Optional: `limit` (default 20, max 1000 — over-max → 400, no silent clamp), `offset` (default 0), `project_id`. Returns `meta.total_count`. |
 | `knowledge_lint` | Run a lint check on the knowledge wiki to identify stale or low-coverage articles. Optional: `project_id`, `stale_days`, `min_coverage`, `max_per_category` (default 50, max 500). True totals returned in `summary.total_per_category`. |
 | `knowledge_export` | Export all knowledge articles as an OKF v0.1 bundle (gzipped tar archive, unbounded, bounded-memory streaming, fail-closed). Returns a curl command for direct download — **the download requires `LOOPCTL_USER_KEY`** (an orchestrator key would 403). Pass `format=json` for buffered in-memory JSON (convenience tool for file writers; capped at `export_max_buffered_export_articles` — returns 413 if over-cap). Optional: `project_id`, `format` (`tar.gz` default or `json`). |
-| `knowledge_ingest` | Submit a URL or raw content for knowledge extraction. Enqueues an Oban job. Extracted articles are **drafts by default** (lower-trust LLM output); pass `publish: true` to publish on extraction. Required: `source_type`. One of: `url` or `content`. Optional: `project_id`, `publish`. |
+| `knowledge_ingest` | Submit a URL or raw content for knowledge extraction. Enqueues an Oban job. Extracted articles are **drafts by default** (lower-trust LLM output); pass `publish: true` to publish on extraction. **BYO:** runs on the tenant's own Anthropic key — a keyless tenant gets a 422 whose result leads with an `ACTION REQUIRED` notice pointing at `set_llm_config` (see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)). Required: `source_type`. One of: `url` or `content`. Optional: `project_id`, `publish`. |
 | `knowledge_ingest_batch` | Submit up to 50 ingestion items in a single request. Each item has the same shape as `knowledge_ingest` (incl. `publish`). Returns per-item results. Required: `items`. Optional: batch-level `project_id` / `publish` defaults. |
 | `knowledge_ingestion_jobs` | List recent content ingestion jobs (last 7 days, max 50). |
 
@@ -185,8 +230,8 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 | Tool | Description |
 |---|---|
-| `llm_config` | Get the tenant's BYO Anthropic LLM config: per-operation models, `has_api_key`, and a masked last-4 hint. Never returns the key. Requires **user** key. |
-| `set_llm_config` | Set/rotate the tenant's OWN Anthropic API key (stored encrypted, never returned) + the three per-operation models (`extraction_model`/`classification_model`/`merge_model`). Any subset; omitting `api_key` leaves it untouched. Requires **user** key. |
+| `llm_config` | **Check your onboarding status.** Get the tenant's BYO LLM config: per-operation models and whether each key is set — `has_api_key` (Anthropic) / `has_embedding_key` (OpenAI embedding) — plus masked last-4 hints. Never returns a key. Requires **user** key. |
+| `set_llm_config` | **First-time setup (do once).** Set/rotate the tenant's OWN **Anthropic `api_key`** (powers ingest) AND **OpenAI `embedding_api_key`** (powers semantic search) — both stored encrypted, never returned — plus the per-operation models (`extraction_model`/`classification_model`/`merge_model`/`embedding_model`). Any subset; partial-merge (omitting a key leaves it untouched). See [First-time setup](#first-time-setup--provision-your-byo-llm-keys). Requires **user** key. |
 | `knowledge_llm_usage` | Per-tenant LLM token-usage summary, grouped by operation + model + source_type + day over an optional `from`/`to` range (defaults to a 90-day lookback; effective window echoed in `meta.from`/`meta.to`), with `limit`/`offset` pagination. Record-only (no budget enforcement). Requires orchestrator key. |
 
 ### Knowledge Analytics Tools (orchestrator key)

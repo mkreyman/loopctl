@@ -231,6 +231,46 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
       assert body["meta"]["fallback"] == true
     end
 
+    test "keyless-embedding fallback surfaces meta.remediation naming set_llm_config (no secret)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Keyword Findable Article",
+        body: "Content about pagination that keyword search can find.",
+        category: :pattern,
+        status: :published,
+        tags: ["pagination"]
+      })
+
+      # A missing embedding key (mandatory BYO) — sanitizes to the actionable
+      # "no_embedding_key" tag, unlike the generic ":service_unavailable" above.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/context", %{query: "pagination"})
+        |> json_response(200)
+
+      assert body["meta"]["fallback"] == true
+      assert body["meta"]["fallback_reason"] == "no_embedding_key"
+
+      # Self-service remediation mirrors /knowledge/search: name the set_llm_config
+      # MCP tool + the missing embedding credential, and NEVER a secret.
+      remediation = body["meta"]["remediation"]
+      assert remediation["action"] == "configure_llm"
+      assert remediation["missing"] == ["embedding_api_key"]
+      assert remediation["mcp_tool"] == "set_llm_config"
+      assert remediation["api"] == "PATCH /api/v1/tenants/me/llm-config"
+      assert remediation["example"] =~ "embedding_api_key"
+      refute inspect(body) =~ ~r/sk-[A-Za-z0-9]{8}/
+    end
+
     test "missing query returns 400", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

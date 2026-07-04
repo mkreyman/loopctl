@@ -13,6 +13,8 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   Full article body is never included.
   """
 
+  alias Loopctl.Llm.Remediation
+
   @max_snippet_length 300
 
   @doc "Renders search results with unified score field and truncated snippets."
@@ -157,6 +159,13 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # `fallback_reason` (#297): a stable, non-sensitive tag naming WHY combined/semantic
     # degraded to keyword_only (present only alongside `fallback: true`).
     |> maybe_put(:fallback_reason, meta[:fallback_reason])
+    # `remediation`: when the degradation is a MISSING embedding key
+    # (`fallback_reason == "no_embedding_key"`), attach a machine-readable,
+    # secret-free next-step so the agent can enable semantic ranking WITHOUT a
+    # human — naming the `set_llm_config` MCP tool + the REST endpoint. Absent for
+    # transient/provider fallbacks (a key IS configured there, so "configure a key"
+    # would be wrong).
+    |> maybe_put(:remediation, Remediation.for_fallback_reason(meta[:fallback_reason]))
     # `semantic_result_count` (#297): rows the semantic half contributed in combined
     # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
     # from a keyword_only fallback.

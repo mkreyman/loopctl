@@ -3,12 +3,14 @@ defmodule LoopctlWeb.TenantOnboardingLive do
   US-26.0.1 — post-signup onboarding checklist.
 
   Rendered after a tenant completes the WebAuthn signup ceremony. Walks
-  the operator through the first four setup steps:
+  the operator through the first setup steps:
 
   1. Audit key generation (US-26.0.2)
-  2. System article tour
-  3. First project creation
-  4. First agent registration
+  2. Provision BYO LLM keys (the step right after the human-anchored signup;
+     see `docs/onboarding-agent-tenant.md`)
+  3. System article tour
+  4. First project creation
+  5. First agent registration
 
   This LiveView is intentionally a skeleton: the individual step
   completion is tracked on the tenant's `settings.onboarding` jsonb
@@ -25,6 +27,15 @@ defmodule LoopctlWeb.TenantOnboardingLive do
       title: "Generate audit signing key",
       body:
         "Creates the ed25519 keypair that signs every audit chain entry for this tenant (US-26.0.2)."
+    },
+    %{
+      key: "provision_llm_keys",
+      title: "Provision your BYO LLM keys",
+      body:
+        "loopctl is strictly BYO — it fronts no LLM cost. Provision your own Anthropic + " <>
+          "OpenAI embedding keys once via the set_llm_config MCP tool " <>
+          "(PATCH /api/v1/tenants/me/llm-config). Until then, knowledge ingest 422s and " <>
+          "semantic search degrades to keyword-only. See docs/onboarding-agent-tenant.md."
     },
     %{
       key: "system_article_tour",

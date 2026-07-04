@@ -816,6 +816,8 @@ defmodule LoopctlWeb.SignupLiveTest do
 
       assert html =~ "Onboarding Target"
       assert html =~ "Generate audit signing key"
+      assert html =~ "Provision your BYO LLM keys"
+      assert html =~ "set_llm_config"
       assert html =~ "Create your first project"
       assert html =~ "Register your first agent"
     end
