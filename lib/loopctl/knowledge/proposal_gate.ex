@@ -26,13 +26,10 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
   require Logger
 
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.VectorSearch
-
-  @embedding_client Application.compile_env(
-                      :loopctl,
-                      :embedding_client,
-                      Loopctl.Knowledge.EmbeddingClient
-                    )
+  alias Loopctl.Llm
+  alias Loopctl.Llm.ProviderError
 
   @default_duplicate_threshold 0.97
   @default_overlap_threshold 0.88
@@ -49,7 +46,11 @@ defmodule Loopctl.Knowledge.ProposalGate do
     dup = config(:knowledge_proposal_duplicate_threshold, @default_duplicate_threshold)
     overlap = config(:knowledge_proposal_overlap_threshold, @default_overlap_threshold)
 
-    case @embedding_client.generate_embedding(tenant_id, build_text(attrs)) do
+    # Route through the GUARDED embedding path (review #4): tenant-scoped circuit
+    # breaker + timeout, so a provider outage fast-fails here (this runs SYNCHRONOUSLY
+    # in the HTTP write path) instead of hammering a dead provider and risking an LB
+    # timeout.
+    case Knowledge.generate_embedding(tenant_id, build_text(attrs)) do
       {:ok, vector} when is_list(vector) and vector != [] ->
         neighbors =
           VectorSearch.nearest(tenant_id, vector, @neighbors_k,
@@ -60,8 +61,19 @@ defmodule Loopctl.Knowledge.ProposalGate do
         score = neighbors |> List.first() |> neighbor_score()
         %{verdict: classify(score, dup, overlap), score: score, neighbors: neighbors}
 
+      {:error, :no_api_key} ->
+        # Mandatory BYO: keyless tenant — fall open (never block write-back) and audit
+        # the block for a consistent trail with the worker/Anthropic paths (review #9).
+        Llm.record_blocked(tenant_id, :embedding)
+        open_verdict()
+
       other ->
-        Logger.warning("ProposalGate: embedding failed, falling open: #{inspect(other)}")
+        # NEVER inspect the raw tuple (review #2): a provider error body can echo a
+        # masked key fragment. Log only a value-free tag.
+        Logger.warning(
+          "ProposalGate: embedding failed, falling open (#{ProviderError.log_tag(other)})"
+        )
+
         open_verdict()
     end
   end

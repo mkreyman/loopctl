@@ -180,6 +180,28 @@ defmodule Loopctl.Llm do
   end
 
   @doc """
+  Whether a (sanitized) provider error is PERMANENT — it will never succeed on
+  retry, so a worker should `{:discard}` rather than burn its Oban attempts on it
+  (review #5). A 4xx response is a bad/revoked key or malformed request (permanent)
+  EXCEPT 408 (request timeout) and 429 (rate limit), which are transient. Everything
+  else (5xx, transport, timeout, crash) is transient.
+  """
+  @spec permanent_provider_error?(term()) :: boolean()
+  def permanent_provider_error?({:api_error, status, _}) when status in [408, 429], do: false
+
+  def permanent_provider_error?({:api_error, status, _})
+      when is_integer(status) and status >= 400 and status < 500,
+      do: true
+
+  def permanent_provider_error?({:api_error, status}) when status in [408, 429], do: false
+
+  def permanent_provider_error?({:api_error, status})
+      when is_integer(status) and status >= 400 and status < 500,
+      do: true
+
+  def permanent_provider_error?(_other), do: false
+
+  @doc """
   Records that a tenant LLM `operation` was BLOCKED for a missing BYO key
   (review #2 — the mandatory-BYO cutover needs observability). Emits a
   `Logger.warning`, a `[:loopctl, :llm, :blocked]` telemetry event, and an
@@ -189,8 +211,8 @@ defmodule Loopctl.Llm do
   @spec record_blocked(Ecto.UUID.t(), operation()) :: :ok
   def record_blocked(tenant_id, operation) when is_binary(tenant_id) do
     Logger.warning(
-      "Loopctl.Llm: tenant=#{tenant_id} blocked op=#{operation} — no Anthropic API key " <>
-        "configured (mandatory BYO)."
+      "Loopctl.Llm: tenant=#{tenant_id} blocked op=#{operation} — no " <>
+        "#{blocked_credential(operation)} configured (mandatory BYO)."
     )
 
     :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{
@@ -214,6 +236,12 @@ defmodule Loopctl.Llm do
       Logger.error("Loopctl.Llm.record_blocked failed: #{Exception.message(e)}")
       :ok
   end
+
+  # The two BYO credentials are SEPARATE — name the right one in the block log so an
+  # operator isn't misled into checking the Anthropic key for an embedding block
+  # (review MED #3). The structured audit already carries the exact operation.
+  defp blocked_credential(:embedding), do: "embedding API key"
+  defp blocked_credential(_anthropic_op), do: "Anthropic API key"
 
   @doc """
   A safe view of the tenant's settings for API responses: the model choices,

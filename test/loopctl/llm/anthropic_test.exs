@@ -38,15 +38,45 @@ defmodule Loopctl.Llm.AnthropicTest do
     refute log =~ @secret
   end
 
-  test "never logs the api_key on the 200-unexpected-shape branch" do
+  test "sanitizes the 200-unexpected-shape body (never leaks a key fragment) (review CRIT #1)" do
     tenant = tenant_with_key()
 
+    # A misconfigured/compromised endpoint can return HTTP 200 with an error-shaped
+    # body echoing a masked key fragment. The 200-shape branch must sanitize it just
+    # like a non-200 — the returned term is value-free and the fragment never leaks
+    # (into the error term that becomes an Oban reason, nor the log).
+    masked = "sk-ant-...LEAK200"
+
     Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
-      Req.Test.json(conn, %{"unexpected" => true})
+      Req.Test.json(conn, %{"error" => %{"message" => "Invalid x-api-key header: #{masked}"}})
     end)
 
-    log = capture_log(fn -> assert {:error, {:api_error, 200, _}} = run(tenant) end)
+    log =
+      capture_log(fn ->
+        assert {:error, {:api_error, 200, :provider_error}} = run(tenant)
+      end)
+
     refute log =~ @secret
+    refute log =~ masked
+  end
+
+  test "sanitizes the non-200 body to the exact value-free term (review #11)" do
+    tenant = tenant_with_key()
+    masked = "sk-ant-...LEAK401"
+
+    Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+      conn
+      |> Plug.Conn.put_status(401)
+      |> Req.Test.json(%{"error" => %{"message" => "Invalid x-api-key header: #{masked}"}})
+    end)
+
+    log =
+      capture_log(fn ->
+        assert {:error, {:api_error, 401, :provider_error}} = run(tenant)
+      end)
+
+    refute log =~ @secret
+    refute log =~ masked
   end
 
   test "never logs the api_key on the non-200 branch" do

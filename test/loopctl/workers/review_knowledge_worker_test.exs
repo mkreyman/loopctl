@@ -606,4 +606,46 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorkerTest do
       assert log.new_state["article_count"] == 1
     end
   end
+
+  # --- Provider-error sanitization at the worker boundary (review #5) ---
+
+  describe "provider-error sanitization" do
+    test "a key-bearing api_error becomes a value-free Oban discard reason" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+      masked = "sk-ant-...WXYZ-LEAK"
+
+      # A 4xx (permanent) provider error whose body echoes a masked key fragment.
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:error, {:api_error, 401, "Invalid x-api-key header: #{masked}"}}
+      end)
+
+      result =
+        ReviewKnowledgeWorker.perform(%Oban.Job{
+          args: %{"review_record_id" => review_record.id, "tenant_id" => tenant.id}
+        })
+
+      # Permanent -> discard, but the reason is sanitized (no body, no key fragment).
+      assert {:discard, {:api_error, 401, :provider_error}} = result
+      refute inspect(result) =~ masked
+    end
+
+    test "a transient 5xx api_error becomes a value-free Oban error reason" do
+      %{tenant: tenant} = setup_tenant()
+      review_record = create_review_record(tenant.id)
+      masked = "sk-ant-...5XX-LEAK"
+
+      expect(Loopctl.MockExtractor, :extract_articles, fn _tenant_id, _ctx ->
+        {:error, {:api_error, 503, "upstream error for key #{masked}"}}
+      end)
+
+      result =
+        ReviewKnowledgeWorker.perform(%Oban.Job{
+          args: %{"review_record_id" => review_record.id, "tenant_id" => tenant.id}
+        })
+
+      assert {:error, {:api_error, 503, :provider_error}} = result
+      refute inspect(result) =~ masked
+    end
+  end
 end

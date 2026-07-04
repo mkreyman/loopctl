@@ -28,6 +28,10 @@ defmodule Loopctl.Application do
       # US-27.16: owns the ETS table tracking in-flight streaming-export slots so a
       # crashed exporter's slot is reclaimed (concurrency cap, AC-27.16.6).
       Loopctl.Knowledge.ExportConcurrency,
+      # Owns the per-tenant embedding circuit-breaker ETS table so it has a STABLE,
+      # long-lived owner (it would otherwise be created by a transient request/job/Task
+      # and vanish when that process died — silently resetting the breaker).
+      Loopctl.Knowledge.EmbeddingCircuitBreaker,
       LoopctlWeb.Endpoint
     ]
 

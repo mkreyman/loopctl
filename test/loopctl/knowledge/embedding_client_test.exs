@@ -89,20 +89,49 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
     refute_received {:auth, ["Bearer test-openai-key-BBBB"]}
   end
 
-  test "never logs the embedding api_key (success + error branches)" do
+  test "never logs the embedding api_key on the SUCCESS branch (review #14)" do
     tenant = fixture(:tenant)
-    secret = "test-openai-key-NEVERLOG-#{System.unique_integer([:positive])}"
+    secret = "test-openai-key-SUCCESS-NEVERLOG-#{System.unique_integer([:positive])}"
     set_embedding_key(tenant, secret)
 
     Req.Test.stub(EmbeddingClient, fn conn ->
-      conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      Req.Test.json(conn, %{
+        "data" => [%{"embedding" => [0.5, 0.5]}],
+        "usage" => %{"prompt_tokens" => 3, "total_tokens" => 3}
+      })
     end)
 
     log =
       capture_log(fn ->
-        assert {:error, {:api_error, 500, _}} = EmbeddingClient.generate_embedding(tenant.id, "x")
+        assert {:ok, [0.5, 0.5]} = EmbeddingClient.generate_embedding(tenant.id, "x")
       end)
 
     refute log =~ secret
+  end
+
+  test "never logs the embedding api_key on the error branch, and DROPS the body (review #3)" do
+    tenant = fixture(:tenant)
+    secret = "test-openai-key-NEVERLOG-#{System.unique_integer([:positive])}"
+    set_embedding_key(tenant, secret)
+
+    # A realistic OpenAI 401 body that echoes a masked key fragment — it must never
+    # reach the returned error term (which becomes an Oban error) nor the logs.
+    masked = "test-openai-...ZXY9"
+
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      conn
+      |> Plug.Conn.put_status(401)
+      |> Req.Test.json(%{"error" => %{"message" => "Incorrect API key provided: #{masked}"}})
+    end)
+
+    log =
+      capture_log(fn ->
+        # Sanitized: value-free {:api_error, 401, :provider_error} — no body.
+        assert {:error, {:api_error, 401, :provider_error}} =
+                 EmbeddingClient.generate_embedding(tenant.id, "x")
+      end)
+
+    refute log =~ secret
+    refute log =~ masked
   end
 end

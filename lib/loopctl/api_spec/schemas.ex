@@ -2773,7 +2773,7 @@ defmodule Loopctl.ApiSpec.Schemas do
               day: %Schema{type: :string, format: :"date-time"},
               operation: %Schema{
                 type: :string,
-                enum: ["extraction", "classification", "merge"]
+                enum: ["extraction", "classification", "merge", "embedding"]
               },
               model: %Schema{type: :string},
               source_type: %Schema{type: :string, nullable: true},

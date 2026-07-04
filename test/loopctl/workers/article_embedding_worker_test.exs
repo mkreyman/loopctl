@@ -86,14 +86,20 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
         |> Ecto.Changeset.change(%{status: :published})
         |> Loopctl.AdminRepo.update!()
 
+      # A transient 5xx whose body echoes a key fragment: the worker retries
+      # ({:error, _}) but the reason that lands in oban_jobs.errors is SANITIZED
+      # (review #5) — the body is dropped, only the status remains.
       expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
-        {:error, {:api_error, 500, "Internal Server Error"}}
+        {:error, {:api_error, 500, "Internal Server Error: key sk-...LEAK"}}
       end)
 
-      assert {:error, {:api_error, 500, "Internal Server Error"}} =
-               ArticleEmbeddingWorker.perform(%Oban.Job{
-                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
-               })
+      result =
+        ArticleEmbeddingWorker.perform(%Oban.Job{
+          args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+        })
+
+      assert {:error, {:api_error, 500, :provider_error}} = result
+      refute inspect(result) =~ "LEAK"
     end
   end
 
@@ -335,22 +341,43 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
   # --- Mandatory BYO: a keyless tenant gets a clean discard, never a crash ---
 
+  defp create_draft_then_publish(tenant_id, attrs) do
+    {:ok, article} =
+      Knowledge.create_article(
+        tenant_id,
+        Map.merge(%{category: :pattern, status: :draft}, attrs)
+      )
+
+    article
+    |> Ecto.Changeset.change(%{status: :published})
+    |> Loopctl.AdminRepo.update!()
+  end
+
   describe "mandatory BYO embeddings" do
-    test "discards {:no_embedding_key, id} when the tenant has no embedding key" do
+    test "discards {:no_embedding_key, id} + emits telemetry when the tenant has no key" do
       %{tenant: tenant} = setup_tenant()
 
-      {:ok, article} =
-        Knowledge.create_article(tenant.id, %{
+      article =
+        create_draft_then_publish(tenant.id, %{
           title: "Keyless Tenant Article",
-          body: "This tenant configured no embedding key.",
-          category: :pattern,
-          status: :draft
+          body: "This tenant configured no embedding key."
         })
 
-      article =
-        article
-        |> Ecto.Changeset.change(%{status: :published})
-        |> Loopctl.AdminRepo.update!()
+      # Attach a telemetry handler and assert the skip signal fires with tenant_id (#15).
+      ref = make_ref()
+      handler_id = "test-skip-#{inspect(ref)}"
+      parent = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :embedding, :skipped_no_key],
+        fn _event, measurements, metadata, _cfg ->
+          send(parent, {:telemetry, ref, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
 
       # The embedding client refuses to call the provider for a keyless tenant.
       expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
@@ -364,9 +391,92 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorkerTest do
 
       assert article_id == article.id
 
+      assert_received {:telemetry, ^ref, %{count: 1}, %{tenant_id: tenant_id}}
+      assert tenant_id == tenant.id
+
       # No embedding was stored (the article stays created, just not vector-searchable).
       {:ok, loaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
       assert loaded.embedding == nil
+    end
+  end
+
+  # --- Permanent-error discard: a revoked/invalid key (4xx) isn't retried (#5) ---
+
+  describe "permanent provider errors" do
+    test "discards on a 4xx (bad/revoked key) instead of retrying" do
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Revoked Key Article",
+          body: "The tenant's embedding key was revoked."
+        })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 401, :provider_error}}
+      end)
+
+      assert {:discard, {:embedding_permanent_error, {:api_error, 401, _}}} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+    end
+
+    test "retries (returns {:error, _}) on a transient 5xx" do
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Transient Error Article",
+          body: "The provider had a hiccup."
+        })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 500, :provider_error}}
+      end)
+
+      assert {:error, {:api_error, 500, _}} =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+    end
+  end
+
+  # --- Idempotency: a retry with unchanged content never re-calls the provider (#12) ---
+
+  describe "idempotent re-runs" do
+    test "skips the paid provider when the article is already embedded for this content" do
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_draft_then_publish(tenant.id, %{
+          title: "Already Embedded Article",
+          body: "Content that will be embedded exactly once."
+        })
+
+      # First run: the provider IS called (exactly once) and the embedding is stored.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 1, fn _tenant_id, _text ->
+        {:ok, List.duplicate(0.25, 1536)}
+      end)
+
+      assert :ok =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      # Second run (a retry for the SAME content): the provider must NOT be called
+      # again — the stored content-hash matches, so it's an idempotent no-op.
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, 0, fn _tenant_id, _text ->
+        flunk("provider must not be re-called for already-embedded content")
+      end)
+
+      assert :ok =
+               ArticleEmbeddingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => article.id, "tenant_id" => tenant.id}
+               })
+
+      {:ok, loaded} = Knowledge.get_article_with_embedding(tenant.id, article.id)
+      assert loaded.embedding != nil
     end
   end
 end

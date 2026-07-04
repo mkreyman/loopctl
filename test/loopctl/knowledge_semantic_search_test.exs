@@ -388,7 +388,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "falls back to keyword-only when embedding generation fails" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -451,7 +451,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "accepts weights that sum to 1.0 within tolerance" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -493,7 +493,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "semantic-heavy weight favors semantically close results" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       # "Exact Match" has keyword match on "deployment" + far embedding
       _exact_match =
@@ -570,7 +570,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "falls back after 3 consecutive failures within 60 seconds" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -599,7 +599,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "circuit breaker resets after success" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -636,13 +636,133 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     end
   end
 
+  # --- Per-tenant circuit breaker + error classification (BYO review #1/#6) ---
+
+  describe "generate_embedding/3 - per-tenant circuit breaker" do
+    test "a keyless tenant's :no_api_key NEVER trips the breaker" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      for _i <- 1..5 do
+        assert {:error, :no_api_key} = Knowledge.generate_embedding(tenant.id, "q")
+      end
+
+      # A subsequent successful call still reaches the client — proving the breaker
+      # was never opened by the config-gap errors (an open breaker would short-circuit
+      # to {:error, :circuit_open} WITHOUT calling the client).
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:ok, _vec} = Knowledge.generate_embedding(tenant.id, "q")
+    end
+
+    test "a 4xx (per-tenant credential/quota) NEVER trips the breaker" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 401, :provider_error}}
+      end)
+
+      for _i <- 1..5 do
+        assert {:error, {:api_error, 401, _}} = Knowledge.generate_embedding(tenant.id, "q")
+      end
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:ok, _vec} = Knowledge.generate_embedding(tenant.id, "q")
+    end
+
+    test "5xx failures DO open the breaker (and short-circuit further calls)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 500, :provider_error}}
+      end)
+
+      for _i <- 1..3 do
+        assert {:error, {:api_error, 500, _}} = Knowledge.generate_embedding(tenant.id, "q")
+      end
+
+      # Breaker is now open for THIS tenant: the next call short-circuits without
+      # touching the client (which would otherwise return {:ok, _}).
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "q")
+    end
+
+    test "tenant A's 5xx failures do NOT degrade tenant B's search (the #1 repro)" do
+      %{tenant: a} = setup_tenant()
+      %{tenant: b} = setup_tenant()
+      Knowledge.reset_circuit_breaker(a.id)
+      Knowledge.reset_circuit_breaker(b.id)
+
+      # A always 5xx-fails; B always succeeds.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn tenant_id, _text ->
+        if tenant_id == a.id do
+          {:error, {:api_error, 500, :provider_error}}
+        else
+          {:ok, make_embedding(:query)}
+        end
+      end)
+
+      # Trip A's breaker.
+      for _i <- 1..3 do
+        assert {:error, {:api_error, 500, _}} = Knowledge.generate_embedding(a.id, "q")
+      end
+
+      # A is now circuit-open...
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(a.id, "q")
+
+      # ...but B is completely unaffected — its breaker is independent.
+      assert {:ok, _vec} = Knowledge.generate_embedding(b.id, "q")
+    end
+
+    test "concurrent failures for one tenant reliably open the breaker (atomic window #2)" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 500, :provider_error}}
+      end)
+
+      # Fire many failures for the SAME tenant CONCURRENTLY. With a non-atomic
+      # window reset (the pre-fix TOCTOU) a parallel reset-to-0 could wipe an
+      # increment and delay the breaker; the period-keyed atomic counter must count
+      # them all and open reliably.
+      1..12
+      |> Task.async_stream(fn _ -> Knowledge.generate_embedding(tenant.id, "q") end,
+        max_concurrency: 8,
+        timeout: 10_000
+      )
+      |> Stream.run()
+
+      # Even a single successful call now must be short-circuited — the breaker is open.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:error, :circuit_open} = Knowledge.generate_embedding(tenant.id, "q")
+    end
+  end
+
   # --- Score normalization edge case ---
 
   describe "score normalization" do
     test "all equal scores normalize to 1.0" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       # Create multiple articles with identical embeddings
       for i <- 1..3 do
@@ -689,7 +809,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "combined search includes search_mode: combined on success" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -709,7 +829,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "combined search includes search_mode: keyword_only on fallback" do
       %{tenant: tenant} = setup_tenant()
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       fixture(:article, %{
         tenant_id: tenant.id,
@@ -847,7 +967,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         {:ok, make_embedding(:query)}
       end)
 
-      Knowledge.reset_circuit_breaker()
+      Knowledge.reset_circuit_breaker(tenant.id)
 
       {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "hub")
 

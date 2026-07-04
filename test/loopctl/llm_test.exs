@@ -7,6 +7,7 @@ defmodule Loopctl.LlmTest do
   alias Loopctl.Llm.TenantLlmSettings
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   describe "upsert_settings/2 + resolve/2" do
     test "stores models + key and resolves the per-operation model + decrypted key" do
@@ -467,6 +468,26 @@ defmodule Loopctl.LlmTest do
       assert %{data: []} = Llm.usage_summary(a.id, [])
       %{data: rows_b} = Llm.usage_summary(b.id, [])
       assert Enum.any?(rows_b, &(&1.operation == :embedding))
+    end
+  end
+
+  describe "record_blocked/2 log text names the right credential (review #3)" do
+    test ":embedding names the embedding key, not the Anthropic key" do
+      tenant = fixture(:tenant)
+
+      log = capture_log(fn -> assert :ok = Llm.record_blocked(tenant.id, :embedding) end)
+
+      assert log =~ "no embedding API key configured"
+      refute log =~ "no Anthropic API key configured"
+    end
+
+    test "an Anthropic operation names the Anthropic key" do
+      tenant = fixture(:tenant)
+
+      log = capture_log(fn -> assert :ok = Llm.record_blocked(tenant.id, :extraction) end)
+
+      assert log =~ "no Anthropic API key configured"
+      refute log =~ "no embedding API key configured"
     end
   end
 end

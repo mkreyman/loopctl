@@ -61,6 +61,9 @@ defmodule Loopctl.Knowledge.Article do
     field :metadata, :map, default: %{}
 
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
+    # SHA-256 hex of the exact text that produced `embedding` — the idempotency key
+    # that lets ArticleEmbeddingWorker skip re-calling the paid provider on retry.
+    field :embedding_content_hash, :string
 
     has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
     has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id
@@ -245,10 +248,11 @@ defmodule Loopctl.Knowledge.Article do
 
   An `Ecto.Changeset` with dimension validation applied when `embedding` is not nil.
   """
-  @spec embedding_changeset(%__MODULE__{}, list(number()) | nil) :: Ecto.Changeset.t()
-  def embedding_changeset(article, embedding) do
+  @spec embedding_changeset(%__MODULE__{}, list(number()) | nil, String.t() | nil) ::
+          Ecto.Changeset.t()
+  def embedding_changeset(article, embedding, content_hash \\ nil) do
     article
-    |> change(%{embedding: embedding})
+    |> change(%{embedding: embedding, embedding_content_hash: content_hash})
     |> validate_embedding_dimensions()
   end
 

@@ -595,12 +595,33 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
     case Knowledge.generate_embedding(tenant_id, q) do
-      {:ok, embedding} -> Knowledge.search_semantic(tenant_id, embedding, opts)
-      {:error, _} -> {:error, :embedding_unavailable}
+      {:ok, embedding} ->
+        Knowledge.search_semantic(tenant_id, embedding, opts)
+
+      {:error, :no_api_key} ->
+        # Mandatory BYO (review #8): a keyless tenant's explicit semantic search must
+        # NOT 503. Degrade to keyword-only with `fallback: true`, mirroring combined.
+        semantic_keyword_fallback(tenant_id, q, opts)
+
+      {:error, _} ->
+        {:error, :embedding_unavailable}
     end
   end
 
   defp execute_search(tenant_id, {:search, q}, "combined", opts) do
     Knowledge.search_combined(tenant_id, q, opts)
+  end
+
+  # Keyword-only degrade for a keyless-tenant semantic request: same shape as the
+  # combined-search fallback so clients can detect it via `meta.fallback` /
+  # `meta.search_mode`.
+  defp semantic_keyword_fallback(tenant_id, q, opts) do
+    case Knowledge.search_keyword(tenant_id, q, opts) do
+      {:ok, %{meta: meta} = result} ->
+        {:ok, %{result | meta: Map.merge(meta, %{fallback: true, search_mode: "keyword_only"})}}
+
+      other ->
+        other
+    end
   end
 end
