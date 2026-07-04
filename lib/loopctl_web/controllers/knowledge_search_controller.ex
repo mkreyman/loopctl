@@ -250,6 +250,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                      "Combined mode only (#297): rows the semantic half contributed. `0` with " <>
                        "no `fallback` means the embedding SUCCEEDED but ranking returned nothing " <>
                        "(a recall problem) — distinct from a keyword_only fallback."
+                 },
+                 remediation: %OpenApiSpex.Schema{
+                   type: :object,
+                   description:
+                     "Present ONLY when `fallback_reason == \"no_embedding_key\"`: a " <>
+                       "machine-readable, secret-free next-step so an agent can enable semantic " <>
+                       "ranking WITHOUT a human. Names the `set_llm_config` MCP tool " <>
+                       "(`mcp_tool`), the REST endpoint (`api`), the missing credential " <>
+                       "(`missing: [\"embedding_api_key\"]`), a copy-paste `example`, and the " <>
+                       "onboarding `docs`. Absent for transient/provider fallbacks (a key IS " <>
+                       "configured there)."
                  }
                }
              }

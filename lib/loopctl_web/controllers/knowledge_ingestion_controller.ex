@@ -19,7 +19,10 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   # Mandatory BYO (Epic 28, #179): extraction runs on the tenant's OWN Anthropic
   # key. Reject up front with a clear 422 so we never enqueue a job that can only
   # {:discard} for a missing key.
-  @no_api_key_message "Configure your Anthropic API key (PATCH /api/v1/tenants/me/llm-config) before ingesting content."
+  @no_api_key_message "Configure your Anthropic API key before ingesting content. " <>
+                        "loopctl is BYO — provision it ONCE via the set_llm_config MCP tool " <>
+                        "(user role), or PATCH /api/v1/tenants/me/llm-config. See the response " <>
+                        "`remediation` for the exact call."
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
 

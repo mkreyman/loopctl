@@ -295,6 +295,50 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert body["meta"]["fallback"] == true
       assert body["meta"]["search_mode"] == "keyword_only"
       assert body["meta"]["fallback_reason"] == "no_embedding_key"
+
+      # Self-service remediation: the degraded response tells the agent how to enable
+      # semantic ranking without a human — name the set_llm_config MCP tool + the
+      # missing embedding credential, and NEVER a secret.
+      remediation = body["meta"]["remediation"]
+      assert remediation["action"] == "configure_llm"
+      assert remediation["missing"] == ["embedding_api_key"]
+      assert remediation["mcp_tool"] == "set_llm_config"
+      assert remediation["api"] == "PATCH /api/v1/tenants/me/llm-config"
+      assert remediation["example"] =~ "embedding_api_key"
+      refute inspect(body) =~ ~r/sk-[A-Za-z0-9]{8}/
+    end
+
+    test "combined provider-error fallback carries NO remediation (a key IS configured)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      Loopctl.Knowledge.reset_circuit_breaker(tenant.id)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Keyword Findable Article",
+        body: "Content about pagination that keyword search can find.",
+        category: :pattern,
+        status: :published,
+        tags: ["pagination"]
+      })
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 401, "Incorrect API key provided: sk-SECRETDEADBEEF"}}
+      end)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{q: "pagination"})
+        |> json_response(200)
+
+      assert body["meta"]["fallback_reason"] == "embedding_provider_error_401"
+      # The key is configured but the provider rejected it — "configure a key" would
+      # be the wrong advice, so no remediation is attached.
+      refute Map.has_key?(body["meta"], "remediation")
     end
 
     test "filters by project_id, category, and tags", %{conn: conn} do

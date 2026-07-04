@@ -58,12 +58,25 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       assert body["error"]["code"] == "no_api_key"
       assert body["error"]["message"] =~ "Anthropic API key"
 
-      # The remediation string must name a verb+path ACTUALLY registered in the
+      # Self-service remediation: the agent must be able to onboard from the response
+      # ALONE — it names the set_llm_config MCP tool, the missing credential, a
+      # copy-paste example, and the REST endpoint.
+      remediation = body["error"]["remediation"]
+      assert remediation["action"] == "configure_llm"
+      assert remediation["missing"] == ["api_key"]
+      assert remediation["mcp_tool"] == "set_llm_config"
+      assert remediation["example"] =~ "set_llm_config"
+      assert is_binary(remediation["docs"])
+
+      # The remediation's `api` must name a verb+path ACTUALLY registered in the
       # router (review #7 — catches PUT/PATCH drift between the copy and the route).
-      [verb, path] = String.split(body["error"]["remediation"]["configure"], " ", parts: 2)
+      [verb, path] = String.split(remediation["api"], " ", parts: 2)
 
       assert route_registered?(verb, path),
              "422 remediation names #{verb} #{path}, which is not a registered route"
+
+      # Never leaks a key/secret.
+      refute inspect(body) =~ ~r/sk-[A-Za-z0-9]{8}/
     end
 
     test "POST /knowledge/ingest/batch with a keyless tenant -> 422 code no_api_key", %{

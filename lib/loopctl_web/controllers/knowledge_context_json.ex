@@ -6,6 +6,8 @@ defmodule LoopctlWeb.KnowledgeContextJSON do
   plus one-hop linked article references (lightweight: id, title, category).
   """
 
+  alias Loopctl.Llm.Remediation
+
   @doc "Renders context results with full bodies and scores."
   def context(%{results: results, meta: meta}) do
     %{
@@ -54,6 +56,10 @@ defmodule LoopctlWeb.KnowledgeContextJSON do
     # `fallback_reason` (#297): a stable, non-sensitive tag naming WHY the context's
     # underlying combined search degraded to keyword_only. Present only on fallback.
     |> maybe_put_fallback_reason(meta[:fallback_reason])
+    # `remediation`: a machine-readable, secret-free next-step when the degradation
+    # is a MISSING embedding key, so an agent can enable semantic ranking without a
+    # human. Mirrors the /knowledge/search response. Absent otherwise.
+    |> maybe_put_remediation(Remediation.for_fallback_reason(meta[:fallback_reason]))
   end
 
   defp maybe_put_fallback(map, true), do: Map.put(map, :fallback, true)
@@ -61,4 +67,7 @@ defmodule LoopctlWeb.KnowledgeContextJSON do
 
   defp maybe_put_fallback_reason(map, nil), do: map
   defp maybe_put_fallback_reason(map, reason), do: Map.put(map, :fallback_reason, reason)
+
+  defp maybe_put_remediation(map, nil), do: map
+  defp maybe_put_remediation(map, remediation), do: Map.put(map, :remediation, remediation)
 end

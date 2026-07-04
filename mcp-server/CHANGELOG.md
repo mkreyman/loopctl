@@ -5,6 +5,38 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.34.0 — 2026-07-03 (smooth agent BYO-LLM onboarding — self-healing remediation + self-documenting tools)
+
+### Added
+
+- **First-time-setup walkthrough in the README.** A prominent "First-time setup —
+  provision your BYO LLM keys" section BEFORE the tool reference walks a stranger
+  agent the whole smooth path: sign up → set env (`LOOPCTL_SERVER`,
+  `LOOPCTL_USER_KEY`, agent/orch keys) → call `set_llm_config({api_key, embedding_api_key})`
+  ONCE → ingest + semantic search work. Explains the strictly-BYO model, which key
+  powers what, the per-op model overrides, and that without keys ingest 422s and
+  search silently degrades to keyword-only.
+- **Self-healing remediation surfaced in tool results.** `knowledge_ingest`,
+  `knowledge_ingest_batch`, `knowledge_search`, and `knowledge_context` now lead
+  their result with an `ACTION REQUIRED` notice when the server reports a missing
+  BYO key — the ingest no-key 422 (`code: no_api_key`) and the search/context
+  keyword-only degrade (`meta.fallback_reason: no_embedding_key`) both carry a
+  machine-readable `remediation` naming the `set_llm_config` MCP tool, a copy-paste
+  example, the REST endpoint, and the onboarding docs. An agent that skips setup
+  reads the exact next step instead of a bare error.
+
+### Changed
+
+- **`set_llm_config` / `llm_config` descriptions rewritten to fully onboard a
+  stranger agent** — WHAT (provision your OWN Anthropic + OpenAI embedding keys, BYO,
+  stored encrypted, never returned), WHY (required before ingest/search; loopctl
+  fronts no LLM cost), WHEN (once, at signup), the required `LOOPCTL_USER_KEY`, which
+  key powers what, the partial-merge semantics, and that `llm_config` reports
+  `has_api_key` / `has_embedding_key` so an agent can CHECK its setup.
+- README tool-table rows for `llm_config` / `set_llm_config` now mention BOTH the
+  Anthropic AND embedding keys; the `LOOPCTL_USER_KEY` env row notes it is also
+  required for first-time LLM-key provisioning.
+
 ## 2.33.1 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry + cache hardening — #298)
 
 ### Security

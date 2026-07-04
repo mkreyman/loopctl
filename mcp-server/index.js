@@ -233,6 +233,51 @@ function toContentCompact(result) {
   return toContent(result);
 }
 
+/**
+ * Surface a server-emitted BYO-LLM `remediation` PROMINENTLY as a leading text
+ * block. A stranger agent that calls knowledge_ingest / knowledge_search /
+ * knowledge_context BEFORE provisioning its keys then reads the exact next step
+ * in the tool result — call set_llm_config — instead of hunting through raw JSON.
+ *
+ * The remediation lives in one of two places depending on the failure shape:
+ *   - ingest no-key 422  → result.body.error.remediation (code "no_api_key")
+ *   - search/context degrade → result.meta.remediation (fallback_reason
+ *     "no_embedding_key"); the request still returns 200 keyword-only results.
+ *
+ * Returns a notice string, or null when there is no LLM remediation to surface.
+ */
+function llmRemediationNotice(result) {
+  const rem =
+    (result &&
+      result.error === true &&
+      result.body &&
+      result.body.error &&
+      result.body.error.remediation) ||
+    (result && result.meta && result.meta.remediation) ||
+    null;
+
+  if (!rem || rem.action !== "configure_llm") return null;
+
+  const missing = Array.isArray(rem.missing) ? rem.missing.join(", ") : rem.missing;
+  return (
+    `ACTION REQUIRED — BYO LLM key not configured (missing: ${missing}). ` +
+    `${rem.message || ""} Provision it ONCE with the ${rem.mcp_tool} MCP tool, e.g. ` +
+    `${rem.example} (REST: ${rem.api}). Requires your user-role key (LOOPCTL_USER_KEY). ` +
+    `Docs: ${rem.docs}`
+  ).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * toContent, but with any BYO-LLM remediation notice prepended so it is the first
+ * thing the agent reads. Preserves isError from the underlying result.
+ */
+function withRemediationNotice(result) {
+  const base = toContent(result);
+  const notice = llmRemediationNotice(result);
+  if (!notice) return base;
+  return { ...base, content: [{ type: "text", text: notice }, ...base.content] };
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -831,7 +876,10 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, match,
   if (offset != null) params.set("offset", String(offset));
 
   const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
-  return toContent(result);
+  // If search silently degraded to keyword-only for a missing embedding key, the
+  // server attaches meta.remediation — surface it PROMINENTLY so the agent knows to
+  // call set_llm_config to enable semantic ranking.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeList({
@@ -902,7 +950,8 @@ async function knowledgeContext({
   if (conversation_id) params.set("conversation_id", conversation_id);
 
   const result = await apiCall("GET", `/api/v1/knowledge/context?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
-  return toContent(result);
+  // Same as knowledge_search: surface a missing-embedding-key remediation prominently.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeCreate({
@@ -1158,7 +1207,9 @@ async function knowledgeIngest({ url, content, source_type, project_id, publish 
   if (project_id) body.project_id = project_id;
   if (publish) body.publish = true;
   const result = await apiCall("POST", "/api/v1/knowledge/ingest", body, process.env.LOOPCTL_ORCH_KEY);
-  return toContent(result);
+  // A keyless tenant gets a 422 (code no_api_key) carrying a remediation — surface it
+  // prominently so a first-time agent knows to call set_llm_config before ingesting.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeIngestBatch({ items, project_id, publish }) {
@@ -1181,7 +1232,9 @@ async function knowledgeIngestBatch({ items, project_id, publish }) {
     { items: resolvedItems },
     process.env.LOOPCTL_ORCH_KEY
   );
-  return toContent(result);
+  // Batch ingest gates on the Anthropic key up front too — a keyless tenant gets a
+  // 422 with the same remediation; surface it prominently.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeIngestionJobs(args = {}) {
@@ -2618,7 +2671,9 @@ const TOOLS = [
       "If semantic ranking is unavailable the search transparently degrades to keyword-only " +
       "(meta.fallback: true, meta.search_mode: 'keyword_only') and now reports meta.fallback_reason " +
       "— a stable tag naming WHY (e.g. no_embedding_key, embedding_circuit_open, " +
-      "embedding_provider_error_<status>, embedding_timeout).",
+      "embedding_provider_error_<status>, embedding_timeout). When the reason is a MISSING " +
+      "embedding key (no_embedding_key), the result leads with an ACTION REQUIRED notice + " +
+      "meta.remediation telling you to provision it with set_llm_config (BYO — do it once).",
     inputSchema: {
       type: "object",
       properties: {
@@ -3296,7 +3351,10 @@ const TOOLS = [
       "Enqueues an Oban job that fetches the content (if URL), extracts knowledge articles via LLM, " +
       "and inserts them. Extracted articles are DRAFTS by default (lower-trust LLM output, staged " +
       "for review) — unlike knowledge_create which publishes by default. Pass publish:true to " +
-      "publish them on extraction. Requires orchestrator role.",
+      "publish them on extraction. Requires orchestrator role. BYO: extraction runs on the " +
+      "tenant's OWN Anthropic key — a keyless tenant gets a 422 (code no_api_key) and the " +
+      "result leads with an ACTION REQUIRED notice telling you to provision it once via " +
+      "set_llm_config.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3409,29 +3467,44 @@ const TOOLS = [
   {
     name: "llm_config",
     description:
-      "Get the tenant's BYO Anthropic + embedding configuration: the per-operation " +
-      "model choices, whether each key is configured (has_api_key / has_embedding_key), " +
-      "and masked last-4 hints. NEVER returns a key itself. Requires user role " +
-      "(LOOPCTL_USER_KEY).",
+      "CHECK your BYO LLM onboarding status. Returns this tenant's per-operation model " +
+      "choices and whether each key is configured — `has_api_key` (Anthropic, powers " +
+      "ingest) and `has_embedding_key` (OpenAI embedding, powers semantic search) — plus " +
+      "masked last-4 hints. NEVER returns a key itself. Call this BEFORE ingest/search to " +
+      "confirm setup, or after set_llm_config to verify it took. Uses your user-role key " +
+      "(LOOPCTL_USER_KEY, obtained at signup); managing tenant secrets is user-only, so an " +
+      "agent/orchestrator key is rejected.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "set_llm_config",
     description:
-      "Set/rotate the tenant's OWN Anthropic API key AND OpenAI embedding key (both " +
-      "stored encrypted, never returned) and the per-operation models " +
-      "(extraction/classification/merge/embedding). loopctl fronts no cost — the " +
-      "tenant's keys bill the tenant. Mandatory BYO for embeddings: without an " +
-      "embedding_api_key the tenant's articles are not vector-searchable. Any subset " +
-      "of fields may be sent; omitting a key leaves the existing key untouched. Model " +
-      "ids are free-form (any model the key permits). Requires user role " +
-      "(LOOPCTL_USER_KEY).",
+      "FIRST-TIME SETUP — do this ONCE, right after signup, to bring the wiki online. " +
+      "Provision your OWN Anthropic + OpenAI embedding keys so knowledge ingest AND " +
+      "semantic search work. loopctl is strictly BYO: it fronts NO LLM cost — your keys " +
+      "bill you directly and are stored ENCRYPTED, never returned. WHY it's required: with " +
+      "no `api_key`, knowledge_ingest returns 422 (code no_api_key); with no " +
+      "`embedding_api_key`, knowledge_search silently degrades to keyword-only " +
+      "(meta.fallback_reason: no_embedding_key) — both responses carry a `remediation` " +
+      "pointing back to THIS tool. WHICH key powers WHAT: `api_key` (Anthropic) → ingest " +
+      "extraction / classification / merge synthesis; `embedding_api_key` " +
+      "(OpenAI-compatible) → article embeddings + semantic ranking. All params are optional " +
+      "and partial-merge — omitting a key leaves the existing one untouched, so you can set " +
+      "or rotate one at a time. The per-operation model overrides " +
+      "(extraction_model / classification_model / merge_model / embedding_model) are " +
+      "free-form (any model the key permits) and default server-side when omitted. Typical " +
+      'onboarding call: set_llm_config({api_key: "sk-ant-...", embedding_api_key: "sk-..."}). ' +
+      "Verify anytime with llm_config (has_api_key / has_embedding_key). REQUIRES your " +
+      "user-role key LOOPCTL_USER_KEY (minted by the human-anchored signup ceremony); if it " +
+      "is unset the tool fails fast telling you to set it.",
     inputSchema: {
       type: "object",
       properties: {
         api_key: {
           type: "string",
-          description: "Anthropic API key (write-only; stored encrypted, never returned).",
+          description:
+            "Anthropic API key — powers knowledge ingest (extraction/classification/merge). " +
+            "Write-only; stored encrypted, never returned.",
         },
         extraction_model: {
           type: "string",
@@ -3448,7 +3521,9 @@ const TOOLS = [
         embedding_api_key: {
           type: "string",
           description:
-            "OpenAI-compatible embedding API key (write-only; stored encrypted, never returned).",
+            "OpenAI-compatible embedding API key — powers article embeddings + semantic " +
+            "search. Write-only; stored encrypted, never returned. Without it, articles are " +
+            "not vector-searchable and search degrades to keyword-only.",
         },
         embedding_model: {
           type: "string",
