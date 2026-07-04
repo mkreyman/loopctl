@@ -63,6 +63,7 @@ Or if installed locally:
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (verify, reject, review, import) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
 | `LOOPCTL_USER_KEY` | User role API key. Required ONLY for destructive admin tools like `knowledge_bulk_publish`. Leave unset if you don't use those tools. | -- |
+| `LOOPCTL_STH_STATE_PATH` | Absolute path for the witness-protocol STH cache file (see [Witness protocol](#witness-protocol-sth)). Optional. | per-server file under the OS temp dir |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
 
@@ -321,6 +322,35 @@ loopctl enforces that nobody marks their own work as done. The API returns `409`
 - `verify_story` -- 409 `self_verify_blocked`
 
 The implementer's final action is `request_review`. All subsequent steps (report, review, verify) must come from different agents.
+
+## Witness protocol (STH)
+
+Every authenticated request echoes the caller's last-known Signed Tree Head (STH)
+via the `X-Loopctl-Last-Known-STH` header — loopctl's tamper-evident audit chain
+(chain-of-custody v2, §4.4). A brand-new caller has no STH, so its first request
+opts in with `X-Loopctl-STH-Bootstrap: true` to receive the current STH in the
+`x-loopctl-current-sth` response header. **That bootstrap grace is one-time per
+API key** (a deliberate security gate): once consumed, a later request that still
+lacks the header gets `412 witness_bootstrap_already_consumed`.
+
+This MCP server handles that transparently, so you never see the 412:
+
+- **Retry-once contract.** Any `412` carrying an `x-loopctl-current-sth` header is
+  caught, the STH is cached, and the SAME request is retried exactly **once** with
+  `X-Loopctl-Last-Known-STH`. Bounded to a single retry (never a loop). It is safe
+  because the server's witness plug halts *before* the operation runs, so the
+  rejected request had no side effect. The 412 body also carries a machine-readable
+  `error.remediation.retry` contract describing exactly this.
+- **Cross-process persistence.** The learned STH is cached to a small state file so
+  a **fresh** MCP process (a new Claude session, a script, a CI run) loads it and
+  sends a real header on its first request — avoiding the 412 entirely. The file
+  defaults to a per-server path under the OS temp dir
+  (`loopctl-mcp-sth-<hash>.json`) and can be overridden with `LOOPCTL_STH_STATE_PATH`.
+  All file I/O degrades gracefully: a missing, corrupt, or unwritable state file
+  falls back to in-memory caching plus the retry-once contract above.
+
+Dispatch-based (v2) clients that mint a fresh ephemeral key per dispatch are
+unaffected — each fresh key gets its own clean one-time bootstrap.
 
 ## Troubleshooting
 

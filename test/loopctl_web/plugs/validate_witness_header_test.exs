@@ -235,6 +235,83 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
                "witness_bootstrap_already_consumed"
     end
 
+    test "the already-consumed 412 ALWAYS carries a valid current-sth header + retry contract (#298)" do
+      # The linchpin that makes a fresh client's retry-once reliable: the
+      # bootstrap-already-consumed 412 must ALWAYS hand back the current STH (in
+      # the header AND the body) plus a machine-readable retry contract, so the
+      # client can cache it and retry the same request without rediscovering the
+      # protocol.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      _server_prefix = insert_sth(api_key.tenant_id, 3)
+
+      _ = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+      reloaded = AdminRepo.get!(ApiKey, api_key.id)
+
+      conn = reloaded |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+
+      assert conn.status == 412
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "witness_bootstrap_already_consumed"
+
+      # Header is present and well-formed (position:22-char-base64url-prefix).
+      assert [sth] = get_resp_header(conn, "x-loopctl-current-sth")
+      assert sth =~ ~r/\A\d+:[A-Za-z0-9_-]{22}\z/
+
+      # The body echoes the same STH and the machine-readable retry contract.
+      remediation = body["error"]["remediation"]
+      assert remediation["current_sth"] == sth
+      assert remediation["retry"]["cache_header"] == "x-loopctl-current-sth"
+      assert remediation["retry"]["resend_as"] == "X-Loopctl-Last-Known-STH"
+      assert remediation["retry"]["max_retries"] == 1
+    end
+
+    test "the already-consumed 412 carries the zero STH header even when the tenant has no STH" do
+      # Guarantee holds on the no-STH branch too: current_sth_value/1 falls back to
+      # the all-zero STH, so the header is ALWAYS present and shape-valid — the
+      # retry path can never be stranded by a header-less 412.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+
+      _ = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+      reloaded = AdminRepo.get!(ApiKey, api_key.id)
+
+      conn = reloaded |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+
+      assert conn.status == 412
+      assert [sth] = get_resp_header(conn, "x-loopctl-current-sth")
+      assert sth =~ ~r/\A\d+:[A-Za-z0-9_-]{22}\z/
+    end
+
+    test "consumed-grace 412 emits a distinct telemetry event for the operator" do
+      # Observability: the consumed-grace 412 is expected/benign (retryable), so it
+      # emits its OWN event — separate from the divergence-alerting path — that an
+      # operator can meter without alarm.
+      {_raw, api_key} = fixture(:api_key, %{role: :agent})
+      _ = api_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+      reloaded = AdminRepo.get!(ApiKey, api_key.id)
+
+      ref = make_ref()
+      test_pid = self()
+      handler_id = "witness-bootstrap-consumed-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :witness, :bootstrap_already_consumed],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {ref, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      _conn = reloaded |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
+
+      assert_receive {^ref, [:loopctl, :witness, :bootstrap_already_consumed], %{count: 1},
+                      %{tenant_id: tenant_id}}
+
+      assert tenant_id == api_key.tenant_id
+    end
+
     test "atomic consume is single-winner even when the in-memory struct still shows nil (TOCTOU)" do
       {_raw, api_key} = fixture(:api_key, %{role: :agent})
       assert is_nil(api_key.sth_bootstrap_consumed_at)

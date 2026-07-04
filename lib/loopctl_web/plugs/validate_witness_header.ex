@@ -14,6 +14,15 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
   - Signature-prefix mismatch against the server's STH → 409
     (`witness_divergence`) with the server's current STH in the
     `x-loopctl-current-sth` response header so a stale client can resync.
+  - A key whose one-time bootstrap grace is already spent → 412
+    (`witness_bootstrap_already_consumed`). This 412 ALWAYS carries the current
+    STH in the `x-loopctl-current-sth` response header (and echoes it, plus a
+    machine-readable retry contract, in `error.remediation`) so a fresh client
+    can cache it and retry the SAME request ONCE with `X-Loopctl-Last-Known-STH`.
+    That retry-once is safe because this plug halts BEFORE the operation runs, so
+    the rejected request had no side effect (#298). This does NOT weaken the
+    one-time grace (custody-03): the request is still rejected — we only make the
+    already-present resync path reliable and self-documenting.
 
   ## Custody safety (private advisories)
 
@@ -236,7 +245,13 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
       # Winner: grant the grace. Only pure response-header setting remains after
       # the committed UPDATE, so nothing here can fail and strand the client.
       1 -> grant_bootstrap_grace(conn, sth_value)
-      0 -> bootstrap_already_consumed(conn)
+      # Already consumed: hand the client the STH we ALREADY read above (never a
+      # second DB round-trip). Because that read is inside this rescue-guarded
+      # block, a transient failure would have already fallen through to a clean
+      # retryable `missing_header` 412 — so the already-consumed 412 can never be
+      # a 500 and ALWAYS carries a valid `x-loopctl-current-sth` for the client's
+      # one-shot retry (#298).
+      0 -> bootstrap_already_consumed(conn, sth_value)
     end
   rescue
     exception ->
@@ -267,10 +282,33 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
 
   defp sanitized_db_error(exception), do: inspect(exception.__struct__)
 
-  defp bootstrap_already_consumed(conn) do
+  # `sth_value` is the STH already read (successfully) in `atomic_consume_bootstrap`
+  # BEFORE the conditional UPDATE, so this response never re-queries the DB and can
+  # never turn into a 500 — it is a clean, stable 412 that ALWAYS carries the
+  # current STH for a client one-shot retry. The one-time grace is NOT weakened:
+  # the request is still halted (no operation runs); we only make the already-
+  # present retry path reliable and self-documenting.
+  defp bootstrap_already_consumed(conn, sth_value) do
+    # Observability: a DISTINCT, low-severity signal for consumed-grace 412s so an
+    # operator can watch how often fresh clients arrive without a cached STH. This
+    # is the custody-03 gate working as DESIGNED (a retryable precondition), not a
+    # divergence — hence info level and its own telemetry event, separate from the
+    # `[:loopctl, :witness, :divergence]` alerting path.
+    tenant_id = get_tenant_id(conn)
+
+    Logger.info(
+      "WITNESS bootstrap grace already consumed (412, retryable): tenant=#{inspect(tenant_id)}"
+    )
+
+    :telemetry.execute(
+      [:loopctl, :witness, :bootstrap_already_consumed],
+      %{count: 1},
+      %{tenant_id: tenant_id}
+    )
+
     conn
     |> put_status(:precondition_failed)
-    |> put_resp_header("x-loopctl-current-sth", current_sth_value(get_tenant_id(conn)))
+    |> put_resp_header("x-loopctl-current-sth", sth_value)
     |> Phoenix.Controller.json(%{
       error: %{
         code: "witness_bootstrap_already_consumed",
@@ -281,6 +319,16 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeader do
             "every subsequent request. The current STH is in the " <>
             "x-loopctl-current-sth response header.",
         remediation: %{
+          # Machine-readable retry contract so clients don't each rediscover it:
+          # read the STH from `cache_header`, resend it as `resend_as`, and retry
+          # AT MOST `max_retries` time(s). The witness plug halts before the
+          # operation runs, so this retry is side-effect-safe.
+          retry: %{
+            cache_header: "x-loopctl-current-sth",
+            resend_as: "X-Loopctl-Last-Known-STH",
+            max_retries: 1
+          },
+          current_sth: sth_value,
           learn_more: "https://loopctl.com/wiki/witness-protocol"
         }
       }

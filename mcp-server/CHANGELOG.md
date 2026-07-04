@@ -5,6 +5,37 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.33.0 — 2026-07-03 (witness STH persistence + transparent bootstrap-412 retry — #298)
+
+### Fixed
+
+- **Fresh MCP processes no longer fail their first tool call with `412
+  witness_bootstrap_already_consumed` (#298).** The witness protocol's one-time
+  bootstrap grace is consumed once per API key; every subsequent fresh process
+  (a new Claude session, a standalone script, a CI run) reusing a long-lived
+  env-var key (`LOOPCTL_AGENT_KEY`, `LOOPCTL_ORCH_KEY`, …) previously started with
+  no Signed Tree Head (STH) and tripped that 412. Two client-side fixes:
+  - **Transparent retry:** any `412` carrying an `x-loopctl-current-sth` header is
+    now caught, the STH is cached, and the SAME request is retried exactly ONCE
+    with `X-Loopctl-Last-Known-STH` — so the tool call succeeds instead of
+    surfacing the 412. Bounded to a single retry (never a loop). Safe because the
+    server's witness plug halts BEFORE the operation runs, so the rejected request
+    had no side effect.
+  - **Cross-process persistence:** the learned STH is cached to a small state file
+    so a FRESH process loads it and sends a real header on its first request,
+    avoiding the 412 entirely. Location defaults to a per-server file under the OS
+    temp dir (`loopctl-mcp-sth-<hash>.json`) and can be overridden with
+    `LOOPCTL_STH_STATE_PATH`. All file I/O degrades gracefully: a missing,
+    corrupt, or unwritable state file falls back to in-memory caching + the
+    transparent retry above.
+
+### Added
+
+- **`LOOPCTL_STH_STATE_PATH`** env var to override the STH state-file location
+  (absolute path). Dispatch-based (v2) clients that mint a fresh ephemeral key per
+  dispatch are unaffected by the 412 (each fresh key gets its own clean bootstrap)
+  and do not need this.
+
 ## 2.32.0 — 2026-07-03 (per-tenant BYO for embeddings — Epic 28 #179)
 
 ### Added
