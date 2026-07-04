@@ -297,6 +297,10 @@ defmodule Loopctl.KnowledgeContextTest do
       {:ok, result} = Knowledge.get_context(tenant.id, "embedding fallback")
 
       assert result.meta.fallback == true
+      # #297: the reason propagates from the underlying combined search into the
+      # context meta so /knowledge/context is as diagnosable as /knowledge/search.
+      # An unmapped bare atom reason collapses to the bounded generic tag.
+      assert result.meta.fallback_reason == "embedding_error"
     end
 
     test "results sorted by combined_score descending" do

@@ -49,9 +49,16 @@ defmodule LoopctlWeb.KnowledgeContextJSON do
       recency_weight: meta.recency_weight
     }
 
-    case meta[:fallback] do
-      true -> Map.put(base, :fallback, true)
-      _ -> base
-    end
+    base
+    |> maybe_put_fallback(meta[:fallback])
+    # `fallback_reason` (#297): a stable, non-sensitive tag naming WHY the context's
+    # underlying combined search degraded to keyword_only. Present only on fallback.
+    |> maybe_put_fallback_reason(meta[:fallback_reason])
   end
+
+  defp maybe_put_fallback(map, true), do: Map.put(map, :fallback, true)
+  defp maybe_put_fallback(map, _), do: map
+
+  defp maybe_put_fallback_reason(map, nil), do: map
+  defp maybe_put_fallback_reason(map, reason), do: Map.put(map, :fallback_reason, reason)
 end

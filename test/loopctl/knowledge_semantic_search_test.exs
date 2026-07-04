@@ -415,6 +415,182 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     end
   end
 
+  # --- #297: fallback_reason + telemetry observability for the silent semantic→
+  # keyword degradation. Each fallback CAUSE must map to the right stable tag,
+  # NEVER leak the api key / provider body, fire the telemetry event, and the
+  # "embed worked but recall empty" case must be distinguishable from an embed
+  # failure. A successful semantic must set neither fallback nor fallback_reason.
+
+  describe "search_combined/3 - fallback_reason observability (#297)" do
+    # Attach a telemetry handler SCOPED to this test's tenant_id (unique UUID) so a
+    # parallel async test emitting the same global event can never leak into this
+    # one — the handler branches on tenant_id and NEVER raises (a raising handler
+    # would be auto-detached by :telemetry, breaking isolation the other way).
+    defp attach_fallback_handler(tenant_id) do
+      test_pid = self()
+      handler_id = "semfb-#{System.unique_integer([:positive])}"
+      event = [:loopctl, :knowledge, :semantic_fallback]
+
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn ^event, measurements, metadata, _config ->
+          if metadata.tenant_id == tenant_id do
+            send(test_pid, {:semantic_fallback, measurements, metadata})
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
+    defp keyword_article(tenant_id) do
+      fixture(:article, %{
+        tenant_id: tenant_id,
+        title: "Testing Guide",
+        body: "Unit test patterns for testing Elixir applications.",
+        status: :published
+      })
+    end
+
+    test ":no_api_key -> \"no_embedding_key\" in meta + telemetry" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+      attach_fallback_handler(tenant.id)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback == true
+      assert meta.search_mode == "keyword_only"
+      assert meta.fallback_reason == "no_embedding_key"
+
+      assert_receive {:semantic_fallback, measurements, metadata}
+      assert metadata.reason == "no_embedding_key"
+      assert metadata.tenant_id == tenant.id
+      assert measurements.query_len == byte_size("testing")
+      assert measurements.count == 1
+    end
+
+    test ":timeout -> \"embedding_timeout\" in meta + telemetry" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+      attach_fallback_handler(tenant.id)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :timeout}
+      end)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback_reason == "embedding_timeout"
+
+      assert_receive {:semantic_fallback, _m, %{reason: "embedding_timeout"}}
+    end
+
+    test "{:api_error, 401, body-with-a-fake-key} -> status-only tag, NEVER leaks the key/body" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+      attach_fallback_handler(tenant.id)
+
+      fake_key = "sk-SECRET-DEADBEEF-must-not-leak"
+      provider_body = "Incorrect API key provided: #{fake_key}"
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 401, provider_body}}
+      end)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback_reason == "embedding_provider_error_401"
+
+      # The sanitizer (ProviderError) drops the body — neither the key nor the
+      # provider message survives into the response meta.
+      refute inspect(meta) =~ fake_key
+      refute inspect(meta) =~ "Incorrect API key"
+
+      assert_receive {:semantic_fallback, _m, metadata}
+      assert metadata.reason == "embedding_provider_error_401"
+      refute inspect(metadata) =~ fake_key
+      refute inspect(metadata) =~ "Incorrect API key"
+    end
+
+    test "a genuinely OPEN circuit breaker surfaces \"embedding_circuit_open\"" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      keyword_article(tenant.id)
+
+      # 5xx is a COUNTABLE failure; three trip the tenant-scoped breaker.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, {:api_error, 500, "upstream boom"}}
+      end)
+
+      for _ <- 1..3, do: Knowledge.search_combined(tenant.id, "testing")
+
+      # Attach only now so we observe the circuit-open call specifically.
+      attach_fallback_handler(tenant.id)
+
+      # The breaker is now open: generate_embedding short-circuits to :circuit_open
+      # WITHOUT calling the client.
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+      assert meta.fallback_reason == "embedding_circuit_open"
+
+      assert_receive {:semantic_fallback, _m, %{reason: "embedding_circuit_open"}}
+    end
+
+    test "embedding OK but semantic EMPTY -> semantic_result_count: 0, no fallback, distinct telemetry" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      # Keyword-findable but NOT embedded, so the semantic half (which excludes nil
+      # embeddings) contributes zero rows even though the default stub embeds OK.
+      keyword_article(tenant.id)
+      attach_fallback_handler(tenant.id)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_combined(tenant.id, "testing")
+
+      # NOT a keyword_only fallback — combined still ran, keyword merged.
+      refute Map.get(meta, :fallback)
+      refute Map.has_key?(meta, :fallback_reason)
+      assert meta.search_mode == "combined"
+      assert meta.semantic_result_count == 0
+
+      assert_receive {:semantic_fallback, measurements, metadata}
+      assert metadata.reason == "semantic_empty"
+      assert measurements.semantic_result_count == 0
+    end
+
+    test "successful semantic (embedding ok + non-empty) sets NO fallback/fallback_reason and fires NO telemetry" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      create_article_with_embedding(
+        tenant.id,
+        %{title: "Deployment Guide", body: "How to deploy an Elixir app for testing."},
+        :close
+      )
+
+      attach_fallback_handler(tenant.id)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "testing")
+
+      refute Map.get(meta, :fallback)
+      refute Map.has_key?(meta, :fallback_reason)
+      assert meta.semantic_result_count >= 1
+      assert results != []
+
+      refute_receive {:semantic_fallback, _m, _metadata}
+    end
+  end
+
   # --- TC-20.4.4: Invalid weights return {:error, :invalid_weights} ---
 
   describe "search_combined/3 - weight validation" do

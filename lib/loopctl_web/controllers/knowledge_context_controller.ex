@@ -116,7 +116,21 @@ defmodule LoopctlWeb.KnowledgeContextController do
                properties: %{
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  limit: %OpenApiSpex.Schema{type: :integer},
-                 fallback: %OpenApiSpex.Schema{type: :boolean},
+                 fallback: %OpenApiSpex.Schema{
+                   type: :boolean,
+                   description:
+                     "true when the underlying combined search degraded to keyword-only " <>
+                       "because embedding generation failed. Present only when it degraded."
+                 },
+                 fallback_reason: %OpenApiSpex.Schema{
+                   type: :string,
+                   description:
+                     "Present only alongside `fallback: true` (#297): a stable, non-sensitive " <>
+                       "tag naming WHY semantic ranking was unavailable (never leaks an api key " <>
+                       "or provider body). One of `no_embedding_key`, `embedding_circuit_open`, " <>
+                       "`embedding_timeout`, `embedding_request_failed`, `embedding_crash`, " <>
+                       "`embedding_error`, or `embedding_provider_error_<status>`."
+                 },
                  recency_weight: %OpenApiSpex.Schema{type: :number}
                }
              }
