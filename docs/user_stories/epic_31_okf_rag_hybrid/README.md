@@ -6,9 +6,11 @@ answer** and falls back to semantic retrieval for the long tail, with **provenan
 **progressive disclosure** via index files — so callers never get a confidently-wrong fuzzy chunk
 when a canonical answer exists, and never have to choose "RAG or curated."
 
-> **Status: authored with `user-story-writer` (current schema, `estimated_tokens`).**
-> Pending the three-lens enhanced review (analyst / architect / adversarial) before
-> `/implement-plan`, same as epics 28–30.
+> **Status: authored with `user-story-writer`, hardened through one enhanced-review round.**
+> Three-lens review (analyst / architect / adversarial), each verified against the live code,
+> found a critical flaw (a near-but-wrong curated doc mislabeled `:curated` — worse than the RAG
+> failure it replaces) plus governance/system-scope/staleness gaps and code-name errors — all
+> applied (see "Review changes"). A confirm-pass before `/implement-plan` is still worthwhile.
 
 ## Composes an already-shipped subsystem (not greenfield)
 
@@ -41,6 +43,30 @@ Unlike epics 28–30, this is a **resolution layer on top of existing code**: `k
   entrypoint.
 - **The headline proof** (US-31.5): the refund-policy-style hallucination (a confident answer from an
   unrelated chunk) is demonstrably avoided when a curated answer exists.
+
+## Review changes (enhanced-review round 1, applied)
+
+- **Critical — curated must actually answer:** `:curated` is returned only when a curated source
+  clears an absolute threshold AND beats the best retrieved candidate by a margin AND is not
+  conflicted/superseded — otherwise `:retrieved`. Added a near-but-wrong negative test. (A curated
+  doc semantically near a query it doesn't answer, labeled authoritative, is worse than the RAG bug.)
+- **Governance/poisoning:** "curated" is a **governed marker** (admin/`kb_curation`-gated), not an
+  agent-settable `category` — the article changeset doesn't role-gate `:published`, so category-only
+  would let any agent self-promote to authoritative.
+- **System scope:** `@scope_values [:tenant, :system]` — system (public-wiki) canonical articles may
+  participate but never override a tenant's own curated answer, and never leak cross-tenant.
+- **Staleness/conflict:** a `:superseded` or open-`:potential_conflict` curated article is not
+  returned as authoritative without surfacing the conflict.
+- **Code-name corrections:** the Elixir fn is `search_combined/3` (not `knowledge_search`); the
+  signature is `hybrid_search(tenant_id, query, opts)` (no scope-struct/map-query convention exists);
+  hubs are **emergent** (`article_link` degree), not a modeled type; the OKF `index.md` is a private
+  full-export artifact, so progressive disclosure is built on `knowledge_index` + link traversal +
+  `derive_description/1` (made public), capped top-K.
+- **Also:** provenance emitted to `RetrievalMetrics`; tenant isolation is explicit-predicate on
+  AdminRepo/HeavyRead (BYPASSRLS, not RLS); the progressive index/drill MCP tool is required (not
+  optional); shape-parity + unit tests added.
+- **Deferred (v2, tracked):** #306's freshness/novelty index ranking is out of scope for v1 (noted
+  here rather than silently dropped).
 
 ## Provenance
 

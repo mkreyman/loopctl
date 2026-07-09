@@ -1,42 +1,53 @@
 {
   "id": "US-31.1",
-  "title": "Curated-source identification: mark/identify canonical articles for the hybrid resolver",
+  "title": "Curated-source identification: a GOVERNED (non-self-assignable) canonical marker + scope rules",
   "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
   "priority": "high",
   "phase": "domain",
-  "priority_note": "The resolver (31.2) needs a defined notion of 'curated/canonical' — the knowledge subsystem has category/scope enums and hubs but no explicit curated-answer marker. This story supplies it. No dependencies.",
+  "priority_note": "The resolver (31.2) trusts 'curated', so curated status must be GOVERNED (an agent cannot self-promote its own article to authoritative) — otherwise the hybrid path is poisonable. No dependencies. Enhanced-review round 1 applied.",
   "background": {
-    "reference": "GitHub issues #305 + #306 (same feature); Second Brain hub 820602df (Cloud Codes OKF+RAG), okf-open-knowledge-format memory. Composes the EXISTING knowledge subsystem (lib/loopctl/knowledge.ex, okf.ex) — do NOT re-architect embeddings.",
-    "includes": "loopctl articles have category (Ecto.Enum), status, scope, and hub/link structure, plus OKF export/import — but no flag distinguishing an AUTHORED/CANONICAL answer from a probabilistic chunk. The hybrid resolver must prefer curated over fuzzy, so 'curated' needs a concrete, queryable definition."
+    "reference": "GitHub issues #305/#306; hub 820602df. Composes the EXISTING knowledge subsystem. Review round 1: category alone is agent-self-assignable (article.ex changeset does NOT role-gate :published/:category), so 'curated' must key off a governed signal; and system-scoped (public-wiki) articles must be handled explicitly.",
+    "includes": "Articles have category (Categories.all(): pattern/decision/finding/reference/playbook/insight/entity/idea/quote/question), status [:draft,:published,:archived,:superseded], and scope [:tenant,:system]. There is NO curated-answer flag ('canonical' in knowledge.ex is dedup/conflict only), and hubs are NOT modeled (emergent via article_link degree). loopctl DOES have curation governance (kb_curation.ex / kb_curation_event.ex)."
   },
   "story": {
     "as_a": "loopctl platform engineer",
-    "i_want_to": "define and expose which published articles count as 'curated/canonical' (a configured curated category set and/or explicit curated marker, plus OKF-index/hub membership) with a helper to identify them",
-    "so_that": "the hybrid resolver can prefer a curated answer over a fuzzy chunk with a clear, testable rule"
+    "i_want_to": "identify a published article as 'curated' only via a GOVERNED marker (admin/curation-gated, not an agent-settable category), define how system-scoped canonical articles participate, and expose a curated?/1 + scoped listing",
+    "so_that": "the resolver can prefer curated answers without an agent being able to self-promote poisoned content to authoritative"
   },
-  "rationale": "The whole point of #305/#306 is 'prefer curated over fuzzy when both exist' — which is undefinable without a concrete curated-source rule. Basing it on the existing category enum + hub/OKF membership (rather than a brand-new subsystem) keeps this a thin resolution layer, per the issue's 'compose existing pieces' constraint, while making 'curated' auditable and tenant-scoped.",
+  "rationale": "The value of the hybrid interface is 'trust curated'. If curated == category in {reference,playbook,pattern} on a self-published article, any agent that writes a :reference article becomes authoritative — a direct poisoning path, since the article changeset does not gate who may publish. Basing curated on a governed marker (kb_curation) makes provenance trustworthy; category is a filter, not sufficient alone.",
   "acceptance_criteria": [
-    { "id": "AC-31.1.1", "description": "A curated-source rule is defined: a published article is 'curated' if its category is in a configured curated set (e.g. reference/playbook/pattern hubs) AND/OR it carries an explicit curated marker. If a new marker is used, add it via migration (nullable boolean/field on articles) with tenant scoping; if category-based, no migration. The choice is documented with rationale.", "status": "pending" },
-    { "id": "AC-31.1.2", "description": "Loopctl.Knowledge.curated?/1 (and a scoped list/query helper) returns whether an article is curated and lists a tenant's curated sources, reusing existing published-status + category + hub/OKF-index membership signals.", "status": "pending" },
-    { "id": "AC-31.1.3", "description": "Curated identification is tenant-scoped: a curated article of tenant A is never surfaced as curated in tenant B's scope.", "status": "pending" },
-    { "id": "AC-31.1.4", "description": "Only PUBLISHED articles can be curated (a draft/archived canonical source is not treated as a curated answer).", "status": "pending" }
+    { "id": "AC-31.1.1", "description": "The curated predicate is PINNED and governed: a published article is 'curated' iff it carries a governed curated marker set through an admin/curation-gated path (reuse/extend kb_curation governance), NOT merely by an agent-settable category. Category may be a filter but is never sufficient alone. If a marker column/state is added it is set only via the governed path (agents cannot self-assign it).", "status": "pending" },
+    { "id": "AC-31.1.2", "description": "Loopctl.Knowledge.curated?/1 and a scoped listing return curated status, keyed on the governed marker + published status. A pure predicate is unit-testable.", "status": "pending" },
+    { "id": "AC-31.1.3", "description": "System-scope handling is explicit: system-scoped (tenant_id nil, public-wiki) canonical articles MAY participate in the hybrid path as curated, but a tenant's OWN curated article takes precedence over a system one (a system canonical never overrides a tenant's fresher/own answer), and system articles never leak as another tenant's private content. The decision + precedence is documented.", "status": "pending" },
+    { "id": "AC-31.1.4", "description": "Only :published articles are curated; :draft/:archived/:superseded are excluded. Additionally, an article in an OPEN :potential_conflict is NOT treated as authoritative curated without the conflict being surfaced (ties to US-31.2 AC-31.2.6).", "status": "pending" },
+    { "id": "AC-31.1.5", "description": "Curated identification is tenant-scoped for tenant articles; the two-tenant isolation test runs consistently with how knowledge reads scope (explicit tenant_id predicate via AdminRepo/HeavyRead — RLS does not backstop these reads).", "status": "pending" }
   ],
   "test_cases": [
-    { "id": "TC-31.1.1", "name": "curated? reflects the configured rule", "type": "integration",
-      "preconditions": ["tenant = fixture(:tenant)", "a published reference/hub article", "a published low-category chunk-like article", "a draft reference article"],
+    { "id": "TC-31.1.1", "name": "curated? requires the governed marker, not just category", "type": "unit",
+      "preconditions": ["tenant = fixture(:tenant)", "a published :reference article WITHOUT the governed curated marker (agent-authored)", "a published article WITH the governed marker"],
       "steps": ["Loopctl.Knowledge.curated?/1 on each"],
-      "expected_results": ["the published reference/hub is curated; the low-category one is not; the draft is not (published-only)"], "status": "pending" },
-    { "id": "TC-31.1.2", "name": "curated listing is tenant-isolated", "type": "integration",
-      "preconditions": ["tenant_a with a curated article", "tenant_b = fixture(:tenant)"],
+      "expected_results": ["the agent-authored reference article is NOT curated (self-promotion blocked); the governed-marked one is curated"], "status": "pending" },
+    { "id": "TC-31.1.2", "name": "draft/superseded/conflicted are not authoritative curated", "type": "integration",
+      "preconditions": ["a draft governed article", "a superseded one", "a published governed article in an open potential_conflict"],
+      "steps": ["curated?/1 + the authoritative check on each"],
+      "expected_results": ["draft and superseded are not curated; the conflicted one is not returned as authoritative curated without the conflict surfaced"], "status": "pending" },
+    { "id": "TC-31.1.3", "name": "system canonical participates but does not override a tenant's own curated", "type": "integration",
+      "preconditions": ["a system-scoped curated article on topic X", "tenant_a's OWN curated article on topic X"],
+      "steps": ["resolve curated sources for tenant_a on topic X"],
+      "expected_results": ["tenant_a's own curated article takes precedence; the system one is available but does not override; no cross-tenant private leak"], "status": "pending" },
+    { "id": "TC-31.1.4", "name": "curated listing is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a with a governed curated article", "tenant_b = fixture(:tenant)"],
       "steps": ["list curated sources for tenant_b"],
-      "expected_results": ["none from tenant_a appear"], "status": "pending" }
+      "expected_results": ["none of tenant_a's private curated articles appear"], "status": "pending" }
   ],
   "technical_notes": [
-    "Reuse Loopctl.Knowledge category (@category_values) + status + hub/link + OKF membership; prefer category-set config over a new column if it covers the cases (avoids a migration).",
-    "If a marker column is added, migration must tenant-scope + enable RLS consistency with articles.",
-    "This is the resolution-layer definition only — no embedding/vector changes (out of scope per #305).",
-    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:article, ...) with category/status)."
+    "Governance: reuse kb_curation.ex / kb_curation_event.ex for the curated marker's authoring path; the marker must NOT be settable via the ordinary article changeset (article.ex does not role-gate :published).",
+    "Categories are Loopctl.Knowledge.Categories.all(); use as a filter, not the sole signal.",
+    "Hubs are NOT modeled — do not key curated on 'hub membership'. If hub enrichment is wanted, define it operationally as >= N outgoing :relates_to article_links.",
+    "System scope: @scope_values [:tenant, :system]; system articles (tenant_id nil) are served by get_system_article_by_slug/list_system_articles and are excluded from tenant search by the tenant_id predicate — AC-31.1.3 must decide their participation explicitly.",
+    "Tenant isolation is explicit-predicate on AdminRepo/HeavyRead (BYPASSRLS), not Postgres RLS (knowledge.ex header) — thread tenant_id, don't rely on RLS.",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:article, category:, status:, scope:))."
   ],
   "dependencies": [],
-  "estimated_tokens": 220000
+  "estimated_tokens": 300000
 }
