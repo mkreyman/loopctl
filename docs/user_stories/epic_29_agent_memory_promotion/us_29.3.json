@@ -1,0 +1,132 @@
+{
+  "id": "US-29.3",
+  "title": "API: POST /api/v1/memory/promote + superadmin promoted-vs-explicit oversight (list filter + reject)",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "high",
+  "phase": "api",
+  "priority_note": "Exposes the explicit promotion trigger over HTTP and delivers the human oversight of promoted memories via the superadmin API (loopctl has no web UI). Depends on the worker (29.2) and epic_28's memory API.",
+  "background": {
+    "reference": "GitHub issue #308; extends epic_28's LoopctlWeb.MemoryController + the :authenticated pipeline. #308 originally specified a LiveView for promoted-vs-explicit oversight; loopctl is agent-native (no web UI), so oversight is delivered via the superadmin API established in epic_28 US-28.3 AC-28.3.4.",
+    "includes": "US-29.2 provides Loopctl.Memory.promote_session/1. This story adds the explicit HTTP trigger and extends the memory list/delete API so a superadmin can filter promoted vs explicit memories, see source_session_id + confidence, and reject (delete) a bad promotion — the agent-native replacement for the LiveView quality loop."
+  },
+  "story": {
+    "as_a": "an agent (or Stop-hook) ending a session, and a superadmin auditing promotions",
+    "i_want_to": "POST to trigger promotion of a session, and (as superadmin) list memories filtered by source with confidence + session, and delete bad promotions",
+    "so_that": "session end compiles durable memory over the same governed transport, and a human retains the reject-a-bad-promotion quality loop without a web UI"
+  },
+  "rationale": "Cole Medin's pillar includes a human quality loop over auto-promoted memory (visibility + reject). Because loopctl is agent-native, that loop is an API affordance, not a LiveView: a superadmin filters by source: :promoted, inspects confidence/source_session_id, and deletes wrong promotions. Exposing the explicit trigger on the same authenticated/witness pipeline keeps the MCP tool a thin client.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.3.1",
+      "description": "POST /api/v1/memory/promote (on the :authenticated pipeline) accepts a session_id, derives scope (tenant_id + subject_id) from the resolved API key per epic_28 US-28.1 AC-28.1.4, and enqueues promotion via Loopctl.Memory.promote_session/1. Returns 202 with the job reference on success; returns 429 (with the standard error envelope) when the tenant is over its promotion budget (US-29.2 AC-29.2.8), without enqueuing or calling the LLM. Body-supplied tenant/subject is ignored.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.3.2",
+      "description": "The promote endpoint is subject to the full write pipeline (RateLimiter, ValidateWitnessHeader, CheckCustodyHalt); a custody-halted or invalid-witness request is rejected consistently with other write endpoints. A caller may only promote its own (tenant, subject) sessions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.3.3",
+      "description": "The epic_28 GET /api/v1/memory list gains a source filter (?source=promoted|explicit) and returns source, source_session_id, and confidence per memory; non-superadmin callers see only their own subject; superadmin (with all_subjects) sees all subjects but is CLAMPED to its own tenant (all_subjects never widens beyond the caller's tenant — it rides the epic_28 tenant-clamped list, US-28.3 AC-28.3.4).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.3.4",
+      "description": "Reject-a-promotion: DELETE of a promoted memory (epic_28 forget path) works for the owning subject and for a superadmin across the tenant; deleting a superseder nilifies dependents (epic_28 on_delete), so rejecting a promotion never leaves a memory permanently hidden.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.3.5",
+      "description": "OpenAPI: the promote operation macro is declared in LoopctlWeb.MemoryController (schemas under lib/loopctl/api_spec/); it renders at /swaggerui and the openapi_test passes with no missing-operation warning.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.3.1",
+      "name": "promote endpoint enqueues promotion scoped to the key",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "a session s1 with session memory under the key's subject",
+        "Promoter LLM + embedding stubbed via Mox"
+      ],
+      "steps": [
+        "POST /api/v1/memory/promote %{session_id: \"s1\"} with valid witness",
+        "drain the MemoryPromotionWorker queue",
+        "GET /api/v1/memory?source=promoted"
+      ],
+      "expected_results": [
+        "202 on promote; a promoted memory appears with source_session_id s1 and a confidence, scoped to the key's subject"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.3.2",
+      "name": "a caller cannot promote another subject's session",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{_, key_a} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "{_, key_b} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "session s1 belongs to subject A"
+      ],
+      "steps": [
+        "POST /api/v1/memory/promote %{session_id: \"s1\"} as key_b"
+      ],
+      "expected_results": [
+        "no promotion of A's session occurs (empty/observed no-op or 404); B never causes A's memory to be written"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.3.3",
+      "name": "superadmin lists promoted across subjects and rejects one",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{_, admin} = fixture(:api_key, tenant: tenant, role: :superadmin)",
+        "promoted memories exist under two subjects"
+      ],
+      "steps": [
+        "GET /api/v1/memory?source=promoted&all_subjects=true as admin",
+        "DELETE /api/v1/memory/:id for one promoted memory as admin"
+      ],
+      "expected_results": [
+        "admin sees promoted memories for both subjects with confidence + source_session_id",
+        "the deleted promotion is gone; no memory is left orphaned-invisible"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.3.4",
+      "name": "custody-halted key cannot promote",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent) placed in custody-halt"
+      ],
+      "steps": [
+        "POST /api/v1/memory/promote %{session_id: \"s1\"}"
+      ],
+      "expected_results": [
+        "rejected consistently with other write endpoints"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Extend LoopctlWeb.MemoryController (epic_28) with promote/2 -> Loopctl.Memory.promote_session/1; route POST /api/v1/memory/promote under the :authenticated scope.",
+    "There is NO LiveView (loopctl is agent-native). The #308 'promoted-vs-explicit LiveView' is delivered as the source filter + superadmin all_subjects list + delete on the existing memory API.",
+    "Scope + superadmin oversight reuse epic_28 US-28.3 AC-28.3.2/AC-28.3.4 exactly; do not fork the auth path.",
+    "OpenAPI operation macro in the controller; schemas in lib/loopctl/api_spec/.",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:api_key, tenant:, role:)) + Mox for the Promoter LLM and embedding client."
+  ],
+  "dependencies": ["US-29.2"],
+  "estimated_tokens": 240000
+}
