@@ -120,7 +120,11 @@ defmodule Loopctl.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
-      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
+
+      # Dev-only runtime MCP server for AI coding agents (runtime intelligence).
+      # never ships to test/prod. MCP endpoint: http://localhost:4000/tidewave/mcp
+      {:tidewave, "~> 0.6", only: :dev}
     ]
   end
 
