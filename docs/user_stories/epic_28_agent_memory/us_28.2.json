@@ -240,6 +240,8 @@
     "supersede + source=:promoted are the seams #308 uses. superseded_by on_delete: :nilify_all is set in US-28.1.",
     "Tests use Loopctl.Fixtures.fixture/2; add fixture(:memory_scope, attrs), fixture(:memory, attrs), fixture(:session_memory, attrs). Stub the embedding provider with Mox against the existing embedding behaviour (no network)."
   ],
-  "dependencies": ["US-28.1"],
-  "estimated_hours": 20
+  "dependencies": [
+    "US-28.1"
+  ],
+  "estimated_tokens": 480000
 }
