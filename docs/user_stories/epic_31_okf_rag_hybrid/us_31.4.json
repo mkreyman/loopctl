@@ -1,0 +1,46 @@
+{
+  "id": "US-31.4",
+  "title": "API + MCP: single hybrid retrieval entrypoint with provenance",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "high",
+  "phase": "api",
+  "priority_note": "Exposes the hybrid resolver + progressive index to agents over the existing HTTP/MCP surface, so callers get one interface + provenance (no RAG-or-curated branching). Depends on the resolver (31.2) and index (31.3).",
+  "background": {
+    "reference": "GitHub issues #305/#306; extends the existing knowledge HTTP API (knowledge_search_controller / knowledge_context_controller) + the mcp-server knowledge_* tools.",
+    "includes": "US-31.2/31.3 provide hybrid_search + progressive disclosure. This story surfaces them: an HTTP endpoint + an MCP tool returning provenance, reusing the existing knowledge API/MCP conventions."
+  },
+  "story": {
+    "as_a": "an agent via MCP (or an API client)",
+    "i_want_to": "call one hybrid knowledge tool/endpoint that returns curated-or-retrieved answers with provenance, and a progressive index tool",
+    "so_that": "I use the hybrid interface the same way I use knowledge_search today, but with trustable provenance"
+  },
+  "rationale": "The value of a single hybrid interface is lost if callers must still pick an endpoint. Surfacing hybrid_search (and the progressive index) as one API endpoint + one MCP tool, on the existing authenticated pipeline, is what delivers 'no caller-side RAG-or-curated branching' to real agents.",
+  "acceptance_criteria": [
+    { "id": "AC-31.4.1", "description": "An HTTP endpoint (e.g. POST /api/v1/knowledge/hybrid_search, on the :authenticated pipeline) calls Loopctl.Knowledge.hybrid_search and returns results + provenance (:curated|:retrieved) + confidence + meta; scope from the resolved key. OpenAPI operation in the controller + schema in api_spec/.", "status": "pending" },
+    { "id": "AC-31.4.2", "description": "An MCP tool (e.g. knowledge_hybrid_search) is added by the existing two-list convention, calling the endpoint via the shared HTTP + witness/STH helpers, with a docstring that explains provenance and when to prefer it over knowledge_search. Optionally a knowledge_index/drill tool for progressive disclosure (US-31.3).", "status": "pending" },
+    { "id": "AC-31.4.3", "description": "Response provenance is preserved end-to-end (a curated answer is flagged curated at the MCP boundary, retrieved flagged retrieved); existing knowledge_* tools/endpoints are unchanged (additive).", "status": "pending" },
+    { "id": "AC-31.4.4", "description": "Tenant isolation + witness/custody: the endpoint rides the existing authenticated/witness pipeline; a two-tenant test proves no cross-tenant answer via API or MCP.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.4.1", "name": "hybrid endpoint returns curated with provenance over HTTP", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)", "a curated refund-policy article + fuzzy chunks", "embedding stubbed"],
+      "steps": ["POST /api/v1/knowledge/hybrid_search %{query: \"refund policy\"}"],
+      "expected_results": ["200 with the curated article, provenance: curated, confidence, meta"], "status": "pending" },
+    { "id": "TC-31.4.2", "name": "MCP knowledge_hybrid_search preserves provenance; static tools unchanged", "type": "integration",
+      "preconditions": ["MCP server pointed at the test API; a curated article + fuzzy chunks"],
+      "steps": ["call knowledge_hybrid_search", "ListTools"],
+      "expected_results": ["curated answer flagged curated; existing knowledge_* tools still present + unchanged"], "status": "pending" },
+    { "id": "TC-31.4.3", "name": "hybrid API/MCP is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a curated content", "{_, key_u} = fixture(:api_key, tenant: fixture(:tenant), role: :agent)"],
+      "steps": ["POST /api/v1/knowledge/hybrid_search as key_u for tenant_a's topic"],
+      "expected_results": ["no tenant_a article returned"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Controller: extend the knowledge controllers (knowledge_search_controller / a new hybrid action); reuse the :authenticated pipeline + error envelope + OpenAPI convention (macro in controller, schema in api_spec/).",
+    "MCP: add knowledge_hybrid_search (+ optional index/drill) to mcp-server/index.js by the two-list convention; reuse http-helpers.js + witness-sth.js.",
+    "Additive only — do not change existing knowledge_search behavior/shape.",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:api_key, tenant:, role:)) + Mox embedding."
+  ],
+  "dependencies": ["US-31.2", "US-31.3"],
+  "estimated_tokens": 280000
+}

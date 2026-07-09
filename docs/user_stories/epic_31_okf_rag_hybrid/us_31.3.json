@@ -1,0 +1,42 @@
+{
+  "id": "US-31.3",
+  "title": "OKF index progressive disclosure: compact index -> drill into relevant articles",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "medium",
+  "phase": "domain",
+  "priority_note": "The 'load the index, then drill only into relevant docs' half of the OKF pattern — reduces over-retrieval. Reuses knowledge_index + hubs + OKF. Depends on the curated rule (31.1).",
+  "background": {
+    "reference": "GitHub issues #305/#306 ('OKF index files for progressive disclosure'); hub 820602df; reuses Loopctl.Knowledge index/hub + okf.ex + the knowledge_index controller.",
+    "includes": "Rather than over-retrieving chunks, an agent should load a compact index (hubs / OKF index files) and drill into only the relevant curated articles. loopctl already has knowledge_index (category view), hubs, and OKF export; this story composes them into a progressive-disclosure entrypoint."
+  },
+  "story": {
+    "as_a": "an agent",
+    "i_want_to": "fetch a compact index/hub for a topic and then drill into only the relevant curated articles",
+    "so_that": "I navigate by index (few tokens) instead of over-retrieving many fuzzy chunks"
+  },
+  "rationale": "Karpathy's 'navigate by index' rule and the OKF index-file pattern both say the model should read a compact index and follow the few relevant pages, not scan the corpus. Exposing loopctl's existing hub/index/OKF layer as a progressive-disclosure path is the token-efficiency half of the hybrid interface and complements the resolver (31.2).",
+  "acceptance_criteria": [
+    { "id": "AC-31.3.1", "description": "A progressive-disclosure entrypoint returns, for a topic/query, a COMPACT index (hub + linked curated article stubs: id, title, category, one-line summary) rather than full bodies — reusing knowledge_index / hub structure / OKF index files, tenant-scoped.", "status": "pending" },
+    { "id": "AC-31.3.2", "description": "A drill step fetches the full body of a chosen indexed article by id (scope-enforced), so the agent loads only what the index pointed at.", "status": "pending" },
+    { "id": "AC-31.3.3", "description": "The index prefers curated sources (US-31.1) and reflects OKF index files where present (reuse knowledge_okf_export/okf.ex index representation); it does not dump the whole corpus.", "status": "pending" },
+    { "id": "AC-31.3.4", "description": "Tenant isolation: the index and drill only expose the caller tenant's articles.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.3.1", "name": "index returns compact stubs then drill returns the body", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a hub linking several curated articles"],
+      "steps": ["fetch the progressive index for the hub's topic", "drill into one returned id"],
+      "expected_results": ["index returns stubs (id/title/summary, not full bodies); drill returns the full article body; token-compact"], "status": "pending" },
+    { "id": "TC-31.3.2", "name": "index is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a hub + articles", "tenant_b = fixture(:tenant)"],
+      "steps": ["fetch the index as tenant_b"],
+      "expected_results": ["no tenant_a stubs appear"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Reuse the knowledge_index controller/context + hub link structure + okf.ex index representation; do not build a new index store.",
+    "Compact stub = id, title, category, short summary/first line — NOT the full body (that is the drill step).",
+    "Tenant scoping via the existing knowledge scope mechanism.",
+    "Tests use Loopctl.Fixtures.fixture/2 with a hub + linked articles."
+  ],
+  "dependencies": ["US-31.1"],
+  "estimated_tokens": 260000
+}

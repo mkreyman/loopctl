@@ -1,0 +1,52 @@
+{
+  "id": "US-31.2",
+  "title": "Hybrid resolver: prefer curated answer, fall back to retrieval, return provenance",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "The core of #305/#306: one resolution path that prefers curated, falls back to RAG, and tells the caller which answered. Depends on the curated-source rule (31.1).",
+  "background": {
+    "reference": "GitHub issues #305/#306; hub 820602df (the refund-policy hallucination failure mode). Reuses Loopctl.Knowledge.knowledge_search (semantic + keyword_only fallback + meta).",
+    "includes": "US-31.1 defines curated sources. This story adds Loopctl.Knowledge.hybrid_search/2 (or extends knowledge_search) that first tries a curated answer and only falls back to semantic retrieval for the long tail, returning provenance (curated|retrieved) + confidence so callers trust curated and treat retrieved as fuzzy."
+  },
+  "story": {
+    "as_a": "an agent querying the knowledge layer",
+    "i_want_to": "call one hybrid retrieval function that returns a curated answer when one exists (flagged curated) and retrieval results otherwise (flagged retrieved), with confidence",
+    "so_that": "I never get a confidently-wrong fuzzy chunk when a canonical answer exists, and I don't have to choose 'RAG or curated' myself"
+  },
+  "rationale": "The harvested failure mode is a hallucinated refund policy from an unrelated chunk — exactly what happens when RAG answers a query that had a canonical answer. Preferring curated when a high-confidence curated match exists, and labeling every answer's provenance, directly prevents that failure while preserving retrieval for the long tail.",
+  "acceptance_criteria": [
+    { "id": "AC-31.2.1", "description": "Loopctl.Knowledge.hybrid_search/2 (tenant-scoped) first attempts a curated match: a high-confidence semantic/keyword match to a curated source (US-31.1). If found above a configurable curated-confidence threshold, it returns that with provenance: :curated. Otherwise it falls back to knowledge_search and returns provenance: :retrieved.", "status": "pending" },
+    { "id": "AC-31.2.2", "description": "The response always carries provenance (:curated | :retrieved), a confidence/score, and the underlying meta (including knowledge_search's fallback/search_mode when the retrieved path ran) — a single shape callers read without branching on which subsystem answered.", "status": "pending" },
+    { "id": "AC-31.2.3", "description": "Prefer-curated resolution: when BOTH a curated source and fuzzy chunks match, the curated one wins (the default resolution rule); a canonical article outranks a probabilistic chunk match.", "status": "pending" },
+    { "id": "AC-31.2.4", "description": "Degradation honesty (SOUL rule 7): if embeddings are unavailable, curated matching may use the keyword path and the response reflects the degraded mode in meta — never a silent empty or a false-curated answer.", "status": "pending" },
+    { "id": "AC-31.2.5", "description": "Tenant isolation: hybrid_search only ever returns the caller tenant's articles (curated or retrieved); a two-tenant test proves no cross-tenant answer.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.2.1", "name": "curated answer wins over fuzzy chunk", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a curated reference article answering 'refund policy'", "several low-category chunk-like articles loosely matching", "embedding stubbed deterministic"],
+      "steps": ["Loopctl.Knowledge.hybrid_search(scope, %{query: \"what is the refund policy?\"})"],
+      "expected_results": ["returns the curated article with provenance: :curated + confidence; NOT a fuzzy chunk"], "status": "pending" },
+    { "id": "TC-31.2.2", "name": "long-tail query falls back to retrieval, flagged", "type": "integration",
+      "preconditions": ["tenant with only non-curated articles matching a niche query"],
+      "steps": ["hybrid_search(scope, %{query: <niche>})"],
+      "expected_results": ["returns retrieval results with provenance: :retrieved + meta (search_mode); no curated claim"], "status": "pending" },
+    { "id": "TC-31.2.3", "name": "degraded embeddings surface in meta, not a false curated answer", "type": "integration",
+      "preconditions": ["EmbeddingCircuitBreaker open; a curated article present"],
+      "steps": ["hybrid_search(scope, %{query: ...})"],
+      "expected_results": ["meta reflects keyword_only/fallback; provenance honest; no silent empty"], "status": "pending" },
+    { "id": "TC-31.2.4", "name": "hybrid_search is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a curated + retrieved matches", "tenant_b = fixture(:tenant)"],
+      "steps": ["hybrid_search as tenant_b for tenant_a's topic"],
+      "expected_results": ["no tenant_a article returned"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Function: Loopctl.Knowledge.hybrid_search/2 (or an extension of knowledge_search with a mode); reuse the existing knowledge_search semantic+keyword path and its meta contract (fallback/search_mode).",
+    "Curated-confidence threshold is config; below it, do not claim curated.",
+    "Prefer-curated is the default resolution rule (AC-31.2.3) — encode explicitly.",
+    "No embedding/vector re-architecture (out of scope per #305) — this is resolution on top.",
+    "Tests use Loopctl.Fixtures.fixture/2 + Mox embedding stub."
+  ],
+  "dependencies": ["US-31.1"],
+  "estimated_tokens": 360000
+}

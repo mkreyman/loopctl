@@ -1,0 +1,42 @@
+{
+  "id": "US-31.1",
+  "title": "Curated-source identification: mark/identify canonical articles for the hybrid resolver",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "The resolver (31.2) needs a defined notion of 'curated/canonical' — the knowledge subsystem has category/scope enums and hubs but no explicit curated-answer marker. This story supplies it. No dependencies.",
+  "background": {
+    "reference": "GitHub issues #305 + #306 (same feature); Second Brain hub 820602df (Cloud Codes OKF+RAG), okf-open-knowledge-format memory. Composes the EXISTING knowledge subsystem (lib/loopctl/knowledge.ex, okf.ex) — do NOT re-architect embeddings.",
+    "includes": "loopctl articles have category (Ecto.Enum), status, scope, and hub/link structure, plus OKF export/import — but no flag distinguishing an AUTHORED/CANONICAL answer from a probabilistic chunk. The hybrid resolver must prefer curated over fuzzy, so 'curated' needs a concrete, queryable definition."
+  },
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "define and expose which published articles count as 'curated/canonical' (a configured curated category set and/or explicit curated marker, plus OKF-index/hub membership) with a helper to identify them",
+    "so_that": "the hybrid resolver can prefer a curated answer over a fuzzy chunk with a clear, testable rule"
+  },
+  "rationale": "The whole point of #305/#306 is 'prefer curated over fuzzy when both exist' — which is undefinable without a concrete curated-source rule. Basing it on the existing category enum + hub/OKF membership (rather than a brand-new subsystem) keeps this a thin resolution layer, per the issue's 'compose existing pieces' constraint, while making 'curated' auditable and tenant-scoped.",
+  "acceptance_criteria": [
+    { "id": "AC-31.1.1", "description": "A curated-source rule is defined: a published article is 'curated' if its category is in a configured curated set (e.g. reference/playbook/pattern hubs) AND/OR it carries an explicit curated marker. If a new marker is used, add it via migration (nullable boolean/field on articles) with tenant scoping; if category-based, no migration. The choice is documented with rationale.", "status": "pending" },
+    { "id": "AC-31.1.2", "description": "Loopctl.Knowledge.curated?/1 (and a scoped list/query helper) returns whether an article is curated and lists a tenant's curated sources, reusing existing published-status + category + hub/OKF-index membership signals.", "status": "pending" },
+    { "id": "AC-31.1.3", "description": "Curated identification is tenant-scoped: a curated article of tenant A is never surfaced as curated in tenant B's scope.", "status": "pending" },
+    { "id": "AC-31.1.4", "description": "Only PUBLISHED articles can be curated (a draft/archived canonical source is not treated as a curated answer).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.1.1", "name": "curated? reflects the configured rule", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a published reference/hub article", "a published low-category chunk-like article", "a draft reference article"],
+      "steps": ["Loopctl.Knowledge.curated?/1 on each"],
+      "expected_results": ["the published reference/hub is curated; the low-category one is not; the draft is not (published-only)"], "status": "pending" },
+    { "id": "TC-31.1.2", "name": "curated listing is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a with a curated article", "tenant_b = fixture(:tenant)"],
+      "steps": ["list curated sources for tenant_b"],
+      "expected_results": ["none from tenant_a appear"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Reuse Loopctl.Knowledge category (@category_values) + status + hub/link + OKF membership; prefer category-set config over a new column if it covers the cases (avoids a migration).",
+    "If a marker column is added, migration must tenant-scope + enable RLS consistency with articles.",
+    "This is the resolution-layer definition only — no embedding/vector changes (out of scope per #305).",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:article, ...) with category/status)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 220000
+}
