@@ -1,0 +1,61 @@
+{
+  "id": "US-30.1",
+  "title": "Entity-definition schema + migration + per-tenant registry (server column allowlist, entity cap)",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "Foundation: the entity definitions everything generates from. The server-defined per-source column allowlist added here is the security root — the entity def is otherwise an attacker-authored allowlist. No dependencies. Enhanced-review round 1 applied.",
+  "background": {
+    "reference": "GitHub issue #309; Second Brain hub 3ee5f890. Agent-native: no web UI. Review round 1: added a server per-source column allowlist, a per-tenant entity cap, RLS-on-migration, and deferred relationships out of v1.",
+    "includes": "loopctl's knowledge_search retrieves CURATED articles; there is no schema-driven governed tool surface over STRUCTURED records. This story adds per-tenant entity definitions (the schema the generator + executor consume). Phase-1 backing sources are loopctl-internal only (projects/stories/epics). CRUCIAL: because the entity definition becomes the executor's field allowlist, a tenant admin must NOT be able to declare arbitrary columns of the backing table — a SERVER-defined per-source exposed-column allowlist bounds what any entity may declare."
+  },
+  "story": {
+    "as_a": "a loopctl tenant admin (or an agent acting for one)",
+    "i_want_to": "declare entity definitions (name, fields with type + filterable?/searchable?, backing source) whose fields are constrained to a server-approved column allowlist for that source, persisted per tenant",
+    "so_that": "the generator and executor produce a governed query surface that can never expose a backing column the server did not sanction"
+  },
+  "rationale": "The entity definition IS the executor's allowlist (US-30.2/30.3), and it is authored by a >= user tenant admin. Without a server-side per-source column allowlist, an admin could declare tenant_id, audit/custody, or arbitrary jsonb columns and the 'declared-fields-only' shaping would faithfully return them — a self-authored data-exfiltration path. Bounding declarable fields to a sanctioned set per backing source is the security root the whole epic rests on.",
+  "acceptance_criteria": [
+    { "id": "AC-30.1.1", "description": "Ecto schema Loopctl.ContextRetriever.Entity (table entity_definitions): tenant_id, name (unique per tenant), backing_source (Ecto.Enum, phase-1 loopctl-internal sources only), fields ({:array, :map} with per-element validation: %{name, type, filterable, searchable}), inserted_at/updated_at. tenant_id set programmatically, never cast. (Relationships are NOT persisted in v1 — see AC-30.1.6.)", "status": "pending" },
+    { "id": "AC-30.1.2", "description": "A SERVER-defined per-backing-source exposed-column allowlist (code constant, e.g. %{stories: [:status, :title, :description, :epic_id, ...], projects: [...]}) lists which columns each source may expose. Changeset validation rejects any declared field whose name is not in that source's allowlist, in addition to validating type, filterable/searchable booleans, and a safe identifier regex. A tenant CANNOT declare tenant_id, audit/custody, or unsanctioned columns.", "status": "pending" },
+    { "id": "AC-30.1.3", "description": "Loopctl.ContextRetriever.Registry.for_tenant/1 returns a tenant's entity definitions (scope-enforced); get_entity/2 returns one by name within tenant. A definition from tenant A is invisible to tenant B.", "status": "pending" },
+    { "id": "AC-30.1.4", "description": "Tenant isolation rides SetTenant + RLS on Loopctl.Repo for entity_definitions; the isolation TEST must run under the non-owner app role (SET LOCAL ROLE loopctl_app / Repo.with_tenant), because RLS is ENABLE not FORCE and a superuser/owner connection bypasses the policy and would prove nothing.", "status": "pending" },
+    { "id": "AC-30.1.5", "description": "A configurable per-tenant cap on entity definitions (and thus generated tools) is enforced at create time, so a tenant cannot inflate the dynamic ListTools payload/latency without bound. Over-cap creation returns {:error, :entity_limit}.", "status": "pending" },
+    { "id": "AC-30.1.6", "description": "Relationships are explicitly OUT of scope for v1 and are NOT persisted (no unvalidated relationship JSON is stored). A note records that any future relationship/join traversal must add per-join tenant scoping + target-entity-must-be-allowlisted validation before it ships.", "status": "pending" },
+    { "id": "AC-30.1.7", "description": "The migration creates entity_definitions AND calls enable_rls(:entity_definitions) (like every other tenant table); the down migration cleanly drops it. Migrations run green on a fresh DB and pass the rollback test.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.1.1", "name": "create + fetch an entity definition within tenant", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)"],
+      "steps": ["insert an Entity for the stories source with allowlisted fields [%{name: \"status\", type: :string, filterable: true, searchable: false}]", "Registry.get_entity(tenant.id, \"story\")"],
+      "expected_results": ["the entity is returned with its fields; unique-per-tenant enforced"], "status": "pending" },
+    { "id": "TC-30.1.2", "name": "changeset rejects non-allowlisted column, unsafe name, unknown source", "type": "unit",
+      "preconditions": ["tenant = fixture(:tenant)"],
+      "steps": ["build Entity changeset declaring field {name: \"tenant_id\"} (not in the stories allowlist)", "another declaring {name: \"status; DROP\"}", "another with backing_source :tenant_supplied"],
+      "expected_results": ["all invalid: column-not-allowlisted error; identifier-regex error; backing_source not-allowlisted error"], "status": "pending" },
+    { "id": "TC-30.1.3", "name": "entity definitions are tenant-isolated (proven under the app role)", "type": "integration",
+      "preconditions": ["tenant_a = fixture(:tenant)", "tenant_b = fixture(:tenant)", "an Entity under tenant_a", "queries run under SET LOCAL ROLE loopctl_app"],
+      "steps": ["Registry.for_tenant(tenant_b.id) with tenant_b context set"],
+      "expected_results": ["tenant_b sees no entities; tenant_a sees its one; the test fails if run as owner (RLS actually enforced)"], "status": "pending" },
+    { "id": "TC-30.1.4", "name": "entity cap is enforced", "type": "integration",
+      "preconditions": ["tenant at the configured entity cap"],
+      "steps": ["attempt to create one more entity"],
+      "expected_results": ["{:error, :entity_limit}; no row inserted"], "status": "pending" },
+    { "id": "TC-30.1.5", "name": "migration up/down is reversible and enables RLS", "type": "integration",
+      "preconditions": ["fresh test DB"],
+      "steps": ["run the migration up then down"],
+      "expected_results": ["entity_definitions created with RLS enabled on up; cleanly dropped on down; no orphaned objects"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Modules: Loopctl.ContextRetriever.Entity (lib/loopctl/context_retriever/entity.ex), Loopctl.ContextRetriever.Registry. Table entity_definitions.",
+    "fields is {:array, :map} with per-element changeset validation (the codebase has NO embedded_schema/embeds_many anywhere; match Story.acceptance_criteria = {:array, :map}).",
+    "Per-source column allowlist is a server code constant keyed by backing_source; the source of truth for what any entity may expose. Validate at define time (here) AND execute time (US-30.3).",
+    "Backing sources v1: projects (Loopctl.Projects.Project), stories (Loopctl.WorkBreakdown.Story), epics — loopctl-internal only.",
+    "Field-name regex ^[a-z_][a-z0-9_]*$ is defense-in-depth; the allowlist is the real control.",
+    "RLS: migration must enable_rls(:entity_definitions) (RlsHelpers, ENABLE not FORCE); isolation tests MUST run under the non-owner app role or they silently pass.",
+    "Relationships deferred out of v1 (not persisted) — avoids dead unguarded JSON that a later join feature could turn into a cross-tenant hole.",
+    "Tests use Loopctl.Fixtures.fixture/2."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 300000
+}

@@ -1,0 +1,46 @@
+{
+  "id": "US-30.2",
+  "title": "Tool generator: entity definition -> filter + full-text tool specs",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "Turns an entity into the tool specs the API/MCP expose and the executor runs. Depends on the entity schema (30.1).",
+  "background": {
+    "reference": "GitHub issue #309; Cole Medin: 'a tool for each attribute + a text search'.",
+    "includes": "US-30.1 provides entity definitions. This story deterministically derives tool specs from them: one filter tool per filterable field, one full-text search tool per entity with searchable text fields. The specs are consumed by the API list endpoint, the MCP dynamic listing (US-30.5), and the executor (US-30.3)."
+  },
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "generate a stable set of tool specs (name, description, JSON input schema) from an entity definition — filter_<entity>_by_<field> for each filterable field and search_<entity> for full-text",
+    "so_that": "the agent tool surface is derived from schema, not hand-maintained, and every generated tool maps to an allowlisted field/operation"
+  },
+  "rationale": "The generator is the bridge from declaration to surface. Making it pure and deterministic (same entity -> same specs) means the API, the MCP listing, and the executor all agree on the exact tool set and input schema, and it guarantees no tool can reference a field the entity did not mark filterable/searchable — the generator is where the executor's allowlist originates.",
+  "acceptance_criteria": [
+    { "id": "AC-30.2.1", "description": "Loopctl.ContextRetriever.ToolGenerator.specs_for/1 takes an Entity and returns a deterministic list of tool specs: one filter_<entity>_by_<field> per field where filterable == true (input: the field value + pagination), and one search_<entity> when the entity has >= 1 searchable text field (input: query string + pagination).", "status": "pending" },
+    { "id": "AC-30.2.2", "description": "Each spec carries a JSON input schema typed from the field type (string/int/bool/date), a clear description, and metadata linking it to its (entity, field, operation) so the executor can dispatch without re-parsing the tool name.", "status": "pending" },
+    { "id": "AC-30.2.3", "description": "Tool names are namespaced/prefixed to avoid collision with loopctl's static MCP tools (e.g. cr_filter_<entity>_by_<field>), and are stable across regenerations for an unchanged entity.", "status": "pending" },
+    { "id": "AC-30.2.4", "description": "A field NOT marked filterable produces NO filter tool; an entity with no searchable field produces NO search tool — the generated surface is exactly the allowlist, nothing more.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.2.1", "name": "generator emits filter tools (typed) only for filterable fields + a search tool", "type": "unit",
+      "preconditions": ["entity = an Entity with fields status(string,filterable), priority(int,filterable), active(bool,filterable), due(date,filterable), description(text,searchable), secret(neither)"],
+      "steps": ["Loopctl.ContextRetriever.ToolGenerator.specs_for(entity)"],
+      "expected_results": ["filter tools for status/priority/active/due with input schemas typed string/integer/boolean/date respectively; a search tool; NO tool references secret; each spec carries (entity, field, operation) metadata"], "status": "pending" },
+    { "id": "TC-30.2.3", "name": "an entity with no searchable field produces no search tool", "type": "unit",
+      "preconditions": ["entity = an Entity whose fields are all filterable-only (no searchable)"],
+      "steps": ["ToolGenerator.specs_for(entity)"],
+      "expected_results": ["only filter tools; NO search_<entity> tool is generated"], "status": "pending" },
+    { "id": "TC-30.2.2", "name": "specs are deterministic and collision-safe", "type": "unit",
+      "preconditions": ["the same entity"],
+      "steps": ["call specs_for/1 twice; compare names to loopctl static tool names"],
+      "expected_results": ["identical specs both calls; generated names are prefixed and do not collide with static tool names"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Module: Loopctl.ContextRetriever.ToolGenerator. Pure function of the entity; no DB, no side effects.",
+    "Name prefix (e.g. cr_) prevents collisions in the MCP ListTools merge (US-30.5).",
+    "The spec's (entity, field, operation) metadata is the contract the executor (US-30.3) dispatches on — do not have the executor re-parse tool names.",
+    "Tests are unit (pure)."
+  ],
+  "dependencies": ["US-30.1"],
+  "estimated_tokens": 200000
+}

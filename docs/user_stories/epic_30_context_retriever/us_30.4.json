@@ -1,0 +1,57 @@
+{
+  "id": "US-30.4",
+  "title": "API: entity-definition CRUD + GET /retrieve/tools + POST /retrieve/:entity",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "api",
+  "priority_note": "Exposes entity management + the generated tool list + the query executor over HTTP (the MCP layer is a thin client). Depends on the executor (30.3).",
+  "background": {
+    "reference": "GitHub issue #309; extends the :authenticated pipeline. Agent-native: entity definitions are managed via API/MCP, NOT a LiveView (the #309 entity-designer LiveView is dropped — no web UI).",
+    "includes": "US-30.1/30.2/30.3 provide the registry, generator, and executor. This story wires them to HTTP: CRUD for entity definitions, a per-tenant generated-tool-spec listing, and the generic query-execution endpoint."
+  },
+  "story": {
+    "as_a": "a tenant admin (via API) and an agent",
+    "i_want_to": "create/read/update/delete my entity definitions, list the generated tool specs for my tenant, and execute a generated query",
+    "so_that": "the structured-data tool surface is defined and used over the same governed transport as knowledge and memory"
+  },
+  "rationale": "Putting entity CRUD, the generated-tool listing, and the executor behind /api/v1 on the existing authenticated/witness pipeline is what lets the MCP server stay a thin client and inherit tenant resolution + role gating. It also delivers the entity-definition management that the dropped LiveView would have provided, agent-natively.",
+  "acceptance_criteria": [
+    { "id": "AC-30.4.1", "description": "LoopctlWeb.ContextRetrieverController on the :authenticated pipeline: CRUD for entity definitions (POST/GET/PATCH/DELETE /api/v1/entities), GET /api/v1/retrieve/tools (generated tool specs for the tenant), POST /api/v1/retrieve/:entity (execute via the Executor). Scope from the resolved key; body tenant ignored.", "status": "pending" },
+    { "id": "AC-30.4.2", "description": "Role gating: defining/mutating entity definitions requires >= user role (403 for agent/orchestrator). Querying (/retrieve/*) requires only authentication — agent is the FLOOR role (superadmin>user>orchestrator>agent), so every authenticated key may query; the negative case is 401 unauthenticated, NOT a 'below-agent 403' (no such role exists). Reuse Loopctl.Auth.Role + the full authenticated/witness/custody chain.", "status": "pending" },
+    { "id": "AC-30.4.6", "description": "The model-invoked /retrieve/:entity endpoint is rate-limited per tenant (reuse Loopctl.RateLimiter.Hammer as elsewhere) so a looping/hostile agent cannot flood the executor; over-limit returns 429.", "status": "pending" },
+    { "id": "AC-30.4.3", "description": "GET /api/v1/retrieve/tools returns only the calling tenant's generated specs (from ToolGenerator over Registry.for_tenant); another tenant's entities never appear.", "status": "pending" },
+    { "id": "AC-30.4.4", "description": "POST /api/v1/retrieve/:entity validates the entity + field/operation against the tenant's definitions, calls Executor.run, and returns %{results, meta}; a request for an unknown entity or non-allowlisted field is 4xx, not executed.", "status": "pending" },
+    { "id": "AC-30.4.5", "description": "OpenAPI: operation macros in the controller (schemas under lib/loopctl/api_spec/); endpoints render at /swaggerui and openapi_test passes.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.4.1", "name": "define an entity then list + query it", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{_, user_key} = fixture(:api_key, tenant: tenant, role: :user)", "{_, agent_key} = fixture(:api_key, tenant: tenant, role: :agent)", "projects seeded under tenant"],
+      "steps": ["POST /api/v1/entities (project entity) as user_key", "GET /api/v1/retrieve/tools as agent_key", "POST /api/v1/retrieve/project %{field: \"status\", op: \"filter\", value: \"active\"} as agent_key"],
+      "expected_results": ["entity created; tools list includes cr_filter_project_by_status; query returns tenant's active projects with meta"], "status": "pending" },
+    { "id": "TC-30.4.2", "name": "agent cannot define entities; unauthenticated cannot query", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{_, agent_key} = fixture(:api_key, tenant: tenant, role: :agent)"],
+      "steps": ["POST /api/v1/entities as agent_key", "POST /api/v1/retrieve/project with no/invalid key"],
+      "expected_results": ["define is 403 for agent (below user); query with no valid key is 401 (agent is the floor role, so any authenticated key may query — there is no below-agent role to 403)"], "status": "pending" },
+    { "id": "TC-30.4.4", "name": "entity update + delete regenerate the tool surface", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{_, user_key} = fixture(:api_key, tenant: tenant, role: :user)", "an existing project entity"],
+      "steps": ["PATCH /api/v1/entities/:id (mark a new field filterable) as user_key", "GET /api/v1/retrieve/tools", "DELETE /api/v1/entities/:id", "GET /api/v1/retrieve/tools"],
+      "expected_results": ["after PATCH the generated tools reflect the new field; after DELETE the entity's tools are gone"], "status": "pending" },
+    { "id": "TC-30.4.5", "name": "/retrieve is rate-limited", "type": "integration",
+      "preconditions": ["a tenant at its /retrieve rate limit"],
+      "steps": ["POST /api/v1/retrieve/project once more"],
+      "expected_results": ["429; not executed"], "status": "pending" },
+    { "id": "TC-30.4.3", "name": "tools + queries never cross tenant", "type": "integration",
+      "preconditions": ["tenant_t + entity + rows", "tenant_u = fixture(:tenant); {_, key_u} = fixture(:api_key, tenant: tenant_u, role: :agent)"],
+      "steps": ["GET /api/v1/retrieve/tools as key_u", "attempt POST /api/v1/retrieve/<tenant_t entity> as key_u"],
+      "expected_results": ["key_u sees none of tenant_t's tools; the query for tenant_t's entity is unknown/4xx for key_u — never returns tenant_t rows"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Controller: LoopctlWeb.ContextRetrieverController; routes under :authenticated scope \"/api/v1\".",
+    "NO LiveView (agent-native); entity CRUD replaces the dropped #309 entity-designer UI.",
+    "Role gating via Loopctl.Auth.Role (define >= user, query >= agent); reuse the existing pipeline + error envelope.",
+    "OpenAPI operation macros in the controller; schemas in lib/loopctl/api_spec/.",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:api_key, tenant:, role:))."
+  ],
+  "dependencies": ["US-30.3"],
+  "estimated_tokens": 280000
+}
