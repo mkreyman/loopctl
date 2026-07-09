@@ -1,6 +1,6 @@
 {
   "id": "US-28.1",
-  "title": "Memory store schemas + migrations: session_memories + memories (embedded, HNSW), tenant/project/subject scoped",
+  "title": "Memory store schemas + migrations: session_memories + memories (embedded, HNSW), tenant/subject scoped",
   "epic": {
     "id": "epic_28",
     "name": "Agent Memory (Part 1: store + semantic retrieval)"
@@ -9,44 +9,49 @@
   "phase": "foundation",
   "priority_note": "Foundation story — every other epic_28 story depends on these tables. No dependencies of its own.",
   "background": {
-    "reference": "GitHub issue #307; Second Brain hub 3ee5f890 (Cole Medin agent-memory pillar); revived idea 787761cd",
-    "includes": "loopctl's Knowledge Wiki stores curated articles (articles table, pgvector embeddings, HNSW index). There is NO per-agent/per-user working-memory concept; mcp-memory-keeper (separate repo, flat JSON) is the current stand-in. This story adds the persistence substrate for a native memory subsystem, kept strictly separate from the knowledge tables. pgvector is already enabled by migration 20260410022854."
+    "reference": "GitHub issue #307; Second Brain hub 3ee5f890 (Cole Medin agent-memory pillar); revived idea 787761cd. Enhanced-review round 1 (analyst/architect/adversarial) findings applied.",
+    "includes": "loopctl's Knowledge Wiki stores curated articles (articles table, pgvector embeddings, HNSW index). There is NO per-agent working-memory concept; mcp-memory-keeper (separate repo, flat JSON) is the current stand-in. This story adds the persistence substrate for a native memory subsystem, kept strictly separate from the knowledge tables. pgvector is already enabled by migration 20260410022854. NOTE: loopctl is agent-native — API-key auth only, no human web UI — so scope owners are API-key identities, not human users."
   },
   "story": {
     "as_a": "loopctl platform engineer",
-    "i_want_to": "add two Ecto schemas and migrations — session_memories (short-term append log, not embedded) and memories (long-term, embedded vector(1536) + HNSW cosine index) — each scoped by tenant_id + project_id + subject_id",
+    "i_want_to": "add two Ecto schemas and migrations — session_memories (short-term append log with expiry, not embedded) and memories (long-term, embedded vector(1536) + HNSW cosine index) — each scoped by tenant_id + project_id + subject_id",
     "so_that": "agents have a durable, scoped place to write and later semantically recall memory without overloading the curated-knowledge articles table"
   },
-  "rationale": "Cole Medin's production architecture names agent memory as a non-optional pillar: short-term session memory plus a per-user long-term memory retrieved by vector search that scales to millions of entries. The Knowledge Wiki is the wrong home for this (different lifecycle, agent-private not curated), so a dedicated scoped schema is the precondition for the context module, API, MCP tools, and UI in the rest of the epic.",
+  "rationale": "Cole Medin's production architecture names agent memory as a non-optional pillar: short-term session memory plus a per-user long-term memory retrieved by vector search that scales to millions of entries. The Knowledge Wiki is the wrong home for this (different lifecycle, agent-private not curated), so a dedicated scoped schema is the precondition for the context module, API, and MCP tools in the rest of the epic. The scope model (subject_id) is the subsystem's security boundary and must be pinned precisely at the schema layer.",
   "acceptance_criteria": [
     {
       "id": "AC-28.1.1",
-      "description": "Schema Loopctl.Memory.SessionMemory (table session_memories): fields session_id :string (required), tenant_id, project_id (nullable), subject_id (scope owner), role Ecto.Enum [:user,:assistant,:system,:fact], content :text, metadata :map, inserted_at. Append-only, no embedding column. Composite index on (tenant_id, session_id, inserted_at).",
+      "description": "Schema Loopctl.Memory.SessionMemory (table session_memories): fields session_id :string (required), tenant_id, project_id (nullable), subject_id :string (scope owner, required), role Ecto.Enum [:user,:assistant,:system,:fact], content :text, metadata :map, expires_at :utc_datetime_usec (required), inserted_at. Append-only, no embedding column. Composite index on (tenant_id, session_id, inserted_at) for chronological read and an index on expires_at for pruning.",
       "status": "pending"
     },
     {
       "id": "AC-28.1.2",
-      "description": "Schema Loopctl.Memory.Memory (table memories): fields tenant_id, project_id (nullable), subject_id (scope owner), text :text (required), embedding Pgvector.Ecto.Vector with load_in_query: false, embedding_content_hash :string, confidence :float default 1.0, source Ecto.Enum [:explicit,:promoted] default :explicit, source_session_id (nullable), tags {:array,:string} default [], superseded_by (nullable self-reference), inserted_at, updated_at.",
+      "description": "Schema Loopctl.Memory.Memory (table memories): fields tenant_id, project_id (nullable), subject_id :string (scope owner, required), text :text (required), embedding Pgvector.Ecto.Vector with load_in_query: false, embedding_content_hash :string, confidence :float default 1.0, source Ecto.Enum [:explicit,:promoted] default :explicit, source_session_id (nullable), tags {:array,:string} default [], superseded_by (nullable self-reference to memories, references with on_delete: :nilify_all), inserted_at, updated_at.",
       "status": "pending"
     },
     {
       "id": "AC-28.1.3",
-      "description": "Migration creates an HNSW cosine index on memories.embedding using the existing lib/loopctl/repo/hnsw_index.ex helper (mirroring 20260410022906_add_embedding_hnsw_index.exs). The index is asserted present by capability (pg_am amname = 'hnsw'), never by a hard-coded name (tolerating prod name drift, same foot-gun as US-27.1 AC-27.1.7).",
+      "description": "Migration creates an HNSW cosine index on memories.embedding using the existing lib/loopctl/repo/hnsw_index.ex helper (mirroring 20260410022906_add_embedding_hnsw_index.exs), and a btree index on (tenant_id, subject_id) to back scope filtering on the OLTP path. The HNSW index is asserted present by capability (pg_am amname = 'hnsw'), never by a hard-coded name (tolerating prod name drift, same foot-gun as US-27.1 AC-27.1.7).",
       "status": "pending"
     },
     {
       "id": "AC-28.1.4",
-      "description": "Changesets set tenant_id and subject_id programmatically from the caller scope (never via cast), validate required fields, cap text/content byte length, and return a changeset error when tenant_id/subject_id are absent — no row can be persisted without a resolved scope.",
+      "description": "subject_id derivation is pinned and total: it is resolved server-side from the caller's API key — api_key.agent_id for agent-role keys, else api_key.id — and is NEVER accepted from request params. Because Loopctl.Auth.Role ranks agent as the FLOOR role (level 1), every authenticated key resolves to a non-null subject_id via this rule; if resolution ever yields nil the changeset/caller path returns an error rather than persisting a null-scoped (leak-prone) row. tenant_id and subject_id are set programmatically, never via cast.",
       "status": "pending"
     },
     {
       "id": "AC-28.1.5",
-      "description": "Tenant isolation is enforced by the same RLS/SetTenant mechanism used for articles: a memory or session_memory written under tenant A is invisible to tenant B at the Repo level.",
+      "description": "Changesets validate required fields (session_id, subject_id, tenant_id, text/content, expires_at for session) and cap text/content byte length; over-cap text and missing scope both produce changeset errors.",
       "status": "pending"
     },
     {
       "id": "AC-28.1.6",
-      "description": "Down migrations drop both tables and the HNSW index with no orphaned index or enum type; migrations run green on a fresh DB and pass the project's migration/rollback test.",
+      "description": "Tenant isolation on the OLTP path (writes, list, forget via Loopctl.Repo) rides the same RLS/SetTenant mechanism as articles. NOTE for downstream stories: the semantic recall path (US-28.2) runs on Loopctl.HeavyReadRepo which is BYPASSRLS, so recall isolation is NOT RLS — it is an explicit (tenant_id, subject_id) predicate enforced by a structural guard (US-28.2 AC). This AC documents the split so no implementer assumes RLS covers recall.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.7",
+      "description": "Down migrations drop both tables, the HNSW index, and the btree indexes with no orphaned index or enum type; migrations run green on a fresh DB and pass the project's migration/rollback test.",
       "status": "pending"
     }
   ],
@@ -60,33 +65,69 @@
       ],
       "steps": [
         "Query information_schema.columns for session_memories and memories",
-        "Query pg_indexes joined to pg_am for an hnsw index on memories.embedding"
+        "Query pg_indexes joined to pg_am for an hnsw index on memories.embedding",
+        "Query pg_indexes for the (tenant_id, subject_id) btree on memories"
       ],
       "expected_results": [
-        "All columns from AC-28.1.1 and AC-28.1.2 are present with the specified types",
-        "An HNSW index on memories.embedding is detected via pg_am amname = 'hnsw'"
+        "All columns from AC-28.1.1 and AC-28.1.2 are present with the specified types (including expires_at, subject_id, superseded_by)",
+        "An HNSW index on memories.embedding is detected via pg_am amname = 'hnsw'",
+        "The (tenant_id, subject_id) btree exists"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.1.2",
-      "name": "Memory changeset rejects a row with no resolved scope",
+      "name": "Memory changeset rejects a row with no resolved subject scope",
       "type": "unit",
       "preconditions": [
         "tenant = fixture(:tenant)"
       ],
       "steps": [
-        "Build Loopctl.Memory.Memory changeset with text set but subject_id/tenant_id omitted from the scope"
+        "Build Loopctl.Memory.Memory changeset with text set but subject_id resolved to nil (simulating a key with nil agent_id and no fallback)"
       ],
       "expected_results": [
         "changeset.valid? == false",
-        "errors include tenant_id and subject_id"
+        "errors include subject_id (and tenant_id when absent)"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.1.3",
-      "name": "Memory rows are tenant-isolated at the Repo level",
+      "name": "Over-cap text is rejected by the changeset",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "Build a Memory changeset with text exceeding the byte-length cap under a valid scope"
+      ],
+      "expected_results": [
+        "changeset.valid? == false with a length error on text"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.1.4",
+      "name": "superseded_by nilifies when the referenced memory is deleted",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "a = fixture(:memory, tenant: tenant, subject_id: \"A\", text: \"old\")",
+        "b = fixture(:memory, tenant: tenant, subject_id: \"A\", text: \"new\")",
+        "set a.superseded_by = b.id"
+      ],
+      "steps": [
+        "Delete b via Repo",
+        "Reload a"
+      ],
+      "expected_results": [
+        "a.superseded_by is nil (on_delete: :nilify_all), so a is not left pointing at a deleted row"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.1.5",
+      "name": "Memory rows are tenant-isolated on the OLTP path",
       "type": "integration",
       "preconditions": [
         "tenant_a = fixture(:tenant)",
@@ -94,13 +135,13 @@
         "insert one memory under tenant_a via the scoped changeset"
       ],
       "steps": [
-        "List memories in tenant_b scope",
-        "List memories in tenant_a scope"
+        "List memories in tenant_b scope via Loopctl.Repo",
+        "List memories in tenant_a scope via Loopctl.Repo"
       ],
       "expected_results": [
         "tenant_b sees 0 memories",
         "tenant_a sees 1 memory",
-        "tenant_id was set programmatically, not from cast params"
+        "tenant_id/subject_id were set programmatically, not from cast params"
       ],
       "status": "pending"
     }
@@ -108,13 +149,15 @@
   "technical_notes": [
     "Namespace: Loopctl.Memory.* (domain) — a sibling to Loopctl.Knowledge.*, NOT nested under it.",
     "Schema modules: Loopctl.Memory.SessionMemory, Loopctl.Memory.Memory. Tables: session_memories, memories.",
-    "Reuse Pgvector.Ecto.Vector with load_in_query: false exactly as lib/loopctl/knowledge/article.ex does.",
+    "Reuse Pgvector.Ecto.Vector with load_in_query: false exactly as lib/loopctl/knowledge/article.ex (line ~63) does; dimension 1536.",
     "HNSW: reuse lib/loopctl/repo/hnsw_index.ex; detect by pg_am amname = 'hnsw' to tolerate name drift.",
-    "embedding is NULL on insert; it is populated asynchronously by the worker in US-28.2 — do not block writes on embedding.",
+    "subject_id is a STRING holding the resolved API-key identity (api_key.agent_id for agent keys, else api_key.id). agent_id is :binary_id and nullable in lib/loopctl/auth/api_key.ex; the fallback to api_key.id is what makes AC-28.1.4 total. This is the security boundary — see US-28.2/US-28.3 for the structural guard + tests.",
+    "superseded_by references memories with on_delete: :nilify_all so forget/2 (US-28.2) never leaves a memory permanently hidden behind a dangling pointer.",
+    "session_memories carries expires_at; the prune worker + TTL policy live in US-28.2. #307 requires Part 1 to bound session memory.",
+    "embedding is NULL on insert; populated asynchronously by the worker in US-28.2 — do not block writes on embedding.",
     "source enum includes :promoted now (written by #308's compiler in Part 2) so Part 2 needs no migration.",
-    "Tests use Loopctl.Fixtures.fixture/1,2; add fixture(:memory, attrs) and fixture(:session_memory, attrs) helpers in this story.",
-    "tenant_id/subject_id set programmatically on every row, never cast (same rule as US-27.1 AC-27.1.9)."
+    "Tests use Loopctl.Fixtures.fixture/1,2; add fixture(:memory, attrs) and fixture(:session_memory, attrs) helpers in this story. fixture(:tenant) and fixture(:api_key, role:) already exist; there is NO fixture(:user)/fixture(:tenant_user) (no human-auth in loopctl)."
   ],
   "dependencies": [],
-  "estimated_hours": 10
+  "estimated_hours": 12
 }

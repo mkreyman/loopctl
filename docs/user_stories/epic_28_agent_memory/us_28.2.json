@@ -1,59 +1,74 @@
 {
   "id": "US-28.2",
-  "title": "Loopctl.Memory context + embedding worker: remember / recall / forget / list / supersede with scope enforcement",
+  "title": "Loopctl.Memory context + workers: remember / recall / forget / list / session_history / supersede with scope-guarded retrieval",
   "epic": {
     "id": "epic_28",
     "name": "Agent Memory (Part 1: store + semantic retrieval)"
   },
   "priority": "high",
   "phase": "domain",
-  "priority_note": "The domain heart of the epic; the API (28.3), MCP (28.4), and UI (28.5) are thin layers over this context.",
+  "priority_note": "The domain heart of the epic; the API (28.3) and MCP (28.4) are thin layers over this context. Carries the subsystem's security boundary (subject-scoped recall) and the two review blockers about it.",
   "background": {
-    "reference": "GitHub issue #307; mirrors the Loopctl.Knowledge context + lib/loopctl/workers/article_embedding_worker.ex patterns",
-    "includes": "US-28.1 provides the tables. This story provides the public domain API the API/MCP/UI layers call, plus async embedding of long-term memories so recall is semantic. Reuses Loopctl.Knowledge.EmbeddingClient (per-tenant BYO key), VectorSearch (HNSW kNN), and EmbeddingCircuitBreaker."
+    "reference": "GitHub issue #307; mirrors Loopctl.Knowledge + lib/loopctl/workers/article_embedding_worker.ex. Enhanced-review round 1 applied: recall isolation is NOT RLS (heavy-read is BYPASSRLS); subject_id needs a structural guard and an index-safe design; session tier needs a read path + TTL.",
+    "includes": "US-28.1 provides the tables. This story provides the public domain API + the embedding worker + the session-prune worker. Reuses Loopctl.Knowledge.EmbeddingClient (per-tenant BYO key), the HNSW kNN path (currently Loopctl.Knowledge.VectorSearch, article-bound — extract a shared helper), EmbeddingCircuitBreaker, and Loopctl.HeavyRead (BYPASSRLS + structural guard)."
   },
   "story": {
     "as_a": "loopctl platform engineer",
-    "i_want_to": "implement Loopctl.Memory.remember/2, recall/2, forget/2, list/2, and supersede/2, backed by an Oban worker that embeds long-term memories via the existing knowledge embedding pipeline",
-    "so_that": "callers write and semantically retrieve scoped memory through one governed API that enforces scope on every read"
+    "i_want_to": "implement Loopctl.Memory.remember/2, recall/2, forget/2, list/2, session_history/2, and supersede/2, backed by an embedding worker and a session-prune worker, with recall isolated by a structural (tenant_id, subject_id) guard on the heavy-read path",
+    "so_that": "callers write and semantically retrieve scoped memory through one governed API where cross-tenant AND cross-subject isolation is mechanically enforced, not left to a remembered where-clause"
   },
-  "rationale": "A store with no accessor is unusable and a store with an unenforced scope is a data leak. Centralizing remember/recall/forget/list/supersede in one context guarantees every read is scope-filtered and every long-term write is embedded exactly once — the discipline Loopctl.Knowledge already applies to articles.",
+  "rationale": "A store with no accessor is unusable and a store whose isolation is not mechanically enforced is a data leak. Because semantic recall runs on the BYPASSRLS heavy-read repo, subject isolation must be a structural guard (like the existing tenant_id guard), and subject filtering must stay HNSW-index-safe or an agent will silently fail to recall its own memories. Centralizing all access in one context is what makes these properties testable and uniform.",
   "acceptance_criteria": [
     {
       "id": "AC-28.2.1",
-      "description": "Loopctl.Memory.remember/2 accepts a scope struct + attrs and writes either a session memory or a long-term memory depending on opts[:tier]; long-term writes enqueue the embedding worker (embedding starts NULL). Scope (tenant_id/project_id/subject_id) comes from the scope struct, never from free-form attrs.",
+      "description": "Loopctl.Memory.remember/2 accepts a scope struct (tenant_id, project_id, subject_id) + attrs and writes either a session memory (tier: :session, with expires_at) or a long-term memory (tier: :long_term); long-term writes enqueue the embedding worker (embedding starts NULL). Scope comes from the scope struct, never from attrs. The write path inherits the existing LoopctlWeb RateLimiter at the API layer (US-28.3) and enforces a per-(tenant,subject) long-term memory count cap, returning {:error, :quota_exceeded} past the cap.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.2",
-      "description": "Loopctl.Memory.recall/2 runs HNSW cosine top-k over long-term memories WITHIN the scope's (tenant_id, optional project_id, subject_id), excludes rows where superseded_by is not null, and returns [{memory, score}] ranked. A recall never returns a memory outside scope.",
+      "description": "Loopctl.Memory.recall/2 runs HNSW cosine top-k over long-term memories on Loopctl.HeavyReadRepo (BYPASSRLS). Isolation is an EXPLICIT (tenant_id, subject_id) predicate enforced by a structural guard: extend Loopctl.HeavyRead.guard!/2 (or add a memory-specific guard) to REJECT any memory heavy-read whose query lacks both the tenant_id and subject_id predicates — mirroring how the existing guard enforces tenant_id. Superseded rows (superseded_by not null) are excluded. Returns the shape in AC-28.2.6.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.3",
-      "description": "recall/2 degrades gracefully when embeddings are unavailable (EmbeddingCircuitBreaker open or no key): it falls back to recent-first ILIKE text match within scope and returns meta %{fallback: true, reason: <tag>} mirroring knowledge_search — never a silent empty result (SOUL rule 7).",
+      "description": "Recall stays index-safe under subject scoping: a selective (tenant_id, subject_id) btree filter on the HNSW inner subquery defeats the ANN index (the documented #170/#172 failure), so the implementation MUST either (i) over-fetch k' > k from the ANN pool and post-filter by subject with a documented scale/EXPLAIN gate proving no under-fill for a subject holding N memories among M total (reuse US-27.1 ANALYZE-at-scale discipline), or (ii) use per-tenant/subject-partitioned retrieval. A scale test (tagged @tag :scale, executed by the terminal story US-28.5) asserts a subject reliably recalls its own top-k when other subjects dominate the corpus.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.4",
-      "description": "forget/2 deletes a memory by id only within scope; a foreign-scope id returns {:error, :not_found} (no existence leak). list/2 enumerates scoped memories with limit/offset and returns total_count in meta with no silent cap.",
+      "description": "recall/2 degrades gracefully when embeddings are unavailable (EmbeddingCircuitBreaker open or no key): it falls back to recent-first ILIKE text match within (tenant_id, subject_id) scope and returns meta %{fallback: true, reason: <tag>} — never a silent empty result (SOUL rule 7). A legitimately empty scope returns results: [] with meta %{fallback: false, reason: nil} (the two zero-result cases are distinguishable).",
       "status": "pending"
     },
     {
       "id": "AC-28.2.5",
-      "description": "supersede/2 sets superseded_by on an in-scope memory to a new memory id; superseded memories are excluded from recall/2 and list/2 by default and included only when opts[:include_superseded] is true.",
+      "description": "forget/2 deletes a memory by id only within scope; a foreign-scope (or foreign-subject) id returns {:error, :not_found} (no existence leak). Because superseded_by is on_delete: :nilify_all (US-28.1), deleting a superseder nilifies dependents so no memory is left permanently hidden. list/2 enumerates scoped memories with limit/offset and total_count meta (no silent cap). session_history/2 returns session_memories for a (tenant_id, session_id) scope in insertion order with limit/offset + total_count, scope-enforced.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.6",
-      "description": "Loopctl.Memory.Workers.MemoryEmbeddingWorker (Oban) embeds a long-term memory via EmbeddingClient, writes embedding + embedding_content_hash, is idempotent (unchanged text re-run is a no-op via the content hash), and honors EmbeddingCircuitBreaker. Mirrors lib/loopctl/workers/article_embedding_worker.ex.",
+      "description": "Every recall/list/session_history path returns a single pinned shape %{results: [...], meta: %{...}} — recall results are [{memory, score}] ranked; list/session_history results are [memory]; meta always carries total_count and (for recall) fallback + reason. No path returns a bare list.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.7",
+      "description": "supersede/2 sets superseded_by on an in-scope memory to a new memory id; superseded memories are excluded from recall/2 and list/2 by default and included only when opts[:include_superseded] is true. Concurrent supersede on the same row is serialized (row lock or a guard) so two supersedes cannot create an A↔B cycle or a lost update.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.8",
+      "description": "Loopctl.Workers.MemoryEmbeddingWorker (Oban, flat Loopctl.Workers.* namespace per #307 and article_embedding_worker.ex) embeds a long-term memory via EmbeddingClient, writes embedding + embedding_content_hash, uses Oban unique: [keys: [:memory_id], period: <n>] AND a content-hash short-circuit so a re-run with unchanged text is a no-op (single embed call), and honors EmbeddingCircuitBreaker / no-key discard.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.9",
+      "description": "Loopctl.Workers.SessionMemoryPruneWorker (Oban cron) deletes session_memories past expires_at, bounding the short-term tier per #307. Scheduled via the Oban cron plugin in config/config.exs, following the existing cleanup-worker convention (e.g. webhook_cleanup_worker.ex).",
       "status": "pending"
     }
   ],
   "test_cases": [
     {
       "id": "TC-28.2.1",
-      "name": "remember then recall round-trips a long-term memory within scope",
+      "name": "remember then recall round-trips a long-term memory within scope (pinned shape)",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
@@ -66,14 +81,33 @@
         "Loopctl.Memory.recall(scope, %{query: \"how does this user want delayed orders handled?\"})"
       ],
       "expected_results": [
-        "recall returns the memory as top-1 with a numeric score",
-        "the stored row has non-null embedding and embedding_content_hash"
+        "return is %{results: [{memory, score} | _], meta: %{total_count: _, fallback: false, reason: nil}}",
+        "the target memory is top-1; the stored row has non-null embedding and embedding_content_hash"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.2.2",
-      "name": "recall and forget are isolated across subject and tenant",
+      "name": "session remember persists a row and session_history reads it back in order",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")"
+      ],
+      "steps": [
+        "remember(scope, %{tier: :session, session_id: \"s1\", role: :user, content: \"m1\", expires_at: <future>})",
+        "remember(scope, %{tier: :session, session_id: \"s1\", role: :assistant, content: \"m2\", expires_at: <future>})",
+        "Loopctl.Memory.session_history(scope, %{session_id: \"s1\"})"
+      ],
+      "expected_results": [
+        "results are [m1, m2] in insertion order",
+        "meta.total_count == 2; the rows have no embedding"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.3",
+      "name": "recall and forget are isolated across subject and tenant (heavy-read guard)",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
@@ -84,67 +118,128 @@
         "m = remember(scope_a, %{tier: :long_term, text: \"secret A fact\"}); drain embedding"
       ],
       "steps": [
-        "Loopctl.Memory.recall(scope_b, %{query: \"secret\"})",
-        "Loopctl.Memory.recall(scope_u, %{query: \"secret\"})",
-        "Loopctl.Memory.forget(scope_b, m.id)"
+        "recall(scope_b, %{query: \"secret\"})",
+        "recall(scope_u, %{query: \"secret\"})",
+        "forget(scope_b, m.id)",
+        "attempt a raw memory heavy-read query missing the subject_id predicate"
       ],
       "expected_results": [
-        "scope_b recall does not include m",
-        "scope_u recall does not include m",
-        "forget returns {:error, :not_found} and m still exists for scope_a"
-      ],
-      "status": "pending"
-    },
-    {
-      "id": "TC-28.2.3",
-      "name": "recall falls back to text match (not empty) when embeddings are down",
-      "type": "integration",
-      "preconditions": [
-        "tenant = fixture(:tenant)",
-        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
-        "remember(scope, %{tier: :long_term, text: \"always expedite reships\"}); drain embedding",
-        "EmbeddingCircuitBreaker forced open"
-      ],
-      "steps": [
-        "Loopctl.Memory.recall(scope, %{query: \"expedite\"})"
-      ],
-      "expected_results": [
-        "the memory is returned via ILIKE text fallback",
-        "meta == %{fallback: true, reason: _} (not a silent [])"
+        "scope_b and scope_u recalls do not include m",
+        "forget returns {:error, :not_found} and m still exists for scope_a",
+        "the guard raises on a heavy-read query lacking the subject_id predicate"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.2.4",
-      "name": "supersede hides the old memory from recall by default",
-      "type": "unit",
+      "name": "recall falls back to text match when embeddings are down; empty scope is distinct",
+      "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
-        "old = fixture(:memory, scope: scope, text: \"prefers refunds\")",
-        "new = fixture(:memory, scope: scope, text: \"prefers reshipments\")"
+        "empty = fixture(:memory_scope, tenant: tenant, subject_id: \"Z\")",
+        "remember(scope, %{tier: :long_term, text: \"always expedite reships\"}); drain embedding",
+        "EmbeddingCircuitBreaker forced open"
+      ],
+      "steps": [
+        "recall(scope, %{query: \"expedite\"})",
+        "recall(empty, %{query: \"expedite\"})"
+      ],
+      "expected_results": [
+        "scope recall returns the memory via ILIKE fallback with meta %{fallback: true, reason: _}",
+        "empty recall returns %{results: [], meta: %{fallback: true, reason: _}} — non-empty scope with fallback vs truly-empty are both handled without a silent []"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.5",
+      "name": "supersede excludes the old memory from recall AND list by default",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "old = remember(scope, %{tier: :long_term, text: \"prefers refunds\"})",
+        "new = remember(scope, %{tier: :long_term, text: \"prefers reshipments\"}); drain embedding"
       ],
       "steps": [
         "Loopctl.Memory.supersede(scope, old.id, new.id)",
-        "Loopctl.Memory.list(scope, %{})",
-        "Loopctl.Memory.list(scope, %{include_superseded: true})"
+        "recall(scope, %{query: \"refund preference\"})",
+        "list(scope, %{})",
+        "list(scope, %{include_superseded: true})"
       ],
       "expected_results": [
-        "default list excludes old, includes new",
+        "recall and default list exclude old, include new",
         "include_superseded list includes both"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.6",
+      "name": "list pagination returns total_count and windows correctly (no silent cap)",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "insert 25 long-term memories in scope"
+      ],
+      "steps": [
+        "list(scope, %{limit: 10, offset: 0})",
+        "list(scope, %{limit: 10, offset: 20})"
+      ],
+      "expected_results": [
+        "first page has 10 results, meta.total_count == 25",
+        "third page has 5 results; no imposed hard cap below total_count"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.7",
+      "name": "embedding worker is idempotent on unchanged text",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "Mox expect the embedding client called exactly once",
+        "m = remember(scope, %{tier: :long_term, text: \"stable fact\"})"
+      ],
+      "steps": [
+        "drain the MemoryEmbeddingWorker queue twice for m"
+      ],
+      "expected_results": [
+        "the embedding client fired once (content-hash / unique short-circuit)",
+        "m.embedding_content_hash is unchanged after the second run"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.8",
+      "name": "prune worker deletes expired session memories only",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "expired = fixture(:session_memory, scope: scope, expires_at: <past>)",
+        "live = fixture(:session_memory, scope: scope, expires_at: <future>)"
+      ],
+      "steps": [
+        "perform Loopctl.Workers.SessionMemoryPruneWorker"
+      ],
+      "expected_results": [
+        "expired is deleted; live remains"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Context module: Loopctl.Memory (lib/loopctl/memory.ex). Worker: Loopctl.Memory.Workers.MemoryEmbeddingWorker.",
-    "Reuse Loopctl.Knowledge.VectorSearch for the kNN; if it is article-specific, extract a shared kNN helper rather than duplicating the HNSW query.",
-    "Scope struct (tenant_id, project_id, subject_id) is passed explicitly so the context is callable in tests without a conn; the plug chain in US-28.3 builds it from the authenticated caller.",
-    "EmbeddingClient is per-tenant BYO key and mandatory; the AC-28.2.3 fallback is the memory analogue of knowledge_search's keyword_only fallback (finding 877a415d).",
-    "supersede + source=:promoted are the seams #308 uses — implement them now so Part 2 adds no schema/context surface.",
-    "Tests use Loopctl.Fixtures.fixture/2; add fixture(:memory_scope, attrs) and fixture(:memory, attrs).",
-    "Stub the embedding provider with Mox against the existing embedding behaviour so tests are deterministic (no network)."
+    "Context module: Loopctl.Memory (lib/loopctl/memory.ex). Workers: Loopctl.Workers.MemoryEmbeddingWorker, Loopctl.Workers.SessionMemoryPruneWorker (flat Loopctl.Workers.* — matches article_embedding_worker.ex and #307).",
+    "Loopctl.Knowledge.VectorSearch is hard-bound to Article (from(a in Article ...)); extract a shared kNN helper parameterized by schema/scope rather than duplicating the HNSW query. It already runs via Loopctl.HeavyRead.all/3 on the BYPASSRLS Loopctl.HeavyReadRepo.",
+    "SECURITY: HeavyRead.guard!/2 today structurally enforces only tenant_id (heavy_read.ex ~line 29). Extend it (or add a memory guard) to also require the subject_id predicate for memory reads — subject isolation is application-level, not RLS, so it needs a structural backstop like tenant does.",
+    "HNSW selectivity: a selective (tenant_id, subject_id) btree on the inner index-ordered subquery defeats HNSW (VectorSearch docs ~lines 350-363 / #170/#172). Prefer over-fetch k' + post-filter by subject with an EXPLAIN/scale gate, or subject-partitioned retrieval; verify at scale in US-28.5 (@tag :scale, ANALYZE per US-27.1).",
+    "EmbeddingClient is per-tenant BYO key and mandatory; the AC-28.2.4 fallback is the memory analogue of knowledge_search's keyword_only fallback (finding 877a415d).",
+    "Scope struct (tenant_id, project_id, subject_id) is passed explicitly so the context is callable in tests without a conn; the plug chain in US-28.3 builds it from the authenticated caller (subject_id per US-28.1 AC-28.1.4).",
+    "supersede + source=:promoted are the seams #308 uses. superseded_by on_delete: :nilify_all is set in US-28.1.",
+    "Tests use Loopctl.Fixtures.fixture/2; add fixture(:memory_scope, attrs), fixture(:memory, attrs), fixture(:session_memory, attrs). Stub the embedding provider with Mox against the existing embedding behaviour (no network)."
   ],
   "dependencies": ["US-28.1"],
-  "estimated_hours": 16
+  "estimated_hours": 20
 }

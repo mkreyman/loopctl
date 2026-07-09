@@ -1,117 +1,127 @@
 {
   "id": "US-28.5",
-  "title": "Memory-Inspector LiveView: human browse / search / delete of memories per scope",
+  "title": "Docs + terminal cross-surface isolation, scale-recall & end-to-end verification (runs last)",
   "epic": {
     "id": "epic_28",
     "name": "Agent Memory (Part 1: store + semantic retrieval)"
   },
-  "priority": "medium",
-  "phase": "app",
-  "priority_note": "Medium — the API/MCP make memory usable; this makes it trustworthy. Cole explicitly calls out visibility + delete as part of the pillar.",
+  "priority": "high",
+  "phase": "verification_docs",
+  "priority_note": "Terminal story: owns the epic-wide isolation proof, the at-scale recall check, and the docs, so no earlier story is blocked mid-loop on cross-surface concerns. Mirrors epic_27's US-27.17.",
   "background": {
-    "reference": "GitHub issue #307; Cole Medin's 'full control and visibility' — the delete-a-memory UX",
-    "includes": "loopctl has only 4 LiveViews (wiki index/show, signup, onboarding). This adds an AUTHENTICATED inspector (not the live_session :public_wiki), reusing wiki_show_live.ex's Earmark rendering and wiki_index_live.ex's pagination."
+    "reference": "GitHub issue #307; mirrors epic_27's terminal verification story (US-27.17). Enhanced-review round 1 applied: cross-SUBJECT isolation must be proven on the API too (not just the context), the subject-scoped recall must be verified at scale (HNSW under-fill risk), and there is no LiveView surface (loopctl is agent-native).",
+    "includes": "Every prior story asserts its own slice; this story proves the pillar end-to-end across context/API/MCP, proves cross-tenant AND cross-subject isolation everywhere, verifies subject-scoped recall at prod-like scale, and writes the memory-vs-knowledge documentation. Depends on every leaf story and runs DEAD LAST."
   },
   "story": {
-    "as_a": "a loopctl operator (human) for my tenant",
-    "i_want_to": "browse, semantically search, and delete the memories agents have stored, scoped to a project/subject",
-    "so_that": "I keep control and visibility over agent memory and can remove wrong or stale entries"
+    "as_a": "a loopctl maintainer",
+    "i_want_to": "run one end-to-end pass that writes and recalls memory through every surface (context, API, MCP), proves cross-tenant/cross-subject isolation everywhere, and proves subject-scoped recall holds at scale, plus document the memory-vs-knowledge boundary",
+    "so_that": "the agent-memory pillar ships proven and understandable, not just unit-green"
   },
-  "rationale": "Auto-accumulated memory that a human cannot see or correct is a liability. A minimal read + search + delete inspector closes the trust loop and is the seam Part 2 (#308) extends to flag promoted-vs-explicit and reject bad promotions.",
+  "rationale": "Scope isolation (tenant AND subject) is the security property of the whole subsystem, and asserting it once per layer is not the same as asserting it holds across the full write->embed->recall path — especially since subject isolation is application-level (BYPASSRLS heavy-read) and can silently under-fill at scale. A single terminal verification (the epic_27 model) plus authoritative docs turns a set of merged stories into a trustworthy, teachable feature.",
   "acceptance_criteria": [
     {
       "id": "AC-28.5.1",
-      "description": "LoopctlWeb.MemoryInspectorLive is routed in an AUTHENTICATED live_session in lib/loopctl_web/router.ex (NOT live_session :public_wiki). Access requires an authenticated human tenant session, and memories are shown only within the viewer's tenant scope via on_mount scope assignment.",
+      "description": "docs/agent-memory.md is written: subsystem architecture, the two tiers (session vs long-term) and session TTL/pruning, the scope model (subject_id derivation + the BYPASSRLS heavy-read structural guard), and an explicit 'when to use memory vs knowledge (vs the future context retriever)' section. It absorbs any durable content the removed docs/cole-medin-self-evolving-wiki.md carried (now KB hub fb9abd73). It states loopctl is agent-native (no web UI) and that operator oversight is the superadmin API path.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.2",
-      "description": "The view lists long-term memories for a selected scope (project/subject filter) with pagination (limit/offset + total_count), newest-first by default, showing text, tags, confidence, source, and timestamps, rendering text via the Earmark pattern from wiki_show_live.ex.",
+      "description": "README.md (feature + memory_* tool list), CLAUDE.md and AGENTS.md (agent guidance: pick memory_* vs knowledge_*), and CHANGELOG.md are updated; the memory endpoints render at /swaggerui.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.3",
-      "description": "A search box calls Loopctl.Memory.recall/2 within scope and shows ranked results with scores; when recall returns meta.fallback == true a visible 'degraded recall' banner is shown — never a silent empty list.",
+      "description": "An end-to-end integration test writes a memory via the API, drains embedding, then recalls it via BOTH Loopctl.Memory and the API, asserting the same memory is reachable through each with the pinned result shape — one coherent path.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.4",
-      "description": "An operator can delete a memory from the UI behind a confirm; the delete calls Loopctl.Memory.forget/2 (scope-checked server-side, cannot delete outside tenant) and the list updates without a full page reload.",
+      "description": "A cross-surface isolation suite proves a memory written under (tenant T, subject A) is NOT retrievable as tenant U, NOR as subject B of T, through the context AND the API AND (where testable) the MCP tool — closing both the cross-tenant and cross-subject leak surfaces epic-wide.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.5",
-      "description": "The view leaves a clean seam for Part 2: columns/filters for source (:explicit|:promoted), source_session_id, and confidence exist or are trivially extensible so #308 can add promoted-vs-explicit flagging and a reject action without a rewrite.",
+      "description": "A @tag :scale recall test seeds a subject with N memories among a much larger multi-subject corpus (reuse US-27.1 ANALYZE-at-scale seeding) and asserts the subject reliably recalls its own top-k — proving the subject filter did not get starved by HNSW under-fill (US-28.2 AC-28.2.3). Excluded from mix precommit; executed here.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.5.6",
+      "description": "The docs record a PII/secret stance: memory text is embedded by a third-party (per-tenant BYO) provider, so memory content leaves the tenant boundary to the embedding API; the docs state what should NOT be stored as memory and note the write path is rate-limited + per-scope capped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.5.7",
+      "description": "A documented seam note records where #308 (auto-promotion) and mkreyman/claude-config#85 (skills consumer) hook in (source=:promoted, supersede/2, session_history/2, which memory_* tools the skills call). No implementation of those here — only the verified extension points.",
       "status": "pending"
     }
   ],
   "test_cases": [
     {
       "id": "TC-28.5.1",
-      "name": "Inspector lists and deletes only in-scope memories",
+      "name": "End-to-end write(API) then recall(context + API) for one memory",
       "type": "integration",
       "preconditions": [
-        "tenant_t = fixture(:tenant)",
-        "operator = fixture(:user); fixture(:tenant_user, tenant: tenant_t, user: operator)",
-        "tenant_u = fixture(:tenant)",
-        "fixture(:memory, tenant: tenant_t, subject_id: \"A\", text: \"T fact\")",
-        "fixture(:memory, tenant: tenant_u, subject_id: \"A\", text: \"U fact\")"
+        "tenant = fixture(:tenant)",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "embedding client stubbed via Mox to deterministic vectors"
       ],
       "steps": [
-        "live(conn authenticated as operator, ~p\"/memory\")",
-        "assert the rendered memory list",
-        "click delete on the tenant_t memory and confirm"
+        "POST /api/v1/memory with a fact",
+        "drain the MemoryEmbeddingWorker queue",
+        "Loopctl.Memory.recall(scope, %{query: ...}) and POST /api/v1/memory/recall with the same query"
       ],
       "expected_results": [
-        "only the tenant_t memory is listed (never the tenant_u one)",
-        "after delete the row is gone and the list re-renders without a full reload",
-        "a delete attempt on a foreign id is rejected server-side"
+        "both recalls return the same memory id with a score in the pinned %{results, meta} shape",
+        "the API and context results agree"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.5.2",
-      "name": "Search shows ranked results and a degraded banner on fallback",
+      "name": "Cross-tenant and cross-subject isolation holds on context and API",
       "type": "integration",
       "preconditions": [
-        "tenant = fixture(:tenant)",
-        "operator = fixture(:user); fixture(:tenant_user, tenant: tenant, user: operator)",
-        "fixture(:memory, tenant: tenant, subject_id: \"A\", text: \"always expedite reships\")",
-        "EmbeddingCircuitBreaker forced open"
+        "tenant_t = fixture(:tenant)",
+        "tenant_u = fixture(:tenant)",
+        "{_, key_u} = fixture(:api_key, tenant: tenant_u, role: :agent)",
+        "{_, key_tb} = fixture(:api_key, tenant: tenant_t, role: :agent)  # subject B of T",
+        "m = fixture(:memory, tenant: tenant_t, subject_id: \"A\", text: \"T/A secret\"); drain embedding"
       ],
       "steps": [
-        "live(conn as operator, ~p\"/memory\")",
-        "submit the search form with query \"expedite\""
+        "recall/list/forget m as key_u via the API",
+        "recall/list/forget m as key_tb (subject B) via the API",
+        "recall/list/forget m as (tenant_t, subject B) via Loopctl.Memory"
       ],
       "expected_results": [
-        "the matching memory is shown via text fallback",
-        "a visible 'degraded recall' banner is rendered"
+        "m is never returned or mutated on any surface, cross-tenant or cross-subject",
+        "no response leaks m's existence"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.5.3",
-      "name": "Unauthenticated access is refused",
+      "name": "Subject-scoped recall survives at scale (no HNSW under-fill)",
       "type": "integration",
       "preconditions": [
-        "no authenticated session"
+        "@tag :scale",
+        "seed a large multi-subject corpus (>= prod floor) with subject A holding N distinctive memories, ANALYZEd (US-27.1 helper)"
       ],
       "steps": [
-        "attempt live(conn, ~p\"/memory\")"
+        "recall as subject A for a query matching A's memories"
       ],
       "expected_results": [
-        "redirected/denied (not served); the route is not in the public_wiki live_session"
+        "A's top-k own memories are returned (not starved by other subjects dominating the ANN pool)"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "LiveView: LoopctlWeb.MemoryInspectorLive; route under an authenticated live_session with the same on_mount used by other tenant-scoped surfaces — do NOT reuse live_session :public_wiki (system-scoped, unauthenticated).",
-    "Reuse wiki_show_live.ex Earmark rendering and wiki_index_live.ex pagination for consistency.",
-    "Phoenix 1.8 conventions: Layouts.app, to_form/2, .input; keep the UI deliberately minimal (read/search/delete).",
-    "Promoted-vs-explicit UX and reject-a-promotion belong to #308 — only leave the columns/filters extensible.",
-    "Tests use Loopctl.Fixtures.fixture/2 and Phoenix.LiveViewTest live/2; fixture(:tenant_user) already exists."
+    "Model on epic_27's US-27.17 terminal-verification pattern: depends on all leaves, runs last, owns the @tag :scale checks excluded from mix precommit.",
+    "docs/agent-memory.md is authoritative for the three-layer mental model (knowledge / memory / context-retriever) the Cole Medin comparison surfaced — keep it short and decision-oriented; state loopctl is agent-native (no web UI).",
+    "There is NO LiveView/inspector surface (removed — loopctl has no human web auth); operator oversight is the superadmin API path in US-28.3 AC-28.3.4.",
+    "Do NOT implement #308 or claude-config#85 here; only assert and document the seams they rely on.",
+    "Tests use Loopctl.Fixtures.fixture/2; reuse the deterministic Mox embedding stub from US-28.2 and the ScaleSeed helper from US-27.1."
   ],
-  "dependencies": ["US-28.2", "US-28.3"],
+  "dependencies": ["US-28.1", "US-28.2", "US-28.3", "US-28.4"],
   "estimated_hours": 12
 }

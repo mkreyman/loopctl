@@ -1,23 +1,23 @@
 {
   "id": "US-28.3",
-  "title": "HTTP JSON API for memory: /api/v1/memory* on the authenticated pipeline (+ OpenAPI)",
+  "title": "HTTP JSON API for memory: /api/v1/memory* on the authenticated pipeline, with superadmin oversight (+ OpenAPI)",
   "epic": {
     "id": "epic_28",
     "name": "Agent Memory (Part 1: store + semantic retrieval)"
   },
   "priority": "high",
   "phase": "api",
-  "priority_note": "Bridges the domain (28.2) to the MCP layer (28.4); must reuse the existing auth/witness pipeline exactly.",
+  "priority_note": "Bridges the domain (28.2) to the MCP layer (28.4); must reuse the existing auth/witness pipeline exactly. Also carries operator oversight (superadmin) since loopctl has no web UI.",
   "background": {
-    "reference": "GitHub issue #307; mirrors the knowledge_* controllers and the :authenticated router pipeline (ExtractApiKey/ResolveApiKey/SetTenant/RequireAuth/ValidateWitnessHeader/CheckCustodyHalt)",
-    "includes": "The MCP tools (US-28.4) call the Phoenix /api/v1 API, not the context directly. This story exposes Loopctl.Memory over HTTP so it inherits tenant resolution, role gating, and the witness/chain-of-custody layer."
+    "reference": "GitHub issue #307; mirrors the knowledge_* controllers and the full :authenticated router pipeline. Enhanced-review round 1 applied: subject derivation reconciled with the role floor; operator oversight moved from a (nonexistent) LiveView to a superadmin API path; OpenAPI-operations location corrected; cross-subject isolation test added.",
+    "includes": "The MCP tools (US-28.4) call the Phoenix /api/v1 API, not the context directly, so memory inherits tenant resolution, role gating, and witness/chain-of-custody. The full :authenticated pipeline (lib/loopctl_web/router.ex) is ExtractApiKey → ResolveApiKey → SetTenant → SeedTenantMetadata → Impersonate → RequireAuth → RateLimiter → ValidateWitnessHeader → CheckCustodyHalt → UpdateLastSeen (do not rely on an abbreviated subset)."
   },
   "story": {
-    "as_a": "a loopctl API consumer (an agent via MCP, or a direct client)",
-    "i_want_to": "call REST endpoints to write, recall, list, and delete memory, authenticated with my API key and scoped to my tenant/role",
-    "so_that": "agents use memory over the same governed transport as the knowledge and story APIs"
+    "as_a": "a loopctl API consumer (an agent via MCP, or a direct client) and, for oversight, a superadmin",
+    "i_want_to": "call REST endpoints to write, recall, list, and delete my own scoped memory, and (as superadmin) list/delete memory across subjects within a tenant",
+    "so_that": "agents use memory over the same governed transport as the knowledge and story APIs, and a human operator retains visibility + delete control without a web UI"
   },
-  "rationale": "loopctl's MCP server is a thin HTTP client over /api/v1, so memory must live there to inherit tenant resolution, role gating, and the witness/custody layer instead of re-implementing them. Putting the boundary anywhere else would fork the auth story.",
+  "rationale": "loopctl's MCP server is a thin HTTP client over /api/v1, so memory must live there to inherit tenant resolution, role gating, and the witness/custody layer instead of re-implementing them. Because loopctl is agent-native (no human web UI), Cole Medin's 'operator visibility + delete' requirement is met by a superadmin-scoped API oversight path rather than a LiveView.",
   "acceptance_criteria": [
     {
       "id": "AC-28.3.1",
@@ -26,34 +26,39 @@
     },
     {
       "id": "AC-28.3.2",
-      "description": "Role gating via Loopctl.Auth.Role: memory read/write requires role >= agent. Scope (tenant_id + subject_id) is derived from the resolved key (ResolveApiKey/SetTenant/Impersonate) and any tenant_id/subject_id in the request body is ignored, not honored.",
+      "description": "Scope (tenant_id + subject_id) is derived from the resolved API key per US-28.1 AC-28.1.4 (agent_id for agent keys, else api_key.id), NOT from the request body; any tenant_id/subject_id in the body is ignored. If subject_id cannot be resolved the request is rejected with a deterministic 4xx (never a null-scoped write). Role note: agent is the FLOOR role, so 'authenticated' is the effective gate for own-memory operations — the real boundary is (tenant_id, subject_id), not role; document this so it is not misread as a privilege gate.",
       "status": "pending"
     },
     {
       "id": "AC-28.3.3",
-      "description": "The full authenticated plug chain applies; a custody-halted key cannot write memory (CheckCustodyHalt), and a missing/invalid witness header is rejected consistently with other write endpoints (ValidateWitnessHeader).",
+      "description": "The full :authenticated plug chain applies; a custody-halted key cannot write memory (CheckCustodyHalt), a missing/invalid witness header is rejected consistently with other write endpoints (ValidateWitnessHeader), and the write path is subject to RateLimiter.",
       "status": "pending"
     },
     {
       "id": "AC-28.3.4",
-      "description": "recall responses carry meta (fallback flag + reason when embeddings degrade); list carries offset/limit/total_count; errors use the API's standard error envelope. No endpoint imposes a silent hard cap.",
+      "description": "Superadmin oversight (replaces the web inspector): a superadmin-role key MAY list all subjects' memories within its tenant (GET /api/v1/memory?all_subjects=true or an /api/v1/admin/memory route) and delete any memory in the tenant. Non-superadmin keys are strictly confined to their own subject_id; requesting all_subjects as a non-superadmin is ignored/403.",
       "status": "pending"
     },
     {
       "id": "AC-28.3.5",
-      "description": "OpenAPI operations for all four endpoints are added under lib/loopctl/api_spec/, render at /swaggerui, and the existing openapi_test passes with no 'No operation spec defined' warning for the new actions.",
+      "description": "recall responses carry the pinned shape/meta from US-28.2 AC-28.2.6 (results + meta.fallback/reason); list carries offset/limit/total_count; errors use the API's standard error envelope; no endpoint imposes a silent hard cap.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.3.6",
+      "description": "OpenAPI: operation macros are declared IN LoopctlWeb.MemoryController via use OpenApiSpex.ControllerSpecs (collected by Paths.from_router/1), and request/response SCHEMAS are added under lib/loopctl/api_spec/. The endpoints render at /swaggerui and the existing openapi_test passes with no 'No operation spec defined' warning for the new actions.",
       "status": "pending"
     }
   ],
   "test_cases": [
     {
       "id": "TC-28.3.1",
-      "name": "remember + recall round-trip over HTTP within tenant scope",
+      "name": "remember + recall round-trip over HTTP within tenant/subject scope",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "key = fixture(:api_key, tenant: tenant, role: :agent)",
-        "conn authenticated with key + valid witness header",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "conn authenticated with raw key + valid witness header",
         "embedding client stubbed via Mox"
       ],
       "steps": [
@@ -63,18 +68,38 @@
       ],
       "expected_results": [
         "write returns 201",
-        "recall returns 200 with the memory ranked and meta present, scoped to tenant"
+        "recall returns 200 with the memory ranked, scoped to the key's subject, and meta present"
       ],
       "status": "pending"
     },
     {
       "id": "TC-28.3.2",
-      "name": "Body-supplied tenant/subject is ignored; cross-tenant read is impossible",
+      "name": "Body-supplied tenant/subject is ignored; cross-subject read is impossible within a tenant",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw_a, key_a} = fixture(:api_key, tenant: tenant, role: :agent)  # distinct agent_id A",
+        "{raw_b, key_b} = fixture(:api_key, tenant: tenant, role: :agent)  # distinct agent_id B",
+        "as key_a: POST a memory; drain embedding"
+      ],
+      "steps": [
+        "as key_b: POST /api/v1/memory/recall with body %{query: \"...\", subject_id: <A>}",
+        "as key_b: GET /api/v1/memory"
+      ],
+      "expected_results": [
+        "the body subject_id is ignored; key_b's scope stays subject B",
+        "key_a's memory is never returned to key_b; no 500 and no existence leak"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.3.3",
+      "name": "Cross-tenant read is impossible and body tenant_id is ignored",
       "type": "integration",
       "preconditions": [
         "tenant_t = fixture(:tenant)",
         "tenant_u = fixture(:tenant)",
-        "key = fixture(:api_key, tenant: tenant_t, role: :agent)",
+        "{raw, key} = fixture(:api_key, tenant: tenant_t, role: :agent)",
         "a memory exists under tenant_u"
       ],
       "steps": [
@@ -82,37 +107,57 @@
         "GET /api/v1/memory as key"
       ],
       "expected_results": [
-        "scope stays tenant_t; the tenant_u memory is never returned",
-        "no 500 and no existence leak"
+        "scope stays tenant_t; the tenant_u memory is never returned; the row a prior write created lands under tenant_t/subject-of-key regardless of body"
       ],
       "status": "pending"
     },
     {
-      "id": "TC-28.3.3",
+      "id": "TC-28.3.4",
+      "name": "Superadmin can list across subjects; agent cannot",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{_, admin} = fixture(:api_key, tenant: tenant, role: :superadmin)",
+        "{_, agent} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "memories exist under two different subjects in tenant"
+      ],
+      "steps": [
+        "GET /api/v1/memory?all_subjects=true as admin",
+        "GET /api/v1/memory?all_subjects=true as agent"
+      ],
+      "expected_results": [
+        "admin sees both subjects' memories",
+        "agent's all_subjects request is ignored/403 — it sees only its own subject"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.3.5",
       "name": "Custody-halted key cannot write memory",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
         "key placed in custody-halt"
       ],
       "steps": [
         "POST /api/v1/memory with a valid body"
       ],
       "expected_results": [
-        "rejected consistently with other write endpoints (same status and error shape as a halted knowledge write)"
+        "rejected consistently with other write endpoints (same status/shape as a halted knowledge write)"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Controller: LoopctlWeb.MemoryController; view: LoopctlWeb.MemoryJSON; routes added in lib/loopctl_web/router.ex under the existing :authenticated scope \"/api/v1\".",
+    "Controller: LoopctlWeb.MemoryController; view: LoopctlWeb.MemoryJSON; routes in lib/loopctl_web/router.ex under the existing :authenticated scope \"/api/v1\" (superadmin oversight under /api/v1/admin or a role-gated param).",
     "Model the controller on an existing write-capable knowledge controller for the plug pipeline + error envelope; do not invent a new auth path.",
-    "The scope struct passed to Loopctl.Memory is built from conn.assigns set by SetTenant/Impersonate — mirror how knowledge controllers read the current tenant/subject.",
-    "Keep recall a POST (query/params in body) to match knowledge_search ergonomics and avoid long query strings.",
-    "OpenAPI schemas live in lib/loopctl/api_spec/; add request/response schema modules and wire operations so openapi_test stays green.",
-    "Tests use Loopctl.Fixtures.fixture/2; fixture(:api_key, tenant:, role:) already exists for other controller tests."
+    "The scope struct passed to Loopctl.Memory is built from conn.assigns set by ResolveApiKey/SetTenant/Impersonate; subject_id per US-28.1 AC-28.1.4. Note Impersonate merges tenant/role onto the superadmin key — ensure the impersonated subject_id is resolved deterministically, not left as the superadmin's nil agent_id.",
+    "Keep recall a POST (query/params in body) to match knowledge_search ergonomics.",
+    "OpenAPI: operation macros go IN the controller (use OpenApiSpex.ControllerSpecs, as article_controller.ex ~line 15); only schemas live in lib/loopctl/api_spec/schemas.ex.",
+    "fixture(:api_key, tenant:, role:) returns {raw_key, %ApiKey{}} and already exists; there is no human-user fixture.",
+    "agent role is the floor (level 1) in lib/loopctl/auth/role.ex — 'role >= agent' is a no-op gate; the boundary is (tenant_id, subject_id)."
   ],
   "dependencies": ["US-28.2"],
-  "estimated_hours": 12
+  "estimated_hours": 14
 }

@@ -95,6 +95,24 @@
         "A's memory is not returned to B; no error leaks its existence"
       ],
       "status": "pending"
+    },
+    {
+      "id": "TC-28.4.4",
+      "name": "First-write witness 412 self-heals; absent/invalid witness is rejected",
+      "type": "integration",
+      "preconditions": [
+        "a fresh MCP process (no persisted STH) against the test API",
+        "an agent-role key"
+      ],
+      "steps": [
+        "Force a 412 witness_bootstrap_already_consumed on the first memory_remember, then let the tool retry with the STH echoed from the 412",
+        "Separately, call memory_remember with a stripped/invalid witness header"
+      ],
+      "expected_results": [
+        "the 412 retry succeeds (self-heal, as publish.py does) and the memory is written",
+        "the invalid-witness call is rejected consistently with other write tools"
+      ],
+      "status": "pending"
     }
   ],
   "technical_notes": [
