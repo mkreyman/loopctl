@@ -21,6 +21,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
+  alias Loopctl.Memory.Memory
+  alias Loopctl.Memory.SessionMemory
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
@@ -178,6 +180,35 @@ defmodule Loopctl.Fixtures do
         access_type: "get",
         metadata: %{},
         accessed_at: DateTime.utc_now()
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:memory, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        text: "Memory fact #{seq}",
+        confidence: 1.0,
+        source: :explicit,
+        tags: []
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:session_memory, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        session_id: "session-#{seq}",
+        role: :user,
+        content: "Session turn #{seq}",
+        metadata: %{},
+        expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
       },
       Enum.into(attrs, %{})
     )
@@ -558,6 +589,58 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Article{tenant_id: tenant_id, project_id: project_id}
       |> Article.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:memory, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    # project_id is set programmatically (not cast) — the write path derives it
+    # from authorized caller context, so the fixture mirrors that.
+    project_id = Map.get(attrs, :project_id)
+    data = build(:memory, attrs)
+
+    changeset =
+      %Memory{tenant_id: tenant_id, subject_id: subject_id, project_id: project_id}
+      |> Memory.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:session_memory, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    # project_id is set programmatically (not cast) — the write path derives it
+    # from authorized caller context, so the fixture mirrors that.
+    project_id = Map.get(attrs, :project_id)
+    data = build(:session_memory, attrs)
+
+    changeset =
+      %SessionMemory{tenant_id: tenant_id, subject_id: subject_id, project_id: project_id}
+      |> SessionMemory.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
