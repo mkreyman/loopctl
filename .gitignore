@@ -33,4 +33,13 @@ mcp-server/node_modules/
 
 # Design reference templates (not application code)
 /docs/tailwind/
-.claude/implement-plan.run.json
+
+# Claude Code harness state — ignore run artifacts + personal local settings,
+# but keep project-scoped skills/commands/agents tracked.
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+!.claude/commands/
+!.claude/commands/**
+!.claude/agents/
+!.claude/agents/**
