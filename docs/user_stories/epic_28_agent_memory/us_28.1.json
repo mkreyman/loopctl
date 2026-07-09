@@ -1,0 +1,83 @@
+{
+  "id": "US-28.1",
+  "title": "Memory store schemas + migrations: session_memories + memories (embedded, HNSW), tenant/project/agent scoped",
+  "epic": {
+    "id": "epic_28",
+    "name": "Agent Memory (Part 1: store + semantic retrieval)"
+  },
+  "priority": "high",
+  "phase": "foundation",
+  "background": {
+    "reference": "GitHub issue #307; Second Brain hub 3ee5f890 (Cole Medin agent-memory pillar); revived idea 787761cd",
+    "includes": "loopctl's Knowledge Wiki stores curated articles (articles table, pgvector embeddings, HNSW index). There is NO per-agent/per-user working-memory concept; mcp-memory-keeper (separate repo, flat JSON) is the current stand-in. This story adds the persistence substrate for a native memory subsystem, kept strictly separate from the knowledge tables."
+  },
+  "priority_note": "Foundation story — every other epic_28 story depends on these tables. No dependencies of its own.",
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "add two Ecto schemas and migrations — session_memories (short-term, append log, not embedded) and memories (long-term, embedded vector(1536) + HNSW cosine index) — each scoped by tenant_id + project_id + agent/user identity",
+    "so_that": "agents have a durable, scoped place to write and later semantically recall memory, without overloading the curated-knowledge articles table"
+  },
+  "rationale": "Cole Medin's production architecture names agent memory as a non-optional pillar: short-term session memory plus a per-user long-term memory retrieved by vector search that scales to millions of entries. The Knowledge Wiki is the wrong home for this (different lifecycle, different scope, agent-private not curated). A dedicated, scoped schema is the precondition for the context module, API, MCP tools, and UI in the rest of the epic.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-28.1.1",
+      "description": "New Ecto schema Loopctl.Memory.SessionMemory (table session_memories): fields session_id (string, required), tenant_id, project_id (nullable), agent_id/subject (the scope owner), role (enum: user|assistant|system|fact), content (text), metadata (map), inserted_at. Append-only; no embedding column. Indexed on (tenant_id, session_id, inserted_at).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.2",
+      "description": "New Ecto schema Loopctl.Memory.Memory (table memories): fields tenant_id, project_id (nullable), subject_id (per-user/per-agent scope owner), text (required), embedding (Pgvector.Ecto.Vector, load_in_query: false), embedding_content_hash, confidence (float, default 1.0), source_session_id (nullable), source ('explicit' now; 'promoted' reserved for Part 2/#308), tags ({:array,:string}), superseded_by (nullable self-ref), inserted_at/updated_at.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.3",
+      "description": "Migration enables/reuses pgvector (already enabled by 20260410022854) and creates an HNSW cosine index on memories.embedding via the existing hnsw_index helper pattern (mirror 20260410022906_add_embedding_hnsw_index.exs). Index detected by capability (amname='hnsw'), not a hard-coded name.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.4",
+      "description": "Both schemas set tenant_id programmatically (never via cast). Changesets validate required fields, cap text/content length, and reject a memory whose subject_id/tenant_id is not derivable from the caller's resolved scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.5",
+      "description": "Tenant isolation: rows are only visible within their tenant_id (reuse the existing RLS/SetTenant mechanism used by articles). A memory or session_memory written under tenant A is invisible to tenant B, verified by test.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.1.6",
+      "description": "Down migrations cleanly drop both tables and the HNSW index; no orphaned index or type. Migrations run green on a fresh DB and are idempotent-safe under the project's migration test.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-28.1.1",
+      "name": "Both tables exist with the expected columns and the HNSW index is present",
+      "type": "integration",
+      "preconditions": ["Migrations run on a fresh test DB"],
+      "steps": ["Introspect information_schema for session_memories + memories columns", "Query pg_indexes joined to pg_am for an hnsw index on memories.embedding"],
+      "expected_results": ["All AC-28.1.1 / AC-28.1.2 columns present", "An HNSW index on memories.embedding is detected by capability (amname='hnsw')"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.1.2",
+      "name": "Memory rows are tenant-isolated",
+      "type": "integration",
+      "preconditions": ["tenant_a, tenant_b", "Insert one memory under tenant_a"],
+      "steps": ["Query memories in tenant_b scope"],
+      "expected_results": ["tenant_b sees 0 memories; tenant_a sees 1; tenant_id was set programmatically, not cast"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Namespace: Loopctl.Memory.* (domain) — a sibling to Loopctl.Knowledge.*, NOT nested under it.",
+    "Reuse Pgvector.Ecto.Vector and load_in_query:false exactly as lib/loopctl/knowledge/article.ex does.",
+    "HNSW: reuse lib/loopctl/repo/hnsw_index.ex; detect by amname='hnsw' to tolerate name drift (same foot-gun as US-27.1 AC-27.1.7).",
+    "embedding is NULL on insert here; it is populated by the embedding worker in US-28.2 (do not block writes on embedding).",
+    "source field: only 'explicit' is produced in Part 1; 'promoted' is written by #308's compiler — include the enum value now so Part 2 needs no migration.",
+    "Keep session_memories cheap: no embedding, bounded by a documented TTL/retention (retention policy itself can be a Part-2 concern; note it)."
+  ],
+  "dependencies": [],
+  "estimated_hours": 10
+}

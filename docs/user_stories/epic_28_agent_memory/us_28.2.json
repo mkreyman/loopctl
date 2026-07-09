@@ -1,0 +1,90 @@
+{
+  "id": "US-28.2",
+  "title": "Loopctl.Memory context + embedding worker: remember / recall / forget / list / supersede with scope enforcement",
+  "epic": {
+    "id": "epic_28",
+    "name": "Agent Memory (Part 1: store + semantic retrieval)"
+  },
+  "priority": "high",
+  "phase": "domain",
+  "background": {
+    "reference": "GitHub issue #307; mirrors the Loopctl.Knowledge context + article_embedding_worker patterns",
+    "includes": "US-28.1 provides the tables. This story provides the public domain API the API/MCP/UI layers call, plus the async embedding of long-term memories so recall is semantic."
+  },
+  "priority_note": "The domain heart of the epic; the API (28.3), MCP (28.4), and UI (28.5) are thin layers over this context.",
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "implement a Loopctl.Memory context exposing remember/2, recall/2 (semantic top-k within scope), forget/2, list/2, and supersede/2, backed by an Oban embedding worker that embeds long-term memories using the existing knowledge embedding pipeline",
+    "so_that": "callers can write and semantically retrieve scoped memory through one governed API that enforces scope on every read"
+  },
+  "rationale": "A store with no accessor is unusable and a store with an unenforced scope is a data-leak. Centralizing remember/recall/forget/list/supersede in one context guarantees every read is scope-filtered and every write is embedded exactly once — the same discipline Loopctl.Knowledge applies to articles.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-28.2.1",
+      "description": "Loopctl.Memory.remember/2 writes either a session memory (short-term) or a long-term memory depending on opts; long-term writes enqueue the embedding worker (embedding starts NULL, populated async). Scope (tenant/project/subject) is taken from the caller context, never from free-form params.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.2",
+      "description": "Loopctl.Memory.recall/2 performs HNSW cosine top-k over long-term memories WITHIN the caller's (tenant, project?, subject) scope, using Loopctl.Knowledge.VectorSearch (or a shared helper), excluding superseded rows. Returns ranked {memory, score}. A recall never returns a memory outside scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.3",
+      "description": "recall degrades gracefully when embeddings are unavailable (EmbeddingCircuitBreaker open / no key): it falls back to recent-first keyword/text match within scope and sets a meta flag (fallback: true, reason) mirroring knowledge_search's contract — never a silent empty result.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.4",
+      "description": "forget/2 deletes (or soft-deletes) a memory by id only within the caller's scope; a caller cannot forget another scope's memory (returns not_found, not an error leaking existence). list/2 enumerates scoped memories with limit/offset + total_count meta (no silent cap).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.5",
+      "description": "supersede/2 marks an existing in-scope memory superseded_by a new one (used later by #308 dedup); superseded memories are excluded from recall/list by default but retrievable with an explicit include_superseded flag.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.2.6",
+      "description": "Loopctl.Memory.Workers.MemoryEmbeddingWorker (Oban) embeds a long-term memory via EmbeddingClient (per-tenant BYO key), writes embedding + embedding_content_hash, is idempotent (re-run with unchanged text is a no-op via the content hash), and honors EmbeddingCircuitBreaker. Mirrors lib/loopctl/workers/article_embedding_worker.ex.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-28.2.1",
+      "name": "remember → embed → recall round-trips within scope",
+      "type": "integration",
+      "preconditions": ["tenant + subject scope", "Stub/di the embedding client to deterministic vectors"],
+      "steps": ["remember a long-term memory", "drain the embedding worker", "recall with a semantically-near query"],
+      "expected_results": ["The memory is returned top-1 with a score; embedding + content_hash populated"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.2",
+      "name": "recall and forget are scope-isolated",
+      "type": "integration",
+      "preconditions": ["Memory M written under subject A of tenant T"],
+      "steps": ["recall as subject B / tenant T", "recall as a subject of tenant U", "forget M as subject B"],
+      "expected_results": ["B and tenant-U recalls never return M; forget as B returns not_found and M still exists for A"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.3",
+      "name": "recall falls back (not empty) when embeddings are down",
+      "type": "integration",
+      "preconditions": ["EmbeddingCircuitBreaker forced open"],
+      "steps": ["recall a query that matches a memory's text"],
+      "expected_results": ["Returns the memory via text fallback with meta.fallback=true and a reason; not a silent []"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse Loopctl.Knowledge.VectorSearch for the kNN; if it is article-specific, extract a shared kNN helper rather than duplicating the HNSW query.",
+    "EmbeddingClient is per-tenant BYO key and mandatory — same constraint as knowledge; recall fallback (AC-28.2.3) is the SOUL rule-7 'no silent degradation' analogue of knowledge_search's keyword_only fallback.",
+    "Scope resolution: session/subject/tenant come from the authenticated caller (US-28.3 plug chain), passed into the context as an explicit scope struct — the context must be callable in tests without a conn.",
+    "supersede + the source='promoted' field are the seams #308 will use; implement them now so Part 2 adds no schema/context surface."
+  ],
+  "dependencies": ["US-28.1"],
+  "estimated_hours": 16
+}

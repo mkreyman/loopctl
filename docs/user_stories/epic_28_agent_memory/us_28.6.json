@@ -1,0 +1,75 @@
+{
+  "id": "US-28.6",
+  "title": "Docs + terminal cross-surface scope-isolation & end-to-end verification (runs last)",
+  "epic": {
+    "id": "epic_28",
+    "name": "Agent Memory (Part 1: store + semantic retrieval)"
+  },
+  "priority": "high",
+  "phase": "verification_docs",
+  "background": {
+    "reference": "GitHub issue #307; mirrors epic_27's terminal verification story (US-27.17) pattern",
+    "includes": "Every prior story asserts its own slice; this story proves the pillar end-to-end across app/api/mcp and writes the memory-vs-knowledge documentation. It depends on every leaf story and runs DEAD LAST."
+  },
+  "priority_note": "Terminal story: owns the epic-wide scope-isolation proof and the docs so no earlier story is blocked mid-loop on cross-surface concerns.",
+  "story": {
+    "as_a": "loopctl maintainer",
+    "i_want_to": "run one end-to-end pass that writes and recalls memory through every surface (context, API, MCP) and proves cross-tenant/cross-subject isolation holds everywhere, plus document the memory-vs-knowledge boundary",
+    "so_that": "the agent-memory pillar ships proven and understandable, not just unit-green"
+  },
+  "rationale": "Scope isolation is the security property of the whole subsystem; asserting it once per layer is not the same as asserting it holds across the full write→embed→recall→UI path. A single terminal verification (the epic_27 model) plus authoritative docs turns a set of merged stories into a trustworthy, teachable feature.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-28.6.1",
+      "description": "docs/agent-memory.md written: the subsystem architecture, the two tiers (session vs long-term), the scope model, and an explicit 'when to use memory vs knowledge (vs the future context retriever)' section. It reconciles/absorbs any content the removed docs/cole-medin-self-evolving-wiki.md carried (that transcript is now KB hub fb9abd73).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.6.2",
+      "description": "README.md (feature + memory_* tool list), CLAUDE.md and AGENTS.md (agent guidance: pick memory_* vs knowledge_*), and CHANGELOG.md are updated. OpenAPI docs render the memory endpoints at /swaggerui.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.6.3",
+      "description": "An end-to-end test writes a memory via the API, drains embedding, recalls it via the context AND the API, and asserts the same memory is reachable through each — one coherent path, not three isolated stubs.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.6.4",
+      "description": "A cross-surface scope-isolation suite proves a memory written under (tenant T, subject A) is NOT retrievable as tenant U, nor as subject B of T, through the context, the API, and the MCP tool — closing the leak surface epic-wide.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.6.5",
+      "description": "A documented seam note for #308 (auto-promotion) and mkreyman/claude-config#85 (skills consumer): where the compiler hooks in (source='promoted', supersede) and which memory_* tools the skills call. No implementation of those here — just the verified extension points.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-28.6.1",
+      "name": "End-to-end write(API) → recall(context+API) for one memory",
+      "type": "integration",
+      "preconditions": ["Authenticated agent key; deterministic embedding stub"],
+      "steps": ["POST /api/v1/memory", "drain worker", "recall via Loopctl.Memory and via POST /api/v1/memory/recall"],
+      "expected_results": ["Both recalls return the same memory; scores present"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.6.2",
+      "name": "Cross-tenant and cross-subject isolation holds on every surface",
+      "type": "integration",
+      "preconditions": ["Memory under (T, A)"],
+      "steps": ["Attempt recall/list/forget as tenant U and as (T, B) via context, API, and MCP"],
+      "expected_results": ["Never returned or mutated on any surface; no existence leak"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Model on epic_27's US-27.17 terminal-verification pattern: this story depends on all leaves and runs last so no implementation story blocks on cross-surface concerns.",
+    "Docs are authoritative for the three-layer mental model (knowledge / memory / context-retriever) that the Cole Medin comparison surfaced — keep it short and decision-oriented.",
+    "Do not implement #308 or #85 here; only assert and document the seams they rely on."
+  ],
+  "dependencies": ["US-28.1", "US-28.2", "US-28.3", "US-28.4", "US-28.5"],
+  "estimated_hours": 10
+}
