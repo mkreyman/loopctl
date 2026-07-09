@@ -78,7 +78,8 @@ defmodule Loopctl.HeavyRead do
   Known endpoints: `:suggested_links`, `:semantic_search`, `:distant_pairs`,
   `:distant_pairs_bridge` (the slower `bridge_path=true` branch — its own key so its
   statement_timeout/slow-query telemetry are distinct), `:novelty`, `:enumeration`,
-  `:change_feed`, `:vector_search` (the shared kNN helper path).
+  `:change_feed`, `:vector_search` (the shared kNN helper path), `:memory_recall`
+  (the US-28.2 agent-memory HNSW recall via `all_memory/4`).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do
@@ -139,6 +140,34 @@ defmodule Loopctl.HeavyRead do
     {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
     query = guard!(tenant_id, queryable)
     with_statement_timeout(st, fn -> repo().one(query, opts) end)
+  end
+
+  @doc """
+  Like `all/3`, but for AGENT-MEMORY heavy reads: additionally requires an explicit
+  `subject_id` scope (US-28.2).
+
+  Memory rows on the BYPASSRLS heavy-read pool are isolated within a tenant by
+  `subject_id` at the APPLICATION level (not RLS), so — exactly as `tenant_id`
+  needs a structural backstop here — `subject_id` needs one too. This raises
+  unless BOTH hold:
+
+    * every base-table source is tenant-scoped (the existing `guard!/2`), AND
+    * the OUTERMOST query carries a conjunctive `x.subject_id == ^subject_id`
+      equality bound to the passed `subject_id`.
+
+  The subject predicate is required on the OUTER query (not recursively on every
+  source) BY DESIGN: the index-safe HNSW recall (US-28.2 AC-28.2.3) must keep
+  `subject_id` OFF the inner ANN subquery (a selective `(tenant_id, subject_id)`
+  btree there defeats the pgvector index — #170/#172), and post-filters subject on
+  the over-fetched pool. Requiring subject on the final output guarantees no
+  cross-subject row is ever RETURNED, which is what the isolation boundary needs;
+  tenant remains enforced on every source (the cross-tenant boundary).
+  """
+  @spec all_memory(binary(), binary(), Ecto.Queryable.t(), keyword()) :: [term()]
+  def all_memory(tenant_id, subject_id, queryable, opts \\ []) do
+    {st, opts} = Keyword.pop(opts, :statement_timeout, default_statement_timeout())
+    query = guard_memory!(tenant_id, subject_id, queryable)
+    with_statement_timeout(st, fn -> repo().all(query, opts) end)
   end
 
   # Run `fun` under a per-read SET LOCAL statement_timeout. There is NO un-timed path:
@@ -247,6 +276,47 @@ defmodule Loopctl.HeavyRead do
             inspect(tenant_id)
   end
 
+  # --- structural (tenant + subject) memory guard (US-28.2) ---
+
+  defp guard_memory!(tenant_id, subject_id, queryable)
+       when is_binary(tenant_id) and is_binary(subject_id) do
+    # First enforce the full tenant guard on every base-table source, then require
+    # a subject equality on the OUTERMOST query (see all_memory/4 for why subject is
+    # NOT required recursively — it must stay off the index-ordered inner ANN).
+    query = guard!(tenant_id, queryable)
+
+    unless outer_scoped_by_field?(query, :subject_id, {:value, subject_id}) do
+      raise ArgumentError,
+            "Loopctl.HeavyRead refuses a memory query not scoped to the given subject " <>
+              "(BYPASSRLS pool, cross-subject leak within a tenant). The outermost query must " <>
+              "carry a conjunctive `x.subject_id == ^subject_id` equality bound to the passed " <>
+              "subject_id."
+    end
+
+    query
+  end
+
+  defp guard_memory!(tenant_id, subject_id, _queryable) do
+    raise ArgumentError,
+          "Loopctl.HeavyRead.all_memory requires a binary tenant_id AND subject_id, got: " <>
+            inspect({tenant_id, subject_id})
+  end
+
+  @doc false
+  # Structural shape check (no value binding): does this query's OUTERMOST level
+  # carry a conjunctive `x.subject_id == ^subject` equality? Exposed for the guard
+  # unit tests (companion to `filters_by_tenant?/1`).
+  def filters_by_subject?(queryable) do
+    queryable |> Ecto.Queryable.to_query() |> outer_scoped_by_field?(:subject_id, :any)
+  end
+
+  # True iff the outermost query (its own wheres/havings/join-ons, NOT recursively)
+  # constrains SOME binding by a conjunctive `x.field == ^pin` equality — with the
+  # pin bound to the value for `{:value, v}`, or any pin for `:any`.
+  defp outer_scoped_by_field?(%Ecto.Query{} = query, field, mode) do
+    MapSet.size(field_scoped_bindings(query, field, mode)) > 0
+  end
+
   @doc false
   # Structural shape check (no value binding): would this query pass the guard for
   # SOME tenant? Exposed for the guard unit tests.
@@ -287,7 +357,11 @@ defmodule Loopctl.HeavyRead do
   # Binding indices constrained by a CONJUNCTIVE `x.tenant_id == ^pin` equality in a
   # where/having/join-on (a tenant equality nested under an OR does NOT count — it
   # can re-admit other tenants). For `{:value, t}` the pin must be bound to `t`.
-  defp scoped_bindings(query, mode) do
+  defp scoped_bindings(query, mode), do: field_scoped_bindings(query, :tenant_id, mode)
+
+  # Generalized over the scoping field (`:tenant_id` or `:subject_id`). Returns the
+  # binding indices constrained by a conjunctive `x.field == ^pin` equality.
+  defp field_scoped_bindings(query, field, mode) do
     exprs =
       query.wheres ++
         query.havings ++
@@ -296,7 +370,7 @@ defmodule Loopctl.HeavyRead do
     Enum.reduce(exprs, MapSet.new(), fn %{expr: expr, params: params}, acc ->
       expr
       |> and_conjuncts()
-      |> Enum.flat_map(&tenant_binding(&1, params, mode))
+      |> Enum.flat_map(&field_binding(&1, field, params, mode))
       |> Enum.into(acc)
     end)
   end
@@ -304,18 +378,20 @@ defmodule Loopctl.HeavyRead do
   defp and_conjuncts({:and, _, [l, r]}), do: and_conjuncts(l) ++ and_conjuncts(r)
   defp and_conjuncts(other), do: [other]
 
-  defp tenant_binding({:==, _, [l, r]}, params, mode) do
+  defp field_binding({:==, _, [l, r]}, field, params, mode) do
     cond do
-      (k = tenant_field_binding(l)) && pin?(r) && pin_matches?(r, params, mode) -> [k]
-      (k = tenant_field_binding(r)) && pin?(l) && pin_matches?(l, params, mode) -> [k]
+      (k = field_access_binding(l, field)) && pin?(r) && pin_matches?(r, params, mode) -> [k]
+      (k = field_access_binding(r, field)) && pin?(l) && pin_matches?(l, params, mode) -> [k]
       true -> []
     end
   end
 
-  defp tenant_binding(_, _, _), do: []
+  defp field_binding(_, _, _, _), do: []
 
-  defp tenant_field_binding({{:., _, [{:&, _, [k]}, :tenant_id]}, _, _}), do: k
-  defp tenant_field_binding(_), do: nil
+  # Matches `x.field` for the SAME `field` atom passed in (the repeated `field`
+  # variable in the head is an equality constraint).
+  defp field_access_binding({{:., _, [{:&, _, [k]}, field]}, _, _}, field), do: k
+  defp field_access_binding(_, _), do: nil
 
   defp pin?({:^, _, [_]}), do: true
   defp pin?(_), do: false

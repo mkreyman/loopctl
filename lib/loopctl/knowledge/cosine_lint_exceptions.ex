@@ -114,6 +114,18 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
         "logical owner of the novelty MIN aggregate (runs novelty_distance_query/4 through " <>
           "HeavyRead) — documented for auditability; the cosine literal itself is in " <>
           "novelty_distance_query/4 (also registered)"
+    },
+    %{
+      module: Loopctl.Memory,
+      function: :memory_candidate_query,
+      arity: 4,
+      rationale:
+        "US-28.2 agent-memory HNSW recall — the SAME index-safe two-tier shape as " <>
+          "VectorSearch.candidate_query/4 (inner pure ORDER BY embedding <=> $const LIMIT pool " <>
+          "with only tenant/not-null residuals; subject + superseded post-filters on the outer " <>
+          "pool), but bound to the Memory schema which VectorSearch is hard-bound away from " <>
+          "(Article). Reuses VectorSearch.pool_size/2 + to_embedding_list/1; not routable " <>
+          "through nearest/4 without parameterizing that Article-bound helper by schema"
     }
   ]
 

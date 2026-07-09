@@ -9,9 +9,27 @@ defmodule Loopctl.Memory do
   - `Loopctl.Memory.Memory` — long-term, `vector(1536)`-embedded, HNSW-recalled
     memory.
 
-  This foundation story provides the schemas, migrations, and the pinned
-  `subject_id` derivation. The write/list/recall/forget/prune paths are added in
-  US-28.2.
+  US-28.2 adds the public write/read API — `remember/2`, `recall/2`, `forget/2`,
+  `list/2`, `session_history/2`, `supersede/3` — plus the two Oban workers
+  (`Loopctl.Workers.MemoryEmbeddingWorker`, `Loopctl.Workers.SessionMemoryPruneWorker`).
+
+  ## Scope
+
+  Every public function takes a `Loopctl.Memory.Scope` (`tenant_id`, `subject_id`,
+  optional `project_id`) as its first argument. `tenant_id`/`subject_id` are the
+  isolation boundary and are set programmatically — never from request params.
+
+  ## The two persistence tiers + the repo split
+
+  - OLTP writes/list/forget/session_history/supersede go through `Loopctl.AdminRepo`
+    with EXPLICIT `(tenant_id, subject_id)` predicates on every query — mirroring the
+    sibling `Loopctl.Knowledge` context (which likewise routes all article OLTP
+    through `AdminRepo`). Isolation is the explicit predicate; the `memories` /
+    `session_memories` RLS policies remain as DB-level defense-in-depth.
+  - `recall/2` runs an HNSW cosine kNN over long-term memories on the BYPASSRLS
+    `Loopctl.HeavyReadRepo` — reached ONLY through `Loopctl.HeavyRead.all_memory/4`,
+    whose structural guard requires an explicit `(tenant_id, subject_id)` predicate
+    (subject isolation is application-level on that pool, not RLS).
 
   ## `subject_id` — the memory scope owner
 
@@ -20,7 +38,573 @@ defmodule Loopctl.Memory do
   `subject_id_for/1`.
   """
 
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.VectorSearch
+  alias Loopctl.Llm.ProviderError
+  alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.Scope
+  alias Loopctl.Memory.SessionMemory
+  alias Loopctl.Workers.MemoryEmbeddingWorker
+
+  @default_recall_k 10
+  @default_list_limit 50
+  @max_list_limit 200
+
+  @typedoc "The pinned result envelope every read path returns."
+  @type result_envelope :: %{results: list(), meta: map()}
+
+  # ===========================================================================
+  # Write path
+  # ===========================================================================
+
+  @doc """
+  Writes a memory in `scope`, choosing the tier from `attrs[:tier]`:
+
+    * `:session` (short-term) — appends a `Loopctl.Memory.SessionMemory`
+      (requires `session_id`, `content`, `expires_at`). No embedding.
+    * `:long_term` (default) — inserts a `Loopctl.Memory.Memory` (requires
+      `text`) and enqueues `Loopctl.Workers.MemoryEmbeddingWorker` (the
+      `embedding` starts NULL and is populated asynchronously).
+
+  `tenant_id`, `subject_id`, and `project_id` come from `scope` and are set
+  programmatically on the struct — never cast from `attrs`. A long-term write is
+  refused with `{:error, :quota_exceeded}` once the per-`(tenant, subject)` cap
+  (`:max_long_term_memories_per_subject`, default 10_000, non-superseded rows) is
+  reached. The API-layer RateLimiter (US-28.3) sits in front of this path.
+  """
+  @spec remember(Scope.t(), map()) ::
+          {:ok, MemorySchema.t() | SessionMemory.t()}
+          | {:error, Ecto.Changeset.t() | :quota_exceeded}
+  def remember(%Scope{} = scope, attrs) when is_map(attrs) do
+    case normalize_tier(opt(attrs, :tier, :long_term)) do
+      :session -> remember_session(scope, attrs)
+      :long_term -> remember_long_term(scope, attrs)
+    end
+  end
+
+  defp remember_session(scope, attrs) do
+    %SessionMemory{
+      tenant_id: scope.tenant_id,
+      subject_id: scope.subject_id,
+      project_id: scope.project_id
+    }
+    |> SessionMemory.create_changeset(attrs)
+    |> AdminRepo.insert()
+  end
+
+  defp remember_long_term(scope, attrs) do
+    # Count + insert in one transaction so the cap check and the write are atomic.
+    result =
+      AdminRepo.transaction(fn ->
+        if long_term_count(scope) >= max_long_term_memories() do
+          AdminRepo.rollback(:quota_exceeded)
+        else
+          insert_long_term!(scope, attrs)
+        end
+      end)
+
+    # Enqueue the embedding worker AFTER the write commits, so an inline (test) or
+    # racing worker never reads an uncommitted row.
+    with {:ok, memory} <- result do
+      enqueue_embedding(memory)
+      {:ok, memory}
+    end
+  end
+
+  # Insert the long-term memory or `AdminRepo.rollback/1` the changeset (called only
+  # inside the `remember_long_term` transaction).
+  defp insert_long_term!(scope, attrs) do
+    %MemorySchema{
+      tenant_id: scope.tenant_id,
+      subject_id: scope.subject_id,
+      project_id: scope.project_id
+    }
+    |> MemorySchema.create_changeset(attrs)
+    |> AdminRepo.insert()
+    |> case do
+      {:ok, memory} -> memory
+      {:error, changeset} -> AdminRepo.rollback(changeset)
+    end
+  end
+
+  defp enqueue_embedding(%MemorySchema{} = memory) do
+    %{memory_id: memory.id, tenant_id: memory.tenant_id}
+    |> MemoryEmbeddingWorker.new()
+    |> Oban.insert()
+  end
+
+  # Count of the subject's LIVE (non-superseded) long-term memories in scope.
+  defp long_term_count(scope) do
+    MemorySchema
+    |> where(
+      [m],
+      m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id and
+        is_nil(m.superseded_by)
+    )
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  # ===========================================================================
+  # Recall (HNSW kNN over long-term memories, BYPASSRLS heavy-read pool)
+  # ===========================================================================
+
+  @doc """
+  Recalls the top-`k` long-term memories for `scope` most similar to
+  `opts[:query]` (cosine), via an HNSW kNN on `Loopctl.HeavyReadRepo`.
+
+  Isolation is an EXPLICIT `(tenant_id, subject_id)` predicate enforced by
+  `Loopctl.HeavyRead.all_memory/4`'s structural guard. Superseded rows are
+  excluded unless `opts[:include_superseded]` is true.
+
+  ## Index-safety (AC-28.2.3)
+
+  A selective `(tenant_id, subject_id)` btree on the inner index-ordered subquery
+  defeats the HNSW ANN index (#170/#172). So this uses OPTION (i): the inner pool
+  over-fetches `k' > k` nearest-by-cosine with ONLY index-safe residual filters
+  (tenant equality + `embedding IS NOT NULL`), and the subject scope + superseded
+  exclusion are applied on the OUTER query over the materialized pool. The scale
+  behaviour (a subject recalls its own top-k when other subjects dominate the
+  corpus) is verified in the terminal story US-28.5.
+
+  ## Degradation (AC-28.2.4)
+
+  When embedding generation is unavailable (circuit open / no key / provider
+  error), recall falls back to a recent-first ILIKE text match within the same
+  `(tenant_id, subject_id)` scope and returns `meta.fallback: true` with a stable
+  `meta.reason` tag — NEVER a silent empty result. A legitimately empty scope on
+  the healthy path returns `results: []` with `meta.fallback: false, reason: nil`
+  (the two zero-result cases are distinguishable).
+
+  Options:
+
+    * `:query` — the query text to embed / ILIKE against (default `""`).
+    * `:limit` — max results (clamped to `[1, Loopctl.Knowledge.VectorSearch.max_k/0]`,
+      default #{@default_recall_k}).
+    * `:include_superseded` — include superseded rows (default `false`).
+
+  Returns `%{results: [{memory, score} | ...], meta: %{total_count, fallback, reason}}`.
+  """
+  @spec recall(Scope.t(), keyword() | map()) :: result_envelope()
+  def recall(%Scope{} = scope, opts \\ []) do
+    query_text = to_string(opt(opts, :query, ""))
+    k = clamp_k(opt(opts, :limit, @default_recall_k))
+    include_superseded? = truthy?(opt(opts, :include_superseded, false))
+
+    case Knowledge.generate_embedding(scope.tenant_id, query_text) do
+      {:ok, embedding} ->
+        recall_semantic(scope, embedding, k, include_superseded?)
+
+      {:error, reason} ->
+        recall_fallback(scope, reason, query_text, k, include_superseded?)
+    end
+  end
+
+  defp recall_semantic(scope, embedding, k, include_superseded?) do
+    query = memory_candidate_query(scope, embedding, k, include_superseded?)
+
+    rows =
+      HeavyRead.all_memory(
+        scope.tenant_id,
+        scope.subject_id,
+        query,
+        HeavyRead.opts(:memory_recall)
+      )
+
+    results =
+      Enum.map(rows, fn row ->
+        {row_to_memory(row), 1.0 - row.distance}
+      end)
+
+    %{results: results, meta: %{total_count: length(results), fallback: false, reason: nil}}
+  end
+
+  # INNER: the pure index-ordered ANN top-`pool` (tenant + not-null embedding
+  # ONLY — the index-safe residuals). Subject is DELIBERATELY absent here: the
+  # memories(tenant_id, subject_id) btree would let a selective subject flip the
+  # planner off HNSW (#170/#172). OUTER: subject scope (the structural guard
+  # REQUIRES this predicate here) + superseded exclusion over the ≤pool rows —
+  # trivial filters on a tiny set that cannot defeat the index. Mirrors
+  # Loopctl.Knowledge.VectorSearch's two-tier shape (reusing its pool sizing /
+  # embedding-list helpers) rather than duplicating the HNSW query, but bound to
+  # the Memory schema.
+  defp memory_candidate_query(scope, embedding, k, include_superseded?) do
+    target = VectorSearch.to_embedding_list(embedding)
+    pool = VectorSearch.pool_size(k)
+
+    inner =
+      from(m in MemorySchema,
+        where: m.tenant_id == ^scope.tenant_id,
+        where: not is_nil(m.embedding),
+        order_by: [asc: fragment("? <=> ?", m.embedding, ^target)],
+        limit: ^pool,
+        select: %{
+          id: m.id,
+          tenant_id: m.tenant_id,
+          subject_id: m.subject_id,
+          project_id: m.project_id,
+          text: m.text,
+          embedding_content_hash: m.embedding_content_hash,
+          confidence: m.confidence,
+          source: m.source,
+          source_session_id: m.source_session_id,
+          tags: m.tags,
+          superseded_by: m.superseded_by,
+          inserted_at: m.inserted_at,
+          updated_at: m.updated_at,
+          distance: fragment("? <=> ?", m.embedding, ^target)
+        }
+      )
+
+    from(c in subquery(inner),
+      where: c.subject_id == ^scope.subject_id,
+      order_by: [asc: c.distance],
+      limit: ^k,
+      select: c
+    )
+    |> maybe_exclude_superseded_sub(include_superseded?)
+  end
+
+  defp maybe_exclude_superseded_sub(query, true), do: query
+
+  defp maybe_exclude_superseded_sub(query, false),
+    do: where(query, [c], is_nil(c.superseded_by))
+
+  # Rebuild a %Memory{} from the recalled projection map. `embedding` is
+  # `load_in_query: false` so it is intentionally absent (recall never returns the
+  # raw vector); `:distance` is a computed column, dropped before struct build.
+  defp row_to_memory(row) do
+    struct(MemorySchema, Map.drop(row, [:distance]))
+  end
+
+  defp recall_fallback(scope, reason, query_text, k, include_superseded?) do
+    reason_tag = fallback_reason_tag(reason)
+
+    query =
+      from(m in MemorySchema,
+        where: m.tenant_id == ^scope.tenant_id,
+        where: m.subject_id == ^scope.subject_id,
+        order_by: [desc: m.inserted_at, desc: m.id],
+        limit: ^k
+      )
+      |> maybe_exclude_superseded_base(include_superseded?)
+      |> maybe_ilike(query_text)
+
+    rows =
+      HeavyRead.all_memory(
+        scope.tenant_id,
+        scope.subject_id,
+        query,
+        HeavyRead.opts(:memory_recall)
+      )
+
+    results = Enum.map(rows, fn memory -> {memory, nil} end)
+
+    %{results: results, meta: %{total_count: length(results), fallback: true, reason: reason_tag}}
+  end
+
+  defp maybe_ilike(query, ""), do: query
+
+  defp maybe_ilike(query, text) when is_binary(text) do
+    pattern = "%#{escape_like(text)}%"
+    where(query, [m], ilike(m.text, ^pattern))
+  end
+
+  # Escape LIKE metacharacters so a query containing `%` or `_` is matched
+  # literally rather than as a wildcard.
+  defp escape_like(text) do
+    text
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
+  end
+
+  # Map a discarded embedding-generation error to a STABLE, non-sensitive tag for
+  # `meta.reason` (mirrors Loopctl.Knowledge's fallback tagging). Sanitized via
+  # ProviderError first so no api key / provider body can leak.
+  defp fallback_reason_tag(reason) do
+    case ProviderError.sanitize(reason) do
+      :no_api_key -> "no_embedding_key"
+      :circuit_open -> "embedding_circuit_open"
+      :timeout -> "embedding_timeout"
+      {:api_error, status, _} when is_integer(status) -> "embedding_provider_error_#{status}"
+      {:api_error, status} when is_integer(status) -> "embedding_provider_error_#{status}"
+      {:request_failed, _} -> "embedding_request_failed"
+      {:embedding_crash, _} -> "embedding_crash"
+      _ -> "embedding_error"
+    end
+  end
+
+  # ===========================================================================
+  # forget / list / session_history / supersede (RLS OLTP path)
+  # ===========================================================================
+
+  @doc """
+  Deletes a long-term memory by `id`, but ONLY within `scope`.
+
+  A foreign-tenant id (invisible under RLS) or a foreign-subject id returns
+  `{:error, :not_found}` — no existence leak. Because `superseded_by` is
+  `on_delete: :nilify_all` (US-28.1), deleting a superseder nilifies its
+  dependents' back-reference so no memory is left permanently hidden.
+  """
+  @spec forget(Scope.t(), String.t()) :: {:ok, :deleted} | {:error, :not_found}
+  def forget(%Scope{} = scope, id) when is_binary(id) do
+    if valid_uuid?(id) do
+      {count, _} =
+        MemorySchema
+        |> where(
+          [m],
+          m.id == ^id and m.tenant_id == ^scope.tenant_id and
+            m.subject_id == ^scope.subject_id
+        )
+        |> AdminRepo.delete_all()
+
+      if count > 0, do: {:ok, :deleted}, else: {:error, :not_found}
+    else
+      {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Lists the long-term memories in `scope`, newest first, paginated.
+
+  Options (keyword list or map, atom or string keys):
+
+    * `:limit` — page size (clamped to `[1, #{@max_list_limit}]`, default #{@default_list_limit}).
+    * `:offset` — pagination offset (default 0).
+    * `:include_superseded` — include superseded rows (default `false`).
+
+  Returns `%{results: [memory], meta: %{total_count, limit, offset}}`. `total_count`
+  is the TRUE scoped total (never silently capped by `limit`).
+  """
+  @spec list(Scope.t(), keyword() | map()) :: result_envelope()
+  def list(%Scope{} = scope, opts \\ []) do
+    limit = clamp_limit(opt(opts, :limit, @default_list_limit))
+    offset = max(to_int(opt(opts, :offset, 0), 0), 0)
+    include_superseded? = truthy?(opt(opts, :include_superseded, false))
+
+    base =
+      MemorySchema
+      |> where([m], m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id)
+      |> maybe_exclude_superseded_base(include_superseded?)
+
+    total = AdminRepo.aggregate(base, :count, :id)
+
+    results =
+      base
+      |> order_by([m], desc: m.inserted_at, desc: m.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    %{results: results, meta: %{total_count: total, limit: limit, offset: offset}}
+  end
+
+  @doc """
+  Returns a session's short-term memories for `(scope.tenant_id, opts[:session_id])`
+  in insertion order (oldest first), paginated and scope-enforced.
+
+  Options:
+
+    * `:session_id` — the session identifier (required).
+    * `:limit` — page size (clamped to `[1, #{@max_list_limit}]`, default #{@default_list_limit}).
+    * `:offset` — pagination offset (default 0).
+
+  Returns `%{results: [session_memory], meta: %{total_count, limit, offset}}`.
+  """
+  @spec session_history(Scope.t(), keyword() | map()) :: result_envelope()
+  def session_history(%Scope{} = scope, opts \\ []) do
+    session_id = opt(opts, :session_id, nil)
+    limit = clamp_limit(opt(opts, :limit, @default_list_limit))
+    offset = max(to_int(opt(opts, :offset, 0), 0), 0)
+
+    base =
+      SessionMemory
+      |> where(
+        [s],
+        s.tenant_id == ^scope.tenant_id and s.session_id == ^session_id and
+          s.subject_id == ^scope.subject_id
+      )
+
+    total = AdminRepo.aggregate(base, :count, :id)
+
+    results =
+      base
+      |> order_by([s], asc: s.inserted_at, asc: s.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    %{results: results, meta: %{total_count: total, limit: limit, offset: offset}}
+  end
+
+  @doc """
+  Marks the in-scope memory `old_id` as superseded by `new_id`.
+
+  Both ids must be in `scope`; a foreign/absent id returns `{:error, :not_found}`.
+  A superseded memory is excluded from `recall/2` and `list/2` by default.
+
+  ## Concurrency (AC-28.2.7)
+
+  Both rows are locked `FOR UPDATE` in a stable (id-ordered) single statement, so
+  concurrent supersedes on the same row are serialized (no lost update) and cannot
+  race into an A↔B cycle: a concurrent `supersede(new, old)` blocks on the same
+  locks and then fails the cycle guard (`new` already points at `old`).
+  """
+  @spec supersede(Scope.t(), String.t(), String.t()) ::
+          {:ok, MemorySchema.t()}
+          | {:error, :not_found | :self_supersede | :cycle | Ecto.Changeset.t()}
+  def supersede(%Scope{} = scope, old_id, new_id)
+      when is_binary(old_id) and is_binary(new_id) do
+    cond do
+      not (valid_uuid?(old_id) and valid_uuid?(new_id)) -> {:error, :not_found}
+      old_id == new_id -> {:error, :self_supersede}
+      true -> do_supersede(scope, old_id, new_id)
+    end
+  end
+
+  defp do_supersede(scope, old_id, new_id) do
+    AdminRepo.transaction(fn ->
+      rows =
+        MemorySchema
+        |> where(
+          [m],
+          m.id in ^[old_id, new_id] and m.tenant_id == ^scope.tenant_id and
+            m.subject_id == ^scope.subject_id
+        )
+        |> order_by([m], asc: m.id)
+        |> lock("FOR UPDATE")
+        |> AdminRepo.all()
+
+      old = Enum.find(rows, &(&1.id == old_id))
+      new = Enum.find(rows, &(&1.id == new_id))
+
+      resolve_supersede(old, new, old_id, new_id)
+    end)
+  end
+
+  # Called only inside the `do_supersede` transaction (rollbacks abort it).
+  defp resolve_supersede(old, new, old_id, new_id) do
+    cond do
+      is_nil(old) or is_nil(new) ->
+        AdminRepo.rollback(:not_found)
+
+      # Cycle guard: `new` already superseded by `old` would make A↔B.
+      new.superseded_by == old_id ->
+        AdminRepo.rollback(:cycle)
+
+      true ->
+        apply_supersede(old, new_id)
+    end
+  end
+
+  defp apply_supersede(old, new_id) do
+    old
+    |> Ecto.Changeset.change(superseded_by: new_id)
+    |> AdminRepo.update()
+    |> case do
+      {:ok, memory} -> memory
+      {:error, changeset} -> AdminRepo.rollback(changeset)
+    end
+  end
+
+  # ===========================================================================
+  # Worker support (BYPASSRLS AdminRepo — the workers run without a conn scope)
+  # ===========================================================================
+
+  @doc """
+  Fetches a long-term memory (including its `embedding` + hash) by `id` within
+  `tenant_id`, for `Loopctl.Workers.MemoryEmbeddingWorker`. Returns `{:ok, memory}`
+  or `{:error, :not_found}`.
+  """
+  @spec get_memory_for_embedding(String.t(), String.t()) ::
+          {:ok, MemorySchema.t()} | {:error, :not_found}
+  def get_memory_for_embedding(tenant_id, id) when is_binary(tenant_id) and is_binary(id) do
+    query =
+      from(m in MemorySchema,
+        where: m.id == ^id and m.tenant_id == ^tenant_id,
+        select_merge: %{embedding: m.embedding}
+      )
+
+    case Loopctl.AdminRepo.one(query) do
+      nil -> {:error, :not_found}
+      memory -> {:ok, memory}
+    end
+  end
+
+  @doc """
+  Stores `embedding` + `content_hash` on the long-term memory `id` within
+  `tenant_id`, via `Loopctl.Memory.Memory.embedding_changeset/3` (the only
+  changeset allowed to touch `:embedding`). For the embedding worker.
+  """
+  @spec update_memory_embedding(String.t(), String.t(), list(number()), String.t()) ::
+          {:ok, MemorySchema.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def update_memory_embedding(tenant_id, id, embedding, content_hash)
+      when is_binary(tenant_id) and is_binary(id) do
+    case Loopctl.AdminRepo.get_by(MemorySchema, id: id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :not_found}
+
+      memory ->
+        memory
+        |> MemorySchema.embedding_changeset(embedding, content_hash)
+        |> Loopctl.AdminRepo.update()
+    end
+  end
+
+  # ===========================================================================
+  # shared helpers
+  # ===========================================================================
+
+  defp maybe_exclude_superseded_base(query, true), do: query
+
+  defp maybe_exclude_superseded_base(query, false),
+    do: where(query, [m], is_nil(m.superseded_by))
+
+  defp normalize_tier(tier) when tier in [:session, :long_term], do: tier
+  defp normalize_tier("session"), do: :session
+  defp normalize_tier("long_term"), do: :long_term
+  defp normalize_tier(_), do: :long_term
+
+  defp max_long_term_memories do
+    Application.get_env(:loopctl, :max_long_term_memories_per_subject, 10_000)
+  end
+
+  defp clamp_k(k), do: k |> to_int(@default_recall_k) |> max(1) |> min(VectorSearch.max_k())
+
+  defp clamp_limit(limit),
+    do: limit |> to_int(@default_list_limit) |> max(1) |> min(@max_list_limit)
+
+  defp to_int(v, _default) when is_integer(v), do: v
+
+  defp to_int(v, default) when is_binary(v) do
+    case Integer.parse(v) do
+      {int, _} -> int
+      :error -> default
+    end
+  end
+
+  defp to_int(_v, default), do: default
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?(_), do: false
+
+  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
+
+  # Read an option from a keyword list OR a map (atom or string key).
+  defp opt(opts, key, default) when is_list(opts), do: Keyword.get(opts, key, default)
+
+  defp opt(opts, key, default) when is_map(opts) do
+    case Map.fetch(opts, key) do
+      {:ok, value} -> value
+      :error -> Map.get(opts, to_string(key), default)
+    end
+  end
 
   @doc """
   Resolves the `subject_id` (memory scope owner) from an authenticated API key.
