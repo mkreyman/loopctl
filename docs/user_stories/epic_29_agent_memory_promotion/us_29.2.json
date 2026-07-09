@@ -1,121 +1,178 @@
 {
   "id": "US-29.2",
-  "title": "Promotion worker: triggers (explicit + scheduled sweep), dedupe/supersede, idempotency",
+  "title": "Promotion workers: watermarked idempotent promotion + dedicated cross-tenant sweep, with budget + telemetry",
   "epic": {
     "id": "epic_29",
     "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
   },
   "priority": "high",
   "phase": "domain",
-  "priority_note": "Turns the pure compiler (29.1) into the actual self-evolving loop: it persists promoted memories, dedupes against existing ones, and runs both on demand and on a schedule. Idempotency is the load-bearing property.",
+  "priority_note": "Turns the compiler (29.1) into the self-evolving loop. Idempotency and scope-safe cross-tenant sweeping are load-bearing because this runs UNATTENDED (cron + Stop-hook). Enhanced-review round 1 rebuilt the idempotency spine and added unattended-safety guards.",
   "background": {
-    "reference": "GitHub issue #308; mirrors lib/loopctl/workers/content_ingestion_worker.ex + article_embedding_worker.ex; Oban cron plugin at config/config.exs:~273. Dedup reuses epic_28 embedding similarity + memories.embedding_content_hash + supersede/2.",
-    "includes": "US-29.1 produces confidence-gated candidates. This story persists them as long-term memories (source: :promoted, source_session_id set), dedupes/supersedes against existing in-scope memories, and provides the two triggers from #308: an explicit enqueue (used by the API/MCP in 29.3/29.4) and a scheduled Oban cron sweep of sessions with stale unpromoted turns."
+    "reference": "GitHub issue #308; mirrors lib/loopctl/workers/{content_ingestion_worker,article_embedding_worker,knowledge_moc_worker}.ex + Oban cron (config/config.exs ~273). Review round 1: added a promotion watermark, synchronous content hash + partial unique index, per-tenant budget, a dedicated all-tenants sweep worker, and telemetry.",
+    "includes": "US-29.1 produces confidence-gated candidates. This story persists them as long-term memories (source: :promoted, source_session_id set), dedupes/supersedes idempotently, writes a per-session promotion WATERMARK on every run (including zero-survivor), and provides both triggers: an explicit per-session enqueue and a scheduled cross-tenant sweep."
   },
   "story": {
     "as_a": "loopctl platform engineer",
-    "i_want_to": "implement Loopctl.Workers.MemoryPromotionWorker that compiles a session (via the Promoter), dedupes/supersedes candidates against existing in-scope long-term memories, writes survivors as source: :promoted memories, and is idempotent on re-run — plus a scheduled sweep that enqueues promotion for stale unpromoted sessions",
-    "so_that": "session memory automatically compounds into durable, recall-able memory without duplication, whether triggered explicitly at session end or swept on a cron"
+    "i_want_to": "implement a per-session MemoryPromotionWorker (compile -> dedupe/supersede -> write, idempotent via a session-content-hash watermark and a partial unique index) and a separate MemoryPromotionSweepWorker (cron, all-tenants, scope-correct, budget-capped)",
+    "so_that": "session memory compounds into durable memory automatically without duplicate/unbounded growth, without crossing scope, and without exhausting a tenant's LLM budget"
   },
-  "rationale": "This is the loop that makes memory 'self-evolving' (Cole Medin) — but a promotion loop that duplicates on every run, or that leaks across scope, or that re-embeds unchanged nuggets, is worse than no loop. Idempotent dedupe/supersede (re-running a session is a no-op) and strict scope attribution are what make it safe to run automatically and repeatedly.",
+  "rationale": "An unattended promotion loop has two catastrophic failure modes: duplicate/unbounded accumulation and cross-scope leakage — plus cost blowups from re-compiling unchanged sessions or sweeping thousands at once. A content-hash watermark (skip unchanged sessions, including zero-survivor ones), a synchronous exact-dedupe key with a unique index, deterministic compile, and a per-tenant budget are what make it safe to run on a cron and a Stop-hook.",
   "acceptance_criteria": [
     {
       "id": "AC-29.2.1",
-      "description": "Loopctl.Workers.MemoryPromotionWorker (Oban, flat Loopctl.Workers.* namespace) takes a scope + session_id, calls Loopctl.Memory.Promoter.compile/2, and for each surviving candidate writes a long-term memory via Loopctl.Memory with source: :promoted, source_session_id set, confidence carried through, and subject_id/tenant_id from the session scope (never widened).",
+      "description": "Loopctl.Workers.MemoryPromotionWorker (Oban, flat Loopctl.Workers.* namespace) takes tenant_id + subject_id + session_id, calls Loopctl.Memory.Promoter.compile/2, and for each surviving candidate writes a long-term memory via Loopctl.Memory with source: :promoted, source_session_id, confidence, and subject_id/tenant_id from the session scope (never widened).",
       "status": "pending"
     },
     {
       "id": "AC-29.2.2",
-      "description": "Dedupe/supersede: before writing a candidate, it checks for a near-duplicate existing in-scope memory (exact via embedding_content_hash, near via cosine similarity above a configurable threshold using the epic_28 recall/vector path). On a near-duplicate it SUPERSEDES the old memory with the new one (supersede/2) rather than inserting a duplicate; on an exact-content match it is a no-op.",
+      "description": "Promotion watermark: a new session_promotions table (tenant_id, subject_id, session_id, session_content_hash, last_turn_inserted_at, promoted_at; unique on (tenant_id, subject_id, session_id)) is upserted on EVERY promotion run — INCLUDING zero-survivor runs. Both triggers skip a session whose current content hash equals the watermark's, so an unchanged session is never re-compiled (kills the re-LLM-every-tick and paraphrase-drift problems).",
       "status": "pending"
     },
     {
       "id": "AC-29.2.3",
-      "description": "Idempotency: re-running the worker for the same session promotes the same nuggets and, via dedupe/supersede, results in NO net new rows (a no-op) — proven by count before == count after on a second run. Oban unique: [keys: [:session_id, :subject_id], period: <n>] prevents concurrent double-promotion of one session.",
+      "description": "Exact dedupe is synchronous and race-safe: embedding_content_hash (a hash of candidate text, computed AT WRITE TIME — decoupled from the async embedding) plus a PARTIAL UNIQUE INDEX on memories (tenant_id, subject_id, embedding_content_hash) where source = :promoted. Candidate writes for a session run inside a transaction using on_conflict (do nothing / update) so two concurrent workers (explicit + sweep on the same session) cannot double-insert.",
       "status": "pending"
     },
     {
       "id": "AC-29.2.4",
-      "description": "Explicit trigger: a public enqueue function (e.g. Loopctl.Memory.promote_session/2) inserts the Oban job for a given scope + session_id; used by the API/MCP in 29.3/29.4. Returns {:ok, job} / {:error, _}.",
+      "description": "Near-duplicate supersede uses the epic_28 cosine recall path within (tenant_id, subject_id); on a near-match it SUPERSEDES the prior memory (supersede/2). CRITICAL: if recall returns meta.fallback == true (embeddings degraded, epic_28 US-28.2 AC-28.2.3), 'no near-dup found' is NOT authoritative — the job snoozes/retries via Oban rather than inserting a possible duplicate.",
       "status": "pending"
     },
     {
       "id": "AC-29.2.5",
-      "description": "Scheduled sweep: an Oban cron entry (config/config.exs Oban Plugins.Cron) periodically finds sessions with unpromoted turns older than a configurable window and enqueues promotion for each, scope-attributed. A session already fully promoted (no new turns since last promotion) is skipped.",
+      "description": "Idempotency is measured correctly: re-running promotion for an unchanged session inserts nothing (watermark skip). Even if forced to re-compile, TOTAL rows including superseded do not grow across runs (assert count including superseded, not just the default superseded-excluded list). Oban unique: [keys: [:tenant_id, :subject_id, :session_id], states: [:available, :scheduled, :executing, :retryable], period: <n>] prevents concurrent double-promotion.",
       "status": "pending"
     },
     {
       "id": "AC-29.2.6",
-      "description": "Failure handling: a compile/LLM failure fails the job for Oban retry without partial writes (promotion of a session is all-or-nothing per run, or safely resumable); embedding of promoted memories reuses the epic_28 MemoryEmbeddingWorker path.",
+      "description": "Explicit trigger: Loopctl.Memory.promote_session/1 (a scope+session_id struct) enforces the per-tenant promotion budget (below), then inserts the per-session Oban job. Returns {:ok, job} / {:error, :budget_exceeded} / {:error, _}.",
       "status": "pending"
     },
     {
       "id": "AC-29.2.7",
-      "description": "Reconcile the prior 'kill': update the comment in lib/loopctl/workers/knowledge_moc_worker.ex (line ~9) that references the killed 'session memory compiler' idea to point to this implemented worker / issue #308 (no stale 'killed' claim remains).",
+      "description": "Scheduled sweep: a SEPARATE Loopctl.Workers.MemoryPromotionSweepWorker (the crontab target in config/config.exs; the per-session worker cannot be a cron target because it needs a session_id) enumerates sessions ACROSS ALL TENANTS via the heavy-read/all-tenants path (like KnowledgeMocWorker), pairs each session with ITS OWN (tenant_id, subject_id) from the row, skips watermark-unchanged sessions, caps sessions-enqueued-per-tick (config), and enqueues per-session promotion. It never mis-attributes a session to another tenant/subject.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.8",
+      "description": "Per-tenant promotion budget: a configurable compiles/hour cap per tenant is enforced in promote_session/1 AND the sweep, so a spamming agent (distinct session_ids) or a tenant with thousands of stale sessions cannot exhaust the BYO LLM key. Over-budget requests are refused ({:error, :budget_exceeded}) without an LLM call.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.9",
+      "description": "Failure handling is resumable, not all-or-nothing: on a compile/LLM failure the job fails for Oban retry with no watermark advance; an epic_28 {:error, :quota_exceeded} (subject at its memory cap, US-28.2 AC-28.2.1) is a TERMINAL discard (job does not retry-loop the LLM). Embedding of promoted rows reuses epic_28 MemoryEmbeddingWorker.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.10",
+      "description": "TTL-vs-promotion safety: the promotion sweep window MUST be shorter than the epic_28 session_memories TTL (documented invariant, asserted in config/test), so the SessionMemoryPruneWorker never deletes session turns before they are promoted (no silent golden-nugget loss).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.11",
+      "description": "Observability (SOUL rule 7): both workers emit :telemetry per tenant for sessions swept / compiled / candidates gated-out / promoted / superseded / FAILED, so a sweep failing every tick (bad key, open circuit) is visible, not silent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.12",
+      "description": "Reconcile the prior 'kill': update the moduledoc comment in lib/loopctl/workers/knowledge_moc_worker.ex (~line 9) that cites the 'killed session memory compiler' as brittle-without-an-eval-loop — the compiler now ships WITH that eval loop (US-29.5); preserve the point that MOC's no-LLM-narrative design remains intentional, and point the comment at #308.",
       "status": "pending"
     }
   ],
   "test_cases": [
     {
       "id": "TC-29.2.1",
-      "name": "worker promotes gated candidates as source: :promoted with session attribution",
+      "name": "worker promotes gated candidates as source: :promoted with session attribution + watermark",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
         "fixture(:session_memory, scope: scope, session_id: \"s1\", content: \"always reship expedited\")",
-        "Promoter LLM stubbed via Mox to one 0.9-confidence candidate",
-        "embedding client stubbed via Mox"
+        "MockPromoterLLM -> one 0.9 candidate; embedding client stubbed"
       ],
       "steps": [
-        "perform MemoryPromotionWorker for scope + \"s1\"",
-        "Loopctl.Memory.list(scope, %{})"
+        "perform MemoryPromotionWorker for {tenant, A, \"s1\"}",
+        "Loopctl.Memory.list(scope, %{}); query session_promotions"
       ],
       "expected_results": [
-        "one long-term memory exists with source: :promoted, source_session_id == \"s1\", confidence 0.9",
-        "it is recall-able within scope after embedding drains"
+        "one memory with source: :promoted, source_session_id \"s1\", confidence 0.9, embedding_content_hash set synchronously",
+        "a session_promotions watermark row exists for (tenant, A, s1)"
       ],
       "status": "pending"
     },
     {
       "id": "TC-29.2.2",
-      "name": "re-running the worker is a no-op (idempotent dedupe)",
+      "name": "unchanged session is skipped on re-run (watermark); zero-survivor session is also watermarked and skipped",
       "type": "integration",
       "preconditions": [
-        "same setup as TC-29.2.1, worker already run once"
+        "a session already promoted (TC-29.2.1)",
+        "a second session s2 whose candidates are all below the confidence gate (zero survivors), already run once"
       ],
       "steps": [
-        "count promoted memories in scope",
-        "perform MemoryPromotionWorker for scope + \"s1\" again",
-        "count promoted memories in scope"
+        "count memories incl. superseded for scope",
+        "perform MemoryPromotionWorker for s1 again and for s2 again",
+        "count memories incl. superseded"
       ],
       "expected_results": [
-        "count after == count before (no duplicate rows); a near-duplicate supersedes rather than inserts"
+        "no LLM call for s1 or s2 (watermark hash unchanged)",
+        "total count including superseded is unchanged (true idempotency)"
       ],
       "status": "pending"
     },
     {
       "id": "TC-29.2.3",
-      "name": "near-duplicate candidate supersedes the prior memory",
+      "name": "changed session paraphrase supersedes rather than duplicates; superseded rows do not grow unbounded",
       "type": "integration",
       "preconditions": [
-        "tenant = fixture(:tenant)",
-        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
         "an existing promoted memory \"prefers reships\" (embedded)",
-        "a new session whose candidate is a near-paraphrase \"strongly prefers reshipments\"",
+        "the session content changes; MockPromoterLLM now returns a near-paraphrase \"strongly prefers reshipments\"",
         "embedding stub makes them cosine-near"
       ],
       "steps": [
-        "perform MemoryPromotionWorker",
+        "perform MemoryPromotionWorker (watermark now differs)",
         "list(scope, %{}) and list(scope, %{include_superseded: true})"
       ],
       "expected_results": [
-        "default list shows only the new memory; the old is superseded (superseded_by set), not duplicated"
+        "default list shows only the new memory; the old is superseded (not duplicated)",
+        "running again with the SAME (now-current) content is a watermark no-op — superseded count does not keep climbing"
       ],
       "status": "pending"
     },
     {
       "id": "TC-29.2.4",
+      "name": "concurrent explicit + sweep promotion of one session does not double-insert",
+      "type": "integration",
+      "preconditions": [
+        "a session s1 with one candidate; embedding_content_hash computed at write",
+        "partial unique index on (tenant_id, subject_id, embedding_content_hash) where source = :promoted"
+      ],
+      "steps": [
+        "enqueue/perform two promotions of s1 (simulating explicit + sweep) writing the same candidate"
+      ],
+      "expected_results": [
+        "exactly one promoted row (on_conflict / unique index); no duplicate; no crash"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.5",
+      "name": "degraded embeddings do not silently create duplicates",
+      "type": "integration",
+      "preconditions": [
+        "an existing promoted memory paraphrase-near a new candidate",
+        "EmbeddingCircuitBreaker forced open (recall returns meta.fallback: true)"
+      ],
+      "steps": [
+        "perform MemoryPromotionWorker for the changed session"
+      ],
+      "expected_results": [
+        "the job snoozes/retries (does not insert) because near-dup detection is non-authoritative under fallback — no duplicate is created"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.6",
       "name": "promotion never crosses scope",
       "type": "integration",
       "preconditions": [
@@ -125,7 +182,7 @@
         "session s1 under scope_a"
       ],
       "steps": [
-        "perform MemoryPromotionWorker for scope_a + s1",
+        "perform MemoryPromotionWorker for {tenant, A, s1}",
         "list(scope_b, %{})"
       ],
       "expected_results": [
@@ -134,32 +191,82 @@
       "status": "pending"
     },
     {
-      "id": "TC-29.2.5",
-      "name": "scheduled sweep skips already-promoted sessions",
+      "id": "TC-29.2.7",
+      "name": "sweep attributes each session to its own tenant/subject and caps per tick",
       "type": "integration",
       "preconditions": [
-        "a session fully promoted with no new turns since",
-        "a second session with stale unpromoted turns"
+        "sessions under (tenant_t, A), (tenant_t, B), (tenant_u, C), each with stale unpromoted turns",
+        "per-tick cap configured to a small number"
       ],
       "steps": [
-        "run the sweep function"
+        "perform MemoryPromotionSweepWorker (all-tenants)"
       ],
       "expected_results": [
-        "a promotion job is enqueued only for the stale-unpromoted session; the already-promoted one is skipped"
+        "each enqueued per-session job carries the session's OWN (tenant, subject); no cross-tenant/subject mis-pairing",
+        "no more than the per-tick cap of jobs are enqueued"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.8",
+      "name": "per-tenant budget refuses over-cap promotion without an LLM call",
+      "type": "integration",
+      "preconditions": [
+        "tenant at its configured compiles/hour cap"
+      ],
+      "steps": [
+        "Loopctl.Memory.promote_session for a new session in that tenant"
+      ],
+      "expected_results": [
+        "{:error, :budget_exceeded}; no Oban job enqueued; no LLM call"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.9",
+      "name": "subject at memory cap terminates promotion (no LLM retry loop)",
+      "type": "integration",
+      "preconditions": [
+        "subject A at its epic_28 per-(tenant,subject) memory cap",
+        "a promotable session for A"
+      ],
+      "steps": [
+        "perform MemoryPromotionWorker; Loopctl.Memory.remember returns {:error, :quota_exceeded}"
+      ],
+      "expected_results": [
+        "the job discards terminally (does not retry-loop and re-call the LLM); telemetry records the outcome"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.10",
+      "name": "promote_session enqueues a correctly-scoped job",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant); scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "tenant under budget"
+      ],
+      "steps": [
+        "Loopctl.Memory.promote_session(%{scope | session_id: \"s1\"})"
+      ],
+      "expected_results": [
+        "{:ok, job} with args carrying tenant_id, subject_id A, session_id s1"
       ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Worker: Loopctl.Workers.MemoryPromotionWorker (flat namespace, like article_embedding_worker.ex / content_ingestion_worker.ex).",
-    "Enqueue helper: Loopctl.Memory.promote_session/2 (used by API US-29.3 + MCP US-29.4).",
-    "Dedupe: exact via memories.embedding_content_hash; near via cosine over the epic_28 vector/recall path within (tenant_id, subject_id) scope, threshold from config. There is NO separate SimHash module — reuse embedding similarity + content hash.",
+    "Workers: Loopctl.Workers.MemoryPromotionWorker (per-session, args tenant_id/subject_id/session_id) and Loopctl.Workers.MemoryPromotionSweepWorker (cron all-tenants; add to config/config.exs Oban Plugins.Cron ~line 273; mirror KnowledgeMocWorker all-tenants enumeration + RetrievalMetricsWorker).",
+    "New schema: session_promotions (migration) with unique (tenant_id, subject_id, session_id) + session_content_hash + last_turn_inserted_at + promoted_at, written on EVERY run incl zero-survivor.",
+    "Migration also: partial unique index on memories (tenant_id, subject_id, embedding_content_hash) WHERE source = :promoted; and compute embedding_content_hash SYNCHRONOUSLY at write (hash of text) — do NOT depend on the async MemoryEmbeddingWorker for the exact-dedupe key.",
+    "Content-hash watermark is the primary idempotency mechanism; deterministic compile (US-29.1 temperature 0) makes it reliable. Near-dup supersede via epic_28 cosine recall is secondary and must fail-safe on meta.fallback == true.",
     "supersede via epic_28 Loopctl.Memory.supersede/2 (superseded_by, on_delete: :nilify_all).",
-    "Scheduled sweep: add an entry to the Oban Plugins.Cron crontab in config/config.exs (~line 273); the sweep query finds sessions whose latest turn is newer than their last promotion (or never promoted) and older than a config window.",
-    "Idempotency uses Oban unique on (session_id, subject_id) + dedupe; re-run must be a true no-op (TC-29.2.2).",
-    "Embedding of promoted memories reuses epic_28 Loopctl.Workers.MemoryEmbeddingWorker.",
-    "Tests use Loopctl.Fixtures.fixture/2 + Mox for both the Promoter LLM and the embedding client."
+    "Oban unique keys include tenant_id (session_id is agent-supplied/arbitrary) + explicit states + period; concurrent write safety also rests on the partial unique index + on_conflict.",
+    "Budget: a per-tenant compiles/hour cap (reuse the existing rate/limit conventions, e.g. Hammer, keyed by tenant); enforced BEFORE any LLM call.",
+    "TTL invariant: promotion sweep window < epic_28 session_memories TTL (US-28.2 AC-28.2.9) — assert in config/test so prune never precedes promotion.",
+    "Reconcile knowledge_moc_worker.ex:~9 preserving the intentional no-LLM-narrative rationale.",
+    "Tests use Loopctl.Fixtures.fixture/2 + config-swapped MockPromoterLLM + Mox embedding stub."
   ],
   "dependencies": ["US-29.1"],
-  "estimated_tokens": 420000
+  "estimated_tokens": 520000
 }

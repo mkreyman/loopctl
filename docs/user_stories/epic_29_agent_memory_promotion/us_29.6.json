@@ -21,7 +21,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-29.6.1",
-      "description": "docs/agent-memory.md is extended with the promotion lifecycle (session -> compile -> confidence gate -> dedupe/supersede -> long-term), the confidence-threshold + eval story (US-29.5), and the Claude Code Stop-hook recipe (cross-ref mkreyman/claude-config#85). It reconciles/removes the stale 'killed session compiler' framing (now implemented).",
+      "description": "docs/agent-memory.md is extended with the promotion lifecycle (session -> compile -> confidence gate -> synchronous-hash dedupe/supersede -> long-term), the watermark + per-tenant budget + TTL-window invariant, the confidence-threshold + eval story (US-29.5), the prompt-injection stance, and the Claude Code Stop-hook recipe (cross-ref mkreyman/claude-config#85). NOTE: the #308 line item 'reconcile docs/cole-medin-self-evolving-wiki.md' is already satisfied — that file was removed in PR #310 (its content lives in KB hub fb9abd73); no action needed beyond recording that here.",
       "status": "pending"
     },
     {
@@ -36,12 +36,17 @@
     },
     {
       "id": "AC-29.6.4",
-      "description": "A terminal idempotency test proves re-running promotion for the same session (explicit + scheduled) yields no net new rows across the whole path, and a cross-scope test proves a promoted memory under (tenant T, subject A) is never produced for or visible to tenant U or subject B — via context, API, and MCP.",
+      "description": "A terminal idempotency test proves re-running promotion for the same UNCHANGED session (explicit + scheduled) yields no net new rows measured INCLUDING superseded rows (watermark skip), and a cross-scope test proves a promoted memory under (tenant T, subject A) is never produced for or visible to tenant U or subject B — via context, API, and MCP.",
       "status": "pending"
     },
     {
       "id": "AC-29.6.5",
-      "description": "The knowledge_moc_worker.ex 'killed session compiler' comment (US-29.2 AC-29.2.7) is confirmed reconciled, and a seam note documents the claude-config Stop-hook + skills consumer (#85) integration points — no implementation of #85 here.",
+      "description": "An end-to-end unattended-safety test: (a) a session with an injected instruction does not produce a poisoned/cross-tenant-linked promoted memory (US-29.1 AC-29.1.5); (b) an over-budget tenant is refused (US-29.2 AC-29.2.8); (c) promotion-failure telemetry is emitted (US-29.2 AC-29.2.11) so a failing sweep is observable.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.6.6",
+      "description": "The knowledge_moc_worker.ex 'killed session compiler' comment (US-29.2 AC-29.2.12) is confirmed reconciled (preserving the intentional no-LLM-narrative rationale), and a seam note documents the claude-config Stop-hook + skills consumer (#85) integration points — no implementation of #85 here.",
       "status": "pending"
     }
   ],
@@ -80,8 +85,29 @@
         "attempt recall/list of A's promoted memory as tenant_u and as subject B via context/API/MCP"
       ],
       "expected_results": [
-        "no net new rows after re-promotion (idempotent)",
+        "no net new rows after re-promotion, counting superseded rows too (watermark skip)",
         "A's promoted memory is never returned to tenant_u or subject B on any surface"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.6.3",
+      "name": "unattended-safety: injection stripped, budget enforced, failure observable",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant); {raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "a session whose content injects an instruction to cross-link a foreign-tenant article",
+        "telemetry handler attached"
+      ],
+      "steps": [
+        "promote the injected session and inspect the resulting promoted memory",
+        "drive the tenant over its promotion budget and POST /api/v1/memory/promote again",
+        "force a compile failure and observe telemetry"
+      ],
+      "expected_results": [
+        "no promoted memory carries the foreign article link or obeys the injected instruction",
+        "the over-budget promote returns 429 without an LLM call",
+        "a promotion-failure telemetry event is emitted (not silent)"
       ],
       "status": "pending"
     }

@@ -21,7 +21,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-29.4.1",
-      "description": "A memory_promote tool is registered by the existing convention (inputSchema entry in the tools array + a case in the CallToolRequestSchema switch + a handler) that POSTs to /api/v1/memory/promote via the shared HTTP + witness/STH helpers. Input: session_id (+ optional project scope).",
+      "description": "A memory_promote tool is registered by the existing convention (inputSchema entry in the tools array + a case in the CallToolRequestSchema switch + a handler) that POSTs to /api/v1/memory/promote via the shared HTTP + witness/STH helpers. Input is session_id ONLY — tenant/subject scope is derived server-side from the key; no project_id/subject input is accepted (isolation is (tenant, subject), never client-supplied).",
       "status": "pending"
     },
     {

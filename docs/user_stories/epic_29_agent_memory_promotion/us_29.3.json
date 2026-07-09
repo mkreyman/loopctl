@@ -10,7 +10,7 @@
   "priority_note": "Exposes the explicit promotion trigger over HTTP and delivers the human oversight of promoted memories via the superadmin API (loopctl has no web UI). Depends on the worker (29.2) and epic_28's memory API.",
   "background": {
     "reference": "GitHub issue #308; extends epic_28's LoopctlWeb.MemoryController + the :authenticated pipeline. #308 originally specified a LiveView for promoted-vs-explicit oversight; loopctl is agent-native (no web UI), so oversight is delivered via the superadmin API established in epic_28 US-28.3 AC-28.3.4.",
-    "includes": "US-29.2 provides Loopctl.Memory.promote_session/2. This story adds the explicit HTTP trigger and extends the memory list/delete API so a superadmin can filter promoted vs explicit memories, see source_session_id + confidence, and reject (delete) a bad promotion — the agent-native replacement for the LiveView quality loop."
+    "includes": "US-29.2 provides Loopctl.Memory.promote_session/1. This story adds the explicit HTTP trigger and extends the memory list/delete API so a superadmin can filter promoted vs explicit memories, see source_session_id + confidence, and reject (delete) a bad promotion — the agent-native replacement for the LiveView quality loop."
   },
   "story": {
     "as_a": "an agent (or Stop-hook) ending a session, and a superadmin auditing promotions",
@@ -21,7 +21,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-29.3.1",
-      "description": "POST /api/v1/memory/promote (on the :authenticated pipeline) accepts a session_id, derives scope (tenant_id + subject_id) from the resolved API key per epic_28 US-28.1 AC-28.1.4, and enqueues promotion via Loopctl.Memory.promote_session/2. Returns 202 with the job reference. Body-supplied tenant/subject is ignored.",
+      "description": "POST /api/v1/memory/promote (on the :authenticated pipeline) accepts a session_id, derives scope (tenant_id + subject_id) from the resolved API key per epic_28 US-28.1 AC-28.1.4, and enqueues promotion via Loopctl.Memory.promote_session/1. Returns 202 with the job reference on success; returns 429 (with the standard error envelope) when the tenant is over its promotion budget (US-29.2 AC-29.2.8), without enqueuing or calling the LLM. Body-supplied tenant/subject is ignored.",
       "status": "pending"
     },
     {
@@ -31,7 +31,7 @@
     },
     {
       "id": "AC-29.3.3",
-      "description": "The epic_28 GET /api/v1/memory list gains a source filter (?source=promoted|explicit) and returns source, source_session_id, and confidence per memory; non-superadmin callers see only their own subject, superadmin (with all_subjects) sees the tenant.",
+      "description": "The epic_28 GET /api/v1/memory list gains a source filter (?source=promoted|explicit) and returns source, source_session_id, and confidence per memory; non-superadmin callers see only their own subject; superadmin (with all_subjects) sees all subjects but is CLAMPED to its own tenant (all_subjects never widens beyond the caller's tenant — it rides the epic_28 tenant-clamped list, US-28.3 AC-28.3.4).",
       "status": "pending"
     },
     {
@@ -121,7 +121,7 @@
     }
   ],
   "technical_notes": [
-    "Extend LoopctlWeb.MemoryController (epic_28) with promote/2 -> Loopctl.Memory.promote_session/2; route POST /api/v1/memory/promote under the :authenticated scope.",
+    "Extend LoopctlWeb.MemoryController (epic_28) with promote/2 -> Loopctl.Memory.promote_session/1; route POST /api/v1/memory/promote under the :authenticated scope.",
     "There is NO LiveView (loopctl is agent-native). The #308 'promoted-vs-explicit LiveView' is delivered as the source filter + superadmin all_subjects list + delete on the existing memory API.",
     "Scope + superadmin oversight reuse epic_28 US-28.3 AC-28.3.2/AC-28.3.4 exactly; do not fork the auth path.",
     "OpenAPI operation macro in the controller; schemas in lib/loopctl/api_spec/.",
