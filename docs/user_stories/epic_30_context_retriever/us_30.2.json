@@ -22,10 +22,14 @@
     { "id": "AC-30.2.4", "description": "A field NOT marked filterable produces NO filter tool; an entity with no searchable field produces NO search tool — the generated surface is exactly the allowlist, nothing more.", "status": "pending" }
   ],
   "test_cases": [
-    { "id": "TC-30.2.1", "name": "generator emits filter tools only for filterable fields + a search tool", "type": "unit",
-      "preconditions": ["entity = an Entity with fields status(filterable), city(filterable), description(searchable text), secret(neither)"],
+    { "id": "TC-30.2.1", "name": "generator emits filter tools (typed) only for filterable fields + a search tool", "type": "unit",
+      "preconditions": ["entity = an Entity with fields status(string,filterable), priority(int,filterable), active(bool,filterable), due(date,filterable), description(text,searchable), secret(neither)"],
       "steps": ["Loopctl.ContextRetriever.ToolGenerator.specs_for(entity)"],
-      "expected_results": ["specs include filter tools for status and city and a search tool; NO tool references secret; each spec carries entity/field/operation metadata + typed input schema"], "status": "pending" },
+      "expected_results": ["filter tools for status/priority/active/due with input schemas typed string/integer/boolean/date respectively; a search tool; NO tool references secret; each spec carries (entity, field, operation) metadata"], "status": "pending" },
+    { "id": "TC-30.2.3", "name": "an entity with no searchable field produces no search tool", "type": "unit",
+      "preconditions": ["entity = an Entity whose fields are all filterable-only (no searchable)"],
+      "steps": ["ToolGenerator.specs_for(entity)"],
+      "expected_results": ["only filter tools; NO search_<entity> tool is generated"], "status": "pending" },
     { "id": "TC-30.2.2", "name": "specs are deterministic and collision-safe", "type": "unit",
       "preconditions": ["the same entity"],
       "steps": ["call specs_for/1 twice; compare names to loopctl static tool names"],

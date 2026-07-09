@@ -17,15 +17,15 @@
   "rationale": "Dogfooding on loopctl's own project/story data is the strongest correctness + safety proof: the hand-written tools are the known-good oracle, so parity between them and the generated tools demonstrates the generator/executor produce the same scoped results — and any divergence (a leaked column, a scope miss) is caught against a trusted baseline.",
   "acceptance_criteria": [
     { "id": "AC-30.6.1", "description": "A seed defines entity definitions for projects, stories, and epics with appropriate filterable fields (e.g. story: status, epic; project: status) and searchable text fields (e.g. story title/description), scoped per tenant.", "status": "pending" },
-    { "id": "AC-30.6.2", "description": "Parity: for a given tenant, filtering stories by status via the generated cr_filter_story_by_status returns the same story set (ids) as the existing hand-written list_stories filtered equivalently — proving the generated executor honors the same tenant/role scoping.", "status": "pending" },
-    { "id": "AC-30.6.3", "description": "The generated tools expose ONLY the declared fields of projects/stories/epics — no sensitive/internal column (e.g. custody/audit fields) leaks through result shaping.", "status": "pending" },
+    { "id": "AC-30.6.2", "description": "Parity is defined against list_stories' FULL effective filter set, not a naive status match: list_stories(tenant_id, epic_id, opts) is per (tenant, epic) (and list_stories_by_project per project), and may apply implicit filters/ordering/soft-deletes. The generated cr_filter_story_by_status is per-tenant across epics, so the test proves the generated path exposes NO rows the oracle would hide (subset/superset checked deliberately), not just 'identical ids' — the generated surface must never be a broader read than the vetted tool.", "status": "pending" },
+    { "id": "AC-30.6.3", "description": "The generated tools expose ONLY the declared, server-allowlisted fields of projects/stories/epics (US-30.1 AC-30.1.2 makes this enforceable — a tenant cannot declare custody/audit columns); no sensitive/internal column leaks through result shaping.", "status": "pending" },
     { "id": "AC-30.6.4", "description": "Scope/role parity: a generated story query as an agent of tenant A never returns tenant B's stories, matching the hand-written tools' isolation.", "status": "pending" }
   ],
   "test_cases": [
-    { "id": "TC-30.6.1", "name": "generated story filter matches hand-written list_stories", "type": "integration",
-      "preconditions": ["tenant = fixture(:tenant)", "stories seeded with varied status via fixtures", "story entity seeded"],
-      "steps": ["query cr_filter_story_by_status {value: \"ready\"} via /retrieve", "call the existing list_stories filtered to status ready"],
-      "expected_results": ["identical story id sets; same ordering contract; %{results, meta}"], "status": "pending" },
+    { "id": "TC-30.6.1", "name": "generated story filter is not a broader read than list_stories", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "stories across multiple epics with varied status (incl. any soft-deleted/hidden)", "story entity seeded"],
+      "steps": ["query cr_filter_story_by_status {value: \"ready\"} via /retrieve (per-tenant)", "union list_stories(tenant, epic, status: ready) across the tenant's epics"],
+      "expected_results": ["the generated result set contains no story the oracle union hides (no soft-deleted/other-scope rows); scope/role parity holds"], "status": "pending" },
     { "id": "TC-30.6.2", "name": "no undeclared column leaks", "type": "integration",
       "preconditions": ["story entity declaring a subset of fields"],
       "steps": ["query the generated story tool"],

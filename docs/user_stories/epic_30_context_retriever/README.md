@@ -5,9 +5,11 @@ Agent Memory, epics 28–29). A per-tenant **entity/schema layer** auto-generate
 surface (filter + full-text tools) over **structured** data, so an agent queries in a single
 governed tool call instead of scanning documents or hand-writing SQL.
 
-> **Status: authored with `user-story-writer` (current schema, `estimated_tokens`).**
-> Pending the three-lens enhanced review (analyst / architect / adversarial) before
-> `/implement-plan`, same as epics 28–29.
+> **Status: authored with `user-story-writer`, hardened through one enhanced-review round.**
+> Three-lens review (analyst / architect / adversarial-security), each verified against the live
+> code, found three blockers (self-authored allowlist, unbuildable full-text, vacuous role gate)
+> and safety gaps — all applied (see "Review changes"). A confirm-pass before `/implement-plan`
+> is still worthwhile.
 
 ## Distinct from the Knowledge Wiki (and Agent Memory)
 
@@ -42,13 +44,35 @@ Do not conflate them; `retrieve_*` is not `knowledge_search` is not `memory_reca
 
 ## Security is the theme (US-30.3 is the crux)
 
-The executor turns model output into database queries, so v1 is security-first: **allowlist only**
-(a tool can only touch fields an entity marks filterable/searchable), **parameterized always** (an
-injection payload is a literal value, never SQL), **mandatory non-overridable tenant scoping**,
-**role gating** (define ≥ user, query ≥ agent), **capped pagination**, and **declared-fields-only
-result shaping** (no undeclared/audit column leakage). The dogfood (US-30.6) proves parity against
-loopctl's known-good hand-written story/project tools; US-30.7 proves the security properties
-epic-wide across API + MCP.
+The executor turns model output into database queries, so v1 is security-first:
+- **Server per-source column allowlist** (US-30.1): the entity def is authored by a `≥user` admin,
+  so a *server* constant bounds which columns each backing source may expose — an admin can't
+  declare `tenant_id`/audit/custody columns. Validated at define AND execute time.
+- **Parameterized always** — injection payloads (filter values *and* search queries) are literals.
+- **Mandatory non-overridable tenant scoping** — RLS context *and* an explicit predicate; isolation
+  tests run under the non-owner app role (RLS is `ENABLE`, not `FORCE`, so an owner connection
+  bypasses it and would prove nothing).
+- **Indexed full-text** — a GIN tsvector migration on the backing tables (they have none off
+  `articles`); no on-the-fly `to_tsvector` seq-scan, no `ILIKE`.
+- **Role gate**: define ≥ user; querying needs only authentication (`agent` is the floor role, so
+  a "below-agent 403" doesn't exist — the negative case is 401).
+- **Audit + rate-limit + entity cap**: every execution is audited; `/retrieve` is Hammer-rate-limited;
+  entities-per-tenant are capped so dynamic `ListTools` stays bounded.
+- **Declared-fields-only result shaping**; **relationships deferred out of v1** (no unvalidated JSON).
+
+The dogfood (US-30.6) proves the generated path is **not a broader read surface** than loopctl's
+vetted `list_stories` (which is per tenant+epic); US-30.7 proves the security properties epic-wide.
+
+## Review changes (enhanced-review round 1, applied)
+
+Added the server per-source column allowlist (blocker: entity def was a self-authored allowlist);
+replaced the "reuse the articles full-text path" (which exists only on `articles`) with a GIN
+tsvector migration on the backing tables (blocker: full-text was unbuildable safely); fixed the
+vacuous "query ≥ agent" gate to authentication-only + 401 negatives (blocker: agent is the floor
+role); added execute-time allowlist re-validation, audit logging, `/retrieve` rate-limiting, a
+per-tenant entity cap, superadmin/stale-def fail-closed edges, `{:array,:map}` fields (no embeds in
+this codebase), RLS-on-migration + non-owner-role isolation tests, MCP structured-args dispatch,
+search execution tests, and re-baselined the dogfood parity oracle; deferred relationships out of v1.
 
 ## Provenance
 

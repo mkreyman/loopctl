@@ -17,19 +17,19 @@
   "rationale": "The context retriever lets a model's output drive database queries across tenants, so its safety properties must be proven across the whole define->list->execute path, not just per unit. A single terminal security verification plus authoritative docs (the three-layer mental model) turns the merged stories into a trustworthy, teachable capability.",
   "acceptance_criteria": [
     { "id": "AC-30.7.1", "description": "docs/context-retriever.md is written: the entity->generator->executor architecture, the security model (allowlist, parameterization, tenant/role scoping, pagination cap, no model SQL), and the THREE-LAYER model — Knowledge Wiki (curated) vs Agent Memory (scoped, auto-accumulated) vs Context Retriever (governed structured-data access). States loopctl is agent-native (no web UI); entity management is via API/MCP.", "status": "pending" },
-    { "id": "AC-30.7.2", "description": "README.md, CLAUDE.md + AGENTS.md (agent guidance: when to use retrieve_* vs knowledge_* vs memory_*), CHANGELOG.md updated; endpoints render at /swaggerui. The #309 'reconcile docs/cole-medin-self-evolving-wiki.md' item is noted as already satisfied (removed in PR #310; content in KB hub fb9abd73).", "status": "pending" },
-    { "id": "AC-30.7.3", "description": "An end-to-end integration test: define an entity via API -> the generated tool appears in MCP ListTools -> a query via both POST /retrieve and the MCP generated tool returns the same tenant-scoped results.", "status": "pending" },
-    { "id": "AC-30.7.4", "description": "A terminal SECURITY suite proves epic-wide: (a) an injection payload in a filter value matches literally (no SQL execution); (b) a non-allowlisted field is rejected on every surface; (c) cross-tenant define/list/query isolation holds via context, API, and MCP; (d) no undeclared column leaks in results.", "status": "pending" }
+    { "id": "AC-30.7.2", "description": "README.md, CLAUDE.md + AGENTS.md (agent guidance: when to use retrieve_* vs knowledge_* vs memory_*), CHANGELOG.md updated; endpoints render at /swaggerui. The #309 'reconcile docs/cole-medin-self-evolving-wiki.md' item is noted as already satisfied (removed in PR #310; content in KB hub fb9abd73). The docs also note the epic folder is epic_30 (the #309 body's 'epic_29_context_retriever' predates epic_29 being assigned to Agent Memory Part 2 / #308).", "status": "pending" },
+    { "id": "AC-30.7.3", "description": "An end-to-end integration test: define an entity (with a filterable AND a searchable field) via API -> both generated tools appear in MCP ListTools -> a FILTER query and a SEARCH query via both POST /retrieve and the MCP generated tools return the same tenant-scoped results.", "status": "pending" },
+    { "id": "AC-30.7.4", "description": "A terminal SECURITY suite proves epic-wide, run under the non-owner app role: (a) injection payloads in both a filter value AND a search query match literally (no SQL execution); (b) a non-allowlisted field is rejected on every surface; (c) cross-tenant define/list/query isolation holds via context, API, and MCP; (d) no undeclared column leaks; (e) every /retrieve execution wrote an audit record; (f) /retrieve is rate-limited.", "status": "pending" }
   ],
   "test_cases": [
-    { "id": "TC-30.7.1", "name": "end-to-end define -> ListTools -> query (API + MCP) agree", "type": "integration",
-      "preconditions": ["tenant = fixture(:tenant)", "{_, user_key}/{_, agent_key} = fixture(:api_key, ...)", "projects seeded"],
-      "steps": ["POST /api/v1/entities (project) as user_key", "MCP ListTools as agent_key", "POST /retrieve/project and call the MCP generated tool"],
-      "expected_results": ["the generated tool is listed; API + MCP queries return the same tenant-scoped result set"], "status": "pending" },
-    { "id": "TC-30.7.2", "name": "terminal security: injection + non-allowlist + cross-tenant + no-leak", "type": "integration",
-      "preconditions": ["two tenants each with entities + rows; an injection value; a non-allowlisted field; an entity declaring a field subset"],
-      "steps": ["run an injection filter value", "query a non-allowlisted field", "attempt cross-tenant list/query via API + MCP", "inspect returned columns"],
-      "expected_results": ["injection matches literally/no SQL; non-allowlist rejected everywhere; no cross-tenant data on any surface; only declared fields returned"], "status": "pending" }
+    { "id": "TC-30.7.1", "name": "end-to-end define -> ListTools -> filter + search (API + MCP) agree", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{_, user_key}/{_, agent_key} = fixture(:api_key, ...)", "stories seeded (with searchable title text; tsvector migration applied)"],
+      "steps": ["POST /api/v1/entities (story: status filterable, title searchable) as user_key", "MCP ListTools as agent_key", "run a filter query and a search query via POST /retrieve and via the MCP generated tools"],
+      "expected_results": ["both generated tools are listed; API + MCP filter and search queries each return the same tenant-scoped result set"], "status": "pending" },
+    { "id": "TC-30.7.2", "name": "terminal security: injection (filter+search) + non-allowlist + cross-tenant + no-leak + audit + rate-limit", "type": "integration",
+      "preconditions": ["two tenants each with entities + rows; injection payloads; a non-allowlisted field; an entity declaring a field subset; queries run under the app role"],
+      "steps": ["run injection in a filter value AND a search query", "query a non-allowlisted field", "attempt cross-tenant list/query via API + MCP", "inspect returned columns", "check the audit log after a query", "exceed the /retrieve rate limit"],
+      "expected_results": ["both injections match literally/no SQL; non-allowlist rejected everywhere; no cross-tenant data on any surface; only declared fields returned; an audit record exists per execution; over-limit is 429"], "status": "pending" }
   ],
   "technical_notes": [
     "Model on epic_28 US-28.5 / epic_29 US-29.6 terminal-verification pattern: depends on all leaves, runs last.",

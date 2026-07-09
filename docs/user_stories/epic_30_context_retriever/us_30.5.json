@@ -17,9 +17,9 @@
   "rationale": "Hand-maintaining tools in a ~4,395-line index.js is the 'markdown doesn't scale' problem applied to the tool layer. Making ListTools dynamic (static + per-tenant generated) and dispatching unknown generated names to one generic executor endpoint is the structural fix and the productizable core of the context-retriever pillar.",
   "acceptance_criteria": [
     { "id": "AC-30.5.1", "description": "The ListToolsRequestSchema handler returns the static tools array PLUS the calling tenant's generated specs fetched from GET /api/v1/retrieve/tools (via the shared authenticated HTTP helper). If the fetch fails, it degrades to the static tools (and logs) rather than erroring the whole listing.", "status": "pending" },
-    { "id": "AC-30.5.2", "description": "The CallToolRequestSchema handler dispatches any tool name NOT in the static switch and matching the generated prefix (cr_) to a generic handler that POSTs to /api/v1/retrieve/:entity with the parsed entity/field/op; static tools continue to dispatch exactly as before (no regression).", "status": "pending" },
+    { "id": "AC-30.5.2", "description": "The CallToolRequestSchema handler dispatches any tool name NOT in the static switch and matching the generated prefix (cr_) to a generic handler that POSTs to /api/v1/retrieve/:entity. The (entity, field, operation) are taken from STRUCTURED metadata carried on the generated tool spec (US-30.2), not by splitting the tool name (entity/field names contain underscores — name-splitting is ambiguous). Static tools dispatch exactly as before (no regression).", "status": "pending" },
     { "id": "AC-30.5.3", "description": "Generated tools are tenant-scoped: the list reflects only the authenticated key's tenant, and a generic call is executed under that key's scope (the server never lets one tenant call another tenant's generated tool).", "status": "pending" },
-    { "id": "AC-30.5.4", "description": "Witness/STH and error handling for generated-tool calls match the other write/read tools; a generated call carries the same auth/witness as a static one.", "status": "pending" }
+    { "id": "AC-30.5.4", "description": "Witness/STH and error handling for generated-tool calls match the other read tools; a generated call carries the same auth/witness as a static one. Dynamic listing fetches /retrieve/tools with a query-capable key (agent+); since the stdio MCP process is one-tenant-per-process, 'the tenant' is the process key's tenant (AC-30.5.3 is satisfied structurally, not by per-request negotiation). The appended generated-tool count is bounded by the per-tenant entity cap (US-30.1 AC-30.1.5) so ListTools payload/latency stays bounded.", "status": "pending" }
   ],
   "test_cases": [
     { "id": "TC-30.5.1", "name": "ListTools includes generated tools + static tools", "type": "integration",
@@ -37,7 +37,11 @@
     { "id": "TC-30.5.4", "name": "listing degrades gracefully if the tools fetch fails", "type": "integration",
       "preconditions": ["retrieve/tools endpoint stubbed to error"],
       "steps": ["issue ListToolsRequest"],
-      "expected_results": ["static tools still returned; no crash; the failure is logged"], "status": "pending" }
+      "expected_results": ["static tools still returned; no crash; the failure is logged"], "status": "pending" },
+    { "id": "TC-30.5.5", "name": "a generated call carries the same witness/STH as a static call", "type": "integration",
+      "preconditions": ["MCP server with a defined entity; witness/STH configured"],
+      "steps": ["call a generated cr_ tool and a static read tool, inspecting the outgoing auth/witness headers"],
+      "expected_results": ["both carry the same auth + witness/STH; the generated call is not a weaker path"], "status": "pending" }
   ],
   "technical_notes": [
     "Edit mcp-server/index.js: ListToolsRequestSchema handler (~4130) merges static + fetched generated specs; CallToolRequestSchema (~4134) routes cr_-prefixed unknown names to a generic /retrieve/:entity handler. Reuse mcp-server/lib/http-helpers.js + witness-sth.js.",
