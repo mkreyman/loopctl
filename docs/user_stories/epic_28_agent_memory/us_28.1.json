@@ -159,5 +159,5 @@
     "Tests use Loopctl.Fixtures.fixture/1,2; add fixture(:memory, attrs) and fixture(:session_memory, attrs) helpers in this story. fixture(:tenant) and fixture(:api_key, role:) already exist; there is NO fixture(:user)/fixture(:tenant_user) (no human-auth in loopctl)."
   ],
   "dependencies": [],
-  "estimated_hours": 12
+  "estimated_tokens": 300000
 }

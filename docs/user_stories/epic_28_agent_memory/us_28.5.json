@@ -122,6 +122,11 @@
     "Do NOT implement #308 or claude-config#85 here; only assert and document the seams they rely on.",
     "Tests use Loopctl.Fixtures.fixture/2; reuse the deterministic Mox embedding stub from US-28.2 and the ScaleSeed helper from US-27.1."
   ],
-  "dependencies": ["US-28.1", "US-28.2", "US-28.3", "US-28.4"],
-  "estimated_hours": 12
+  "dependencies": [
+    "US-28.1",
+    "US-28.2",
+    "US-28.3",
+    "US-28.4"
+  ],
+  "estimated_tokens": 240000
 }

@@ -158,6 +158,8 @@
     "fixture(:api_key, tenant:, role:) returns {raw_key, %ApiKey{}} and already exists; there is no human-user fixture.",
     "agent role is the floor (level 1) in lib/loopctl/auth/role.ex — 'role >= agent' is a no-op gate; the boundary is (tenant_id, subject_id)."
   ],
-  "dependencies": ["US-28.2"],
-  "estimated_hours": 14
+  "dependencies": [
+    "US-28.2"
+  ],
+  "estimated_tokens": 280000
 }

@@ -121,6 +121,8 @@
     "Mirror the STH persistence pattern proven in youtube-knowledge-extract's publish.py (persists an .sth file, self-heals on 412) — referenced in KB finding 877a415d.",
     "Node tests use the existing mcp-server/test harness (see knowledge_tools.test.js / story_tools.test.js); add memory_tools.test.js."
   ],
-  "dependencies": ["US-28.3"],
-  "estimated_hours": 10
+  "dependencies": [
+    "US-28.3"
+  ],
+  "estimated_tokens": 160000
 }
