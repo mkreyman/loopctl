@@ -7,41 +7,41 @@
   },
   "priority": "high",
   "phase": "api",
+  "priority_note": "Bridges the domain (28.2) to the MCP layer (28.4); must reuse the existing auth/witness pipeline exactly.",
   "background": {
-    "reference": "GitHub issue #307; mirrors the knowledge_* controllers and the :authenticated router pipeline",
-    "includes": "The MCP tools (US-28.4) call the Phoenix /api/v1 API, not the context directly. This story exposes Loopctl.Memory over HTTP with the existing auth/witness stack."
+    "reference": "GitHub issue #307; mirrors the knowledge_* controllers and the :authenticated router pipeline (ExtractApiKey/ResolveApiKey/SetTenant/RequireAuth/ValidateWitnessHeader/CheckCustodyHalt)",
+    "includes": "The MCP tools (US-28.4) call the Phoenix /api/v1 API, not the context directly. This story exposes Loopctl.Memory over HTTP so it inherits tenant resolution, role gating, and the witness/chain-of-custody layer."
   },
-  "priority_note": "Bridges the domain (28.2) to the MCP layer (28.4). Must reuse the existing auth pipeline exactly.",
   "story": {
-    "as_a": "loopctl API consumer (an agent via MCP, or a direct API client)",
+    "as_a": "a loopctl API consumer (an agent via MCP, or a direct client)",
     "i_want_to": "call REST endpoints to write, recall, list, and delete memory, authenticated with my API key and scoped to my tenant/role",
-    "so_that": "agents can use memory over the same governed transport as the knowledge and story APIs"
+    "so_that": "agents use memory over the same governed transport as the knowledge and story APIs"
   },
-  "rationale": "loopctl's MCP server is a thin HTTP client over /api/v1; memory must live there to inherit tenant resolution, role gating, and the witness/chain-of-custody layer instead of re-implementing them.",
+  "rationale": "loopctl's MCP server is a thin HTTP client over /api/v1, so memory must live there to inherit tenant resolution, role gating, and the witness/custody layer instead of re-implementing them. Putting the boundary anywhere else would fork the auth story.",
   "acceptance_criteria": [
     {
       "id": "AC-28.3.1",
-      "description": "New LoopctlWeb.MemoryController + MemoryJSON view. Routes under scope \"/api/v1\": POST /api/v1/memory (remember), POST /api/v1/memory/recall (semantic recall), GET /api/v1/memory (list, limit/offset + total_count meta), DELETE /api/v1/memory/:id (forget). All on the :authenticated pipeline.",
+      "description": "LoopctlWeb.MemoryController + MemoryJSON view expose, under scope \"/api/v1\" on the :authenticated pipeline: POST /api/v1/memory (remember), POST /api/v1/memory/recall (semantic recall), GET /api/v1/memory (list, limit/offset + total_count meta), DELETE /api/v1/memory/:id (forget).",
       "status": "pending"
     },
     {
       "id": "AC-28.3.2",
-      "description": "Role gating via Loopctl.Auth.Role: writing/reading memory requires >= agent; the scope (tenant + subject) is derived from the resolved API key (ResolveApiKey/SetTenant/Impersonate), never accepted from the request body. Requests that try to set another tenant/subject are ignored or 403, not honored.",
+      "description": "Role gating via Loopctl.Auth.Role: memory read/write requires role >= agent. Scope (tenant_id + subject_id) is derived from the resolved key (ResolveApiKey/SetTenant/Impersonate) and any tenant_id/subject_id in the request body is ignored, not honored.",
       "status": "pending"
     },
     {
       "id": "AC-28.3.3",
-      "description": "The full authenticated plug chain applies (ExtractApiKey → ResolveApiKey → SetTenant → RequireAuth → ValidateWitnessHeader → CheckCustodyHalt). A custody-halted key cannot write memory; a missing/invalid witness header is rejected consistently with other write endpoints.",
+      "description": "The full authenticated plug chain applies; a custody-halted key cannot write memory (CheckCustodyHalt), and a missing/invalid witness header is rejected consistently with other write endpoints (ValidateWitnessHeader).",
       "status": "pending"
     },
     {
       "id": "AC-28.3.4",
-      "description": "recall response carries the same meta contract as knowledge_search where relevant (fallback flag + reason when embeddings degrade); list carries offset/limit/total_count. Errors use the API's standard error envelope.",
+      "description": "recall responses carry meta (fallback flag + reason when embeddings degrade); list carries offset/limit/total_count; errors use the API's standard error envelope. No endpoint imposes a silent hard cap.",
       "status": "pending"
     },
     {
       "id": "AC-28.3.5",
-      "description": "OpenAPI: operations for all four endpoints are added under lib/loopctl/api_spec/ (request/response schemas), appear at /swaggerui, and the existing openapi_test passes (no 'No operation spec defined' warning for the new actions).",
+      "description": "OpenAPI operations for all four endpoints are added under lib/loopctl/api_spec/, render at /swaggerui, and the existing openapi_test passes with no 'No operation spec defined' warning for the new actions.",
       "status": "pending"
     }
   ],
@@ -49,35 +49,69 @@
     {
       "id": "TC-28.3.1",
       "name": "remember + recall round-trip over HTTP within tenant scope",
-      "type": "controller",
-      "preconditions": ["Authenticated agent-role key for tenant T"],
-      "steps": ["POST /api/v1/memory with a fact", "drain embedding worker", "POST /api/v1/memory/recall with a near query"],
-      "expected_results": ["201 on write; recall returns the memory ranked, scoped to T; response meta present"],
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "conn authenticated with key + valid witness header",
+        "embedding client stubbed via Mox"
+      ],
+      "steps": [
+        "POST /api/v1/memory with %{tier: \"long_term\", text: \"prefers reshipments\"}",
+        "drain the MemoryEmbeddingWorker queue",
+        "POST /api/v1/memory/recall with %{query: \"handling delayed orders\"}"
+      ],
+      "expected_results": [
+        "write returns 201",
+        "recall returns 200 with the memory ranked and meta present, scoped to tenant"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-28.3.2",
-      "name": "Body-supplied tenant/subject is ignored; cross-tenant read impossible",
-      "type": "controller",
-      "preconditions": ["Key for tenant T; a memory exists under tenant U"],
-      "steps": ["POST recall with body claiming tenant_id=U", "GET /api/v1/memory"],
-      "expected_results": ["Scope stays T; tenant-U memory never returned; no 500, no leak"],
+      "name": "Body-supplied tenant/subject is ignored; cross-tenant read is impossible",
+      "type": "integration",
+      "preconditions": [
+        "tenant_t = fixture(:tenant)",
+        "tenant_u = fixture(:tenant)",
+        "key = fixture(:api_key, tenant: tenant_t, role: :agent)",
+        "a memory exists under tenant_u"
+      ],
+      "steps": [
+        "POST /api/v1/memory/recall as key with body %{query: \"x\", tenant_id: tenant_u.id}",
+        "GET /api/v1/memory as key"
+      ],
+      "expected_results": [
+        "scope stays tenant_t; the tenant_u memory is never returned",
+        "no 500 and no existence leak"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-28.3.3",
-      "name": "Custody-halted / witness-invalid write is rejected",
-      "type": "controller",
-      "preconditions": ["A key placed in custody-halt"],
-      "steps": ["POST /api/v1/memory"],
-      "expected_results": ["Rejected consistently with other write endpoints (same status/shape)"],
+      "name": "Custody-halted key cannot write memory",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "key = fixture(:api_key, tenant: tenant, role: :agent)",
+        "key placed in custody-halt"
+      ],
+      "steps": [
+        "POST /api/v1/memory with a valid body"
+      ],
+      "expected_results": [
+        "rejected consistently with other write endpoints (same status and error shape as a halted knowledge write)"
+      ],
       "status": "pending"
     }
   ],
   "technical_notes": [
+    "Controller: LoopctlWeb.MemoryController; view: LoopctlWeb.MemoryJSON; routes added in lib/loopctl_web/router.ex under the existing :authenticated scope \"/api/v1\".",
     "Model the controller on an existing write-capable knowledge controller for the plug pipeline + error envelope; do not invent a new auth path.",
-    "Scope struct passed to Loopctl.Memory comes from conn.assigns set by SetTenant/Impersonate — mirror how knowledge controllers read the current tenant/subject.",
-    "Keep recall a POST (query + params in body) to match knowledge_search ergonomics and avoid long query strings for embeddings."
+    "The scope struct passed to Loopctl.Memory is built from conn.assigns set by SetTenant/Impersonate — mirror how knowledge controllers read the current tenant/subject.",
+    "Keep recall a POST (query/params in body) to match knowledge_search ergonomics and avoid long query strings.",
+    "OpenAPI schemas live in lib/loopctl/api_spec/; add request/response schema modules and wire operations so openapi_test stays green.",
+    "Tests use Loopctl.Fixtures.fixture/2; fixture(:api_key, tenant:, role:) already exists for other controller tests."
   ],
   "dependencies": ["US-28.2"],
   "estimated_hours": 12

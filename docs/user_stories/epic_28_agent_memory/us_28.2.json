@@ -7,83 +7,143 @@
   },
   "priority": "high",
   "phase": "domain",
-  "background": {
-    "reference": "GitHub issue #307; mirrors the Loopctl.Knowledge context + article_embedding_worker patterns",
-    "includes": "US-28.1 provides the tables. This story provides the public domain API the API/MCP/UI layers call, plus the async embedding of long-term memories so recall is semantic."
-  },
   "priority_note": "The domain heart of the epic; the API (28.3), MCP (28.4), and UI (28.5) are thin layers over this context.",
+  "background": {
+    "reference": "GitHub issue #307; mirrors the Loopctl.Knowledge context + lib/loopctl/workers/article_embedding_worker.ex patterns",
+    "includes": "US-28.1 provides the tables. This story provides the public domain API the API/MCP/UI layers call, plus async embedding of long-term memories so recall is semantic. Reuses Loopctl.Knowledge.EmbeddingClient (per-tenant BYO key), VectorSearch (HNSW kNN), and EmbeddingCircuitBreaker."
+  },
   "story": {
     "as_a": "loopctl platform engineer",
-    "i_want_to": "implement a Loopctl.Memory context exposing remember/2, recall/2 (semantic top-k within scope), forget/2, list/2, and supersede/2, backed by an Oban embedding worker that embeds long-term memories using the existing knowledge embedding pipeline",
-    "so_that": "callers can write and semantically retrieve scoped memory through one governed API that enforces scope on every read"
+    "i_want_to": "implement Loopctl.Memory.remember/2, recall/2, forget/2, list/2, and supersede/2, backed by an Oban worker that embeds long-term memories via the existing knowledge embedding pipeline",
+    "so_that": "callers write and semantically retrieve scoped memory through one governed API that enforces scope on every read"
   },
-  "rationale": "A store with no accessor is unusable and a store with an unenforced scope is a data-leak. Centralizing remember/recall/forget/list/supersede in one context guarantees every read is scope-filtered and every write is embedded exactly once — the same discipline Loopctl.Knowledge applies to articles.",
+  "rationale": "A store with no accessor is unusable and a store with an unenforced scope is a data leak. Centralizing remember/recall/forget/list/supersede in one context guarantees every read is scope-filtered and every long-term write is embedded exactly once — the discipline Loopctl.Knowledge already applies to articles.",
   "acceptance_criteria": [
     {
       "id": "AC-28.2.1",
-      "description": "Loopctl.Memory.remember/2 writes either a session memory (short-term) or a long-term memory depending on opts; long-term writes enqueue the embedding worker (embedding starts NULL, populated async). Scope (tenant/project/subject) is taken from the caller context, never from free-form params.",
+      "description": "Loopctl.Memory.remember/2 accepts a scope struct + attrs and writes either a session memory or a long-term memory depending on opts[:tier]; long-term writes enqueue the embedding worker (embedding starts NULL). Scope (tenant_id/project_id/subject_id) comes from the scope struct, never from free-form attrs.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.2",
-      "description": "Loopctl.Memory.recall/2 performs HNSW cosine top-k over long-term memories WITHIN the caller's (tenant, project?, subject) scope, using Loopctl.Knowledge.VectorSearch (or a shared helper), excluding superseded rows. Returns ranked {memory, score}. A recall never returns a memory outside scope.",
+      "description": "Loopctl.Memory.recall/2 runs HNSW cosine top-k over long-term memories WITHIN the scope's (tenant_id, optional project_id, subject_id), excludes rows where superseded_by is not null, and returns [{memory, score}] ranked. A recall never returns a memory outside scope.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.3",
-      "description": "recall degrades gracefully when embeddings are unavailable (EmbeddingCircuitBreaker open / no key): it falls back to recent-first keyword/text match within scope and sets a meta flag (fallback: true, reason) mirroring knowledge_search's contract — never a silent empty result.",
+      "description": "recall/2 degrades gracefully when embeddings are unavailable (EmbeddingCircuitBreaker open or no key): it falls back to recent-first ILIKE text match within scope and returns meta %{fallback: true, reason: <tag>} mirroring knowledge_search — never a silent empty result (SOUL rule 7).",
       "status": "pending"
     },
     {
       "id": "AC-28.2.4",
-      "description": "forget/2 deletes (or soft-deletes) a memory by id only within the caller's scope; a caller cannot forget another scope's memory (returns not_found, not an error leaking existence). list/2 enumerates scoped memories with limit/offset + total_count meta (no silent cap).",
+      "description": "forget/2 deletes a memory by id only within scope; a foreign-scope id returns {:error, :not_found} (no existence leak). list/2 enumerates scoped memories with limit/offset and returns total_count in meta with no silent cap.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.5",
-      "description": "supersede/2 marks an existing in-scope memory superseded_by a new one (used later by #308 dedup); superseded memories are excluded from recall/list by default but retrievable with an explicit include_superseded flag.",
+      "description": "supersede/2 sets superseded_by on an in-scope memory to a new memory id; superseded memories are excluded from recall/2 and list/2 by default and included only when opts[:include_superseded] is true.",
       "status": "pending"
     },
     {
       "id": "AC-28.2.6",
-      "description": "Loopctl.Memory.Workers.MemoryEmbeddingWorker (Oban) embeds a long-term memory via EmbeddingClient (per-tenant BYO key), writes embedding + embedding_content_hash, is idempotent (re-run with unchanged text is a no-op via the content hash), and honors EmbeddingCircuitBreaker. Mirrors lib/loopctl/workers/article_embedding_worker.ex.",
+      "description": "Loopctl.Memory.Workers.MemoryEmbeddingWorker (Oban) embeds a long-term memory via EmbeddingClient, writes embedding + embedding_content_hash, is idempotent (unchanged text re-run is a no-op via the content hash), and honors EmbeddingCircuitBreaker. Mirrors lib/loopctl/workers/article_embedding_worker.ex.",
       "status": "pending"
     }
   ],
   "test_cases": [
     {
       "id": "TC-28.2.1",
-      "name": "remember → embed → recall round-trips within scope",
+      "name": "remember then recall round-trips a long-term memory within scope",
       "type": "integration",
-      "preconditions": ["tenant + subject scope", "Stub/di the embedding client to deterministic vectors"],
-      "steps": ["remember a long-term memory", "drain the embedding worker", "recall with a semantically-near query"],
-      "expected_results": ["The memory is returned top-1 with a score; embedding + content_hash populated"],
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"agent-1\")",
+        "embedding client stubbed via Mox to deterministic vectors"
+      ],
+      "steps": [
+        "Loopctl.Memory.remember(scope, %{tier: :long_term, text: \"prefers reshipments over refunds\"})",
+        "drain the MemoryEmbeddingWorker Oban queue",
+        "Loopctl.Memory.recall(scope, %{query: \"how does this user want delayed orders handled?\"})"
+      ],
+      "expected_results": [
+        "recall returns the memory as top-1 with a numeric score",
+        "the stored row has non-null embedding and embedding_content_hash"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-28.2.2",
-      "name": "recall and forget are scope-isolated",
+      "name": "recall and forget are isolated across subject and tenant",
       "type": "integration",
-      "preconditions": ["Memory M written under subject A of tenant T"],
-      "steps": ["recall as subject B / tenant T", "recall as a subject of tenant U", "forget M as subject B"],
-      "expected_results": ["B and tenant-U recalls never return M; forget as B returns not_found and M still exists for A"],
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope_a = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "scope_b = fixture(:memory_scope, tenant: tenant, subject_id: \"B\")",
+        "tenant2 = fixture(:tenant)",
+        "scope_u = fixture(:memory_scope, tenant: tenant2, subject_id: \"A\")",
+        "m = remember(scope_a, %{tier: :long_term, text: \"secret A fact\"}); drain embedding"
+      ],
+      "steps": [
+        "Loopctl.Memory.recall(scope_b, %{query: \"secret\"})",
+        "Loopctl.Memory.recall(scope_u, %{query: \"secret\"})",
+        "Loopctl.Memory.forget(scope_b, m.id)"
+      ],
+      "expected_results": [
+        "scope_b recall does not include m",
+        "scope_u recall does not include m",
+        "forget returns {:error, :not_found} and m still exists for scope_a"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-28.2.3",
-      "name": "recall falls back (not empty) when embeddings are down",
+      "name": "recall falls back to text match (not empty) when embeddings are down",
       "type": "integration",
-      "preconditions": ["EmbeddingCircuitBreaker forced open"],
-      "steps": ["recall a query that matches a memory's text"],
-      "expected_results": ["Returns the memory via text fallback with meta.fallback=true and a reason; not a silent []"],
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "remember(scope, %{tier: :long_term, text: \"always expedite reships\"}); drain embedding",
+        "EmbeddingCircuitBreaker forced open"
+      ],
+      "steps": [
+        "Loopctl.Memory.recall(scope, %{query: \"expedite\"})"
+      ],
+      "expected_results": [
+        "the memory is returned via ILIKE text fallback",
+        "meta == %{fallback: true, reason: _} (not a silent [])"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.2.4",
+      "name": "supersede hides the old memory from recall by default",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "old = fixture(:memory, scope: scope, text: \"prefers refunds\")",
+        "new = fixture(:memory, scope: scope, text: \"prefers reshipments\")"
+      ],
+      "steps": [
+        "Loopctl.Memory.supersede(scope, old.id, new.id)",
+        "Loopctl.Memory.list(scope, %{})",
+        "Loopctl.Memory.list(scope, %{include_superseded: true})"
+      ],
+      "expected_results": [
+        "default list excludes old, includes new",
+        "include_superseded list includes both"
+      ],
       "status": "pending"
     }
   ],
   "technical_notes": [
+    "Context module: Loopctl.Memory (lib/loopctl/memory.ex). Worker: Loopctl.Memory.Workers.MemoryEmbeddingWorker.",
     "Reuse Loopctl.Knowledge.VectorSearch for the kNN; if it is article-specific, extract a shared kNN helper rather than duplicating the HNSW query.",
-    "EmbeddingClient is per-tenant BYO key and mandatory — same constraint as knowledge; recall fallback (AC-28.2.3) is the SOUL rule-7 'no silent degradation' analogue of knowledge_search's keyword_only fallback.",
-    "Scope resolution: session/subject/tenant come from the authenticated caller (US-28.3 plug chain), passed into the context as an explicit scope struct — the context must be callable in tests without a conn.",
-    "supersede + the source='promoted' field are the seams #308 will use; implement them now so Part 2 adds no schema/context surface."
+    "Scope struct (tenant_id, project_id, subject_id) is passed explicitly so the context is callable in tests without a conn; the plug chain in US-28.3 builds it from the authenticated caller.",
+    "EmbeddingClient is per-tenant BYO key and mandatory; the AC-28.2.3 fallback is the memory analogue of knowledge_search's keyword_only fallback (finding 877a415d).",
+    "supersede + source=:promoted are the seams #308 uses — implement them now so Part 2 adds no schema/context surface.",
+    "Tests use Loopctl.Fixtures.fixture/2; add fixture(:memory_scope, attrs) and fixture(:memory, attrs).",
+    "Stub the embedding provider with Mox against the existing embedding behaviour so tests are deterministic (no network)."
   ],
   "dependencies": ["US-28.1"],
   "estimated_hours": 16

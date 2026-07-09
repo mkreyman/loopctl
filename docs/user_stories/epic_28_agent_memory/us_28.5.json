@@ -7,41 +7,41 @@
   },
   "priority": "medium",
   "phase": "app",
+  "priority_note": "Medium — the API/MCP make memory usable; this makes it trustworthy. Cole explicitly calls out visibility + delete as part of the pillar.",
   "background": {
     "reference": "GitHub issue #307; Cole Medin's 'full control and visibility' — the delete-a-memory UX",
-    "includes": "loopctl has only 4 LiveViews (wiki index/show, signup, onboarding). This adds an authenticated inspector so a human can see and prune what agents have stored — not the public wiki live_session."
+    "includes": "loopctl has only 4 LiveViews (wiki index/show, signup, onboarding). This adds an AUTHENTICATED inspector (not the live_session :public_wiki), reusing wiki_show_live.ex's Earmark rendering and wiki_index_live.ex's pagination."
   },
-  "priority_note": "Medium — the API/MCP make memory usable; this makes it trustworthy (humans can audit and delete). Cole explicitly calls out visibility + delete as part of the pillar.",
   "story": {
     "as_a": "a loopctl operator (human) for my tenant",
     "i_want_to": "browse, semantically search, and delete the memories agents have stored, scoped to a project/subject",
     "so_that": "I keep control and visibility over agent memory and can remove wrong or stale entries"
   },
-  "rationale": "Auto-accumulated memory that a human cannot see or correct is a liability. A minimal read+search+delete inspector closes the trust loop and is the seam Part 2 (#308) extends to flag promoted-vs-explicit and reject bad promotions.",
+  "rationale": "Auto-accumulated memory that a human cannot see or correct is a liability. A minimal read + search + delete inspector closes the trust loop and is the seam Part 2 (#308) extends to flag promoted-vs-explicit and reject bad promotions.",
   "acceptance_criteria": [
     {
       "id": "AC-28.5.1",
-      "description": "New LoopctlWeb.MemoryInspectorLive routed in an AUTHENTICATED live_session in router.ex (not live_session :public_wiki). Access requires an authenticated human tenant session; a memory is only shown within the viewer's tenant scope.",
+      "description": "LoopctlWeb.MemoryInspectorLive is routed in an AUTHENTICATED live_session in lib/loopctl_web/router.ex (NOT live_session :public_wiki). Access requires an authenticated human tenant session, and memories are shown only within the viewer's tenant scope via on_mount scope assignment.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.2",
-      "description": "Lists long-term memories for a selected scope (project/subject filter) with pagination (limit/offset + total_count), newest-first default, showing text, tags, confidence, source ('explicit' now), and timestamps. Renders text via the existing Earmark pattern from wiki_show_live.ex.",
+      "description": "The view lists long-term memories for a selected scope (project/subject filter) with pagination (limit/offset + total_count), newest-first by default, showing text, tags, confidence, source, and timestamps, rendering text via the Earmark pattern from wiki_show_live.ex.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.3",
-      "description": "A search box runs Loopctl.Memory.recall within scope and shows ranked results with scores; degraded-embedding fallback is surfaced visibly (a banner), never a silent empty list.",
+      "description": "A search box calls Loopctl.Memory.recall/2 within scope and shows ranked results with scores; when recall returns meta.fallback == true a visible 'degraded recall' banner is shown — never a silent empty list.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.4",
-      "description": "Delete: an operator can delete a memory from the UI (with a confirm); the delete is scope-checked server-side (cannot delete outside tenant), and the list updates without a full reload.",
+      "description": "An operator can delete a memory from the UI behind a confirm; the delete calls Loopctl.Memory.forget/2 (scope-checked server-side, cannot delete outside tenant) and the list updates without a full page reload.",
       "status": "pending"
     },
     {
       "id": "AC-28.5.5",
-      "description": "The view leaves a clean seam for Part 2: columns/filters for source (explicit|promoted), source_session_id, and confidence exist or are trivially extensible so #308 can add promoted-vs-explicit flagging and a reject action without a rewrite.",
+      "description": "The view leaves a clean seam for Part 2: columns/filters for source (:explicit|:promoted), source_session_id, and confidence exist or are trivially extensible so #308 can add promoted-vs-explicit flagging and a reject action without a rewrite.",
       "status": "pending"
     }
   ],
@@ -49,26 +49,68 @@
     {
       "id": "TC-28.5.1",
       "name": "Inspector lists and deletes only in-scope memories",
-      "type": "liveview",
-      "preconditions": ["Authenticated operator for tenant T; memories under T and under tenant U"],
-      "steps": ["Mount the inspector", "Assert listed set", "Delete one memory"],
-      "expected_results": ["Only tenant-T memories listed (never U); delete removes it and updates the list; a delete attempt on a foreign id is rejected server-side"],
+      "type": "integration",
+      "preconditions": [
+        "tenant_t = fixture(:tenant)",
+        "operator = fixture(:user); fixture(:tenant_user, tenant: tenant_t, user: operator)",
+        "tenant_u = fixture(:tenant)",
+        "fixture(:memory, tenant: tenant_t, subject_id: \"A\", text: \"T fact\")",
+        "fixture(:memory, tenant: tenant_u, subject_id: \"A\", text: \"U fact\")"
+      ],
+      "steps": [
+        "live(conn authenticated as operator, ~p\"/memory\")",
+        "assert the rendered memory list",
+        "click delete on the tenant_t memory and confirm"
+      ],
+      "expected_results": [
+        "only the tenant_t memory is listed (never the tenant_u one)",
+        "after delete the row is gone and the list re-renders without a full reload",
+        "a delete attempt on a foreign id is rejected server-side"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-28.5.2",
       "name": "Search shows ranked results and a degraded banner on fallback",
-      "type": "liveview",
-      "preconditions": ["EmbeddingCircuitBreaker open"],
-      "steps": ["Enter a query that matches a memory's text"],
-      "expected_results": ["Result shown via text fallback with a visible 'degraded recall' banner"],
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "operator = fixture(:user); fixture(:tenant_user, tenant: tenant, user: operator)",
+        "fixture(:memory, tenant: tenant, subject_id: \"A\", text: \"always expedite reships\")",
+        "EmbeddingCircuitBreaker forced open"
+      ],
+      "steps": [
+        "live(conn as operator, ~p\"/memory\")",
+        "submit the search form with query \"expedite\""
+      ],
+      "expected_results": [
+        "the matching memory is shown via text fallback",
+        "a visible 'degraded recall' banner is rendered"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.5.3",
+      "name": "Unauthenticated access is refused",
+      "type": "integration",
+      "preconditions": [
+        "no authenticated session"
+      ],
+      "steps": [
+        "attempt live(conn, ~p\"/memory\")"
+      ],
+      "expected_results": [
+        "redirected/denied (not served); the route is not in the public_wiki live_session"
+      ],
       "status": "pending"
     }
   ],
   "technical_notes": [
-    "Put the route behind the same authenticated on_mount used by other tenant-scoped surfaces; do NOT reuse the public_wiki live_session (that renders system-scoped, unauthenticated).",
-    "Reuse wiki_show_live.ex's Earmark rendering and wiki_index_live.ex's pagination approach for consistency.",
-    "Keep it deliberately minimal (read/search/delete). Promoted-vs-explicit UX and reject-a-promotion belong to #308 — just leave the columns/filters extensible."
+    "LiveView: LoopctlWeb.MemoryInspectorLive; route under an authenticated live_session with the same on_mount used by other tenant-scoped surfaces — do NOT reuse live_session :public_wiki (system-scoped, unauthenticated).",
+    "Reuse wiki_show_live.ex Earmark rendering and wiki_index_live.ex pagination for consistency.",
+    "Phoenix 1.8 conventions: Layouts.app, to_form/2, .input; keep the UI deliberately minimal (read/search/delete).",
+    "Promoted-vs-explicit UX and reject-a-promotion belong to #308 — only leave the columns/filters extensible.",
+    "Tests use Loopctl.Fixtures.fixture/2 and Phoenix.LiveViewTest live/2; fixture(:tenant_user) already exists."
   ],
   "dependencies": ["US-28.2", "US-28.3"],
   "estimated_hours": 12

@@ -5,10 +5,12 @@ semantic retrieval). This is the **substrate**: a first-class, tenant/project/ag
 memory subsystem — short-term *session memory* + long-term, vector-retrieved *promoted
 memory* — distinct from the Knowledge Wiki.
 
-> **Status: FIRST-DRAFT SCAFFOLD — not yet review-hardened.**
-> These stories were authored quickly to give #307 an implementable shape. Before running
-> `/implement-plan`, refine them with the `user-story-writer` skill and put them through the
-> enhanced-review pass (the way epic_27 was), then verify every AC against the live code.
+> **Status: authored with the `user-story-writer` skill; not yet enhanced-review-hardened.**
+> These stories follow the skill's schema and the epic_27 JSON convention (`fixture/2`
+> preconditions, `unit`/`integration` test types, AC/TC id patterns). Before running
+> `/implement-plan`, put them through the multi-agent enhanced-review pass the way epic_27
+> was (two rounds: analyst / architect / adversarial), verifying every AC against the live
+> code — that review, not another authoring pass, is the remaining gate.
 
 ## Scope boundary (read first)
 
