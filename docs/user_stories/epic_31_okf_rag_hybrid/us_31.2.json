@@ -1,0 +1,63 @@
+{
+  "id": "US-31.2",
+  "title": "Hybrid resolver: prefer curated ONLY when it actually answers, else retrieval, with provenance",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "The core of #305/#306 AND its biggest risk: a curated answer that is near-but-wrong, labeled :curated, is a confidently-wrong answer that is now trusted — strictly worse than the RAG failure this epic exists to prevent. Depends on the governed curated rule (31.1).",
+  "background": {
+    "reference": "GitHub issues #305/#306; hub 820602df (the refund-policy hallucination). Reuses Loopctl.Knowledge.search_combined/3 (the Elixir function; 'knowledge_search' is the MCP tool/route name) and its meta (fallback/search_mode/keyword_only).",
+    "includes": "US-31.1 defines governed curated sources. This story adds hybrid_search that returns a curated answer ONLY when a curated source clears an absolute threshold, beats the best retrieved candidate by a margin, and is not conflicted/superseded; otherwise it returns retrieval — every response flagged with provenance."
+  },
+  "story": {
+    "as_a": "an agent querying the knowledge layer",
+    "i_want_to": "call one hybrid function that returns a curated answer only when a curated source genuinely answers the query (flagged :curated) and retrieval otherwise (flagged :retrieved), with confidence and meta",
+    "so_that": "I get a trustworthy curated answer when one exists and never a near-but-wrong curated doc mislabeled authoritative"
+  },
+  "rationale": "The harvested failure is a confident answer from an unrelated chunk. The naive fix ('prefer any curated doc') recreates that failure with a worse label: a curated doc semantically near a query it does not answer, returned as authoritative. Requiring the curated candidate to clear an absolute threshold AND beat retrieval by a margin AND be conflict-free is what makes ':curated' actually trustworthy.",
+  "acceptance_criteria": [
+    { "id": "AC-31.2.1", "description": "Loopctl.Knowledge.hybrid_search(tenant_id, query_string, opts \\\\ []) returns {:ok, %{results, meta}} where meta carries provenance (:curated | :retrieved) + confidence, folded into the existing search_combined meta. It returns :curated ONLY when a governed curated source (US-31.1) matches above an absolute curated-confidence threshold (config).", "status": "pending" },
+    { "id": "AC-31.2.2", "description": "Curated-must-actually-answer: a curated candidate wins ONLY when it clears the absolute threshold AND its score beats the best retrieved candidate by a configurable margin AND it is not superseded / not in an open potential_conflict. A curated doc that is semantically near but below threshold, or not competitive, falls to :retrieved (no false :curated claim). AC-31.2.1 and this AC together are the single, non-contradictory resolution rule.",
+      "status": "pending" },
+    { "id": "AC-31.2.3", "description": "The :curated and :retrieved responses share the SAME shape/keys (results + meta{provenance, confidence, search_mode, fallback, ...}) so a caller reads one shape and branches on the provenance FIELD, never on which subsystem answered — the literal form of #305's 'no caller-side RAG-or-curated branching'.", "status": "pending" },
+    { "id": "AC-31.2.4", "description": "Degradation honesty (SOUL rule 7): when embeddings are unavailable, curated matching uses the keyword path; if a curated source is still confidently identifiable by keyword it is returned :curated, otherwise the response is :retrieved with meta.fallback/search_mode reflecting keyword_only — never a silent empty and never a false :curated under degraded matching.", "status": "pending" },
+    { "id": "AC-31.2.5", "description": "Provenance outcome (curated vs retrieved, hit/miss) is emitted into the existing retrieval metrics (Loopctl.Knowledge.RetrievalMetrics / retrieval_metric_snapshot), so 'prefer-curated silently hiding better retrieval' is observable per tenant.", "status": "pending" },
+    { "id": "AC-31.2.6", "description": "Tenant isolation: hybrid_search threads tenant_id into BOTH search_combined AND the curated lookup via AdminRepo/HeavyRead (RLS does NOT backstop these BYPASSRLS reads); a two-tenant test proves no cross-tenant answer.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.2.1", "name": "curated that answers wins; near-but-wrong curated does NOT", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a governed curated article answering 'refund policy'", "a DIFFERENT governed curated article semantically near 'refund' but about shipping refunds process (does not answer the policy query)", "embedding stubbed deterministic so the near-but-wrong doc scores high but below the answering doc/threshold"],
+      "steps": ["hybrid_search(tenant.id, \"what is the refund policy?\")", "hybrid_search(tenant.id, \"<query the near-but-wrong doc is only loosely related to>\")"],
+      "expected_results": ["first: the answering curated article, provenance: :curated", "second: falls to :retrieved (the near-but-wrong curated doc is NOT returned as :curated)"], "status": "pending" },
+    { "id": "TC-31.2.2", "name": "curated and retrieved responses share the same shape", "type": "unit",
+      "preconditions": ["a curated response and a retrieved response from hybrid_search"],
+      "steps": ["compare Map.keys of both results/meta"],
+      "expected_results": ["identical key sets; both carry provenance + confidence + search_mode — caller branches only on provenance"], "status": "pending" },
+    { "id": "TC-31.2.3", "name": "long-tail query falls back to retrieval, flagged", "type": "integration",
+      "preconditions": ["tenant with only non-curated articles matching a niche query"],
+      "steps": ["hybrid_search(tenant.id, <niche>)"],
+      "expected_results": ["provenance: :retrieved + meta.search_mode; no curated claim"], "status": "pending" },
+    { "id": "TC-31.2.4", "name": "threshold/margin resolution is a testable pure decision", "type": "unit",
+      "preconditions": ["a curated score, a best-retrieved score, threshold + margin config"],
+      "steps": ["evaluate the resolution rule for: above-threshold+beats-margin; above-threshold+within-margin; below-threshold"],
+      "expected_results": [":curated only in the first; :retrieved in the other two"], "status": "pending" },
+    { "id": "TC-31.2.5", "name": "degraded embeddings: honest meta, no false curated", "type": "integration",
+      "preconditions": ["EmbeddingCircuitBreaker open; a governed curated article present"],
+      "steps": ["hybrid_search(tenant.id, ...)"],
+      "expected_results": ["meta reflects keyword_only/fallback; curated returned only if keyword-confident, else :retrieved; never a silent empty"], "status": "pending" },
+    { "id": "TC-31.2.6", "name": "hybrid_search is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a curated + retrieved matches", "tenant_b = fixture(:tenant)"],
+      "steps": ["hybrid_search(tenant_b.id, <tenant_a topic>)"],
+      "expected_results": ["no tenant_a article returned"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Function: Loopctl.Knowledge.hybrid_search/3 = (tenant_id, query_string, opts) -> {:ok, %{results, meta}}, matching the module convention (search_combined/3, search_keyword/3). There is NO scope-struct or map-query convention in the knowledge context — do not invent one.",
+    "Reuse Loopctl.Knowledge.search_combined/3 (knowledge.ex ~5656) for retrieval + its meta (fallback/search_mode/keyword_only). 'knowledge_search' is the MCP tool / GET /api/v1/knowledge/search route, NOT an Elixir function.",
+    "Resolution rule (single, non-contradictory): :curated iff curated_score >= absolute_threshold AND curated_score - best_retrieved_score >= margin AND source not superseded/not in open potential_conflict; else :retrieved. Thresholds are config.",
+    "Emit provenance to Loopctl.Knowledge.RetrievalMetrics.",
+    "Tenant: thread tenant_id via AdminRepo/HeavyRead; RLS does not backstop (knowledge.ex header BYPASSRLS caveat).",
+    "Tests: pure resolution/predicate cases are unit; DB-backed cases are integration; Mox embedding stub."
+  ],
+  "dependencies": ["US-31.1"],
+  "estimated_tokens": 400000
+}

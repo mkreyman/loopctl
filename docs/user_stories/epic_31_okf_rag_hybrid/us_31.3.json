@@ -1,0 +1,44 @@
+{
+  "id": "US-31.3",
+  "title": "Progressive disclosure: compact index (knowledge_index + link traversal) -> drill into articles",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "medium",
+  "phase": "domain",
+  "priority_note": "The 'load the index, then drill' half — reduces over-retrieval. Built on knowledge_index + article_link (NOT the OKF full-export Markdown, which is not topic-scoped). Depends on the curated rule (31.1).",
+  "background": {
+    "reference": "GitHub issues #305/#306 ('OKF index files for progressive disclosure'); hub 820602df. Review round 1: okf.ex's index.md is a PRIVATE, full-tenant, project-scoped Markdown export (render_category_index/render_root_index are defp) — NOT a topic-scoped stub source; and hubs are emergent (article_link degree), not a modeled type.",
+    "includes": "Rather than over-retrieving chunks, an agent loads a compact, capped index of relevant curated-source stubs and drills into only the chosen ones. Built from knowledge_index (id/title/category) + article_link traversal + okf.ex derive_description/1 for the one-line summary — not a new index store, and not the OKF full export."
+  },
+  "story": {
+    "as_a": "an agent",
+    "i_want_to": "fetch a compact, capped index of relevant curated-source stubs for a topic and then drill into only the chosen articles",
+    "so_that": "I navigate by index in a bounded number of tokens instead of over-retrieving many fuzzy chunks"
+  },
+  "rationale": "Karpathy's 'navigate by index' and the OKF index-file pattern both say read a compact index and follow the few relevant pages. loopctl already has knowledge_index + links + a description helper; composing them into a bounded, topic-scoped stub query is the token-efficiency half of the hybrid interface — without over-claiming a capability okf.ex's full-export index does not have.",
+  "acceptance_criteria": [
+    { "id": "AC-31.3.1", "description": "A progressive-disclosure entrypoint returns, for a topic/query, a COMPACT, CAPPED set of stubs (id, title, category, one-line summary via okf.ex derive_description/1 extracted to a shared/public helper) built from knowledge_index + article_link traversal — NOT full bodies, and NOT the OKF full-export Markdown. Tenant-scoped.", "status": "pending" },
+    { "id": "AC-31.3.2", "description": "The index is bounded: a configurable top-K cap on stubs (and traversal fan-out) so a densely-linked hub does not flood context; the cap is documented and tested.", "status": "pending" },
+    { "id": "AC-31.3.3", "description": "A drill step fetches the full body of a chosen indexed article by id (scope-enforced), so the agent loads only what the index pointed at.", "status": "pending" },
+    { "id": "AC-31.3.4", "description": "The index prefers governed curated sources (US-31.1) and, if hub enrichment is used, defines a hub operationally as an article with >= N outgoing :relates_to article_links (hubs are not a modeled type). Tenant isolation: index + drill only expose the caller tenant's articles (system-scope per US-31.1 AC-31.1.3).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.3.1", "name": "index returns capped compact stubs then drill returns the body", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "an article with > top-K outgoing :relates_to links to curated articles (an operational hub)"],
+      "steps": ["fetch the progressive index for the topic", "drill into one returned id"],
+      "expected_results": ["index returns <= top-K stubs (id/title/category/summary, not full bodies); drill returns the full body; token-compact and capped"], "status": "pending" },
+    { "id": "TC-31.3.2", "name": "index is tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a linked curated articles", "tenant_b = fixture(:tenant)"],
+      "steps": ["fetch the index as tenant_b"],
+      "expected_results": ["no tenant_a stubs appear"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Build on the knowledge_index controller/context (id/title/category, index.js ~2443) + article_link :relates_to traversal + okf.ex derive_description/1 (make it public/shared for the one-liner).",
+    "okf.ex index.md (render_category_index/render_root_index, defp) is a FULL-tenant, project-scoped Markdown export bounded by max_buffered_export_articles — it is NOT a topic-scoped stub source; do not reuse it for this query.",
+    "Hub is emergent (>= N outgoing :relates_to links via article_link), not a field/category/tag.",
+    "Cap traversal fan-out (the code already bounds high-degree hub fan-out elsewhere — mirror it).",
+    "Tenant scoping is explicit-predicate on AdminRepo/HeavyRead.",
+    "Tests use Loopctl.Fixtures.fixture/2 with explicit article_link rows (not a nonexistent hub type)."
+  ],
+  "dependencies": ["US-31.1"],
+  "estimated_tokens": 280000
+}

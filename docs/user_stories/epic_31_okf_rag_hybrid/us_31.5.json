@@ -1,0 +1,41 @@
+{
+  "id": "US-31.5",
+  "title": "Docs + terminal verification: refund-policy failure avoided, provenance correct, no caller branching (runs last)",
+  "epic": { "id": "epic_31", "name": "OKF-curated + RAG Hybrid Knowledge Interface" },
+  "priority": "high",
+  "phase": "verification_docs",
+  "priority_note": "Terminal story: proves the acceptance criteria of #305/#306 end-to-end and documents the hybrid interface + the three-layer model. Depends on all leaves; runs last.",
+  "background": {
+    "reference": "GitHub issues #305/#306 acceptance section; mirrors the epic_28/29/30 terminal-verification pattern.",
+    "includes": "Each prior story asserts its slice; this story proves #305/#306's acceptance end-to-end (curated wins, long-tail retrieves, single interface + provenance, the refund-policy failure avoided) and writes docs."
+  },
+  "story": {
+    "as_a": "a loopctl maintainer",
+    "i_want_to": "run one end-to-end pass proving the hybrid interface satisfies #305/#306's acceptance, and document it (including the three-layer model)",
+    "so_that": "the hybrid knowledge interface ships proven and clearly positioned against agent-memory and the context-retriever"
+  },
+  "rationale": "The headline claim — 'the confidently-wrong answer from an unrelated chunk is avoided when a curated answer exists' — must be demonstrated, not asserted. A terminal end-to-end test plus authoritative docs turns the composed pieces into a trustworthy interface.",
+  "acceptance_criteria": [
+    { "id": "AC-31.5.1", "description": "docs/knowledge-hybrid-retrieval.md is written: the curated-vs-retrieved resolution rule, provenance, progressive disclosure, and where it sits in the three-layer model (Knowledge Wiki hybrid retrieval vs Agent Memory vs Context Retriever). README/CLAUDE/AGENTS/CHANGELOG updated; endpoint at /swaggerui. Notes the #305 'reconcile cole-medin doc' style items and that #305/#306 are the same feature (recommend closing one as a duplicate).", "status": "pending" },
+    { "id": "AC-31.5.2", "description": "An end-to-end test demonstrates #305/#306 acceptance WITH a negative control: (a) a query WITH a curated answer returns THAT flagged curated; (b) a long-tail query returns retrieval flagged retrieved; (c) callers read one shape + provenance (no RAG-or-curated branch); (d) NEGATIVE CONTROL — the SAME corpus with the curated article ABSENT returns the unrelated chunk (the refund-policy failure), proving the curated article is what suppresses it; and a near-but-wrong curated doc is NOT mislabeled curated.", "status": "pending" },
+    { "id": "AC-31.5.3", "description": "The terminal suite covers the confident-wrong-curated failure modes epic-wide: tenant isolation (no other tenant's content via resolver/index/API/MCP), a system-scoped curated article participating without overriding a tenant's own, and a conflicted/superseded curated article not returned as authoritative without surfacing the conflict.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-31.5.1", "name": "end-to-end with negative control: curated suppresses the unrelated-chunk failure", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a governed curated refund-policy article + unrelated fuzzy chunks + a niche non-curated topic", "embedding stubbed"],
+      "steps": ["hybrid_search 'refund policy' WITH the curated article present", "remove the curated article and hybrid_search 'refund policy' again (negative control)", "hybrid_search the niche topic"],
+      "expected_results": ["with curated present: the curated article, provenance :curated (the unrelated chunk is suppressed)", "with curated absent: the unrelated chunk is returned as :retrieved (the failure the curated article was suppressing)", "niche: :retrieved"], "status": "pending" },
+    { "id": "TC-31.5.2", "name": "hybrid interface is tenant-isolated across surfaces", "type": "integration",
+      "preconditions": ["tenant_a curated + retrieved content", "an agent key for tenant_b"],
+      "steps": ["hybrid_search / index / drill as tenant_b for tenant_a topics via context, API, MCP"],
+      "expected_results": ["no tenant_a content on any surface"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Model on epic_28/29/30 terminal-verification pattern: depends on all leaves, runs last.",
+    "docs/knowledge-hybrid-retrieval.md is authoritative; keep it decision-oriented.",
+    "Recommend the team close #305 or #306 as a duplicate (same feature) — note it in the docs/PR, don't auto-close.",
+    "Tests reuse Loopctl.Fixtures.fixture/2 + Mox embedding."
+  ],
+  "dependencies": ["US-31.1", "US-31.2", "US-31.3", "US-31.4"],
+  "estimated_tokens": 220000
+}
