@@ -607,10 +607,13 @@ defmodule Loopctl.Fixtures do
       end
 
     subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    # project_id is set programmatically (not cast) — the write path derives it
+    # from authorized caller context, so the fixture mirrors that.
+    project_id = Map.get(attrs, :project_id)
     data = build(:memory, attrs)
 
     changeset =
-      %Memory{tenant_id: tenant_id, subject_id: subject_id}
+      %Memory{tenant_id: tenant_id, subject_id: subject_id, project_id: project_id}
       |> Memory.create_changeset(data)
 
     AdminRepo.insert!(changeset)
@@ -630,10 +633,13 @@ defmodule Loopctl.Fixtures do
       end
 
     subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    # project_id is set programmatically (not cast) — the write path derives it
+    # from authorized caller context, so the fixture mirrors that.
+    project_id = Map.get(attrs, :project_id)
     data = build(:session_memory, attrs)
 
     changeset =
-      %SessionMemory{tenant_id: tenant_id, subject_id: subject_id}
+      %SessionMemory{tenant_id: tenant_id, subject_id: subject_id, project_id: project_id}
       |> SessionMemory.create_changeset(data)
 
     AdminRepo.insert!(changeset)

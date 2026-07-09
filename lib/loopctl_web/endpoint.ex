@@ -43,14 +43,6 @@ defmodule LoopctlWeb.Endpoint do
     only: LoopctlWeb.static_paths(),
     raise_on_missing_only: code_reloading?
 
-  # Dev-only runtime MCP server for AI coding agents (runtime intelligence).
-  # Must run before Plug.Parsers so it can read the raw request body. The dep is
-  # `only: :dev`, so Code.ensure_loaded?/1 is true only in dev and this plug is
-  # never compiled into test/prod. MCP endpoint: http://localhost:4000/tidewave/mcp
-  if Code.ensure_loaded?(Tidewave) do
-    plug Tidewave
-  end
-
   # Code reloading can be explicitly enabled under the
   # :code_reloader configuration of your endpoint.
   if code_reloading? do

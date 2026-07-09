@@ -56,7 +56,9 @@ defmodule Loopctl.Repo.Migrations.CreateMemoryStores do
 
       add :subject_id, :string, null: false
       add :text, :text, null: false
-      add :embedding, :vector, size: 1536, null: true
+      # `embedding vector(1536)` is added in a SEPARATE, pgvector-guarded step
+      # below — NOT inline here — so this CREATE TABLE stays runnable on a DB
+      # without the pgvector extension (see the guarded execute after this block).
       add :embedding_content_hash, :string, null: true
       add :confidence, :float, null: false, default: 1.0
       add :source, :string, null: false, default: "explicit"
@@ -68,6 +70,51 @@ defmodule Loopctl.Repo.Migrations.CreateMemoryStores do
 
       timestamps(type: :utc_datetime_usec)
     end
+
+    # --- embedding column: pgvector-guarded, graceful degradation ---
+    #
+    # The `vector` type only exists where the pgvector extension is installed.
+    # An inline `add :embedding, :vector` inside CREATE TABLE would raise
+    # `type "vector" does not exist` and abort the WHOLE migration on any
+    # environment that lacks the extension (Fly.io Managed Postgres pre-ticket,
+    # DR restore, self-host, a fresh region). We mirror the established
+    # graceful-degradation pattern from
+    # `20260410022854_enable_pgvector_and_add_embedding.exs`: only add the
+    # column when `pg_extension` shows `vector` is present. Where it is absent
+    # the table stays migratable and the column simply doesn't exist yet — the
+    # async embedding worker (US-28.2) already tolerates a missing/NULL embedding
+    # and the HNSW index migration is likewise capability-gated. Once pgvector is
+    # enabled, a follow-up migration adds the column + backfills.
+    #
+    # execute/2 supplies both directions so `change/0` stays reversible: the down
+    # side drops the column if it exists (the table drop that follows on rollback
+    # would remove it anyway, but this keeps the step self-consistent).
+    execute(
+      """
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'memories' AND column_name = 'embedding'
+          ) THEN
+            ALTER TABLE memories ADD COLUMN embedding vector(1536);
+          END IF;
+        END IF;
+      END $$;
+      """,
+      """
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'memories' AND column_name = 'embedding'
+        ) THEN
+          ALTER TABLE memories DROP COLUMN embedding;
+        END IF;
+      END $$;
+      """
+    )
 
     # Backs (tenant_id, subject_id) scope filtering on the OLTP path.
     create index(:memories, [:tenant_id, :subject_id])

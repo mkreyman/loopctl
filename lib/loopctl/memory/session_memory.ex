@@ -59,18 +59,24 @@ defmodule Loopctl.Memory.SessionMemory do
     timestamps(updated_at: false, type: :utc_datetime_usec)
   end
 
-  @cast_fields [:session_id, :role, :content, :metadata, :expires_at, :project_id]
+  @cast_fields [:session_id, :role, :content, :metadata, :expires_at]
 
   @doc """
   Changeset for appending a session memory.
 
-  `tenant_id` and `subject_id` are set programmatically on the struct and must
-  NOT appear in `attrs`. Validates required fields and caps `content` byte size.
+  `tenant_id`, `subject_id`, and `project_id` are set programmatically on the
+  struct and must NOT appear in `attrs`. `project_id`'s FK is checked with RLS
+  BYPASSED, so casting it from request params would let a caller point at
+  ANOTHER tenant's project (a cross-tenant graph edge + INSERT-time existence
+  oracle); the US-28.2 write path sets it from the caller's already-authorized
+  context, mirroring the sibling `Loopctl.WorkBreakdown.Story` schema. Validates
+  required fields and caps `content` byte size.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(session_memory \\ %__MODULE__{}, attrs) do
     session_memory
     |> cast(attrs, @cast_fields)
+    |> normalize_nil(:metadata, %{})
     |> validate_required([:session_id, :subject_id, :tenant_id, :content, :expires_at])
     |> validate_subject_id()
     |> validate_content_byte_size()
@@ -85,6 +91,18 @@ defmodule Loopctl.Memory.SessionMemory do
   @doc "Maximum `content` byte size."
   @spec max_content_bytes() :: pos_integer()
   def max_content_bytes, do: @max_content_bytes
+
+  # A caller may pass an explicit `metadata: nil`; `cast/3` records that as a nil
+  # CHANGE (the schema default `%{}` differs from nil), but the DB column is
+  # `NOT NULL`. Without this, insert would raise a raw Postgrex
+  # `not_null_violation` instead of honoring the changeset contract. Normalize a
+  # nil back to the column default so the DB default governs.
+  defp normalize_nil(changeset, field, default) do
+    case get_field(changeset, field) do
+      nil -> put_change(changeset, field, default)
+      _ -> changeset
+    end
+  end
 
   defp validate_subject_id(changeset) do
     case get_field(changeset, :subject_id) do

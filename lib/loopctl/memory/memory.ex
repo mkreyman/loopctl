@@ -84,28 +84,31 @@ defmodule Loopctl.Memory.Memory do
     :confidence,
     :source,
     :source_session_id,
-    :tags,
-    :project_id
+    :tags
   ]
 
   @doc """
   Changeset for creating a memory.
 
-  `tenant_id` and `subject_id` are set programmatically on the struct and must
-  NOT appear in `attrs`. `superseded_by` is likewise NEVER cast from caller
-  params — it is set programmatically by `forget/2` (US-28.2) when one memory
-  replaces another. It is a self-FK to `memories` whose Postgres constraint
-  bypasses RLS, so accepting it from request params would let a caller point at
-  ANOTHER tenant's memory id (a cross-tenant graph edge + INSERT-time existence
-  oracle); keeping it out of `cast` closes that on the security-boundary schema.
-  `embedding` is never cast here — it is populated asynchronously via
-  `embedding_changeset/3` in US-28.2. Validates required fields, `confidence`
-  presence + range, and caps `text` byte size.
+  `tenant_id`, `subject_id`, and `project_id` are set programmatically on the
+  struct and must NOT appear in `attrs`. Both `project_id` and `superseded_by`
+  are FKs whose Postgres constraint is checked with RLS BYPASSED, so accepting
+  either from request params would let a caller point at ANOTHER tenant's row (a
+  cross-tenant graph edge + INSERT-time existence oracle). `superseded_by` is
+  set by `forget/2` (US-28.2); `project_id` is set by the US-28.2 write path from
+  the caller's already-authorized context — never cast — mirroring the sibling
+  `Loopctl.WorkBreakdown.Story` schema, which likewise sets `project_id`
+  programmatically rather than casting it. (The Knowledge Wiki `Article` casts
+  `project_id`, but a `Memory` is a stricter per-subject security boundary and
+  matches `Story`, not `Article`, here.) `embedding` is never cast here — it is
+  populated asynchronously via `embedding_changeset/3` in US-28.2. Validates
+  required fields, `confidence` presence + range, and caps `text` byte size.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(memory \\ %__MODULE__{}, attrs) do
     memory
     |> cast(attrs, @cast_fields)
+    |> normalize_nil(:tags, [])
     |> validate_required([:subject_id, :tenant_id, :text, :confidence])
     |> validate_subject_id()
     |> validate_text_byte_size()
@@ -139,6 +142,18 @@ defmodule Loopctl.Memory.Memory do
   @doc "Maximum `text` byte size."
   @spec max_text_bytes() :: pos_integer()
   def max_text_bytes, do: @max_text_bytes
+
+  # A caller may pass an explicit `tags: nil`; `cast/3` records that as a nil
+  # CHANGE (the schema default `[]` differs from nil), but the DB column is
+  # `NOT NULL`. Without this, insert would raise a raw Postgrex
+  # `not_null_violation` instead of honoring the changeset contract. Normalize a
+  # nil back to the column default so the DB default governs.
+  defp normalize_nil(changeset, field, default) do
+    case get_field(changeset, field) do
+      nil -> put_change(changeset, field, default)
+      _ -> changeset
+    end
+  end
 
   defp validate_subject_id(changeset) do
     case get_field(changeset, :subject_id) do

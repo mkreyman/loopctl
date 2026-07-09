@@ -78,6 +78,19 @@ defmodule Loopctl.Memory.SessionMemoryTest do
       assert get_change(changeset, :subject_id) == nil
     end
 
+    test "does not cast project_id from params (cross-tenant FK is set programmatically)" do
+      changeset =
+        %SessionMemory{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
+        |> SessionMemory.create_changeset(valid_attrs(%{project_id: Ecto.UUID.generate()}))
+
+      assert get_change(changeset, :project_id) == nil
+    end
+
+    test "normalizes an explicit metadata: nil back to %{} (would be a raw NOT NULL DB error otherwise)" do
+      sm = fixture(:session_memory, %{metadata: nil})
+      assert sm.metadata == %{}
+    end
+
     test "accepts every declared role" do
       for role <- SessionMemory.roles() do
         changeset =

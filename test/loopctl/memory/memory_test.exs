@@ -72,6 +72,22 @@ defmodule Loopctl.Memory.MemoryTest do
       assert get_change(changeset, :superseded_by) == nil
     end
 
+    test "does not cast project_id from params (cross-tenant FK is set programmatically)" do
+      changeset =
+        %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
+        |> MemorySchema.create_changeset(%{
+          text: "a fact",
+          project_id: Ecto.UUID.generate()
+        })
+
+      assert get_change(changeset, :project_id) == nil
+    end
+
+    test "normalizes an explicit tags: nil back to [] (would be a raw NOT NULL DB error otherwise)" do
+      memory = fixture(:memory, %{tags: nil})
+      assert memory.tags == []
+    end
+
     test "rejects an explicit confidence: nil (would be a raw NOT NULL DB error otherwise)" do
       changeset =
         %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
