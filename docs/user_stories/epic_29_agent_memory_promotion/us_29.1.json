@@ -1,0 +1,141 @@
+{
+  "id": "US-29.1",
+  "title": "Memory promotion compiler core: session turns -> LLM-extracted structured nuggets behind a confidence gate",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "The compile core is the heart of Part 2; the worker (29.2), API (29.3), MCP (29.4), and eval (29.5) all sit on top of it. Depends on epic_28's store + context.",
+  "background": {
+    "reference": "GitHub issue #308; Second Brain 02f2d048 (session memory compiler), 3ee5f890 (Cole Medin agent-memory pillar), 227dda43 (confidence-threshold bouncer). Builds on epic_28 (Loopctl.Memory: session_history/2, remember, supersede, source: :promoted).",
+    "includes": "epic_28 stores short-term session memory (session_memories) and long-term memory (memories). This story adds the pure compile function that turns a session's turns into a small set of durable, structured long-term memory candidates via the LLM, gated by a confidence threshold. It performs NO persistence and NO dedupe (that is US-29.2) — it is a deterministic-to-test transform given a stubbed LLM."
+  },
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "implement Loopctl.Memory.Promoter.compile/2 that loads a session's short-term memory, prompts the configured LLM to extract a small set of durable facts/preferences/decisions as structured candidates (text, when_to_apply, tags, confidence, optional cross_links), and drops candidates below a configurable confidence threshold",
+    "so_that": "the raw material for auto-promotion is produced in one tested, scope-aware, BYO-key-configurable function — the 'golden nugget' extractor Cole Medin's pillar depends on"
+  },
+  "rationale": "Cole Medin's agent-memory pillar is only valuable if promotion is automatic: the user should not have to say 'remember this.' The compile step is where session noise becomes durable signal, and it is the step the prior 'kill' verdict called brittle — so it must be isolated, confidence-gated, and testable with a stubbed LLM before any persistence or scheduling is layered on. Keeping compile pure (no writes) is what makes the brittleness measurable in US-29.5.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.1.1",
+      "description": "Loopctl.Memory.Promoter.compile/2 accepts a scope struct (tenant_id, project_id, subject_id) + a session_id, loads that session's short-term memory via Loopctl.Memory.session_history/2 (scope-enforced), and returns {:ok, [candidate]} where each candidate is a struct/map with text, when_to_apply, tags, confidence (0.0-1.0), and optional cross_links (article ids). It writes nothing.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.1.2",
+      "description": "The LLM call goes through loopctl's per-tenant BYO-key path (Loopctl.LLM / llm_config), behind a behaviour so tests inject a deterministic stub (Mox). The prompt instructs extraction of a SMALL set (bounded max, e.g. <= configurable N) of durable facts, not a summary of the whole session.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.1.3",
+      "description": "Candidates with confidence below a configurable threshold (config key, default documented) are dropped — they remain only in session memory, never promoted. The threshold is read from config, not hard-coded.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.1.4",
+      "description": "compile/2 is scope-safe: it only ever reads the given (tenant_id, subject_id, session_id) session memory; a session_id belonging to another tenant/subject yields {:ok, []} (or {:error, :not_found}) and never reads across scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.1.5",
+      "description": "Malformed / non-conforming LLM output is handled defensively: a response that is not valid structured output yields {:error, reason} (or {:ok, []}) rather than crashing or producing garbage candidates; the reason is logged. Each candidate's text length is capped (same cap as memories.text in epic_28).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.1.6",
+      "description": "An empty or single-turn session yields {:ok, []} without an LLM call when there is nothing to compile (cost guard).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.1.1",
+      "name": "compile extracts confidence-gated candidates from a session",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "fixture(:session_memory, scope: scope, session_id: \"s1\", role: :user, content: \"always reship expedited instead of refunding\")",
+        "LLM stubbed via Mox to return two candidates: one confidence 0.9, one confidence 0.2",
+        "confidence threshold configured to 0.5"
+      ],
+      "steps": [
+        "Loopctl.Memory.Promoter.compile(scope, \"s1\")"
+      ],
+      "expected_results": [
+        "{:ok, [candidate]} with exactly the 0.9 candidate (the 0.2 one is dropped)",
+        "candidate has text, when_to_apply, tags, confidence == 0.9",
+        "nothing was persisted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.1.2",
+      "name": "compile never reads another scope's session",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope_a = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "scope_b = fixture(:memory_scope, tenant: tenant, subject_id: \"B\")",
+        "fixture(:session_memory, scope: scope_a, session_id: \"s1\", content: \"A secret\")"
+      ],
+      "steps": [
+        "Loopctl.Memory.Promoter.compile(scope_b, \"s1\")"
+      ],
+      "expected_results": [
+        "{:ok, []} (or {:error, :not_found}) — B's compile never sees A's session",
+        "the LLM stub is not called with A's content"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.1.3",
+      "name": "malformed LLM output does not crash or produce garbage",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "fixture(:session_memory, scope: scope, session_id: \"s1\", content: \"stuff\")",
+        "LLM stubbed to return unparseable output"
+      ],
+      "steps": [
+        "Loopctl.Memory.Promoter.compile(scope, \"s1\")"
+      ],
+      "expected_results": [
+        "{:error, _} or {:ok, []} — no crash, no malformed candidates persisted or returned"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.1.4",
+      "name": "empty session compiles to nothing without an LLM call",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "LLM stub set to fail the test if called"
+      ],
+      "steps": [
+        "Loopctl.Memory.Promoter.compile(scope, \"empty-session\")"
+      ],
+      "expected_results": [
+        "{:ok, []} and the LLM stub was never invoked"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Module: Loopctl.Memory.Promoter (lib/loopctl/memory/promoter.ex). Pure compile only — persistence + dedupe live in US-29.2.",
+    "LLM: use Loopctl.LLM (lib/loopctl/llm.ex) / the existing per-tenant llm_config BYO-key path; wrap behind a behaviour and inject a Mox stub in tests (no network).",
+    "Reads session memory via epic_28's Loopctl.Memory.session_history/2 (scope-enforced) — do not query session_memories directly.",
+    "Confidence threshold: a config key (e.g. :memory_promotion_confidence_threshold) with a documented default; read via Application.get_env, not a literal.",
+    "Prefer the LLM's structured/tool output for the candidate list so parsing is robust (same lesson as the youtube-knowledge-extract tool-use fix); on parse failure fail closed.",
+    "Candidate.text cap mirrors memories.text byte cap from epic_28 US-28.1.",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:memory_scope), fixture(:session_memory) from epic_28)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 320000
+}

@@ -1,0 +1,107 @@
+{
+  "id": "US-29.4",
+  "title": "MCP memory_promote tool (call at session end to compile short-term into long-term memory)",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "high",
+  "phase": "mcp",
+  "priority_note": "The agent-facing trigger; a Claude Code Stop-hook (claude-config #85) will call this at session end. Thin client over the API (29.3).",
+  "background": {
+    "reference": "GitHub issue #308; mcp-server/index.js two-list convention (tools array + switch) + witness-sth.js; extends the epic_28 memory_* tool family.",
+    "includes": "US-29.3 provides POST /api/v1/memory/promote. This story adds the memory_promote MCP tool that calls it, so an agent (or the claude-config Stop-hook) can fire promotion at session end."
+  },
+  "story": {
+    "as_a": "an AI agent (or a Claude Code Stop-hook) finishing a session",
+    "i_want_to": "call memory_promote(session_id) to compile this session's short-term memory into durable long-term memory",
+    "so_that": "the useful facts from the session are auto-promoted and recall-able in future sessions without me listing them explicitly"
+  },
+  "rationale": "The self-evolving loop only closes if the trigger is trivially callable at session end. Exposing memory_promote as a first-class MCP tool (with a docstring that says exactly when to call it) is what lets the claude-config Stop-hook and any agent fire promotion, turning session memory into compounding long-term memory.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.4.1",
+      "description": "A memory_promote tool is registered by the existing convention (inputSchema entry in the tools array + a case in the CallToolRequestSchema switch + a handler) that POSTs to /api/v1/memory/promote via the shared HTTP + witness/STH helpers. Input: session_id (+ optional project scope).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.4.2",
+      "description": "The tool description states exactly when to call it ('call at session end to compile this session's short-term memory into durable long-term memory') and disambiguates it from memory_remember (explicit single write) — so agents fire promotion once at session end, not per turn.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.4.3",
+      "description": "Witness/STH is applied like other write tools (persist + echo STH, self-heal on the 412 witness_bootstrap_already_consumed); a fresh MCP process succeeds on first promote.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.4.4",
+      "description": "ListTools includes memory_promote alongside the epic_28 memory_* tools; existing tools are unchanged. A promote for a session the caller does not own does not promote another scope's memory.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.4.5",
+      "description": "mcp-server/test/memory_tools.test.js covers memory_promote happy path, the witness-412 self-heal, and a scope-isolation assertion (promote cannot act on another subject's session).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.4.1",
+      "name": "memory_promote triggers promotion via the API",
+      "type": "integration",
+      "preconditions": [
+        "MCP server pointed at a test API with an agent key + STH",
+        "a session with session memory owned by the key's subject",
+        "Promoter LLM + embedding stubbed server-side"
+      ],
+      "steps": [
+        "Call the memory_promote tool with the session_id",
+        "then memory_recall for a fact from that session"
+      ],
+      "expected_results": [
+        "promote returns success (202-equivalent); after promotion the fact is recall-able",
+        "witness/STH exchange succeeded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.4.2",
+      "name": "ListTools includes memory_promote without regressing existing tools",
+      "type": "integration",
+      "preconditions": [
+        "MCP server booted against the test API"
+      ],
+      "steps": [
+        "Issue a ListToolsRequest"
+      ],
+      "expected_results": [
+        "memory_promote is present with a session-end docstring; memory_remember/recall/forget/list and knowledge_*/story tools remain"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.4.3",
+      "name": "promote cannot act on another subject's session",
+      "type": "integration",
+      "preconditions": [
+        "two agent keys for different subjects; a session owned by subject A"
+      ],
+      "steps": [
+        "Call memory_promote for A's session using subject B's key"
+      ],
+      "expected_results": [
+        "no promotion of A's session; no memory written under A due to B's call"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Add the tool to mcp-server/index.js (tools array + switch + handler -> POST /api/v1/memory/promote) using mcp-server/lib/http-helpers.js + witness-sth.js.",
+    "Mirror the STH persistence/self-heal pattern proven in youtube-knowledge-extract publish.py (KB 877a415d).",
+    "Node tests: extend mcp-server/test/memory_tools.test.js (created in epic_28 US-28.4).",
+    "The claude-config Stop-hook (mkreyman/claude-config#85) is the primary caller — cross-reference but do not implement here."
+  ],
+  "dependencies": ["US-29.3"],
+  "estimated_tokens": 160000
+}

@@ -1,0 +1,88 @@
+{
+  "id": "US-29.5",
+  "title": "Promotion quality eval hook: sample promoted memories and score compile precision",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "medium",
+  "phase": "domain",
+  "priority_note": "The prior 'kill' verdict was LLM-compile brittleness. This story makes that brittleness measurable rather than assumed — the mitigation that justifies shipping promotion.",
+  "background": {
+    "reference": "GitHub issue #308 (eval hook AC); Second Brain 1622a142 (Synthetic Eval Dataset Auto-Generator), 227dda43 (confidence bouncer). Complements the confidence gate in US-29.1.",
+    "includes": "US-29.1/29.2 produce promoted memories. This story adds a way to sample promoted memories and score compile quality — the precision of 'is this actually a durable fact vs. session noise' — so the confidence threshold can be tuned with evidence, not guesswork."
+  },
+  "story": {
+    "as_a": "a loopctl maintainer",
+    "i_want_to": "sample recently promoted memories and score their compile quality (precision of 'durable fact') via an eval that reuses the synthetic-eval approach, exposing the score as a metric",
+    "so_that": "the promotion loop's brittleness is measurable and the confidence threshold can be calibrated instead of assumed"
+  },
+  "rationale": "Auto-promotion was previously shelved precisely because LLM compilation is brittle without an eval loop. Shipping it responsibly means a measurable precision signal: if promoted memories are frequently not durable facts, the threshold (US-29.1) is raised. Wiring to the existing synthetic-eval idea rather than inventing a new eval keeps this small and consistent with loopctl's retrieval-eval direction.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.5.1",
+      "description": "An eval function (e.g. Loopctl.Memory.PromotionEval.sample_and_score/1) samples N recently promoted memories for a tenant (scope-safe) and scores each as durable-fact vs not, producing an aggregate precision score. Scoring uses an injectable judge (LLM behaviour via Mox in tests) so it is deterministic in tests.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.5.2",
+      "description": "The precision score is exposed as a telemetry metric (reuse the existing telemetry/metrics conventions, e.g. under docs/observability/ dashboards) so promotion quality is observable over time, per tenant.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.5.3",
+      "description": "The eval reuses/extends the synthetic-eval scaffolding referenced in KB 1622a142 rather than a bespoke pipeline; it does NOT block promotion (it is an observability/calibration hook, out of the write path).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.5.4",
+      "description": "The eval is tenant-scoped: it never samples or scores another tenant's promoted memories; a two-tenant test proves isolation.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.5.1",
+      "name": "sample_and_score returns an aggregate precision over sampled promotions",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "three promoted memories (fixture(:memory, source: :promoted)) in scope",
+        "judge LLM stubbed via Mox: 2 durable, 1 not"
+      ],
+      "steps": [
+        "Loopctl.Memory.PromotionEval.sample_and_score(tenant.id)"
+      ],
+      "expected_results": [
+        "aggregate precision == 2/3 (within the sampled set); a telemetry metric is emitted"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.5.2",
+      "name": "eval never crosses tenant boundary",
+      "type": "integration",
+      "preconditions": [
+        "tenant_a = fixture(:tenant) with promoted memories",
+        "tenant_b = fixture(:tenant) with promoted memories"
+      ],
+      "steps": [
+        "sample_and_score(tenant_a.id)"
+      ],
+      "expected_results": [
+        "only tenant_a promotions are sampled/scored; tenant_b is never touched"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Module: Loopctl.Memory.PromotionEval (lib/loopctl/memory/promotion_eval.ex).",
+    "Judge is an LLM behaviour (Loopctl.LLM path) injected via Mox in tests — no network, deterministic.",
+    "Reuse the synthetic-eval scaffolding (KB 1622a142) and the existing telemetry/metrics + docs/observability conventions for the precision metric.",
+    "Out of the write path: this is calibration/observability, not a promotion gate (the gate is the US-29.1 confidence threshold).",
+    "Tests use Loopctl.Fixtures.fixture/2 (fixture(:memory, source: :promoted))."
+  ],
+  "dependencies": ["US-29.2"],
+  "estimated_tokens": 240000
+}

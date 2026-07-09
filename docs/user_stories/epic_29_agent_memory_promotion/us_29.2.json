@@ -1,0 +1,165 @@
+{
+  "id": "US-29.2",
+  "title": "Promotion worker: triggers (explicit + scheduled sweep), dedupe/supersede, idempotency",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "Turns the pure compiler (29.1) into the actual self-evolving loop: it persists promoted memories, dedupes against existing ones, and runs both on demand and on a schedule. Idempotency is the load-bearing property.",
+  "background": {
+    "reference": "GitHub issue #308; mirrors lib/loopctl/workers/content_ingestion_worker.ex + article_embedding_worker.ex; Oban cron plugin at config/config.exs:~273. Dedup reuses epic_28 embedding similarity + memories.embedding_content_hash + supersede/2.",
+    "includes": "US-29.1 produces confidence-gated candidates. This story persists them as long-term memories (source: :promoted, source_session_id set), dedupes/supersedes against existing in-scope memories, and provides the two triggers from #308: an explicit enqueue (used by the API/MCP in 29.3/29.4) and a scheduled Oban cron sweep of sessions with stale unpromoted turns."
+  },
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "implement Loopctl.Workers.MemoryPromotionWorker that compiles a session (via the Promoter), dedupes/supersedes candidates against existing in-scope long-term memories, writes survivors as source: :promoted memories, and is idempotent on re-run — plus a scheduled sweep that enqueues promotion for stale unpromoted sessions",
+    "so_that": "session memory automatically compounds into durable, recall-able memory without duplication, whether triggered explicitly at session end or swept on a cron"
+  },
+  "rationale": "This is the loop that makes memory 'self-evolving' (Cole Medin) — but a promotion loop that duplicates on every run, or that leaks across scope, or that re-embeds unchanged nuggets, is worse than no loop. Idempotent dedupe/supersede (re-running a session is a no-op) and strict scope attribution are what make it safe to run automatically and repeatedly.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.2.1",
+      "description": "Loopctl.Workers.MemoryPromotionWorker (Oban, flat Loopctl.Workers.* namespace) takes a scope + session_id, calls Loopctl.Memory.Promoter.compile/2, and for each surviving candidate writes a long-term memory via Loopctl.Memory with source: :promoted, source_session_id set, confidence carried through, and subject_id/tenant_id from the session scope (never widened).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.2",
+      "description": "Dedupe/supersede: before writing a candidate, it checks for a near-duplicate existing in-scope memory (exact via embedding_content_hash, near via cosine similarity above a configurable threshold using the epic_28 recall/vector path). On a near-duplicate it SUPERSEDES the old memory with the new one (supersede/2) rather than inserting a duplicate; on an exact-content match it is a no-op.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.3",
+      "description": "Idempotency: re-running the worker for the same session promotes the same nuggets and, via dedupe/supersede, results in NO net new rows (a no-op) — proven by count before == count after on a second run. Oban unique: [keys: [:session_id, :subject_id], period: <n>] prevents concurrent double-promotion of one session.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.4",
+      "description": "Explicit trigger: a public enqueue function (e.g. Loopctl.Memory.promote_session/2) inserts the Oban job for a given scope + session_id; used by the API/MCP in 29.3/29.4. Returns {:ok, job} / {:error, _}.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.5",
+      "description": "Scheduled sweep: an Oban cron entry (config/config.exs Oban Plugins.Cron) periodically finds sessions with unpromoted turns older than a configurable window and enqueues promotion for each, scope-attributed. A session already fully promoted (no new turns since last promotion) is skipped.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.6",
+      "description": "Failure handling: a compile/LLM failure fails the job for Oban retry without partial writes (promotion of a session is all-or-nothing per run, or safely resumable); embedding of promoted memories reuses the epic_28 MemoryEmbeddingWorker path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.2.7",
+      "description": "Reconcile the prior 'kill': update the comment in lib/loopctl/workers/knowledge_moc_worker.ex (line ~9) that references the killed 'session memory compiler' idea to point to this implemented worker / issue #308 (no stale 'killed' claim remains).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.2.1",
+      "name": "worker promotes gated candidates as source: :promoted with session attribution",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "fixture(:session_memory, scope: scope, session_id: \"s1\", content: \"always reship expedited\")",
+        "Promoter LLM stubbed via Mox to one 0.9-confidence candidate",
+        "embedding client stubbed via Mox"
+      ],
+      "steps": [
+        "perform MemoryPromotionWorker for scope + \"s1\"",
+        "Loopctl.Memory.list(scope, %{})"
+      ],
+      "expected_results": [
+        "one long-term memory exists with source: :promoted, source_session_id == \"s1\", confidence 0.9",
+        "it is recall-able within scope after embedding drains"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.2",
+      "name": "re-running the worker is a no-op (idempotent dedupe)",
+      "type": "integration",
+      "preconditions": [
+        "same setup as TC-29.2.1, worker already run once"
+      ],
+      "steps": [
+        "count promoted memories in scope",
+        "perform MemoryPromotionWorker for scope + \"s1\" again",
+        "count promoted memories in scope"
+      ],
+      "expected_results": [
+        "count after == count before (no duplicate rows); a near-duplicate supersedes rather than inserts"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.3",
+      "name": "near-duplicate candidate supersedes the prior memory",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "an existing promoted memory \"prefers reships\" (embedded)",
+        "a new session whose candidate is a near-paraphrase \"strongly prefers reshipments\"",
+        "embedding stub makes them cosine-near"
+      ],
+      "steps": [
+        "perform MemoryPromotionWorker",
+        "list(scope, %{}) and list(scope, %{include_superseded: true})"
+      ],
+      "expected_results": [
+        "default list shows only the new memory; the old is superseded (superseded_by set), not duplicated"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.4",
+      "name": "promotion never crosses scope",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "scope_a = fixture(:memory_scope, tenant: tenant, subject_id: \"A\")",
+        "scope_b = fixture(:memory_scope, tenant: tenant, subject_id: \"B\")",
+        "session s1 under scope_a"
+      ],
+      "steps": [
+        "perform MemoryPromotionWorker for scope_a + s1",
+        "list(scope_b, %{})"
+      ],
+      "expected_results": [
+        "scope_b has no promoted memories; all promoted rows carry subject_id A"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.2.5",
+      "name": "scheduled sweep skips already-promoted sessions",
+      "type": "integration",
+      "preconditions": [
+        "a session fully promoted with no new turns since",
+        "a second session with stale unpromoted turns"
+      ],
+      "steps": [
+        "run the sweep function"
+      ],
+      "expected_results": [
+        "a promotion job is enqueued only for the stale-unpromoted session; the already-promoted one is skipped"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Worker: Loopctl.Workers.MemoryPromotionWorker (flat namespace, like article_embedding_worker.ex / content_ingestion_worker.ex).",
+    "Enqueue helper: Loopctl.Memory.promote_session/2 (used by API US-29.3 + MCP US-29.4).",
+    "Dedupe: exact via memories.embedding_content_hash; near via cosine over the epic_28 vector/recall path within (tenant_id, subject_id) scope, threshold from config. There is NO separate SimHash module — reuse embedding similarity + content hash.",
+    "supersede via epic_28 Loopctl.Memory.supersede/2 (superseded_by, on_delete: :nilify_all).",
+    "Scheduled sweep: add an entry to the Oban Plugins.Cron crontab in config/config.exs (~line 273); the sweep query finds sessions whose latest turn is newer than their last promotion (or never promoted) and older than a config window.",
+    "Idempotency uses Oban unique on (session_id, subject_id) + dedupe; re-run must be a true no-op (TC-29.2.2).",
+    "Embedding of promoted memories reuses epic_28 Loopctl.Workers.MemoryEmbeddingWorker.",
+    "Tests use Loopctl.Fixtures.fixture/2 + Mox for both the Promoter LLM and the embedding client."
+  ],
+  "dependencies": ["US-29.1"],
+  "estimated_tokens": 420000
+}

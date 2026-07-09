@@ -1,0 +1,98 @@
+{
+  "id": "US-29.6",
+  "title": "Docs + terminal end-to-end promotion, idempotency & scope-isolation verification (runs last)",
+  "epic": {
+    "id": "epic_29",
+    "name": "Agent Memory (Part 2: auto-promotion / session-memory compiler)"
+  },
+  "priority": "high",
+  "phase": "verification_docs",
+  "priority_note": "Terminal story: owns the end-to-end promotion proof, the idempotency + scope-isolation guarantees across surfaces, and the docs. Depends on all leaves; runs last (epic_27/epic_28 pattern).",
+  "background": {
+    "reference": "GitHub issue #308; mirrors epic_28 US-28.5 terminal-verification pattern. loopctl is agent-native (no web UI).",
+    "includes": "Every prior story asserts its slice; this story proves the full loop — session memory -> promote (API/MCP) -> compile -> dedupe -> long-term -> recall -> superadmin reject — end to end, proves idempotency and scope isolation across surfaces, and writes the promotion documentation + Stop-hook recipe."
+  },
+  "story": {
+    "as_a": "a loopctl maintainer",
+    "i_want_to": "run one end-to-end pass that promotes a session through the API and MCP, recalls the promoted memory, proves re-promotion is a no-op and never crosses scope, and document the promotion lifecycle + Stop-hook recipe",
+    "so_that": "the self-evolving memory loop ships proven, idempotent, scope-safe, and teachable"
+  },
+  "rationale": "Auto-promotion runs unattended on a schedule and via hooks, so its two dangerous failure modes — duplicate accumulation and cross-scope leakage — must be proven closed across the whole path, not just per unit. A single terminal verification plus authoritative docs (including the Stop-hook recipe the claude-config consumer needs) turns the merged stories into a trustworthy feature.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-29.6.1",
+      "description": "docs/agent-memory.md is extended with the promotion lifecycle (session -> compile -> confidence gate -> dedupe/supersede -> long-term), the confidence-threshold + eval story (US-29.5), and the Claude Code Stop-hook recipe (cross-ref mkreyman/claude-config#85). It reconciles/removes the stale 'killed session compiler' framing (now implemented).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.6.2",
+      "description": "README.md (memory_promote tool + promotion feature), CHANGELOG.md, and docs/observability/ (promotion + eval metrics) are updated. The promote endpoint renders at /swaggerui.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.6.3",
+      "description": "An end-to-end integration test: write session memory -> POST /api/v1/memory/promote -> drain compile+embedding -> recall the promoted memory via API and context -> the same memory is reachable; source: :promoted with source_session_id and confidence.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.6.4",
+      "description": "A terminal idempotency test proves re-running promotion for the same session (explicit + scheduled) yields no net new rows across the whole path, and a cross-scope test proves a promoted memory under (tenant T, subject A) is never produced for or visible to tenant U or subject B — via context, API, and MCP.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-29.6.5",
+      "description": "The knowledge_moc_worker.ex 'killed session compiler' comment (US-29.2 AC-29.2.7) is confirmed reconciled, and a seam note documents the claude-config Stop-hook + skills consumer (#85) integration points — no implementation of #85 here.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-29.6.1",
+      "name": "end-to-end promote(API) -> recall(API + context) for a session fact",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "{raw, key} = fixture(:api_key, tenant: tenant, role: :agent)",
+        "session s1 with a durable fact in session memory",
+        "Promoter LLM + embedding stubbed via Mox"
+      ],
+      "steps": [
+        "POST /api/v1/memory/promote %{session_id: \"s1\"}",
+        "drain promotion + embedding queues",
+        "recall via API and Loopctl.Memory"
+      ],
+      "expected_results": [
+        "the promoted memory is recall-able through both surfaces with source: :promoted, source_session_id s1, confidence set"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-29.6.2",
+      "name": "re-promotion is a no-op and promotion never crosses scope (all surfaces)",
+      "type": "integration",
+      "preconditions": [
+        "tenant_t = fixture(:tenant); tenant_u = fixture(:tenant)",
+        "{_, key_tb} = fixture(:api_key, tenant: tenant_t, role: :agent)  # subject B",
+        "a session s1 under (tenant_t, subject A) already promoted"
+      ],
+      "steps": [
+        "promote s1 again (explicit) and run the scheduled sweep",
+        "attempt recall/list of A's promoted memory as tenant_u and as subject B via context/API/MCP"
+      ],
+      "expected_results": [
+        "no net new rows after re-promotion (idempotent)",
+        "A's promoted memory is never returned to tenant_u or subject B on any surface"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Model on epic_28 US-28.5 / epic_27 US-27.17 terminal-verification pattern: depends on all leaves, runs last.",
+    "No LiveView (agent-native); the human quality loop is the superadmin API from US-29.3.",
+    "docs/agent-memory.md is the single home — extend the epic_28 file, do not create a parallel doc.",
+    "Do NOT implement claude-config#85 here; only document + assert the Stop-hook seam.",
+    "Tests reuse the Mox Promoter/embedding stubs and Loopctl.Fixtures.fixture/2."
+  ],
+  "dependencies": ["US-29.1", "US-29.2", "US-29.3", "US-29.4", "US-29.5"],
+  "estimated_tokens": 220000
+}
