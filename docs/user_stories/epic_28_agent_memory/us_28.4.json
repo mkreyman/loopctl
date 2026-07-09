@@ -1,0 +1,108 @@
+{
+  "id": "US-28.4",
+  "title": "MCP memory_* tools (remember/recall/forget/list) with memory-vs-knowledge docstrings",
+  "epic": {
+    "id": "epic_28",
+    "name": "Agent Memory (Part 1: store + semantic retrieval)"
+  },
+  "priority": "high",
+  "phase": "mcp",
+  "priority_note": "This is what agents actually call; docstrings must steer agents to memory vs knowledge or the feature gets misused.",
+  "background": {
+    "reference": "GitHub issue #307; mcp-server/index.js two-list convention (tools array + CallToolRequestSchema switch); helpers in mcp-server/lib/http-helpers.js and witness-sth.js",
+    "includes": "Adding a tool = a {name, description, inputSchema} entry in the tools array + a case in the switch + a handler that HTTP-calls /api/v1/memory*. Node tests live in mcp-server/test/."
+  },
+  "story": {
+    "as_a": "an AI agent connected to the loopctl MCP server",
+    "i_want_to": "call memory_remember, memory_recall, memory_forget, and memory_list to persist and retrieve my scoped working memory",
+    "so_that": "I accumulate and reuse per-project/per-user context across sessions without hand-rolling storage"
+  },
+  "rationale": "The MCP tools are the product surface for #307, and their docstrings are load-bearing: agents must know memory_* is agent-private scoped working state while knowledge_* is curated shared knowledge, or they will write memories into the wiki and search the wiki for memories. Clear disambiguation is the difference between the feature helping and polluting the KB.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-28.4.1",
+      "description": "Four tools registered by the existing convention: memory_remember, memory_recall, memory_forget, memory_list — each with an inputSchema entry in the tools array, a case in the CallToolRequestSchema switch, and a handler calling the matching /api/v1/memory* endpoint via the shared HTTP + witness/STH helpers.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.4.2",
+      "description": "Each tool description explicitly disambiguates memory vs knowledge (e.g. 'Use memory_* for YOUR scoped, private, accumulated working state across sessions; use knowledge_* for curated, shared knowledge articles'), matching the style of the existing knowledge_*/story tool descriptions.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.4.3",
+      "description": "The witness/STH protocol is applied exactly as other write tools (persist + echo the STH, self-heal on the 412 witness_bootstrap_already_consumed), so a fresh MCP process does not fail permanently on its first memory write.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.4.4",
+      "description": "recall and list surface the API meta (fallback flag/reason, total_count) back to the caller so an agent can distinguish degraded recall from an empty scope.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-28.4.5",
+      "description": "ListTools includes the four new tools and all existing tools remain unchanged; mcp-server/test/memory_tools.test.js covers each tool's happy path, an auth/witness failure, and a scope-isolation assertion (a tool call cannot read another scope).",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-28.4.1",
+      "name": "memory_remember then memory_recall via MCP round-trips",
+      "type": "integration",
+      "preconditions": [
+        "MCP server pointed at a test API base URL",
+        "an agent-role API key + STH configured in the test env"
+      ],
+      "steps": [
+        "Call the memory_remember tool with a fact",
+        "Call the memory_recall tool with a semantically near query"
+      ],
+      "expected_results": [
+        "memory_recall returns the stored memory",
+        "the response includes meta and the witness/STH exchange succeeded"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.4.2",
+      "name": "ListTools exposes memory tools without regressing existing ones",
+      "type": "integration",
+      "preconditions": [
+        "MCP server booted against the test API"
+      ],
+      "steps": [
+        "Issue a ListToolsRequest"
+      ],
+      "expected_results": [
+        "memory_remember/recall/forget/list are present with disambiguating descriptions",
+        "knowledge_* and story tools are still present and unchanged"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "TC-28.4.3",
+      "name": "A memory tool call cannot read another scope",
+      "type": "integration",
+      "preconditions": [
+        "two agent keys for different subjects in the test API",
+        "a memory written by subject A"
+      ],
+      "steps": [
+        "Call memory_recall using subject B's key for A's fact"
+      ],
+      "expected_results": [
+        "A's memory is not returned to B; no error leaks its existence"
+      ],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "index.js is ~4,395 lines with two hand-maintained lists; keep additions localized and consistent. The hand-maintenance pain is itself the motivation for the Context Retriever epic (#309) and is out of scope here.",
+    "Reuse mcp-server/lib/http-helpers.js and witness-sth.js; do not open a second HTTP path.",
+    "Mirror the STH persistence pattern proven in youtube-knowledge-extract's publish.py (persists an .sth file, self-heals on 412) — referenced in KB finding 877a415d.",
+    "Node tests use the existing mcp-server/test harness (see knowledge_tools.test.js / story_tools.test.js); add memory_tools.test.js."
+  ],
+  "dependencies": ["US-28.3"],
+  "estimated_hours": 10
+}
