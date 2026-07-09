@@ -1,0 +1,48 @@
+{
+  "id": "US-30.1",
+  "title": "Entity-definition schema + migration + per-tenant registry",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "Foundation: the entity definitions everything else generates from. No dependencies.",
+  "background": {
+    "reference": "GitHub issue #309; Second Brain hub 3ee5f890 (Cole Medin context-retriever pillar), 489d675d/29ecd697 (loopctl entity-relationship ideas). Agent-native: no web UI.",
+    "includes": "loopctl's knowledge_search retrieves CURATED articles; there is no schema-driven, governed tool surface over STRUCTURED records. This story adds per-tenant entity definitions (the schema the tool generator + executor consume). Phase 1 backing source is loopctl's OWN structured tables (projects/stories/epics); tenant-supplied sources are explicitly out of scope (future)."
+  },
+  "story": {
+    "as_a": "a loopctl tenant admin (or an agent acting for one)",
+    "i_want_to": "declare entity definitions — name, fields (name, type, filterable?, searchable?), relationships, and a backing source — persisted per tenant",
+    "so_that": "the tool generator and executor can produce a governed, structured query surface from a single declaration instead of hand-written tools"
+  },
+  "rationale": "Cole Medin's context-retriever frames an entity/schema layer as the production analogue of a Karpathy wiki's index: it tells the agent what it can query and how. That declaration must be a first-class, tenant-scoped, validated schema before any generation or execution — it is the allowlist that makes generated queries safe (US-30.3 can only expose fields an entity marks filterable/searchable).",
+  "acceptance_criteria": [
+    { "id": "AC-30.1.1", "description": "Ecto schema Loopctl.ContextRetriever.Entity (table entity_definitions): tenant_id, name (unique per tenant), backing_source (enum, phase 1: loopctl-internal sources only), fields (embedded/json list of %{name, type, filterable, searchable}), relationships (json), inserted_at/updated_at. tenant_id set programmatically, never cast.", "status": "pending" },
+    { "id": "AC-30.1.2", "description": "Changeset validates: unique (tenant_id, name); every field has a known type; filterable/searchable are booleans; backing_source is one of the allowlisted phase-1 internal sources (reject arbitrary/tenant-supplied sources in v1); field names match a safe identifier pattern (no injection via field names).", "status": "pending" },
+    { "id": "AC-30.1.3", "description": "Loopctl.ContextRetriever.Registry.for_tenant/1 returns a tenant's entity definitions (scope-enforced); get_entity/2 returns one by name within tenant. A definition from tenant A is invisible to tenant B.", "status": "pending" },
+    { "id": "AC-30.1.4", "description": "Tenant isolation rides SetTenant/RLS on Loopctl.Repo for the definitions table; a two-tenant test proves A's entities are never returned in B's scope.", "status": "pending" },
+    { "id": "AC-30.1.5", "description": "Down migration cleanly drops entity_definitions; migrations run green on a fresh DB.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.1.1", "name": "create + fetch an entity definition within tenant", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)"],
+      "steps": ["insert an Entity for a projects source with fields [%{name: \"status\", type: :string, filterable: true, searchable: false}]", "Registry.get_entity(tenant.id, \"project\")"],
+      "expected_results": ["the entity is returned with its fields; unique-per-tenant enforced"], "status": "pending" },
+    { "id": "TC-30.1.2", "name": "changeset rejects unsafe field name and unknown backing source", "type": "unit",
+      "preconditions": ["tenant = fixture(:tenant)"],
+      "steps": ["build Entity changeset with a field name \"status; DROP\" and backing_source :tenant_supplied"],
+      "expected_results": ["invalid: field-name pattern error + backing_source not-allowlisted error"], "status": "pending" },
+    { "id": "TC-30.1.3", "name": "entity definitions are tenant-isolated", "type": "integration",
+      "preconditions": ["tenant_a = fixture(:tenant)", "tenant_b = fixture(:tenant)", "an Entity under tenant_a"],
+      "steps": ["Registry.for_tenant(tenant_b.id)"],
+      "expected_results": ["tenant_b sees no entities; tenant_a sees its one"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Modules: Loopctl.ContextRetriever.Entity (lib/loopctl/context_retriever/entity.ex), Loopctl.ContextRetriever.Registry. Table entity_definitions.",
+    "Backing sources v1: loopctl-internal only (projects via Loopctl.Projects, stories via Loopctl.WorkBreakdown.Story, epics). Tenant-supplied external sources are a future epic.",
+    "Field-name identifier validation is a security control (US-30.3 builds queries from these names) — restrict to ^[a-z_][a-z0-9_]*$.",
+    "Tenant scoping via SetTenant/RLS on Loopctl.Repo (OLTP), same as other tenant-scoped schemas.",
+    "Tests use Loopctl.Fixtures.fixture/2."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 240000
+}

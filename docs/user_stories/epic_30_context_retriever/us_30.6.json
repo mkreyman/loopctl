@@ -1,0 +1,46 @@
+{
+  "id": "US-30.6",
+  "title": "Dogfood: seed loopctl projects/stories as entities; parity with hand-written story tools",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "medium",
+  "phase": "domain",
+  "priority_note": "Proves the generator/executor on data loopctl already exposes, and validates the generated surface against the existing hand-written story tools. Depends on the MCP layer (30.5).",
+  "background": {
+    "reference": "GitHub issue #309 dogfood AC; backing sources are Loopctl.Projects (lib/loopctl/projects.ex) + Loopctl.WorkBreakdown.Story (lib/loopctl/work_breakdown/story.ex).",
+    "includes": "US-30.1..30.5 build the generic machinery. This story seeds entity definitions for loopctl's OWN structured tables (projects, stories, epics) and asserts the generated tools return the same governed data as the existing hand-written story/project MCP tools (get_story, list_stories, ...) — the proof the generic path is correct and safe on real data."
+  },
+  "story": {
+    "as_a": "a loopctl maintainer",
+    "i_want_to": "seed entity definitions for projects/stories/epics and verify the auto-generated tools return results consistent with loopctl's existing hand-written story/project tools",
+    "so_that": "the context-retriever generic path is proven correct, tenant-safe, and role-safe on data loopctl already ships, before any tenant defines their own entities"
+  },
+  "rationale": "Dogfooding on loopctl's own project/story data is the strongest correctness + safety proof: the hand-written tools are the known-good oracle, so parity between them and the generated tools demonstrates the generator/executor produce the same scoped results — and any divergence (a leaked column, a scope miss) is caught against a trusted baseline.",
+  "acceptance_criteria": [
+    { "id": "AC-30.6.1", "description": "A seed defines entity definitions for projects, stories, and epics with appropriate filterable fields (e.g. story: status, epic; project: status) and searchable text fields (e.g. story title/description), scoped per tenant.", "status": "pending" },
+    { "id": "AC-30.6.2", "description": "Parity: for a given tenant, filtering stories by status via the generated cr_filter_story_by_status returns the same story set (ids) as the existing hand-written list_stories filtered equivalently — proving the generated executor honors the same tenant/role scoping.", "status": "pending" },
+    { "id": "AC-30.6.3", "description": "The generated tools expose ONLY the declared fields of projects/stories/epics — no sensitive/internal column (e.g. custody/audit fields) leaks through result shaping.", "status": "pending" },
+    { "id": "AC-30.6.4", "description": "Scope/role parity: a generated story query as an agent of tenant A never returns tenant B's stories, matching the hand-written tools' isolation.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.6.1", "name": "generated story filter matches hand-written list_stories", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "stories seeded with varied status via fixtures", "story entity seeded"],
+      "steps": ["query cr_filter_story_by_status {value: \"ready\"} via /retrieve", "call the existing list_stories filtered to status ready"],
+      "expected_results": ["identical story id sets; same ordering contract; %{results, meta}"], "status": "pending" },
+    { "id": "TC-30.6.2", "name": "no undeclared column leaks", "type": "integration",
+      "preconditions": ["story entity declaring a subset of fields"],
+      "steps": ["query the generated story tool"],
+      "expected_results": ["response rows contain only declared fields; no audit/custody/internal columns"], "status": "pending" },
+    { "id": "TC-30.6.3", "name": "generated story query is tenant-isolated (parity with hand-written)", "type": "integration",
+      "preconditions": ["tenant_a stories; tenant_b = fixture(:tenant) with its own stories; agent key for tenant_a"],
+      "steps": ["query cr_filter_story_by_status as tenant_a"],
+      "expected_results": ["only tenant_a stories; tenant_b never appears — same isolation as list_stories"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Backing modules: Loopctl.Projects, Loopctl.WorkBreakdown.Story (+ epics). Seed via a mix task or a seeding function, tenant-scoped.",
+    "The hand-written story/project MCP tools are the oracle; assert id-set parity, not just non-empty results.",
+    "Result shaping must whitelist declared fields — explicitly test that custody/audit columns don't leak (ties to US-30.3 AC-30.3.6).",
+    "Tests use Loopctl.Fixtures.fixture/2 with real story/project rows across two tenants."
+  ],
+  "dependencies": ["US-30.5"],
+  "estimated_tokens": 220000
+}

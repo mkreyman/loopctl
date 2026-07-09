@@ -1,0 +1,51 @@
+{
+  "id": "US-30.5",
+  "title": "Dynamic MCP tool listing: append per-tenant generated tools, dispatch generically",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "mcp",
+  "priority_note": "The structural change that makes the tool surface schema-driven instead of hand-maintained. Depends on the API (30.4).",
+  "background": {
+    "reference": "GitHub issue #309; mcp-server/index.js ListToolsRequestSchema handler (~line 4130) + CallToolRequestSchema (~line 4134) — today two hand-maintained static lists.",
+    "includes": "US-30.4 exposes GET /api/v1/retrieve/tools + POST /api/v1/retrieve/:entity. This story makes the MCP server list the tenant's generated tools alongside the static ones and dispatch generated-tool calls to the generic execute endpoint — Cole Medin's 'auto-generated MCP tools per entity'."
+  },
+  "story": {
+    "as_a": "an AI agent connected to the loopctl MCP server",
+    "i_want_to": "see and call my tenant's generated entity tools (cr_filter_*, cr_search_*) alongside the built-in tools",
+    "so_that": "I can query structured data in a single governed tool call without anyone hand-writing a tool per entity/tenant"
+  },
+  "rationale": "Hand-maintaining tools in a ~4,395-line index.js is the 'markdown doesn't scale' problem applied to the tool layer. Making ListTools dynamic (static + per-tenant generated) and dispatching unknown generated names to one generic executor endpoint is the structural fix and the productizable core of the context-retriever pillar.",
+  "acceptance_criteria": [
+    { "id": "AC-30.5.1", "description": "The ListToolsRequestSchema handler returns the static tools array PLUS the calling tenant's generated specs fetched from GET /api/v1/retrieve/tools (via the shared authenticated HTTP helper). If the fetch fails, it degrades to the static tools (and logs) rather than erroring the whole listing.", "status": "pending" },
+    { "id": "AC-30.5.2", "description": "The CallToolRequestSchema handler dispatches any tool name NOT in the static switch and matching the generated prefix (cr_) to a generic handler that POSTs to /api/v1/retrieve/:entity with the parsed entity/field/op; static tools continue to dispatch exactly as before (no regression).", "status": "pending" },
+    { "id": "AC-30.5.3", "description": "Generated tools are tenant-scoped: the list reflects only the authenticated key's tenant, and a generic call is executed under that key's scope (the server never lets one tenant call another tenant's generated tool).", "status": "pending" },
+    { "id": "AC-30.5.4", "description": "Witness/STH and error handling for generated-tool calls match the other write/read tools; a generated call carries the same auth/witness as a static one.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.5.1", "name": "ListTools includes generated tools + static tools", "type": "integration",
+      "preconditions": ["MCP server pointed at a test API; a tenant with a project entity defined", "an agent key for that tenant"],
+      "steps": ["issue ListToolsRequest"],
+      "expected_results": ["cr_filter_project_by_status appears alongside knowledge_*/memory_*/story tools; static tools unchanged"], "status": "pending" },
+    { "id": "TC-30.5.2", "name": "generated tool call dispatches to the executor; static unaffected", "type": "integration",
+      "preconditions": ["as TC-30.5.1; projects seeded"],
+      "steps": ["call cr_filter_project_by_status {value: \"active\"}", "call a static tool (e.g. get_story)"],
+      "expected_results": ["the generated call returns tenant projects via /retrieve; the static call still works"], "status": "pending" },
+    { "id": "TC-30.5.3", "name": "a tenant cannot list or call another tenant's generated tools", "type": "integration",
+      "preconditions": ["tenant_t with an entity; an agent key for tenant_u"],
+      "steps": ["ListTools as tenant_u; attempt cr_filter_<tenant_t entity> as tenant_u"],
+      "expected_results": ["tenant_u's listing omits tenant_t tools; the call is rejected/unknown, returns no tenant_t rows"], "status": "pending" },
+    { "id": "TC-30.5.4", "name": "listing degrades gracefully if the tools fetch fails", "type": "integration",
+      "preconditions": ["retrieve/tools endpoint stubbed to error"],
+      "steps": ["issue ListToolsRequest"],
+      "expected_results": ["static tools still returned; no crash; the failure is logged"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Edit mcp-server/index.js: ListToolsRequestSchema handler (~4130) merges static + fetched generated specs; CallToolRequestSchema (~4134) routes cr_-prefixed unknown names to a generic /retrieve/:entity handler. Reuse mcp-server/lib/http-helpers.js + witness-sth.js.",
+    "The generic dispatcher uses the spec's (entity, field, operation) metadata carried in the generated tool (US-30.2), not brittle name-parsing where avoidable.",
+    "Tenant scope comes from the authenticated key server-side; the MCP server never accepts a tenant override.",
+    "Tests: mcp-server/test/context_retriever_tools.test.js.",
+    "Caveat: dynamic listing means ListTools now makes an HTTP call — keep it cached/short-timeout and degrade to static on failure (AC-30.5.1)."
+  ],
+  "dependencies": ["US-30.4"],
+  "estimated_tokens": 320000
+}

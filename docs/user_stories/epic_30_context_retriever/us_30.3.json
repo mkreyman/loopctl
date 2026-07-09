@@ -1,0 +1,58 @@
+{
+  "id": "US-30.3",
+  "title": "Query executor: generated tool call -> safe, tenant/role-scoped, paginated Ecto query (no model SQL)",
+  "epic": { "id": "epic_30", "name": "Context Retriever (entity-schema -> auto-generated agent tool surface)" },
+  "priority": "high",
+  "phase": "domain",
+  "priority_note": "The security boundary of the whole epic: it turns a model-initiated tool call into a database query. Any gap here is an injection / cross-tenant / data-exfiltration hole. Depends on the entity schema (30.1) and generator metadata (30.2).",
+  "background": {
+    "reference": "GitHub issue #309 ('safe, scoped Ecto query, parameterized, tenant/role-scoped, paginated. No raw SQL from the model'). Security-first.",
+    "includes": "US-30.2 specs carry (entity, field, operation) metadata. This story executes a generated tool call against the entity's backing loopctl source, enforcing the entity allowlist, tenant scoping, role gating, parameterization, and pagination — so an agent can query structured data in one call without ever authoring SQL or reaching another tenant's rows."
+  },
+  "story": {
+    "as_a": "loopctl platform engineer",
+    "i_want_to": "execute a generated tool call by building a parameterized Ecto query scoped to the caller's tenant, restricted to the entity's allowlisted filterable/searchable fields, with enforced pagination",
+    "so_that": "agents get governed structured-data access with no model-authored SQL, no way to filter on non-allowlisted columns, and no cross-tenant reads"
+  },
+  "rationale": "This is where a model's output touches the database, so it is the highest-risk component in the epic. Building queries only from the generator's (entity, field, operation) metadata against an allowlist — never from the raw tool name or arbitrary params — plus mandatory tenant scoping and pagination is what turns 'let an LLM query our data' from a liability into a safe capability.",
+  "acceptance_criteria": [
+    { "id": "AC-30.3.1", "description": "Loopctl.ContextRetriever.Executor.run/3 takes a scope (tenant_id + role), a generated tool spec's (entity, field, operation) metadata, and params, resolves the entity via the Registry, and builds a PARAMETERIZED Ecto query against the entity's backing loopctl source. Field/operation are validated against the entity's allowlist; a request naming a non-allowlisted field (or a field not marked filterable/searchable) is rejected, never executed.", "status": "pending" },
+    { "id": "AC-30.3.2", "description": "Every query is tenant-scoped: the executor injects a tenant_id predicate (and runs on the correct repo) so results can only be the caller's tenant's rows — proven even when the backing source table also holds other tenants' data. No param can widen or override the tenant scope.", "status": "pending" },
+    { "id": "AC-30.3.3", "description": "No model-authored SQL: values are always Ecto-parameterized (never string-interpolated); an injection payload in a filter value (e.g. \"' OR 1=1 --\") is treated as a literal value and matches nothing, not as SQL.", "status": "pending" },
+    { "id": "AC-30.3.4", "description": "Pagination is enforced with a hard maximum page size (config) and returns %{results, meta: %{total_count, limit, offset}}; a caller cannot request an unbounded result set. Full-text search uses loopctl's existing Postgres full-text/keyword approach (parameterized), not raw LIKE interpolation.", "status": "pending" },
+    { "id": "AC-30.3.5", "description": "Role gating: the executor (and the API in 30.4) require >= agent role to query; it also honors any per-entity/source read constraints (e.g. a source that should not expose all rows to all subjects) — documented per source in the dogfood story (30.6).", "status": "pending" },
+    { "id": "AC-30.3.6", "description": "Result shaping returns only the entity's declared fields (no accidental column leakage of sensitive/undeclared columns from the backing table).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-30.3.1", "name": "filter executes as a parameterized, tenant-scoped query", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "a projects entity (status filterable)", "projects seeded under tenant and under another tenant"],
+      "steps": ["Executor.run(scope(tenant, :agent), {\"project\", \"status\", :filter}, %{value: \"active\"})"],
+      "expected_results": ["only tenant's active projects returned; other tenant's rows never appear; %{results, meta} shape"], "status": "pending" },
+    { "id": "TC-30.3.2", "name": "non-allowlisted field is rejected", "type": "integration",
+      "preconditions": ["a projects entity where secret_field is NOT filterable"],
+      "steps": ["Executor.run(scope, {\"project\", \"secret_field\", :filter}, %{value: \"x\"})"],
+      "expected_results": ["{:error, _} — rejected, no query executed; secret_field never queried"], "status": "pending" },
+    { "id": "TC-30.3.3", "name": "SQL-injection payload is treated as a literal value", "type": "integration",
+      "preconditions": ["a projects entity (status filterable)"],
+      "steps": ["Executor.run(scope, {\"project\", \"status\", :filter}, %{value: \"' OR 1=1 --\"})"],
+      "expected_results": ["matches zero rows (literal comparison); no error leaking SQL; no extra rows returned"], "status": "pending" },
+    { "id": "TC-30.3.4", "name": "pagination is capped", "type": "integration",
+      "preconditions": ["> max_page_size projects under tenant"],
+      "steps": ["Executor.run(scope, ..., %{limit: 100000})"],
+      "expected_results": ["result length <= configured max page size; meta.total_count reflects the full count"], "status": "pending" },
+    { "id": "TC-30.3.5", "name": "body/param cannot override tenant scope", "type": "integration",
+      "preconditions": ["tenant_t scope; rows exist under tenant_u"],
+      "steps": ["Executor.run(scope(tenant_t, :agent), ..., %{tenant_id: tenant_u.id, value: \"active\"})"],
+      "expected_results": ["scope stays tenant_t; tenant_u rows never returned"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Module: Loopctl.ContextRetriever.Executor. Build Ecto queries dynamically from the entity allowlist via field references (e.g. dynamic/2 with validated field atoms from the entity, NOT from raw strings), values always as pinned params.",
+    "SECURITY: never String.to_atom on model input; map a validated allowlisted field name to a known atom/column; reject anything else. No fragment/raw SQL with interpolated values.",
+    "Tenant predicate is mandatory and non-overridable; run on the repo the backing source uses (OLTP Loopctl.Repo for projects/stories).",
+    "Full-text: reuse loopctl's existing parameterized keyword/full-text approach (the articles search path is the reference) rather than raw ILIKE string-building.",
+    "Return only entity-declared fields; do not select * into the response.",
+    "Tests use Loopctl.Fixtures.fixture/2 with real projects/stories rows across two tenants."
+  ],
+  "dependencies": ["US-30.1", "US-30.2"],
+  "estimated_tokens": 420000
+}
