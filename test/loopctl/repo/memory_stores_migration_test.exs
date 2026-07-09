@@ -22,6 +22,26 @@ defmodule Loopctl.Repo.MemoryStoresMigrationTest do
     |> Map.new(fn [name, type] -> {name, type} end)
   end
 
+  # pg_constraint.confdeltype for the FK on `table.column`: "n" = SET NULL
+  # (nilify_all), "c" = CASCADE (delete_all), "a" = NO ACTION, "r" = RESTRICT.
+  defp fk_on_delete(table, column) do
+    %{rows: [[confdeltype]]} =
+      AdminRepo.query!(
+        """
+        SELECT c.confdeltype
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.contype = 'f' AND n.nspname = 'public'
+          AND t.relname = $1 AND a.attname = $2
+        """,
+        [table, column]
+      )
+
+    confdeltype
+  end
+
   describe "session_memories table" do
     test "has all AC-28.1.1 columns" do
       cols = columns("session_memories")
@@ -58,6 +78,14 @@ defmodule Loopctl.Repo.MemoryStoresMigrationTest do
 
     test "has the (tenant_id, subject_id) btree index" do
       assert index_columns("memories", ["tenant_id", "subject_id"])
+    end
+
+    # A long-term memory is durable: deleting its project must fall it back to
+    # tenant-wide scope (project_id = NULL), NOT destroy the memory. session
+    # memories expire anyway, so they keep cascade delete.
+    test "project_id FK is ON DELETE SET NULL (nilify_all), not cascade" do
+      assert fk_on_delete("memories", "project_id") == "n"
+      assert fk_on_delete("session_memories", "project_id") == "c"
     end
 
     # AC-28.1.3 / TC-28.1.1: detect the HNSW index by access method, not by name.

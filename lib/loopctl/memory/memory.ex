@@ -42,9 +42,15 @@ defmodule Loopctl.Memory.Memory do
 
   @sources [:explicit, :promoted]
 
-  # Memory text is byte-capped to bound memory/wire footprint and to keep it
-  # within embedding-provider input limits. A single memory is far smaller than
-  # a curated article (100KB body); 100_000 bytes is a generous ceiling.
+  # Memory text is byte-capped to bound memory/wire footprint (a single memory is
+  # far smaller than a curated article's 100KB body; 100_000 bytes is a generous
+  # ceiling that still rejects pathological payloads).
+  #
+  # NOTE (US-28.2): this cap is NOT an embedding-provider input limit. 100KB is
+  # ~25k tokens, well beyond typical embedding-model context windows (e.g.
+  # text-embedding-3 caps ~8191 tokens). The async embedding worker MUST
+  # chunk/truncate `text` to the provider's token limit before embedding —
+  # a max-size memory that passes this changeset will NOT fit an embedder as-is.
   @max_text_bytes 100_000
 
   # A blank subject_id must never be a usable owner (see SessionMemory / #163).
@@ -79,23 +85,28 @@ defmodule Loopctl.Memory.Memory do
     :source,
     :source_session_id,
     :tags,
-    :project_id,
-    :superseded_by
+    :project_id
   ]
 
   @doc """
   Changeset for creating a memory.
 
   `tenant_id` and `subject_id` are set programmatically on the struct and must
-  NOT appear in `attrs`. `embedding` is never cast here — it is populated
-  asynchronously via `embedding_changeset/3` in US-28.2. Validates required
-  fields, `confidence` range, and caps `text` byte size.
+  NOT appear in `attrs`. `superseded_by` is likewise NEVER cast from caller
+  params — it is set programmatically by `forget/2` (US-28.2) when one memory
+  replaces another. It is a self-FK to `memories` whose Postgres constraint
+  bypasses RLS, so accepting it from request params would let a caller point at
+  ANOTHER tenant's memory id (a cross-tenant graph edge + INSERT-time existence
+  oracle); keeping it out of `cast` closes that on the security-boundary schema.
+  `embedding` is never cast here — it is populated asynchronously via
+  `embedding_changeset/3` in US-28.2. Validates required fields, `confidence`
+  presence + range, and caps `text` byte size.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(memory \\ %__MODULE__{}, attrs) do
     memory
     |> cast(attrs, @cast_fields)
-    |> validate_required([:subject_id, :tenant_id, :text])
+    |> validate_required([:subject_id, :tenant_id, :text, :confidence])
     |> validate_subject_id()
     |> validate_text_byte_size()
     |> validate_number(:confidence,
@@ -104,7 +115,6 @@ defmodule Loopctl.Memory.Memory do
     )
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:tenant_id)
-    |> foreign_key_constraint(:superseded_by)
   end
 
   @doc """

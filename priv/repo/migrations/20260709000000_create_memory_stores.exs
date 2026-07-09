@@ -47,7 +47,12 @@ defmodule Loopctl.Repo.Migrations.CreateMemoryStores do
 
       add :tenant_id, references(:tenants, type: :binary_id, on_delete: :delete_all), null: false
 
-      add :project_id, references(:projects, type: :binary_id, on_delete: :delete_all), null: true
+      # nilify_all (NOT delete_all): a long-term memory is a durable, semantically
+      # recalled fact. Deleting its project must NOT destroy it — it falls back to
+      # tenant-wide scope (project_id = NULL), matching the schema's documented
+      # `null = tenant-wide` semantics. (session_memories keeps delete_all: those
+      # rows are short-lived and expire regardless.)
+      add :project_id, references(:projects, type: :binary_id, on_delete: :nilify_all), null: true
 
       add :subject_id, :string, null: false
       add :text, :text, null: false

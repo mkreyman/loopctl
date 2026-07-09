@@ -61,6 +61,26 @@ defmodule Loopctl.Memory.MemoryTest do
       assert get_change(changeset, :subject_id) == nil
     end
 
+    test "does not cast superseded_by from params (cross-tenant self-FK is set programmatically)" do
+      changeset =
+        %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
+        |> MemorySchema.create_changeset(%{
+          text: "a fact",
+          superseded_by: Ecto.UUID.generate()
+        })
+
+      assert get_change(changeset, :superseded_by) == nil
+    end
+
+    test "rejects an explicit confidence: nil (would be a raw NOT NULL DB error otherwise)" do
+      changeset =
+        %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
+        |> MemorySchema.create_changeset(%{text: "a fact", confidence: nil})
+
+      refute changeset.valid?
+      assert Map.has_key?(errors_on(changeset), :confidence)
+    end
+
     test "rejects confidence outside [0, 1]" do
       changeset =
         %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
