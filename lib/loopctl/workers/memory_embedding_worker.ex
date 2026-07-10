@@ -50,7 +50,6 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   alias Loopctl.Memory
 
   @worker_yield_ms 8_000
-  @max_text_length 32_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"memory_id" => memory_id, "tenant_id" => tenant_id}}) do
@@ -121,7 +120,11 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   defp already_embedded?(_memory, _content_hash), do: false
 
   defp content_hash(text) do
-    :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+    # Delegates to the schema's single source of truth so the async worker hash and
+    # the synchronous US-29.2 promotion write-time hash never drift. `text` here is
+    # already `build_embedding_text/1` (the sliced input); `embedding_content_hash/1`
+    # re-slices idempotently, so the hash is identical either way.
+    Memory.Memory.embedding_content_hash(text)
   end
 
   defp skip_no_embedding_key(tenant_id, memory_id) do
@@ -142,6 +145,6 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
   end
 
   defp build_embedding_text(memory) do
-    String.slice(memory.text, 0, @max_text_length)
+    Memory.Memory.embedding_input(memory.text)
   end
 end

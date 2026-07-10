@@ -267,6 +267,13 @@ config :loopctl, :promoter_llm, Loopctl.MockPromoterLLM
 config :loopctl, :memory_promotion_confidence_threshold, 0.5
 config :loopctl, :memory_promotion_max_candidates, 3
 
+# US-29.2 auto-promotion tunables. Small caps so the per-tenant compiles/hour budget
+# and the sweep per-tick cap are exercised without seeding hundreds of rows. The TTL
+# invariant (sweep window < session TTL) holds: 600 < 3600 (defaults from config.exs).
+config :loopctl, :memory_promotion_compiles_per_hour, 5
+config :loopctl, :memory_promotion_sweep_max_per_tick, 5
+config :loopctl, :memory_promotion_near_dup_threshold, 0.9
+
 # DI: Use mock category classifier in tests
 config :loopctl, :category_classifier, Loopctl.MockCategoryClassifier
 

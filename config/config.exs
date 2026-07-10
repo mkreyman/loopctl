@@ -268,6 +268,7 @@ config :loopctl, Oban,
     maintenance: 2,
     embeddings: 5,
     knowledge: 5,
+    memory: 3,
     audit: 3
   ],
   plugins: [
@@ -285,6 +286,11 @@ config :loopctl, Oban,
        {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker, args: %{"mode" => "all_tenants"}},
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
        {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+       # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
+       # its window MUST stay shorter than :session_memory_ttl_seconds (asserted at
+       # boot below) so session turns are promoted before SessionMemoryPruneWorker can
+       # delete them (no silent golden-nugget loss).
+       {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
        {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
        {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker}
@@ -324,6 +330,25 @@ config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.DefaultLLM
 # confidence. Query-shaped defaults; documented in the module.
 config :loopctl, :memory_promotion_confidence_threshold, 0.5
 config :loopctl, :memory_promotion_max_candidates, 5
+
+# Auto-promotion loop tunables (Epic 29 / US-29.2).
+#
+# - compiles_per_hour: per-tenant cap on promotion COMPILES (each compile = one LLM
+#   call), enforced BEFORE any LLM call in `Loopctl.Memory.promote_session/1` and the
+#   sweep, so a spamming agent or a tenant with thousands of stale sessions cannot
+#   exhaust its BYO LLM key.
+# - near_dup_threshold: cosine score at/above which a candidate supersedes the nearest
+#   existing memory instead of inserting a fresh row.
+# - sweep_max_per_tick / sweep_scan_limit: bound the cross-tenant sweep's fan-out.
+# - session_memory_ttl_seconds: the session-turn TTL used to set `expires_at`. The
+#   promotion sweep window MUST be shorter than this so turns are promoted before they
+#   are pruned (invariant asserted at boot in runtime.exs).
+config :loopctl, :memory_promotion_compiles_per_hour, 200
+config :loopctl, :memory_promotion_near_dup_threshold, 0.92
+config :loopctl, :memory_promotion_sweep_max_per_tick, 100
+config :loopctl, :memory_promotion_sweep_scan_limit, 2000
+config :loopctl, :memory_promotion_sweep_window_seconds, 600
+config :loopctl, :session_memory_ttl_seconds, 3600
 
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
