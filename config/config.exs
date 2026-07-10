@@ -291,9 +291,12 @@ config :loopctl, Oban,
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
        {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
        # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
-       # its window MUST stay shorter than :session_memory_ttl_seconds (asserted at
-       # boot below) so session turns are promoted before SessionMemoryPruneWorker can
-       # delete them (no silent golden-nugget loss).
+       # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
+       # which is the data form of this schedule that the boot invariant reasons over.
+       # The expiry floor MUST exceed this interval and stay shorter than
+       # :session_memory_ttl_seconds (both asserted at boot) so session turns are
+       # promoted before SessionMemoryPruneWorker can delete them (no silent
+       # golden-nugget loss).
        {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
        {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
@@ -344,14 +347,26 @@ config :loopctl, :memory_promotion_max_candidates, 5
 # - near_dup_threshold: cosine score at/above which a candidate supersedes the nearest
 #   existing memory instead of inserting a fresh row.
 # - sweep_max_per_tick / sweep_scan_limit: bound the cross-tenant sweep's fan-out.
-# - session_memory_ttl_seconds: the session-turn TTL used to set `expires_at`. The
-#   promotion sweep window MUST be shorter than this so turns are promoted before they
-#   are pruned (invariant asserted at boot in runtime.exs).
+# - session_memory_ttl_seconds: the DEFAULT session-turn lifetime. `Loopctl.Memory`
+#   sets a session turn's `expires_at` to `now + this` when the caller omits it, and
+#   FLOORS any caller-supplied `expires_at` to `now + sweep_window_seconds` — so both
+#   knobs govern the real per-row prune deadline (see `Loopctl.Memory` server-governed
+#   expiry). The sweep window MUST be strictly shorter than this TTL so turns are
+#   promoted before `SessionMemoryPruneWorker` deletes them; that invariant is asserted
+#   at boot in `Loopctl.Application.start/1` (via `assert_promotion_ttl_invariant!/0`).
+# - sweep_interval_seconds: the ACTUAL cadence of `MemoryPromotionSweepWorker`. It MUST
+#   equal the sweep's crontab entry above (`*/10` = 600s) — it is the data form of that
+#   schedule so the boot invariant can model the REAL binding constraint. The expiry
+#   FLOOR (sweep_window_seconds) MUST be strictly greater than this interval so a turn
+#   created at any point survives until a LATER sweep tick (plus promotion-job latency
+#   headroom) rather than racing its first eligible tick against the prune worker. Keep
+#   this in sync if you change the `*/10` crontab entry.
 config :loopctl, :memory_promotion_compiles_per_hour, 200
 config :loopctl, :memory_promotion_near_dup_threshold, 0.92
 config :loopctl, :memory_promotion_sweep_max_per_tick, 100
 config :loopctl, :memory_promotion_sweep_scan_limit, 2000
-config :loopctl, :memory_promotion_sweep_window_seconds, 600
+config :loopctl, :memory_promotion_sweep_interval_seconds, 600
+config :loopctl, :memory_promotion_sweep_window_seconds, 900
 config :loopctl, :session_memory_ttl_seconds, 3600
 
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:

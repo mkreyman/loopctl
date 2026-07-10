@@ -47,7 +47,10 @@
 ## The metric
 
 For each labeled session we match the compiler's emitted nuggets against the ground
-truth (normalized, greedy, label-driven text equality — never an LLM):
+truth by **token-overlap similarity** (a Sørensen–Dice coefficient over case-folded
+word tokens) at/above a configurable threshold
+(`:memory_promotion_eval_match_threshold`, default `0.5`) — greedy best-first,
+label-driven, **never an LLM**:
 
 | Count | Meaning |
 | --- | --- |
@@ -57,6 +60,23 @@ truth (normalized, greedy, label-driven text equality — never an LLM):
 
 - `precision = TP / (TP + FP)` — did the compiler emit only durable facts?
 - `recall = TP / (TP + FN)` — did it emit all the durable facts?
+
+**Why token-overlap, not exact equality.** In production the compiler runs a real LLM
+whose prompt asks for a "concise standalone statement" — i.e. a **paraphrase** — so a
+correctly-extracted fact almost never reproduces its label character-for-character.
+Exact-string matching would score a *well-behaved* compiler at precision≈recall≈0
+(every paraphrase a false positive AND its label a false negative) and, worse, would
+**kill the injection precision-drop signal** (precision already pegged at 0 cannot drop
+further). Token overlap tolerates paraphrase while staying fully deterministic and
+comparing only to FIXED ground-truth text — it is not a same-class LLM re-judging the
+output. When a session's facts are semantically distinct (they are, by construction),
+unrelated/injected text scores near 0 and does not spuriously match.
+
+**Undefined precision (`nil`, not `0.0`).** When the compiler emits nothing at all
+(`TP + FP == 0` — the total-LLM-outage shape), `precision` is **`nil`** (undefined —
+there were no predictions to be precise about), not `0.0`. This is what keeps a
+precision-floor alert from misfiring on an infra outage; on an outage read `recall`
+(which is a well-defined `0.0`, since the expected facts all become false negatives).
 
 The **injection case** is the load-bearing one: its `expected_facts` is empty, so a
 compiler regression that emits an injected instruction as a "durable fact" shows up as
@@ -83,8 +103,18 @@ dataset.
 - **Compile errors drag recall, not precision.** If a tenant has no LLM key,
   `Promoter.compile/2` returns `{:error, _}`; the eval scores that session as "emitted
   nothing", so its expected facts become false negatives (recall drops) without a crash.
-  A low recall with clean precision often means "the tenant's LLM is unavailable", not
-  "the compiler is wrong".
+  On a *total* outage every session emits nothing, so `precision` is **`nil`**
+  (undefined) and `recall` is `0.0` — a nil precision with recall at/near 0 means "the
+  tenant's LLM is unavailable", not "the compiler is wrong". (Precision is `nil`, not a
+  low number, precisely so a precision-floor alert does not misfire on an outage.)
+- **The daily worker only scores tenants with an extraction key, and the spend is
+  bounded + attributed.** Scoring the real compiler runs a real extraction LLM call per
+  labeled session on the tenant's BYO key, so the `all_tenants` fan-out only enqueues
+  tenants that have a usable extraction key — selected in one round-trip by joining
+  `tenant_llm_settings` on a non-null `api_key` (no per-tenant N+1 settings read) — so
+  there is no wasted job on a keyless tenant. For a keyed tenant the cost is a handful of short synthetic sessions
+  once/day, the extraction call records per-tenant token usage best-effort, and the eval
+  emits a per-tenant telemetry event — so the calibration spend is observable.
 - **The reference `llm_output` is a test aid, not the score.** Production runs use the
   tenant's real LLM; the committed `llm_output` only makes the test path deterministic.
   The score always compares the compiler's REAL output to `expected_facts`.

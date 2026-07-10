@@ -8,6 +8,18 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
   confidence threshold) and never re-judges production memories with an LLM. Additive /
   idempotent (upsert per tenant/dataset_version/day).
 
+  ## LLM cost containment
+
+  Scoring the REAL compiler means each labeled session runs a real, tenant-scoped
+  extraction LLM call on the tenant's BYO key. To avoid spending tokens on tenants who
+  never configured extraction, the `all_tenants` fan-out only enqueues tenants that
+  have a usable extraction key (selected in one round-trip by joining
+  `tenant_llm_settings` on a non-null `api_key`); keyless tenants are skipped entirely
+  (no wasted job, no error). The cost is BOUNDED (the committed
+  dataset's handful of short synthetic sessions, once/day) and OBSERVABLE — the
+  extraction call records per-tenant token usage best-effort, and the eval emits a
+  per-tenant `[:loopctl, :memory_promotion, :eval]` telemetry event.
+
   Scheduled daily via the Oban Cron plugin, alongside `RetrievalMetricsWorker`.
   """
 
@@ -21,12 +33,23 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Memory.PromotionEval
   alias Loopctl.Tenants.Tenant
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
-    from(t in Tenant, where: t.status == :active, select: t.id)
+    # Select active tenants that have a usable extraction key in ONE round-trip by joining
+    # tenant_llm_settings, instead of an N+1 `Llm.has_api_key?/1` settings read per tenant.
+    # A stored `api_key` is always non-empty (the settings changeset rejects blank keys), so
+    # `not is_nil(s.api_key)` is exactly the mandatory-BYO gate `resolve(_, :extraction)`
+    # applies — keyless tenants are skipped (no wasted job, no spent BYO tokens).
+    from(t in Tenant,
+      join: s in TenantLlmSettings,
+      on: s.tenant_id == t.id,
+      where: t.status == :active and not is_nil(s.api_key),
+      select: t.id
+    )
     |> AdminRepo.all()
     |> Enum.each(fn tenant_id ->
       %{"tenant_id" => tenant_id} |> __MODULE__.new() |> Oban.insert()
@@ -41,8 +64,8 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
         Logger.info(
           "PromotionEvalWorker: tenant=#{tenant_id} dataset=#{snap.dataset_version} " <>
             "day=#{snap.day} tp=#{snap.true_positives} fp=#{snap.false_positives} " <>
-            "fn=#{snap.false_negatives} precision=#{Float.round(snap.precision, 3)} " <>
-            "recall=#{Float.round(snap.recall, 3)}"
+            "fn=#{snap.false_negatives} precision=#{fmt(snap.precision)} " <>
+            "recall=#{fmt(snap.recall)}"
         )
 
         :ok
@@ -51,4 +74,8 @@ defmodule Loopctl.Workers.PromotionEvalWorker do
         {:error, reason}
     end
   end
+
+  # precision/recall are nil when the compiler emitted nothing (undefined metric).
+  defp fmt(nil), do: "n/a"
+  defp fmt(value) when is_float(value), do: value |> Float.round(3) |> Float.to_string()
 end

@@ -87,14 +87,20 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
 
   defp watermark(scope, session_id), do: Memory.get_session_promotion(scope, session_id)
 
-  defp attach_telemetry(events) do
+  # `tenant_id` filters to the calling test's tenant — telemetry handlers are GLOBAL, so
+  # without it a concurrent async test's event of the same name would leak in.
+  defp attach_telemetry(events, tenant_id \\ nil) do
     handler = "test-#{inspect(make_ref())}"
     test_pid = self()
 
     :telemetry.attach_many(
       handler,
       Enum.map(events, &[:loopctl, :memory_promotion, &1]),
-      fn name, meas, meta, _ -> send(test_pid, {:telemetry, List.last(name), meas, meta}) end,
+      fn name, meas, meta, _ ->
+        if is_nil(tenant_id) or meta[:tenant_id] == tenant_id do
+          send(test_pid, {:telemetry, List.last(name), meas, meta})
+        end
+      end,
       nil
     )
 
@@ -172,6 +178,45 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
       assert :ok = run(scope, "s1")
       refute_received :llm_called
     end
+
+    # US-29.3 finding fix (budget-starvation): a 0/1-turn session compiles to nothing
+    # WITHOUT an LLM call, so it must NOT write a budget-consuming watermark. Otherwise
+    # an agent POSTing N distinct junk/empty session_ids (each 0 turns) could exhaust
+    # the tenant's per-hour promotion budget at zero LLM cost.
+    test "a 0-turn (junk/empty) session is a no-op: no LLM call, no watermark, no budget spent" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      # Fail the test loudly if the LLM is ever reached for a 0-turn session.
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o ->
+        send(self(), :llm_called)
+        {:ok, "[]"}
+      end)
+
+      before = Memory.promotion_compiles_this_hour(scope.tenant_id)
+
+      assert :ok = run(scope, "junk-session-id")
+
+      refute_received :llm_called
+      assert watermark(scope, "junk-session-id") == nil
+      assert all_promoted(scope) == []
+      # The watermark meter did not advance — the tenant's budget is untouched.
+      assert Memory.promotion_compiles_this_hour(scope.tenant_id) == before
+    end
+
+    test "a single-turn session is a no-op: no LLM call and no watermark" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      seed_turns(scope, "s1", ["only one turn — nothing durable to compile"])
+
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o ->
+        send(self(), :llm_called)
+        {:ok, "[]"}
+      end)
+
+      assert :ok = run(scope, "s1")
+      refute_received :llm_called
+      assert watermark(scope, "s1") == nil
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -245,6 +290,52 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
   end
 
   # ---------------------------------------------------------------------------
+  # AC-29.2.4 — promoted rows are embedded SYNCHRONOUSLY at write time, so a near-dup
+  # written earlier is immediately recallable (no async-embedding lag window in which a
+  # paraphrase could slip past `nearest_live/2` and duplicate). Under async prod this
+  # gap was previously MASKED by the :inline test engine embedding synchronously.
+  # ---------------------------------------------------------------------------
+
+  describe "persist_promotion/2 — synchronous embedding (AC-29.2.4)" do
+    test "a promoted row carries its embedding immediately (no async fill required)" do
+      scope = %{fixture(:memory_scope, subject_id: "A") | session_id: "s1"}
+      stub_embeddings(& &1)
+
+      candidates = [
+        %{text: "durable fact", when_to_apply: "", tags: [], confidence: 0.9, cross_links: []}
+      ]
+
+      assert {:ok, %{promoted: 1}} = Memory.persist_promotion(scope, candidates)
+
+      [row] = all_promoted(scope)
+      {:ok, with_embedding} = Memory.get_memory_for_embedding(scope.tenant_id, row.id)
+      # The vector is present at write time — not left NULL for an async worker.
+      refute is_nil(with_embedding.embedding)
+    end
+
+    test "two paraphrase candidates in ONE run supersede rather than both inserting fresh" do
+      scope = %{fixture(:memory_scope, subject_id: "A") | session_id: "s1"}
+      a = "customer prefers async email updates"
+      b = "this customer likes email updates asynchronously"
+      # Both paraphrases map to the SAME embedding (near-dup); different text ⇒ different
+      # hash, so exact-dedupe cannot catch it — only a synchronously-embedded first row
+      # makes the second candidate's near-dup recall find it within the same run.
+      stub_embeddings(fn text -> if text in [a, b], do: "shared", else: text end)
+
+      candidates = [
+        %{text: a, when_to_apply: "", tags: [], confidence: 0.9, cross_links: []},
+        %{text: b, when_to_apply: "", tags: [], confidence: 0.9, cross_links: []}
+      ]
+
+      assert {:ok, %{promoted: 1, superseded: 1}} = Memory.persist_promotion(scope, candidates)
+
+      all = all_promoted(scope)
+      assert length(all) == 2
+      assert length(Enum.filter(all, &is_nil(&1.superseded_by))) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # TC-29.2.5 — degraded embeddings → snooze, no duplicate
   # ---------------------------------------------------------------------------
 
@@ -306,10 +397,133 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
       stub_llm([%{text: "cannot fit", confidence: 0.9}])
 
       assert {:discard, :quota_exceeded} = run(scope, "s1")
-      assert_received {:telemetry, :quota_exceeded, _, %{tenant_id: _}}
+      # The dropped-survivor count is emitted so the loss is VISIBLE, not silent: the
+      # single compiled candidate could not be written, so dropped == 1.
+      assert_received {:telemetry, :quota_exceeded, %{count: 1, dropped: 1}, %{tenant_id: _}}
       # Watermark advanced so the unchanged session is not re-compiled just to re-hit
       # the cap.
       assert watermark(scope, "s1") != nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # AC-29.2.9 / AC-29.2.11 — compile/LLM failure is retryable AND visible
+  # ---------------------------------------------------------------------------
+
+  describe "perform/1 — compile failure (AC-29.2.9 / AC-29.2.11)" do
+    test "an LLM/compile error emits :failed telemetry, returns {:error,_}, and does NOT advance the watermark" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      attach_telemetry([:failed], scope.tenant_id)
+      seed_turns(scope, "s1", ["one", "two"])
+
+      # The BYO LLM key is bad / provider down.
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o -> {:error, :provider_down} end)
+
+      # {:error,_} → Oban retries with backoff (no {:ok}/{:discard} that would swallow it).
+      assert {:error, :provider_down} = run(scope, "s1")
+      # Visible in metrics, tagged with the failing stage.
+      assert_received {:telemetry, :failed, %{count: 1}, %{stage: :compile}}
+      # No watermark advance — a healthy retry re-attempts the same session.
+      assert watermark(scope, "s1") == nil
+      assert all_promoted(scope) == []
+    end
+
+    test "a compile failure at/above the attempt cap is TERMINALLY discarded (bounds LLM key spend)" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      seed_turns(scope, "s1", ["one", "two"])
+
+      # A persistently-failing compile burns a BYO LLM call per attempt and is NOT counted
+      # by the compiles/hour meter, so once the attempt count reaches the cap it must
+      # discard rather than retry to max_attempts (AC-29.2.8).
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o -> {:error, :provider_down} end)
+
+      job = %Oban.Job{
+        attempt: 2,
+        args: %{
+          "tenant_id" => scope.tenant_id,
+          "subject_id" => scope.subject_id,
+          "project_id" => scope.project_id,
+          "session_id" => "s1"
+        }
+      }
+
+      assert {:discard, {:compile_failed, :provider_down}} = MemoryPromotionWorker.perform(job)
+      # Still no watermark advance / no rows — the session can re-promote if content changes.
+      assert watermark(scope, "s1") == nil
+      assert all_promoted(scope) == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # AC-29.2.8 — execution-time per-tenant budget gate (closes the enqueue race)
+  # ---------------------------------------------------------------------------
+
+  describe "perform/1 — execution-time budget re-check (AC-29.2.8)" do
+    test "a compile at the per-tenant compiles/hour budget is discarded WITHOUT an LLM call" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      attach_telemetry([:budget_exceeded], scope.tenant_id)
+
+      budget = Application.get_env(:loopctl, :memory_promotion_compiles_per_hour)
+
+      # Fill this tenant's hourly budget with distinct promoted sessions.
+      for i <- 1..budget do
+        {:ok, _} =
+          Memory.upsert_session_promotion(%{scope | session_id: "seed#{i}"}, %{
+            content_hash: "h#{i}",
+            last_turn_inserted_at: DateTime.utc_now()
+          })
+      end
+
+      # Flag the LLM if it is (wrongly) called.
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o ->
+        send(self(), :llm_called)
+        {:ok, "[]"}
+      end)
+
+      seed_turns(scope, "over", ["one", "two"])
+
+      assert {:discard, :budget_exceeded} = run(scope, "over")
+      refute_received :llm_called
+      assert_received {:telemetry, :budget_exceeded, %{count: 1}, %{tenant_id: _}}
+      assert all_promoted(scope) == []
+      # No watermark advance — the next sweep re-enqueues once budget frees up.
+      assert watermark(scope, "over") == nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # AC-29.2.4 — near-dup supersede NEVER clobbers an explicit user memory
+  # ---------------------------------------------------------------------------
+
+  describe "perform/1 — near-dup is source-scoped to :promoted (AC-29.2.4)" do
+    test "a promoted candidate near an EXPLICIT memory inserts fresh; the explicit row stays live" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      shared = "customer prefers async email updates"
+      # The explicit memory and the promoted candidate share an embedding (near-dup);
+      # every other text is orthogonal.
+      stub_embeddings(fn text -> if text == shared, do: "shared", else: text end)
+
+      # The user's own explicit long-term memory.
+      {:ok, explicit} = Memory.remember(scope, %{tier: :long_term, text: shared})
+      assert explicit.source == :explicit
+
+      # Auto-promote a session whose sole survivor is a near-dup of the explicit memory.
+      seed_turns(scope, "s1", ["turn one", "turn two"])
+      stub_llm([%{text: shared, confidence: 0.9}])
+      assert :ok = run(scope, "s1")
+
+      # The unattended promoter did NOT supersede the human-authored memory: it stays
+      # live, and a fresh :promoted row was inserted instead.
+      reloaded = AdminRepo.get(MemorySchema, explicit.id)
+      assert is_nil(reloaded.superseded_by)
+
+      promoted = all_promoted(scope)
+      assert length(promoted) == 1
+      assert hd(promoted).source == :promoted
+      assert is_nil(hd(promoted).superseded_by)
     end
   end
 end

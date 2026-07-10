@@ -37,12 +37,29 @@ defmodule Loopctl.Memory.PromotionEval do
 
   ## Matching rule
 
-  An emitted nugget matches an expected fact when their NORMALIZED texts (trimmed,
-  case-folded, internal whitespace collapsed) are equal. Matching is greedy and each
-  expected fact is consumed at most once. A compiler that returns `{:error, _}` for a
-  session (e.g. a tenant with no LLM key) scores as "emitted nothing" — its expected
-  facts become false negatives, dragging RECALL down (a health signal) without ever
-  crashing the eval.
+  An emitted nugget matches an expected fact by TOKEN-OVERLAP similarity (a
+  Sørensen–Dice coefficient over case-folded word tokens) at or above a configurable
+  threshold (`:memory_promotion_eval_match_threshold`, default 0.5).
+  Matching is greedy best-first (each emitted nugget takes its highest-scoring
+  still-unclaimed expected fact) and each expected fact is consumed at most once.
+
+  Token-overlap — NOT exact string equality — is deliberate. In production the
+  compiler runs a REAL LLM whose system prompt asks for a "concise standalone
+  statement", i.e. a PARAPHRASE, so a correctly-extracted durable fact almost never
+  reproduces its label character-for-character. Exact-equality matching would score a
+  well-behaved production compiler at precision≈recall≈0 (every paraphrase a false
+  positive AND its label a false negative), which would both peg the trend at zero and
+  KILL the injection precision-drop signal AC-29.5.4 exists to produce (precision
+  already floored at 0 cannot drop further). Token overlap is still fully deterministic
+  and LABEL-DRIVEN — it is a similarity to FIXED ground-truth text, never a same-class
+  LLM re-judging the output (that circularity is why auto-promotion was shelved).
+
+  A compiler that returns `{:error, _}` for a session (e.g. a tenant with no LLM key)
+  scores as "emitted nothing" — its expected facts become false negatives, dragging
+  RECALL down (a health signal) without crashing the eval. When NOTHING is emitted
+  across all sessions (`TP+FP == 0`, the total-outage shape), `precision` is `nil`
+  (UNDEFINED — there were no predictions to be precise about), not `0.0`, so a
+  precision-floor alert does not misfire on an infra outage; read `recall` instead.
   """
 
   import Ecto.Query
@@ -58,10 +75,24 @@ defmodule Loopctl.Memory.PromotionEval do
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
 
-  # A reserved, non-guessable-collision subject the eval seeds its synthetic sessions
-  # under. It is NEVER a real API-key identity, so eval turns can never mingle with a
-  # real subject's memory, and cleanup can target it wholesale.
-  @eval_subject_id "__promotion_eval__"
+  # The reserved subject the eval seeds its synthetic sessions under, shared from the
+  # `Loopctl.Memory` context (single source of truth — the sweep worker and the
+  # durable-promotion write path reference the same value).
+  #
+  # Isolation from real subjects is a VALIDATED invariant, not a naming convention — but
+  # the mechanism is `Memory.subject_id_for/1` + a compile-time guard, NOT a column-type
+  # rejection: `subject_id_for/1` always returns a UUID *value* (an agent key's `agent_id`,
+  # else the key's own id), and `Memory`'s compile-time guard fails the build if this
+  # sentinel is ever UUID-shaped. So every real subject_id is a UUID and this sentinel
+  # deliberately is not — they provably cannot collide. (`subject_id` is actually a
+  # `:string` column on both memory schemas, so Ecto does NOT reject a non-UUID at the DB
+  # layer; that is precisely why the durable-promotion write path also refuses this
+  # subject — see `Memory.persist_promotion/2`.)
+  @eval_subject_id Memory.eval_subject_id()
+
+  # Token-overlap similarity threshold at/above which an emitted nugget is counted a
+  # match for an expected fact (see the "Matching rule" section of the moduledoc).
+  @default_match_threshold 0.5
 
   # Seeded eval turns are short-lived; they are deleted right after scoring, but carry a
   # short TTL as a belt-and-suspenders guard in case a run crashes before cleanup.
@@ -115,27 +146,45 @@ defmodule Loopctl.Memory.PromotionEval do
     day = Keyword.get(opts, :day, Date.utc_today())
     scope = %Scope{tenant_id: tenant_id, subject_id: @eval_subject_id, project_id: nil}
 
-    session_results = Enum.map(dataset.sessions, &score_session(scope, &1))
+    # Pre-generate a session_id per labeled session so the try/after cleanup can delete
+    # THIS run's seeded turns even when scoring blows up MID-map — a `Promoter.compile`
+    # crash that is an UNEXPECTED exception (LLM adapter/parser fault), not the handled
+    # `{:error, _}` tuple. Without pre-generated ids the cleanup couldn't name what was
+    # already seeded, so a crash would strand synthetic turns until the TTL reaper runs
+    # (up to `@seed_ttl_seconds`), widening the window an auto-promotion sweep could act on
+    # them.
+    sessions = Enum.map(dataset.sessions, fn session -> {new_session_id(), session} end)
+    session_ids = Enum.map(sessions, fn {session_id, _session} -> session_id end)
 
-    # Clean up ALL synthetic eval turns for this tenant (including any stranded by a
-    # prior crashed run) once scoring is done — the eval leaves no residue.
-    delete_eval_turns(tenant_id)
+    try do
+      session_results =
+        Enum.map(sessions, fn {sid, session} -> score_session(scope, sid, session) end)
 
-    tp = sum_by(session_results, :true_positives)
-    fp = sum_by(session_results, :false_positives)
-    fn_count = sum_by(session_results, :false_negatives)
+      tp = sum_by(session_results, :true_positives)
+      fp = sum_by(session_results, :false_positives)
+      fn_count = sum_by(session_results, :false_negatives)
 
-    %{
-      day: day,
-      dataset_version: dataset.version,
-      session_count: length(dataset.sessions),
-      true_positives: tp,
-      false_positives: fp,
-      false_negatives: fn_count,
-      precision: ratio(tp, tp + fp),
-      recall: ratio(tp, tp + fn_count),
-      session_results: session_results
-    }
+      %{
+        day: day,
+        dataset_version: dataset.version,
+        session_count: length(dataset.sessions),
+        true_positives: tp,
+        false_positives: fp,
+        false_negatives: fn_count,
+        precision: precision(tp, fp),
+        recall: recall(tp, fn_count),
+        session_results: session_results
+      }
+    after
+      # Clean up ONLY the synthetic turns THIS run seeded (scoped to its own per-run
+      # session_ids), so a concurrent same-tenant run (a manual `run/1` mid-cron, an Oban
+      # retry) can't wipe the other's in-flight seeds and record a spurious recall≈0
+      # snapshot. In an `after` so cleanup runs on the happy path AND when scoring raises
+      # — bounding exposure to the run's actual duration. Any turns stranded by a HARD
+      # crash (VM exit) before this still carry a TTL (`@seed_ttl_seconds`) and are reaped
+      # by `SessionMemoryPruneWorker` — the eval leaves no lasting residue either way.
+      delete_eval_turns(tenant_id, session_ids)
+    end
   end
 
   @doc """
@@ -215,9 +264,11 @@ defmodule Loopctl.Memory.PromotionEval do
   # Per-session scoring
   # ===========================================================================
 
-  # Seed a session's turns, compile via the Promoter, and score emitted-vs-expected.
-  defp score_session(scope, %{id: id, turns: turns, expected_facts: expected}) do
-    session_id = seed_session(scope, turns)
+  # Seed a session's turns under the PRE-GENERATED `session_id`, compile via the Promoter,
+  # and score emitted-vs-expected. The caller owns the id (so its try/after cleanup can
+  # name this run's turns even if compile raises) and aggregates the returned result map.
+  defp score_session(scope, session_id, %{id: id, turns: turns, expected_facts: expected}) do
+    seed_session(scope, session_id, turns)
 
     emitted =
       case Promoter.compile(scope, session_id) do
@@ -231,42 +282,75 @@ defmodule Loopctl.Memory.PromotionEval do
     %{id: id, true_positives: tp, false_positives: fp, false_negatives: fn_count}
   end
 
-  # Greedy, normalized, label-driven match. Each expected fact is consumed at most once.
-  # NOT a live LLM judge (AC-29.5.1) — deterministic text equality.
+  # Greedy best-first, token-overlap, label-driven match. Each expected fact is consumed
+  # at most once. NOT a live LLM judge (AC-29.5.1) — a deterministic similarity to FIXED
+  # ground-truth text. Token overlap (not exact equality) tolerates the compiler's
+  # paraphrase so a well-behaved production compiler scores near 1.0 and the injection
+  # precision-drop signal (AC-29.5.4) stays alive. See the moduledoc "Matching rule".
   defp match(emitted, expected) do
-    emitted_texts = Enum.map(emitted, &normalize(&1.text))
-    expected_norm = Enum.map(expected, &normalize/1)
+    emitted_tokens = Enum.map(emitted, &tokenize(&1.text))
+    expected_tokens = Enum.map(expected, &tokenize/1)
 
     {tp, remaining} =
-      Enum.reduce(emitted_texts, {0, expected_norm}, fn text, {tp, remaining} ->
-        if text in remaining do
-          {tp + 1, List.delete(remaining, text)}
-        else
-          {tp, remaining}
+      Enum.reduce(emitted_tokens, {0, expected_tokens}, fn tokens, {tp, remaining} ->
+        case best_match_index(tokens, remaining) do
+          nil -> {tp, remaining}
+          idx -> {tp + 1, List.delete_at(remaining, idx)}
         end
       end)
 
-    fp = length(emitted_texts) - tp
+    fp = length(emitted_tokens) - tp
     fn_count = length(remaining)
     {tp, fp, fn_count}
   end
 
-  defp normalize(text) do
+  # Index of the still-unclaimed expected fact with the highest token-overlap similarity
+  # to `tokens`, provided it clears the match threshold; `nil` when none qualifies.
+  defp best_match_index(tokens, expected_tokens) do
+    threshold = match_threshold()
+
+    expected_tokens
+    |> Enum.with_index()
+    |> Enum.map(fn {etoks, idx} -> {similarity(tokens, etoks), idx} end)
+    |> Enum.filter(fn {sim, _idx} -> sim >= threshold end)
+    |> case do
+      [] -> nil
+      scored -> scored |> Enum.max_by(fn {sim, _idx} -> sim end) |> elem(1)
+    end
+  end
+
+  # Sørensen–Dice coefficient over the two token SETS: 2·|A∩B| / (|A|+|B|). 1.0 for
+  # identical token sets, 0.0 for disjoint. Empty-on-either-side scores 0.0.
+  defp similarity(a, b) do
+    total = MapSet.size(a) + MapSet.size(b)
+
+    if total == 0 do
+      0.0
+    else
+      2 * MapSet.size(MapSet.intersection(a, b)) / total
+    end
+  end
+
+  # Case-folded word-token SET (letters/digits only; punctuation and whitespace split).
+  defp tokenize(text) do
     text
-    |> String.trim()
     |> String.downcase()
-    |> String.replace(~r/\s+/u, " ")
+    |> String.split(~r/[^\p{L}\p{N}]+/u, trim: true)
+    |> MapSet.new()
   end
 
   # ===========================================================================
   # Synthetic session seeding + cleanup (out of the promotion write path)
   # ===========================================================================
 
-  # Seed the session's turns as short-term memories under the reserved eval subject,
-  # returning the generated session id. A unique id per call avoids collisions across
-  # concurrent runs; expired/stranded rows are also swept by `delete_eval_turns/1`.
-  defp seed_session(scope, turns) do
-    session_id = "promeval-#{System.unique_integer([:positive])}"
+  # A unique per-call session id (generated up front in `compute/2` so cleanup can name
+  # this run's turns). Uniqueness avoids collisions across concurrent runs.
+  defp new_session_id, do: "promeval-#{System.unique_integer([:positive])}"
+
+  # Seed the session's turns as short-term memories under the reserved eval subject and
+  # the caller-supplied `session_id`. The turns carry a TTL (`@seed_ttl_seconds`) so any
+  # left stranded by a HARD crash before cleanup are reaped by `SessionMemoryPruneWorker`.
+  defp seed_session(scope, session_id, turns) do
     expires_at = DateTime.add(DateTime.utc_now(), @seed_ttl_seconds, :second)
 
     Enum.each(turns, fn content ->
@@ -280,20 +364,41 @@ defmodule Loopctl.Memory.PromotionEval do
         })
     end)
 
-    session_id
+    :ok
   end
 
-  # Delete every synthetic eval turn for this tenant (explicitly tenant + eval-subject
-  # scoped). Leaves no residue — the eval is calibration-only.
-  defp delete_eval_turns(tenant_id) do
+  # Delete only THIS run's synthetic eval turns — scoped to tenant + eval-subject AND
+  # the run's own `session_ids` — so a concurrent same-tenant run's in-flight seeds are
+  # never wiped. Stranded turns from a crashed run are TTL-reaped (see `compute/2`).
+  defp delete_eval_turns(tenant_id, session_ids) do
     from(s in SessionMemory,
-      where: s.tenant_id == ^tenant_id and s.subject_id == ^@eval_subject_id
+      where:
+        s.tenant_id == ^tenant_id and s.subject_id == ^@eval_subject_id and
+          s.session_id in ^session_ids
     )
     |> AdminRepo.delete_all()
   end
 
   defp sum_by(results, key), do: Enum.reduce(results, 0, &(&2 + Map.fetch!(&1, key)))
 
-  defp ratio(_num, 0), do: 0.0
-  defp ratio(num, denom), do: num / denom
+  # Precision is UNDEFINED (nil) when nothing was emitted (TP+FP == 0) — there were no
+  # predictions to be precise about. Returning `nil` (not 0.0) keeps a precision-floor
+  # alert from misfiring on a total LLM outage, where every session emits nothing.
+  defp precision(0, 0), do: nil
+  defp precision(tp, fp), do: tp / (tp + fp)
+
+  # Recall is UNDEFINED (nil) only when there are no expected facts at all (TP+FN == 0);
+  # a real outage has FN > 0, so recall is a well-defined 0.0 there (the health signal).
+  defp recall(0, 0), do: nil
+  defp recall(tp, fn_count), do: tp / (tp + fn_count)
+
+  @doc "Token-overlap match threshold (`:memory_promotion_eval_match_threshold`)."
+  @spec match_threshold() :: float()
+  def match_threshold do
+    Application.get_env(
+      :loopctl,
+      :memory_promotion_eval_match_threshold,
+      @default_match_threshold
+    )
+  end
 end

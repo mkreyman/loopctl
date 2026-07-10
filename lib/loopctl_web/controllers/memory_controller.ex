@@ -63,8 +63,11 @@ defmodule LoopctlWeb.MemoryController do
         "derived from the API key — NOT from the body (any tenant_id/subject_id in " <>
         "the body is ignored). `tier` selects the substrate: `long_term` (default; " <>
         "requires `text`, embedded asynchronously and recalled by semantic " <>
-        "similarity) or `session` (short-term; requires `session_id`, `content`, " <>
-        "`expires_at`). Returns 201 with the created memory. Subject to the full " <>
+        "similarity) or `session` (short-term; requires `session_id` and `content`; " <>
+        "`expires_at` is OPTIONAL — the server defaults it to now + the session-memory " <>
+        "TTL and floors any supplied value up to the promotion sweep window, so a turn " <>
+        "is always promoted before it can be pruned). Returns 201 with the created " <>
+        "memory. Subject to the full " <>
         ":authenticated chain (custody halt, witness header, rate limiting).",
     request_body: {"Memory params", "application/json", Schemas.MemoryCreateRequest},
     responses: %{
@@ -115,7 +118,10 @@ defmodule LoopctlWeb.MemoryController do
       422 =>
         {"Missing session_id or subject/tenant unresolvable", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Promotion budget exceeded", "application/json", Schemas.RateLimitError},
+      429 => {"Promotion budget exceeded", "application/json", Schemas.PromotionBudgetError},
+      500 =>
+        {"Promotion could not be enqueued (server error)", "application/json",
+         Schemas.ErrorResponse},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
   )
@@ -240,11 +246,18 @@ defmodule LoopctlWeb.MemoryController do
   def promote(conn, params) do
     with_scope(conn, fn %Scope{} = scope ->
       case Memory.promote_session(%{scope | session_id: params["session_id"]}) do
-        {:ok, %Oban.Job{} = job} ->
+        {:ok, %Oban.Job{}} ->
+          # The enqueue reference is the caller's own `session_id` (the promotion is
+          # unique per (tenant, subject, session)), NOT the raw `Oban.Job.id`. That id
+          # is a SYSTEM-WIDE monotonic bigserial: returning it to an agent-role key
+          # leaks a cross-tenant throughput side-channel (sample the counter over time
+          # → estimate aggregate platform job volume). session_id is tenant-scoped, is
+          # what the caller already supplied, and is a sufficient work reference
+          # (US-29.3 finding fix).
           conn
           |> put_status(:accepted)
           |> json(%{
-            data: %{job_id: job.id, session_id: params["session_id"], status: "enqueued"}
+            data: %{session_id: params["session_id"], status: "enqueued"}
           })
 
         {:error, :budget_exceeded} ->
@@ -268,6 +281,31 @@ defmodule LoopctlWeb.MemoryController do
               status: 422,
               code: "missing_session_id",
               message: "A non-blank `session_id` is required to promote a session."
+            }
+          })
+
+        # Catch-all for the documented `{:error, term()}` branch of
+        # `Memory.promote_session/1`. Its success path ends in `Oban.insert/1`,
+        # which returns `{:ok, job}` OR `{:error, %Ecto.Changeset{}}` (and, by
+        # spec, `{:error, term()}`). Without this clause an enqueue failure would
+        # raise CaseClauseError and escape as an UNSTRUCTURED HTTP 500 that the
+        # action_fallback cannot rescue (a raised error never returns a tuple to
+        # the action). The caller did nothing wrong (args are server-built and
+        # always valid; unique conflicts return `{:ok, existing}`, not an error),
+        # so this is a genuine server-side failure → a structured 500 envelope
+        # with a named code, NOT a client 4xx. Declared as 500 in
+        # `operation(:promote)` so the published contract covers this path.
+        {:error, _reason} ->
+          conn
+          |> put_status(:internal_server_error)
+          |> json(%{
+            error: %{
+              status: 500,
+              code: "promotion_enqueue_failed",
+              message:
+                "The promotion could not be enqueued due to an unexpected server error. " <>
+                  "No LLM call was made and no session was promoted. Please retry; if the " <>
+                  "problem persists, contact support."
             }
           })
       end
