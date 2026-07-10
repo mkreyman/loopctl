@@ -1064,6 +1064,92 @@ async function knowledgeCreate({
   return toContent(result);
 }
 
+// --- Agent Memory Tools (US-28.4) ---
+//
+// memory_* is YOUR own scoped, private, accumulated working state — recall
+// across sessions, running notes, in-flight task context. knowledge_* is the
+// curated, shared wiki. Scope (tenant_id/subject_id) is resolved SERVER-SIDE
+// from the API key (US-28.3) — these tools never accept or forward a
+// tenant_id/subject_id, so there is no way to express a cross-scope read
+// here even by mistake. Routes through the shared apiCall/witness client
+// (same as every other write tool), so witness/STH persistence + the
+// transparent 412 self-heal on a fresh MCP process apply automatically
+// (AC-28.4.3) — no bespoke witness code needed.
+
+async function memoryRemember({
+  tier,
+  text,
+  confidence,
+  tags,
+  source_session_id,
+  session_id,
+  role,
+  content,
+  expires_at,
+}) {
+  const payload = {};
+  if (tier) payload.tier = tier;
+  if (text != null) payload.text = text;
+  if (confidence != null) payload.confidence = confidence;
+  if (tags) payload.tags = tags;
+  if (source_session_id) payload.source_session_id = source_session_id;
+  if (session_id) payload.session_id = session_id;
+  if (role) payload.role = role;
+  if (content != null) payload.content = content;
+  if (expires_at) payload.expires_at = expires_at;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/memory",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function memoryRecall({ query, limit, include_superseded }) {
+  const payload = { query };
+  if (limit != null) payload.limit = limit;
+  if (include_superseded != null) payload.include_superseded = include_superseded;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/memory/recall",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
+  // a degraded recall from a genuinely empty scope (AC-28.4.4) — toContent already
+  // preserves the full result (data + meta), we just keep this call explicit.
+  return toContent(result);
+}
+
+async function memoryList({ limit, offset, include_superseded, all_subjects }) {
+  const params = new URLSearchParams();
+  if (limit != null) params.set("limit", String(limit));
+  if (offset != null) params.set("offset", String(offset));
+  if (include_superseded != null) params.set("include_superseded", String(include_superseded));
+  // Superadmin-only server-side; a non-superadmin key sending this is ignored
+  // (falls back to its own subject) rather than erroring.
+  if (all_subjects != null) params.set("all_subjects", String(all_subjects));
+
+  const qs = params.toString();
+  const path = qs ? `/api/v1/memory?${qs}` : "/api/v1/memory";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
+  // Surface meta.total_count/limit/offset (AC-28.4.4).
+  return toContent(result);
+}
+
+async function memoryForget({ id }) {
+  const result = await apiCall(
+    "DELETE",
+    `/api/v1/memory/${id}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 // --- Knowledge Management Tools (orch key) ---
 
 async function knowledgePublish({ article_id }) {
@@ -3052,6 +3138,154 @@ const TOOLS = [
     },
   },
 
+  // Agent Memory Tools (US-28.4)
+  {
+    name: "memory_remember",
+    description:
+      "Write to YOUR OWN scoped, private, accumulated working memory — running notes, " +
+      "in-flight task state, decisions you made this session — NOT the shared knowledge " +
+      "wiki. Use memory_* for private per-scope working state across sessions; use " +
+      "knowledge_* for curated, shared knowledge articles other agents should see. Scope " +
+      "(tenant_id/subject_id) is resolved server-side from your API key — never pass or " +
+      "expect a tenant_id/subject_id here; there is no way to write into another scope. " +
+      "`tier` selects the substrate: `long_term` (default; requires `text`, embedded " +
+      "asynchronously and later recalled by semantic similarity via memory_recall) or " +
+      "`session` (short-term; requires `session_id`, `content`, `expires_at` — pruned " +
+      "after expiry, not semantically recalled). Returns 201 with the stored memory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tier: {
+          type: "string",
+          enum: ["long_term", "session"],
+          description: "Memory substrate. Defaults to long_term.",
+        },
+        text: {
+          type: "string",
+          description: "Long-term memory content (required when tier=long_term).",
+        },
+        confidence: {
+          type: "number",
+          description: "Optional: confidence score (0.0-1.0) for a long-term memory.",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional: tags for a long-term memory.",
+        },
+        source_session_id: {
+          type: "string",
+          description: "Optional: the session this long-term memory was distilled from.",
+        },
+        session_id: {
+          type: "string",
+          description: "Session identifier (required when tier=session).",
+        },
+        role: {
+          type: "string",
+          enum: ["user", "assistant", "system", "fact"],
+          description: "Optional: speaker role for a session-tier turn.",
+        },
+        content: {
+          type: "string",
+          description: "Session turn content (required when tier=session).",
+        },
+        expires_at: {
+          type: "string",
+          format: "date-time",
+          description: "Prune deadline (required when tier=session).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "memory_recall",
+    description:
+      "Semantically recall YOUR OWN long-term memories most similar to `query` — private, " +
+      "scoped working state, NOT the shared knowledge wiki. Use memory_* for your scoped, " +
+      "private, accumulated working state across sessions; use knowledge_* for curated, " +
+      "shared knowledge articles. Scope is resolved server-side from your API key. When " +
+      "embedding generation is unavailable the response degrades to a recent-first text " +
+      "match with `meta.fallback: true` and a stable `meta.reason` (score is null on that " +
+      "path) — check meta.fallback before treating a short/empty result as a genuinely " +
+      "empty scope. `meta.total_count` and `meta.underfilled` are also returned so you can " +
+      "distinguish a short page from a hard cap.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Text to embed / match against.",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: max results, clamped to the vector-search max (no silent hard cap).",
+        },
+        include_superseded: {
+          type: "boolean",
+          description: "Optional: include superseded memories (default false).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "memory_list",
+    description:
+      "List YOUR OWN long-term memories, newest first — private, scoped working state, " +
+      "NOT the shared knowledge wiki. Use memory_* for your scoped, private, accumulated " +
+      "working state across sessions; use knowledge_* for curated, shared knowledge " +
+      "articles. Scope is resolved server-side from your API key. Paginated with " +
+      "`meta.total_count/limit/offset` (the true scoped count, never silently capped by " +
+      "limit) so you can distinguish an empty scope from a short page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "integer",
+          description: "Optional: page size (default 50, max 200).",
+        },
+        offset: {
+          type: "integer",
+          description: "Optional: records to skip (default 0).",
+        },
+        include_superseded: {
+          type: "boolean",
+          description: "Optional: include superseded memories (default false).",
+        },
+        all_subjects: {
+          type: "boolean",
+          description:
+            "Optional, superadmin only: list all subjects' memories in the tenant. Ignored " +
+            "(falls back to your own subject) for non-superadmin keys.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "memory_forget",
+    description:
+      "Delete one of YOUR OWN long-term memories by id — private, scoped working state, " +
+      "NOT the shared knowledge wiki. Use memory_* for your scoped, private, accumulated " +
+      "working state; use knowledge_* for curated, shared knowledge articles (delete those " +
+      "with knowledge_delete). Scope is resolved server-side from your API key: a foreign-" +
+      "subject, foreign-tenant, or unknown id returns 404 (no existence leak) rather than " +
+      "revealing whether it exists in another scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          format: "uuid",
+          description: "The UUID of the memory to forget.",
+        },
+      },
+      required: ["id"],
+    },
+  },
+
   // Knowledge Management Tools (orchestrator key)
   {
     name: "knowledge_publish",
@@ -4262,6 +4496,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_create":
       return await knowledgeCreate(args);
+
+    // Agent Memory Tools
+    case "memory_remember":
+      return await memoryRemember(args);
+
+    case "memory_recall":
+      return await memoryRecall(args);
+
+    case "memory_list":
+      return await memoryList(args);
+
+    case "memory_forget":
+      return await memoryForget(args);
 
     // Knowledge Management Tools
     case "knowledge_publish":
