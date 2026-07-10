@@ -1572,4 +1572,124 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       _ = tenant_a
     end
   end
+
+  # #331 (finding 2): resolve_conflict is visibility-scoped like update/delete/archive.
+  # The linker flags :potential_conflict on PUBLISHED articles with NO visibility
+  # filter, so a published-but-private agent memory is conflict-eligible. Without
+  # scoping, agent B could resolve a pair whose member is agent A's private memory
+  # and have the executor retire it (supersede) or synthesize it into a draft (merge).
+  describe "conflict resolution visibility isolation (#331)" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      agent_a = fixture(:agent, %{tenant_id: tenant.id})
+      agent_b = fixture(:agent, %{tenant_id: tenant.id})
+      {key_a, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent_a.id})
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent_b.id})
+
+      # A's PRIVATE memory (published → conflict-eligible) paired with a SHARED article.
+      priv =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "A-private",
+          status: :published,
+          metadata: %{"visibility" => "private", "agent_id" => to_string(agent_a.id)}
+        })
+
+      shared = fixture(:article, %{tenant_id: tenant.id, title: "Shared", status: :published})
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: priv.id,
+        target_article_id: shared.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+      |> AdminRepo.insert!()
+
+      %{
+        conn: conn,
+        tenant: tenant,
+        conn_a: auth_conn(conn, key_a),
+        conn_b: auth_conn(conn, key_b),
+        priv: priv,
+        shared: shared
+      }
+    end
+
+    test "agent B cannot supersede a pair whose member is agent A's private memory (422)",
+         ctx do
+      conn =
+        post(ctx.conn_b, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => ctx.priv.id,
+          "target_article_id" => ctx.shared.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => ctx.shared.id,
+          "confidence" => "high"
+        })
+
+      assert json_response(conn, 422)
+
+      # No verdict row → the nightly executor retires nothing; the private memory stays.
+      assert is_nil(
+               AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: ctx.tenant.id)
+             )
+
+      assert 0 == Loopctl.Knowledge.execute_conflict_resolutions(ctx.tenant.id)
+      assert AdminRepo.get!(Article, ctx.priv.id).status == :published
+    end
+
+    test "agent B cannot merge a pair whose member is agent A's private memory (422)", ctx do
+      conn =
+        post(ctx.conn_b, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => ctx.priv.id,
+          "target_article_id" => ctx.shared.id,
+          "disposition" => "merge",
+          "authoritative_article_id" => ctx.shared.id,
+          "confidence" => "high"
+        })
+
+      assert json_response(conn, 422)
+
+      assert is_nil(
+               AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: ctx.tenant.id)
+             )
+    end
+
+    test "the conflict queue hides a pair agent B cannot see; agent A (owner) sees it", ctx do
+      # Agent B: the pair contains A's private memory → excluded (empty queue).
+      b_body =
+        ctx.conn_b
+        |> get(~p"/api/v1/knowledge/conflicts")
+        |> json_response(200)
+
+      assert b_body["meta"]["total_count"] == 0
+      assert b_body["data"] == []
+
+      # Agent A owns the private member → the pair IS visible.
+      a_body =
+        ctx.conn_a
+        |> get(~p"/api/v1/knowledge/conflicts")
+        |> json_response(200)
+
+      assert a_body["meta"]["total_count"] == 1
+    end
+
+    test "agent A (owner of the private member) CAN resolve the pair it can see", ctx do
+      conn =
+        post(ctx.conn_a, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => ctx.priv.id,
+          "target_article_id" => ctx.shared.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => ctx.priv.id,
+          "confidence" => "high"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "supersede"
+
+      # Executor retires the loser (the shared article A judged non-authoritative).
+      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(ctx.tenant.id)
+      assert AdminRepo.get!(Article, ctx.shared.id).status == :superseded
+    end
+  end
 end

@@ -7,7 +7,8 @@ defmodule LoopctlWeb.ArticleController do
   - `GET /api/v1/articles` -- list articles with filters (agent+)
   - `GET /api/v1/projects/:project_id/articles` -- list project-scoped articles (agent+)
   - `GET /api/v1/articles/:id` -- get article with preloaded links (agent+)
-  - `PATCH /api/v1/articles/:id` -- update article (agent+)
+  - `PATCH /api/v1/articles/:id` -- update article content (agent+); a `status`
+    key in the body is user+ only (403 `status_change_forbidden` otherwise)
   - `DELETE /api/v1/articles/:id` -- archive article / soft delete (agent+)
 
   Role note: the whole KB *content* surface (create/update/archive/soft-delete)
@@ -16,14 +17,19 @@ defmodule LoopctlWeb.ArticleController do
   the wiki. Irreversible / custody ops stay `user`-gated elsewhere (bulk HARD
   delete, tenant/project delete). An agent editing/archiving is additionally
   scoped by article visibility (it cannot touch another agent's `private`/`owner`
-  memory — that resolves to 404, matching reads). See the "Security & Trust
-  Model" checklist in the project `CLAUDE.md` for the KB carve-out.
+  memory — that resolves to 404, matching reads). One carve-out on PATCH: a
+  caller-supplied `status` is a user+ capability (it publishes/retires/archives an
+  article, bypassing the lifecycle endpoints' transition guards), so a lower role
+  sending `status` gets 403 and must use POST /articles/:id/{publish,unpublish,
+  archive} instead. See the "Security & Trust Model" checklist in the project
+  `CLAUDE.md` for the KB carve-out.
   """
 
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.ArticleJSON
@@ -220,11 +226,15 @@ defmodule LoopctlWeb.ArticleController do
     description:
       "**PATCH /api/v1/articles/:id** — updates an existing article in place. Send only " <>
         "the fields to change; supported keys are `title`, `body`, `tags` (replaces the " <>
-        "whole array), `category`, `status`, `metadata`, and `project_id`. Partial updates " <>
+        "whole array), `category`, `metadata`, and `project_id`. Partial updates " <>
         "are supported (e.g. body-only to tidy a hub, or tags-only). `tenant_id` is never " <>
         "accepted from the body. Returns the full updated article. A changed `body`/`tags` " <>
-        "re-triggers embedding/linking. Role: agent+ (KB content curation; an agent may " <>
-        "only edit articles it can see — another agent's private/owner memory 404s).",
+        "re-triggers embedding/linking. Role: agent+ for content edits (KB content curation; " <>
+        "an agent may only edit articles it can see — another agent's private/owner memory " <>
+        "404s). `status` is a **user+**-only key on PATCH (a `status` in the body from a " <>
+        "lower role returns 403 `status_change_forbidden`); agents/orchestrators change " <>
+        "lifecycle via the dedicated endpoints — POST /articles/:id/publish (orchestrator+), " <>
+        "/unpublish (user+), /archive (agent+) — which enforce the transition guards.",
     parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
     request_body:
       {"Update params", "application/json",
@@ -233,6 +243,10 @@ defmodule LoopctlWeb.ArticleController do
       200 =>
         {"Updated article", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      403 =>
+        {"Forbidden — a `status` change on PATCH requires role user+ (code " <>
+           "status_change_forbidden); use the lifecycle endpoints instead", "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -543,7 +557,47 @@ defmodule LoopctlWeb.ArticleController do
 
   @doc "PATCH /api/v1/articles/:id"
   def update(conn, %{"id" => article_id} = params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+
+    # #331 privilege-bypass guard: a caller-supplied `status` on PATCH is a user+
+    # capability. `Article.update_changeset/2` CASTS :status with NO
+    # `valid_transition?/2` enforcement (the schema trusts it), so an agent PATCHing
+    # {"status":"published"} would publish a draft — bypassing the orchestrator-gated
+    # publish REVIEW that #331 deliberately keeps at orchestrator+ — and
+    # {"status":"superseded"/"archived"} would change lifecycle directly, bypassing
+    # the workflow transition guards + the supersede link/confidence flow. On master
+    # `update` was user-role, so caller-set status was already a trusted user+
+    # capability; gating (not stripping) at user+ reverts exactly the #331-introduced
+    # agent exposure without changing user behavior. Agents/orchestrators use the
+    # lifecycle endpoints (publish/unpublish/archive). Whole-request reject (not a
+    # silent strip) so the caller isn't misled into thinking the status change applied.
+    if status_change_forbidden?(params, api_key) do
+      conn
+      |> put_status(:forbidden)
+      |> json(%{
+        error: %{
+          status: 403,
+          code: "status_change_forbidden",
+          message:
+            "Changing article status is not available on PATCH for your role. Use the " <>
+              "lifecycle endpoints: POST /articles/:id/publish (orchestrator+), " <>
+              "/unpublish (user+), /archive (agent+)."
+        }
+      })
+    else
+      do_update(conn, article_id, params, api_key)
+    end
+  end
+
+  # A `status` key in the PATCH body is only honoured for user-or-higher (see
+  # update/2's guard). role_at_least?/2 is true for :user and :superadmin only, so
+  # :agent and :orchestrator are denied.
+  defp status_change_forbidden?(params, api_key) do
+    Map.has_key?(params, "status") and not Role.role_at_least?(api_key.role, :user)
+  end
+
+  defp do_update(conn, article_id, params, api_key) do
+    tenant_id = api_key.tenant_id
     # Visibility scope (#163/#331): an agent may only edit an article it can see.
     # Another agent's private/owner memory resolves to :not_found (404), matching
     # the read paths; higher roles pass no scope and can edit anything in-tenant.
@@ -569,7 +623,7 @@ defmodule LoopctlWeb.ArticleController do
       # metadata may only attribute it to its OWN verified key identity — stamp
       # metadata.agent_id from the key (overriding any spoofed value); an agent
       # with no key identity can't attribute a memory → 403.
-      case bind_agent_identity(conn.assigns.current_api_key, taken) do
+      case bind_agent_identity(api_key, taken) do
         {:ok, attrs} ->
           render_update(conn, Knowledge.update_article(tenant_id, article_id, attrs, opts))
 

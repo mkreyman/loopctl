@@ -716,6 +716,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         []
         |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        # Visibility scope (#331): an agent must not even see a conflict pair whose
+        # member is another agent's private/owner memory — parity with resolve.
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       result = Knowledge.list_potential_conflicts(tenant_id, opts)
 
@@ -737,7 +740,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   end
 
   defp do_resolve_conflict(conn, tenant_id, params) do
-    audit_opts = AuditContext.from_conn(conn)
+    # Visibility scope (#331): an agent may only resolve a pair whose BOTH members
+    # it can see — annotate_conflict/3 refuses an invisible member as :no_potential_conflict
+    # (422), matching the update/delete/archive paths. Higher roles pass no scope.
+    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -749,7 +755,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       "confidence" => params["confidence"]
     }
 
-    case Knowledge.annotate_conflict(tenant_id, attrs, audit_opts) do
+    case Knowledge.annotate_conflict(tenant_id, attrs, opts) do
       {:ok, resolution} ->
         conn
         |> put_status(:created)
