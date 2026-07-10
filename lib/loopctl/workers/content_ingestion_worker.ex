@@ -53,6 +53,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Net.UrlGuard
+  alias Loopctl.SystemConfig
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
   @content_extractor Application.compile_env(
@@ -74,19 +75,32 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   #     a later timeout/failure — see ingest_chunks/2), and
   #   * scale the job timeout by chunk count with a hard cap.
   #
-  # Concrete values:
-  #   * @per_chunk_timeout_ms = 30s — ~2x+ headroom over the observed 7–13s so a
-  #     healthy chunk is never falsely timed out under tail latency/variance.
-  #   * @max_job_timeout_ms   = 6 min — the ABSOLUTE ceiling a single job may hold
-  #     a :knowledge slot (concurrency 5), independent of chunk count. Bounds abuse
-  #     (GHSA-j7m9-ffmr-pwhm) while comfortably covering a realistic large doc.
-  #   * @max_chunks = cap / per_chunk = 12 — a document chunking to MORE than this
-  #     (>~96KB) can't be guaranteed within the cap, so we ingest the first
-  #     @max_chunks (persisted incrementally) and {:discard} the rest cleanly with
-  #     a count, rather than crash-looping or silently losing everything.
-  @per_chunk_timeout_ms :timer.seconds(30)
-  @max_job_timeout_ms :timer.minutes(6)
-  @max_chunks div(@max_job_timeout_ms, @per_chunk_timeout_ms)
+  # These budgets are now DB-backed and live-tunable via `Loopctl.SystemConfig`
+  # (no redeploy to adjust). The in-code defaults below match the seeded rows and
+  # apply on a cache miss (safe degrade):
+  #   * per_chunk_timeout_ms/0 = 60s (default) — ample headroom over the observed
+  #     7–13s so a healthy chunk is never falsely timed out under tail latency,
+  #     with room for one internal extractor retry (see ClaudeContentExtractor).
+  #   * max_job_timeout_ms/0   = 6 min (default) — the ABSOLUTE ceiling a single
+  #     job may hold a :knowledge slot (concurrency 5), independent of chunk count.
+  #     Bounds abuse (GHSA-j7m9-ffmr-pwhm) while covering a realistic large doc.
+  #   * max_chunks/0 = cap / per_chunk = 6 (at the defaults) — a document chunking
+  #     to MORE than this can't be guaranteed within the cap, so we ingest the
+  #     first max_chunks (persisted incrementally) and {:discard} the rest cleanly
+  #     with a count, rather than crash-looping or silently losing everything.
+  defp per_chunk_timeout_ms,
+    do: SystemConfig.get_int("ingestion_per_chunk_timeout_ms", 60_000)
+
+  defp max_job_timeout_ms,
+    do: SystemConfig.get_int("ingestion_max_job_timeout_ms", 360_000)
+
+  # Derived at runtime from the two live budgets. Guarded against a
+  # (mis)configured per-chunk value of 0 so the worker can never divide by zero,
+  # and floored at 1 chunk.
+  defp max_chunks do
+    per_chunk = per_chunk_timeout_ms()
+    if per_chunk > 0, do: max(div(max_job_timeout_ms(), per_chunk), 1), else: 1
+  end
 
   # ON CONFLICT arbiter for the partial `articles_tenant_idempotency_key_idx`
   # (WHERE idempotency_key IS NOT NULL). A partial index can only be inferred as
@@ -195,19 +209,19 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   # Per-job wall-clock cap that SCALES with chunk count (#264), floored at one
-  # chunk and hard-capped at @max_job_timeout_ms. A hostile/slow endpoint still
+  # chunk and hard-capped at max_job_timeout_ms/0. A hostile/slow endpoint still
   # can't pin a :knowledge queue slot beyond the cap (worker-01 /
   # GHSA-j7m9-ffmr-pwhm), while a legitimate multi-chunk document now gets enough
   # wall-clock to finish. For a URL job the fetched size is unknown until fetch,
-  # so we grant the full capped budget; perform/1 self-limits to @max_chunks and
+  # so we grant the full capped budget; perform/1 self-limits to max_chunks/0 and
   # persists incrementally, so the cap is a backstop, not the mechanism.
   @impl Oban.Worker
   def timeout(%Oban.Job{args: args}) do
     args
     |> chunk_count_for_timeout()
     |> max(1)
-    |> Kernel.*(@per_chunk_timeout_ms)
-    |> min(@max_job_timeout_ms)
+    |> Kernel.*(per_chunk_timeout_ms())
+    |> min(max_job_timeout_ms())
   end
 
   defp chunk_count_for_timeout(%{"content" => content})
@@ -216,7 +230,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   end
 
   defp chunk_count_for_timeout(%{"url" => url}) when is_binary(url) and url != "" do
-    @max_chunks
+    max_chunks()
   end
 
   defp chunk_count_for_timeout(_), do: 1
@@ -226,7 +240,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # Ingest a document chunk-by-chunk, PERSISTING each chunk's articles as it
   # completes (#264). A timeout or mid-run failure therefore keeps the articles
   # already extracted instead of discarding everything. Documents that chunk
-  # beyond @max_chunks are ingested up to that bound and the remainder is
+  # beyond max_chunks/0 are ingested up to that bound and the remainder is
   # {:discard}ed cleanly (with a count) rather than silently lost.
   defp ingest_chunks(ctx, content) do
     # Key the per-chunk idempotency/skip on a hash of the ACTUALLY-RESOLVED bytes
@@ -242,7 +256,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
     chunks = ContentChunker.chunk(content)
     chunk_count = length(chunks)
-    {processable, dropped} = Enum.split(chunks, @max_chunks)
+    {processable, dropped} = Enum.split(chunks, max_chunks())
 
     if chunk_count > 1 do
       Logger.info(
@@ -386,7 +400,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   #     job :completed and permanently lose the failed chunk (Finding 2).
   #   * ONLY permanent errors (4xx that a retry can't fix) → {:discard} so it
   #     doesn't retry forever; whatever persisted stays committed.
-  #   * dropped chunks (document > @max_chunks) → {:discard} with an ACCURATE
+  #   * dropped chunks (document > max_chunks/0) → {:discard} with an ACCURATE
   #     attempted-chunk count (Finding 3).
   #   * otherwise → :ok.
   defp finalize_ingest(
@@ -464,8 +478,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   defp constraint_violation?(_), do: false
 
   defp too_large_message(chunk_count, dropped, inserted, attempted) do
-    "document too large: #{chunk_count} chunks exceed the #{@max_chunks}-chunk per-job " <>
-      "budget (cap #{div(@max_job_timeout_ms, 1000)}s); persisted #{inserted} article(s) " <>
+    "document too large: #{chunk_count} chunks exceed the #{max_chunks()}-chunk per-job " <>
+      "budget (cap #{div(max_job_timeout_ms(), 1000)}s); persisted #{inserted} article(s) " <>
       "from #{attempted} attempted chunk(s), #{length(dropped)} chunk(s) not processed"
   end
 

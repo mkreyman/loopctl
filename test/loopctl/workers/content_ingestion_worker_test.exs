@@ -1184,9 +1184,10 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   # --- #264: the job timeout scales with chunk count (bounded by the cap) ---
 
   describe "timeout/1 scales with chunk count (#264)" do
-    test "a single-chunk job gets the base 30s budget" do
+    test "a single-chunk job gets the base 60s budget" do
       job = %Oban.Job{args: %{"content" => "small", "content_hash" => "t", "source_type" => "x"}}
-      assert ContentIngestionWorker.timeout(job) == :timer.seconds(30)
+      # per-chunk budget is now DB-backed (SystemConfig), default 60s.
+      assert ContentIngestionWorker.timeout(job) == :timer.seconds(60)
     end
 
     test "a multi-chunk job gets a larger, chunk-scaled budget" do
@@ -1199,12 +1200,12 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       big_timeout = ContentIngestionWorker.timeout(big)
 
       assert big_timeout > ContentIngestionWorker.timeout(small)
-      # 4 chunks * 30s = 120s, still under the cap.
-      assert big_timeout == 4 * :timer.seconds(30)
+      # 4 chunks * 60s = 240s, still under the 6-min cap.
+      assert big_timeout == 4 * :timer.seconds(60)
     end
 
     test "the timeout is hard-capped for a very large document" do
-      # 40 sections -> ~40 chunks; 40 * 30s = 1200s would blow past the cap, so
+      # 40 sections -> ~40 chunks; 40 * 60s = 2400s would blow past the cap, so
       # the timeout must clamp to the 6-minute ceiling.
       huge = %Oban.Job{args: %{"content" => multi_chunk_content(40), "source_type" => "x"}}
       assert ContentIngestionWorker.timeout(huge) == :timer.minutes(6)
@@ -1222,8 +1223,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     test "a document exceeding the per-job chunk budget persists what fits, then discards cleanly" do
       %{tenant: tenant} = setup_tenant()
 
-      # 14 sections -> 14 chunks, above the 12-chunk per-job budget. Each chunk
-      # yields one article; the first 12 persist, the rest are discarded.
+      # 14 sections -> 14 chunks, above the 6-chunk per-job budget (max_job 6min /
+      # per_chunk 60s). Each chunk yields one article; the first 6 persist, the
+      # rest are discarded.
       Mox.stub(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
                                                                        _chunk,
                                                                        _opts ->
