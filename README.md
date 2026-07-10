@@ -65,6 +65,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | **Cost Summary** | An aggregated view of token usage per agent, with efficiency rankings and model mix breakdown. |
 | **Cost Anomaly** | A story whose token consumption deviates beyond a configurable multiplier from the project baseline, flagged automatically. |
 | **Agent Memory** | An agent subject's private working memory, isolated per `(tenant, subject_id)`: short-term **session** turns (chronological, TTL-pruned) and long-term, vector-embedded **facts** (semantically recalled, supersede/forget lifecycle). Distinct from the shared Knowledge Wiki. |
+| **Memory Promotion** | Unattended compilation of a session's short-term turns into durable long-term `:promoted` memories (via `POST /api/v1/memory/promote`, the `memory_promote` tool, or an hourly sweep). Watermark-idempotent, per-tenant budget-bounded, confidence-gated, hash-deduped/superseded, and prompt-injection-resistant. See [`docs/agent-memory.md`](docs/agent-memory.md). |
 | **Subject** | The owner of a memory scope, derived server-side from the API key: an agent key's `agent_id` (so rotated keys share one memory), else the key's own id. Never client-supplied. |
 
 ## Tech Stack
