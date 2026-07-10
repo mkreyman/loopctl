@@ -31,12 +31,23 @@ defmodule Loopctl.Memory.SessionPromotion do
     field :session_id, :string
     field :session_content_hash, :string
     field :last_turn_inserted_at, :utc_datetime_usec
+    # The monotonic `seq` of the newest turn seen at the last compile — the sweep's
+    # tiebreaker when a turn is appended at the exact microsecond of
+    # `last_turn_inserted_at` (US-29.2 review hardening). Nullable: legacy rows written
+    # before this column keep NULL and are handled by the sweep's NULL-safe comparison.
+    field :last_turn_seq, :integer
     field :promoted_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
   end
 
-  @cast_fields [:session_id, :session_content_hash, :last_turn_inserted_at, :promoted_at]
+  @cast_fields [
+    :session_id,
+    :session_content_hash,
+    :last_turn_inserted_at,
+    :last_turn_seq,
+    :promoted_at
+  ]
 
   @doc """
   Changeset for inserting/upserting a promotion watermark.

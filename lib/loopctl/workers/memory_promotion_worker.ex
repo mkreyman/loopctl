@@ -121,15 +121,17 @@ defmodule Loopctl.Workers.MemoryPromotionWorker do
         PromotionTelemetry.emit(:skipped, %{count: 1}, meta(scope, session_id))
         :ok
 
-      # AC-29.2.8 execution-time budget gate. `promote_session/1` and the sweep check the
-      # per-tenant compiles/hour budget at ENQUEUE, but check-then-enqueue is not atomic
-      # and a concurrent burst of distinct-session jobs can all pass that pre-check. This
-      # RE-CHECK — right before the LLM compile — tightens the guarantee: as earlier jobs
-      # execute and advance the watermark count, later jobs bail here WITHOUT an LLM call,
-      # so a spamming agent cannot overshoot the cap by the full burst size. A watermark
-      # skip above is free (no LLM) and is intentionally NOT budget-gated. Terminal
-      # discard (no retry loop against the same wall); the next sweep re-enqueues if the
-      # session still needs promotion.
+      # AC-29.2.8 execution-time budget gate — the REAL cost boundary. `promote_session/1`
+      # reserves atomically (per-tenant advisory lock), but the sweep's enqueue pre-check
+      # is UNLOCKED, so a concurrent burst of distinct-session jobs can all pass that
+      # pre-check and overshoot the compiles/hour cap by a small, bounded amount (roughly
+      # ~memory-queue-concurrency) before any watermark advances. This RE-CHECK — right
+      # before the LLM compile — is what actually caps the BYO-key spend: as earlier jobs
+      # execute and advance the watermark count, later jobs in the burst bail here WITHOUT
+      # an LLM call, so the overshoot converts to cheap no-ops rather than real compiles.
+      # A watermark skip above is free (no LLM) and is intentionally NOT budget-gated.
+      # Terminal discard (no retry loop against the same wall); the next sweep re-enqueues
+      # if the session still needs promotion.
       not Memory.promotion_budget_available?(scope.tenant_id) ->
         PromotionTelemetry.emit(:budget_exceeded, %{count: 1}, meta(scope, session_id))
         {:discard, :budget_exceeded}

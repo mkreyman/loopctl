@@ -1059,6 +1059,7 @@ defmodule Loopctl.Memory do
   @spec upsert_session_promotion(Scope.t(), %{
           :content_hash => String.t(),
           :last_turn_inserted_at => DateTime.t() | nil,
+          optional(:last_turn_seq) => integer() | nil,
           optional(atom()) => any()
         }) :: {:ok, SessionPromotion.t()} | {:error, Ecto.Changeset.t()}
   def upsert_session_promotion(%Scope{session_id: session_id} = scope, fingerprint)
@@ -1067,6 +1068,7 @@ defmodule Loopctl.Memory do
       session_id: session_id,
       session_content_hash: fingerprint.content_hash,
       last_turn_inserted_at: fingerprint.last_turn_inserted_at,
+      last_turn_seq: Map.get(fingerprint, :last_turn_seq),
       promoted_at: DateTime.utc_now()
     }
 
@@ -1074,7 +1076,14 @@ defmodule Loopctl.Memory do
     |> SessionPromotion.upsert_changeset(attrs)
     |> AdminRepo.insert(
       on_conflict:
-        {:replace, [:session_content_hash, :last_turn_inserted_at, :promoted_at, :updated_at]},
+        {:replace,
+         [
+           :session_content_hash,
+           :last_turn_inserted_at,
+           :last_turn_seq,
+           :promoted_at,
+           :updated_at
+         ]},
       conflict_target: [:tenant_id, :subject_id, :session_id]
     )
   end

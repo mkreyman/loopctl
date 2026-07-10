@@ -223,5 +223,46 @@ defmodule Loopctl.Workers.MemoryPromotionSweepWorkerTest do
       assert watermark_count() == count_after_first
       assert length(promoted_for(tenant.id, "A")) == 1
     end
+
+    # US-29.2 review hardening: the pre-filter used a STRICT `max(inserted_at) >
+    # last_turn_inserted_at`, so a turn appended at the EXACT microsecond of the stored
+    # watermark tied the comparison and was permanently skipped. The monotonic `seq`
+    # tiebreak must still surface it.
+    test "a turn appended at the watermark's exact microsecond is still detected via seq" do
+      stub_llm("wm fact")
+      tenant = fixture(:tenant)
+      scope = %Loopctl.Memory.Scope{tenant_id: tenant.id, subject_id: "A"}
+      seed_turns(tenant.id, "A", "s1", ["one", "two"])
+
+      # First sweep promotes + watermarks: last_turn_inserted_at/seq = the newest turn.
+      assert :ok = MemoryPromotionSweepWorker.perform(%Oban.Job{args: %{}})
+      wm1 = Loopctl.Memory.get_session_promotion(scope, "s1")
+      assert is_integer(wm1.last_turn_seq)
+
+      # Append a NEW turn at the EXACT microsecond of the watermark. `seq` is a
+      # strictly-monotonic bigserial, so this turn gets a HIGHER seq while tying on
+      # inserted_at — the case the strict-`>` pre-filter dropped forever.
+      new_turn =
+        %SessionMemory{
+          tenant_id: tenant.id,
+          subject_id: "A",
+          session_id: "s1",
+          role: :user,
+          content: "three — a NEW durable fact at the same microsecond",
+          metadata: %{},
+          expires_at: DateTime.add(DateTime.utc_now(), 3600, :second),
+          inserted_at: wm1.last_turn_inserted_at
+        }
+        |> AdminRepo.insert!()
+
+      assert new_turn.seq > wm1.last_turn_seq
+
+      # Second sweep must re-enqueue → re-compile → advance the watermark's seq to the
+      # newly-appended turn (proving the same-microsecond turn was detected).
+      assert :ok = MemoryPromotionSweepWorker.perform(%Oban.Job{args: %{}})
+      wm2 = Loopctl.Memory.get_session_promotion(scope, "s1")
+      assert wm2.last_turn_seq == new_turn.seq
+      assert wm2.last_turn_seq > wm1.last_turn_seq
+    end
   end
 end

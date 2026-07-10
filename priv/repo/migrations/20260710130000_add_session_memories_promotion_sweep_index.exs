@@ -27,6 +27,16 @@ defmodule Loopctl.Repo.Migrations.AddSessionMemoriesPromotionSweepIndex do
   @index "session_memories_promotion_sweep_index"
 
   def up do
+    # A CREATE INDEX CONCURRENTLY that fails midway (crash, lock timeout, deploy killed)
+    # leaves a permanently-INVALID index behind. On the next deploy, `IF NOT EXISTS`
+    # matches that invalid leftover BY NAME and skips the rebuild — the migration records
+    # as complete while the index stays unusable and every sweep silently full-scans.
+    # Dropping any leftover FIRST (also CONCURRENTLY, IF EXISTS so a clean DB is a no-op)
+    # guarantees the CREATE always rebuilds from a known-clean state. Two separate
+    # statements are required — each CONCURRENTLY op runs outside a transaction, which is
+    # why @disable_ddl_transaction is set.
+    execute("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
+
     execute("""
     CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@index}
       ON session_memories (tenant_id, subject_id, session_id, inserted_at)

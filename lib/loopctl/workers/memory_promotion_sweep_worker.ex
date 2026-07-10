@@ -85,7 +85,7 @@ defmodule Loopctl.Workers.MemoryPromotionSweepWorker do
 
     {_count, allocated, seen} =
       Enum.reduce_while(sessions, {0, %{}, %{}}, fn session, {count, allocated, seen} ->
-        {tenant_id, _subject_id, _session_id, _last_at} = session
+        {tenant_id, _subject_id, _session_id, _last_at, _last_seq} = session
         seen = Map.update(seen, tenant_id, 1, &(&1 + 1))
 
         cond do
@@ -104,9 +104,25 @@ defmodule Loopctl.Workers.MemoryPromotionSweepWorker do
     :ok
   end
 
-  defp maybe_enqueue({tenant_id, subject_id, session_id, _last_at}, count, allocated, seen) do
+  defp maybe_enqueue(
+         {tenant_id, subject_id, session_id, _last_at, _last_seq},
+         count,
+         allocated,
+         seen
+       ) do
     used = Map.get(allocated, tenant_id, 0)
 
+    # KNOWN BOUNDED OVERSHOOT (reviewer-flagged, by design): unlike the explicit
+    # `promote_session/1` path — whose reservation is atomic under a per-tenant advisory
+    # lock — this sweep pre-check reads the compiles/hour budget WITHOUT a lock. So this
+    # tick's sweep and up to ~memory-queue-concurrency in-flight per-session workers can
+    # each pass their check before any of them advances a watermark, letting the tenant
+    # overshoot the compiles/hour cap by a small, bounded amount (roughly the queue
+    # concurrency) before the watermark counts self-correct. That is acceptable: the
+    # per-session worker's EXECUTION-TIME re-check (see MemoryPromotionWorker.perform's
+    # `not promotion_budget_available?` branch) is the real cost boundary — it bails
+    # WITHOUT an LLM call as earlier jobs land, capping the actual BYO-key spend. This
+    # unlocked pre-check exists only to avoid enqueuing obviously-over-budget work.
     if Memory.promotion_budget_available?(tenant_id, used) do
       case enqueue(tenant_id, subject_id, session_id) do
         {:ok, _job} ->
@@ -144,13 +160,22 @@ defmodule Loopctl.Workers.MemoryPromotionSweepWorker do
     |> Oban.insert()
   end
 
-  # Distinct (tenant_id, subject_id, session_id) with the session's newest-turn time,
-  # across ALL tenants (BYPASSRLS). Single-turn sessions are excluded. The watermark
-  # filter is applied IN SQL (LEFT JOIN session_promotions, HAVING newest-turn exceeds
-  # the watermark) BEFORE the LIMIT, so already-promoted/unchanged sessions never consume
-  # a scan slot. Oldest-active first (`asc: max(inserted_at)`) so sessions nearest their
-  # prune deadline are enqueued first, bounding AC-29.2.10 starvation (prune deletes
+  # Distinct (tenant_id, subject_id, session_id) with the session's newest-turn time AND
+  # monotonic seq, across ALL tenants (BYPASSRLS). Single-turn sessions are excluded. The
+  # watermark filter is applied IN SQL (LEFT JOIN session_promotions, HAVING newest-turn
+  # exceeds the watermark) BEFORE the LIMIT, so already-promoted/unchanged sessions never
+  # consume a scan slot. Oldest-active first (`asc: max(inserted_at)`) so sessions nearest
+  # their prune deadline are enqueued first, bounding AC-29.2.10 starvation (prune deletes
   # oldest-first).
+  #
+  # "Exceeds the watermark" is a COMPOSITE (inserted_at, seq) comparison, not a bare
+  # `max(inserted_at) >`: a turn appended at the EXACT microsecond of the stored
+  # `last_turn_inserted_at` ties on time, so we tiebreak on the strictly-monotonic
+  # `seq` — without it that turn would be filtered out here forever and never promoted.
+  # A legacy watermark with a NULL `last_turn_seq` (written before that column) can't be
+  # seq-compared, so a same-microsecond match against it is treated as "changed" and
+  # re-enqueued ONCE — the worker's content-hash gate makes that cheap when genuinely
+  # unchanged, and the next upsert populates `last_turn_seq`.
   #
   # The reserved promotion-eval subject (`Memory.eval_subject_id/0`) is excluded
   # STRUCTURALLY here: the eval (US-29.5) seeds synthetic labeled sessions — including an
@@ -167,23 +192,46 @@ defmodule Loopctl.Workers.MemoryPromotionSweepWorker do
       on:
         w.tenant_id == s.tenant_id and w.subject_id == s.subject_id and
           w.session_id == s.session_id,
-      group_by: [s.tenant_id, s.subject_id, s.session_id, w.last_turn_inserted_at],
+      group_by: [
+        s.tenant_id,
+        s.subject_id,
+        s.session_id,
+        w.last_turn_inserted_at,
+        w.last_turn_seq
+      ],
       having:
         count(s.id) > 1 and
-          (is_nil(w.last_turn_inserted_at) or max(s.inserted_at) > w.last_turn_inserted_at),
+          (is_nil(w.last_turn_inserted_at) or
+             max(s.inserted_at) > w.last_turn_inserted_at or
+             (max(s.inserted_at) == w.last_turn_inserted_at and
+                (is_nil(w.last_turn_seq) or max(s.seq) > w.last_turn_seq))),
       order_by: [asc: max(s.inserted_at)],
       limit: ^limit,
-      select: {s.tenant_id, s.subject_id, s.session_id, max(s.inserted_at)}
+      select: {s.tenant_id, s.subject_id, s.session_id, max(s.inserted_at), max(s.seq)}
     )
     |> AdminRepo.all()
   end
 
-  defp watermark_current?({tenant_id, subject_id, session_id, last_at}) do
+  # Belt-and-suspenders re-check between the candidate query and the enqueue: skip only
+  # when the watermark already COVERS the newest turn (it advanced since the query, e.g.
+  # an explicit trigger promoted the session). "Covers" is the SAME composite
+  # (inserted_at, seq) comparison the SQL HAVING uses — a bare `inserted_at` equality
+  # here would re-skip a same-microsecond newer-seq turn and silently undo the HAVING
+  # tiebreak. A NULL stored `last_turn_seq` (legacy row) at an equal microsecond is NOT
+  # treated as covering (fall through to enqueue; the content-hash gate keeps it cheap).
+  defp watermark_current?({tenant_id, subject_id, session_id, last_at, last_seq}) do
     scope = %Scope{tenant_id: tenant_id, subject_id: subject_id}
 
     case Memory.get_session_promotion(scope, session_id) do
-      %{last_turn_inserted_at: %DateTime{} = wm_at} -> DateTime.compare(wm_at, last_at) == :eq
-      _ -> false
+      %{last_turn_inserted_at: %DateTime{} = wm_at} = wm ->
+        case DateTime.compare(wm_at, last_at) do
+          :gt -> true
+          :eq -> not is_nil(wm.last_turn_seq) and wm.last_turn_seq >= last_seq
+          :lt -> false
+        end
+
+      _ ->
+        false
     end
   end
 

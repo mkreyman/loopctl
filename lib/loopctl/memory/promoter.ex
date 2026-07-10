@@ -108,29 +108,36 @@ defmodule Loopctl.Memory.Promoter do
   Used by US-29.2's promotion watermark: the `content_hash` is a deterministic
   SHA-256 hex over the SAME assembled turns `compile/2` would send to the LLM (same
   ordering, same read window), so an unchanged session hashes identically across runs
-  and is skipped. `last_turn_inserted_at` is the newest loaded turn's insert time (a
-  cheap monotonic pre-filter for the sweep), and `turn_count` is how many turns were
-  assembled.
+  and is skipped. `last_turn_inserted_at` is the newest loaded turn's insert time and
+  `last_turn_seq` its monotonic `seq` — together a cheap pre-filter for the sweep
+  (`seq` tiebreaks a turn appended at the same microsecond as the stored watermark).
+  `turn_count` is how many turns were assembled.
 
-  A session with no turns yields the hash of the empty string and a nil
-  `last_turn_inserted_at`. This never calls the LLM and never crosses scope (its
-  `session_history/2` read is scope-enforced).
+  A session with no turns yields the hash of the empty string, a nil
+  `last_turn_inserted_at`, and a nil `last_turn_seq`. This never calls the LLM and never
+  crosses scope (its `session_history/2` read is scope-enforced).
   """
   @spec session_fingerprint(Scope.t(), String.t()) :: %{
           content_hash: String.t(),
           last_turn_inserted_at: DateTime.t() | nil,
+          last_turn_seq: integer() | nil,
           turn_count: non_neg_integer()
         }
   def session_fingerprint(%Scope{} = scope, session_id) when is_binary(session_id) do
     turns = load_turns(scope, session_id)
     content = assemble_content(turns)
+    last_turn = List.last(turns)
 
     %{
       content_hash: :sha256 |> :crypto.hash(content) |> Base.encode16(case: :lower),
-      last_turn_inserted_at: turns |> List.last() |> turn_inserted_at(),
+      last_turn_inserted_at: turn_inserted_at(last_turn),
+      last_turn_seq: turn_seq(last_turn),
       turn_count: length(turns)
     }
   end
+
+  defp turn_seq(nil), do: nil
+  defp turn_seq(%{seq: seq}), do: seq
 
   defp turn_inserted_at(nil), do: nil
   defp turn_inserted_at(%{inserted_at: inserted_at}), do: inserted_at
