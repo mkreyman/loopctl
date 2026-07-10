@@ -48,7 +48,7 @@ defmodule Loopctl.ContextRetriever.Executor do
   ## Indexed full-text search (AC-30.3.4)
 
   `:search` runs `search_vector @@ websearch_to_tsquery('english', ?)` against the
-  GIN-indexed generated `tsvector` column added to each backing table by
+  GIN-indexed, trigger-maintained `tsvector` column added to each backing table by
   `20260712000000_add_search_vectors_to_backing_tables.exs` — NOT an on-the-fly
   `to_tsvector` sequential scan, and NOT `ILIKE`.
 
@@ -138,6 +138,8 @@ defmodule Loopctl.ContextRetriever.Executor do
           | :search_not_indexed
           | :stale_entity
           | :audit_failed
+          | :invalid_params
+          | :unsupported_filter_type
 
   @doc """
   Executes a generated Context-Retriever tool call.
@@ -160,7 +162,10 @@ defmodule Loopctl.ContextRetriever.Executor do
     * `{:ok, %{results: [map()], meta: %{total_count, limit, offset}}}`
     * `{:error, atom()}` where atom is one of `:no_tenant`, `:unknown_entity`,
       `:field_not_allowlisted`, `:invalid_operation`, `:search_not_indexed`,
-      `:stale_entity`, `:audit_failed`.
+      `:stale_entity`, `:audit_failed`, `:invalid_params` (malformed call —
+      non-`Scope` scope, non-tuple dispatch, or non-map params),
+      `:unsupported_filter_type` (equality filter on a `:decimal` column, which
+      only supports representation-fragile exact equality — rejected in v1).
   """
   @spec run(Scope.t(), dispatch(), map()) :: {:ok, result()} | {:error, error()}
   def run(scope, dispatch, params \\ %{})
@@ -174,7 +179,8 @@ defmodule Loopctl.ContextRetriever.Executor do
     with {:ok, entity} <- resolve_entity(tenant_id, entity_name),
          {:ok, schema, allowlist} <- resolve_source(entity),
          select_cols = declared_columns(entity, allowlist),
-         {:ok, plan} <- build_plan(operation, field, entity, allowlist, params) do
+         {:ok, plan} <- build_plan(operation, field, entity, allowlist, params),
+         :ok <- reject_unsupported_filter(schema, plan) do
       limit = page_limit(params)
       offset = page_offset(params)
 
@@ -188,6 +194,14 @@ defmodule Loopctl.ContextRetriever.Executor do
       end
     end
   end
+
+  # Fail-closed catch-all: a malformed call — a non-`Scope` scope, a dispatch that
+  # is not a `{entity, field, operation}` tuple, or `params` that is not a map
+  # (e.g. a top-level JSON array body forwarded from US-30.4) — matches no clause
+  # above and MUST return an error rather than raise `FunctionClauseError`. The
+  # module is THE fail-closed security boundary; a crash on malformed input is
+  # inconsistent with that contract.
+  def run(_scope, _dispatch, _params), do: {:error, :invalid_params}
 
   # AC-30.3.6: the audit write is part of the read's correctness. If it fails we
   # FAIL CLOSED — no rows are returned without a persisted audit trail (chain of
@@ -285,6 +299,24 @@ defmodule Loopctl.ContextRetriever.Executor do
   defp build_plan(_operation, _field, _entity, _allowlist, _params),
     do: {:error, :invalid_operation}
 
+  # Reject a :filter whose backing column is `:decimal` (stories.estimated_hours).
+  # The executor supports ONLY exact `field == ^value` equality, and an equality
+  # between a stored NUMERIC and a bound param is representation-fragile — a
+  # value that round-trips through the declared "float" cast (0.5 may match, 0.1
+  # silently will not) — so a decimal-column filter would SILENTLY return
+  # wrong/empty rows with no signal that equality-on-decimal is the wrong tool.
+  # Fail explicitly instead. The `:decimal` verdict is read from the LIVE schema
+  # (`__schema__/2`), so it can never drift from the column's real type. Only
+  # :filter plans carry a column; :search / :no_match plans pass through.
+  defp reject_unsupported_filter(schema, %{kind: :filter, column: col}) do
+    case schema.__schema__(:type, col) do
+      :decimal -> {:error, :unsupported_filter_type}
+      _ -> :ok
+    end
+  end
+
+  defp reject_unsupported_filter(_schema, _plan), do: :ok
+
   # A non-blank query is a real search; a blank/absent query matches nothing and
   # short-circuits to zero rows (websearch_to_tsquery('') would match nothing
   # anyway), never touching the DB.
@@ -359,6 +391,27 @@ defmodule Loopctl.ContextRetriever.Executor do
       {:error, reason} -> {:error, translate_db_error(reason)}
     end
   rescue
+    e in [Ecto.Query.CastError, Ecto.ChangeError] ->
+      # AC-30.3.3 / AC-30.3.7b: the pinned filter value cannot be cast to the
+      # column's REAL type. `cast_value/2` only casts to the entity's DECLARED
+      # type, but an allowlisted `Ecto.Enum` column (stories.agent_status /
+      # stories.verified_status / projects.status) or the `:decimal`
+      # stories.estimated_hours has a real column type that DIVERGES from the only
+      # declarable text type ("string"), so Ecto re-casts the pinned value at query
+      # normalization and raises here — e.g. an injection payload `"' OR 1=1 --"`
+      # or a stale/typo status `"ready"` against agent_status. Map it to :no_match
+      # (zero rows, still audited) — EXACTLY the treatment `cast_value/2` gives a
+      # bad-typed value — so injection-as-literal matches nothing (AC-30.3.3) and
+      # `run/3` stays fail-closed (AC-30.3.7). The raw message is NEVER returned: it
+      # echoes the payload AND discloses the column's enum member set / schema
+      # internals, which AC-30.3.7b forbids.
+      Logger.warning(
+        "ContextRetriever.Executor un-castable pinned filter value " <>
+          "(fail-closed as :no_match): #{inspect(e.__struct__)}"
+      )
+
+      {:ok, 0, []}
+
     e in Postgrex.Error ->
       # AC-30.3.7b: a dropped/renamed backing column (stale entity def) raises
       # `undefined_column`; any other DB error is likewise failed closed. The raw
@@ -483,11 +536,18 @@ defmodule Loopctl.ContextRetriever.Executor do
     |> min(max_page_size())
   end
 
+  # Clamp the caller-supplied offset to `[0, max_offset]`. Bounding the UPPER end
+  # matters: an uncapped offset (e.g. `offset: 100_000_000`) makes Postgres walk
+  # and discard that many rows (O(offset)) before returning the capped page — a
+  # residual unbounded-work vector on a surface governed as "no unindexed-scan
+  # DoS", even though AC-30.3.5 only mandates a page-SIZE cap. The cap is
+  # deliberately generous (deep paging still works) but finite.
   defp page_offset(params) do
     params
     |> fetch_param("offset")
     |> to_int(0)
     |> max(0)
+    |> min(max_offset())
   end
 
   defp to_int(value, _default) when is_integer(value), do: value
@@ -566,6 +626,12 @@ defmodule Loopctl.ContextRetriever.Executor do
 
   defp max_page_size do
     Application.get_env(:loopctl, :context_retriever_max_page_size, 100)
+  end
+
+  # Hard upper bound on the pagination offset — bounds the O(offset) deep-scan a
+  # model-driven call could otherwise trigger with an arbitrarily large offset.
+  defp max_offset do
+    Application.get_env(:loopctl, :context_retriever_max_offset, 100_000)
   end
 
   # --- DB error helpers ---

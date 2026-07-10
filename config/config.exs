@@ -381,6 +381,13 @@ config :loopctl, :max_entity_definitions_per_tenant, 50
 # unbounded result set; a caller-supplied `limit` is clamped to `[1, this]`.
 config :loopctl, :context_retriever_max_page_size, 100
 
+# Epic 30 / US-30.3: hard maximum pagination OFFSET for the Context Retriever
+# query executor. A caller-supplied `offset` is clamped to `[0, this]` so a
+# model-driven call cannot force an O(offset) deep-scan (Postgres walking and
+# discarding an arbitrarily large offset) on the governed query surface. Deep
+# paging still works up to this generous bound.
+config :loopctl, :context_retriever_max_offset, 100_000
+
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
 # (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF

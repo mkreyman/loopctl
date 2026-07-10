@@ -141,8 +141,8 @@ defmodule Loopctl.ContextRetriever.Entity do
                             end)
 
   # SERVER-defined per-source set of columns each backing table's generated
-  # `search_vector` tsvector column ACTUALLY covers. This MUST mirror the STORED
-  # generated columns created by
+  # `search_vector` tsvector column ACTUALLY covers. This MUST mirror the
+  # trigger-maintained `search_vector` columns created by
   # `priv/repo/migrations/20260712000000_add_search_vectors_to_backing_tables.exs`
   # — the migration is the DB truth, this constant is the code-side mirror the
   # US-30.2 `ToolGenerator` and US-30.3 `Executor` consult.
@@ -255,7 +255,7 @@ defmodule Loopctl.ContextRetriever.Entity do
   Returns the per-source set of columns each backing table's generated
   `search_vector` actually covers (source atom => list of column atoms).
 
-  Mirrors the STORED generated columns created by
+  Mirrors the trigger-maintained `search_vector` columns created by
   `20260712000000_add_search_vectors_to_backing_tables.exs`. US-30.2's
   `ToolGenerator` and US-30.3's `Executor` consult this to authorize an entity's
   search tool ONLY when every declared searchable-text column is indexed by the

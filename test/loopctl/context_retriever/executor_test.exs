@@ -101,6 +101,12 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
     %{name: "number", type: :string, filterable: true, searchable: false}
   ]
 
+  # agent_status is an Ecto.Enum column, declared here as a filterable string —
+  # the canonical enum-filter path exercised by the HIGH-finding regression tests.
+  @agent_status_fields [
+    %{name: "agent_status", type: :string, filterable: true, searchable: false}
+  ]
+
   describe "TC-30.3.1 — filter: parameterized, tenant-scoped, shaped, audited" do
     test "returns only caller-tenant matching rows with meta and writes an audit row" do
       tenant_a = repo_tenant()
@@ -279,11 +285,12 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
       tenant = repo_tenant()
       seed_story(tenant.id, %{title: "Some story", number: "101"})
 
-      # estimated_hours is server-allowlisted and text-safe to drop (not part of
-      # search_vector). Declaring it filterable, then dropping the underlying
-      # column, simulates a stale entity def.
+      # sort_key is a server-allowlisted :integer column, not part of the
+      # search_vector and not :decimal (so it is filter-supported). Declaring it
+      # filterable, then dropping the underlying column, simulates a stale entity
+      # def whose backing column no longer exists.
       create_story_entity(tenant.id, [
-        %{name: "estimated_hours", type: :float, filterable: true, searchable: false}
+        %{name: "sort_key", type: :integer, filterable: true, searchable: false}
       ])
 
       # Drop the backing column on the Repo connection (rolls back at test exit).
@@ -291,11 +298,11 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
       # `SET LOCAL ROLE loopctl_app` persists for the rest of the sandbox
       # transaction; reset to the owner role so the DDL is permitted.
       Repo.query!("RESET ROLE")
-      Repo.query!("ALTER TABLE stories DROP COLUMN estimated_hours")
+      Repo.query!("ALTER TABLE stories DROP COLUMN sort_key")
 
       assert {:error, :stale_entity} =
-               Executor.run(scope_for(tenant), {"story", "estimated_hours", :filter}, %{
-                 "estimated_hours" => "1.5"
+               Executor.run(scope_for(tenant), {"story", "sort_key", :filter}, %{
+                 "sort_key" => "3"
                })
     end
   end
@@ -404,6 +411,111 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
       # No rows disclosed to the caller AND no audit row persisted — chain of
       # custody is preserved by failing closed.
       assert context_audits(tenant.id) == []
+    end
+  end
+
+  describe "enum-status filter — the canonical filter use case (HIGH-finding regression)" do
+    # agent_status is an Ecto.Enum column. cast_value/2 can only cast to the
+    # declared "string" type, but Ecto re-casts the pinned value against the
+    # column's REAL enum type at query normalization — a non-member value raises
+    # Ecto.Query.CastError. run_query/6 must map that to :no_match (zero rows,
+    # still audited), NOT crash and NOT disclose the enum member set.
+    test "filtering by a VALID enum member returns matching rows" do
+      tenant = repo_tenant()
+      # seed_story defaults agent_status to :pending.
+      seed_story(tenant.id, %{title: "Pending story", number: "101"})
+      create_story_entity(tenant.id, @agent_status_fields)
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Executor.run(scope_for(tenant), {"story", "agent_status", :filter}, %{
+                 "agent_status" => "pending"
+               })
+
+      assert results == [%{agent_status: :pending}]
+      assert meta.total_count == 1
+    end
+
+    test "an injection payload on the enum column matches nothing (no crash, no disclosure)" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Pending story", number: "101"})
+      create_story_entity(tenant.id, @agent_status_fields)
+
+      assert {:ok, %{results: [], meta: %{total_count: 0}}} =
+               Executor.run(scope_for(tenant), {"story", "agent_status", :filter}, %{
+                 "agent_status" => "' OR 1=1 --"
+               })
+
+      # Still audited (row_count 0) even though the value never matched a member.
+      assert [audit] = context_audits(tenant.id)
+      assert audit.metadata["row_count"] == 0
+    end
+
+    test "a non-member / stale status value returns an empty page rather than crashing" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Pending story", number: "101"})
+      create_story_entity(tenant.id, @agent_status_fields)
+
+      # "ready" is a plausible typo / stale status that is NOT a current enum
+      # member — it must return zero rows, not raise Ecto.Query.CastError.
+      assert {:ok, %{results: [], meta: %{total_count: 0}}} =
+               Executor.run(scope_for(tenant), {"story", "agent_status", :filter}, %{
+                 "agent_status" => "ready"
+               })
+    end
+  end
+
+  describe "decimal-column filter is rejected as unsupported" do
+    test "a filter on the :decimal estimated_hours column returns :unsupported_filter_type" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Has hours", number: "101"})
+
+      # estimated_hours is a :decimal column; exact float8 equality against NUMERIC
+      # is representation-fragile, so an equality filter on it is rejected rather
+      # than silently returning wrong/empty rows.
+      create_story_entity(tenant.id, [
+        %{name: "estimated_hours", type: :float, filterable: true, searchable: false}
+      ])
+
+      assert {:error, :unsupported_filter_type} =
+               Executor.run(scope_for(tenant), {"story", "estimated_hours", :filter}, %{
+                 "estimated_hours" => "0.5"
+               })
+
+      # Rejected before any query/audit.
+      assert context_audits(tenant.id) == []
+    end
+  end
+
+  describe "malformed calls fail closed (no FunctionClauseError)" do
+    test "a non-map params returns :invalid_params" do
+      tenant = repo_tenant()
+
+      assert {:error, :invalid_params} =
+               Executor.run(scope_for(tenant), {"story", "title", :filter}, [1, 2, 3])
+    end
+
+    test "a non-tuple dispatch returns :invalid_params" do
+      tenant = repo_tenant()
+
+      assert {:error, :invalid_params} =
+               Executor.run(scope_for(tenant), "not-a-tuple", %{"x" => 1})
+    end
+  end
+
+  describe "pagination offset is capped" do
+    test "an absurd offset is clamped to the configured max (no unbounded scan)" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "OffsetCap", number: "101"})
+      create_story_entity(tenant.id, @story_fields)
+
+      assert {:ok, %{results: [], meta: meta}} =
+               Executor.run(scope_for(tenant), {"story", "title", :filter}, %{
+                 "title" => "OffsetCap",
+                 "offset" => 100_000_000
+               })
+
+      # Clamped to the test-config max (50), not the requested 100_000_000.
+      assert meta.offset == 50
     end
   end
 
