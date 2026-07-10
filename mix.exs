@@ -130,6 +130,9 @@ defmodule Loopctl.MixProject do
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
+      # Run ONLY the cross-context journey tests (test/e2e/*, tagged :e2e). `--only`
+      # overrides the default :e2e exclude in test_helper.exs.
+      "test.e2e": ["ecto.create --quiet", "ecto.migrate --quiet", "test --only e2e"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [

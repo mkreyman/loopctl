@@ -143,6 +143,16 @@ jobs:
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
+      # The cross-context journeys (test/e2e/*) are @moduletag :e2e and excluded
+      # from the default `mix test` above (keeps it fast). Run them here in the
+      # SAME job so they reuse the provisioned Postgres and GATE deploy (deploy
+      # `needs: [test]`) — otherwise the regression net never fires in CI.
+      # `--only e2e` overrides the default exclude and won't pull :scale/:pgbouncer.
+      - name: Run e2e journey tests
+        run: mix test --only e2e
+        env:
+          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -548,3 +558,29 @@ jobs:
         run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  smoke:
+    name: Post-deploy Smoke
+    runs-on: ubuntu-latest
+    # Runs AFTER the Fly deploy so it validates the freshly-deployed release, not
+    # the old one. It does NOT gate anything (deploy already happened) — it is a
+    # DETECTOR: a smoke failure turns the run RED so the operator knows to roll
+    # back (see docs/runbooks/post-deploy-smoke.md). Only on a real master push;
+    # never on PRs (no live release to probe) or the nightly schedule.
+    needs: [deploy]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # LOOPCTL_SMOKE_KEY MUST be a LOW-PRIVILEGE READ key (agent role is enough):
+      # smoke.sh issues only read-only requests, and CI secrets should carry the
+      # least privilege that satisfies the checks. The secret goes in `env:` (not
+      # inline on `run:`) as the safe pattern against a future `set -x`.
+      - name: Run post-deploy smoke
+        env:
+          BASE_URL: https://loopctl.com
+          LOOPCTL_SMOKE_KEY: ${{ secrets.LOOPCTL_SMOKE_KEY }}
+        run: bash scripts/smoke.sh
