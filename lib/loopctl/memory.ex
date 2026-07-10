@@ -24,12 +24,16 @@ defmodule Loopctl.Memory do
   - OLTP writes/list/forget/session_history/supersede go through `Loopctl.AdminRepo`
     with EXPLICIT `(tenant_id, subject_id)` predicates on every query — mirroring the
     sibling `Loopctl.Knowledge` context (which likewise routes all article OLTP
-    through `AdminRepo`). Isolation is the explicit predicate; the `memories` /
-    `session_memories` RLS policies remain as DB-level defense-in-depth.
+    through `AdminRepo`). `AdminRepo` connects with a BYPASSRLS role, so the
+    `memories` / `session_memories` RLS policies do NOT engage on ANY path in this
+    context: the explicit `(tenant_id, subject_id)` predicate is the ONLY isolation
+    here, not a second layer behind RLS. (The RLS policies exist for a HYPOTHETICAL
+    RLS-enforcing `Loopctl.Repo` caller; this context has none. A maintainer relaxing
+    an explicit predicate cannot lean on an RLS backstop that is not engaged.)
   - `recall/2` runs an HNSW cosine kNN over long-term memories on the BYPASSRLS
     `Loopctl.HeavyReadRepo` — reached ONLY through `Loopctl.HeavyRead.all_memory/4`,
     whose structural guard requires an explicit `(tenant_id, subject_id)` predicate
-    (subject isolation is application-level on that pool, not RLS).
+    (both tenant and subject isolation are application-level on that pool, not RLS).
 
   ## `subject_id` — the memory scope owner
 
@@ -40,6 +44,7 @@ defmodule Loopctl.Memory do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.HeavyRead
@@ -74,8 +79,13 @@ defmodule Loopctl.Memory do
   `tenant_id`, `subject_id`, and `project_id` come from `scope` and are set
   programmatically on the struct — never cast from `attrs`. A long-term write is
   refused with `{:error, :quota_exceeded}` once the per-`(tenant, subject)` cap
-  (`:max_long_term_memories_per_subject`, default 10_000, non-superseded rows) is
-  reached. The API-layer RateLimiter (US-28.3) sits in front of this path.
+  (`:max_long_term_memories_per_subject`, default 10_000) is reached. The cap counts
+  ONLY live (non-superseded) rows, so it bounds the recallable tier; superseded rows
+  are intentionally uncounted and thus not directly capped (see `long_term_count/2`
+  for that stated tradeoff and its bounds). The cap check + insert + embedding enqueue
+  run in one advisory-locked transaction, so the cap is race-free under concurrent
+  same-subject writers and the enqueue is atomic with the write. The API-layer
+  RateLimiter (US-28.3) sits in front of this path.
   """
   @spec remember(Scope.t(), map()) ::
           {:ok, MemorySchema.t() | SessionMemory.t()}
@@ -97,56 +107,97 @@ defmodule Loopctl.Memory do
     |> AdminRepo.insert()
   end
 
-  defp remember_long_term(scope, attrs) do
-    # Count + insert in one transaction so the cap check and the write are atomic.
-    result =
-      AdminRepo.transaction(fn ->
-        if long_term_count(scope) >= max_long_term_memories() do
-          AdminRepo.rollback(:quota_exceeded)
-        else
-          insert_long_term!(scope, attrs)
-        end
-      end)
+  # A fixed advisory-lock NAMESPACE (the first of the two int4 keys) so the memory
+  # quota lock can never collide with an unrelated single-bigint or differently-keyed
+  # advisory lock elsewhere. Computed at compile time from a stable term.
+  @long_term_quota_lock_ns :erlang.phash2(:loopctl_memory_long_term_quota)
 
-    # Enqueue the embedding worker AFTER the write commits, so an inline (test) or
-    # racing worker never reads an uncommitted row.
-    with {:ok, memory} <- result do
-      enqueue_embedding(memory)
-      {:ok, memory}
+  # The cap check, the insert, AND the embedding enqueue run in ONE AdminRepo
+  # transaction (via Ecto.Multi), so:
+  #
+  #   * the enqueue is GENUINELY ATOMIC with the write — and, critically, on the SAME
+  #     connection. It uses `Oban.insert/3` (the Multi-aware variant), NOT the bare
+  #     `Oban.insert/1`. `Oban.insert/1` would insert the `oban_jobs` row through
+  #     Oban's CONFIGURED repo (`Loopctl.Repo`, config/config.exs) — a DIFFERENT
+  #     pool/connection than this `AdminRepo` transaction — so the job would commit
+  #     independently BEFORE (or without) the memory row, and a commit-window race
+  #     could dispatch the worker against a not-yet-committed memory (the worker reads
+  #     `not_found -> :ok`, a terminal no-op), stranding a NULL-embedding memory with
+  #     no pending job, permanently invisible to semantic recall. `Oban.insert/3`
+  #     instead adds an `Ecto.Multi.run` step that rebinds `conf.repo` to the repo the
+  #     Multi executes on (AdminRepo here — see deps/oban engine `insert_job/5`), so
+  #     the job row is written on the SAME AdminRepo connection inside this
+  #     transaction and commits atomically with the memory (and it still applies the
+  #     worker's `unique` contract, unlike a raw `Multi.insert` of the changeset). If
+  #     the enqueue fails, the `:embedding_job` step returns `{:error, _}` and the
+  #     whole transaction rolls back — a row can NEVER persist with `embedding: NULL`
+  #     and no scheduled worker. In the `:inline` test engine the worker runs
+  #     synchronously in this same transaction/connection and reads the just-inserted
+  #     (uncommitted) row.
+  #   * a transaction-scoped advisory lock (`:quota` step), keyed on the fixed
+  #     namespace + the (tenant, subject) hash, SERIALIZES concurrent writers for the
+  #     same subject so the count-then-insert cap (AC-28.2.1) is race-free — without it
+  #     two writers under READ COMMITTED could each observe `count = cap - 1` and both
+  #     insert past the cap. The lock auto-releases at COMMIT/ROLLBACK.
+  defp remember_long_term(scope, attrs) do
+    Multi.new()
+    |> Multi.run(:quota, fn repo, _changes ->
+      lock_long_term_quota!(repo, scope)
+
+      if long_term_count(repo, scope) >= max_long_term_memories() do
+        {:error, :quota_exceeded}
+      else
+        {:ok, :ok}
+      end
+    end)
+    |> Multi.insert(:memory, long_term_changeset(scope, attrs))
+    |> Oban.insert(:embedding_job, fn %{memory: memory} ->
+      MemoryEmbeddingWorker.new(%{memory_id: memory.id, tenant_id: memory.tenant_id})
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{memory: memory}} -> {:ok, memory}
+      {:error, :quota, :quota_exceeded, _changes} -> {:error, :quota_exceeded}
+      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:error, :embedding_job, reason, _changes} -> {:error, reason}
     end
   end
 
-  # Insert the long-term memory or `AdminRepo.rollback/1` the changeset (called only
-  # inside the `remember_long_term` transaction).
-  defp insert_long_term!(scope, attrs) do
+  defp long_term_changeset(scope, attrs) do
     %MemorySchema{
       tenant_id: scope.tenant_id,
       subject_id: scope.subject_id,
       project_id: scope.project_id
     }
     |> MemorySchema.create_changeset(attrs)
-    |> AdminRepo.insert()
-    |> case do
-      {:ok, memory} -> memory
-      {:error, changeset} -> AdminRepo.rollback(changeset)
-    end
   end
 
-  defp enqueue_embedding(%MemorySchema{} = memory) do
-    %{memory_id: memory.id, tenant_id: memory.tenant_id}
-    |> MemoryEmbeddingWorker.new()
-    |> Oban.insert()
+  # Serialize concurrent long-term writes for the SAME (tenant, subject) inside the
+  # quota transaction. `pg_advisory_xact_lock(int4, int4)` — the two-int form so the
+  # fixed namespace key isolates this lock class. Auto-released at COMMIT/ROLLBACK.
+  defp lock_long_term_quota!(repo, scope) do
+    key = :erlang.phash2({scope.tenant_id, scope.subject_id})
+    repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@long_term_quota_lock_ns, key])
   end
 
   # Count of the subject's LIVE (non-superseded) long-term memories in scope.
-  defp long_term_count(scope) do
+  #
+  # NB (tier-footprint tradeoff, by design): superseded rows are DELIBERATELY excluded
+  # from the cap — the cap bounds the LIVE, recallable tier, matching the documented
+  # `non-superseded rows` contract. A subject can therefore accumulate superseded rows
+  # beyond the live cap via repeated create-then-supersede (each superseded row still
+  # holds text + a 1536-d embedding). Growth is bounded by churn (every supersede
+  # requires a live, counted `new_id`) and `forget/2` deletes rows outright; a
+  # superseded-row cleanup worker is out of scope for US-28.2 and tracked with the
+  # subsystem's pruning story. This is a stated tradeoff, not a contradiction.
+  defp long_term_count(repo, scope) do
     MemorySchema
     |> where(
       [m],
       m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id and
         is_nil(m.superseded_by)
     )
-    |> AdminRepo.aggregate(:count, :id)
+    |> repo.aggregate(:count, :id)
   end
 
   # ===========================================================================
@@ -166,10 +217,19 @@ defmodule Loopctl.Memory do
   A selective `(tenant_id, subject_id)` btree on the inner index-ordered subquery
   defeats the HNSW ANN index (#170/#172). So this uses OPTION (i): the inner pool
   over-fetches `k' > k` nearest-by-cosine with ONLY index-safe residual filters
-  (tenant equality + `embedding IS NOT NULL`), and the subject scope + superseded
-  exclusion are applied on the OUTER query over the materialized pool. The scale
-  behaviour (a subject recalls its own top-k when other subjects dominate the
-  corpus) is verified in the terminal story US-28.5.
+  (tenant equality + `embedding IS NOT NULL`), and the SUBJECT scope is applied on
+  the OUTER query over the materialized pool. The scale behaviour (a subject recalls
+  its own top-k when other subjects dominate the corpus) is verified in the terminal
+  story US-28.5.
+
+  Superseded exclusion is handled differently: on the default path the inner ANN adds
+  `superseded_by IS NULL`, served by the PARTIAL HNSW index
+  `memories_live_embedding_hnsw_idx` (whose predicate exactly matches, so HNSW is
+  kept), so superseded rows never occupy pool slots and default recall does not
+  under-fill with live rows for a heavily-superseding subject. `include_superseded:
+  true` uses the full index. `meta.underfilled` is `true` when fewer than the
+  requested `k` rows were recalled (a small live scope OR cross-subject pool
+  under-fill) so callers can distinguish it from a genuinely capped page.
 
   ## Degradation (AC-28.2.4)
 
@@ -187,7 +247,8 @@ defmodule Loopctl.Memory do
       default #{@default_recall_k}).
     * `:include_superseded` — include superseded rows (default `false`).
 
-  Returns `%{results: [{memory, score} | ...], meta: %{total_count, fallback, reason}}`.
+  Returns `%{results: [{memory, score} | ...], meta: %{total_count, fallback, reason,
+  underfilled}}`.
   """
   @spec recall(Scope.t(), keyword() | map()) :: result_envelope()
   def recall(%Scope{} = scope, opts \\ []) do
@@ -217,48 +278,60 @@ defmodule Loopctl.Memory do
 
     results =
       Enum.map(rows, fn row ->
-        {row_to_memory(row), 1.0 - row.distance}
+        # Clamp to [0, 1]: pgvector cosine distance ranges [0, 2], so a distance > 1
+        # would make `1 - distance` NEGATIVE. Mirror VectorSearch's `:knn` score
+        # contract (GREATEST of 0 and `1 - distance`) so the [{memory, score}]
+        # envelope surfaced to US-28.3/US-28.4 never carries a negative similarity.
+        # Ordering is by ascending distance (below), so the clamp cannot reorder.
+        {row_to_memory(row), max(0.0, 1.0 - row.distance)}
       end)
 
-    %{results: results, meta: %{total_count: length(results), fallback: false, reason: nil}}
+    %{
+      results: results,
+      meta: %{
+        total_count: length(results),
+        fallback: false,
+        reason: nil,
+        underfilled: length(results) < k
+      }
+    }
   end
 
-  # INNER: the pure index-ordered ANN top-`pool` (tenant + not-null embedding
-  # ONLY — the index-safe residuals). Subject is DELIBERATELY absent here: the
-  # memories(tenant_id, subject_id) btree would let a selective subject flip the
-  # planner off HNSW (#170/#172). OUTER: subject scope (the structural guard
-  # REQUIRES this predicate here) + superseded exclusion over the ≤pool rows —
-  # trivial filters on a tiny set that cannot defeat the index. Mirrors
-  # Loopctl.Knowledge.VectorSearch's two-tier shape (reusing its pool sizing /
-  # embedding-list helpers) rather than duplicating the HNSW query, but bound to
-  # the Memory schema.
+  # INNER: the pure index-ordered ANN top-`pool` — built through the SHARED,
+  # schema-parameterized `Loopctl.Knowledge.VectorSearch.index_safe_knn_base/4` (the
+  # single home of the #170/#172-safe HNSW shape) plus its `put_distance/2` for the
+  # raw distance, so this path CANNOT drift from the article recall it mirrors and
+  # holds no hand-rolled cosine literal of its own. It carries the index-safe
+  # residuals (tenant + not-null embedding) PLUS, on the default path, the live-only
+  # `superseded_by IS NULL` filter (see `maybe_live_only_inner/2`). Subject is
+  # DELIBERATELY absent here — the memories(tenant_id, subject_id) btree would let a
+  # selective subject flip the planner off HNSW. OUTER: subject scope (the structural
+  # guard REQUIRES this predicate here) + superseded exclusion over the ≤pool rows —
+  # trivial filters on a tiny set that cannot defeat the index.
   defp memory_candidate_query(scope, embedding, k, include_superseded?) do
     target = VectorSearch.to_embedding_list(embedding)
     pool = VectorSearch.pool_size(k)
 
     inner =
-      from(m in MemorySchema,
-        where: m.tenant_id == ^scope.tenant_id,
-        where: not is_nil(m.embedding),
-        order_by: [asc: fragment("? <=> ?", m.embedding, ^target)],
-        limit: ^pool,
-        select: %{
-          id: m.id,
-          tenant_id: m.tenant_id,
-          subject_id: m.subject_id,
-          project_id: m.project_id,
-          text: m.text,
-          embedding_content_hash: m.embedding_content_hash,
-          confidence: m.confidence,
-          source: m.source,
-          source_session_id: m.source_session_id,
-          tags: m.tags,
-          superseded_by: m.superseded_by,
-          inserted_at: m.inserted_at,
-          updated_at: m.updated_at,
-          distance: fragment("? <=> ?", m.embedding, ^target)
-        }
-      )
+      MemorySchema
+      |> VectorSearch.index_safe_knn_base(scope.tenant_id, target, pool)
+      |> maybe_live_only_inner(include_superseded?)
+      |> select([m], %{
+        id: m.id,
+        tenant_id: m.tenant_id,
+        subject_id: m.subject_id,
+        project_id: m.project_id,
+        text: m.text,
+        embedding_content_hash: m.embedding_content_hash,
+        confidence: m.confidence,
+        source: m.source,
+        source_session_id: m.source_session_id,
+        tags: m.tags,
+        superseded_by: m.superseded_by,
+        inserted_at: m.inserted_at,
+        updated_at: m.updated_at
+      })
+      |> VectorSearch.put_distance(target)
 
     from(c in subquery(inner),
       where: c.subject_id == ^scope.subject_id,
@@ -269,6 +342,24 @@ defmodule Loopctl.Memory do
     |> maybe_exclude_superseded_sub(include_superseded?)
   end
 
+  # Live-only filter on the INNER index-ordered ANN, applied ONLY on the default
+  # (exclude-superseded) path. This is the ONE additional inner predicate that is
+  # index-SAFE despite the shared helper's "no extra inner predicate" rule: it EXACTLY
+  # matches the partial HNSW index `memories_live_embedding_hnsw_idx`
+  # (`... WHERE superseded_by IS NULL`, migration 20260709000300), so the planner
+  # serves the ANN from that partial index rather than the full one — superseded rows
+  # are not in the index and therefore cannot crowd the top-`pool`, so default recall
+  # no longer under-fills with live rows when a subject has churned many supersedes.
+  # `include_superseded: true` skips this and uses the full index (all rows wanted).
+  defp maybe_live_only_inner(query, true), do: query
+
+  defp maybe_live_only_inner(query, false),
+    do: where(query, [m], is_nil(m.superseded_by))
+
+  # Belt-and-suspenders exclusion on the OUTER over-the-pool query. Redundant with
+  # `maybe_live_only_inner/2` on the default path (kept so the exclusion is correct
+  # even if the inner ever changes) and load-bearing when `include_superseded?` is
+  # false but the caller path bypasses the inner filter.
   defp maybe_exclude_superseded_sub(query, true), do: query
 
   defp maybe_exclude_superseded_sub(query, false),
@@ -304,7 +395,15 @@ defmodule Loopctl.Memory do
 
     results = Enum.map(rows, fn memory -> {memory, nil} end)
 
-    %{results: results, meta: %{total_count: length(results), fallback: true, reason: reason_tag}}
+    %{
+      results: results,
+      meta: %{
+        total_count: length(results),
+        fallback: true,
+        reason: reason_tag,
+        underfilled: length(results) < k
+      }
+    }
   end
 
   defp maybe_ilike(query, ""), do: query
@@ -434,7 +533,11 @@ defmodule Loopctl.Memory do
 
     results =
       base
-      |> order_by([s], asc: s.inserted_at, asc: s.id)
+      # `seq` is a DB-generated bigserial (strictly monotonic per insert), so it is
+      # the deterministic insertion-order key (AC-28.2.5). `inserted_at` leads for
+      # readability; `seq` is the load-bearing tiebreaker that makes same-microsecond
+      # appends deterministic where the random binary_id PK could not.
+      |> order_by([s], asc: s.inserted_at, asc: s.seq)
       |> limit(^limit)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -448,12 +551,18 @@ defmodule Loopctl.Memory do
   Both ids must be in `scope`; a foreign/absent id returns `{:error, :not_found}`.
   A superseded memory is excluded from `recall/2` and `list/2` by default.
 
-  ## Concurrency (AC-28.2.7)
+  ## Concurrency + cycle prevention (AC-28.2.7)
 
   Both rows are locked `FOR UPDATE` in a stable (id-ordered) single statement, so
   concurrent supersedes on the same row are serialized (no lost update) and cannot
-  race into an A↔B cycle: a concurrent `supersede(new, old)` blocks on the same
-  locks and then fails the cycle guard (`new` already points at `old`).
+  race into a cycle. The cycle guard requires `new_id` to be a LIVE head (its own
+  `superseded_by` is nil): a supersede may only ever point at a live survivor. This
+  rejects the direct A↔B cycle AND any longer chain (A→B→C→A) AND superseding into an
+  already-superseded row — none of which can leave a set of rows all hidden with no
+  live head. `{:error, :cycle}` is returned in every such case. This is stronger than
+  the AC-28.2.7 letter (which requires only A↔B + lost-update prevention), and matters
+  because the Part 2 auto-promotion compiler (epic_28 #308) drives supersede
+  programmatically, making an accidental longer cycle reachable.
   """
   @spec supersede(Scope.t(), String.t(), String.t()) ::
           {:ok, MemorySchema.t()}
@@ -488,13 +597,20 @@ defmodule Loopctl.Memory do
   end
 
   # Called only inside the `do_supersede` transaction (rollbacks abort it).
-  defp resolve_supersede(old, new, old_id, new_id) do
+  defp resolve_supersede(old, new, _old_id, new_id) do
     cond do
       is_nil(old) or is_nil(new) ->
         AdminRepo.rollback(:not_found)
 
-      # Cycle guard: `new` already superseded by `old` would make A↔B.
-      new.superseded_by == old_id ->
+      # Cycle guard: a supersede may ONLY point at a LIVE head (`new.superseded_by`
+      # is nil). Requiring liveness — rather than only rejecting the direct
+      # `new.superseded_by == old_id` (A↔B) case — structurally prevents cycles of
+      # ANY length AND refuses superseding into an already-dead `new_id`. In a 3+
+      # node cycle (supersede(A,B); supersede(B,C); then supersede(C,A)) the third
+      # call has `new = A` with `A.superseded_by == B` (non-nil), so it is rejected
+      # here instead of closing A→B→C→A with no live survivor. Both rows are held
+      # `FOR UPDATE`, so the liveness read is consistent under concurrent supersedes.
+      not is_nil(new.superseded_by) ->
         AdminRepo.rollback(:cycle)
 
       true ->

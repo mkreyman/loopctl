@@ -114,19 +114,14 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
         "logical owner of the novelty MIN aggregate (runs novelty_distance_query/4 through " <>
           "HeavyRead) — documented for auditability; the cosine literal itself is in " <>
           "novelty_distance_query/4 (also registered)"
-    },
-    %{
-      module: Loopctl.Memory,
-      function: :memory_candidate_query,
-      arity: 4,
-      rationale:
-        "US-28.2 agent-memory HNSW recall — the SAME index-safe two-tier shape as " <>
-          "VectorSearch.candidate_query/4 (inner pure ORDER BY embedding <=> $const LIMIT pool " <>
-          "with only tenant/not-null residuals; subject + superseded post-filters on the outer " <>
-          "pool), but bound to the Memory schema which VectorSearch is hard-bound away from " <>
-          "(Article). Reuses VectorSearch.pool_size/2 + to_embedding_list/1; not routable " <>
-          "through nearest/4 without parameterizing that Article-bound helper by schema"
     }
+    # NB: `Loopctl.Memory.memory_candidate_query/4` (US-28.2 agent-memory HNSW recall) is
+    # DELIBERATELY NOT registered here — it holds NO hand-rolled cosine literal. It builds
+    # its index-ordered inner pool through the shared, schema-parameterized
+    # `Loopctl.Knowledge.VectorSearch.index_safe_knn_base/4` + `put_distance/2`, so the
+    # cosine operator lives ONLY in `VectorSearch` (the lint whole-module home). Extracting that
+    # shared helper — rather than duplicating the HNSW query into Memory and registering an
+    # exception — is exactly what US-28.2 technical notes mandated.
   ]
 
   @doc """

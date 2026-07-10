@@ -138,6 +138,35 @@ defmodule Loopctl.HeavyReadTest do
              )
     end
 
+    test "false when subject_id scopes only a JOINED source, not the primary from binding" do
+      # The returned `from` rows are only tenant-scoped; a JOINED table carries the
+      # subject predicate. The output could still surface cross-subject rows from the
+      # unscoped `from` binding, so the guard must reject — matching the tenant guard's
+      # every-output-source strength (the subject predicate must sit on binding 0).
+      refute HeavyRead.filters_by_subject?(
+               from(m in MemorySchema,
+                 join: m2 in MemorySchema,
+                 on: m2.tenant_id == m.tenant_id and m2.subject_id == ^"s",
+                 where: m.tenant_id == ^"t"
+               )
+             )
+    end
+
+    test "all_memory/4 raises when subject_id is only on a joined source, not the from" do
+      tenant = Ecto.UUID.generate()
+
+      q =
+        from(m in MemorySchema,
+          join: m2 in MemorySchema,
+          on: m2.tenant_id == ^tenant and m2.subject_id == ^"subj",
+          where: m.tenant_id == ^tenant
+        )
+
+      assert_raise ArgumentError, ~r/subject/, fn ->
+        HeavyRead.all_memory(tenant, "subj", q, [])
+      end
+    end
+
     test "all_memory/4 raises when the query lacks a subject_id predicate" do
       tenant = Ecto.UUID.generate()
       q = from(m in MemorySchema, where: m.tenant_id == ^tenant)

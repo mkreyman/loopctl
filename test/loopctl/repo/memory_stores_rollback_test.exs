@@ -8,9 +8,14 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
 
   The forward-migrated catalog state is asserted by
   `Loopctl.Repo.MemoryStoresMigrationTest`; this test complements it by proving
-  the reverse: after rolling both migrations down, NEITHER table exists, the
-  HNSW index is gone (dropped with its table), and no `tenant_isolation` RLS
+  the reverse: after rolling the memory migrations down, NEITHER table exists, the
+  HNSW indexes are gone (dropped with their table), and no `tenant_isolation` RLS
   policy is left orphaned — then re-applying `up` restores the forward state.
+
+  Three migrations are driven newest-first: the US-28.2 PARTIAL live-only HNSW index
+  (20260709000300), the US-28.1 full HNSW index (20260709000100), and the
+  create-stores migration (20260709000000). `memories` carries TWO hnsw indexes in
+  the forward state (full recall + partial live), so the invariant is 2 → 0 → 2.
 
   ## How the migrations are driven
 
@@ -44,14 +49,21 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
 
   @create_version 20_260_709_000_000
   @hnsw_version 20_260_709_000_100
+  @partial_hnsw_version 20_260_709_000_300
 
   @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
   create_file = Path.wildcard(Path.join(@migrations_dir, "#{@create_version}_*.exs")) |> hd()
   hnsw_file = Path.wildcard(Path.join(@migrations_dir, "#{@hnsw_version}_*.exs")) |> hd()
+
+  partial_file =
+    Path.wildcard(Path.join(@migrations_dir, "#{@partial_hnsw_version}_*.exs")) |> hd()
+
   Code.require_file(create_file)
   Code.require_file(hnsw_file)
+  Code.require_file(partial_file)
 
   alias Loopctl.Repo.Migrations.AddMemoriesEmbeddingHnswIndex
+  alias Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex
   alias Loopctl.Repo.Migrations.CreateMemoryStores
 
   setup do
@@ -131,14 +143,16 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   end
 
   test "down drops both tables, the HNSW + btree indexes, and the RLS policy with no orphans; up restores them" do
-    # Baseline: the forward-migrated state.
+    # Baseline: the forward-migrated state carries TWO hnsw indexes on memories
+    # (the full recall index + the US-28.2 partial live-only index).
     assert relation_exists?("memories")
     assert relation_exists?("session_memories")
-    assert hnsw_count("memories") == 1
+    assert hnsw_count("memories") == 2
     assert policy_present?("memories")
     assert policy_present?("session_memories")
 
-    # Roll both migrations back, newest first.
+    # Roll all three memory migrations back, newest first.
+    migrate(AddMemoriesLiveEmbeddingPartialHnswIndex, @partial_hnsw_version, :down)
     migrate(AddMemoriesEmbeddingHnswIndex, @hnsw_version, :down)
     migrate(CreateMemoryStores, @create_version, :down)
 
@@ -146,18 +160,21 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
     refute relation_exists?("memories")
     refute relation_exists?("session_memories")
 
-    # No orphaned HNSW index and no orphaned tenant_isolation policy.
+    # No orphaned HNSW index (neither the full nor the partial) and no orphaned
+    # tenant_isolation policy.
     assert hnsw_count("memories") == 0
     refute policy_present?("memories")
     refute policy_present?("session_memories")
 
-    # Re-applying up restores the forward-migrated state.
+    # Re-applying up (oldest first) restores the full forward-migrated state,
+    # including BOTH hnsw indexes.
     migrate(CreateMemoryStores, @create_version, :up)
     migrate(AddMemoriesEmbeddingHnswIndex, @hnsw_version, :up)
+    migrate(AddMemoriesLiveEmbeddingPartialHnswIndex, @partial_hnsw_version, :up)
 
     assert relation_exists?("memories")
     assert relation_exists?("session_memories")
-    assert hnsw_count("memories") == 1
+    assert hnsw_count("memories") == 2
     assert policy_present?("memories")
     assert policy_present?("session_memories")
   end

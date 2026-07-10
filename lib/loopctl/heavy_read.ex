@@ -285,7 +285,7 @@ defmodule Loopctl.HeavyRead do
     # NOT required recursively — it must stay off the index-ordered inner ANN).
     query = guard!(tenant_id, queryable)
 
-    unless outer_scoped_by_field?(query, :subject_id, {:value, subject_id}) do
+    unless outer_from_scoped_by_field?(query, :subject_id, {:value, subject_id}) do
       raise ArgumentError,
             "Loopctl.HeavyRead refuses a memory query not scoped to the given subject " <>
               "(BYPASSRLS pool, cross-subject leak within a tenant). The outermost query must " <>
@@ -303,18 +303,28 @@ defmodule Loopctl.HeavyRead do
   end
 
   @doc false
-  # Structural shape check (no value binding): does this query's OUTERMOST level
-  # carry a conjunctive `x.subject_id == ^subject` equality? Exposed for the guard
-  # unit tests (companion to `filters_by_tenant?/1`).
+  # Structural shape check (no value binding): does this query's PRIMARY OUTPUT
+  # (`from`) binding carry a conjunctive `x.subject_id == ^subject` equality?
+  # Exposed for the guard unit tests (companion to `filters_by_tenant?/1`).
   def filters_by_subject?(queryable) do
-    queryable |> Ecto.Queryable.to_query() |> outer_scoped_by_field?(:subject_id, :any)
+    queryable |> Ecto.Queryable.to_query() |> outer_from_scoped_by_field?(:subject_id, :any)
   end
 
-  # True iff the outermost query (its own wheres/havings/join-ons, NOT recursively)
-  # constrains SOME binding by a conjunctive `x.field == ^pin` equality — with the
-  # pin bound to the value for `{:value, v}`, or any pin for `:any`.
-  defp outer_scoped_by_field?(%Ecto.Query{} = query, field, mode) do
-    MapSet.size(field_scoped_bindings(query, field, mode)) > 0
+  # True iff the outermost query's PRIMARY OUTPUT binding — its `from`, binding
+  # index 0 — is constrained (in the outer level's own wheres/havings/join-ons, NOT
+  # recursively) by a conjunctive `x.field == ^pin` equality, pin bound to the value
+  # for `{:value, v}` / any pin for `:any`.
+  #
+  # Requiring the predicate on the OUTPUT binding — not merely SOME binding — matches
+  # the tenant guard's every-output-source strength. The weaker any-binding form
+  # would PASS a query whose returned `from` rows are only tenant-scoped while a
+  # JOINED source happens to carry the subject predicate, and then return
+  # cross-subject rows from the unscoped `from` binding on the BYPASSRLS pool. The
+  # index-safe HNSW recall keeps subject OFF the inner ANN and post-filters it on the
+  # outer query's `from` (a from-subquery) — so anchoring on binding 0 is exactly the
+  # recall shape while closing the joined-source leak.
+  defp outer_from_scoped_by_field?(%Ecto.Query{} = query, field, mode) do
+    MapSet.member?(field_scoped_bindings(query, field, mode), 0)
   end
 
   @doc false

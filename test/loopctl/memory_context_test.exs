@@ -215,6 +215,101 @@ defmodule Loopctl.MemoryContextTest do
       # The A<->B cycle is refused.
       assert {:error, :cycle} = Memory.supersede(scope, b.id, a.id)
     end
+
+    test "a 3+ node cycle is refused (no chain closes with every row hidden)" do
+      scope = fixture(:memory_scope)
+
+      {:ok, a} = Memory.remember(scope, %{tier: :long_term, text: "a"})
+      {:ok, b} = Memory.remember(scope, %{tier: :long_term, text: "b"})
+      {:ok, c} = Memory.remember(scope, %{tier: :long_term, text: "c"})
+
+      # A -> B -> C, each pointing at a LIVE head.
+      assert {:ok, _} = Memory.supersede(scope, a.id, b.id)
+      assert {:ok, _} = Memory.supersede(scope, b.id, c.id)
+
+      # Closing C -> A would form A->B->C->A with NO live survivor. `A` is already
+      # superseded (by B), so it is not a live head and the supersede is refused —
+      # the guard requires `new_id` to be live, structurally preventing cycles of any
+      # length (not just the direct A<->B case).
+      assert {:error, :cycle} = Memory.supersede(scope, c.id, a.id)
+
+      # C remains the live head, still recallable via default list.
+      live_ids = scope |> Memory.list() |> Map.fetch!(:results) |> Enum.map(& &1.id)
+      assert c.id in live_ids
+    end
+
+    test "superseding into an already-superseded (dead) new_id is refused" do
+      scope = fixture(:memory_scope)
+
+      {:ok, a} = Memory.remember(scope, %{tier: :long_term, text: "a"})
+      {:ok, b} = Memory.remember(scope, %{tier: :long_term, text: "b"})
+      {:ok, c} = Memory.remember(scope, %{tier: :long_term, text: "c"})
+
+      # B is superseded by C (B is now dead).
+      assert {:ok, _} = Memory.supersede(scope, b.id, c.id)
+
+      # Pointing a live A at the DEAD B would hide A behind a non-live head. Refused.
+      assert {:error, :cycle} = Memory.supersede(scope, a.id, b.id)
+
+      # A is untouched — still a live head.
+      reloaded = AdminRepo.get(MemorySchema, a.id)
+      assert is_nil(reloaded.superseded_by)
+    end
+  end
+
+  # --- recall include_superseded + superseder-delete nilify (AC-28.2.5 / AC-28.2.7) ---
+
+  describe "recall/2 include_superseded + forget/2 of a superseder (AC-28.2.5)" do
+    test "recall with include_superseded: true surfaces the superseded row; default hides it" do
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      {:ok, old} = Memory.remember(scope, %{tier: :long_term, text: "old truth about elixir"})
+      {:ok, new} = Memory.remember(scope, %{tier: :long_term, text: "new truth about elixir"})
+      assert {:ok, _} = Memory.supersede(scope, old.id, new.id)
+
+      # Default recall excludes the superseded row...
+      default_ids =
+        scope
+        |> Memory.recall(query: "elixir", limit: 10)
+        |> Map.fetch!(:results)
+        |> Enum.map(fn {m, _} -> m.id end)
+
+      refute old.id in default_ids
+
+      # ...but include_superseded: true surfaces it.
+      included_ids =
+        scope
+        |> Memory.recall(query: "elixir", limit: 10, include_superseded: true)
+        |> Map.fetch!(:results)
+        |> Enum.map(fn {m, _} -> m.id end)
+
+      assert old.id in included_ids
+      assert new.id in included_ids
+    end
+
+    test "deleting the superseder nilifies dependents (on_delete: :nilify_all) so no memory stays hidden" do
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      {:ok, old} = Memory.remember(scope, %{tier: :long_term, text: "old truth about phoenix"})
+      {:ok, new} = Memory.remember(scope, %{tier: :long_term, text: "new truth about phoenix"})
+      assert {:ok, _} = Memory.supersede(scope, old.id, new.id)
+
+      # While superseded, old is hidden from default recall + list.
+      refute old.id in default_recall_ids(scope, "phoenix")
+      refute old.id in default_list_ids(scope)
+
+      # Delete the SUPERSEDER; on_delete: :nilify_all clears old.superseded_by.
+      assert {:ok, :deleted} = Memory.forget(scope, new.id)
+
+      reloaded = AdminRepo.get(MemorySchema, old.id)
+      assert is_nil(reloaded.superseded_by)
+
+      # old is no longer superseded, so it reappears in default recall AND list.
+      assert old.id in default_recall_ids(scope, "phoenix")
+      assert old.id in default_list_ids(scope)
+    end
   end
 
   # --- TC-28.2.6: list pagination ---
@@ -263,5 +358,19 @@ defmodule Loopctl.MemoryContextTest do
       # The row still exists for tenant A.
       assert AdminRepo.get(MemorySchema, m.id)
     end
+  end
+
+  defp default_recall_ids(scope, query) do
+    scope
+    |> Memory.recall(query: query, limit: 10)
+    |> Map.fetch!(:results)
+    |> Enum.map(fn {m, _} -> m.id end)
+  end
+
+  defp default_list_ids(scope) do
+    scope
+    |> Memory.list()
+    |> Map.fetch!(:results)
+    |> Enum.map(& &1.id)
   end
 end

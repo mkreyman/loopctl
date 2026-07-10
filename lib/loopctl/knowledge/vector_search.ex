@@ -392,17 +392,61 @@ defmodule Loopctl.Knowledge.VectorSearch do
     status = Keyword.get(opts, :status, :published)
 
     base =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: not is_nil(a.embedding),
-        order_by: [asc: fragment("? <=> ?", a.embedding, ^target)],
-        limit: ^pool
-      )
+      Article
+      |> index_safe_knn_base(tenant_id, target, pool)
       |> maybe_filter_by_status(status)
       |> maybe_exclude_self(exclude_id)
       |> maybe_filter_by_visibility(vis)
 
     pool_select(base, Keyword.get(opts, :select, :knn), target)
+  end
+
+  @doc """
+  The single index-safe HNSW inner base query, PARAMETERIZED BY SCHEMA (US-28.2).
+
+  This is the ONE load-bearing shape whose SQL is scale-gated (the #170/#172 prod
+  500s): a pure `ORDER BY <schema>.embedding <=> $target LIMIT pool` carrying ONLY
+  the index-safe residuals `tenant_id == ^tenant_id` and `embedding IS NOT NULL`.
+  ANY additional predicate (subject scope, status, superseded, tags, category, …)
+  MUST be applied on an OUTER query over the materialized ≤`pool` rows — putting a
+  selective btree predicate here flips the planner off the HNSW index.
+
+  Both `Loopctl.Knowledge`'s article recall (`candidate_pool_query/4`) and
+  `Loopctl.Memory`'s agent-memory recall build their inner pool through THIS one
+  function, so the index-safety fix lives in exactly one place and can never drift
+  between the two consumers (US-28.2 technical-notes: "extract a shared kNN helper
+  parameterized by schema/scope rather than duplicating the HNSW query"). The caller
+  adds its own `select`/`select_merge` projection — the SELECT list does not affect
+  HNSW usage, only the WHERE/ORDER BY/LIMIT do.
+
+  `target` must already be a bound `[float()]` list (via `to_embedding_list/1`);
+  `schema` is any Ecto schema carrying `tenant_id` + `embedding` columns.
+  """
+  @spec index_safe_knn_base(module(), Ecto.UUID.t(), [float()], pos_integer()) ::
+          Ecto.Query.t()
+  def index_safe_knn_base(schema, tenant_id, target, pool)
+      when is_atom(schema) and is_binary(tenant_id) and is_list(target) and is_integer(pool) do
+    from(x in schema,
+      where: x.tenant_id == ^tenant_id,
+      where: not is_nil(x.embedding),
+      order_by: [asc: fragment("? <=> ?", x.embedding, ^target)],
+      limit: ^pool
+    )
+  end
+
+  @doc """
+  Merges the raw cosine `:distance` (`embedding <=> $target`) onto `query`'s map
+  selection.
+
+  This is the centralized home for the distance projection so a schema-parameterized
+  caller (agent-memory recall, which needs the raw distance to compute its own score)
+  never hand-rolls the `<=>` literal outside this module — keeping the single-home
+  invariant the cosine-reintroduction lint enforces. `query` must already carry a MAP
+  `select` (the `:distance` key is merged into it); `target` is a bound `[float()]` list.
+  """
+  @spec put_distance(Ecto.Query.t(), [float()]) :: Ecto.Query.t()
+  def put_distance(query, target) when is_list(target) do
+    select_merge(query, [x], %{distance: fragment("? <=> ?", x.embedding, ^target)})
   end
 
   # Status equality on the inner ANN (index-safe, like the tenant/not-null filters).

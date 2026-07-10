@@ -10,11 +10,15 @@ defmodule Loopctl.Memory.SessionMemory do
 
   ## Scope / security boundary
 
-  Every row is scoped by `tenant_id` (RLS-enforced on the OLTP path) plus a
-  required `subject_id` — the API-key identity that owns the memory. `subject_id`
-  is resolved SERVER-SIDE from the caller's key (see `Loopctl.Memory.subject_id_for/1`)
-  and is NEVER accepted from request params. `tenant_id` and `subject_id` are set
-  programmatically on the struct, never via `cast/3`.
+  Every row is scoped by `tenant_id` plus a required `subject_id` — the API-key
+  identity that owns the memory. `subject_id` is resolved SERVER-SIDE from the
+  caller's key (see `Loopctl.Memory.subject_id_for/1`) and is NEVER accepted from
+  request params. `tenant_id` and `subject_id` are set programmatically on the
+  struct, never via `cast/3`. NOTE (US-28.2): the `Loopctl.Memory` context writes
+  and reads session memories ONLY through the BYPASSRLS `Loopctl.AdminRepo`, so the
+  table's RLS policies do NOT engage on this context's paths — the explicit
+  `(tenant_id, subject_id)` predicate is the ONLY isolation here, not a layer behind
+  RLS (RLS applies only to a hypothetical `Loopctl.Repo` caller).
 
   ## Fields
 
@@ -55,6 +59,11 @@ defmodule Loopctl.Memory.SessionMemory do
     field :content, :string
     field :metadata, :map, default: %{}
     field :expires_at, :utc_datetime_usec
+
+    # DB-generated (`bigserial`) strictly-monotonic insertion counter — the
+    # deterministic tiebreaker for `Loopctl.Memory.session_history/2`'s insertion
+    # ordering (AC-28.2.5). Never cast; `read_after_writes` so an insert returns it.
+    field :seq, :integer, read_after_writes: true
 
     timestamps(updated_at: false, type: :utc_datetime_usec)
   end
