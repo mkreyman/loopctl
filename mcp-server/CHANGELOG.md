@@ -5,6 +5,25 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.38.0 — 2026-07-10 (US-29.4 — memory_promote tool)
+
+### Added
+
+- **`memory_promote`.** A fifth thin tool over the Agent Memory HTTP API (US-29.3,
+  `POST /api/v1/memory/promote`) so an agent — or a Claude Code Stop-hook — can
+  compile a session's short-term (`session`-tier) memory into durable
+  `long_term` memory, once, at session end. Unlike `memory_remember` (a single
+  explicit write), `memory_promote` compiles the WHOLE session's session-tier
+  memory in one shot. Input is `session_id` ONLY — scope (tenant_id/subject_id)
+  is resolved server-side from the API key, so the tool cannot express or
+  smuggle a cross-scope promote. Returns 202 Accepted with `{job_id, session_id,
+  status: "enqueued"}` — promotion runs asynchronously via an Oban worker, so
+  the resulting long-term memory becomes recallable via `memory_recall` only
+  after that worker drains. Routes through the shared `apiCall`/witness client
+  (same as every other memory_* tool), so witness/STH persistence and the
+  transparent bootstrap-412 self-heal apply automatically — no bespoke witness
+  code was needed.
+
 ## 2.37.0 — 2026-07-09 (US-28.4 — memory_* tools: remember / recall / forget / list)
 
 ### Added

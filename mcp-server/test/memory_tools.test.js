@@ -1,6 +1,8 @@
 /**
  * Tests for US-28.4: MCP memory_* tools (remember/recall/forget/list) with
- * memory-vs-knowledge docstrings.
+ * memory-vs-knowledge docstrings, extended by US-29.4 for the fifth tool,
+ * memory_promote (compiles a session's short-term memory into long-term
+ * memory).
  *
  * Uses Node.js built-in test runner (node:test). Run: node --test test/
  *
@@ -8,20 +10,22 @@
  * forwarding.test.js): index.js is a stdio entry point with top-level await, so
  * its handlers cannot be imported directly. We combine:
  *
- *   - Source-assertion tests: read index.js as text and assert the four TOOLS
+ *   - Source-assertion tests: read index.js as text and assert the TOOLS
  *     entries exist with disambiguating descriptions, a switch case each, and
  *     that the handlers route through apiCall (the shared witness-aware HTTP
  *     helper) to the correct /api/v1/memory* path + method (AC-28.4.1,
- *     AC-28.4.3, AC-28.4.5).
+ *     AC-28.4.3, AC-28.4.5, AC-29.4.1, AC-29.4.3, AC-29.4.4).
  *   - Behavioral tests: a minimal reimplementation of the handler bodies
  *     (mirroring index.js exactly) exercised against a mocked fetch, covering
  *     the remember->recall happy path (TC-28.4.1), a non-self-healing
- *     auth/witness failure (TC-28.4.4), and that recall/list meta
- *     (fallback/total_count) is surfaced (AC-28.4.4).
- *   - Scope isolation (TC-28.4.3 / AC-28.4.5): the memory tool inputSchemas
- *     must NOT accept tenant_id/subject_id, and handlers must never forward a
- *     body-supplied scope — the tool cannot even express a cross-scope read;
- *     scope is key-derived server-side (US-28.3's job to enforce there).
+ *     auth/witness failure (TC-28.4.4), that recall/list meta
+ *     (fallback/total_count) is surfaced (AC-28.4.4), and memory_promote's
+ *     happy path / witness-412 self-heal / scope isolation (AC-29.4.5).
+ *   - Scope isolation (TC-28.4.3 / AC-28.4.5 / AC-29.4.1 / AC-29.4.4): the
+ *     memory tool inputSchemas must NOT accept tenant_id/subject_id/
+ *     project_id, and handlers must never forward a body-supplied scope — the
+ *     tool cannot even express a cross-scope read/write; scope is key-derived
+ *     server-side (US-28.3/US-29.3's job to enforce there).
  *
  * TC-28.4.4 self-heal: the generic bootstrap-412 retry mechanics (single
  * retry, error.code anchoring, persistence, coalescing) are covered end-to-end
@@ -35,7 +39,9 @@
  * block below uses `witness_header_malformed` instead — a 412 code that is
  * deliberately NOT self-healing (per witness-sth.js's error.code anchoring) —
  * so it documents the error-surfacing case without contradicting the
- * self-heal expectation for the bootstrap-grace code.
+ * self-heal expectation for the bootstrap-grace code. AC-29.4.3's "self-heal"
+ * requirement is verified separately for memory_promote below (mirrors the
+ * same pattern for its POST /api/v1/memory/promote shape).
  */
 
 import { test, describe } from "node:test";
@@ -177,6 +183,17 @@ async function memoryForget({ id }) {
     "DELETE",
     `/api/v1/memory/${id}`,
     null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function memoryPromote({ session_id }) {
+  const payload = { session_id };
+  const result = await apiCall(
+    "POST",
+    "/api/v1/memory/promote",
+    payload,
     process.env.LOOPCTL_AGENT_KEY,
   );
   return toContent(result);
@@ -609,6 +626,183 @@ describe("TC-28.4.4 self-heal: memory_remember survives a bootstrap-grace 412", 
   });
 });
 
+// ---------------------------------------------------------------------------
+// US-29.4: memory_promote — compiles a session's short-term memory into
+// durable long-term memory, once, at session end.
+// ---------------------------------------------------------------------------
+
+describe("TC-29.4.1: memory_promote happy path", () => {
+  test("POSTs {session_id} to /api/v1/memory/promote with the agent key and returns the 202 result", async () => {
+    setupEnv();
+    const enqueued = {
+      job_id: "9c1f2e10-6b3a-4e9d-9b5a-2f6a1c8d4e77",
+      session_id: "sess-abc-123",
+      status: "enqueued",
+    };
+    const calls = mockFetch({ data: enqueued }, 202);
+
+    const result = await memoryPromote({ session_id: "sess-abc-123" });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, "/api/v1/memory/promote");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    assert.deepEqual(JSON.parse(options.body), { session_id: "sess-abc-123" });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(JSON.parse(result.content[0].text), { data: enqueued });
+  });
+
+  test("a 429 promotion_budget_exceeded from memory_promote returns a structured error, not a throw", async () => {
+    setupEnv();
+    mockFetch(
+      { error: { status: 429, code: "promotion_budget_exceeded" } },
+      429,
+    );
+
+    const result = await memoryPromote({ session_id: "sess-over-budget" });
+
+    assert.equal(result.isError, true);
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.status, 429);
+    assert.equal(parsed.body.error.code, "promotion_budget_exceeded");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-29.4.3 / AC-29.4.5: memory_promote self-heals on the bootstrap-grace 412
+// exactly like every other memory write tool — driven through the REAL shared
+// witness client (mirrors the TC-28.4.4 self-heal block above).
+// ---------------------------------------------------------------------------
+
+describe("AC-29.4.3 self-heal: memory_promote survives a bootstrap-grace 412", () => {
+  test("the SAME memory_promote-shaped POST is retried once by the shared witness client, and the promote succeeds", async () => {
+    const STH = "5:AAAAAAAAAAAAAAAAAAAAAA";
+    const enqueued = {
+      job_id: "9c1f2e10-6b3a-4e9d-9b5a-2f6a1c8d4e77",
+      session_id: "sess-abc-123",
+      status: "enqueued",
+    };
+    let callCount = 0;
+    const calls = [];
+
+    const fetchImpl = async (url, options) => {
+      callCount += 1;
+      calls.push({ url, options });
+
+      if (callCount === 1) {
+        const body = { error: { status: 412, code: "witness_bootstrap_already_consumed" } };
+        return {
+          status: 412,
+          headers: { get: (name) => (name.toLowerCase() === "x-loopctl-current-sth" ? STH : null) },
+          clone() {
+            return { async json() { return body; } };
+          },
+        };
+      }
+
+      return {
+        status: 202,
+        headers: {
+          get: (name) => {
+            const lower = name.toLowerCase();
+            if (lower === "x-loopctl-current-sth") return STH;
+            if (lower === "content-type") return "application/json";
+            return null;
+          },
+        },
+        async json() { return { data: enqueued }; },
+        async text() { return JSON.stringify({ data: enqueued }); },
+      };
+    };
+
+    const client = createWitnessClient({ fetchImpl });
+    const payload = { session_id: "sess-abc-123" };
+
+    const response = await client.send({
+      url: `${BASE_URL}/api/v1/memory/promote`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AGENT_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      serializedBody: JSON.stringify(payload),
+    });
+
+    assert.equal(callCount, 2, "exactly one transparent retry");
+    assert.equal(calls[0].options.headers["X-Loopctl-STH-Bootstrap"], "true");
+    assert.equal(calls[1].options.headers["X-Loopctl-Last-Known-STH"], STH);
+
+    assert.equal(response.status, 202);
+    const body = await response.json();
+    assert.deepEqual(body, { data: enqueued });
+    assert.equal(client.getSTH(), STH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-29.4.1 / AC-29.4.4: memory_promote scope isolation — input is session_id
+// ONLY; the tool cannot express or smuggle tenant_id/subject_id/project_id.
+// ---------------------------------------------------------------------------
+
+describe("AC-29.4.1 / AC-29.4.4: memory_promote scope isolation", () => {
+  test("memoryPromote destructures ONLY {session_id} — no tenant_id/subject_id/project_id param to bind", () => {
+    const start = INDEX_SRC.indexOf("async function memoryPromote(");
+    assert.ok(start !== -1, "memoryPromote handler must exist");
+
+    const sigEnd = INDEX_SRC.indexOf(")", start);
+    const signature = INDEX_SRC.slice(start, sigEnd);
+    assert.match(
+      signature,
+      /\{\s*session_id\s*\}/,
+      "memoryPromote must destructure exactly {session_id}",
+    );
+    assert.ok(!/tenant_id/.test(signature), "memoryPromote must not destructure tenant_id");
+    assert.ok(!/subject_id/.test(signature), "memoryPromote must not destructure subject_id");
+    assert.ok(!/project_id/.test(signature), "memoryPromote must not destructure project_id");
+  });
+
+  test("memory_promote inputSchema exposes only session_id — no tenant_id/subject_id/project_id property", () => {
+    const toolStart = INDEX_SRC.indexOf('name: "memory_promote",');
+    assert.ok(toolStart !== -1, "memory_promote TOOLS entry must exist");
+    const nextEntry = INDEX_SRC.indexOf('\n    name: "', toolStart + 20);
+    const entryEnd = nextEntry === -1 ? toolStart + 3000 : nextEntry;
+    const inputSchemaStart = INDEX_SRC.indexOf("inputSchema:", toolStart);
+    assert.ok(inputSchemaStart !== -1 && inputSchemaStart < entryEnd, "memory_promote must have an inputSchema");
+    const schemaBlock = INDEX_SRC.slice(inputSchemaStart, entryEnd);
+
+    assert.match(schemaBlock, /session_id:\s*\{/, "memory_promote inputSchema must declare session_id");
+    assert.ok(!/\btenant_id\b/.test(schemaBlock), "memory_promote inputSchema must not expose tenant_id");
+    assert.ok(!/\bsubject_id\b/.test(schemaBlock), "memory_promote inputSchema must not expose subject_id");
+    assert.ok(!/\bproject_id\b/.test(schemaBlock), "memory_promote inputSchema must not expose project_id");
+  });
+
+  test("a forged tenant_id/subject_id/project_id passed to memoryPromote is not forwarded to the wire", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { job_id: "x", session_id: "s", status: "enqueued" } }, 202);
+
+    await memoryPromote({
+      session_id: "sess-abc-123",
+      tenant_id: "victim-tenant",
+      subject_id: "victim-subject",
+      project_id: "victim-project",
+    });
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(JSON.parse(calls[0].options.body), { session_id: "sess-abc-123" });
+  });
+
+  test("memoryPromote only ever calls apiCall (never a raw fetch)", () => {
+    const start = INDEX_SRC.indexOf("async function memoryPromote(");
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+
+    assert.ok(/apiCall\(/.test(body), "memoryPromote must call apiCall(...) — inherits witness/STH");
+    assert.ok(!/(?<!api)fetch\(/i.test(body), "memoryPromote must not call a raw fetch");
+  });
+});
+
 describe("memory_forget: happy path", () => {
   test("DELETEs /api/v1/memory/:id with the agent key", async () => {
     setupEnv();
@@ -695,8 +889,14 @@ describe("memory_forget: rejects a non-UUID id before touching the network (path
 // ---------------------------------------------------------------------------
 
 describe("TC-28.4.3: scope isolation — no tenant_id/subject_id bypass surface", () => {
-  test("none of the four memory tool inputSchemas accept tenant_id or subject_id", () => {
-    for (const toolName of ["memory_remember", "memory_recall", "memory_list", "memory_forget"]) {
+  test("none of the five memory tool inputSchemas accept tenant_id or subject_id", () => {
+    for (const toolName of [
+      "memory_remember",
+      "memory_recall",
+      "memory_list",
+      "memory_forget",
+      "memory_promote",
+    ]) {
       const toolStart = INDEX_SRC.indexOf(`name: "${toolName}",`);
       assert.ok(toolStart !== -1, `${toolName} TOOLS entry must exist`);
 
@@ -727,7 +927,13 @@ describe("TC-28.4.3: scope isolation — no tenant_id/subject_id bypass surface"
   });
 
   test("handlers never forward a body-supplied tenant_id/subject_id/scope to apiCall", () => {
-    for (const fnName of ["memoryRemember", "memoryRecall", "memoryList", "memoryForget"]) {
+    for (const fnName of [
+      "memoryRemember",
+      "memoryRecall",
+      "memoryList",
+      "memoryForget",
+      "memoryPromote",
+    ]) {
       const start = INDEX_SRC.indexOf(`async function ${fnName}(`);
       assert.ok(start !== -1, `${fnName} handler must exist`);
       const end = INDEX_SRC.indexOf("\n}\n", start);
@@ -738,8 +944,14 @@ describe("TC-28.4.3: scope isolation — no tenant_id/subject_id bypass surface"
     }
   });
 
-  test("memoryRemember/memoryRecall/memoryList/memoryForget only ever call apiCall (never a raw fetch)", () => {
-    for (const fnName of ["memoryRemember", "memoryRecall", "memoryList", "memoryForget"]) {
+  test("memoryRemember/memoryRecall/memoryList/memoryForget/memoryPromote only ever call apiCall (never a raw fetch)", () => {
+    for (const fnName of [
+      "memoryRemember",
+      "memoryRecall",
+      "memoryList",
+      "memoryForget",
+      "memoryPromote",
+    ]) {
       const start = INDEX_SRC.indexOf(`async function ${fnName}(`);
       assert.ok(start !== -1, `${fnName} handler must exist`);
       const end = INDEX_SRC.indexOf("\n}\n", start);
@@ -755,9 +967,15 @@ describe("TC-28.4.3: scope isolation — no tenant_id/subject_id bypass surface"
 // AC-28.4.1 / AC-28.4.2 / AC-28.4.5: source-level wiring assertions
 // ---------------------------------------------------------------------------
 
-describe("AC-28.4.1: four memory tools registered by the existing convention", () => {
-  test("TOOLS array has an entry for each of the four tools", () => {
-    for (const toolName of ["memory_remember", "memory_recall", "memory_list", "memory_forget"]) {
+describe("AC-28.4.1 / AC-29.4.1: five memory tools registered by the existing convention", () => {
+  test("TOOLS array has an entry for each of the five tools", () => {
+    for (const toolName of [
+      "memory_remember",
+      "memory_recall",
+      "memory_list",
+      "memory_forget",
+      "memory_promote",
+    ]) {
       assert.ok(
         INDEX_SRC.includes(`name: "${toolName}",`),
         `TOOLS array must have an entry named "${toolName}"`,
@@ -765,11 +983,12 @@ describe("AC-28.4.1: four memory tools registered by the existing convention", (
     }
   });
 
-  test("CallToolRequestSchema switch has a case for each of the four tools", () => {
+  test("CallToolRequestSchema switch has a case for each of the five tools", () => {
     assert.match(INDEX_SRC, /case "memory_remember":\s*\n\s*return await memoryRemember\(args\);/);
     assert.match(INDEX_SRC, /case "memory_recall":\s*\n\s*return await memoryRecall\(args\);/);
     assert.match(INDEX_SRC, /case "memory_list":\s*\n\s*return await memoryList\(args\);/);
     assert.match(INDEX_SRC, /case "memory_forget":\s*\n\s*return await memoryForget\(args\);/);
+    assert.match(INDEX_SRC, /case "memory_promote":\s*\n\s*return await memoryPromote\(args\);/);
   });
 
   test("each handler calls the matching /api/v1/memory* endpoint via apiCall", () => {
@@ -789,10 +1008,20 @@ describe("AC-28.4.1: four memory tools registered by the existing convention", (
     const forgetStart = INDEX_SRC.indexOf("async function memoryForget(");
     const forgetBody = INDEX_SRC.slice(forgetStart, forgetStart + 500);
     assert.match(forgetBody, /apiCall\(\s*"DELETE",\s*`\/api\/v1\/memory\/\$\{id\}`,/);
+
+    const promoteStart = INDEX_SRC.indexOf("async function memoryPromote(");
+    const promoteBody = INDEX_SRC.slice(promoteStart, promoteStart + 500);
+    assert.match(promoteBody, /apiCall\(\s*"POST",\s*"\/api\/v1\/memory\/promote",/);
   });
 
   test("every handler passes LOOPCTL_AGENT_KEY (agents are the intended caller)", () => {
-    for (const fnName of ["memoryRemember", "memoryRecall", "memoryList", "memoryForget"]) {
+    for (const fnName of [
+      "memoryRemember",
+      "memoryRecall",
+      "memoryList",
+      "memoryForget",
+      "memoryPromote",
+    ]) {
       const start = INDEX_SRC.indexOf(`async function ${fnName}(`);
       const end = INDEX_SRC.indexOf("\n}\n", start);
       const body = INDEX_SRC.slice(start, end);
@@ -804,9 +1033,15 @@ describe("AC-28.4.1: four memory tools registered by the existing convention", (
   });
 });
 
-describe("AC-28.4.2: descriptions disambiguate memory vs knowledge", () => {
-  test("each of the four tool descriptions mentions both 'memory' and 'knowledge'", () => {
-    for (const toolName of ["memory_remember", "memory_recall", "memory_list", "memory_forget"]) {
+describe("AC-28.4.2 / AC-29.4.2: descriptions disambiguate memory vs knowledge", () => {
+  test("each of the five tool descriptions mentions both 'memory' and 'knowledge'", () => {
+    for (const toolName of [
+      "memory_remember",
+      "memory_recall",
+      "memory_list",
+      "memory_forget",
+      "memory_promote",
+    ]) {
       const start = INDEX_SRC.indexOf(`name: "${toolName}",`);
       assert.ok(start !== -1, `${toolName} entry must exist`);
       const inputSchemaStart = INDEX_SRC.indexOf("inputSchema:", start);
@@ -823,6 +1058,29 @@ describe("AC-28.4.2: descriptions disambiguate memory vs knowledge", () => {
         `${toolName} description must mention "knowledge" to disambiguate from knowledge_*`,
       );
     }
+  });
+
+  test("memory_promote's description literally states when to call it and disambiguates from memory_remember", () => {
+    const start = INDEX_SRC.indexOf('name: "memory_promote",');
+    assert.ok(start !== -1, "memory_promote entry must exist");
+    const inputSchemaStart = INDEX_SRC.indexOf("inputSchema:", start);
+    const descriptionBlock = INDEX_SRC.slice(start, inputSchemaStart);
+
+    assert.match(
+      descriptionBlock,
+      /call at session end to compile this session's short-term memory into durable long-term memory/i,
+      "memory_promote description must literally contain the AC-29.4.2 phrase",
+    );
+    assert.match(
+      descriptionBlock,
+      /once at session end/i,
+      "memory_promote description must state it fires once at session end, not per turn",
+    );
+    assert.match(
+      descriptionBlock,
+      /memory_remember/,
+      "memory_promote description must disambiguate itself from memory_remember",
+    );
   });
 });
 
@@ -920,5 +1178,45 @@ describe("AC-28.4.5: existing knowledge_*/story tools remain unchanged", () => {
 
   test("ListToolsRequestSchema returns the TOOLS array as-is (append-only exposure)", () => {
     assert.match(INDEX_SRC, /server\.setRequestHandler\(ListToolsRequestSchema, async \(\) => \(\{\s*\n\s*tools: TOOLS,/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-29.4.2: ListTools includes memory_promote alongside the epic_28 memory_*
+// tools; existing tools (memory_remember/recall/list/forget + representative
+// knowledge_*/story tools) are unchanged (AC-29.4.4).
+// ---------------------------------------------------------------------------
+
+describe("TC-29.4.2: ListTools includes memory_promote alongside all pre-existing tools", () => {
+  test("TOOLS array has an entry for memory_promote AND memory_remember/recall/list/forget remain", () => {
+    for (const toolName of [
+      "memory_promote",
+      "memory_remember",
+      "memory_recall",
+      "memory_list",
+      "memory_forget",
+    ]) {
+      assert.ok(
+        INDEX_SRC.includes(`name: "${toolName}",`),
+        `TOOLS array must have an entry named "${toolName}"`,
+      );
+    }
+  });
+
+  test("representative pre-existing knowledge_*/story tools are unaffected by the new tool", () => {
+    for (const toolName of [
+      "knowledge_search",
+      "knowledge_create",
+      "knowledge_context",
+      "knowledge_list",
+      "knowledge_get",
+      "list_projects",
+      "get_progress",
+    ]) {
+      assert.ok(
+        INDEX_SRC.includes(`name: "${toolName}",`),
+        `pre-existing tool "${toolName}" must still be registered`,
+      );
+    }
   });
 });

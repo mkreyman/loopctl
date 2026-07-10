@@ -1159,6 +1159,17 @@ async function memoryForget({ id }) {
   return toContent(result);
 }
 
+async function memoryPromote({ session_id }) {
+  const payload = { session_id };
+  const result = await apiCall(
+    "POST",
+    "/api/v1/memory/promote",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 // --- Knowledge Management Tools (orch key) ---
 
 async function knowledgePublish({ article_id }) {
@@ -3298,6 +3309,29 @@ const TOOLS = [
       required: ["id"],
     },
   },
+  {
+    name: "memory_promote",
+    description:
+      "Call at session end to compile this session's short-term memory into durable long-term memory" +
+      " — private, scoped working state, NOT the shared knowledge wiki. Unlike " +
+      "memory_remember, which writes a single explicit fact, this compiles the WHOLE session's " +
+      "session-tier memory in one shot — fire it once at session end, not per turn. Scope " +
+      "(tenant_id/subject_id) is resolved server-side from your API key: you can only promote " +
+      "your OWN sessions. Returns 202 Accepted with `{job_id, session_id, status: \"enqueued\"}` " +
+      "— promotion runs asynchronously via a background worker, so the resulting long-term " +
+      "memory becomes recallable via memory_recall only after that worker drains, not " +
+      "immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "The session whose short-term memory to compile into long-term memory.",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
 
   // Knowledge Management Tools (orchestrator key)
   {
@@ -4522,6 +4556,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "memory_forget":
       return await memoryForget(args);
+
+    case "memory_promote":
+      return await memoryPromote(args);
 
     // Knowledge Management Tools
     case "knowledge_publish":
