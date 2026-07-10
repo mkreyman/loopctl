@@ -53,6 +53,8 @@ defmodule Loopctl.Memory.ScaleRecallTest do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
@@ -102,10 +104,23 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     Knowledge.reset_circuit_breaker(tenant.id)
 
     on_exit(fn ->
+      # ScaleSeed.teardown/1 runs UNBOXED and COMMITS, with a :timeout bounded well
+      # above the measured ~150s full-corpus delete precisely so a genuine regression
+      # (corpus outgrows the bound, a lock, a mid-statement raise) FAILS LOUDLY here
+      # instead of silently orphaning ~80k committed rows that accumulate across runs
+      # and slow every later scale seed (see ScaleSeed.teardown/1 docs). Do NOT swallow
+      # the error with a bare `rescue _ -> :ok` — that defeats the fail-loudly intent.
+      # Log the leak-specific diagnostic, then re-raise so ExUnit surfaces the failure.
       try do
         unboxed(fn -> ScaleSeed.teardown(tenant.id) end)
       rescue
-        _ -> :ok
+        e ->
+          Logger.error(
+            "ScaleSeed.teardown failed for tenant #{tenant.id}; ~80k committed rows may " <>
+              "be orphaned in the shared test DB: #{Exception.message(e)}"
+          )
+
+          reraise e, __STACKTRACE__
       end
     end)
 
