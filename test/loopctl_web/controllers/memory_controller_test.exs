@@ -262,4 +262,151 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert json_response(result, 422)["error"]["code"] == "subject_id_unresolvable"
     end
   end
+
+  # --- Recall degradation shape over HTTP (AC-28.3.5) ---
+
+  describe "POST /api/v1/memory/recall degradation" do
+    test "degrades to the fallback envelope (score null, meta.fallback/reason) when " <>
+           "embeddings are unavailable" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      # Seed a long-term row directly so the ILIKE fallback has something to return.
+      fixture(:memory, %{
+        tenant_id: tenant.id,
+        subject_id: to_string(agent.id),
+        text: "prefers reshipments"
+      })
+
+      # Force embedding generation to fail -> recall takes the recent-first ILIKE
+      # fallback path (`:no_api_key` is exempt from the circuit breaker, so this is
+      # deterministic and self-contained).
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+
+      assert %{"data" => [entry | _], "meta" => meta} = body
+      assert entry["memory"]["text"] == "prefers reshipments"
+      # score is null on the fallback path (no vector similarity computed).
+      assert entry["score"] == nil
+      assert meta["fallback"] == true
+      assert meta["reason"] == "no_embedding_key"
+    end
+
+    test "a non-string query is rejected with a deterministic 422 (no 500 crash)" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => %{"nested" => "object"}})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_query"
+      assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- Quota-exceeded envelope over HTTP (create/2) ---
+
+  describe "POST /api/v1/memory quota" do
+    test "a write past the per-subject quota returns the 422 quota_exceeded envelope", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      cap = Application.get_env(:loopctl, :max_long_term_memories_per_subject, 10_000)
+
+      # Fill the subject's live long-term tier exactly to the cap.
+      for n <- 1..cap do
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "seed #{n}"
+        })
+      end
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "one too many"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "quota_exceeded"
+      assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- Index pagination meta over HTTP (AC-28.3.5) ---
+
+  describe "GET /api/v1/memory pagination meta" do
+    test "index returns meta.total_count/limit/offset reflecting the scoped page" do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      for n <- 1..3 do
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "m#{n}"
+        })
+      end
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> get(~p"/api/v1/memory?limit=2&offset=1")
+        |> json_response(200)
+
+      assert %{"data" => data, "meta" => meta} = body
+      # limit caps the page; total_count is the TRUE scoped total (never capped).
+      assert length(data) == 2
+      assert meta["total_count"] == 3
+      assert meta["limit"] == 2
+      assert meta["offset"] == 1
+    end
+  end
+
+  # --- Superadmin oversight WITHOUT an impersonation target (AC-28.3.4 / .5) ---
+
+  describe "superadmin oversight without impersonation" do
+    test "all_subjects list without X-Impersonate-Tenant returns 422, not a 500 crash", %{
+      conn: conn
+    } do
+      # Superadmin keys are tenant-less; without impersonation the tenant scope is
+      # nil, which would crash the guarded `list_all_subjects/2` (is_binary/1).
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      body =
+        conn
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?all_subjects=true")
+        |> json_response(422)
+
+      assert body["error"]["code"] == "impersonation_tenant_required"
+      assert body["error"]["status"] == 422
+    end
+
+    test "any-subject delete without X-Impersonate-Tenant returns 422, not a 500 crash", %{
+      conn: conn
+    } do
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      body =
+        conn
+        |> auth(raw_super)
+        |> delete(~p"/api/v1/memory/#{Ecto.UUID.generate()}")
+        |> json_response(422)
+
+      assert body["error"]["code"] == "impersonation_tenant_required"
+      assert body["error"]["status"] == 422
+    end
+  end
 end

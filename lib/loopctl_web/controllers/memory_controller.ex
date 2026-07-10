@@ -89,7 +89,8 @@ defmodule LoopctlWeb.MemoryController do
     request_body: {"Recall params", "application/json", Schemas.MemoryRecallRequest},
     responses: %{
       200 => {"Recall results", "application/json", Schemas.MemoryRecallResponse},
-      422 => {"Subject unresolvable", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Subject unresolvable or non-string query", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -138,6 +139,9 @@ defmodule LoopctlWeb.MemoryController do
     responses: %{
       200 => {"Deleted", "application/json", Schemas.MemoryDeleteResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Superadmin oversight delete without an impersonation target", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -166,6 +170,17 @@ defmodule LoopctlWeb.MemoryController do
                   "Forget existing memories before writing new ones."
             }
           })
+
+          # NOTE (review finding, disproven): the three clauses above are EXHAUSTIVE
+          # for `Memory.remember/2`. Dialyzer's success typing proves the return is
+          # exactly `{:ok, memory} | {:error, :quota_exceeded} | {:error,
+          # %Ecto.Changeset{}}` — the `remember_long_term/2` `:embedding_job` Multi
+          # step can only fail with an `Ecto.Changeset` (Oban validates the job via a
+          # changeset), so no non-changeset error term can reach here. A catch-all
+          # would be unreachable dead code (`pattern_match_cov`), and `@dialyzer`
+          # suppressions are forbidden. Dialyzer is the compile-time guard: if
+          # `remember/2` ever gains a new error shape, this case stops being total and
+          # the build breaks — a stronger contract than a runtime catch-all.
       end
     end)
   end
@@ -173,58 +188,85 @@ defmodule LoopctlWeb.MemoryController do
   @doc "POST /api/v1/memory/recall"
   def recall(conn, params) do
     with_scope(conn, fn scope ->
-      opts = [
-        query: to_string(params["query"] || ""),
-        limit: params["limit"],
-        include_superseded: params["include_superseded"]
-      ]
+      case coerce_query(params["query"]) do
+        {:ok, query} ->
+          opts = [
+            query: query,
+            limit: params["limit"],
+            include_superseded: params["include_superseded"]
+          ]
 
-      json(conn, MemoryJSON.recall(Memory.recall(scope, opts)))
+          json(conn, MemoryJSON.recall(Memory.recall(scope, opts)))
+
+        :error ->
+          invalid_query(conn)
+      end
     end)
   end
 
   @doc "GET /api/v1/memory"
   def index(conn, params) do
     api_key = conn.assigns.current_api_key
+    superadmin_all = all_subjects?(params) and api_key.role == :superadmin
 
-    with_scope(conn, fn scope ->
-      opts = [
-        limit: params["limit"],
-        offset: params["offset"],
-        include_superseded: params["include_superseded"]
-      ]
+    cond do
+      # A superadmin key is tenant-less (api_key.ex forbids a superadmin tenant_id),
+      # so the oversight reader needs an impersonation target to resolve a tenant
+      # scope. Without X-Impersonate-Tenant, refuse deterministically rather than
+      # letting the nil tenant_id crash `list_all_subjects/2` (guarded
+      # `when is_binary(tenant_id)`) with a bare 500.
+      superadmin_all and is_nil(api_key.tenant_id) ->
+        impersonation_tenant_required(conn)
 
-      result =
-        if all_subjects?(params) and api_key.role == :superadmin do
-          Memory.list_all_subjects(api_key.tenant_id, opts)
-        else
-          Memory.list(scope, opts)
-        end
+      superadmin_all ->
+        json(
+          conn,
+          MemoryJSON.index(Memory.list_all_subjects(api_key.tenant_id, list_opts(params)))
+        )
 
-      json(conn, MemoryJSON.index(result))
-    end)
+      true ->
+        with_scope(conn, fn scope ->
+          json(conn, MemoryJSON.index(Memory.list(scope, list_opts(params))))
+        end)
+    end
   end
 
   @doc "DELETE /api/v1/memory/:id"
   def delete(conn, %{"id" => id}) do
     api_key = conn.assigns.current_api_key
+    superadmin? = api_key.role == :superadmin
 
-    with_scope(conn, fn scope ->
-      result =
-        if api_key.role == :superadmin do
-          Memory.forget_any(api_key.tenant_id, id)
-        else
-          Memory.forget(scope, id)
-        end
+    cond do
+      # Same tenant-less-superadmin guard as `index/2`: `forget_any/2` is guarded
+      # `when is_binary(tenant_id)`, so a superadmin delete WITHOUT an impersonation
+      # target would crash with a bare 500. Refuse deterministically instead.
+      superadmin? and is_nil(api_key.tenant_id) ->
+        impersonation_tenant_required(conn)
 
-      case result do
-        {:ok, :deleted} -> json(conn, %{data: %{id: id, deleted: true}})
-        {:error, :not_found} -> {:error, :not_found}
-      end
-    end)
+      superadmin? ->
+        render_delete(conn, Memory.forget_any(api_key.tenant_id, id), id)
+
+      true ->
+        with_scope(conn, fn scope -> render_delete(conn, Memory.forget(scope, id), id) end)
+    end
   end
 
   # --- Private helpers ---
+
+  # Shared list pagination opts for both the own-subject (`list/2`) and superadmin
+  # oversight (`list_all_subjects/2`) readers. Values are coerced/clamped downstream.
+  defp list_opts(params) do
+    [
+      limit: params["limit"],
+      offset: params["offset"],
+      include_superseded: params["include_superseded"]
+    ]
+  end
+
+  # Render a forget/forget_any outcome: 200 on delete, else delegate the
+  # `{:error, :not_found}` to the FallbackController (404, no existence leak).
+  defp render_delete(conn, {:ok, :deleted}, id), do: json(conn, %{data: %{id: id, deleted: true}})
+  defp render_delete(_conn, {:error, :not_found} = error, _id), do: error
 
   # Resolve the `(tenant_id, subject_id)` scope from the API key (NEVER the body)
   # and run `fun` with it. A subject that cannot be resolved is rejected with a
@@ -249,6 +291,43 @@ defmodule LoopctlWeb.MemoryController do
           }
         })
     end
+  end
+
+  # Deterministic 422 for a superadmin oversight request that lacks an
+  # impersonation target (tenant_id nil). The oversight readers/deletes are
+  # tenant-scoped, so without a resolved tenant there is nothing to scope to.
+  defp impersonation_tenant_required(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "impersonation_tenant_required",
+        message:
+          "A superadmin oversight request (all_subjects list / any-subject delete) " <>
+            "needs an impersonation target. Set the X-Impersonate-Tenant header so " <>
+            "the tenant scope can be resolved."
+      }
+    })
+  end
+
+  # Coerce the recall `query` to a binary rather than blindly `to_string/1`-ing it
+  # (which raises Protocol.UndefinedError on a map/list body value → HTTP 500). A
+  # missing/nil query defaults to ""; a present non-binary value is rejected 422.
+  defp coerce_query(nil), do: {:ok, ""}
+  defp coerce_query(query) when is_binary(query), do: {:ok, query}
+  defp coerce_query(_), do: :error
+
+  defp invalid_query(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_query",
+        message: "The `query` field must be a string."
+      }
+    })
   end
 
   # Pass only the recognized memory attributes through to the context — any
