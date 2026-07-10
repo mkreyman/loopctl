@@ -14,13 +14,19 @@ defmodule Loopctl.Memory.Memory do
 
   ## Scope / security boundary
 
-  Every row is scoped by `tenant_id` (RLS-enforced on the OLTP path) plus a
-  required `subject_id` — the API-key identity that owns the memory. `subject_id`
-  is resolved SERVER-SIDE from the caller's key (see `Loopctl.Memory.subject_id_for/1`)
-  and is NEVER accepted from request params. `tenant_id` and `subject_id` are set
-  programmatically on the struct, never via `cast/3`. NOTE (US-28.2): the recall
-  path runs on `Loopctl.HeavyReadRepo` (BYPASSRLS), so recall isolation is an
-  explicit `(tenant_id, subject_id)` predicate, NOT RLS.
+  Every row is scoped by `tenant_id` plus a required `subject_id` — the API-key
+  identity that owns the memory. `subject_id` is resolved SERVER-SIDE from the
+  caller's key (see `Loopctl.Memory.subject_id_for/1`) and is NEVER accepted from
+  request params. `tenant_id` and `subject_id` are set programmatically on the
+  struct, never via `cast/3`.
+
+  NOTE (US-28.2): the `Loopctl.Memory` context reaches this table ONLY through
+  BYPASSRLS repos — `Loopctl.AdminRepo` for OLTP and `Loopctl.HeavyReadRepo` for
+  recall — so the table's RLS policies do NOT engage on any of its access paths.
+  Isolation is the explicit `(tenant_id, subject_id)` predicate on every query (the
+  recall pool additionally backstopped by `Loopctl.HeavyRead`'s structural guard),
+  NOT RLS. The RLS policies apply only to a hypothetical RLS-enforcing
+  `Loopctl.Repo` caller, of which this context has none.
 
   ## Fields
 

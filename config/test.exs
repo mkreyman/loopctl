@@ -110,7 +110,13 @@ config :loopctl, :heavy_read_statement_timeout_overrides, %{
   # Theme-2 target is asserted SEPARATELY (wall-clock) in distant_pairs_novelty_scale_test.exs;
   # prod carries the tighter 4s backstop (config/config.exs).
   distant_pairs: 5_000,
-  distant_pairs_bridge: 5_000
+  distant_pairs_bridge: 5_000,
+  # US-28.2: the agent-memory HNSW recall (Loopctl.Memory.recall/2 -> all_memory/4).
+  # Sub-ms on the small sandbox dataset, but a generous 5s override keeps it off the
+  # aggressive 250ms pool default under parallel contention AND avoids a successful
+  # low-timeout SET LOCAL persisting into the enclosing sandbox transaction. No test
+  # asserts a :memory_recall timeout, so this cannot mask a real one.
+  memory_recall: 5_000
 }
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).
@@ -241,6 +247,12 @@ config :loopctl, :token_archival, Loopctl.MockTokenArchival
 
 # DI: Use mock embedding client in tests
 config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
+
+# US-28.2: a small per-(tenant, subject) long-term memory cap so the quota path
+# (`{:error, :quota_exceeded}`) is testable without inserting tens of thousands of
+# rows. Kept above the largest pagination test (25 rows) so that test stays under
+# the cap. Production uses the 10_000 default.
+config :loopctl, :max_long_term_memories_per_subject, 30
 
 # DI: Use mock knowledge extractor in tests
 config :loopctl, :knowledge_extractor, Loopctl.MockExtractor

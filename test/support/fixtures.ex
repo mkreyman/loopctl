@@ -645,6 +645,25 @@ defmodule Loopctl.Fixtures do
     AdminRepo.insert!(changeset)
   end
 
+  # A `Loopctl.Memory.Scope` for the US-28.2 context API. Creates a tenant when one
+  # isn't supplied and derives a unique `subject_id` — mirroring how the write path
+  # sets `(tenant_id, subject_id, project_id)` programmatically. This is a plain
+  # struct (no DB row), so it is `build`-like but lives under `fixture/2` per the
+  # story's naming.
+  def fixture(:memory_scope, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id = Map.get(attrs, :tenant_id) || fixture(:tenant).id
+    subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    project_id = Map.get(attrs, :project_id)
+
+    %Loopctl.Memory.Scope{
+      tenant_id: tenant_id,
+      subject_id: subject_id,
+      project_id: project_id
+    }
+  end
+
   def fixture(:article_link, attrs) do
     attrs = Enum.into(attrs, %{})
 

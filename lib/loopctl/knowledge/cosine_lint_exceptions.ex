@@ -115,6 +115,13 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
           "HeavyRead) — documented for auditability; the cosine literal itself is in " <>
           "novelty_distance_query/4 (also registered)"
     }
+    # NB: `Loopctl.Memory.memory_candidate_query/4` (US-28.2 agent-memory HNSW recall) is
+    # DELIBERATELY NOT registered here — it holds NO hand-rolled cosine literal. It builds
+    # its index-ordered inner pool through the shared, schema-parameterized
+    # `Loopctl.Knowledge.VectorSearch.index_safe_knn_base/4` + `put_distance/2`, so the
+    # cosine operator lives ONLY in `VectorSearch` (the lint whole-module home). Extracting that
+    # shared helper — rather than duplicating the HNSW query into Memory and registering an
+    # exception — is exactly what US-28.2 technical notes mandated.
   ]
 
   @doc """

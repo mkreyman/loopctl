@@ -433,6 +433,10 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
                               # real cosine query sites:
                               "lib/loopctl/knowledge.ex",
                               "lib/loopctl/knowledge/vector_search.ex",
+                              # NB: `lib/loopctl/memory.ex` is DELIBERATELY absent — US-28.2 agent-memory
+                              # recall holds NO hand-rolled cosine literal: it builds its index-ordered
+                              # inner pool through the shared VectorSearch.index_safe_knn_base/4 +
+                              # put_distance/2, so the cosine op lives only in VectorSearch (above).
                               # registry rationale strings quote the operators (data, not query):
                               "lib/loopctl/knowledge/cosine_lint_exceptions.ex",
                               # doc-only tokens (a `<->` arrow in prose / a `<=>` inside a comment):

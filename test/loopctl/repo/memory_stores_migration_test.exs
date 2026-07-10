@@ -89,11 +89,16 @@ defmodule Loopctl.Repo.MemoryStoresMigrationTest do
     end
 
     # AC-28.1.3 / TC-28.1.1: detect the HNSW index by access method, not by name.
-    test "has an HNSW index on embedding (detected by amname, not name)" do
+    # US-28.2 adds a SECOND, PARTIAL hnsw index over live rows
+    # (`WHERE superseded_by IS NULL`, migration 20260709000300) so default recall's
+    # over-fetch pool is not crowded by still-embedded superseded rows. `memories`
+    # therefore carries exactly TWO hnsw indexes: the full recall index (unfiltered)
+    # and the partial live index.
+    test "has HNSW indexes on embedding: the full recall index + the US-28.2 partial live index" do
       %{rows: rows} =
         AdminRepo.query!(
           """
-          SELECT i.relname
+          SELECT i.relname, pg_get_expr(x.indpred, x.indrelid) AS predicate
           FROM pg_index x
           JOIN pg_class i ON i.oid = x.indexrelid
           JOIN pg_class t ON t.oid = x.indrelid
@@ -104,8 +109,20 @@ defmodule Loopctl.Repo.MemoryStoresMigrationTest do
           []
         )
 
-      assert length(rows) == 1,
-             "expected exactly one hnsw index on memories, got #{inspect(rows)}"
+      assert length(rows) == 2,
+             "expected two hnsw indexes on memories (full + partial live), got #{inspect(rows)}"
+
+      predicates = Enum.map(rows, fn [_name, predicate] -> predicate end)
+
+      # Exactly one is unfiltered (the full recall index)...
+      assert Enum.count(predicates, &is_nil/1) == 1,
+             "expected exactly one UNFILTERED hnsw index, got #{inspect(rows)}"
+
+      # ...and exactly one is the partial live index over non-superseded rows.
+      assert Enum.any?(predicates, fn predicate ->
+               is_binary(predicate) and predicate =~ "superseded_by IS NULL"
+             end),
+             "expected a partial hnsw index WHERE superseded_by IS NULL, got #{inspect(rows)}"
     end
   end
 

@@ -284,6 +284,7 @@ config :loopctl, Oban,
        {"0 5 * * 0", Loopctl.Workers.KnowledgeMocWorker, args: %{"mode" => "all_tenants"}},
        {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker, args: %{"mode" => "all_tenants"}},
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
+       {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
        {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker}
      ]}

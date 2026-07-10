@@ -111,6 +111,95 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
+  describe "filters_by_subject?/1 + all_memory/4 guard (US-28.2)" do
+    alias Loopctl.Memory.Memory, as: MemorySchema
+
+    test "true when the outermost query carries a conjunctive subject_id equality" do
+      assert HeavyRead.filters_by_subject?(from(m in MemorySchema, where: m.subject_id == ^"s"))
+    end
+
+    test "true when subject_id is on the OUTER query over a from-subquery (recall shape)" do
+      inner =
+        from(m in MemorySchema, where: m.tenant_id == ^"t", select: %{subject_id: m.subject_id})
+
+      assert HeavyRead.filters_by_subject?(
+               from(c in subquery(inner), where: c.subject_id == ^"s")
+             )
+    end
+
+    test "false when subject_id only appears inside an inner subquery, not the outer" do
+      inner = from(m in MemorySchema, where: m.subject_id == ^"s", select: %{id: m.id})
+      refute HeavyRead.filters_by_subject?(from(c in subquery(inner), select: count()))
+    end
+
+    test "false when subject_id equality is OR-ed with a broadening condition" do
+      refute HeavyRead.filters_by_subject?(
+               from(m in MemorySchema, where: m.subject_id == ^"s" or m.confidence > 0.0)
+             )
+    end
+
+    test "false when subject_id scopes only a JOINED source, not the primary from binding" do
+      # The returned `from` rows are only tenant-scoped; a JOINED table carries the
+      # subject predicate. The output could still surface cross-subject rows from the
+      # unscoped `from` binding, so the guard must reject — matching the tenant guard's
+      # every-output-source strength (the subject predicate must sit on binding 0).
+      refute HeavyRead.filters_by_subject?(
+               from(m in MemorySchema,
+                 join: m2 in MemorySchema,
+                 on: m2.tenant_id == m.tenant_id and m2.subject_id == ^"s",
+                 where: m.tenant_id == ^"t"
+               )
+             )
+    end
+
+    test "all_memory/4 raises when subject_id is only on a joined source, not the from" do
+      tenant = Ecto.UUID.generate()
+
+      q =
+        from(m in MemorySchema,
+          join: m2 in MemorySchema,
+          on: m2.tenant_id == ^tenant and m2.subject_id == ^"subj",
+          where: m.tenant_id == ^tenant
+        )
+
+      assert_raise ArgumentError, ~r/subject/, fn ->
+        HeavyRead.all_memory(tenant, "subj", q, [])
+      end
+    end
+
+    test "all_memory/4 raises when the query lacks a subject_id predicate" do
+      tenant = Ecto.UUID.generate()
+      q = from(m in MemorySchema, where: m.tenant_id == ^tenant)
+
+      assert_raise ArgumentError, ~r/subject/, fn ->
+        HeavyRead.all_memory(tenant, "subj", q, [])
+      end
+    end
+
+    test "all_memory/4 raises when the subject predicate is bound to a DIFFERENT subject" do
+      tenant = Ecto.UUID.generate()
+      q = from(m in MemorySchema, where: m.tenant_id == ^tenant and m.subject_id == ^"other")
+
+      assert_raise ArgumentError, ~r/subject/, fn ->
+        HeavyRead.all_memory(tenant, "subj", q, [])
+      end
+    end
+
+    test "all_memory/4 still enforces the tenant guard on every base-table source" do
+      q = from(m in MemorySchema, where: m.subject_id == ^"subj")
+
+      assert_raise ArgumentError, ~r/scoped to the given tenant/, fn ->
+        HeavyRead.all_memory(Ecto.UUID.generate(), "subj", q, [])
+      end
+    end
+
+    test "all_memory/4 requires binary tenant_id AND subject_id" do
+      q = from(m in MemorySchema, where: m.tenant_id == ^"t" and m.subject_id == ^"s")
+      assert_raise ArgumentError, fn -> HeavyRead.all_memory(nil, "s", q, []) end
+      assert_raise ArgumentError, fn -> HeavyRead.all_memory("t", nil, q, []) end
+    end
+  end
+
   describe "all/3 + one/3 guard" do
     test "raise ArgumentError when tenant_id is not a binary" do
       q = from(a in Article, where: a.tenant_id == ^"t")
