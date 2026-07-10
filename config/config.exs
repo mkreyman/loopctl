@@ -287,7 +287,16 @@ config :loopctl, Oban,
        {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
        {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker}
-     ]}
+     ]},
+    # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
+    # Without Lifeline these rows stay `executing` forever — 110 such orphans (from
+    # 2026-06-22) were found still clogging the queues on 2026-07-10. Reset a stuck
+    # job back to `available` (or discard if attempts are exhausted) after 30 min so
+    # the slot frees and it re-runs instead of leaking.
+    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
+    # Prune terminal (completed/discarded/cancelled) jobs older than 7 days so the
+    # oban_jobs table doesn't grow unbounded.
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7}
   ]
 
 # Cloak Vault — key configured per environment
