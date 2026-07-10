@@ -629,9 +629,10 @@ defmodule LoopctlWeb.MemoryControllerTest do
 
       assert promote_body["data"]["session_id"] == "s1"
       assert promote_body["data"]["status"] == "enqueued"
-      # job_id is the job reference (a real integer in prod; nil under Oban's
-      # `testing: :inline`, where the job runs synchronously and is not persisted).
-      assert Map.has_key?(promote_body["data"], "job_id")
+      # The 202 reference is the tenant-scoped session_id, NOT the system-wide Oban job
+      # id: the raw global bigserial is deliberately withheld from agent-role callers to
+      # avoid a cross-tenant throughput side-channel (US-29.3 finding fix).
+      refute Map.has_key?(promote_body["data"], "job_id")
 
       # Inline Oban runs the worker during the request; drain is a harmless no-op.
       Oban.drain_queue(queue: :memory)
@@ -647,6 +648,22 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert entry["source_session_id"] == "s1"
       assert entry["confidence"] == 0.9
       assert entry["subject_id"] == to_string(agent.id)
+    end
+
+    # US-29.3 finding fix: a whitespace-only session_id must hit the documented
+    # "non-blank session_id required" 422, not enqueue a budget-consuming no-op.
+    test "a whitespace-only session_id returns 422 (not a 202 no-op)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/promote", %{"session_id" => "   "})
+        |> json_response(422)
+
+      assert body["error"]["status"] == 422
+      assert body["error"]["code"] == "missing_session_id"
     end
   end
 
@@ -749,6 +766,88 @@ defmodule LoopctlWeb.MemoryControllerTest do
         |> json_response(200)
 
       refute Enum.any?(after_body["data"], &(&1["id"] == p1.id))
+    end
+
+    # AC-29.3.4: rejecting (deleting) a PROMOTED memory that SUPERSEDES a prior
+    # one must never permanently hide the dependent. The promotion worker actively
+    # creates superseders (near-dup supersede), so a :promoted memory CAN be a live
+    # superseder. This exercises that exact path end-to-end through the HTTP delete:
+    # seed a promoted superseder P over dependent D (D.superseded_by = P), then have
+    # a superadmin reject P and assert D's edge is nilified (epic_28
+    # on_delete: :nilify_all) so D resurfaces in the list rather than staying hidden.
+    test "rejecting a promoted superseder nilifies its dependent so no memory stays permanently hidden" do
+      tenant = fixture(:tenant)
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      # D — the dependent (prior) promoted memory that P will supersede.
+      dependent =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: "subj-1",
+          source: :promoted,
+          source_session_id: "sess-1",
+          confidence: 0.6,
+          text: "older promoted truth about the customer"
+        })
+
+      # P — the promoted superseder. `superseded_by` is a programmatic field (never
+      # cast), so set the edge directly on the dependent, mirroring the worker's
+      # supersede write.
+      superseder =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: "subj-1",
+          source: :promoted,
+          source_session_id: "sess-2",
+          confidence: 0.95,
+          text: "newer promoted truth about the customer"
+        })
+
+      {:ok, _} =
+        dependent
+        |> Ecto.Changeset.change(superseded_by: superseder.id)
+        |> Loopctl.AdminRepo.update()
+
+      # While superseded, D is hidden from the default (include_superseded=false) list;
+      # P is present.
+      before_ids =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?source=promoted&all_subjects=true")
+        |> json_response(200)
+        |> Map.fetch!("data")
+        |> Enum.map(& &1["id"])
+
+      refute dependent.id in before_ids
+      assert superseder.id in before_ids
+
+      # Reject the superseder P via superadmin DELETE.
+      del_body =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> delete(~p"/api/v1/memory/#{superseder.id}")
+        |> json_response(200)
+
+      assert del_body["data"]["deleted"] == true
+
+      # on_delete: :nilify_all cleared D.superseded_by — D is no longer hidden.
+      reloaded = Loopctl.AdminRepo.get(Loopctl.Memory.Memory, dependent.id)
+      assert is_nil(reloaded.superseded_by)
+
+      # D resurfaces in the default list; P is gone. Nothing stays permanently hidden.
+      after_ids =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?source=promoted&all_subjects=true")
+        |> json_response(200)
+        |> Map.fetch!("data")
+        |> Enum.map(& &1["id"])
+
+      assert dependent.id in after_ids
+      refute superseder.id in after_ids
     end
   end
 

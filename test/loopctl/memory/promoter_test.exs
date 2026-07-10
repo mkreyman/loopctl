@@ -136,6 +136,70 @@ defmodule Loopctl.Memory.PromoterTest do
       assert own_article.id in candidate.cross_links
     end
 
+    test "drops a cross_link to another agent's private article in the SAME tenant, keeps its own" do
+      tenant = fixture(:tenant)
+      # The compiling subject is agent "A". For an agent-role key subject_id IS the
+      # verified agent_id that Knowledge stamps into metadata.agent_id, so promotion
+      # must apply the SAME visibility rule as the change feed: shared articles plus
+      # the subject's own private/owner articles are linkable; another agent's
+      # private/owner article is not — even in-tenant.
+      scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
+
+      shared = fixture(:article, tenant_id: tenant.id)
+
+      own_private =
+        fixture(:article,
+          tenant_id: tenant.id,
+          metadata: %{"visibility" => "private", "agent_id" => "A"}
+        )
+
+      foreign_private =
+        fixture(:article,
+          tenant_id: tenant.id,
+          metadata: %{"visibility" => "private", "agent_id" => "other-agent"}
+        )
+
+      seed_session(scope, "s1", ["turn one", "turn two"])
+
+      expect(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        {:ok,
+         candidate_json([
+           %{
+             text: "a durable fact",
+             confidence: 0.9,
+             cross_links: [shared.id, own_private.id, foreign_private.id]
+           }
+         ])}
+      end)
+
+      assert {:ok, [candidate]} = Promoter.compile(scope, "s1")
+
+      assert shared.id in candidate.cross_links
+      assert own_private.id in candidate.cross_links
+      refute foreign_private.id in candidate.cross_links
+    end
+
+    test "caps cross_links per candidate, symmetric with the tag/text caps" do
+      tenant = fixture(:tenant)
+      scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
+      seed_session(scope, "s1", ["turn one", "turn two"])
+
+      # Attacker-influenced content could coax the LLM into emitting a very large
+      # cross_links list; the collector caps the COUNT before the batched validation
+      # query so `a.id IN (...)` can never be unbounded. Emit MORE than the cap of
+      # distinct, VALID in-tenant ids so the cap (not validation) is what bounds the
+      # result — 22 > the cap of 20.
+      article_ids = for _ <- 1..22, do: fixture(:article, tenant_id: tenant.id).id
+
+      expect(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        {:ok, candidate_json([%{text: "fact", confidence: 0.9, cross_links: article_ids}])}
+      end)
+
+      assert {:ok, [candidate]} = Promoter.compile(scope, "s1")
+      # All 22 are valid + visible, so only the count cap can trim the list to 20.
+      assert length(candidate.cross_links) == 20
+    end
+
     test "drops malformed (non-UUID) cross_links" do
       tenant = fixture(:tenant)
       scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
