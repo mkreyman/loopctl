@@ -94,6 +94,19 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/article_links"},
                {:delete, "/api/v1/article_links/:id"},
 
+               # Agent Memory (Epic 28, US-28.3) — the agent's own per-subject
+               # working memory, part of the KB-tier agent surface alongside the
+               # Knowledge/article routes above. An agent-rooted (KB-tier) tenant
+               # is the INTENDED user of agent memory, so gating it behind
+               # human-anchor would make the feature unreachable for the very tier
+               # it's built for. Isolation is the (tenant_id, subject_id) boundary
+               # (derived from the key, never the body); own-memory delete is
+               # subject-scoped and the tenant-wide (any-subject) list/delete
+               # oversight path is superadmin-only. recall is a POST-shaped READ.
+               {:post, "/api/v1/memory"},
+               {:post, "/api/v1/memory/recall"},
+               {:delete, "/api/v1/memory/:id"},
+
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,
                # NOT work-breakdown state. Every route is nested under
                # `/projects/:project_id/...` and creating a project
