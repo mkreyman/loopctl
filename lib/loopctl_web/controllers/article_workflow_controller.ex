@@ -4,30 +4,45 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   - `POST /api/v1/articles/:id/publish` -- publish a draft article (orchestrator+)
   - `POST /api/v1/articles/:id/unpublish` -- unpublish a published article (user+)
-  - `POST /api/v1/articles/:id/archive` -- archive an article (user+)
+  - `POST /api/v1/articles/:id/archive` -- archive an article (agent+)
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
   - `POST /api/v1/knowledge/bulk-delete` -- bulk archive/soft-delete (user+)
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
+
+  Role note (#331): single-article `archive` and `resolve_conflict` (all
+  dispositions, incl. supersede/merge) are agent+ KB-content curation — reversible
+  + audited (supersede retires via a reversible link; merge produces a DRAFT). The
+  SET-BASED bulk ops (`bulk_delete`, incl. the irreversible HARD-delete path,
+  `bulk_publish`, `bulk_unpublish`) stay `user`-gated: high blast radius / not
+  reversible.
   """
 
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
-  alias Loopctl.Auth.Role
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.BulkOps
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
+  alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:drafts, :publish]
 
+  # Set-based bulk ops (high blast radius; bulk_delete includes an irreversible
+  # HARD-delete path) and unpublish stay user-gated.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :user]
-       when action in [:unpublish, :archive, :bulk_publish, :bulk_unpublish, :bulk_delete]
+       when action in [:unpublish, :bulk_publish, :bulk_unpublish, :bulk_delete]
+
+  # Single-article archive and conflict resolution are agent+ KB curation (#331):
+  # reversible + audited. archive is visibility-scoped in-action.
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :agent]
+       when action in [:archive, :conflicts, :resolve_conflict]
 
   tags(["Knowledge Wiki"])
 
@@ -66,8 +81,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   operation(:archive,
     summary: "Archive article",
     description:
-      "Transitions article to archived status. " <>
-        "Valid from draft or published. Returns 422 if superseded. Role: user+.",
+      "Transitions article to archived status (soft delete — reversible, audited). " <>
+        "Valid from draft or published. Returns 422 if superseded. Role: agent+ " <>
+        "(an agent may only archive an article it can see — another agent's " <>
+        "private/owner memory 404s).",
     parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
     responses: %{
       200 =>
@@ -263,11 +280,13 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       "Record how a potential-conflict pair should be resolved. `dismiss` (false positive) " <>
         "takes effect immediately; `supersede` (with authoritative_article_id) is applied by " <>
         "the nightly executor at confidence \"high\" — it creates a supersedes link and " <>
-        "retires the loser (reversible, audited); `merge` is recorded for the later LLM step. " <>
+        "retires the loser (reversible, audited); `merge` is recorded for the later LLM step " <>
+        "(it produces a new DRAFT, never auto-published). " <>
         "The KB never re-judges — it acts on your verdict. Last-write-wins per pair. Only " <>
         "pairs the system flagged (GET /knowledge/conflicts) may be resolved; an unknown pair " <>
-        "returns 422. `dismiss` is agent+; the destructive `supersede`/`merge` dispositions " <>
-        "require user+.",
+        "returns 422. All dispositions are agent+ KB-content curation (#331): they are " <>
+        "reversible + audited, and the privileged nightly executor is what actually applies " <>
+        "supersede/merge.",
     request_body:
       {"Resolution", "application/json",
        %OpenApiSpex.Schema{
@@ -293,9 +312,6 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       201 =>
         {"Recorded", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
-      403 =>
-        {"Forbidden (destructive supersede/merge dispositions require role: user+)",
-         "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error, or no system-flagged potential_conflict for the pair",
          "application/json", Schemas.ErrorResponse},
@@ -372,10 +388,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   @doc "POST /api/v1/articles/:id/archive"
   def archive(conn, %{"id" => article_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    audit_opts = AuditContext.from_conn(conn)
+    # Visibility scope (#163/#331): an agent may only archive an article it can
+    # see — another agent's private/owner memory 404s (matching reads).
+    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
 
     with {:ok, article} <-
-           Knowledge.archive_article_workflow(tenant_id, article_id, audit_opts) do
+           Knowledge.archive_article_workflow(tenant_id, article_id, opts) do
       json(conn, ArticleJSON.update(%{article: article}))
     end
   end
@@ -698,6 +716,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         []
         |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        # Visibility scope (#331): an agent must not even see a conflict pair whose
+        # member is another agent's private/owner memory — parity with resolve.
+        |> Keyword.merge(Visibility.scope_opts(conn))
 
       result = Knowledge.list_potential_conflicts(tenant_id, opts)
 
@@ -707,34 +728,22 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
-    api_key = conn.assigns.current_api_key
-    disposition = params["disposition"]
-
-    # kb-02 (GHSA-9gqg-9r6p-658v): `supersede` (retire the loser) and `merge` (retire +
-    # LLM-synthesize) are the DESTRUCTIVE dispositions — the nightly executor applies
-    # them by transitioning an article out of published. Consistent with archive/
-    # unpublish, recording such a verdict requires role: :user. `dismiss` (a false
-    # positive) is non-destructive and stays at :agent, preserving the intended
-    # agent-annotates flow. This is an in-action check (not a static RequireRole plug)
-    # because destructiveness depends on the body param disposition. Enforcing at the
-    # boundary means no agent-originated destructive verdict is ever PERSISTED, so the
-    # executor can never act on one (the ConflictResolution row carries no originating
-    # role, making the controller the only place with the caller's role in hand).
-    if destructive_disposition?(disposition) and
-         not Role.role_at_least?(api_key.role, :user) do
-      forbidden(
-        conn,
-        "Resolving a conflict as '#{disposition}' retires or merges an article, which " <>
-          "removes it from published reads. This destructive disposition requires the " <>
-          "user role or higher. Agents may 'dismiss' a false positive."
-      )
-    else
-      do_resolve_conflict(conn, api_key.tenant_id, params)
-    end
+    # #331: recording a verdict on a potential-conflict pair — dismiss, supersede,
+    # OR merge — is agent+ KB-content curation. All dispositions are reversible +
+    # audited: supersede retires the loser via a supersedes link (only at
+    # confidence "high", by the privileged nightly executor), and merge produces a
+    # new DRAFT (never auto-published). The fabrication guard still stands — only
+    # a pair the system flagged as a `:potential_conflict` may be resolved (422
+    # otherwise) — so opening the disposition doesn't let an agent retire an
+    # arbitrary pair. The agent role gate is the static RequireRole plug above.
+    do_resolve_conflict(conn, conn.assigns.current_api_key.tenant_id, params)
   end
 
   defp do_resolve_conflict(conn, tenant_id, params) do
-    audit_opts = AuditContext.from_conn(conn)
+    # Visibility scope (#331): an agent may only resolve a pair whose BOTH members
+    # it can see — annotate_conflict/3 refuses an invisible member as :no_potential_conflict
+    # (422), matching the update/delete/archive paths. Higher roles pass no scope.
+    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -746,7 +755,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       "confidence" => params["confidence"]
     }
 
-    case Knowledge.annotate_conflict(tenant_id, attrs, audit_opts) do
+    case Knowledge.annotate_conflict(tenant_id, attrs, opts) do
       {:ok, resolution} ->
         conn
         |> put_status(:created)
@@ -770,23 +779,6 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}
     end
-  end
-
-  # supersede/merge lead the nightly executor to retire (and, for merge, synthesize
-  # over) an article — the destructive dispositions. dismiss is non-destructive.
-  # Guarded against non-scalar JSON values so to_string/1 can't raise a 500
-  # (kb-02 FIX C); a non-binary/atom disposition falls through to the changeset's
-  # inclusion validation (422).
-  defp destructive_disposition?(disposition) when is_binary(disposition) or is_atom(disposition),
-    do: to_string(disposition) in ["supersede", "merge"]
-
-  defp destructive_disposition?(_), do: false
-
-  # 403 body matches the RequireRole plug / FallbackController shape.
-  defp forbidden(conn, message) do
-    conn
-    |> put_status(:forbidden)
-    |> json(%{error: %{status: 403, message: message}})
   end
 
   defp resolution_note(%{disposition: :dismiss}),

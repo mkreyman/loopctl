@@ -241,6 +241,24 @@ async function knowledgeCreate({ title, body, category, tags, project_id, draft,
   return toContent(result);
 }
 
+// #331 — mirrors index.js knowledgeUpdate (PATCH, agent key, only-provided-fields).
+async function knowledgeUpdate({ article_id, title, body, category, tags, metadata }) {
+  const payload = {};
+  if (title != null) payload.title = title;
+  if (body != null) payload.body = body;
+  if (category != null) payload.category = category;
+  if (tags != null) payload.tags = tags;
+  if (metadata != null) payload.metadata = metadata;
+
+  const result = await apiCall(
+    "PATCH",
+    `/api/v1/articles/${article_id}`,
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 async function knowledgeAgentUsage({ api_key_id, agent_id, limit, since_days } = {}) {
@@ -964,6 +982,48 @@ describe("knowledge_create: publish-on-create by default (#133)", () => {
 
     assert.equal(result.isError, undefined, "default publish-on-create must not error");
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+  });
+});
+
+describe("knowledge_update: in-place edit on the agent key (#331)", () => {
+  test("PATCHes /api/v1/articles/:id on the agent key, ID preserved in the path", async () => {
+    setupEnv();
+    const id = "11111111-1111-1111-1111-111111111111";
+    const calls = mockFetch({ data: { id, title: "New" } });
+
+    await knowledgeUpdate({ article_id: id, title: "New", body: "b" });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(new URL(url).pathname, `/api/v1/articles/${id}`);
+    assert.equal(options.method, "PATCH");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+  });
+
+  test("sends only the provided fields (partial update)", async () => {
+    setupEnv();
+    const id = "22222222-2222-2222-2222-222222222222";
+    const calls = mockFetch({ data: { id } });
+
+    await knowledgeUpdate({ article_id: id, body: "only body", tags: ["x"] });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.deepEqual(sent, { body: "only body", tags: ["x"] });
+    assert.equal(sent.title, undefined);
+    assert.equal(sent.category, undefined);
+  });
+
+  test("works on an agent-only install (no user/orch key consulted)", async () => {
+    setupEnv();
+    delete process.env.LOOPCTL_USER_KEY;
+    delete process.env.LOOPCTL_ORCH_KEY;
+    const id = "33333333-3333-3333-3333-333333333333";
+    const calls = mockFetch({ data: { id } });
+
+    const result = await knowledgeUpdate({ article_id: id, title: "T" });
+
+    assert.equal(result.isError, undefined);
     assert.equal(calls[0].options.headers.Authorization, `Bearer ${AGENT_KEY}`);
   });
 });

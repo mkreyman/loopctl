@@ -2225,7 +2225,7 @@ defmodule Loopctl.Knowledge do
     project_id = attrs[:project_id] || attrs["project_id"]
 
     with :ok <- validate_project_ownership(tenant_id, project_id),
-         {:ok, article} <- fetch_article(tenant_id, article_id) do
+         {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -2297,7 +2297,7 @@ defmodule Loopctl.Knowledge do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    with {:ok, article} <- fetch_article(tenant_id, article_id) do
+    with {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
       old_status = to_string(article.status)
       changeset = Article.update_changeset(article, %{status: :archived})
 
@@ -2667,11 +2667,15 @@ defmodule Loopctl.Knowledge do
     multi =
       Multi.new()
       |> Multi.run(:fetch, fn _repo, _changes ->
+        # Visibility scope (#163/#331): an agent archiving via the workflow can only
+        # reach an article it can see — another agent's private/owner memory resolves
+        # to :not_found (404). Higher roles pass no scope.
         query =
           from(a in Article,
             where: a.id == ^article_id and a.tenant_id == ^tenant_id,
             lock: "FOR UPDATE"
           )
+          |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
 
         case AdminRepo.one(query) do
           nil -> {:error, {:not_found, nil}}
@@ -3296,12 +3300,23 @@ defmodule Loopctl.Knowledge do
   def list_potential_conflicts(tenant_id, opts \\ []) do
     limit = opts |> Keyword.get(:limit, 50) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     # The queue shows OPEN conflicts only — a pair a retrieving agent has already
-    # ruled on (a `conflict_resolutions` row, either direction) drops out.
+    # ruled on (a `conflict_resolutions` row, either direction) drops out. The
+    # source/target Articles are joined into the base (as :source/:target) so both
+    # the count and the page can be VISIBILITY-scoped (#331): an agent must not even
+    # see — let alone resolve — a pair whose member is another agent's private/owner
+    # memory (published memories are conflict-eligible). Higher roles pass no scope.
     base =
       from(l in ArticleLink,
         as: :link,
+        join: s in Article,
+        as: :source,
+        on: s.id == l.source_article_id,
+        join: t in Article,
+        as: :target,
+        on: t.id == l.target_article_id,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
         # kb-02: only surface SYSTEM-flagged conflicts as resolvable evidence, so a stray
@@ -3319,15 +3334,12 @@ defmodule Loopctl.Knowledge do
             )
           )
       )
+      |> filter_conflict_pairs_by_visibility(vis)
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
     rows =
-      from(l in base,
-        join: s in Article,
-        on: s.id == l.source_article_id,
-        join: t in Article,
-        on: t.id == l.target_article_id,
+      from([link: l, source: s, target: t] in base,
         order_by: [
           desc: fragment("(?->>'similarity_score')::float", l.metadata),
           asc: l.id
@@ -3349,6 +3361,22 @@ defmodule Loopctl.Knowledge do
       end)
 
     %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}
+  end
+
+  # Visibility predicate for the conflict queue: BOTH members of a pair must be
+  # visible to an agent caller (shared/non-memory, or owned by the caller). nil
+  # (higher role) → no filter. Mirrors maybe_filter_by_visibility/2 but applied to
+  # the two named article bindings at once.
+  defp filter_conflict_pairs_by_visibility(query, nil), do: query
+
+  defp filter_conflict_pairs_by_visibility(query, agent_id) when is_binary(agent_id) do
+    from([source: s, target: t] in query,
+      where:
+        (fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", s.metadata) or
+           fragment("?->>'agent_id' = ?", s.metadata, ^agent_id)) and
+          (fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", t.metadata) or
+             fragment("?->>'agent_id' = ?", t.metadata, ^agent_id))
+    )
   end
 
   @doc """
@@ -3384,7 +3412,17 @@ defmodule Loopctl.Knowledge do
     # on ANY two in-tenant articles and have the nightly executor retire/merge one of
     # them. Require a `:potential_conflict` ArticleLink for the pair (the linker/lint
     # sweep flags these; stored in either direction) BEFORE accepting any disposition.
-    with :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
+    #
+    # Visibility parity (#331): an agent caller may only record a verdict on a pair
+    # whose BOTH members it can see. Without this, agent A could resolve a flagged
+    # pair whose member is agent B's private/owner memory and have the executor
+    # retire it (supersede) or LLM-synthesize its content into a new draft (merge —
+    # cross-agent private disclosure). Checked FIRST and returning the same
+    # :no_potential_conflict as an unflagged pair, so an agent can't probe which
+    # private ids exist. Higher roles pass no scope and see everything.
+    with :ok <-
+           validate_pair_visible(tenant_id, src, tgt, Keyword.get(opts, :visibility_agent_id)),
+         :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
       disposition = get.(:disposition)
       now = DateTime.utc_now()
 
@@ -3441,6 +3479,25 @@ defmodule Loopctl.Knowledge do
       result
     end
   end
+
+  # Visibility parity for conflict resolution (#331). nil (higher role) → no check.
+  # For an agent caller, BOTH pair members must be visible (reusing visible_article_ids/3,
+  # the same helper the change feed uses); otherwise the verdict is refused as if the
+  # pair were never flagged (:no_potential_conflict → 422), so an agent can neither act
+  # on nor probe another agent's private/owner memory. A missing/non-binary id is left
+  # to validate_potential_conflict_exists + the changeset's required-field validation.
+  defp validate_pair_visible(tenant_id, src, tgt, agent_id)
+       when is_binary(agent_id) and is_binary(src) and is_binary(tgt) do
+    visible = visible_article_ids(tenant_id, [src, tgt], agent_id)
+
+    if MapSet.member?(visible, src) and MapSet.member?(visible, tgt) do
+      :ok
+    else
+      {:error, :no_potential_conflict}
+    end
+  end
+
+  defp validate_pair_visible(_tenant_id, _src, _tgt, _agent_id), do: :ok
 
   # kb-02: true only when the linker/lint sweep actually flagged this pair as a
   # potential conflict (link stored in either direction). When an id is missing we
@@ -5046,8 +5103,17 @@ defmodule Loopctl.Knowledge do
   defp embedding_dimensions(embedding) when is_list(embedding), do: length(embedding)
   defp embedding_dimensions(%Pgvector{} = vector), do: length(Pgvector.to_list(vector))
 
-  defp fetch_article(tenant_id, article_id) do
-    case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
+  defp fetch_article(tenant_id, article_id, opts) do
+    # Visibility scope (#163/#331): the write paths (update/archive) pass the
+    # caller's `:visibility_agent_id` so an agent cannot mutate another agent's
+    # `private`/`owner` memory — an invisible target resolves to :not_found (404),
+    # matching the read paths. Higher roles pass no scope and reach any in-tenant
+    # article.
+    query =
+      from(a in Article, where: a.id == ^article_id and a.tenant_id == ^tenant_id)
+      |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+
+    case AdminRepo.one(query) do
       nil -> {:error, :not_found}
       article -> {:ok, article}
     end

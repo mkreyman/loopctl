@@ -3,6 +3,12 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
+  alias Loopctl.Knowledge.Article
+
+  import Ecto.Query
+
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
@@ -1092,24 +1098,10 @@ defmodule LoopctlWeb.ArticleControllerTest do
   end
 
   describe "PATCH /api/v1/articles/:id" do
-    test "agent role gets 403 on update", %{conn: conn} do
+    # #331: KB content editing is agent-role curation (was user+).
+    test "agent role can update article in place", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-      article = fixture(:article, %{tenant_id: tenant.id})
-
-      conn =
-        conn
-        |> auth_conn(raw_key)
-        |> patch(~p"/api/v1/articles/#{article.id}", %{
-          "title" => "Updated Title"
-        })
-
-      assert json_response(conn, 403)
-    end
-
-    test "user role can update article", %{conn: conn} do
-      tenant = fixture(:tenant)
-      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       article = fixture(:article, %{tenant_id: tenant.id})
 
       conn =
@@ -1117,17 +1109,128 @@ defmodule LoopctlWeb.ArticleControllerTest do
         |> auth_conn(raw_key)
         |> patch(~p"/api/v1/articles/#{article.id}", %{
           "title" => "Updated Title",
-          "status" => "published"
+          "body" => "Updated body",
+          "category" => "decision",
+          "tags" => ["e", "f"]
         })
 
       body = json_response(conn, 200)
       assert body["data"]["title"] == "Updated Title"
-      assert body["data"]["status"] == "published"
+      assert body["data"]["body"] == "Updated body"
+      assert body["data"]["category"] == "decision"
+      assert body["data"]["tags"] == ["e", "f"]
     end
-  end
 
-  describe "DELETE /api/v1/articles/:id" do
-    test "agent role gets 403 on delete", %{conn: conn} do
+    # #331 privilege-bypass guard: `status` on PATCH is user+ only, so an agent
+    # cannot publish a draft via PATCH (bypassing the orchestrator-gated publish
+    # review) or drive lifecycle directly.
+    test "agent PATCH {status: published} is 403 and leaves the draft unchanged", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"status" => "published"})
+
+      body = json_response(conn, 403)
+      assert body["error"]["code"] == "status_change_forbidden"
+      # The draft was NOT published — the orchestrator-gated review is intact.
+      assert AdminRepo.get!(Article, article.id).status == :draft
+    end
+
+    test "agent PATCH {status: superseded} is 403, unchanged", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"status" => "superseded"})
+
+      assert json_response(conn, 403)["error"]["code"] == "status_change_forbidden"
+      assert AdminRepo.get!(Article, article.id).status == :published
+    end
+
+    # Whole-request reject: a status field poisons the whole PATCH — the content
+    # change (title) must NOT be applied either, so the caller isn't misled.
+    test "agent PATCH mixing title + status is rejected whole (title unchanged)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :draft, title: "Before"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{
+          "title" => "After",
+          "status" => "published"
+        })
+
+      assert json_response(conn, 403)["error"]["code"] == "status_change_forbidden"
+
+      reloaded = AdminRepo.get!(Article, article.id)
+      assert reloaded.title == "Before"
+      assert reloaded.status == :draft
+    end
+
+    # A content-only agent PATCH (no status key) still succeeds — the guard only
+    # trips on a status field.
+    test "agent PATCH with no status key still succeeds (content edited)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Old"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"title" => "New", "body" => "New body"})
+        |> json_response(200)
+
+      assert body["data"]["title"] == "New"
+      assert body["data"]["body"] == "New body"
+    end
+
+    # IDs are load-bearing (cited in CLAUDE.mds, cross-links) — an in-place edit
+    # MUST preserve the article ID rather than churn a new row (#331).
+    test "preserves the article ID across an edit", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Original"})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"body" => "tidied"})
+        |> json_response(200)
+
+      assert body["data"]["id"] == article.id
+      # Exactly one row still exists — no churn.
+      assert AdminRepo.aggregate(from(a in Article, where: a.tenant_id == ^tenant.id), :count) ==
+               1
+    end
+
+    test "a partial (body-only) edit leaves other fields untouched", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      article =
+        fixture(:article, %{tenant_id: tenant.id, title: "Keep Title", category: :pattern})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"body" => "new body only"})
+        |> json_response(200)
+
+      assert body["data"]["title"] == "Keep Title"
+      assert body["data"]["category"] == "pattern"
+      assert body["data"]["body"] == "new body only"
+    end
+
+    test "an invalid field value returns 422 (not a 500)", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
       article = fixture(:article, %{tenant_id: tenant.id})
@@ -1135,23 +1238,135 @@ defmodule LoopctlWeb.ArticleControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> delete(~p"/api/v1/articles/#{article.id}")
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"category" => "not-a-category"})
 
-      assert json_response(conn, 403)
+      assert json_response(conn, 422)
+      # Unchanged in the DB.
+      assert AdminRepo.get!(Article, article.id).category == :pattern
     end
 
-    test "archives article (soft delete) with user role", %{conn: conn} do
+    test "records an article.updated audit entry", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Before"})
+
+      conn
+      |> auth_conn(raw_key)
+      |> patch(~p"/api/v1/articles/#{article.id}", %{"title" => "After"})
+      |> json_response(200)
+
+      audit =
+        from(a in AuditLog,
+          where: a.entity_type == "article" and a.entity_id == ^article.id,
+          where: a.action == "article.updated"
+        )
+        |> AdminRepo.one!()
+
+      assert audit.tenant_id == tenant.id
+    end
+
+    # user role remains allowed (higher role, agent+).
+    test "user role can still update article", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      article = fixture(:article, %{tenant_id: tenant.id})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{
+          "title" => "Updated Title",
+          "status" => "published"
+        })
+        |> json_response(200)
+
+      assert body["data"]["title"] == "Updated Title"
+      assert body["data"]["status"] == "published"
+    end
+
+    # Tenant isolation: agent in tenant B cannot edit tenant A's article (404).
+    test "an agent in another tenant cannot edit the article (404, unchanged)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant_a.id, title: "A-owned"})
+
+      conn =
+        conn
+        |> auth_conn(key_b)
+        |> patch(~p"/api/v1/articles/#{article.id}", %{"title" => "Hijacked"})
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, article.id).title == "A-owned"
+    end
+  end
+
+  describe "DELETE /api/v1/articles/:id" do
+    # #331: soft-delete (archive) is agent-role curation (was user+).
+    test "agent role archives article (soft delete)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> delete(~p"/api/v1/articles/#{article.id}")
+        |> json_response(200)
+
+      assert body["data"]["status"] == "archived"
+      # Soft delete — the row is retained.
+      assert AdminRepo.get!(Article, article.id).status == :archived
+    end
+
+    test "records an article.archived audit entry", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      conn
+      |> auth_conn(raw_key)
+      |> delete(~p"/api/v1/articles/#{article.id}")
+      |> json_response(200)
+
+      audit =
+        from(a in AuditLog,
+          where: a.entity_type == "article" and a.entity_id == ^article.id,
+          where: a.action == "article.archived"
+        )
+        |> AdminRepo.one!()
+
+      assert audit.tenant_id == tenant.id
+    end
+
+    test "user role can still archive article", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       article = fixture(:article, %{tenant_id: tenant.id, status: :published})
 
-      conn =
+      body =
         conn
         |> auth_conn(raw_key)
         |> delete(~p"/api/v1/articles/#{article.id}")
+        |> json_response(200)
 
-      body = json_response(conn, 200)
       assert body["data"]["status"] == "archived"
+    end
+
+    # Tenant isolation: agent in tenant B cannot archive tenant A's article (404).
+    test "an agent in another tenant cannot archive the article (404, unchanged)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant_a.id, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(key_b)
+        |> delete(~p"/api/v1/articles/#{article.id}")
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, article.id).status == :published
     end
   end
 

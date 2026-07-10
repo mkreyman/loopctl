@@ -114,7 +114,9 @@ The API enforces that nobody marks their own work as done:
 Ask these questions:
 
 1. **Does this weaken chain-of-custody?** If a single session could now both implement and verify/report, the change is WRONG.
-2. **Does this give agents destructive capabilities?** ALL destructive operations (any DELETE, archive, budget/token corrections, cost anomaly resolution, tenant audit key rotation) must stay at `role: :user`. Constructive and metadata work-breakdown operations (create/update epics, stories, dependencies, imports, backfills for pre-loopctl work) are at `role: :orchestrator` so an autonomous orchestrator can compose a project and record state without human intervention. Agents (`role: :agent`) can never write work-breakdown data — only read it. The rule of thumb: if the operation REMOVES data, it requires `:user`.
+2. **Does this give agents destructive capabilities?** Tenant-destructive and custody-critical operations must stay at `role: :user` (or WebAuthn): tenant/project delete, budget/token corrections, cost anomaly resolution, tenant audit-key rotation, break-glass override, the SET-BASED bulk KB ops (`knowledge_bulk_delete` — including its irreversible HARD-delete path — `bulk_publish`, `bulk_unpublish`), and anything in the work-breakdown / chain-of-custody surface. Constructive and metadata work-breakdown operations (create/update epics, stories, dependencies, imports, backfills for pre-loopctl work) are at `role: :orchestrator` so an autonomous orchestrator can compose a project and record state without human intervention. Agents (`role: :agent`) can never write work-breakdown data — only read it. The rule of thumb: if the operation IRREVERSIBLY removes data, or serves as a custody gate, it requires `:user`.
+
+   **KB-content carve-out (#331).** The knowledge-wiki **content** surface is agent-role curation — `knowledge_create`, `knowledge_update` (in-place edit, ID-preserving), `knowledge_archive`/`knowledge_delete` (soft delete → `status: :archived`, row retained), and `knowledge_resolve_conflict` in ALL dispositions (`dismiss`, `supersede`, `merge`). These are the exception to "archive/DELETE ⇒ `:user`" precisely because each is **reversible + audited**: a soft delete retains the row, supersede retires the loser via a reversible `supersedes` link applied only by the privileged nightly executor, and merge produces a new DRAFT (never auto-published). Every mutation is recorded in the append-only, hash-chained audit log (and the per-tenant `kb_curation_log` when enabled). Agent edits/archives are additionally visibility-scoped: an agent can only touch an article it can see, so another agent's `private`/`owner` memory 404s. The human gate bought nothing here (nothing is irreversible or self-approval-shaped) while blocking the intended agent-native curation workflow. What stays `:user` on the KB surface: the irreversible bulk HARD delete only.
 3. **Does this collapse trust boundaries?** The role hierarchy exists so that agents can't self-promote. Lowering a role requirement is fine for read operations and for operations the role logically needs (orchestrators creating projects). It's wrong for operations that serve as a security gate.
 4. **Does this affect RLS?** New tables must use `ENABLE ROW LEVEL SECURITY` (not `FORCE`) since the production role (`schema_admin`) is the table owner without BYPASSRLS.
 
@@ -200,7 +202,7 @@ mix ecto.reset         # Drop, create, migrate
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 83 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
+- **MCP Server**: `mcp-server/` — 84 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
 ## MCP Server
@@ -211,7 +213,7 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (83 total). See `mcp-server/README.md` for the full list.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (84 total). See `mcp-server/README.md` for the full list.
 
 ---
 
