@@ -122,6 +122,31 @@ defmodule Loopctl.Memory.MemoryTest do
       assert changeset.valid?
       assert get_field(changeset, :source) == :promoted
     end
+
+    # Review finding (US-28.4): the memory_remember MCP tool / HTTP API advertise
+    # a generic `metadata` param, but the long_term tier used to have no column
+    # for it at all — a caller's metadata was silently discarded. Prove it casts.
+    test "casts metadata" do
+      changeset =
+        %MemorySchema{tenant_id: Ecto.UUID.generate(), subject_id: "subject-A"}
+        |> MemorySchema.create_changeset(%{
+          text: "a fact",
+          metadata: %{"source" => "code_review", "pr" => 320}
+        })
+
+      assert changeset.valid?
+      assert get_field(changeset, :metadata) == %{"source" => "code_review", "pr" => 320}
+    end
+
+    test "defaults metadata to an empty map when omitted" do
+      memory = fixture(:memory)
+      assert memory.metadata == %{}
+    end
+
+    test "normalizes an explicit metadata: nil back to %{} (would be a raw NOT NULL DB error otherwise)" do
+      memory = fixture(:memory, %{metadata: nil})
+      assert memory.metadata == %{}
+    end
   end
 
   describe "embedding_changeset/3" do

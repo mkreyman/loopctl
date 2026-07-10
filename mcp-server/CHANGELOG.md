@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.37.0 — 2026-07-09 (US-28.4 — memory_* tools: remember / recall / forget / list)
+
+### Added
+
+- **`memory_remember` / `memory_recall` / `memory_list` / `memory_forget`.** Four
+  thin tools over the new Agent Memory HTTP API (US-28.3, `/api/v1/memory*`) so
+  an agent can persist/retrieve its OWN scoped, private, accumulated working
+  state (running notes, in-flight task context) across sessions — distinct from
+  the shared, curated `knowledge_*` wiki. `memory_remember` writes a `long_term`
+  (default; embedded asynchronously, semantically recalled) or `session`
+  (short-term, TTL-pruned) memory. `memory_recall` semantically searches your
+  long-term memories and surfaces `meta.fallback`/`meta.reason`/
+  `meta.total_count`/`meta.underfilled` so a degraded (keyword-fallback) recall
+  is never mistaken for a genuinely empty scope. `memory_list` paginates your
+  memories with `meta.total_count/limit/offset`. `memory_forget` deletes one by
+  id (404, no existence leak, on a foreign-scope or unknown id). Scope
+  (`tenant_id`/`subject_id`) is resolved server-side from the API key — none of
+  the four tools' `inputSchema` accepts a `tenant_id`/`subject_id`, so there is
+  no NON-SUPERADMIN way to express a cross-scope read/write from the MCP layer
+  (the one carve-out: `memory_list`'s `all_subjects` boolean IS a cross-subject
+  read, enforced server-side and a no-op for a non-superadmin key). All four
+  route through the shared `apiCall`/witness client, so witness/STH persistence
+  and the transparent bootstrap-412 self-heal (#298) apply automatically to a
+  fresh MCP process's first memory write — no bespoke witness code was needed.
+
 ## 2.36.0 — 2026-07-04 (US-26.7.2 — opt-in WebAuthn trust-tier upgrade ceremony)
 
 ### Added
