@@ -65,6 +65,34 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractorTest do
     assert %{data: []} = Llm.usage_summary(tenant.id, [])
   end
 
+  test "retries once on a transient transport error, then succeeds (harvest hardening 2026-07-10)" do
+    tenant = fixture(:tenant)
+    {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-retry"})
+
+    articles_json =
+      JSON.encode!([%{title: "R1", body: "B1", category: "pattern", tags: ["x"]}])
+
+    # A single fast transient blip on the first attempt must NOT discard the whole
+    # ingestion job: `retry: :transient` (set by Anthropic.message) + max_retries: 1
+    # (the extractor) re-attempts once, and the second attempt succeeds. Req.Test
+    # expectations are consumed in order — first HTTP call, then the retry.
+    Req.Test.expect(Loopctl.Llm.Anthropic, fn conn ->
+      Req.Test.transport_error(conn, :econnrefused)
+    end)
+
+    Req.Test.expect(Loopctl.Llm.Anthropic, fn conn ->
+      Req.Test.json(conn, %{
+        "content" => [%{"type" => "text", "text" => articles_json}],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+      })
+    end)
+
+    assert {:ok, [%{title: "R1", category: :pattern}]} =
+             ClaudeContentExtractor.extract_from_content(tenant.id, "raw content",
+               source_type: "newsletter"
+             )
+  end
+
   test "surfaces an API error and records no usage" do
     tenant = fixture(:tenant)
     {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "test-anthropic-1"})
