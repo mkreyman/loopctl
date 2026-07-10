@@ -414,6 +414,72 @@ defmodule Loopctl.MemoryContextTest do
     end
   end
 
+  # --- US-29.3: :source filter on list/2 and list_all_subjects/2 ---
+
+  describe "list/2 :source filter (US-29.3)" do
+    test "filters the caller's own memories by promoted / explicit provenance" do
+      scope = fixture(:memory_scope)
+
+      fixture(:memory, %{
+        tenant_id: scope.tenant_id,
+        subject_id: scope.subject_id,
+        source: :explicit,
+        text: "explicit fact"
+      })
+
+      fixture(:memory, %{
+        tenant_id: scope.tenant_id,
+        subject_id: scope.subject_id,
+        source: :promoted,
+        source_session_id: "s1",
+        text: "promoted fact"
+      })
+
+      %{results: promoted} = Memory.list(scope, %{source: "promoted"})
+      assert Enum.map(promoted, & &1.text) == ["promoted fact"]
+      assert Enum.all?(promoted, &(&1.source == :promoted))
+
+      %{results: explicit} = Memory.list(scope, %{source: "explicit"})
+      assert Enum.map(explicit, & &1.text) == ["explicit fact"]
+      assert Enum.all?(explicit, &(&1.source == :explicit))
+
+      # No/unknown source → both rows.
+      assert %{meta: %{total_count: 2}} = Memory.list(scope, %{})
+      assert %{meta: %{total_count: 2}} = Memory.list(scope, %{source: "bogus"})
+    end
+  end
+
+  describe "list_all_subjects/2 :source filter (US-29.3)" do
+    test "a superadmin oversight list can filter provenance across subjects" do
+      tenant = fixture(:tenant)
+
+      fixture(:memory, %{tenant_id: tenant.id, subject_id: "s1", source: :explicit, text: "e1"})
+
+      fixture(:memory, %{
+        tenant_id: tenant.id,
+        subject_id: "s2",
+        source: :promoted,
+        source_session_id: "sess-2",
+        text: "p2"
+      })
+
+      %{results: promoted, meta: pmeta} =
+        Memory.list_all_subjects(tenant.id, %{source: :promoted})
+
+      assert pmeta.total_count == 1
+      assert Enum.map(promoted, & &1.text) == ["p2"]
+
+      %{results: explicit, meta: emeta} =
+        Memory.list_all_subjects(tenant.id, %{source: :explicit})
+
+      assert emeta.total_count == 1
+      assert Enum.map(explicit, & &1.text) == ["e1"]
+
+      # Unfiltered → both subjects.
+      assert %{meta: %{total_count: 2}} = Memory.list_all_subjects(tenant.id)
+    end
+  end
+
   defp default_recall_ids(scope, query) do
     scope
     |> Memory.recall(query: query, limit: 10)

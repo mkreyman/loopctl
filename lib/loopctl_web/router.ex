@@ -311,6 +311,9 @@ defmodule LoopctlWeb.Router do
     # Scope (tenant_id, subject_id) is derived from the key, never the body.
     # Literal /memory/recall must precede parameterized paths.
     post "/memory/recall", MemoryController, :recall
+    # Literal /memory/promote must precede the parameterized delete so it is not
+    # captured as an :id (US-29.3).
+    post "/memory/promote", MemoryController, :promote
     post "/memory", MemoryController, :create
     get "/memory", MemoryController, :index
     delete "/memory/:id", MemoryController, :delete

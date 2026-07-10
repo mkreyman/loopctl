@@ -5,6 +5,7 @@ defmodule LoopctlWeb.MemoryController do
 
   - `POST   /api/v1/memory`         — remember (write a long-term or session memory)
   - `POST   /api/v1/memory/recall`  — semantic recall (query in the request BODY)
+  - `POST   /api/v1/memory/promote` — trigger session→long-term promotion (US-29.3)
   - `GET    /api/v1/memory`         — list (limit/offset + total_count meta)
   - `DELETE /api/v1/memory/:id`     — forget
 
@@ -96,15 +97,39 @@ defmodule LoopctlWeb.MemoryController do
     }
   )
 
+  operation(:promote,
+    summary: "Promote (trigger session→long-term promotion)",
+    description:
+      "Triggers promotion of the caller's own session `session_id` into durable " <>
+        "long-term `:promoted` memories via `Loopctl.Memory.promote_session/1`. " <>
+        "Scope (`tenant_id`, `subject_id`) is derived from the API key — a caller " <>
+        "may only promote its OWN (tenant, subject) sessions; any tenant/subject in " <>
+        "the body is ignored, only `session_id` is read. Returns 202 with the " <>
+        "enqueued job reference on success; returns 429 (standard error envelope) " <>
+        "when the tenant is over its per-hour promotion budget, WITHOUT enqueuing or " <>
+        "calling the LLM. Subject to the full :authenticated write chain (custody " <>
+        "halt, witness header, rate limiting).",
+    request_body: {"Promote params", "application/json", Schemas.MemoryPromoteRequest},
+    responses: %{
+      202 => {"Promotion enqueued", "application/json", Schemas.MemoryPromoteResponse},
+      422 =>
+        {"Missing session_id or subject/tenant unresolvable", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Promotion budget exceeded", "application/json", Schemas.RateLimitError},
+      503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
   operation(:index,
     summary: "List memories",
     description:
       "Lists the caller's own long-term memories, newest first, paginated with " <>
         "`meta.total_count/limit/offset` (total is the true scoped count, never " <>
-        "silently capped by `limit`). Superadmin oversight: a superadmin key may " <>
-        "pass `all_subjects=true` to list EVERY subject's memories within its " <>
-        "tenant; the same parameter from a non-superadmin key is ignored (results " <>
-        "stay confined to its own subject).",
+        "silently capped by `limit`). Optionally filter by provenance with " <>
+        "`source=promoted|explicit` (US-29.3). Superadmin oversight: a superadmin " <>
+        "key may pass `all_subjects=true` to list EVERY subject's memories within " <>
+        "its tenant; the same parameter from a non-superadmin key is ignored " <>
+        "(results stay confined to its own subject).",
     parameters: [
       limit: [in: :query, type: :integer, description: "Page size (default 50, max 200)"],
       offset: [in: :query, type: :integer, description: "Records to skip (default 0)"],
@@ -112,6 +137,13 @@ defmodule LoopctlWeb.MemoryController do
         in: :query,
         type: :boolean,
         description: "Include superseded memories (default false)"
+      ],
+      source: [
+        in: :query,
+        type: :string,
+        description:
+          "Filter by provenance — one of `promoted` (session→long-term promotions) " <>
+            "or `explicit` (directly written). Any other/omitted value → no filter."
       ],
       all_subjects: [
         in: :query,
@@ -204,6 +236,44 @@ defmodule LoopctlWeb.MemoryController do
     end)
   end
 
+  @doc "POST /api/v1/memory/promote"
+  def promote(conn, params) do
+    with_scope(conn, fn %Scope{} = scope ->
+      case Memory.promote_session(%{scope | session_id: params["session_id"]}) do
+        {:ok, %Oban.Job{} = job} ->
+          conn
+          |> put_status(:accepted)
+          |> json(%{
+            data: %{job_id: job.id, session_id: params["session_id"], status: "enqueued"}
+          })
+
+        {:error, :budget_exceeded} ->
+          conn
+          |> put_status(:too_many_requests)
+          |> json(%{
+            error: %{
+              status: 429,
+              code: "promotion_budget_exceeded",
+              message:
+                "The tenant's per-hour memory-promotion budget has been reached. " <>
+                  "The session was not enqueued and no LLM call was made; retry later."
+            }
+          })
+
+        {:error, :missing_session_id} ->
+          conn
+          |> put_status(:unprocessable_entity)
+          |> json(%{
+            error: %{
+              status: 422,
+              code: "missing_session_id",
+              message: "A non-blank `session_id` is required to promote a session."
+            }
+          })
+      end
+    end)
+  end
+
   @doc "GET /api/v1/memory"
   def index(conn, params) do
     api_key = conn.assigns.current_api_key
@@ -259,7 +329,8 @@ defmodule LoopctlWeb.MemoryController do
     [
       limit: params["limit"],
       offset: params["offset"],
-      include_superseded: params["include_superseded"]
+      include_superseded: params["include_superseded"],
+      source: params["source"]
     ]
   end
 

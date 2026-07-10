@@ -17,6 +17,8 @@ defmodule LoopctlWeb.MemoryControllerTest do
 
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Knowledge
+  alias Loopctl.Memory
+  alias Loopctl.Memory.Scope
   alias LoopctlWeb.MemoryController
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -32,6 +34,32 @@ defmodule LoopctlWeb.MemoryControllerTest do
     agent = fixture(:agent, %{tenant_id: tenant_id})
     {raw, key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
     {raw, key, agent}
+  end
+
+  # The %Scope{} a given agent key resolves to (subject_id = agent.id).
+  defp scope_for(tenant_id, agent),
+    do: %Scope{tenant_id: tenant_id, subject_id: to_string(agent.id)}
+
+  # Override the default promoter-LLM stub to emit a crafted candidate array, and
+  # signal every call so a NON-call can be asserted (refute_received :llm_called).
+  defp stub_promoter(candidates) do
+    json =
+      candidates
+      |> Enum.map(fn c ->
+        %{
+          "text" => c.text,
+          "when_to_apply" => Map.get(c, :when_to_apply, "when relevant"),
+          "tags" => Map.get(c, :tags, ["t"]),
+          "confidence" => c.confidence,
+          "cross_links" => []
+        }
+      end)
+      |> JSON.encode!()
+
+    Mox.stub(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+      send(self(), :llm_called)
+      {:ok, json}
+    end)
   end
 
   # --- TC-28.3.1: remember + recall round-trip over HTTP ---
@@ -556,6 +584,281 @@ defmodule LoopctlWeb.MemoryControllerTest do
         |> json_response(200)
 
       assert del_body["data"]["deleted"] == true
+    end
+  end
+
+  # =========================================================================
+  # US-29.3 — POST /api/v1/memory/promote + promoted-vs-explicit oversight
+  # =========================================================================
+
+  # --- TC-29.3.1: promote endpoint enqueues promotion scoped to the key ---
+
+  describe "POST /api/v1/memory/promote (TC-29.3.1)" do
+    test "enqueues promotion under the key's scope; promoted memory surfaces via source=promoted",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      scope = scope_for(tenant.id, agent)
+
+      # Seed >1 session turn under the KEY's subject so the promotion has content
+      # (compile/2 short-circuits a 0/1-turn session without an LLM call).
+      for content <- [
+            "decided to always expedite reships for this customer",
+            "confirmed the customer prefers email follow-ups"
+          ] do
+        {:ok, _} =
+          Memory.remember(scope, %{
+            tier: :session,
+            session_id: "s1",
+            role: :user,
+            content: content,
+            expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+          })
+      end
+
+      stub_promoter([
+        %{text: "expedite reships for this customer", confidence: 0.9, tags: ["ship"]}
+      ])
+
+      promote_body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/promote", %{"session_id" => "s1"})
+        |> json_response(202)
+
+      assert promote_body["data"]["session_id"] == "s1"
+      assert promote_body["data"]["status"] == "enqueued"
+      # job_id is the job reference (a real integer in prod; nil under Oban's
+      # `testing: :inline`, where the job runs synchronously and is not persisted).
+      assert Map.has_key?(promote_body["data"], "job_id")
+
+      # Inline Oban runs the worker during the request; drain is a harmless no-op.
+      Oban.drain_queue(queue: :memory)
+
+      list_body =
+        base_conn()
+        |> auth(raw)
+        |> get(~p"/api/v1/memory?source=promoted")
+        |> json_response(200)
+
+      assert [entry | _] = list_body["data"]
+      assert entry["source"] == "promoted"
+      assert entry["source_session_id"] == "s1"
+      assert entry["confidence"] == 0.9
+      assert entry["subject_id"] == to_string(agent.id)
+    end
+  end
+
+  # --- TC-29.3.2: a caller cannot promote another subject's session ---
+
+  describe "POST /api/v1/memory/promote scope isolation (TC-29.3.2)" do
+    test "B promoting A's session_id is a scoped no-op; A's memory is never written", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {_raw_a, _key_a, agent_a} = agent_key(tenant.id)
+      {raw_b, _key_b, _agent_b} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      scope_a = scope_for(tenant.id, agent_a)
+
+      # Session s1 belongs to A.
+      {:ok, _} =
+        Memory.remember(scope_a, %{
+          tier: :session,
+          session_id: "s1",
+          role: :user,
+          content: "A's private decision that must not leak to B",
+          expires_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+        })
+
+      stub_promoter([%{text: "should never be promoted for A via B", confidence: 0.9}])
+
+      # B promotes "s1" — resolves to B's subject, whose session s1 is empty → no-op.
+      conn
+      |> auth(raw_b)
+      |> post(~p"/api/v1/memory/promote", %{"session_id" => "s1"})
+      |> json_response(202)
+
+      Oban.drain_queue(queue: :memory)
+
+      # A has NO promoted memory — B's run could not touch A's (tenant, subject).
+      assert %{results: [], meta: %{total_count: 0}} = Memory.list(scope_a, %{source: :promoted})
+    end
+  end
+
+  # --- TC-29.3.3: superadmin lists promoted across subjects and rejects one ---
+
+  describe "superadmin promoted oversight (TC-29.3.3)" do
+    test "lists promoted memories across subjects and can reject one", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      p1 =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: "subj-1",
+          source: :promoted,
+          source_session_id: "sess-1",
+          confidence: 0.8,
+          text: "promoted for subject one"
+        })
+
+      _p2 =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: "subj-2",
+          source: :promoted,
+          source_session_id: "sess-2",
+          confidence: 0.7,
+          text: "promoted for subject two"
+        })
+
+      # An explicit memory must NOT appear under source=promoted.
+      fixture(:memory, %{tenant_id: tenant.id, subject_id: "subj-1", text: "explicit note"})
+
+      list_body =
+        conn
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?source=promoted&all_subjects=true")
+        |> json_response(200)
+
+      subjects = list_body["data"] |> Enum.map(& &1["subject_id"]) |> Enum.uniq() |> Enum.sort()
+      assert subjects == ["subj-1", "subj-2"]
+      assert Enum.all?(list_body["data"], &(&1["source"] == "promoted"))
+      assert Enum.all?(list_body["data"], &(&1["source_session_id"] != nil))
+      assert Enum.all?(list_body["data"], &(&1["confidence"] != nil))
+      refute Enum.any?(list_body["data"], &(&1["text"] == "explicit note"))
+
+      # Reject a bad promotion via DELETE — nothing left orphaned-invisible.
+      del_body =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> delete(~p"/api/v1/memory/#{p1.id}")
+        |> json_response(200)
+
+      assert del_body["data"]["deleted"] == true
+
+      after_body =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?source=promoted&all_subjects=true")
+        |> json_response(200)
+
+      refute Enum.any?(after_body["data"], &(&1["id"] == p1.id))
+    end
+  end
+
+  # --- TC-29.3.4: custody-halted key cannot promote (503) ---
+
+  describe "POST /api/v1/memory/promote custody halt (TC-29.3.4)" do
+    test "a custody-halted tenant's key cannot promote (503)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/promote", %{"session_id" => "s1"})
+        |> json_response(503)
+
+      assert body["error"]["code"] == "tenant_halted"
+    end
+  end
+
+  # --- Over-budget: 429 without enqueuing or calling the LLM ---
+
+  describe "POST /api/v1/memory/promote over budget" do
+    test "returns 429 (standard envelope), enqueues nothing, and never calls the LLM", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+      scope = scope_for(tenant.id, agent)
+
+      # Exhaust the per-hour promotion budget by seeding watermark rows in-hour
+      # (config: :memory_promotion_compiles_per_hour = 5).
+      for i <- 1..Memory.promotion_budget() do
+        {:ok, _} =
+          Memory.upsert_session_promotion(
+            %Scope{scope | session_id: "budget-#{i}"},
+            %{content_hash: "h#{i}", last_turn_inserted_at: DateTime.utc_now()}
+          )
+      end
+
+      # A LLM call would signal :llm_called — assert it never happens.
+      stub_promoter([%{text: "should not compile", confidence: 0.9}])
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/promote", %{"session_id" => "over-budget"})
+        |> json_response(429)
+
+      assert body["error"]["code"] == "promotion_budget_exceeded"
+      assert body["error"]["status"] == 429
+
+      Oban.drain_queue(queue: :memory)
+
+      # No LLM call, and nothing promoted for this subject.
+      refute_received :llm_called
+      assert %{results: [], meta: %{total_count: 0}} = Memory.list(scope, %{source: :promoted})
+    end
+  end
+
+  # --- Missing session_id: 422 ---
+
+  describe "POST /api/v1/memory/promote validation" do
+    test "a blank/missing session_id is rejected with a deterministic 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/promote", %{})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "missing_session_id"
+      assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- GET source=explicit filter isolation ---
+
+  describe "GET /api/v1/memory?source=explicit" do
+    test "returns only explicit memories, never promoted ones", %{conn: _conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      fixture(:memory, %{
+        tenant_id: tenant.id,
+        subject_id: to_string(agent.id),
+        text: "explicit one"
+      })
+
+      fixture(:memory, %{
+        tenant_id: tenant.id,
+        subject_id: to_string(agent.id),
+        source: :promoted,
+        source_session_id: "sX",
+        text: "promoted one"
+      })
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> get(~p"/api/v1/memory?source=explicit")
+        |> json_response(200)
+
+      texts = Enum.map(body["data"], & &1["text"])
+      assert "explicit one" in texts
+      refute "promoted one" in texts
+      assert Enum.all?(body["data"], &(&1["source"] == "explicit"))
     end
   end
 end
