@@ -369,6 +369,12 @@ config :loopctl, :memory_promotion_sweep_interval_seconds, 600
 config :loopctl, :memory_promotion_sweep_window_seconds, 900
 config :loopctl, :session_memory_ttl_seconds, 3600
 
+# Epic 30 / US-30.1: per-tenant cap on entity definitions
+# (`Loopctl.ContextRetriever.Registry`). Bounds the dynamic ListTools payload/
+# latency of the generated agent query surface so a tenant admin cannot inflate
+# it without limit. Over-cap creation returns `{:error, :entity_limit}`.
+config :loopctl, :max_entity_definitions_per_tenant, 50
+
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
 # (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF

@@ -254,6 +254,10 @@ config :loopctl, :embedding_client, Loopctl.MockEmbeddingClient
 # the cap. Production uses the 10_000 default.
 config :loopctl, :max_long_term_memories_per_subject, 30
 
+# US-30.1: a small per-tenant entity-definition cap so the limit path
+# (`{:error, :entity_limit}`) is testable without inserting 50 rows.
+config :loopctl, :max_entity_definitions_per_tenant, 3
+
 # DI: Use mock knowledge extractor in tests
 config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 

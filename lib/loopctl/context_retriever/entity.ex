@@ -1,0 +1,290 @@
+defmodule Loopctl.ContextRetriever.Entity do
+  @moduledoc """
+  Schema for the `entity_definitions` table (Epic 30, Context Retriever).
+
+  An **entity definition** is a tenant-admin-authored declaration of a queryable
+  "entity" — a name, a set of typed fields, and a backing loopctl-internal source
+  (`projects` / `stories` / `epics`). Later stories (US-30.2 generator, US-30.3
+  executor) turn each definition into an auto-generated, governed agent query
+  surface over loopctl's STRUCTURED records.
+
+  ## Security root — the definition IS the executor's field allowlist
+
+  The entity definition is **attacker-authored**: a tenant admin (role >= user)
+  writes it, and the executor later shapes rows to the "declared fields only". If
+  an admin could declare arbitrary columns (`tenant_id`, audit/custody columns,
+  raw jsonb blobs), the "declared-fields-only" shaping would faithfully
+  exfiltrate them. To prevent that, a **SERVER-defined per-backing-source column
+  allowlist** (`@column_allowlist`, a code constant) bounds which columns any
+  entity may declare. `create_changeset/2` REJECTS any declared field whose name
+  is not in the allowlist for the row's `backing_source`, in addition to
+  validating a safe-identifier regex, the field `type` against a fixed set, and
+  the `filterable`/`searchable` booleans. This is the whole point of the story —
+  do not weaken it.
+
+  ## Fields
+
+  - `tenant_id` — set programmatically, NEVER cast (multi-tenant/RLS rule).
+  - `name` — the admin-chosen entity name, unique per tenant. Independent of
+    `backing_source` (an entity named `"story"` may back onto `:stories`).
+  - `backing_source` — `Ecto.Enum`, phase-1 loopctl-internal sources only
+    (`:projects`, `:stories`, `:epics`).
+  - `fields` — `{:array, :map}`; each element is
+    `%{"name" => ..., "type" => ..., "filterable" => bool, "searchable" => bool}`
+    with per-element validation.
+
+  ## Relationships are OUT of scope for v1 (AC-30.1.6)
+
+  Relationships / joins between entities are explicitly NOT persisted in v1 — no
+  unvalidated relationship JSON is stored anywhere on this schema. Any future
+  relationship or join-traversal feature MUST, before it ships, add:
+
+    1. **per-join tenant scoping** — every joined source is filtered by the same
+       `tenant_id` (RLS + explicit predicate), so a join can never cross tenants;
+       and
+    2. **target-entity-must-be-allowlisted validation** — the join target must
+       itself be an allowlisted entity/source (never a raw table name), so the
+       column allowlist above is not bypassed by traversing into an unsanctioned
+       source.
+
+  Shipping join traversal without BOTH of these re-opens exactly the
+  exfiltration hole `@column_allowlist` closes.
+  """
+
+  use Loopctl.Schema
+
+  @type t :: %__MODULE__{}
+
+  # Phase-1 backing sources: loopctl-internal STRUCTURED records only.
+  @backing_sources [:projects, :stories, :epics]
+
+  # Allowed field types a tenant admin may declare. Kept as a fixed set so a
+  # tenant-supplied `type` string is compared, never `String.to_atom/1`'d.
+  @field_types ~w(string integer boolean float datetime)
+
+  # Safe-identifier regex for a declared field `name`. Bounds names to
+  # lowercase snake_case identifiers, defeating `status; DROP TABLE` style input.
+  @identifier_regex ~r/^[a-z_][a-z0-9_]*$/
+
+  # SERVER-defined per-backing-source exposed-column allowlist (AC-30.1.2).
+  #
+  # This is the SECURITY GATE of Epic 30: it is the exhaustive set of columns a
+  # tenant admin may expose per source. It DELIBERATELY excludes `tenant_id`, the
+  # `metadata` jsonb blob, and every custody/dispatch/audit column
+  # (`implementer_dispatch_id`, `verifier_dispatch_id`, `assigned_agent_id`,
+  # timestamps of custody transitions, etc.). Adding a column here exposes it to
+  # every tenant admin's declared query surface — treat additions as a security
+  # review, not a convenience.
+  @column_allowlist %{
+    projects: [
+      :name,
+      :slug,
+      :repo_url,
+      :description,
+      :tech_stack,
+      :status,
+      :mission
+    ],
+    stories: [
+      :number,
+      :title,
+      :description,
+      :agent_status,
+      :verified_status,
+      :epic_id,
+      :project_id,
+      :sort_key,
+      :estimated_hours
+    ],
+    epics: [
+      :number,
+      :title,
+      :description,
+      :phase,
+      :position,
+      :project_id
+    ]
+  }
+
+  # Precompute the allowlist as a set of STRING column names per source, so a
+  # tenant-supplied field `name` (a string) is membership-tested WITHOUT ever
+  # calling `String.to_atom/1` on user input.
+  @column_allowlist_strings Map.new(@column_allowlist, fn {source, cols} ->
+                              {source, MapSet.new(Enum.map(cols, &Atom.to_string/1))}
+                            end)
+
+  schema "entity_definitions" do
+    tenant_field()
+    field :name, :string
+    field :backing_source, Ecto.Enum, values: @backing_sources
+    field :fields, {:array, :map}, default: []
+
+    timestamps()
+  end
+
+  @doc """
+  Changeset for creating a new entity definition.
+
+  `tenant_id` is set programmatically on the struct and is NEVER cast. Validates:
+
+    * `name`, `backing_source`, `fields` all present;
+    * `backing_source` is one of the phase-1 sources (`Ecto.Enum` rejects
+      unknowns automatically);
+    * each element of `fields` is a well-formed
+      `%{name, type, filterable, searchable}` map whose `name` matches the
+      safe-identifier regex, whose `type` is in the allowed set, whose
+      `filterable`/`searchable` are booleans, AND whose `name` is in the SERVER
+      column allowlist for the row's `backing_source`.
+  """
+  @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def create_changeset(entity \\ %__MODULE__{}, attrs) do
+    entity
+    |> cast(attrs, [:name, :backing_source, :fields])
+    |> validate_required([:name, :backing_source, :fields])
+    |> validate_format(:name, @identifier_regex,
+      message: "must be a lowercase snake_case identifier"
+    )
+    |> validate_length(:name, max: 100)
+    |> validate_fields()
+    |> unique_constraint([:tenant_id, :name],
+      message: "has already been taken for this tenant",
+      error_key: :name
+    )
+  end
+
+  @doc "Returns the list of valid backing sources."
+  @spec backing_sources() :: [atom()]
+  def backing_sources, do: @backing_sources
+
+  @doc "Returns the list of allowed field-type strings."
+  @spec field_types() :: [String.t()]
+  def field_types, do: @field_types
+
+  @doc """
+  Returns the SERVER column allowlist (source atom => list of column atoms).
+
+  Later stories (US-30.2 generator, US-30.3 executor) read this to bound the
+  generated/executed query surface to sanctioned columns only.
+  """
+  @spec column_allowlist() :: %{atom() => [atom()]}
+  def column_allowlist, do: @column_allowlist
+
+  # --- Private helpers ---
+
+  # Per-element validation of the `fields` array. Runs against the row's
+  # `backing_source` so the column allowlist is source-specific. A missing/unknown
+  # `backing_source` short-circuits with no field errors — `Ecto.Enum` +
+  # `validate_required` already flag that, and there is no allowlist to check
+  # against.
+  defp validate_fields(changeset) do
+    source = get_field(changeset, :backing_source)
+
+    validate_change(changeset, :fields, fn :fields, fields ->
+      field_list_errors(fields, source)
+    end)
+  end
+
+  defp field_list_errors(fields, _source) when not is_list(fields) do
+    [fields: "must be a list of field definitions"]
+  end
+
+  # No source to validate columns against; the enum/required checks already erred.
+  defp field_list_errors(_fields, nil), do: []
+
+  defp field_list_errors(fields, source) do
+    fields
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {field, index} -> field_errors(field, index, source) end)
+  end
+
+  defp field_errors(field, index, source) when is_map(field) and not is_struct(field) do
+    name = string_value(field, "name")
+    type = type_string(value(field, "type"))
+    filterable = value(field, "filterable")
+    searchable = value(field, "searchable")
+
+    []
+    |> validate_field_name(name, index, source)
+    |> validate_field_type(type, index)
+    |> validate_field_boolean(filterable, "filterable", index)
+    |> validate_field_boolean(searchable, "searchable", index)
+  end
+
+  defp field_errors(_field, index, _source) do
+    [fields: "field ##{index} must be a map with name, type, filterable, searchable"]
+  end
+
+  defp validate_field_name(errors, name, index, source) do
+    allowed = Map.get(@column_allowlist_strings, source, MapSet.new())
+
+    cond do
+      not is_binary(name) ->
+        [{:fields, "field ##{index} name is required"} | errors]
+
+      not Regex.match?(@identifier_regex, name) ->
+        [{:fields, "field ##{index} name #{inspect(name)} is not a safe identifier"} | errors]
+
+      not MapSet.member?(allowed, name) ->
+        [
+          {:fields,
+           "field ##{index} name #{inspect(name)} is not an allowed column for source #{source}"}
+          | errors
+        ]
+
+      true ->
+        errors
+    end
+  end
+
+  defp validate_field_type(errors, type, index) do
+    if is_binary(type) and type in @field_types do
+      errors
+    else
+      [
+        {:fields, "field ##{index} type #{inspect(type)} is not one of #{inspect(@field_types)}"}
+        | errors
+      ]
+    end
+  end
+
+  defp validate_field_boolean(errors, value, key, index) do
+    if is_boolean(value) do
+      errors
+    else
+      [{:fields, "field ##{index} #{key} must be a boolean"} | errors]
+    end
+  end
+
+  # Read a value under the string key OR its atom equivalent. Admin params may
+  # arrive with atom keys (`%{name: ...}`) on the create path, while the DB
+  # round-trips `{:array, :map}` as string-keyed maps. The atom keys checked here
+  # (`name`/`type`/`filterable`/`searchable`) are compile-time literals, so no
+  # atom is ever created from user input.
+  defp value(map, "name"), do: map["name"] || map[:name]
+  defp value(map, "type"), do: map["type"] || map[:type]
+  defp value(map, "filterable"), do: fetch_bool_key(map, "filterable", :filterable)
+  defp value(map, "searchable"), do: fetch_bool_key(map, "searchable", :searchable)
+
+  # For boolean keys, `||` would swallow a legitimate `false`, so fetch explicitly.
+  defp fetch_bool_key(map, string_key, atom_key) do
+    case Map.fetch(map, string_key) do
+      {:ok, v} -> v
+      :error -> Map.get(map, atom_key)
+    end
+  end
+
+  # Normalize a declared `type` to a string for comparison against `@field_types`.
+  # Accepts a string (`"string"`) or an atom (`:string`) — `to_string/1` on an
+  # existing atom is safe (creates no new atom), unlike `String.to_atom/1` on the
+  # user-supplied value. Any other shape becomes `nil` (→ validation error).
+  defp type_string(v) when is_binary(v), do: v
+  defp type_string(v) when is_atom(v) and not is_nil(v), do: Atom.to_string(v)
+  defp type_string(_), do: nil
+
+  defp string_value(map, key) do
+    case value(map, key) do
+      v when is_binary(v) -> v
+      _ -> nil
+    end
+  end
+end
