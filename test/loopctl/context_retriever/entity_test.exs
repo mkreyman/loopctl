@@ -4,6 +4,13 @@ defmodule Loopctl.ContextRetriever.EntityTest do
   setup :verify_on_exit!
 
   alias Loopctl.ContextRetriever.Entity
+  alias Loopctl.Projects.Project
+  alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
+
+  # Maps each backing_source to the real Ecto schema whose columns it exposes, so
+  # the drift-guard test can prove every allowlisted atom is a live field.
+  @backing_schemas %{projects: Project, stories: Story, epics: Epic}
 
   # tenant_id is set programmatically on the struct, never cast — mirror the real
   # create path so unique_constraint and the changeset shape match production.
@@ -250,6 +257,99 @@ defmodule Loopctl.ContextRetriever.EntityTest do
 
     test "backing_sources/0 is loopctl-internal only" do
       assert Entity.backing_sources() == [:projects, :stories, :epics]
+    end
+  end
+
+  describe "column allowlist drift guard" do
+    # Positive guard binding @column_allowlist to the backing schemas' REAL
+    # fields. The existing introspection test is a NEGATIVE guard only (asserts
+    # sensitive columns are absent); this asserts every allowlisted atom is an
+    # actual field on its backing schema. If a backing column is later
+    # renamed/dropped, the allowlist would silently name a stale column and the
+    # US-30.3 executor would raise Ecto.QueryError at runtime — this fails at test
+    # time instead.
+    test "every allowlisted column is a real field on its backing schema" do
+      for {source, columns} <- Entity.column_allowlist() do
+        schema = Map.fetch!(@backing_schemas, source)
+        schema_fields = schema.__schema__(:fields)
+
+        stale = Enum.reject(columns, &(&1 in schema_fields))
+
+        assert stale == [],
+               "#{inspect(source)} allowlist names column(s) #{inspect(stale)} " <>
+                 "absent from #{inspect(schema)}.__schema__(:fields)"
+      end
+    end
+
+    test "the drift guard covers every backing source" do
+      assert Map.keys(@backing_schemas) |> Enum.sort() ==
+               Entity.backing_sources() |> Enum.sort()
+    end
+  end
+
+  describe "create_changeset/2 — fields payload bounds" do
+    test "rejects an entity that declares more than the max number of fields" do
+      # 60 well-shaped field maps (> the 50 cap). These names are not all
+      # allowlisted, but the length cap fires regardless and its message is
+      # distinct from the per-element column errors, so we assert on it directly.
+      too_many =
+        Enum.map(1..60, fn i ->
+          %{name: "f_#{i}", type: :string, filterable: true, searchable: true}
+        end)
+
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories,
+          fields: too_many
+        })
+
+      refute cs.valid?
+      assert Enum.any?(errors_on(cs).fields, &(&1 =~ "should have at most"))
+    end
+
+    test "strips unsanctioned keys from each field map before storage" do
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories,
+          fields: [
+            %{
+              name: "title",
+              type: :string,
+              filterable: true,
+              searchable: true,
+              blob: %{"deeply" => %{"nested" => "junk"}}
+            }
+          ]
+        })
+
+      assert cs.valid?
+      [field] = Ecto.Changeset.get_field(cs, :fields)
+      refute Map.has_key?(field, :blob)
+      refute Map.has_key?(field, "blob")
+      assert field[:name] == "title" || field["name"] == "title"
+    end
+
+    test "strips unsanctioned keys from string-keyed field maps" do
+      cs =
+        changeset(%{
+          "name" => "story",
+          "backing_source" => "stories",
+          "fields" => [
+            %{
+              "name" => "title",
+              "type" => "string",
+              "filterable" => true,
+              "searchable" => true,
+              "blob" => "megabytes"
+            }
+          ]
+        })
+
+      assert cs.valid?
+      [field] = Ecto.Changeset.get_field(cs, :fields)
+      refute Map.has_key?(field, "blob")
     end
   end
 end

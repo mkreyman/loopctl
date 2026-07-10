@@ -52,7 +52,11 @@ defmodule Loopctl.ContextRetriever.Registry do
   def for_tenant(tenant_id) when is_binary(tenant_id) do
     {:ok, entities} =
       Repo.with_tenant(tenant_id, fn ->
-        Repo.all(from(e in Entity, order_by: [asc: e.name]))
+        # RLS already scopes this read to the caller tenant; the explicit
+        # `tenant_id` predicate is defense-in-depth on this security-root read
+        # (mirrors the `:cap` step below) so a future reorder/removal of the RLS
+        # context can't silently make these definitions cross-tenant.
+        Repo.all(from(e in Entity, where: e.tenant_id == ^tenant_id, order_by: [asc: e.name]))
       end)
 
     entities
@@ -68,7 +72,10 @@ defmodule Loopctl.ContextRetriever.Registry do
   def get_entity(tenant_id, name) when is_binary(tenant_id) and is_binary(name) do
     {:ok, entity} =
       Repo.with_tenant(tenant_id, fn ->
-        Repo.get_by(Entity, name: name)
+        # Explicit `tenant_id` predicate as defense-in-depth alongside RLS (see
+        # `for_tenant/1`), so this security-root read stays single-tenant even if
+        # the RLS context were ever broken by a future refactor.
+        Repo.get_by(Entity, tenant_id: tenant_id, name: name)
       end)
 
     entity
@@ -113,7 +120,7 @@ defmodule Loopctl.ContextRetriever.Registry do
   Returns `{:ok, entity}`, `{:error, :entity_limit}`, or `{:error, changeset}`.
   """
   @spec create_entity(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Entity.t()} | {:error, :entity_limit | Ecto.Changeset.t()}
+          {:ok, Entity.t()} | {:error, :entity_limit | Ecto.Changeset.t() | term()}
   def create_entity(tenant_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_map(attrs) and is_list(opts) do
     actor_id = Keyword.get(opts, :actor_id)
@@ -169,6 +176,13 @@ defmodule Loopctl.ContextRetriever.Registry do
       {:ok, %{entity: entity}} -> {:ok, entity}
       {:error, :cap, :entity_limit, _changes} -> {:error, :entity_limit}
       {:error, :entity, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      # Catch-all so any other failing step (notably `:audit` — e.g. a
+      # caller-supplied non-map `:metadata` invalidating the audit changeset, or a
+      # future required/validated audit field or added step) returns `{:error, _}`
+      # per the documented contract instead of raising `CaseClauseError`. The
+      # transaction still rolls back, so nothing is persisted. Mirrors
+      # `Loopctl.Memory.remember/2`'s trailing per-step error handling.
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 

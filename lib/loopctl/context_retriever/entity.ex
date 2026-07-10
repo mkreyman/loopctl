@@ -62,6 +62,24 @@ defmodule Loopctl.ContextRetriever.Entity do
   # tenant-supplied `type` string is compared, never `String.to_atom/1`'d.
   @field_types ~w(string integer boolean float datetime)
 
+  # Hard cap on how many fields one entity may declare. The per-tenant Registry
+  # cap bounds entity COUNT, not fields-per-entity, so without this a single
+  # definition could declare an unbounded number of fields and inflate the
+  # generated ListTools payload/latency (US-30.2). Every valid field must also be
+  # an allowlisted, non-duplicate column, so the largest real source (stories, 9
+  # columns) sits well under this; the cap is a payload/DoS guard, not a
+  # functional limit.
+  @max_fields 50
+
+  # The ONLY keys a declared field map may carry. `field :fields, {:array, :map}`
+  # casts each element verbatim, so extra keys (e.g. a multi-megabyte `blob`)
+  # would otherwise round-trip into the stored jsonb of this security-root record.
+  # Each field map is normalized with `Map.take/2` to these keys (in both string
+  # and atom form, since params arrive atom-keyed and the DB round-trips
+  # string-keyed) before validation and storage.
+  @sanctioned_field_keys ~w(name type filterable searchable)a
+  @sanctioned_field_key_strings ~w(name type filterable searchable)
+
   # Safe-identifier regex for a declared field `name`. Bounds names to
   # lowercase snake_case identifiers, defeating `status; DROP TABLE` style input.
   @identifier_regex ~r/^[a-z_][a-z0-9_]*$/
@@ -129,7 +147,11 @@ defmodule Loopctl.ContextRetriever.Entity do
 
     * `name`, `backing_source`, `fields` all present;
     * `fields` declares at least one field — an empty list is rejected (a
-      zero-field entity would generate a useless, empty tool surface);
+      zero-field entity would generate a useless, empty tool surface) — and at
+      most `#{@max_fields}` (payload/DoS guard on the generated tool surface);
+    * each declared field map is normalized to the four sanctioned keys
+      (`name`/`type`/`filterable`/`searchable`) so no extra key (e.g. an
+      arbitrary `blob`) round-trips into this security-root record's jsonb;
     * `backing_source` is one of the phase-1 sources (`Ecto.Enum` rejects
       unknowns automatically);
     * each element of `fields` is a well-formed
@@ -149,6 +171,8 @@ defmodule Loopctl.ContextRetriever.Entity do
       message: "must be a lowercase snake_case identifier"
     )
     |> validate_length(:name, max: 100)
+    |> normalize_field_keys()
+    |> validate_length(:fields, max: @max_fields)
     |> validate_non_empty_fields()
     |> validate_fields()
     |> unique_constraint([:tenant_id, :name],
@@ -175,6 +199,28 @@ defmodule Loopctl.ContextRetriever.Entity do
   def column_allowlist, do: @column_allowlist
 
   # --- Private helpers ---
+
+  # Strip every declared field map down to the sanctioned keys BEFORE validation
+  # and storage, so an unknown key (e.g. `%{name: ..., blob: <megabytes>}`) cannot
+  # round-trip into the `{:array, :map}` jsonb of this security-root record. Runs
+  # only when `:fields` was cast to a list; non-list values are left for
+  # `validate_fields/1` to reject. `Map.take/2` keeps whichever key form (string
+  # or atom) each element actually carries.
+  defp normalize_field_keys(changeset) do
+    case get_change(changeset, :fields) do
+      fields when is_list(fields) ->
+        put_change(changeset, :fields, Enum.map(fields, &take_sanctioned_keys/1))
+
+      _ ->
+        changeset
+    end
+  end
+
+  defp take_sanctioned_keys(field) when is_map(field) and not is_struct(field) do
+    Map.take(field, @sanctioned_field_keys ++ @sanctioned_field_key_strings)
+  end
+
+  defp take_sanctioned_keys(field), do: field
 
   # Per-element validation of the `fields` array. Runs against the row's
   # `backing_source` so the column allowlist is source-specific. A missing/unknown

@@ -144,6 +144,25 @@ defmodule Loopctl.ContextRetriever.RegistryTest do
       assert audit.new_state["name"] == "story"
       assert audit.new_state["backing_source"] == "stories"
     end
+
+    test "an invalid audit step returns {:error, _} rather than raising" do
+      # A non-map `:metadata` opt fails the audit changeset's `:map` cast, so the
+      # `:audit` Multi step returns `{:error, :audit, changeset, _}`. That must map
+      # to the documented `{:error, _}` contract (via the catch-all clause), NOT a
+      # CaseClauseError, and the transaction must roll back the entity insert.
+      tenant = repo_tenant()
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Registry.create_entity(
+                 tenant.id,
+                 %{name: "story", backing_source: :stories, fields: @valid_fields},
+                 metadata: "not-a-map"
+               )
+
+      refute changeset.valid?
+      # Nothing persisted — the whole transaction rolled back.
+      assert Registry.for_tenant(tenant.id) == []
+    end
   end
 
   describe "for_tenant/1 — tenant isolation (AC-30.1.3)" do
