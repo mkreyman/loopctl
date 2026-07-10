@@ -40,6 +40,13 @@ defmodule Loopctl.Application do
     opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
     result = Supervisor.start_link(children, opts)
 
+    # Prime the SystemConfig :persistent_term cache from the DB now that the repos
+    # are started, so the ingestion/extraction hot path reads live values from the
+    # first request. refresh/0 is rescue-wrapped (a DB blip logs and no-ops), so a
+    # failed prime NEVER blocks boot — the in-code defaults simply apply until the
+    # per-minute refresh cron succeeds.
+    Loopctl.SystemConfig.refresh()
+
     # US-27.11 (AC-27.11.5): warn if the actual configured pools would exceed the live
     # DB max_connections at the expected node count. Prod only (dev/test pools differ),
     # log-only, never blocks boot.

@@ -21,6 +21,7 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
 
   alias Loopctl.Knowledge.Categories
   alias Loopctl.Llm.Anthropic
+  alias Loopctl.SystemConfig
 
   @system_prompt """
   You are a knowledge extraction assistant. Given raw content (web article, \
@@ -51,13 +52,24 @@ defmodule Loopctl.Knowledge.ClaudeContentExtractor do
       }
     end
 
-    # Explicit client budget UNDER the worker's @per_chunk_timeout_ms (30s) Oban
-    # budget (review #9) — the highest-max_tokens (64k) site, so don't rely on the
-    # shared default. 25s + no internal retry keeps the whole request inside the
-    # per-chunk budget; the worker retries the whole (idempotent) job on transients.
+    # Explicit client budget UNDER the worker's per_chunk_timeout_ms/0 (60s
+    # default) Oban budget (review #9) — the highest-max_tokens (64k) site, so
+    # don't rely on the shared default. Both knobs are DB-backed and live-tunable
+    # via Loopctl.SystemConfig; the in-code defaults below match the seeded rows
+    # and apply on a cache miss (safe degrade). 25s keeps a single attempt inside
+    # the per-chunk budget.
+    #
+    # ONE bounded transient retry (2026-07-10): under a harvest burst the provider
+    # throttles and a single fast `:transport_error` / 429 was discarding the whole
+    # multi-chunk ingestion job (then Oban re-ran the entire idempotent job — costly
+    # and often failing all 3 attempts). `retry: :transient` is always set by
+    # Anthropic.message; max_retries: 1 lets Req re-attempt once (~1s backoff) so the
+    # COMMON fast-transient failure self-heals within the per-chunk budget. A slow
+    # (~25s) first failure still can't fit a retry — unchanged, no regression — but
+    # those are the minority.
     case Anthropic.message(tenant_id, :extraction, body_fun, %{source_type: source_type},
-           receive_timeout: 25_000,
-           max_retries: 0
+           receive_timeout: SystemConfig.get_int("extraction_receive_timeout_ms", 25_000),
+           max_retries: SystemConfig.get_int("extraction_max_retries", 1)
          ) do
       {:ok, text} -> parse_articles(text)
       {:error, :no_api_key} -> {:error, :no_api_key}

@@ -29,6 +29,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
+  alias Loopctl.SystemConfig.Setting
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
   alias Loopctl.TokenUsage.Budget, as: TokenBudget
@@ -95,6 +96,20 @@ defmodule Loopctl.Fixtures do
         # large existing custody-test surface is unaffected. Pass
         # `trust_tier: :agent_rooted` explicitly to get a KB-tier tenant.
         trust_tier: :human_anchored
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:system_config, attrs) do
+    Map.merge(
+      %{
+        # Unique key per call so DB-backed system-config tests never collide on the
+        # `system_configs_key_index` unique index, and so their :persistent_term
+        # writes (VM-global) can't clobber another async test's cache entry.
+        key: "test_config_#{System.unique_integer([:positive])}",
+        value: System.unique_integer([:positive]),
+        description: nil
       },
       Enum.into(attrs, %{})
     )
@@ -1192,6 +1207,14 @@ defmodule Loopctl.Fixtures do
   # Inserts a tenant_llm_settings row (auto-creating a tenant if needed). The
   # `api_key` defaults to a plausible test key so `Loopctl.Llm.has_api_key?/1`
   # returns true and the mandatory-BYO gate passes.
+  def fixture(:system_config, attrs) do
+    data = build(:system_config, attrs)
+
+    %Setting{}
+    |> Setting.changeset(data)
+    |> AdminRepo.insert!()
+  end
+
   def fixture(:tenant_llm_settings, attrs) do
     attrs = Enum.into(attrs, %{})
 
