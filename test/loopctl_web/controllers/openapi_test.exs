@@ -52,6 +52,30 @@ defmodule LoopctlWeb.OpenApiTest do
       assert "/api/v1/tenants/{id}/authenticators/revoke-challenge" in paths
       assert "/api/v1/tenants/{id}/authenticators/{auth_id}" in paths
     end
+
+    # US-28.5 (AC-28.5.2) — the Agent Memory endpoints (Epic 28) must render in the
+    # OpenAPI spec (declared via `operation(...)` in MemoryController), so they show
+    # up at /swaggerui.
+    test "includes the Agent Memory (Epic 28) endpoints", %{conn: conn} do
+      body = conn |> get("/api/v1/openapi") |> json_response(200)
+      paths = body["paths"]
+
+      assert Map.has_key?(paths, "/api/v1/memory")
+      assert Map.has_key?(paths, "/api/v1/memory/recall")
+      assert Map.has_key?(paths, "/api/v1/memory/{id}")
+
+      # The verbs the controller declares: remember (POST), list (GET), recall
+      # (POST), forget (DELETE).
+      assert Map.has_key?(paths["/api/v1/memory"], "post")
+      assert Map.has_key?(paths["/api/v1/memory"], "get")
+      assert Map.has_key?(paths["/api/v1/memory/recall"], "post")
+      assert Map.has_key?(paths["/api/v1/memory/{id}"], "delete")
+
+      # And the Memory* response schemas are registered under components.
+      schemas = body["components"]["schemas"]
+      assert Map.has_key?(schemas, "Memory")
+      assert Map.has_key?(schemas, "MemoryRecallResponse")
+    end
   end
 
   describe "GET /swaggerui" do

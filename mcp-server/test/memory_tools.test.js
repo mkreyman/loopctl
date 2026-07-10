@@ -826,6 +826,80 @@ describe("AC-28.4.2: descriptions disambiguate memory vs knowledge", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// US-28.5 (AC-28.5.4): cross-surface isolation at the MCP layer. The context and
+// API surfaces are proven in the Elixir suites
+// (Loopctl.Memory.CrossSurfaceIsolationTest); here we prove the MCP surface
+// offers NO bypass — a caller cannot express, nor smuggle, a cross-tenant /
+// cross-subject scope. Scope is key-derived server-side; the tool is scope-blind.
+// ---------------------------------------------------------------------------
+
+describe("AC-28.5.4: MCP memory tools cannot express or smuggle a cross-scope read/write", () => {
+  test("the REAL index.js memoryRecall destructures ONLY {query,limit,include_superseded} — a forged tenant_id/subject_id has no param to bind and never reaches the wire", () => {
+    // A behavioral test that forged tenant_id/subject_id into the file-local
+    // memoryRecall would be TAUTOLOGICAL: that local mirror drops the scope keys
+    // in its OWN destructure, so the assertion is guaranteed by the test's own
+    // function and cannot detect a regression in the shipped handler. index.js is
+    // a stdio entry point (top-level await) and cannot be imported, so — following
+    // this file's source-assertion convention — we prove the property against the
+    // REAL handler's source: the destructured param list is the ONLY surface a
+    // caller's args can bind to, and the body builds the wire payload only from it.
+    const start = INDEX_SRC.indexOf("async function memoryRecall(");
+    assert.ok(start !== -1, "memoryRecall handler must exist");
+
+    const sigEnd = INDEX_SRC.indexOf(")", start);
+    const signature = INDEX_SRC.slice(start, sigEnd);
+    assert.match(
+      signature,
+      /\{\s*query,\s*limit,\s*include_superseded\s*\}/,
+      "memoryRecall must destructure exactly {query, limit, include_superseded}",
+    );
+    assert.ok(
+      !/tenant_id/.test(signature),
+      "memoryRecall must not destructure a tenant_id param (no surface for a forged scope)",
+    );
+    assert.ok(
+      !/subject_id/.test(signature),
+      "memoryRecall must not destructure a subject_id param (no surface for a forged scope)",
+    );
+
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+    assert.match(
+      body,
+      /const payload = \{ query \};/,
+      "memoryRecall must build the wire payload from `query` alone (then conditionally limit/include_superseded)",
+    );
+    assert.ok(!/tenant_id/.test(body), "memoryRecall body must never reference tenant_id");
+    assert.ok(!/subject_id/.test(body), "memoryRecall body must never reference subject_id");
+  });
+
+  test("a forged tenant_id/subject_id passed to memory_list is NOT forwarded to the query string", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0, limit: 50, offset: 0 } }, 200);
+
+    await memoryList({ limit: 5, tenant_id: "victim-tenant", subject_id: "victim-subject" });
+
+    const parsedUrl = new URL(calls[0].url);
+    assert.equal(parsedUrl.searchParams.has("tenant_id"), false);
+    assert.equal(parsedUrl.searchParams.has("subject_id"), false);
+  });
+
+  test("memory_forget targets ONLY the :id path segment — no scope param can widen its blast radius", async () => {
+    setupEnv();
+    const id = "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0";
+    const calls = mockFetch({ data: { id, deleted: true } }, 200);
+
+    // Extra forged scope keys are ignored; the DELETE hits exactly /api/v1/memory/:id,
+    // which the server confines to the key's own (tenant, subject) scope (404 otherwise).
+    await memoryForget({ id, tenant_id: "victim-tenant", subject_id: "victim-subject" });
+
+    assert.equal(calls.length, 1);
+    assert.equal(new URL(calls[0].url).pathname, `/api/v1/memory/${id}`);
+    assert.equal(calls[0].options.body, undefined);
+  });
+});
+
 describe("AC-28.4.5: existing knowledge_*/story tools remain unchanged", () => {
   test("ListTools still exposes representative pre-existing tools alongside the new memory tools", () => {
     for (const toolName of [

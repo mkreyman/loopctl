@@ -2,6 +2,41 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-09 — Agent Memory (Epic 28, Part 1)
+
+### Added
+
+- **Agent memory subsystem** — a per-agent PRIVATE working memory, isolated per
+  `(tenant_id, subject_id)` and kept strictly separate from the shared Knowledge
+  Wiki. Two tiers:
+  - **Session memory** (`session_memories`) — short-term, append-only, chronological
+    turns/facts with a required `expires_at`, pruned by
+    `Loopctl.Workers.SessionMemoryPruneWorker`. No embedding.
+  - **Long-term memory** (`memories`) — durable facts embedded as `vector(1536)`
+    (populated asynchronously by `Loopctl.Workers.MemoryEmbeddingWorker`) and
+    recalled by HNSW cosine similarity, with a supersede/forget lifecycle and a
+    per-`(tenant, subject)` live-row quota.
+- **HTTP API** — `POST /api/v1/memory` (remember), `POST /api/v1/memory/recall`
+  (semantic recall; degrades to a scoped text match, never a silent empty),
+  `GET /api/v1/memory` (list; superadmin `?all_subjects=true` oversight), and
+  `DELETE /api/v1/memory/:id` (forget). Scope is derived from the API key, never the
+  body; the endpoints render at `/swaggerui`.
+- **MCP tools** — `memory_remember`, `memory_recall`, `memory_list`, `memory_forget`
+  (four tools; scope key-derived, no `tenant_id`/`subject_id` surface).
+- **Docs** — [`docs/agent-memory.md`](docs/agent-memory.md): architecture, the two
+  tiers + session TTL/pruning, the `subject_id` derivation + BYPASSRLS heavy-read
+  structural guard, when to use memory vs knowledge (vs the future context
+  retriever), the PII/secret (BYO-embedding) stance, and the auto-promotion (#308) /
+  skills-consumer (`claude-config#85`) seams.
+
+### Verified (US-28.5, terminal)
+
+- End-to-end (write via API → recall via context AND API), cross-surface isolation
+  (cross-tenant AND cross-subject invisible/immutable across context, API, and MCP,
+  on both the semantic and fallback paths), and an `@tag :scale` recall gate proving
+  a needle subject recalls its own top-k among an ~80k multi-subject corpus (the
+  over-fetch pool + outer subject filter does not starve a subject at scale).
+
 ## [Unreleased] — 2026-07-03 — per-tenant BYO Anthropic LLM config + usage (Epic 28, #179)
 
 ### Added

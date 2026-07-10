@@ -200,7 +200,7 @@ mix ecto.reset         # Drop, create, migrate
 - **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — 60 stories across 15 epics
 - **Skills**: `skills/loopctl-*.md` — 6 orchestration skills
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing
-- **MCP Server**: `mcp-server/` — 69 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
+- **MCP Server**: `mcp-server/` — 82 typed tools for Claude Code agents (no curl needed), published as `loopctl-mcp-server` on npm
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
 ## MCP Server
@@ -211,7 +211,7 @@ Claude Code agents should use the loopctl MCP tools instead of curl. Install via
 {"mcpServers": {"loopctl": {"command": "npx", "args": ["loopctl-mcp-server"], "env": {"LOOPCTL_SERVER": "https://loopctl.com", "LOOPCTL_ORCH_KEY": "...", "LOOPCTL_AGENT_KEY": "..."}}}}
 ```
 
-Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (69 total). See `mcp-server/README.md` for the full list.
+Tools: `mcp__loopctl__list_projects`, `mcp__loopctl__list_stories`, `mcp__loopctl__verify_story`, etc. (82 total). See `mcp-server/README.md` for the full list.
 
 ---
 
@@ -231,6 +231,29 @@ loopctl supports external observability tooling through its API and data model:
 - **`/loopctl:observe` pattern**: Orchestrators can POST structured audit events to loopctl (session
   start/end, rule violations, review outcomes) and query them back via the audit API. This allows
   post-run analysis of orchestrator behavior without coupling to any specific AI tool's log format.
+
+## Epic 28: Agent Memory — `memory_*` vs `knowledge_*`
+
+loopctl gives agents a **private per-agent memory** subsystem (`Loopctl.Memory`,
+tables `memories` / `session_memories`) that is DISTINCT from the shared Knowledge
+Wiki. Full reference: [`docs/agent-memory.md`](docs/agent-memory.md). Pick the
+right surface:
+
+- **`memory_*` (Agent Memory)** — PRIVATE to the caller's `(tenant, subject_id)`
+  scope. Use for facts/preferences/observations THIS agent learned about ITS task
+  or user and needs to recall later — not worth curating for others. `long_term`
+  facts are vector-embedded + semantically recalled; `session` turns are
+  chronological + TTL-pruned. Tools: `memory_remember`, `memory_recall`,
+  `memory_list`, `memory_forget`.
+- **`knowledge_*` (Knowledge Wiki)** — SHARED, curated tenant knowledge (patterns,
+  decisions, findings, references), deduped by the novelty gate, linked and
+  conflict-resolved. Use when the insight is worth ANOTHER agent reading. Tools:
+  `knowledge_create`, `knowledge_search`, etc.
+
+Rule of thumb: *"worth another agent reading?"* → `knowledge_create`. *"a fact only
+I need to recall about my own work?"* → `memory_remember`. Scope is derived from
+your key server-side — you never pass `tenant_id`/`subject_id`. loopctl is
+agent-native (no memory UI); operator oversight is the superadmin API path.
 
 ## Elixir / Phoenix guidelines
 
