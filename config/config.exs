@@ -284,6 +284,10 @@ config :loopctl, Oban,
        {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}},
        {"0 5 * * 0", Loopctl.Workers.KnowledgeMocWorker, args: %{"mode" => "all_tenants"}},
        {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker, args: %{"mode" => "all_tenants"}},
+       # Daily promotion-compile-quality eval (Epic 29 / US-29.5): precision/recall of
+       # Loopctl.Memory.Promoter against the committed labeled dataset. Calibration/
+       # observability only — never gates promotion.
+       {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
        {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
        # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
