@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (82)
+## Tools (83)
 
 ### Project Tools
 
@@ -233,6 +233,7 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 | `memory_recall` | Semantically recall your own long-term memories most similar to `query`. When embedding generation is unavailable the response degrades to a recent-first text match with `meta.fallback: true` and a stable `meta.reason` (score is `null` on that path) — check `meta.fallback` before treating a short/empty result as a genuinely empty scope. `meta.total_count`/`meta.underfilled` are also returned. Optional: `limit`, `include_superseded`. |
 | `memory_list` | List your own long-term memories, newest first, paginated with `meta.total_count/limit/offset` (the true scoped count, never silently capped by `limit`). Optional: `limit`, `offset`, `include_superseded`, `all_subjects` (superadmin only; ignored for non-superadmin keys). |
 | `memory_forget` | Delete one of your own long-term memories by id. A foreign-subject, foreign-tenant, or unknown id returns 404 (no existence leak). Required: `id`. |
+| `memory_promote` | Call at session end to compile this session's short-term (`session`-tier) memory into durable `long_term` memory — unlike `memory_remember` (a single explicit write), this compiles the whole session in one shot; fire it once at session end, not per turn. Returns 202 with `{job_id, session_id, status: "enqueued"}` — promotion runs asynchronously, so the resulting memory is recallable via `memory_recall` only after the worker drains. You can only promote your own sessions (scope resolved server-side from your key). Required: `session_id`. |
 
 ### Knowledge Management Tools (orchestrator key)
 
