@@ -784,7 +784,7 @@ cd mcp-server && npm install
 
 Keys must be in the `env` block — the MCP server process does not inherit the shell environment.
 
-### Available Tools (82)
+### Available Tools (83)
 
 Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summary:
 
