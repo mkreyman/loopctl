@@ -858,6 +858,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `memory_recall` | Semantically recall the caller's OWN long-term memories by `query` (degrades to a scoped text match, never a silent empty). Private memory, not `knowledge_search`. | agent |
 | `memory_list` | List the caller's OWN long-term memories (paginated); superadmin `all_subjects=true` lists a tenant's every subject. | agent |
 | `memory_forget` | Delete one of the caller's OWN memories by id (404 cross-scope, no existence leak). | agent |
+| `memory_promote` | Compile a session's short-term memory into durable long-term memory (async job; caller's own sessions only) | agent |
 | `get_system_articles` | List/fetch system-scoped wiki articles (public) | none |
 | `dispatch` | Mint an ephemeral key for a sub-agent dispatch (Chain of Custody v2) | orchestrator |
 | `recover_cap` | Re-mint a capability token after a session crash | agent |
