@@ -375,6 +375,12 @@ config :loopctl, :session_memory_ttl_seconds, 3600
 # it without limit. Over-cap creation returns `{:error, :entity_limit}`.
 config :loopctl, :max_entity_definitions_per_tenant, 50
 
+# Epic 30 / US-30.3: hard maximum page size for the Context Retriever query
+# executor (`Loopctl.ContextRetriever.Executor`). Every generated filter/search
+# query is capped at this many rows so a model-driven query can never request an
+# unbounded result set; a caller-supplied `limit` is clamped to `[1, this]`.
+config :loopctl, :context_retriever_max_page_size, 100
+
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
 # (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF

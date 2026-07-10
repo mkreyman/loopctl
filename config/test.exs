@@ -258,6 +258,10 @@ config :loopctl, :max_long_term_memories_per_subject, 30
 # (`{:error, :entity_limit}`) is testable without inserting 50 rows.
 config :loopctl, :max_entity_definitions_per_tenant, 3
 
+# US-30.3: a small Context Retriever max page size so the pagination-cap path is
+# testable (TC-30.3.5) without seeding 100+ rows.
+config :loopctl, :context_retriever_max_page_size, 5
+
 # DI: Use mock knowledge extractor in tests
 config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 
