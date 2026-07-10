@@ -153,6 +153,48 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
   # --- TC-21.3.8: Archive published article ---
 
   describe "POST /api/v1/articles/:id/archive" do
+    # #331: single-article archive is agent-role curation (reversible soft delete).
+    test "an agent can archive a published article and it records an audit event", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles/#{article.id}/archive")
+        |> json_response(200)
+
+      assert body["data"]["status"] == "archived"
+      assert AdminRepo.get!(Article, article.id).status == :archived
+
+      audit =
+        from(a in AuditLog,
+          where: a.entity_type == "article" and a.entity_id == ^article.id,
+          where: a.action == "article.archived"
+        )
+        |> AdminRepo.one!()
+
+      assert audit.tenant_id == tenant.id
+      assert audit.new_state == %{"status" => "archived"}
+    end
+
+    # Tenant isolation: an agent in tenant B cannot archive tenant A's article (404).
+    test "an agent in another tenant cannot archive the article (404, unchanged)", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant_a.id, status: :published})
+
+      conn =
+        conn
+        |> auth_conn(key_b)
+        |> post(~p"/api/v1/articles/#{article.id}/archive")
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, article.id).status == :published
+    end
+
     test "archives a published article", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -1357,9 +1399,11 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
     end
 
-    # kb-02 (GHSA-9gqg-9r6p-658v): an :agent may NOT record a destructive verdict.
-    test "an agent recording a supersede is forbidden (403); no row, executor retires nothing",
-         ctx do
+    # #331: supersede/merge are now agent+ KB-content curation (was user+). An agent
+    # records a high-confidence supersede on a REAL flagged pair, and the privileged
+    # nightly executor retires the loser end-to-end — the verdict IS persisted and
+    # actionable at agent role.
+    test "an agent records a supersede applied by the executor (loser retired)", ctx do
       %{conn: conn, tenant: tenant, a: a, b: b} = ctx
 
       conn =
@@ -1371,23 +1415,26 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "confidence" => "high"
         })
 
-      body = json_response(conn, 403)
-      assert body["error"]["status"] == 403
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "supersede"
+      assert body["data"]["executed"] == false
+      assert body["note"] =~ "nightly executor"
 
-      # No verdict row was persisted, so the nightly executor has nothing to apply.
-      assert is_nil(
+      # The verdict row was persisted (chain intact), so the executor can apply it.
+      refute is_nil(
                Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution,
                  tenant_id: tenant.id
                )
              )
 
-      assert 0 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
-      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
     end
 
-    # kb-02: an agent may not have the nightly executor MERGE (retire + synthesize) either.
-    test "an agent recording a merge is forbidden (403)", ctx do
-      %{conn: conn, a: a, b: b} = ctx
+    # #331: an agent may record a MERGE too (the executor synthesizes a DRAFT — never
+    # auto-published — so it stays reversible).
+    test "an agent records a merge verdict (persisted, drafts on execute)", ctx do
+      %{conn: conn, tenant: tenant, a: a, b: b} = ctx
 
       conn =
         post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
@@ -1398,7 +1445,54 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "confidence" => "high"
         })
 
-      assert json_response(conn, 403)
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "merge"
+
+      resolution =
+        Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: tenant.id)
+
+      refute is_nil(resolution)
+      assert resolution.disposition == :merge
+    end
+
+    # (c) curation-log entry is written for an agent's supersede when the tenant has
+    # kb_curation_log on — the executor records a "supersede" curation event.
+    test "an agent supersede executed by the nightly job writes a curation-log entry",
+         %{conn: base_conn} do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      a = fixture(:article, %{tenant_id: tenant.id, title: "CA", status: :published})
+      b = fixture(:article, %{tenant_id: tenant.id, title: "CB", status: :published})
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+      |> AdminRepo.insert!()
+
+      base_conn
+      |> auth_conn(agent_key)
+      |> post(~p"/api/v1/knowledge/conflicts/resolve", %{
+        "source_article_id" => a.id,
+        "target_article_id" => b.id,
+        "disposition" => "supersede",
+        "authoritative_article_id" => a.id,
+        "confidence" => "high"
+      })
+      |> json_response(201)
+
+      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+
+      curation_kinds =
+        Loopctl.Knowledge.KbCurationEvent
+        |> where([e], e.tenant_id == ^tenant.id)
+        |> AdminRepo.all()
+        |> Enum.map(& &1.kind)
+
+      assert "supersede" in curation_kinds
     end
 
     # kb-02: fabrication guard — resolving a pair the system never flagged is rejected,

@@ -626,4 +626,98 @@ defmodule LoopctlWeb.AgentMemoryTrustTest do
       assert a_meta["prior_count"] == 1
     end
   end
+
+  # #331: opening the KB WRITE surface (update/archive/soft-delete) to agent role
+  # must NOT let agent B mutate agent A's private memory. The visibility scope is
+  # threaded into the update/archive fetch, so an invisible target 404s (matching
+  # reads) — agent B can neither edit nor archive what it can't see.
+  describe "write-path: visibility isolation on update/archive/delete (#331)" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_a, _key_a} = agent_key(tenant.id)
+      {raw_b, _key_b} = agent_key(tenant.id)
+      {raw_user, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      priv =
+        post_memory(conn, raw_a, memory_attrs("ZorptPrivateW", %{"visibility" => "private"}))
+        |> json_response(201)
+
+      %{
+        conn: conn,
+        tenant: tenant,
+        raw_a: raw_a,
+        raw_b: raw_b,
+        raw_user: raw_user,
+        priv_id: priv["data"]["id"]
+      }
+    end
+
+    test "another agent cannot PATCH the owner's private memory (404, unchanged)", ctx do
+      conn =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> patch(~p"/api/v1/articles/#{ctx.priv_id}", %{"title" => "Hijacked"})
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, ctx.priv_id).title == "ZorptPrivateW"
+    end
+
+    test "another agent cannot DELETE (soft-archive) the owner's private memory (404)", ctx do
+      conn =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> delete(~p"/api/v1/articles/#{ctx.priv_id}")
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, ctx.priv_id).status != :archived
+    end
+
+    test "another agent cannot archive-workflow the owner's private memory (404)", ctx do
+      conn =
+        ctx.conn
+        |> auth(ctx.raw_b)
+        |> post(~p"/api/v1/articles/#{ctx.priv_id}/archive")
+
+      assert json_response(conn, 404)
+      assert AdminRepo.get!(Article, ctx.priv_id).status != :archived
+    end
+
+    test "the owning agent CAN PATCH its own private memory", ctx do
+      body =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> patch(~p"/api/v1/articles/#{ctx.priv_id}", %{"title" => "OwnerEdited"})
+        |> json_response(200)
+
+      assert body["data"]["title"] == "OwnerEdited"
+      # Owner identity preserved; still private.
+      assert AdminRepo.get!(Article, ctx.priv_id).metadata["visibility"] == "private"
+    end
+
+    test "a PATCH cannot re-attribute the owner's private memory to another agent", ctx do
+      # Owner tries to spoof metadata.agent_id to a foreign value on edit — the
+      # write-path binding stamps the caller's own identity instead (#163).
+      foreign = Ecto.UUID.generate()
+
+      body =
+        ctx.conn
+        |> auth(ctx.raw_a)
+        |> patch(~p"/api/v1/articles/#{ctx.priv_id}", %{
+          "metadata" => %{"visibility" => "private", "agent_id" => foreign}
+        })
+        |> json_response(200)
+
+      refute body["data"]["metadata"]["agent_id"] == foreign
+    end
+
+    test "a higher role (user) may PATCH another agent's private memory", ctx do
+      body =
+        ctx.conn
+        |> auth(ctx.raw_user)
+        |> patch(~p"/api/v1/articles/#{ctx.priv_id}", %{"title" => "UserEdited"})
+        |> json_response(200)
+
+      assert body["data"]["title"] == "UserEdited"
+    end
+  end
 end

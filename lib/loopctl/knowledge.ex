@@ -2225,7 +2225,7 @@ defmodule Loopctl.Knowledge do
     project_id = attrs[:project_id] || attrs["project_id"]
 
     with :ok <- validate_project_ownership(tenant_id, project_id),
-         {:ok, article} <- fetch_article(tenant_id, article_id) do
+         {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
       actor_id = Keyword.get(opts, :actor_id)
       actor_label = Keyword.get(opts, :actor_label)
       actor_type = Keyword.get(opts, :actor_type, "api_key")
@@ -2297,7 +2297,7 @@ defmodule Loopctl.Knowledge do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    with {:ok, article} <- fetch_article(tenant_id, article_id) do
+    with {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
       old_status = to_string(article.status)
       changeset = Article.update_changeset(article, %{status: :archived})
 
@@ -2667,11 +2667,15 @@ defmodule Loopctl.Knowledge do
     multi =
       Multi.new()
       |> Multi.run(:fetch, fn _repo, _changes ->
+        # Visibility scope (#163/#331): an agent archiving via the workflow can only
+        # reach an article it can see — another agent's private/owner memory resolves
+        # to :not_found (404). Higher roles pass no scope.
         query =
           from(a in Article,
             where: a.id == ^article_id and a.tenant_id == ^tenant_id,
             lock: "FOR UPDATE"
           )
+          |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
 
         case AdminRepo.one(query) do
           nil -> {:error, {:not_found, nil}}
@@ -5046,8 +5050,17 @@ defmodule Loopctl.Knowledge do
   defp embedding_dimensions(embedding) when is_list(embedding), do: length(embedding)
   defp embedding_dimensions(%Pgvector{} = vector), do: length(Pgvector.to_list(vector))
 
-  defp fetch_article(tenant_id, article_id) do
-    case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
+  defp fetch_article(tenant_id, article_id, opts) do
+    # Visibility scope (#163/#331): the write paths (update/archive) pass the
+    # caller's `:visibility_agent_id` so an agent cannot mutate another agent's
+    # `private`/`owner` memory — an invisible target resolves to :not_found (404),
+    # matching the read paths. Higher roles pass no scope and reach any in-tenant
+    # article.
+    query =
+      from(a in Article, where: a.id == ^article_id and a.tenant_id == ^tenant_id)
+      |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+
+    case AdminRepo.one(query) do
       nil -> {:error, :not_found}
       article -> {:ok, article}
     end

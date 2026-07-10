@@ -1065,6 +1065,26 @@ async function knowledgeCreate({
   return toContent(result);
 }
 
+// In-place edit of an existing article (#331). PATCH preserves the ID; only the
+// provided fields change. Agent role — KB-content curation, visibility-scoped
+// server-side (another agent's private/owner memory 404s).
+async function knowledgeUpdate({ article_id, title, body, category, tags, metadata }) {
+  const payload = {};
+  if (title != null) payload.title = title;
+  if (body != null) payload.body = body;
+  if (category != null) payload.category = category;
+  if (tags != null) payload.tags = tags;
+  if (metadata != null) payload.metadata = metadata;
+
+  const result = await apiCall(
+    "PATCH",
+    `/api/v1/articles/${article_id}`,
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 // --- Agent Memory Tools (US-28.4) ---
 //
 // memory_* is YOUR own scoped, private, accumulated working state — recall
@@ -1237,22 +1257,25 @@ async function knowledgeUnpublish({ article_id }) {
   return toContent(result);
 }
 
+// #331: single-article archive is agent-role KB curation (reversible soft delete,
+// audited, visibility-scoped server-side).
 async function knowledgeArchive({ article_id }) {
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/archive`,
     null,
-    process.env.LOOPCTL_USER_KEY
+    process.env.LOOPCTL_AGENT_KEY
   );
   return toContent(result);
 }
 
+// #331: soft-delete (archive) is agent-role KB curation, same as knowledge_archive.
 async function knowledgeDelete({ article_id }) {
   const result = await apiCall(
     "DELETE",
     `/api/v1/articles/${article_id}`,
     null,
-    process.env.LOOPCTL_USER_KEY
+    process.env.LOOPCTL_AGENT_KEY
   );
   return toContent(result);
 }
@@ -3157,6 +3180,54 @@ const TOOLS = [
       required: ["title", "body"],
     },
   },
+  {
+    name: "knowledge_update",
+    description:
+      "Edit an EXISTING knowledge article IN PLACE, preserving its ID. Use this to fold a " +
+      "new fact into a canonical article, tidy a hub, retag, or reclassify — WITHOUT " +
+      "creating a new row and churning the article ID (IDs are load-bearing: cited in " +
+      "project CLAUDE.mds and cross-links). Send only the fields you want to change; every " +
+      "field is optional except article_id. `tags` REPLACES the whole array (send the full " +
+      "desired set, not a delta). A changed body/tags re-triggers embedding + auto-linking. " +
+      "Agent role — this is KB-content curation (reversible + audited). Visibility-scoped: " +
+      "you can only edit an article you can see, so another agent's private/owner memory " +
+      "returns 404. `tenant_id` is never accepted. Returns the full updated article. To " +
+      "instead retire/replace an article, use knowledge_archive or knowledge_resolve_conflict.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to edit (preserved across the update).",
+        },
+        title: {
+          type: "string",
+          description: "Optional: new title.",
+        },
+        body: {
+          type: "string",
+          description: "Optional: new body (Markdown). Re-triggers embedding + linking.",
+        },
+        category: {
+          type: "string",
+          description: "Optional: new category.",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional: REPLACES the whole tags array (send the full desired set).",
+        },
+        metadata: {
+          type: "object",
+          description:
+            "Optional: extensible JSONB (merged/replaced wholesale). For an agent key, an " +
+            "agent-memory `agent_id` is stamped from your verified key identity — you cannot " +
+            "re-attribute a memory to another agent.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
 
   // Agent Memory Tools (US-28.4)
   {
@@ -3421,9 +3492,10 @@ const TOOLS = [
     name: "knowledge_archive",
     description:
       "Archive an article (soft delete). The article is hidden from search, context, " +
-      "and the index but the row is retained for audit/history. Works for drafts and " +
-      "published articles. REQUIRES LOOPCTL_USER_KEY (user role — orchestrator role is " +
-      "NOT sufficient for this destructive operation).",
+      "and the index but the row is retained for audit/history (reversible — re-publish " +
+      "or edit it back). Works for drafts and published articles. Agent role — KB-content " +
+      "curation. Visibility-scoped: you can only archive an article you can see, so " +
+      "another agent's private/owner memory returns 404.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3440,8 +3512,9 @@ const TOOLS = [
     description:
       "Delete an article. Under the hood this performs the same soft-delete (archive) " +
       "as knowledge_archive — use whichever name is clearer at the call site. The row " +
-      "is retained for audit; there is no hard delete. REQUIRES LOOPCTL_USER_KEY (user " +
-      "role — orchestrator role is NOT sufficient for this destructive operation).",
+      "is retained for audit; there is no hard delete (that is knowledge_bulk_delete " +
+      "hard:true, which stays user-gated). Agent role — KB-content curation, reversible + " +
+      "audited, visibility-scoped (another agent's private/owner memory 404s).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4543,6 +4616,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_create":
       return await knowledgeCreate(args);
+
+    case "knowledge_update":
+      return await knowledgeUpdate(args);
 
     // Agent Memory Tools
     case "memory_remember":
