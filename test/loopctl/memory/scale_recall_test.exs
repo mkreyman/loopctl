@@ -37,9 +37,23 @@ defmodule Loopctl.Memory.ScaleRecallTest do
   --only scale` (test_helper.exs includes `:scale` only when `SCALE_TESTS` is
   set). Under `SCALE_TESTS`, `config/test.exs` SKIPS the tiny-pool shrink
   (`:max_vector_pool = 6`) and leaves the PROD defaults (factor 5 / floor 100 /
-  cap 500), so `pool_size(k = 10) = 50 |> max(100) |> min(500) |> max(10) = 100`.
-  The regime is therefore `pool = 100 > k = 10` — a genuine over-fetch, so the
+  cap 500), so `pool_size(k = 5) = 25 |> max(100) |> min(500) |> max(5) = 100`.
+  The regime is therefore `pool = 100 > k = 5` — a genuine over-fetch, so the
   outer subject filter is doing real work (discarding nearer foreign rows).
+
+  ## Why k = 5 and decoy_count = 8 (the HNSW reachability ceiling)
+
+  At prod's effective `hnsw.ef_search` (default 40) over the ~80k corpus, the
+  approximate HNSW traversal reliably surfaces only roughly the nearest ~20 rows
+  of the near band into the over-fetch pool (measured with a direct pool probe at
+  80k across independent HNSW builds; deeper near-band rows need ef_search ≥ ~200).
+  So `decoy_count + k` MUST stay comfortably under that ~20-row ceiling for subject
+  A to fill a FULL top-k behind the dominating decoys. `Loopctl.Memory.ScaleSeed`
+  seeds `decoy_count = 8`; the gate uses `k = 5` (sum 13, with ~12 of A's rows
+  reaching the pool) — healthy margin. The pre-fix `decoy_count = 20` + `k = 10`
+  (sum 30) was structurally unreachable at ef_search 40: subject A surfaced ZERO
+  pool rows, which is why AC-28.5.5 failed on execution. See the ScaleSeed
+  reachability-ceiling note before changing either constant.
 
   CRUCIALLY, the gate runs at prod's EFFECTIVE `hnsw.ef_search` (pgvector default
   40) and MUST NOT raise it: the repo forbids a scale gate from diverging from
@@ -148,7 +162,11 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     # Seeded at least the prod floor, spread across many subjects.
     assert seed.total >= ScaleSeed.prod_memory_floor()
 
-    k = 10
+    # k = 5 with decoy_count = 8: both fit under the ~20-row HNSW reachability
+    # ceiling at prod ef_search 40 (see the moduledoc), so the 8 decoys dominate
+    # the top-k AND subject A still fills a FULL k behind them. Do not raise k
+    # without re-measuring that ceiling at 80k.
+    k = 5
 
     # --- Pool-depth / dominance gate (the EXPLAIN-style probe the AC promised) ---
     # Replays the SUBJECT-AGNOSTIC inner over-fetch pool that `Memory.recall/2`
@@ -198,7 +216,7 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     # but is NOT its nearest row — at least one FOREIGN row is strictly nearer, so the
     # outer filter has real work (it must DISCARD nearer foreign rows to reach A). We
     # assert the cluster-level fact the approximate index reliably delivers (≥ 1 of the
-    # 20 globally-nearest decoys surfaces), not the exact per-node top-k ordering it
+    # 8 globally-nearest decoys surfaces), not the exact per-node top-k ordering it
     # cannot guarantee at ef_search 40.
     first_a_rank = Enum.find_index(pool_subjects, &(&1 == seed.subject_a))
     assert first_a_rank != nil, "subject A must appear in the subject-agnostic ANN pool"
@@ -208,7 +226,7 @@ defmodule Loopctl.Memory.ScaleRecallTest do
 
     # Every row the pool ranks AHEAD of A is a foreign decoy — never A, never haystack.
     # Exact even under approximation: distances are computed in SQL, and by seed
-    # construction ONLY the 20 decoys have a true cosine distance smaller than any A row
+    # construction ONLY the 8 decoys have a true cosine distance smaller than any A row
     # (the haystack is strictly farther than A), so any row nearer than A can ONLY be a
     # decoy.
     nearer_than_a = Enum.take(pool_subjects, first_a_rank)
@@ -224,8 +242,17 @@ defmodule Loopctl.Memory.ScaleRecallTest do
 
     a_in_pool = length(a_pool_ids)
 
-    assert a_in_pool >= 1,
-           "subject A's cluster must surface into the pool (else there is nothing to recall)"
+    # A FULL top-k of subject A's rows reaches the pool behind the dominating decoys —
+    # this is the core AC-28.5.5 property ("the subject reliably recalls its own
+    # top-k"): the outer subject filter is NOT starved by HNSW under-fill. It holds
+    # only because decoy_count (8) + k (5) sit under the ~20-row reachability ceiling
+    # at prod ef_search 40 (see the moduledoc); at 80k this is reliably ~12 of A's
+    # rows, comfortably ≥ k across independent HNSW builds. If a future change
+    # re-inflates decoy_count/k past the ceiling, THIS is the assertion that fails
+    # loudly (A surfaces < k, the pre-fix regression).
+    assert a_in_pool >= k,
+           "subject A must surface a FULL top-k (#{k}) into the pool behind the decoys, " <>
+             "got #{a_in_pool} — decoy_count + k likely exceeds the HNSW reachability ceiling"
 
     expected_a_ids = Enum.take(a_pool_ids, k)
 
@@ -242,19 +269,23 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     # no A row the pool held (no filter-induced starvation) and admitted no nearer
     # foreign decoy (no cross-subject leak). This is the core AC-28.5.5 claim, made
     # deterministic by pinning the expectation to the SAME pool the recall drew from.
+    # `a_in_pool >= k` above ⇒ this is a FULL page of exactly k subject-A rows.
     assert returned_ids == expected_a_ids
+    assert length(results) == k
     assert returned_subjects == [seed.subject_a]
 
     # Semantic path (not the degraded ILIKE fallback): scores are floats.
     assert meta.fallback == false
     assert Enum.all?(results, fn {_m, score} -> is_float(score) end)
 
-    # Under-fill is reported IFF the pool genuinely held < k of A's rows — HNSW's own
-    # approximation, which the filter must SIGNAL, not hide (US-28.2 AC-28.2.4). At this
-    # seed the dense 50-row A cluster just behind the decoys virtually always surfaces
-    # ≥ k rows (the common path is a full page); either way the flag is asserted against
-    # the pool truth, not a fixed expectation.
+    # A FULL top-k recall is NOT under-filled: because the pool held ≥ k of A's rows
+    # (asserted above, with margin at prod ef_search 40), the outer subject filter
+    # returns a complete page — the direct proof that the filter added NO starvation of
+    # its own beyond the ANN (US-28.2 AC-28.2.4). The flag is still tied to the pool
+    # truth (`a_in_pool < k`), which is `false` here, so a seed regression that dropped
+    # A below k would flip both this and the `a_in_pool >= k` guard above.
     assert meta.underfilled == a_in_pool < k
+    refute meta.underfilled
 
     # Every recalled id is one of subject A's OWN seeded memories.
     a_id_set = MapSet.new(seed.subject_a_ids)

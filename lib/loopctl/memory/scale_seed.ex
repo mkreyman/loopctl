@@ -38,18 +38,20 @@ defmodule Loopctl.Memory.ScaleSeed do
 
     * **Decoys (foreign, the GLOBAL nearest)** — `decoy_count` rows at phases
       `0..(decoy_count - 1)`, each owned by its OWN foreign subject
-      (`"scale-decoy-<n>"`). Their cosine to the query is `≥ cos(2π·19/1000)
-      ≈ 0.993` (with the default `decoy_count = 20`), so EVERY decoy is strictly
+      (`"scale-decoy-<n>"`). Their cosine to the query is `≥ cos(2π·7/1000)
+      ≈ 0.999` (with the default `decoy_count = 8`), so EVERY decoy is strictly
       NEARER to the query than any of subject A's rows. `decoy_count > k`, so
       these foreign rows fill and dominate the top-k of the subject-agnostic ANN
       pool — a naive "top-k of the pool" would return zero subject-A rows.
     * **Subject A (the needle)** — `subject_a_count` rows at phases
       `subject_a_phase_lo..(subject_a_phase_lo + subject_a_count - 1)`
-      (`40..89` by default), cosine `cos(2π·40/1000) ≈ 0.969` down to
-      `cos(2π·89/1000) ≈ 0.848`. Strictly behind the decoys (0.969 < 0.993) but
-      far ahead of the haystack, and A's nearest `k` sit at pool ranks
-      `decoy_count..(decoy_count + k)` — inside the over-fetch pool / `ef_search`
-      reach, so the outer filter can fill k after discarding the nearer decoys.
+      (`8..57` by default), cosine `cos(2π·8/1000) ≈ 0.999` down to
+      `cos(2π·57/1000) ≈ 0.937`. Strictly behind the decoys (contiguous, just
+      past the decoy band) but far ahead of the haystack, and A's nearest `k`
+      sit at pool ranks `decoy_count..(decoy_count + k)` — inside the
+      HNSW-reachable head of the over-fetch pool at prod `ef_search` (see the
+      reachability-ceiling note below), so the outer filter can fill a FULL k
+      after discarding the nearer decoys.
     * **Haystack (foreign, FAR)** — the remaining rows kept in the phase window
       `[#{200}, #{800})` (any 1000-cycle), cosine ≤ `cos(2π·200/1000) ≈ 0.31`,
       strictly farther than A. Round-robined across `other_subject_count`
@@ -57,6 +59,26 @@ defmodule Loopctl.Memory.ScaleSeed do
 
   So the globally-nearest rows are FOREIGN decoys, subject A is a ~0.06% needle
   ranked BEHIND them, and correct recall must surface A's own top-k anyway.
+
+  ## The HNSW reachability ceiling (LOAD-BEARING calibration — do NOT re-inflate)
+
+  At prod's effective `hnsw.ef_search` (pgvector default 40) over the ~80k
+  corpus, the approximate HNSW traversal reliably surfaces only roughly the
+  **nearest ~20 rows of the near band** (phases ~0..19) into the over-fetch pool;
+  rows deeper in the near band are NOT reached at ef_search 40 (they need
+  ef_search ≥ ~200), and the remaining pool slots fill with far haystack. This is
+  a measured property of the index at scale, verified with a direct pool probe at
+  80k across independent HNSW builds — NOT a filter defect.
+
+  The calibration consequence is a hard invariant: `decoy_count + k` must stay
+  COMFORTABLY below that ~20-row ceiling, or subject A cannot fill a full top-k
+  behind the dominating decoys and the terminal gate under-fills. The defaults
+  `decoy_count = 8` + the gate's `k = 5` (sum 13, with ~12 of A's rows reaching
+  the pool) leave healthy margin. The PRE-FIX defaults `decoy_count = 20` + `k =
+  10` (sum 30) were structurally impossible at ef_search 40 — subject A surfaced
+  ZERO rows — which is why the gate failed on execution (US-28.5 AC-28.5.5 fix).
+  Do NOT raise `decoy_count`/`subject_a_phase_lo` back toward the old values, and
+  do NOT raise the gate's `k`, without re-measuring this ceiling at 80k.
 
   ## IMPORTANT: opt-in, `@tag :scale`, runs UNBOXED
 
@@ -89,20 +111,27 @@ defmodule Loopctl.Memory.ScaleSeed do
   # phase band [@subject_a_phase_lo, @subject_a_phase_lo + @subject_a_count).
   @subject_a_count 50
 
-  # Subject A's phase band starts here, BEHIND the decoy band [0, @decoy_count).
-  # phase 40 → cosine cos(2π·40/1000) ≈ 0.969, strictly below the decoys' minimum
-  # (≈ 0.993 at phase 19). The ~21-phase gap dwarfs the tiny per-dim noise
-  # (noise_weight 0.05 averaged over 1536 dims ≈ 0.001 in cosine), so every A row
-  # is deterministically farther than every decoy.
-  @subject_a_phase_lo 40
+  # Subject A's phase band starts here, CONTIGUOUS with (just past) the decoy band
+  # [0, @decoy_count). With @decoy_count = 8, A begins at phase 8: cosine
+  # cos(2π·8/1000) ≈ 0.999, just below the decoys' minimum (≈ 0.999 at phase 7) yet
+  # strictly behind every decoy. The gate's dominance assertions are ROBUST to the
+  # sub-noise ordering at that one-phase boundary (they assert "every row nearer
+  # than A's first pool appearance is a decoy" + "≥ 1 decoy is nearer", not a
+  # per-node exact order), so contiguity costs no determinism. Keeping A contiguous
+  # (no phase valley) maximizes the near band's HNSW navigability so A's head rows
+  # land inside the reachable pool head (see the reachability-ceiling note).
+  @subject_a_phase_lo 8
 
   # Foreign "decoy" rows that are the GLOBAL nearest to the query — phases
   # 0..(@decoy_count - 1), each owned by its own foreign subject. @decoy_count > k
-  # (the recall test uses k = 10), so the decoys dominate the top-k of the
-  # subject-agnostic ANN pool: the outer subject filter MUST discard nearer
-  # foreign rows to reach subject A's k. @decoy_count + k stays inside the ANN's
-  # ef_search reach (~40) so A's k rows are still surfaced into the pool.
-  @decoy_count 20
+  # (the recall gate uses k = 5), so the decoys dominate the top-k of the
+  # subject-agnostic ANN pool: the outer subject filter MUST discard nearer foreign
+  # rows to reach subject A's k. CRUCIAL: @decoy_count + k must stay comfortably
+  # below the ~20-row HNSW reachability ceiling at prod ef_search 40 (moduledoc),
+  # so A's FULL k rows still surface into the pool behind the decoys. 8 + 5 = 13
+  # leaves margin (~12 of A's rows reach the pool); the pre-fix 20 + 10 = 30 was
+  # unreachable (A surfaced ZERO rows) — the AC-28.5.5 execution failure this fixes.
+  @decoy_count 8
 
   # The haystack is round-robined across this many other subjects so no single
   # other subject is itself a large fraction of the corpus.
@@ -112,7 +141,7 @@ defmodule Loopctl.Memory.ScaleSeed do
   # window. With @other_phase_lo = 200 the SMALLEST phase-distance from the phase-0
   # query is exactly 200, so the LARGEST haystack cosine is cos(2π·200/1000) ≈ 0.31
   # (phases toward 500 fall to cos(π) = -1). That is strictly below subject A's
-  # band minimum (≈ 0.848 at phase 89) and the decoys (≈ 0.993+), so both the
+  # band minimum (≈ 0.937 at phase 57) and the decoys (≈ 0.999), so both the
   # needle and its decoys are always nearer than the whole haystack.
   @other_phase_lo 200
   @other_phase_hi 800
