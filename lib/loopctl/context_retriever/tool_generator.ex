@@ -66,11 +66,55 @@ defmodule Loopctl.ContextRetriever.ToolGenerator do
 
   @tool_prefix "cr_"
 
-  # Text-like field types eligible to back the search tool (AC-30.2.1: "searchable
-  # TEXT field", not merely "searchable field"). Kept as a fixed set, compared
-  # against the declared `type` string, so a non-text column (e.g. an integer
-  # marked searchable) never triggers a meaningless full-text search tool.
-  @text_types ~w(string)
+  # Field-type vocabulary lives authoritatively on `Entity.field_types/0`. Every
+  # type declared there MUST be explicitly classified here as `:text` (eligible
+  # to back the search tool, AC-30.2.1: "searchable TEXT field", not merely
+  # "searchable field") or `:non_text` — see the compile-time guard below.
+  # Classifying is a deliberate call per type (e.g. an integer marked
+  # searchable never triggers a meaningless full-text search tool), so this map
+  # is hand-maintained, NOT derived from the type's JSON Schema shape.
+  @field_type_classification %{
+    "string" => :text,
+    "integer" => :non_text,
+    "boolean" => :non_text,
+    "float" => :non_text,
+    "datetime" => :non_text
+  }
+
+  @text_types @field_type_classification
+              |> Enum.filter(fn {_type, kind} -> kind == :text end)
+              |> Enum.map(fn {type, _kind} -> type end)
+
+  # Explicit JSON Schema mapping per `Entity.field_types/0` member. See the
+  # compile-time guard below — this map, like `@field_type_classification`,
+  # must cover every Entity-declared field type.
+  @json_schema_types %{
+    "string" => %{"type" => "string"},
+    "integer" => %{"type" => "integer"},
+    "boolean" => %{"type" => "boolean"},
+    "float" => %{"type" => "number"},
+    "datetime" => %{"type" => "string", "format" => "date-time"}
+  }
+
+  # Compile-time guard: if a future `Entity.@field_types` addition (e.g.
+  # `"decimal"` or `"text"`) is left unclassified/unmapped here, compilation
+  # fails loudly instead of the generator silently falling back to
+  # `%{"type" => "string"}` (json_schema_type/1) or silently excluding the new
+  # type from the search tool (@text_types) — the schema-drift bug this guard
+  # closes.
+  unmapped_field_types =
+    Enum.uniq(
+      (Entity.field_types() -- Map.keys(@field_type_classification)) ++
+        (Entity.field_types() -- Map.keys(@json_schema_types))
+    )
+
+  if unmapped_field_types != [] do
+    raise CompileError,
+      description:
+        "Loopctl.ContextRetriever.ToolGenerator is missing a @field_type_classification and/or " <>
+          "@json_schema_types entry for Entity field type(s) #{inspect(unmapped_field_types)}. " <>
+          "Add explicit entries for it before compiling."
+  end
 
   @doc """
   Returns the deterministic list of tool specs authorized by `entity`.
@@ -166,12 +210,12 @@ defmodule Loopctl.ContextRetriever.ToolGenerator do
 
   # --- Field-type -> JSON Schema mapping ---
 
-  defp json_schema_type("string"), do: %{"type" => "string"}
-  defp json_schema_type("integer"), do: %{"type" => "integer"}
-  defp json_schema_type("boolean"), do: %{"type" => "boolean"}
-  defp json_schema_type("float"), do: %{"type" => "number"}
-  defp json_schema_type("datetime"), do: %{"type" => "string", "format" => "date-time"}
-  defp json_schema_type(_other), do: %{"type" => "string"}
+  # Derived from `@json_schema_types`, guarded at compile time (above) to cover
+  # every `Entity.field_types/0` member. The fallback only fires for a type
+  # string that isn't one of `Entity.field_types/0` at all (e.g. malformed
+  # data) — never for a real, unmapped Entity type, since that case is now a
+  # compile error instead of a silent runtime fallback.
+  defp json_schema_type(type), do: Map.get(@json_schema_types, type, %{"type" => "string"})
 
   # --- Predicates ---
 

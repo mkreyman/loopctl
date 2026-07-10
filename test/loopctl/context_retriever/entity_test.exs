@@ -241,6 +241,33 @@ defmodule Loopctl.ContextRetriever.EntityTest do
     end
   end
 
+  describe "field_value/2 and field_string_value/2 — general-key contract" do
+    # Regression: field_value/2 and field_string_value/2 advertise a general
+    # `String.t()` key in their @spec, but previously delegated to a private
+    # `value/2` with only four literal-string clauses and no catch-all —
+    # any other key raised FunctionClauseError instead of returning nil.
+    test "field_value/2 returns nil for a key with no dedicated reading logic" do
+      field = %{name: "title", type: "string", filterable: true, searchable: false}
+
+      assert Entity.field_value(field, "description") == nil
+      assert Entity.field_value(field, "blob") == nil
+    end
+
+    test "field_string_value/2 returns nil for a key with no dedicated reading logic" do
+      field = %{"name" => "title", "type" => "string"}
+
+      assert Entity.field_string_value(field, "description") == nil
+    end
+
+    test "field_value/2 and field_string_value/2 still work for the four sanctioned keys" do
+      field = %{name: "title", type: "string", filterable: true, searchable: false}
+
+      assert Entity.field_value(field, "name") == "title"
+      assert Entity.field_value(field, "filterable") == true
+      assert Entity.field_string_value(field, "type") == "string"
+    end
+  end
+
   describe "introspection helpers" do
     test "column_allowlist/0 excludes isolation and custody columns" do
       allow = Entity.column_allowlist()

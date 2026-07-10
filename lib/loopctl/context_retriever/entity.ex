@@ -216,8 +216,13 @@ defmodule Loopctl.ContextRetriever.Entity do
   contract — `Loopctl.ContextRetriever.ToolGenerator` (US-30.2) consumes it
   rather than re-implementing its own copy, so both interpretations of this
   security-root field-map shape stay in lockstep.
+
+  `key` is intentionally general (`String.t()`), but only the four sanctioned
+  field keys (`#{inspect(@sanctioned_field_key_strings)}`) have dedicated
+  reading logic; any other key safely returns `nil` rather than raising, so
+  callers can pass an arbitrary key without first checking membership.
   """
-  @spec field_value(map(), String.t()) :: term()
+  @spec field_value(map(), String.t()) :: term() | nil
   def field_value(map, key), do: value(map, key)
 
   @doc """
@@ -397,6 +402,13 @@ defmodule Loopctl.ContextRetriever.Entity do
   defp value(map, "type"), do: map["type"] || map[:type]
   defp value(map, "filterable"), do: fetch_bool_key(map, "filterable", :filterable)
   defp value(map, "searchable"), do: fetch_bool_key(map, "searchable", :searchable)
+
+  # Any key outside the four sanctioned field keys has no dedicated reading
+  # logic (there is nothing else stored on a declared field element — see
+  # `take_sanctioned_keys/1`), so it safely reads as absent rather than
+  # raising. This keeps `field_value/2`'s public `String.t()` contract honest
+  # for ANY key, not just the four literals matched above.
+  defp value(_map, _key), do: nil
 
   # For boolean keys, `||` would swallow a legitimate `false`, so fetch explicitly.
   defp fetch_bool_key(map, string_key, atom_key) do

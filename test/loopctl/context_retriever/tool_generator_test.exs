@@ -293,4 +293,44 @@ defmodule Loopctl.ContextRetriever.ToolGeneratorTest do
       assert spec.input_schema["properties"]["phase"] == %{"type" => "string"}
     end
   end
+
+  describe "specs_for/1 — Entity.field_types/0 coverage (schema-drift guard)" do
+    # Regression: json_schema_type/1's silent `%{"type" => "string"}` fallback
+    # made it possible for a future Entity.@field_types addition to be mapped
+    # to a wrong JSON Schema type with no compile warning and no test failure.
+    # ToolGenerator now raises a CompileError if any Entity.field_types/0
+    # member lacks an explicit @json_schema_types / @field_type_classification
+    # entry (enforced at compile time — this module already compiled clean, so
+    # that guard passed). This test is a second, runtime-visible line of
+    # defense: it proves every declared type maps to its OWN distinct,
+    # non-fallback JSON Schema type shape, not merely "some non-string shape".
+    test "every Entity.field_types/0 member produces a distinct, non-fallback JSON Schema type" do
+      schema_types_by_field_type =
+        Map.new(Entity.field_types(), fn type ->
+          entity = %Entity{
+            name: "probe",
+            backing_source: :epics,
+            fields: [%{name: "position", type: type, filterable: true, searchable: false}]
+          }
+
+          [spec] = ToolGenerator.specs_for(entity)
+          {type, spec.input_schema["properties"]["position"]}
+        end)
+
+      # No two distinct Entity field types collapse onto the same JSON Schema
+      # shape as the fallback (%{"type" => "string"}) would silently cause for
+      # any type not explicitly handled.
+      fallback = %{"type" => "string"}
+
+      non_string_types = Entity.field_types() -- ["string"]
+
+      Enum.each(non_string_types, fn type ->
+        refute schema_types_by_field_type[type] == fallback,
+               "Entity field type #{inspect(type)} silently fell back to #{inspect(fallback)} " <>
+                 "in ToolGenerator.json_schema_type/1 — add an explicit mapping"
+      end)
+
+      assert schema_types_by_field_type["string"] == fallback
+    end
+  end
 end
