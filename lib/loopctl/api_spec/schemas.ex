@@ -3039,4 +3039,185 @@ defmodule Loopctl.ApiSpec.Schemas do
       }
     })
   end
+
+  # ---------- Agent Memory (Epic 28, US-28.3) ----------
+
+  defmodule Memory do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "Memory",
+      description:
+        "A single agent memory. Long-term memories carry `text`; session " <>
+          "memories carry `session_id`/`role`/`content`/`expires_at`. The raw " <>
+          "embedding vector is never returned.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tier: %Schema{type: :string, enum: ["long_term", "session"]},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        subject_id: %Schema{type: :string},
+        project_id: %Schema{type: :string, format: :uuid, nullable: true},
+        text: %Schema{type: :string, nullable: true},
+        confidence: %Schema{type: :number, format: :float, nullable: true},
+        source: %Schema{type: :string, enum: ["explicit", "promoted"], nullable: true},
+        source_session_id: %Schema{type: :string, nullable: true},
+        tags: %Schema{type: :array, items: %Schema{type: :string}, nullable: true},
+        superseded_by: %Schema{type: :string, format: :uuid, nullable: true},
+        session_id: %Schema{type: :string, nullable: true},
+        role: %Schema{
+          type: :string,
+          enum: ["user", "assistant", "system", "fact"],
+          nullable: true
+        },
+        content: %Schema{type: :string, nullable: true},
+        metadata: %Schema{type: :object, additionalProperties: true, nullable: true},
+        expires_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        seq: %Schema{type: :integer, nullable: true},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time", nullable: true}
+      }
+    })
+  end
+
+  defmodule MemoryCreateRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryCreateRequest",
+      description:
+        "Params for POST /memory. Scope (tenant_id/subject_id) is derived from the " <>
+          "API key — any tenant_id/subject_id in the body is ignored.",
+      type: :object,
+      properties: %{
+        tier: %Schema{
+          type: :string,
+          enum: ["long_term", "session"],
+          description: "Defaults to long_term."
+        },
+        text: %Schema{type: :string, description: "Long-term memory content (tier=long_term)."},
+        confidence: %Schema{type: :number, format: :float, nullable: true},
+        tags: %Schema{type: :array, items: %Schema{type: :string}, nullable: true},
+        source_session_id: %Schema{type: :string, nullable: true},
+        session_id: %Schema{type: :string, description: "Session id (tier=session)."},
+        role: %Schema{type: :string, enum: ["user", "assistant", "system", "fact"]},
+        content: %Schema{type: :string, description: "Session turn content (tier=session)."},
+        expires_at: %Schema{
+          type: :string,
+          format: :"date-time",
+          description: "Prune deadline (tier=session)."
+        }
+      }
+    })
+  end
+
+  defmodule MemoryRecallRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryRecallRequest",
+      description: "Params for POST /memory/recall. Query supplied in the body.",
+      type: :object,
+      properties: %{
+        query: %Schema{type: :string, description: "Text to embed / match against."},
+        limit: %Schema{
+          type: :integer,
+          description: "Max results, clamped to the vector-search max (no silent hard cap)."
+        },
+        include_superseded: %Schema{type: :boolean, description: "Default false."}
+      }
+    })
+  end
+
+  defmodule MemoryResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryResponse",
+      description: "A single memory wrapped in `data`.",
+      type: :object,
+      properties: %{data: Memory}
+    })
+  end
+
+  defmodule MemoryListResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryListResponse",
+      description: "A paginated list of memories.",
+      type: :object,
+      properties: %{
+        data: %Schema{type: :array, items: Memory},
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            total_count: %Schema{type: :integer},
+            limit: %Schema{type: :integer},
+            offset: %Schema{type: :integer}
+          }
+        }
+      }
+    })
+  end
+
+  defmodule MemoryRecallResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryRecallResponse",
+      description:
+        "Recall results with pinned meta. `score` is null on the text-match " <>
+          "fallback path; `meta.fallback`/`meta.reason` flag degradation and " <>
+          "`meta.underfilled` a short page.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :array,
+          items: %Schema{
+            type: :object,
+            properties: %{
+              memory: Memory,
+              score: %Schema{type: :number, format: :float, nullable: true}
+            }
+          }
+        },
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            total_count: %Schema{type: :integer},
+            fallback: %Schema{type: :boolean},
+            reason: %Schema{type: :string, nullable: true},
+            underfilled: %Schema{type: :boolean}
+          }
+        }
+      }
+    })
+  end
+
+  defmodule MemoryDeleteResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryDeleteResponse",
+      description: "Confirmation that a memory was forgotten.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            id: %Schema{type: :string, format: :uuid},
+            deleted: %Schema{type: :boolean}
+          }
+        }
+      }
+    })
+  end
 end

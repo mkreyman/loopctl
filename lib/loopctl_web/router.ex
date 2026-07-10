@@ -307,6 +307,14 @@ defmodule LoopctlWeb.Router do
     # Skill results
     post "/skill_results", SkillResultController, :create
 
+    # Agent Memory (Epic 28, US-28.3) — thin JSON API over Loopctl.Memory.
+    # Scope (tenant_id, subject_id) is derived from the key, never the body.
+    # Literal /memory/recall must precede parameterized paths.
+    post "/memory/recall", MemoryController, :recall
+    post "/memory", MemoryController, :create
+    get "/memory", MemoryController, :index
+    delete "/memory/:id", MemoryController, :delete
+
     # Knowledge Wiki (Epic 19)
     # Publish workflow routes (must precede resources to avoid route conflicts)
     post "/articles/:id/publish", ArticleWorkflowController, :publish

@@ -360,6 +360,66 @@ defmodule Loopctl.MemoryContextTest do
     end
   end
 
+  # --- US-28.3: superadmin oversight context functions ---
+
+  describe "list_all_subjects/2 (US-28.3 AC-28.3.4)" do
+    test "lists every subject's memories in the tenant, but never another tenant's" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+
+      fixture(:memory, %{tenant_id: tenant.id, subject_id: "s1", text: "one"})
+      fixture(:memory, %{tenant_id: tenant.id, subject_id: "s2", text: "two"})
+      fixture(:memory, %{tenant_id: other.id, subject_id: "s1", text: "foreign"})
+
+      %{results: results, meta: meta} = Memory.list_all_subjects(tenant.id)
+
+      subjects = results |> Enum.map(& &1.subject_id) |> Enum.uniq() |> Enum.sort()
+      assert subjects == ["s1", "s2"]
+      assert meta.total_count == 2
+      refute Enum.any?(results, &(&1.text == "foreign"))
+    end
+
+    test "honors limit/offset and excludes superseded by default" do
+      tenant = fixture(:tenant)
+      live = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s1", text: "live"})
+      dead = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s2", text: "dead"})
+
+      dead
+      |> Ecto.Changeset.change(superseded_by: live.id)
+      |> AdminRepo.update!()
+
+      %{results: results, meta: meta} = Memory.list_all_subjects(tenant.id)
+      assert meta.total_count == 1
+      assert [%{id: id}] = results
+      assert id == live.id
+
+      # include_superseded surfaces the dead row too.
+      assert %{meta: %{total_count: 2}} =
+               Memory.list_all_subjects(tenant.id, include_superseded: true)
+    end
+  end
+
+  describe "forget_any/2 (US-28.3 AC-28.3.4)" do
+    test "deletes any subject's memory in the tenant" do
+      tenant = fixture(:tenant)
+      mem = fixture(:memory, %{tenant_id: tenant.id, subject_id: "someone-else"})
+
+      assert {:ok, :deleted} = Memory.forget_any(tenant.id, mem.id)
+      refute AdminRepo.get(MemorySchema, mem.id)
+    end
+
+    test "a foreign-tenant id or invalid UUID returns :not_found (no leak)" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+      foreign = fixture(:memory, %{tenant_id: other.id, subject_id: "x"})
+
+      assert {:error, :not_found} = Memory.forget_any(tenant.id, foreign.id)
+      assert {:error, :not_found} = Memory.forget_any(tenant.id, "not-a-uuid")
+      # The foreign row survives.
+      assert AdminRepo.get(MemorySchema, foreign.id)
+    end
+  end
+
   defp default_recall_ids(scope, query) do
     scope
     |> Memory.recall(query: query, limit: 10)

@@ -504,6 +504,69 @@ defmodule Loopctl.Memory do
   end
 
   @doc """
+  Lists ALL subjects' long-term memories in `tenant_id`, newest first, paginated.
+
+  Superadmin oversight path (US-28.3 AC-28.3.4): unlike `list/2` — which is
+  strictly `(tenant_id, subject_id)`-scoped — this reader is tenant-scoped and
+  subject-agnostic, so a superadmin key may inspect every subject's memories in
+  its OWN tenant. The `tenant_id` predicate is the isolation boundary here (one
+  tenant can never see another's rows); the CALLER is responsible for gating this
+  to superadmin keys — a non-superadmin must never reach this function.
+
+  Same options and `%{results, meta: %{total_count, limit, offset}}` envelope as
+  `list/2`. Runs on `AdminRepo` (BYPASSRLS) with an explicit `tenant_id` predicate,
+  mirroring the rest of this context.
+  """
+  @spec list_all_subjects(String.t(), keyword() | map()) :: result_envelope()
+  def list_all_subjects(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    limit = clamp_limit(opt(opts, :limit, @default_list_limit))
+    offset = max(to_int(opt(opts, :offset, 0), 0), 0)
+    include_superseded? = truthy?(opt(opts, :include_superseded, false))
+
+    base =
+      MemorySchema
+      |> where([m], m.tenant_id == ^tenant_id)
+      |> maybe_exclude_superseded_base(include_superseded?)
+
+    total = AdminRepo.aggregate(base, :count, :id)
+
+    results =
+      base
+      |> order_by([m], desc: m.inserted_at, desc: m.id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> AdminRepo.all()
+
+    %{results: results, meta: %{total_count: total, limit: limit, offset: offset}}
+  end
+
+  @doc """
+  Deletes a long-term memory by `id` anywhere in `tenant_id`, regardless of which
+  subject owns it.
+
+  Superadmin oversight path (US-28.3 AC-28.3.4): unlike `forget/2` — which is
+  strictly `(tenant_id, subject_id)`-scoped — this delete is tenant-scoped and
+  subject-agnostic, so a superadmin key may delete ANY memory in its OWN tenant.
+  A foreign-tenant id (or an invalid UUID) returns `{:error, :not_found}` — no
+  existence leak across tenants. The CALLER must gate this to superadmin keys; a
+  non-superadmin must never reach it. Runs on `AdminRepo` (BYPASSRLS) with an
+  explicit `tenant_id` predicate.
+  """
+  @spec forget_any(String.t(), String.t()) :: {:ok, :deleted} | {:error, :not_found}
+  def forget_any(tenant_id, id) when is_binary(tenant_id) and is_binary(id) do
+    if valid_uuid?(id) do
+      {count, _} =
+        MemorySchema
+        |> where([m], m.id == ^id and m.tenant_id == ^tenant_id)
+        |> AdminRepo.delete_all()
+
+      if count > 0, do: {:ok, :deleted}, else: {:error, :not_found}
+    else
+      {:error, :not_found}
+    end
+  end
+
+  @doc """
   Returns a session's short-term memories for `(scope.tenant_id, opts[:session_id])`
   in insertion order (oldest first), paginated and scope-enforced.
 
