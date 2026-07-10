@@ -22,6 +22,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
   alias Loopctl.Memory.Memory
+  alias Loopctl.Memory.PromotionEval.Dataset, as: PromotionEvalDataset
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
   alias Loopctl.Orchestrator.OrchestratorState
@@ -678,6 +679,14 @@ defmodule Loopctl.Fixtures do
       subject_id: subject_id,
       project_id: project_id
     }
+  end
+
+  # The COMMITTED labeled promotion-eval dataset (US-29.5). Returns the stable, versioned
+  # ground-truth dataset (`priv/promotion_eval/dataset_v1.json`) — >= 3 labeled sessions
+  # with known expected durable-fact counts plus an injection case whose expected label is
+  # "nothing durable". Not a DB row; it is the committed data the eval scores against.
+  def fixture(:promotion_eval_dataset, _attrs) do
+    PromotionEvalDataset.default()
   end
 
   # A US-29.2 promotion WATERMARK row. Auto-creates a tenant when one isn't supplied;

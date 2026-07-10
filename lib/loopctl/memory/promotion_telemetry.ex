@@ -20,6 +20,10 @@ defmodule Loopctl.Memory.PromotionTelemetry do
     * `:quota_exceeded` — subject hit its memory cap; run terminally discarded.
     * `:budget_exceeded` — tenant hit its compiles/hour cap; refused pre-LLM.
     * `:failed` — a compile/LLM/write failure (retryable).
+    * `:eval` — a promotion-compile QUALITY snapshot (US-29.5): precision/recall of
+      the compiler against the committed labeled dataset (`%{precision, recall,
+      true_positives, false_positives, false_negatives, session_count}`).
+      Calibration/observability only — it never gates promotion.
   """
 
   @prefix [:loopctl, :memory_promotion]
@@ -35,6 +39,7 @@ defmodule Loopctl.Memory.PromotionTelemetry do
           | :quota_exceeded
           | :budget_exceeded
           | :failed
+          | :eval
 
   @doc "Emit a promotion telemetry event with `measurements` and `metadata`."
   @spec emit(event(), map(), map()) :: :ok
