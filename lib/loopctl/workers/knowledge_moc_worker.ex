@@ -6,9 +6,15 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
 
   Design principle: the KB does only MECHANICAL work; intelligence lives at
   consumption. So a MOC body is a deterministic, grouped, cross-linked index —
-  **no LLM narrative** (which the killed "session memory compiler" idea showed is
-  brittle without an eval loop). An agent reads the hub and `knowledge_get`s the
-  entries it needs; the smart synthesis happens in the consuming session.
+  **no LLM narrative**. An agent reads the hub and `knowledge_get`s the entries it
+  needs; the smart synthesis happens in the consuming session.
+
+  (History: this comment once cited a "killed session memory compiler" as evidence
+  that LLM narrative is brittle *without an eval loop*. That compiler now ships — as
+  the Agent Memory Part 2 auto-promotion pipeline (#308) — precisely BECAUSE it now
+  carries that eval loop (US-29.5). The point stands unchanged for MOCs: this worker's
+  no-LLM-narrative design is intentional — a MOC is a navigational index, not a
+  synthesis, so it needs no eval loop and takes no LLM dependency.)
 
   ## What it does (per tenant)
 

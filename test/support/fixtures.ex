@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.SessionMemory
+  alias Loopctl.Memory.SessionPromotion
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
@@ -677,6 +678,27 @@ defmodule Loopctl.Fixtures do
       subject_id: subject_id,
       project_id: project_id
     }
+  end
+
+  # A US-29.2 promotion WATERMARK row. Auto-creates a tenant when one isn't supplied;
+  # `promoted_at` defaults to now (so it counts against the compiles/hour budget).
+  def fixture(:session_promotion, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id = Map.get(attrs, :tenant_id) || fixture(:tenant).id
+    subject_id = Map.get(attrs, :subject_id) || "subject-#{System.unique_integer([:positive])}"
+    seq = System.unique_integer([:positive])
+
+    data = %{
+      session_id: Map.get(attrs, :session_id) || "session-#{seq}",
+      session_content_hash: Map.get(attrs, :session_content_hash) || "hash-#{seq}",
+      last_turn_inserted_at: Map.get(attrs, :last_turn_inserted_at),
+      promoted_at: Map.get(attrs, :promoted_at) || DateTime.utc_now()
+    }
+
+    %SessionPromotion{tenant_id: tenant_id, subject_id: subject_id}
+    |> SessionPromotion.upsert_changeset(data)
+    |> AdminRepo.insert!()
   end
 
   def fixture(:article_link, attrs) do

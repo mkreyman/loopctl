@@ -66,6 +66,16 @@ defmodule Loopctl.Memory.Memory do
   # A blank subject_id must never be a usable owner (see SessionMemory / #163).
   @max_subject_id_length 200
 
+  # The embedder's input is the memory text SLICED to this many chars (the embedding
+  # model's ~8191-token window is far below the 100KB text cap). `embedding_input/1`
+  # and `embedding_content_hash/1` are the SINGLE source of truth for that slice + its
+  # SHA-256 content hash, shared by BOTH the async `MemoryEmbeddingWorker` (which
+  # embeds + hashes async) and the synchronous US-29.2 promotion write path (which
+  # sets `embedding_content_hash` AT WRITE TIME for the exact-dedupe partial unique
+  # index). Keeping one implementation guarantees the two hashes match, so the async
+  # worker's `already_embedded?` idempotency check is not defeated by a drifted slice.
+  @embedding_max_chars 32_000
+
   schema "memories" do
     tenant_field()
     belongs_to :project, Loopctl.Projects.Project
@@ -158,6 +168,30 @@ defmodule Loopctl.Memory.Memory do
   @doc "Maximum `text` byte size."
   @spec max_text_bytes() :: pos_integer()
   def max_text_bytes, do: @max_text_bytes
+
+  @doc """
+  The exact text handed to the embedder: `text` sliced to the model's char window.
+
+  The single source of truth for the slice shared by the async embedding worker and
+  the synchronous US-29.2 promotion write path.
+  """
+  @spec embedding_input(String.t()) :: String.t()
+  def embedding_input(text) when is_binary(text), do: String.slice(text, 0, @embedding_max_chars)
+
+  @doc """
+  SHA-256 hex of `embedding_input(text)` — the `embedding_content_hash` value.
+
+  Computed synchronously at promotion write time (for the exact-dedupe partial unique
+  index) AND by the async `MemoryEmbeddingWorker` after embedding; both call this so
+  the hashes match and the worker's idempotency check holds.
+  """
+  @spec embedding_content_hash(String.t()) :: String.t()
+  def embedding_content_hash(text) when is_binary(text) do
+    text
+    |> embedding_input()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
 
   # A caller may pass an explicit `tags: nil`; `cast/3` records that as a nil
   # CHANGE (the schema default `[]` differs from nil), but the DB column is

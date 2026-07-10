@@ -52,9 +52,15 @@ defmodule Loopctl.Memory do
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory.Memory, as: MemorySchema
+  alias Loopctl.Memory.PromotionTelemetry
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
+  alias Loopctl.Memory.SessionPromotion
   alias Loopctl.Workers.MemoryEmbeddingWorker
+  alias Loopctl.Workers.MemoryPromotionWorker
+
+  @default_near_dup_threshold 0.92
+  @default_compiles_per_hour 200
 
   @default_recall_k 10
   @default_list_limit 50
@@ -689,6 +695,346 @@ defmodule Loopctl.Memory do
     |> case do
       {:ok, memory} -> memory
       {:error, changeset} -> AdminRepo.rollback(changeset)
+    end
+  end
+
+  # ===========================================================================
+  # Promotion (Epic 29, Agent Memory Part 2 / auto-promotion — US-29.2)
+  # ===========================================================================
+
+  @doc """
+  Explicit promotion trigger: enqueues a per-session promotion job for
+  `scope.session_id`, enforcing the per-tenant promotion budget FIRST.
+
+  Takes a `%Loopctl.Memory.Scope{}` carrying a `session_id` (the `%{scope | session_id:
+  ...}` shape). Refuses `{:error, :budget_exceeded}` — WITHOUT enqueuing and therefore
+  WITHOUT any LLM call — when the tenant has already hit its compiles/hour cap
+  (`:memory_promotion_compiles_per_hour`), so a spamming agent cycling distinct
+  `session_id`s cannot exhaust the tenant's BYO LLM key. On success returns
+  `{:ok, %Oban.Job{}}`; a missing `session_id` returns `{:error, :missing_session_id}`.
+
+  The compile + persistence happen in `Loopctl.Workers.MemoryPromotionWorker`; the
+  watermark makes an unchanged session a cheap no-op there.
+  """
+  @spec promote_session(Scope.t()) ::
+          {:ok, Oban.Job.t()} | {:error, :budget_exceeded | :missing_session_id | term()}
+  def promote_session(%Scope{session_id: session_id} = scope)
+      when is_binary(session_id) and session_id != "" do
+    if promotion_budget_available?(scope.tenant_id) do
+      %{
+        "tenant_id" => scope.tenant_id,
+        "subject_id" => scope.subject_id,
+        "project_id" => scope.project_id,
+        "session_id" => session_id
+      }
+      |> MemoryPromotionWorker.new()
+      |> Oban.insert()
+    else
+      PromotionTelemetry.emit(:budget_exceeded, %{count: 1}, %{
+        tenant_id: scope.tenant_id,
+        subject_id: scope.subject_id,
+        session_id: session_id
+      })
+
+      {:error, :budget_exceeded}
+    end
+  end
+
+  def promote_session(%Scope{}), do: {:error, :missing_session_id}
+
+  @doc """
+  Whether `tenant_id` is under its per-hour promotion (compile) budget.
+
+  `extra` accounts for compiles already ENQUEUED in the current sweep tick that have
+  not yet advanced the DB watermark count (async execution) — so the sweep can bound
+  itself within a single pass. Counts `session_promotions` rows whose `promoted_at`
+  falls in the last hour; each promotion run (including a zero-survivor run) upserts
+  exactly one such row, so the count is a faithful compiles/hour meter.
+  """
+  @spec promotion_budget_available?(String.t(), non_neg_integer()) :: boolean()
+  def promotion_budget_available?(tenant_id, extra \\ 0) when is_binary(tenant_id) do
+    promotion_compiles_this_hour(tenant_id) + extra < promotion_budget()
+  end
+
+  @doc "Count of promotion compiles for `tenant_id` in the last hour (watermark rows)."
+  @spec promotion_compiles_this_hour(String.t()) :: non_neg_integer()
+  def promotion_compiles_this_hour(tenant_id) when is_binary(tenant_id) do
+    since = DateTime.add(DateTime.utc_now(), -3600, :second)
+
+    SessionPromotion
+    |> where([w], w.tenant_id == ^tenant_id and w.promoted_at >= ^since)
+    |> AdminRepo.aggregate(:count, :id)
+  end
+
+  @doc "Per-tenant compiles/hour cap (`:memory_promotion_compiles_per_hour`)."
+  @spec promotion_budget() :: pos_integer()
+  def promotion_budget do
+    Application.get_env(:loopctl, :memory_promotion_compiles_per_hour, @default_compiles_per_hour)
+  end
+
+  @doc """
+  Reads the promotion watermark for `(scope, session_id)`, or `nil` if never promoted.
+  """
+  @spec get_session_promotion(Scope.t(), String.t()) :: SessionPromotion.t() | nil
+  def get_session_promotion(%Scope{} = scope, session_id) when is_binary(session_id) do
+    AdminRepo.one(
+      from(w in SessionPromotion,
+        where:
+          w.tenant_id == ^scope.tenant_id and w.subject_id == ^scope.subject_id and
+            w.session_id == ^session_id
+      )
+    )
+  end
+
+  @doc """
+  Upserts the promotion watermark for `scope.session_id` to `fingerprint`.
+
+  Called on EVERY completed promotion run — including a zero-survivor run — so that
+  an unchanged session (same `content_hash`) is skipped on the next trigger. Keyed on
+  `(tenant_id, subject_id, session_id)`; a re-run REPLACES the hash / newest-turn /
+  `promoted_at`.
+  """
+  @spec upsert_session_promotion(Scope.t(), %{
+          :content_hash => String.t(),
+          :last_turn_inserted_at => DateTime.t() | nil,
+          optional(atom()) => any()
+        }) :: {:ok, SessionPromotion.t()} | {:error, Ecto.Changeset.t()}
+  def upsert_session_promotion(%Scope{session_id: session_id} = scope, fingerprint)
+      when is_binary(session_id) do
+    attrs = %{
+      session_id: session_id,
+      session_content_hash: fingerprint.content_hash,
+      last_turn_inserted_at: fingerprint.last_turn_inserted_at,
+      promoted_at: DateTime.utc_now()
+    }
+
+    %SessionPromotion{tenant_id: scope.tenant_id, subject_id: scope.subject_id}
+    |> SessionPromotion.upsert_changeset(attrs)
+    |> AdminRepo.insert(
+      on_conflict:
+        {:replace, [:session_content_hash, :last_turn_inserted_at, :promoted_at, :updated_at]},
+      conflict_target: [:tenant_id, :subject_id, :session_id]
+    )
+  end
+
+  @doc """
+  Persists a session's surviving promotion `candidates` (from
+  `Loopctl.Memory.Promoter.compile/2`) as long-term `:promoted` memories in `scope`.
+
+  For each candidate, in order:
+
+    1. **Exact dedupe** — compute `embedding_content_hash` from the candidate text AT
+       WRITE TIME (decoupled from the async embedding). If a `:promoted` memory with
+       that hash already exists in scope, the candidate is a no-op (`deduped`). The
+       write itself runs `ON CONFLICT DO NOTHING` against the partial unique index, so
+       two concurrent workers (explicit + sweep on the same session) cannot
+       double-insert.
+    2. **Near-dup supersede** — recall the nearest LIVE memory in `(tenant_id,
+       subject_id)` (epic_28 cosine path). If `recall/2` reports `meta.fallback`
+       (embeddings degraded), NO near-dup answer is authoritative, so the whole run
+       aborts with `{:error, :embeddings_degraded}` (the worker snoozes/retries rather
+       than risk inserting a duplicate). On a genuine near-match (score ≥
+       `:memory_promotion_near_dup_threshold`) the new row is inserted and the prior
+       memory is `supersede/3`d.
+    3. Otherwise the candidate is inserted fresh (`promoted`).
+
+  Each inserted `:promoted` row enqueues `Loopctl.Workers.MemoryEmbeddingWorker` to
+  fill its vector asynchronously (reusing the epic_28 path). Subject-cap enforcement
+  is shared with `remember/2` (advisory-locked count) — a candidate that would exceed
+  the cap halts with `{:error, :quota_exceeded, summary}` (a TERMINAL condition for the
+  worker; the rows written so far stand, matching the resumable-not-all-or-nothing
+  contract).
+
+  Returns `{:ok, summary}` on full success, `{:error, :embeddings_degraded}`,
+  `{:error, :quota_exceeded, summary}`, or `{:error, other}` (a bad write —
+  retryable). `summary` is `%{promoted, superseded, deduped}` (promoted = fresh
+  inserts; superseded = insert-and-supersede pairs; deduped = exact-dup skips).
+  """
+  @spec persist_promotion(Scope.t(), [map()]) ::
+          {:ok, map()}
+          | {:error, :embeddings_degraded}
+          | {:error, :quota_exceeded, map()}
+          | {:error, term()}
+  def persist_promotion(%Scope{} = scope, candidates) when is_list(candidates) do
+    Enum.reduce_while(candidates, {:ok, %{promoted: 0, superseded: 0, deduped: 0}}, fn candidate,
+                                                                                       {:ok, acc} ->
+      case promote_one(scope, candidate) do
+        {:ok, :deduped} -> {:cont, {:ok, %{acc | deduped: acc.deduped + 1}}}
+        {:ok, :promoted} -> {:cont, {:ok, %{acc | promoted: acc.promoted + 1}}}
+        {:ok, :superseded} -> {:cont, {:ok, %{acc | superseded: acc.superseded + 1}}}
+        {:error, :embeddings_degraded} -> {:halt, {:error, :embeddings_degraded}}
+        {:error, :quota_exceeded} -> {:halt, {:error, :quota_exceeded, acc}}
+        {:error, other} -> {:halt, {:error, other}}
+      end
+    end)
+  end
+
+  defp promote_one(scope, candidate) do
+    hash = MemorySchema.embedding_content_hash(candidate.text)
+
+    if promoted_hash_exists?(AdminRepo, scope, hash) do
+      {:ok, :deduped}
+    else
+      case nearest_live(scope, candidate.text) do
+        {:error, :embeddings_degraded} -> {:error, :embeddings_degraded}
+        {:ok, near_dup_id} -> insert_and_maybe_supersede(scope, candidate, hash, near_dup_id)
+      end
+    end
+  end
+
+  # Recall the nearest LIVE memory to `text` in scope. Returns the near-dup's id (or
+  # nil when none clears the threshold), or `{:error, :embeddings_degraded}` when
+  # recall fell back (AC-29.2.4 — a degraded 'no near-dup found' is NOT authoritative).
+  defp nearest_live(scope, text) do
+    %{results: results, meta: meta} = recall(scope, query: text, limit: 1)
+
+    cond do
+      meta.fallback ->
+        {:error, :embeddings_degraded}
+
+      match?([{_memory, score} | _] when is_number(score) and score >= 0, results) ->
+        [{memory, score} | _] = results
+        if score >= near_dup_threshold(), do: {:ok, memory.id}, else: {:ok, nil}
+
+      true ->
+        {:ok, nil}
+    end
+  end
+
+  defp insert_and_maybe_supersede(scope, candidate, hash, near_dup_id) do
+    case insert_promoted(scope, candidate, hash) do
+      {:ok, :deduped} ->
+        {:ok, :deduped}
+
+      {:ok, %MemorySchema{} = memory} ->
+        maybe_supersede(scope, near_dup_id, memory)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp maybe_supersede(_scope, nil, _memory), do: {:ok, :promoted}
+
+  defp maybe_supersede(scope, near_dup_id, memory) do
+    if near_dup_id == memory.id do
+      {:ok, :promoted}
+    else
+      case supersede(scope, near_dup_id, memory.id) do
+        {:ok, _} -> {:ok, :superseded}
+        # A concurrent supersede won the race (already superseded / not found). The new
+        # row still stands as a fresh promotion — never crash the run over it.
+        {:error, _} -> {:ok, :promoted}
+      end
+    end
+  end
+
+  # Insert one promoted candidate under the subject-cap advisory lock, re-checking the
+  # exact-dup hash INSIDE the lock (authoritative — the lock serializes same-subject
+  # writers) and writing ON CONFLICT DO NOTHING against the partial unique index as a
+  # belt-and-suspenders backstop. The embedding job is enqueued on the SAME AdminRepo
+  # connection via `Oban.insert/3` (see `remember_long_term/2`).
+  defp insert_promoted(scope, candidate, hash) do
+    attrs = %{
+      text: candidate.text,
+      confidence: candidate.confidence,
+      source: :promoted,
+      source_session_id: scope.session_id,
+      embedding_content_hash: hash,
+      tags: candidate.tags,
+      metadata: promoted_metadata(candidate)
+    }
+
+    Multi.new()
+    |> Multi.run(:lock, fn repo, _changes ->
+      lock_long_term_quota!(repo, scope)
+      {:ok, :ok}
+    end)
+    |> Multi.run(:precheck, fn repo, _changes ->
+      if promoted_hash_exists?(repo, scope, hash),
+        do: {:error, :already_promoted},
+        else: {:ok, :absent}
+    end)
+    |> Multi.run(:quota, fn repo, _changes ->
+      if long_term_count(repo, scope) >= max_long_term_memories(),
+        do: {:error, :quota_exceeded},
+        else: {:ok, :ok}
+    end)
+    |> Multi.insert(:memory, long_term_changeset(scope, attrs),
+      on_conflict: :nothing,
+      conflict_target:
+        {:unsafe_fragment,
+         "(tenant_id, subject_id, embedding_content_hash) WHERE source = 'promoted'"}
+    )
+    |> Oban.insert(:embedding_job, fn %{memory: memory} ->
+      MemoryEmbeddingWorker.new(%{memory_id: memory.id, tenant_id: memory.tenant_id})
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{memory: memory}} -> {:ok, memory}
+      {:error, :precheck, :already_promoted, _changes} -> {:ok, :deduped}
+      {:error, :quota, :quota_exceeded, _changes} -> {:error, :quota_exceeded}
+      {:error, :memory, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:error, :embedding_job, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  defp promoted_hash_exists?(repo, scope, hash) do
+    MemorySchema
+    |> where(
+      [m],
+      m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id and
+        m.source == :promoted and m.embedding_content_hash == ^hash
+    )
+    |> repo.exists?()
+  end
+
+  # Carry the compiler's `when_to_apply` + `cross_links` into the promoted memory's
+  # metadata so the durable fact keeps its applicability note and article links.
+  defp promoted_metadata(candidate) do
+    %{
+      "when_to_apply" => Map.get(candidate, :when_to_apply, ""),
+      "cross_links" => Map.get(candidate, :cross_links, [])
+    }
+  end
+
+  defp near_dup_threshold do
+    Application.get_env(
+      :loopctl,
+      :memory_promotion_near_dup_threshold,
+      @default_near_dup_threshold
+    )
+  end
+
+  @doc "The session-turn TTL in seconds (`expires_at` = now + this)."
+  @spec session_memory_ttl_seconds() :: pos_integer()
+  def session_memory_ttl_seconds do
+    Application.get_env(:loopctl, :session_memory_ttl_seconds, 3600)
+  end
+
+  @doc "The promotion sweep window in seconds (must be < the session-turn TTL)."
+  @spec promotion_sweep_window_seconds() :: pos_integer()
+  def promotion_sweep_window_seconds do
+    Application.get_env(:loopctl, :memory_promotion_sweep_window_seconds, 600)
+  end
+
+  @doc """
+  Asserts the TTL-vs-promotion safety invariant (AC-29.2.10): the promotion sweep
+  window MUST be strictly shorter than the session-turn TTL, so session turns are
+  promoted before `SessionMemoryPruneWorker` can delete them. Raises otherwise.
+  """
+  @spec assert_promotion_ttl_invariant!() :: :ok
+  def assert_promotion_ttl_invariant! do
+    window = promotion_sweep_window_seconds()
+    ttl = session_memory_ttl_seconds()
+
+    if window < ttl do
+      :ok
+    else
+      raise ArgumentError,
+            "memory promotion sweep window (#{window}s) must be strictly shorter than " <>
+              "the session-memory TTL (#{ttl}s) so turns are promoted before they are " <>
+              "pruned (US-29.2 AC-29.2.10)"
     end
   end
 

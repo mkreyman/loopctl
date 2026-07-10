@@ -22,14 +22,19 @@ defmodule Loopctl.Memory.Scope do
   - `tenant_id` — the owning tenant UUID (required)
   - `subject_id` — the memory scope owner = the API-key identity (required)
   - `project_id` — optional project UUID (`nil` = tenant-wide)
+  - `session_id` — optional session identifier. Not an isolation key; carried on the
+    scope only so the explicit promotion trigger `Loopctl.Memory.promote_session/1`
+    (US-29.2) can accept a `%{scope | session_id: ...}` struct without a second
+    positional argument. `nil` for every non-promotion path.
   """
 
   @enforce_keys [:tenant_id, :subject_id]
-  defstruct [:tenant_id, :subject_id, :project_id]
+  defstruct [:tenant_id, :subject_id, :project_id, :session_id]
 
   @type t :: %__MODULE__{
           tenant_id: String.t(),
           subject_id: String.t(),
-          project_id: String.t() | nil
+          project_id: String.t() | nil,
+          session_id: String.t() | nil
         }
 end

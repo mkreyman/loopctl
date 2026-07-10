@@ -9,6 +9,11 @@ defmodule Loopctl.Application do
 
   @impl true
   def start(_type, _args) do
+    # US-29.2 (AC-29.2.10): fail fast if the promotion sweep window is not strictly
+    # shorter than the session-turn TTL — otherwise SessionMemoryPruneWorker could
+    # delete turns before they are promoted (silent golden-nugget loss).
+    Loopctl.Memory.assert_promotion_ttl_invariant!()
+
     Loopctl.TenantKeys.init_cache()
 
     # US-27.4: uniform slow-query logging across all repos via one telemetry handler.
