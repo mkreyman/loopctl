@@ -10,6 +10,9 @@ defmodule Loopctl.ContextRetriever.RegistryTest do
 
   setup :verify_on_exit!
 
+  import Ecto.Query
+
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.ContextRetriever.Registry
   alias Loopctl.Tenants.Tenant
@@ -112,6 +115,34 @@ defmodule Loopctl.ContextRetriever.RegistryTest do
     test "get_entity/2 returns nil for an unknown name" do
       tenant = repo_tenant()
       assert Registry.get_entity(tenant.id, "nope") == nil
+    end
+
+    test "writes an audit_log entry recording the security-root creation" do
+      tenant = repo_tenant()
+      actor_id = Ecto.UUID.generate()
+
+      assert {:ok, entity} =
+               Registry.create_entity(
+                 tenant.id,
+                 %{name: "story", backing_source: :stories, fields: @valid_fields},
+                 actor_id: actor_id,
+                 actor_label: "user:admin"
+               )
+
+      # Read the audit row back through the SAME RLS Repo the Registry writes on
+      # (the AdminRepo runs on a separate sandbox connection and cannot see the
+      # row). RLS scopes the read to this tenant.
+      {:ok, [audit]} =
+        Repo.with_tenant(tenant.id, fn ->
+          Repo.all(from a in AuditLog, where: a.entity_type == "entity_definition")
+        end)
+
+      assert audit.entity_id == entity.id
+      assert audit.action == "created"
+      assert audit.actor_id == actor_id
+      assert audit.actor_label == "user:admin"
+      assert audit.new_state["name"] == "story"
+      assert audit.new_state["backing_source"] == "stories"
     end
   end
 

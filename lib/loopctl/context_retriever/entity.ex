@@ -128,13 +128,17 @@ defmodule Loopctl.ContextRetriever.Entity do
   `tenant_id` is set programmatically on the struct and is NEVER cast. Validates:
 
     * `name`, `backing_source`, `fields` all present;
+    * `fields` declares at least one field — an empty list is rejected (a
+      zero-field entity would generate a useless, empty tool surface);
     * `backing_source` is one of the phase-1 sources (`Ecto.Enum` rejects
       unknowns automatically);
     * each element of `fields` is a well-formed
       `%{name, type, filterable, searchable}` map whose `name` matches the
       safe-identifier regex, whose `type` is in the allowed set, whose
       `filterable`/`searchable` are booleans, AND whose `name` is in the SERVER
-      column allowlist for the row's `backing_source`.
+      column allowlist for the row's `backing_source`;
+    * no field `name` is declared more than once (a duplicate would emit
+      duplicate tool-parameter/select entries downstream).
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(entity \\ %__MODULE__{}, attrs) do
@@ -145,6 +149,7 @@ defmodule Loopctl.ContextRetriever.Entity do
       message: "must be a lowercase snake_case identifier"
     )
     |> validate_length(:name, max: 100)
+    |> validate_non_empty_fields()
     |> validate_fields()
     |> unique_constraint([:tenant_id, :name],
       message: "has already been taken for this tenant",
@@ -176,6 +181,18 @@ defmodule Loopctl.ContextRetriever.Entity do
   # `backing_source` short-circuits with no field errors — `Ecto.Enum` +
   # `validate_required` already flag that, and there is no allowlist to check
   # against.
+  # Reject a definition that declares zero fields. `validate_length(:fields, min: 1)`
+  # canNOT be used here: the schema default for `fields` is `[]`, so casting an
+  # empty list (or omitting `fields`) produces NO change and `validate_length`
+  # skips it. Read the resolved value via `get_field/2` instead. A zero-field
+  # entity would generate a useless, empty tool surface downstream (US-30.2).
+  defp validate_non_empty_fields(changeset) do
+    case get_field(changeset, :fields) do
+      [] -> add_error(changeset, :fields, "must declare at least one field")
+      _ -> changeset
+    end
+  end
+
   defp validate_fields(changeset) do
     source = get_field(changeset, :backing_source)
 
@@ -192,9 +209,41 @@ defmodule Loopctl.ContextRetriever.Entity do
   defp field_list_errors(_fields, nil), do: []
 
   defp field_list_errors(fields, source) do
+    per_element =
+      fields
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {field, index} -> field_errors(field, index, source) end)
+
+    per_element ++ duplicate_name_errors(fields)
+  end
+
+  # Reject an entity that declares the same field `name` twice. Duplicates would
+  # otherwise round-trip into the stored `fields` array and let the US-30.2
+  # generator emit duplicate tool-parameter/select entries. Names are compared as
+  # strings so `"title"` and `:title` collide; unnamed/malformed elements are
+  # skipped here (their own per-element error already fired).
+  defp duplicate_name_errors(fields) do
     fields
-    |> Enum.with_index()
-    |> Enum.flat_map(fn {field, index} -> field_errors(field, index, source) end)
+    |> Enum.map(&declared_name/1)
+    |> Enum.reject(&is_nil/1)
+    |> duplicated_values()
+    |> Enum.map(fn name ->
+      {:fields, "field name #{inspect(name)} is declared more than once"}
+    end)
+  end
+
+  defp declared_name(field) when is_map(field) and not is_struct(field) do
+    string_value(field, "name")
+  end
+
+  defp declared_name(_field), do: nil
+
+  # Distinct values that appear more than once, each reported once.
+  defp duplicated_values(values) do
+    values
+    |> Enum.frequencies()
+    |> Enum.filter(fn {_value, count} -> count > 1 end)
+    |> Enum.map(fn {value, _count} -> value end)
   end
 
   defp field_errors(field, index, source) when is_map(field) and not is_struct(field) do

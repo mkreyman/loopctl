@@ -159,6 +159,59 @@ defmodule Loopctl.ContextRetriever.EntityTest do
       assert Map.has_key?(errors_on(cs), :fields)
     end
 
+    test "rejects an entity that declares zero fields (empty list)" do
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories,
+          fields: []
+        })
+
+      refute cs.valid?
+      assert Map.has_key?(errors_on(cs), :fields)
+    end
+
+    test "rejects an entity with fields omitted" do
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories
+        })
+
+      refute cs.valid?
+      assert Map.has_key?(errors_on(cs), :fields)
+    end
+
+    test "rejects duplicate field names" do
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories,
+          fields: [
+            %{name: "title", type: :string, filterable: true, searchable: true},
+            %{name: "title", type: :string, filterable: false, searchable: false}
+          ]
+        })
+
+      refute cs.valid?
+      assert Map.has_key?(errors_on(cs), :fields)
+    end
+
+    test "rejects duplicate field names across string/atom key shapes" do
+      cs =
+        changeset(%{
+          name: "story",
+          backing_source: :stories,
+          fields: [
+            %{name: "title", type: :string, filterable: true, searchable: true},
+            %{"name" => "title", "type" => "string", "filterable" => false, "searchable" => false}
+          ]
+        })
+
+      refute cs.valid?
+      assert Map.has_key?(errors_on(cs), :fields)
+    end
+
     test "rejects a non-identifier entity name" do
       cs =
         changeset(%{

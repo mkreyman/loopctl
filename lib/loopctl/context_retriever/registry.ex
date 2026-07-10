@@ -11,21 +11,36 @@ defmodule Loopctl.ContextRetriever.Registry do
 
   ## Per-tenant cap
 
-  `create_entity/2` enforces a configurable per-tenant cap
+  `create_entity/3` enforces a configurable per-tenant cap
   (`:max_entity_definitions_per_tenant`) BEFORE inserting, so a tenant cannot
   inflate the dynamic ListTools payload/latency of the generated agent query
-  surface without bound. The count and the insert share ONE `with_tenant`
-  transaction, so the check is consistent with the write. An over-cap create
-  returns `{:error, :entity_limit}` and inserts nothing.
+  surface without bound. A transaction-scoped `pg_advisory_xact_lock` keyed on
+  `tenant_id` serializes concurrent same-tenant creates, so the count-then-insert
+  cap is race-free (mirrors `Loopctl.Memory.remember/2`). The count and the
+  insert share ONE transaction, so the check is consistent with the write. An
+  over-cap create returns `{:error, :entity_limit}` and inserts nothing.
+
+  ## Audit
+
+  Because an entity definition is the executor's field allowlist (a security
+  root), `create_entity/3` writes an `audit_log` entry (`entity_definition` /
+  `created`) inside the same transaction via `Loopctl.Audit.log_in_multi/3`.
   """
 
   import Ecto.Query
 
   alias Ecto.Multi
+  alias Loopctl.Audit
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Repo
 
   @default_max_entities 50
+
+  # Namespace for the per-tenant entity-cap advisory lock. `pg_advisory_xact_lock`
+  # takes two int4s (namespace, key); the namespace isolates this lock CLASS from
+  # every other advisory lock in the app (e.g. the memory-quota lock), so hashing
+  # a tenant_id here can never collide with an unrelated lock keyed on the same int.
+  @entity_cap_lock_ns :erlang.phash2(:loopctl_context_retriever_entity_cap)
 
   @doc """
   Returns all of `tenant_id`'s entity definitions, ordered by `name`.
@@ -67,33 +82,88 @@ defmodule Loopctl.ContextRetriever.Registry do
   `{:error, :entity_limit}` WITHOUT inserting. Otherwise validates via
   `Entity.create_changeset/2` and inserts.
 
-  Runs as an `Ecto.Multi` so the RLS context, the cap check, and the insert all
-  execute in ONE transaction and the write's `unique_constraint` is caught as an
-  `{:error, changeset}` (a bare `Repo.insert` inside `Repo.with_tenant` would
-  poison the transaction on a constraint violation — Ecto only savepoints per-op
-  under `Multi`). The `:rls` step sets `SET LOCAL app.current_tenant_id` +
-  `SET LOCAL ROLE`, so the cap count and insert are RLS-scoped to this tenant.
+  Runs as an `Ecto.Multi` so the RLS context, the advisory lock, the cap check,
+  the insert, and the audit entry all execute in ONE transaction and the write's
+  `unique_constraint` is caught as an `{:error, changeset}` (a bare `Repo.insert`
+  inside `Repo.with_tenant` would poison the transaction on a constraint
+  violation — Ecto only savepoints per-op under `Multi`). The `:rls` step sets
+  `SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`, so the cap count, insert,
+  and audit write are RLS-scoped to this tenant.
+
+  ## Race-free cap (advisory lock)
+
+  The `:lock` step takes a transaction-scoped `pg_advisory_xact_lock` keyed on
+  `tenant_id` BEFORE the count, serializing concurrent same-tenant creates.
+  Without it, two creates under READ COMMITTED could each observe
+  `count = cap - 1` (neither sees the other's uncommitted insert) and both
+  commit, landing at `cap + N`. This mirrors `Loopctl.Memory.remember/2`'s
+  quota lock. The lock auto-releases at COMMIT/ROLLBACK.
+
+  ## Audit trail
+
+  The entity definition is a SECURITY ROOT (the executor's field allowlist), so
+  its creation is recorded via `Audit.log_in_multi/3` inside the same
+  transaction. `opts` supplies the actor for that entry:
+
+    * `:actor_id` — the acting API key id (optional).
+    * `:actor_label` — human-readable actor label (optional).
+    * `:actor_type` — defaults to `"api_key"`.
+    * `:metadata` — extra JSONB context (defaults to `%{}`).
 
   Returns `{:ok, entity}`, `{:error, :entity_limit}`, or `{:error, changeset}`.
   """
-  @spec create_entity(Ecto.UUID.t(), map()) ::
+  @spec create_entity(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Entity.t()} | {:error, :entity_limit | Ecto.Changeset.t()}
-  def create_entity(tenant_id, attrs) when is_binary(tenant_id) and is_map(attrs) do
+  def create_entity(tenant_id, attrs, opts \\ [])
+      when is_binary(tenant_id) and is_map(attrs) and is_list(opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    metadata = Keyword.get(opts, :metadata, %{})
+
     Multi.new()
     |> Multi.run(:rls, fn _repo, _changes ->
       Repo.set_rls_context(tenant_id)
       {:ok, :ok}
     end)
+    |> Multi.run(:lock, fn repo, _changes ->
+      # Serialize concurrent same-tenant creates so the count-then-insert cap is
+      # race-free. Two-int form isolates this lock class by namespace.
+      key = :erlang.phash2(tenant_id)
+      repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@entity_cap_lock_ns, key])
+      {:ok, :ok}
+    end)
     |> Multi.run(:cap, fn repo, _changes ->
-      # The cap check shares this transaction with the insert. RLS scopes the
-      # count to this tenant.
-      if repo.aggregate(Entity, :count, :id) >= max_entities() do
+      # The cap check shares this transaction with the insert (under the advisory
+      # lock). RLS already scopes the count to this tenant; the explicit
+      # `tenant_id` predicate is defense-in-depth on the security-root count so a
+      # future reorder/removal of `:rls` can't silently make it cross-tenant.
+      count = repo.aggregate(from(e in Entity, where: e.tenant_id == ^tenant_id), :count, :id)
+
+      if count >= max_entities() do
         {:error, :entity_limit}
       else
         {:ok, :ok}
       end
     end)
     |> Multi.insert(:entity, Entity.create_changeset(%Entity{tenant_id: tenant_id}, attrs))
+    |> Audit.log_in_multi(:audit, fn %{entity: entity} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "entity_definition",
+        entity_id: entity.id,
+        action: "created",
+        actor_type: actor_type,
+        actor_id: actor_id,
+        actor_label: actor_label,
+        metadata: metadata,
+        new_state: %{
+          "name" => entity.name,
+          "backing_source" => to_string(entity.backing_source),
+          "field_count" => length(entity.fields)
+        }
+      }
+    end)
     |> Repo.transaction()
     |> case do
       {:ok, %{entity: entity}} -> {:ok, entity}
