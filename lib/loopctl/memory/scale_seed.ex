@@ -4,12 +4,19 @@ defmodule Loopctl.Memory.ScaleSeed do
   (US-28.5 / AC-28.5.5).
 
   Where `Loopctl.Knowledge.ScaleSeed` seeds ~80k ARTICLES, this seeds ~80k
-  long-term MEMORIES spread across many `subject_id`s, with ONE distinguished
-  subject (subject A) holding a small, distinctive cluster of memories that are
-  the genuine nearest neighbours to a known query embedding. The scale test then
-  proves subject A reliably recalls its OWN top-k out of the 80k-row haystack —
-  i.e. the over-fetch pool + OUTER `subject_id` filter (US-28.2 AC-28.2.3) does
-  not starve a subject whose memories are a needle among many other subjects'.
+  long-term MEMORIES spread across many `subject_id`s. It is deliberately shaped
+  to reproduce the ONE failure AC-28.5.5 guards against: a subject whose relevant
+  memories are NOT the globally-nearest rows (OTHER subjects' rows are nearer and
+  dominate the inner ANN pool), yet must still fill its own top-k. This is the
+  cross-subject-dominance regime the retired placeholder named — "a subject
+  reliably recalls its own top-k WHEN OTHER SUBJECTS DOMINATE THE CORPUS."
+
+  The over-fetch pool + OUTER `subject_id` filter (US-28.2 AC-28.2.3) must reach
+  the subject's k by DISCARDING nearer foreign-subject rows from the
+  subject-agnostic pool, without under-filling. If the inner pool carried a
+  `(tenant_id, subject_id)` predicate (the #170/#172 anti-pattern that defeats
+  HNSW) OR if the pool were too shallow to hold the subject's k behind the nearer
+  decoys, this seed would make the gate FAIL — which is the point.
 
   ## Why a dedicated seeder (not a reuse of the article seeder)
 
@@ -24,20 +31,32 @@ defmodule Loopctl.Memory.ScaleSeed do
   ## The corpus layout (deterministic)
 
   `embedding_for/1` blends a slow sine of period 1000 with a small per-index
-  noise term, so two indices whose position mod 1000 are close are cosine-near,
-  and indices ~250+ apart (mod 1000) are roughly orthogonal or anti-correlated.
-  We exploit that:
+  noise term, so the cosine of index `i` to the query `embedding_for(0)` is
+  ≈ `cos(2π·(i mod 1000)/1000)`: indices whose phase (index mod 1000) is near 0
+  are cosine-near the query; phases ~250+ away are roughly orthogonal or
+  anti-correlated. We exploit that to build THREE bands, nearest-first:
 
-    * **Subject A** owns indices `0..(subject_a_count - 1)` (phase `0..49` by
-      default) — a tight cluster with cosine ≈ 0.99 to the query
-      `embedding_for(0)`.
-    * **Every other subject** owns rows whose index is kept in the phase window
-      `[#{200}, #{800})` (any 1000-cycle), so its cosine to the query is
-      ≤ ~0.31 — strictly farther than ANY of subject A's rows. The haystack is
-      round-robined across `other_subject_count` distinct subjects.
+    * **Decoys (foreign, the GLOBAL nearest)** — `decoy_count` rows at phases
+      `0..(decoy_count - 1)`, each owned by its OWN foreign subject
+      (`"scale-decoy-<n>"`). Their cosine to the query is `≥ cos(2π·19/1000)
+      ≈ 0.993` (with the default `decoy_count = 20`), so EVERY decoy is strictly
+      NEARER to the query than any of subject A's rows. `decoy_count > k`, so
+      these foreign rows fill and dominate the top-k of the subject-agnostic ANN
+      pool — a naive "top-k of the pool" would return zero subject-A rows.
+    * **Subject A (the needle)** — `subject_a_count` rows at phases
+      `subject_a_phase_lo..(subject_a_phase_lo + subject_a_count - 1)`
+      (`40..89` by default), cosine `cos(2π·40/1000) ≈ 0.969` down to
+      `cos(2π·89/1000) ≈ 0.848`. Strictly behind the decoys (0.969 < 0.993) but
+      far ahead of the haystack, and A's nearest `k` sit at pool ranks
+      `decoy_count..(decoy_count + k)` — inside the over-fetch pool / `ef_search`
+      reach, so the outer filter can fill k after discarding the nearer decoys.
+    * **Haystack (foreign, FAR)** — the remaining rows kept in the phase window
+      `[#{200}, #{800})` (any 1000-cycle), cosine ≤ `cos(2π·200/1000) ≈ 0.31`,
+      strictly farther than A. Round-robined across `other_subject_count`
+      distinct subjects so no single owner is a large fraction of the corpus.
 
-  So the globally-nearest rows to the query are exactly subject A's cluster, and
-  the recall must surface A's own top-k despite A being ~0.06% of the corpus.
+  So the globally-nearest rows are FOREIGN decoys, subject A is a ~0.06% needle
+  ranked BEHIND them, and correct recall must surface A's own top-k anyway.
 
   ## IMPORTANT: opt-in, `@tag :scale`, runs UNBOXED
 
@@ -65,25 +84,63 @@ defmodule Loopctl.Memory.ScaleSeed do
   alias Loopctl.Knowledge.ScaleSeed, as: KnowledgeScaleSeed
   alias Loopctl.Memory.Memory, as: MemorySchema
 
-  # Subject A's distinctive cluster size (also the count of its distinct indices,
-  # phase 0..N-1). Small — it's the needle. k in the recall test is <= this.
+  # Subject A's distinctive cluster size. Small — it's the needle. k in the recall
+  # test is <= this. A is NOT the global nearest (the decoys are); A sits in the
+  # phase band [@subject_a_phase_lo, @subject_a_phase_lo + @subject_a_count).
   @subject_a_count 50
+
+  # Subject A's phase band starts here, BEHIND the decoy band [0, @decoy_count).
+  # phase 40 → cosine cos(2π·40/1000) ≈ 0.969, strictly below the decoys' minimum
+  # (≈ 0.993 at phase 19). The ~21-phase gap dwarfs the tiny per-dim noise
+  # (noise_weight 0.05 averaged over 1536 dims ≈ 0.001 in cosine), so every A row
+  # is deterministically farther than every decoy.
+  @subject_a_phase_lo 40
+
+  # Foreign "decoy" rows that are the GLOBAL nearest to the query — phases
+  # 0..(@decoy_count - 1), each owned by its own foreign subject. @decoy_count > k
+  # (the recall test uses k = 10), so the decoys dominate the top-k of the
+  # subject-agnostic ANN pool: the outer subject filter MUST discard nearer
+  # foreign rows to reach subject A's k. @decoy_count + k stays inside the ANN's
+  # ef_search reach (~40) so A's k rows are still surfaced into the pool.
+  @decoy_count 20
 
   # The haystack is round-robined across this many other subjects so no single
   # other subject is itself a large fraction of the corpus.
   @other_subject_count 400
 
-  # Keep every other-subject row's index phase (index mod 1000) inside this
-  # half-open window, at least ~150 away from subject A's [0, 50) band on both
-  # sides (49→200 and 800→1000). At mod-distance ≥ 150 the cosine to the query is
-  # ≤ cos(2π·150/1000) ≈ 0.59 — strictly below A's cluster (≈ 0.99), so A's rows
-  # are always the nearest. #{@subject_a_count} < 200 keeps the gap.
+  # Keep every haystack row's index phase (index mod 1000) inside this half-open
+  # window. With @other_phase_lo = 200 the SMALLEST phase-distance from the phase-0
+  # query is exactly 200, so the LARGEST haystack cosine is cos(2π·200/1000) ≈ 0.31
+  # (phases toward 500 fall to cos(π) = -1). That is strictly below subject A's
+  # band minimum (≈ 0.848 at phase 89) and the decoys (≈ 0.993+), so both the
+  # needle and its decoys are always nearer than the whole haystack.
   @other_phase_lo 200
   @other_phase_hi 800
 
-  @doc "Subject A's cluster size (the distinctive nearest-neighbour memories)."
+  # Per-batch insert timeout. HNSW index maintenance makes each batch cost several
+  # seconds and rising, so batches would blow the default 15s DBConnection query
+  # timeout (see `insert_batches/2`). Bounded well under the enclosing 30-min
+  # `ownership_timeout` so a genuinely stuck insert still fails loudly.
+  @insert_timeout :timer.minutes(5)
+
+  # Teardown delete timeout. Unlinking ~80k rows from the partial HNSW graph
+  # measures ~150s, over the old 120s bound — so teardown always raised and its
+  # `on_exit` rescue swallowed the failure, orphaning the whole corpus. 10 min
+  # clears it with margin, still under the 30-min `ownership_timeout`.
+  @teardown_timeout :timer.minutes(10)
+
+  @doc "Subject A's cluster size (the distinctive needle memories, behind the decoys)."
   @spec subject_a_count() :: pos_integer()
   def subject_a_count, do: @subject_a_count
+
+  @doc """
+  Number of foreign "decoy" rows seeded strictly NEARER to the query than subject
+  A — one per foreign subject `"scale-decoy-0".."scale-decoy-<n-1>"`. These
+  dominate the top of the subject-agnostic ANN pool; the recall gate proves the
+  outer subject filter still fills A's k behind them. `> k` by construction.
+  """
+  @spec decoy_count() :: pos_integer()
+  def decoy_count, do: @decoy_count
 
   @doc """
   The prod-scale memory floor — reuses `Loopctl.Knowledge.ScaleSeed.prod_article_floor/0`
@@ -102,7 +159,8 @@ defmodule Loopctl.Memory.ScaleSeed do
 
   @doc """
   Seeds a multi-subject memory corpus for `tenant_id` and returns the ids of
-  subject A's memories in nearest-first order (index `0` first).
+  subject A's memories in nearest-first order plus the foreign decoy subjects
+  (nearest-first) that outrank A.
 
   ## Options
 
@@ -113,10 +171,20 @@ defmodule Loopctl.Memory.ScaleSeed do
     * `:floor` — override the enforced prod floor (tests that deliberately seed
       smaller pass an explicit lower floor; the default gate never does).
 
-  Returns `{:ok, %{total: committed, subject_a: subject_a_id, subject_a_ids: [id]}}`.
+  Returns `{:ok, %{total: committed, subject_a: subject_a_id, subject_a_ids: [id],
+  decoy_subjects: [subject_id], decoy_ids: [id]}}`, where `decoy_subjects` /
+  `decoy_ids` are ordered nearest-first (decoy `0`, at phase 0, is the GLOBAL
+  nearest row to the query).
   """
   @spec seed_multi_subject(binary(), keyword()) ::
-          {:ok, %{total: non_neg_integer(), subject_a: binary(), subject_a_ids: [binary()]}}
+          {:ok,
+           %{
+             total: non_neg_integer(),
+             subject_a: binary(),
+             subject_a_ids: [binary()],
+             decoy_subjects: [binary()],
+             decoy_ids: [binary()]
+           }}
   def seed_multi_subject(tenant_id, opts \\ []) when is_binary(tenant_id) do
     if AdminRepo.in_transaction?() do
       raise """
@@ -147,31 +215,42 @@ defmodule Loopctl.Memory.ScaleSeed do
 
     assert_hnsw_index_present!()
 
-    {subject_a_ids, total} =
-      insert_interleaved(tenant_id, subject_a, count - @subject_a_count, batch_size)
+    total_others = count - @subject_a_count - @decoy_count
+
+    {subject_a_ids, decoy_subjects, decoy_ids, total} =
+      insert_interleaved(tenant_id, subject_a, total_others, batch_size)
 
     AdminRepo.query!("ANALYZE memories")
 
-    {:ok, %{total: total, subject_a: subject_a, subject_a_ids: subject_a_ids}}
+    {:ok,
+     %{
+       total: total,
+       subject_a: subject_a,
+       subject_a_ids: subject_a_ids,
+       decoy_subjects: decoy_subjects,
+       decoy_ids: decoy_ids
+     }}
   end
 
   # ---------------------------------------------------------------------------
-  # Insertion — subject A's cluster is INTERLEAVED throughout the haystack, not
-  # front-loaded.
+  # Insertion — the near cluster (subject A's needle rows AND the foreign decoys
+  # that outrank it) is INTERLEAVED throughout the haystack, not front-loaded.
   #
-  # HNSW graph reachability depends on insertion order: inserting all 50 of subject
-  # A's needle rows FIRST and then ~80k haystack rows buries A's early nodes so the
-  # approximate search (ef_search=40) can miss the whole cluster at prod scale — a
-  # false "starvation" that is an artifact of the seed, not the recall design. Real
-  # memories accumulate interspersed over time, so we spread subject A's rows evenly
-  # across the haystack batches. A's ids are returned in embedding-index order
-  # (nearest-first), independent of the interleaved physical insertion order.
+  # HNSW graph reachability depends on insertion order: inserting all of the near
+  # rows FIRST and then ~80k haystack rows buries their early nodes so the
+  # approximate search (ef_search≈40) can miss them at prod scale — a false
+  # "starvation" that is an artifact of the seed, not the recall design. Real
+  # memories accumulate interspersed over time, so we spread the near rows evenly
+  # across the haystack batches, near rows leading each segment. Ids are returned
+  # in embedding-index order (nearest-first), independent of the interleaved
+  # physical insertion order.
   # ---------------------------------------------------------------------------
 
   defp insert_interleaved(tenant_id, subject_a, total_others, batch_size) do
     phase_span = @other_phase_hi - @other_phase_lo
-    # One subject-A row is dropped in front of each of `@subject_a_count` evenly-sized
-    # haystack segments, so A's cluster is spread across the whole build.
+    # One subject-A row (and, for the first @decoy_count segments, one decoy row)
+    # leads each of `@subject_a_count` evenly-sized haystack segments, so the near
+    # cluster is spread across the whole build.
     others_per_segment =
       max(div(max(total_others, 1) + @subject_a_count - 1, @subject_a_count), 1)
 
@@ -187,14 +266,24 @@ defmodule Loopctl.Memory.ScaleSeed do
         &2
       )
 
-    {a_ids_by_index, committed} = Enum.reduce(0..(@subject_a_count - 1), {%{}, 0}, reducer)
+    {a_ids_by_index, decoys_by_index, committed} =
+      Enum.reduce(0..(@subject_a_count - 1), {%{}, %{}, 0}, reducer)
 
     subject_a_ids = Enum.map(0..(@subject_a_count - 1), &Map.fetch!(a_ids_by_index, &1))
-    {subject_a_ids, committed}
+
+    {decoy_subjects, decoy_ids} =
+      0..(@decoy_count - 1)
+      |> Enum.map(&Map.fetch!(decoys_by_index, &1))
+      |> Enum.unzip()
+
+    {subject_a_ids, decoy_subjects, decoy_ids, committed}
   end
 
-  # One interleave step: subject A's `seg`-th row followed by its slice of the
-  # haystack, inserted with A first so A's node is woven into the HNSW graph here.
+  # One interleave step: subject A's `seg`-th row (phase @subject_a_phase_lo + seg),
+  # the `seg`-th decoy (phase seg) for the first @decoy_count segments, then this
+  # segment's haystack slice. The near rows lead so their nodes are woven into the
+  # HNSW graph here. Row ids are the pre-generated UUIDs on the built maps, so no
+  # `returning:` round-trip is needed to capture them.
   defp insert_segment(
          seg,
          tenant_id,
@@ -203,18 +292,44 @@ defmodule Loopctl.Memory.ScaleSeed do
          others_per_segment,
          phase_span,
          batch_size,
-         {a_acc, committed}
+         {a_acc, decoy_acc, committed}
        ) do
     now = DateTime.utc_now()
-    a_row = memory_row(tenant_id, subject_a, seg, "subject-A distinctive memory ##{seg}", now)
+
+    a_row =
+      memory_row(
+        tenant_id,
+        subject_a,
+        @subject_a_phase_lo + seg,
+        "subject-A distinctive memory ##{seg}",
+        now
+      )
+
+    {decoy_rows, decoy_acc} =
+      if seg < @decoy_count do
+        decoy_subject = decoy_subject(seg)
+
+        decoy_row =
+          memory_row(tenant_id, decoy_subject, seg, "decoy nearer-than-A memory ##{seg}", now)
+
+        {[decoy_row], Map.put(decoy_acc, seg, {decoy_subject, decoy_row.id})}
+      else
+        {[], decoy_acc}
+      end
 
     lo = seg * others_per_segment
     hi = min(lo + others_per_segment, total_others) - 1
     other_rows = haystack_rows(lo, hi, tenant_id, phase_span, now)
 
-    {_n, [%{id: a_id}]} = insert_batches([a_row | other_rows], batch_size)
-    {Map.put(a_acc, seg, a_id), committed + 1 + length(other_rows)}
+    near_rows = [a_row | decoy_rows]
+    insert_batches(near_rows ++ other_rows, batch_size)
+
+    {Map.put(a_acc, seg, a_row.id), decoy_acc, committed + length(near_rows) + length(other_rows)}
   end
+
+  # Foreign decoy subject id — one distinct subject per decoy so the pool is
+  # dominated by MANY other subjects, not a single one.
+  defp decoy_subject(n), do: "scale-decoy-#{n}"
 
   # The haystack rows for index range `lo..hi` (empty when the range is spent).
   # Each row's embedding phase (index mod 1000) is kept inside [lo, hi) on any
@@ -232,18 +347,24 @@ defmodule Loopctl.Memory.ScaleSeed do
     end
   end
 
-  # Insert a list of rows in `batch_size` chunks, returning {total, returned_ids}.
-  # The FIRST chunk's first row is subject A's (returned first) — insert it in its
-  # own leading chunk so its id is unambiguously the head of `returned`.
-  defp insert_batches([a_row | others], batch_size) do
-    {_n, [%{id: _} = a_returned]} =
-      AdminRepo.insert_all(MemorySchema, [a_row], returning: [:id])
-
-    others
+  # Insert a list of rows in `batch_size` chunks. Row ids are the pre-generated
+  # UUIDs on the built maps, so no `returning:` round-trip is needed — the caller
+  # captures ids from the row maps it built. `rows` leads with the segment's near
+  # rows so they are woven into the HNSW graph before that segment's haystack.
+  #
+  # `timeout:` is CRITICAL: every insert maintains the `memories` partial HNSW
+  # index, and per-batch cost grows as the graph fills (a 1k-row batch is several
+  # seconds and climbs). Without an override the default 15s DBConnection query
+  # timeout trips mid-seed, disconnecting the checked-out connection — which then
+  # surfaces as a `DBConnection.OwnershipError` ("owner process has crashed") on
+  # the next call, not as a timeout. A generous per-batch bound keeps the whole
+  # ~80k build inside the enclosing 30-min `ownership_timeout` (config/test.exs).
+  defp insert_batches(rows, batch_size) do
+    rows
     |> Enum.chunk_every(batch_size)
-    |> Enum.each(fn chunk -> AdminRepo.insert_all(MemorySchema, chunk) end)
-
-    {1 + length(others), [a_returned]}
+    |> Enum.each(fn chunk ->
+      AdminRepo.insert_all(MemorySchema, chunk, timeout: @insert_timeout)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -297,20 +418,21 @@ defmodule Loopctl.Memory.ScaleSeed do
   @doc """
   Deletes a seeded tenant's memories and the tenant itself. Runs UNBOXED.
 
-  Deleting ~80k rows in one statement can outrun the default query timeout, so
-  pass a generous `:timeout` (a tenant-scoped delete on the indexed `tenant_id`
-  is still fast — the timeout just bounds the pool-checkout wait).
+  Deleting ~80k rows is genuinely SLOW: each deleted row must be unlinked from the
+  partial HNSW graph, so a full-corpus delete measures ~150s (not a pool-checkout
+  wait). The `:timeout` must exceed that or the delete raises mid-statement and
+  the caller's `on_exit` rescue swallows it — leaving ~80k committed rows behind
+  that accumulate across runs and slow every later scale seed. Bounded at 10 min
+  here (well above the measured ~150s, under the 30-min `ownership_timeout`).
   """
   @spec teardown(binary()) :: :ok
   def teardown(tenant_id) when is_binary(tenant_id) do
-    timeout = :timer.seconds(120)
-
     AdminRepo.delete_all(from(m in MemorySchema, where: m.tenant_id == ^tenant_id),
-      timeout: timeout
+      timeout: @teardown_timeout
     )
 
     AdminRepo.delete_all(from(t in Loopctl.Tenants.Tenant, where: t.id == ^tenant_id),
-      timeout: timeout
+      timeout: @teardown_timeout
     )
 
     :ok
