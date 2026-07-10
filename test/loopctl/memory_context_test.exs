@@ -334,16 +334,10 @@ defmodule Loopctl.MemoryContextTest do
     end
   end
 
-  # --- Scale stub (executed by the terminal story US-28.5) ---
-
-  @tag :scale
-  @tag :skip
-  test "a subject reliably recalls its own top-k when other subjects dominate the corpus" do
-    # Placeholder: the assertion (subject recall under cross-subject dominance) is
-    # verified at scale by US-28.5 with an ANALYZE/EXPLAIN gate proving the over-fetch
-    # pool does not under-fill for a subject holding N memories among M total.
-    :ok
-  end
+  # --- Scale recall (subject not starved at scale) is now IMPLEMENTED, not stubbed,
+  #     by the terminal story US-28.5: see `Loopctl.Memory.ScaleRecallTest`
+  #     (`@tag :scale`, seeds a ~80k multi-subject corpus via
+  #     `Loopctl.Memory.ScaleSeed` and asserts subject A recalls its own top-k). ---
 
   # --- tenant isolation via forget across tenants (mandatory) ---
 

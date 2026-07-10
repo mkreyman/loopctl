@@ -826,6 +826,63 @@ describe("AC-28.4.2: descriptions disambiguate memory vs knowledge", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// US-28.5 (AC-28.5.4): cross-surface isolation at the MCP layer. The context and
+// API surfaces are proven in the Elixir suites
+// (Loopctl.Memory.CrossSurfaceIsolationTest); here we prove the MCP surface
+// offers NO bypass — a caller cannot express, nor smuggle, a cross-tenant /
+// cross-subject scope. Scope is key-derived server-side; the tool is scope-blind.
+// ---------------------------------------------------------------------------
+
+describe("AC-28.5.4: MCP memory tools cannot express or smuggle a cross-scope read/write", () => {
+  test("a forged tenant_id/subject_id passed to memory_recall is NOT forwarded to the HTTP body", async () => {
+    setupEnv();
+    const calls = mockFetch(
+      { data: [], meta: { total_count: 0, fallback: false, reason: null, underfilled: false } },
+      200,
+    );
+
+    // Even if a caller crafts these keys, the handler only builds the payload from
+    // its named params — the scope keys never reach the wire (server derives scope
+    // from the key).
+    await memoryRecall({
+      query: "another subject's secret",
+      tenant_id: "victim-tenant",
+      subject_id: "victim-subject",
+    });
+
+    const sentBody = JSON.parse(calls[0].options.body);
+    assert.equal("tenant_id" in sentBody, false);
+    assert.equal("subject_id" in sentBody, false);
+    assert.deepEqual(sentBody, { query: "another subject's secret" });
+  });
+
+  test("a forged tenant_id/subject_id passed to memory_list is NOT forwarded to the query string", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { total_count: 0, limit: 50, offset: 0 } }, 200);
+
+    await memoryList({ limit: 5, tenant_id: "victim-tenant", subject_id: "victim-subject" });
+
+    const parsedUrl = new URL(calls[0].url);
+    assert.equal(parsedUrl.searchParams.has("tenant_id"), false);
+    assert.equal(parsedUrl.searchParams.has("subject_id"), false);
+  });
+
+  test("memory_forget targets ONLY the :id path segment — no scope param can widen its blast radius", async () => {
+    setupEnv();
+    const id = "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0";
+    const calls = mockFetch({ data: { id, deleted: true } }, 200);
+
+    // Extra forged scope keys are ignored; the DELETE hits exactly /api/v1/memory/:id,
+    // which the server confines to the key's own (tenant, subject) scope (404 otherwise).
+    await memoryForget({ id, tenant_id: "victim-tenant", subject_id: "victim-subject" });
+
+    assert.equal(calls.length, 1);
+    assert.equal(new URL(calls[0].url).pathname, `/api/v1/memory/${id}`);
+    assert.equal(calls[0].options.body, undefined);
+  });
+});
+
 describe("AC-28.4.5: existing knowledge_*/story tools remain unchanged", () => {
   test("ListTools still exposes representative pre-existing tools alongside the new memory tools", () => {
     for (const toolName of [

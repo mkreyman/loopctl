@@ -5,6 +5,26 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
+### Agent Memory (`memory_*`) vs Knowledge Wiki (`knowledge_*`)
+
+loopctl has TWO stores an agent can write to — pick by ownership + lifecycle
+(full reference: `docs/agent-memory.md`):
+
+- **`memory_*` — Agent Memory**: PRIVATE to your `(tenant, subject_id)` scope
+  (`Loopctl.Memory`; tables `memories`/`session_memories`). Use for facts,
+  preferences, and observations THIS agent learned about ITS task/user and needs
+  to recall later. `long_term` = vector-embedded + semantically recalled; `session`
+  = chronological + TTL-pruned. Tools: `memory_remember`, `memory_recall`,
+  `memory_list`, `memory_forget`.
+- **`knowledge_*` — Knowledge Wiki**: SHARED, curated tenant knowledge, deduped and
+  linked. Use when the insight is worth ANOTHER agent reading.
+
+Rule of thumb: *worth another agent reading?* → `knowledge_create`; *a fact only I
+need to recall about my own work?* → `memory_remember`. Scope is key-derived — you
+never pass `tenant_id`/`subject_id`. Do NOT conflate `Loopctl.Memory` (Epic 28)
+with the article-level agent-memory *metadata* (`memory_type`/`visibility`) on the
+Knowledge `articles` table (#163) — different subsystems.
+
 ### Phoenix v1.8 guidelines
 
 - **Always** begin your LiveView templates with `<Layouts.app flash={@flash} ...>` which wraps all inner content
