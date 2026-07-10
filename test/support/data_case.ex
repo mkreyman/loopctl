@@ -118,6 +118,13 @@ defmodule Loopctl.DataCase do
       {:ok, []}
     end)
 
+    # Default stub for the memory-promotion LLM (Epic 29) -- returns a benign empty
+    # JSON array so unrelated tests that trigger compile/2 don't fail. Individual
+    # tests override with Mox.expect/3 to return crafted candidates.
+    Mox.stub(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+      {:ok, "[]"}
+    end)
+
     # Default stub for category classifier -- zero confidence, so the
     # reclassification backfill is a no-op unless a test sets its own verdict.
     Mox.stub(Loopctl.MockCategoryClassifier, :classify, fn _tenant_id, _title, _body, _opts ->

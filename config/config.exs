@@ -314,6 +314,17 @@ config :loopctl, Loopctl.Vault,
 # DI: Content extractor for knowledge ingestion
 config :loopctl, :content_extractor, Loopctl.Knowledge.ClaudeContentExtractor
 
+# DI: Memory promotion compiler LLM (Epic 29). The production impl wraps the
+# shared tenant-scoped Anthropic client (operation :extraction) with temperature 0
+# and a fixed injection-hardened prompt. Overridden by a Mox mock in test env.
+config :loopctl, :promoter_llm, Loopctl.Memory.Promoter.DefaultLLM
+
+# Memory promotion tunables (Loopctl.Memory.Promoter.compile/2). Candidates below
+# the confidence threshold are dropped; the result is capped to the top-N by
+# confidence. Query-shaped defaults; documented in the module.
+config :loopctl, :memory_promotion_confidence_threshold, 0.5
+config :loopctl, :memory_promotion_max_candidates, 5
+
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
 # (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF

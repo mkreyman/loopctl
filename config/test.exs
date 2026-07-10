@@ -260,6 +260,13 @@ config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 # DI: Use mock content extractor in tests
 config :loopctl, :content_extractor, Loopctl.MockContentExtractor
 
+# DI: Use mock memory-promotion LLM in tests (Epic 29). A small max_candidates so
+# the top-N cap is exercised with a handful of candidates. Config-based DI — no
+# Application.put_env in any test body.
+config :loopctl, :promoter_llm, Loopctl.MockPromoterLLM
+config :loopctl, :memory_promotion_confidence_threshold, 0.5
+config :loopctl, :memory_promotion_max_candidates, 3
+
 # DI: Use mock category classifier in tests
 config :loopctl, :category_classifier, Loopctl.MockCategoryClassifier
 
