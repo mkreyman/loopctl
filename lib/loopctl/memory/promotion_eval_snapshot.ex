@@ -25,8 +25,11 @@ defmodule Loopctl.Memory.PromotionEvalSnapshot do
     field :true_positives, :integer, default: 0
     field :false_positives, :integer, default: 0
     field :false_negatives, :integer, default: 0
-    field :precision, :float, default: 0.0
-    field :recall, :float, default: 0.0
+    # precision/recall are NULLABLE: `precision` is nil when nothing was emitted
+    # (TP+FP == 0 — undefined, not 0.0, so an outage doesn't misfire a precision-floor
+    # alert); `recall` is nil only when there are no expected facts at all.
+    field :precision, :float
+    field :recall, :float
     field :computed_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
@@ -49,6 +52,8 @@ defmodule Loopctl.Memory.PromotionEvalSnapshot do
   def changeset(snapshot \\ %__MODULE__{}, attrs) do
     snapshot
     |> cast(attrs, @cast_fields)
+    # precision/recall are intentionally NOT required — they are nil when the compiler
+    # emitted nothing (undefined metric; see the schema field comment).
     |> validate_required([
       :day,
       :dataset_version,
@@ -56,8 +61,6 @@ defmodule Loopctl.Memory.PromotionEvalSnapshot do
       :true_positives,
       :false_positives,
       :false_negatives,
-      :precision,
-      :recall,
       :computed_at
     ])
     |> unique_constraint([:tenant_id, :dataset_version, :day],

@@ -99,6 +99,57 @@ defmodule Loopctl.MemoryContextTest do
       assert r2.id == m2.id
       refute Map.has_key?(r1, :embedding)
     end
+
+    # AC-29.2.10: the server GOVERNS the session-turn lifetime so a turn always
+    # outlives the promotion sweep (turns are promoted before pruned). This is what
+    # makes assert_promotion_ttl_invariant!/0 load-bearing — both knobs govern the
+    # real per-row expires_at.
+    test "an omitted expires_at defaults to now + session_memory_ttl_seconds" do
+      scope = fixture(:memory_scope)
+      ttl = Application.get_env(:loopctl, :session_memory_ttl_seconds, 3600)
+
+      {:ok, mem} =
+        Memory.remember(scope, %{tier: :session, session_id: "s1", role: :user, content: "t"})
+
+      seconds = DateTime.diff(mem.expires_at, DateTime.utc_now())
+      # Within a small window of the configured TTL (default 3600).
+      assert_in_delta seconds, ttl, 30
+    end
+
+    test "a caller-supplied expires_at shorter than the sweep window is floored up" do
+      scope = fixture(:memory_scope)
+      window = Application.get_env(:loopctl, :memory_promotion_sweep_window_seconds, 600)
+
+      {:ok, mem} =
+        Memory.remember(scope, %{
+          tier: :session,
+          session_id: "s1",
+          role: :user,
+          content: "t",
+          # 60s — well under the sweep window, so a prune could beat promotion.
+          expires_at: DateTime.add(DateTime.utc_now(), 60, :second)
+        })
+
+      seconds = DateTime.diff(mem.expires_at, DateTime.utc_now())
+      # Floored up to at least now + sweep_window (the expiry floor), not the requested 60.
+      assert_in_delta seconds, window, 30
+    end
+
+    test "a caller-supplied expires_at beyond the floor is preserved" do
+      scope = fixture(:memory_scope)
+
+      {:ok, mem} =
+        Memory.remember(scope, %{
+          tier: :session,
+          session_id: "s1",
+          role: :user,
+          content: "t",
+          expires_at: DateTime.add(DateTime.utc_now(), 7200, :second)
+        })
+
+      seconds = DateTime.diff(mem.expires_at, DateTime.utc_now())
+      assert_in_delta seconds, 7200, 30
+    end
   end
 
   # --- TC-28.2.3: cross-subject / cross-tenant isolation + forget + guard ---
@@ -254,6 +305,39 @@ defmodule Loopctl.MemoryContextTest do
       # A is untouched — still a live head.
       reloaded = AdminRepo.get(MemorySchema, a.id)
       assert is_nil(reloaded.superseded_by)
+    end
+
+    test "superseding an ALREADY-superseded old is refused — no second live head" do
+      scope = fixture(:memory_scope)
+
+      {:ok, a} = Memory.remember(scope, %{tier: :long_term, text: "a"})
+      {:ok, b} = Memory.remember(scope, %{tier: :long_term, text: "b"})
+      {:ok, c} = Memory.remember(scope, %{tier: :long_term, text: "c"})
+
+      # a -> b (a superseded).
+      assert {:ok, _} = Memory.supersede(scope, a.id, b.id)
+
+      # Re-superseding a (now dead) at a DIFFERENT new head c would overwrite a's
+      # pointer, orphaning b and leaving BOTH b and c live for one logical fact.
+      # Refused so double-supersede cannot create two live heads (AC-29.2.4 guard).
+      assert {:error, :already_superseded} = Memory.supersede(scope, a.id, c.id)
+
+      # a still points at b; both b and c remain live heads independently, but a is not
+      # duplicated behind two of them.
+      reloaded = AdminRepo.get(MemorySchema, a.id)
+      assert reloaded.superseded_by == b.id
+    end
+
+    test "re-superseding the SAME (old, new) pair is idempotent" do
+      scope = fixture(:memory_scope)
+
+      {:ok, a} = Memory.remember(scope, %{tier: :long_term, text: "a"})
+      {:ok, b} = Memory.remember(scope, %{tier: :long_term, text: "b"})
+
+      assert {:ok, _} = Memory.supersede(scope, a.id, b.id)
+      # Idempotent replay (e.g. a retried worker) is a no-op success, not an error.
+      assert {:ok, again} = Memory.supersede(scope, a.id, b.id)
+      assert again.superseded_by == b.id
     end
   end
 

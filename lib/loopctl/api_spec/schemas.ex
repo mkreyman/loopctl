@@ -74,6 +74,57 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule PromotionBudgetError do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "PromotionBudgetError",
+      description:
+        "Promotion budget exceeded (HTTP 429). Distinct from the generic request " <>
+          "RateLimitError: this is the tenant's PER-HOUR memory-promotion (compile) " <>
+          "budget — a semantic limit that caps how many session→long-term promotions " <>
+          "may run per hour so a spamming agent cannot exhaust the tenant's BYO LLM " <>
+          "key. The session was NOT enqueued and no LLM call was made. Unlike the " <>
+          "request limiter, this response carries a machine-readable `error.code` of " <>
+          "`promotion_budget_exceeded` and does NOT set `Retry-After` or " <>
+          "`X-RateLimit-*` headers (the budget refills on a rolling hourly window, " <>
+          "not a fixed per-request window) — clients should back off and retry later " <>
+          "rather than read a reset header.",
+      type: :object,
+      required: [:error],
+      properties: %{
+        error: %Schema{
+          type: :object,
+          required: [:status, :code, :message],
+          properties: %{
+            status: %Schema{type: :integer, example: 429},
+            code: %Schema{
+              type: :string,
+              enum: ["promotion_budget_exceeded"],
+              example: "promotion_budget_exceeded"
+            },
+            message: %Schema{
+              type: :string,
+              example:
+                "The tenant's per-hour memory-promotion budget has been reached. " <>
+                  "The session was not enqueued and no LLM call was made; retry later."
+            }
+          }
+        }
+      },
+      example: %{
+        error: %{
+          status: 429,
+          code: "promotion_budget_exceeded",
+          message:
+            "The tenant's per-hour memory-promotion budget has been reached. " <>
+              "The session was not enqueued and no LLM call was made; retry later."
+        }
+      }
+    })
+  end
+
   defmodule PaginationMeta do
     @moduledoc false
     require OpenApiSpex
@@ -3165,14 +3216,21 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "MemoryPromoteResponse",
-      description: "Confirmation that a session→long-term promotion was enqueued.",
+      description:
+        "Confirmation that a session→long-term promotion was enqueued. The reference " <>
+          "is the caller's own tenant-scoped `session_id` (the promotion is unique per " <>
+          "(tenant, subject, session)); the internal Oban job id is deliberately NOT " <>
+          "exposed — it is a system-wide monotonic counter that would leak a " <>
+          "cross-tenant throughput side-channel.",
       type: :object,
       properties: %{
         data: %Schema{
           type: :object,
           properties: %{
-            job_id: %Schema{type: :integer, description: "The enqueued Oban job id."},
-            session_id: %Schema{type: :string},
+            session_id: %Schema{
+              type: :string,
+              description: "The session whose promotion was enqueued (the work reference)."
+            },
             status: %Schema{type: :string, enum: ["enqueued"]}
           }
         }

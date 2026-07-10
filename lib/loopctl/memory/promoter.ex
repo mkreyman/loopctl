@@ -15,8 +15,9 @@ defmodule Loopctl.Memory.Promoter do
     4. defensively parses the response (fail-closed on malformed output);
     5. gates candidates by a configurable confidence threshold and caps the result
        to the top-N by confidence;
-    6. hardens every candidate: byte-caps `text`, caps `tags`, and validates every
-       `cross_link` to be an article id belonging to the CALLER's tenant (dropping
+    6. hardens every candidate: byte-caps `text`, caps `tags` and `cross_links`,
+       and validates every `cross_link` to be an article VISIBLE to the compiling
+       subject (in-tenant AND not another agent's private/owner article — dropping
        any that fail);
     7. RETURNS `{:ok, [candidate]}`.
 
@@ -31,7 +32,7 @@ defmodule Loopctl.Memory.Promoter do
         when_to_apply: String.t(), # when the fact applies
         tags: [String.t()],        # capped list of tag strings
         confidence: float(),       # in [0.0, 1.0]
-        cross_links: [Ecto.UUID.t()] # in-tenant article ids only (may be [])
+        cross_links: [Ecto.UUID.t()] # subject-visible in-tenant article ids (may be [])
       }
 
   ## Security
@@ -60,6 +61,11 @@ defmodule Loopctl.Memory.Promoter do
   @default_confidence_threshold 0.5
   @default_max_candidates 5
   @max_tags 20
+  # Cross_links come from attacker-influenced session content, so cap their count
+  # per candidate for symmetry with the byte-capped `text` and the count-capped
+  # `tags` — an LLM coaxed into emitting thousands of UUIDs can't produce an
+  # unbounded `a.id IN (...)` validation query.
+  @max_cross_links 20
 
   @type candidate :: %{
           text: String.t(),
@@ -129,7 +135,14 @@ defmodule Loopctl.Memory.Promoter do
   defp turn_inserted_at(nil), do: nil
   defp turn_inserted_at(%{inserted_at: inserted_at}), do: inserted_at
 
-  @read_window 200
+  # Keep the read window pinned to Loopctl.Memory's list-limit ceiling. load_turns/2
+  # keeps the MOST-RECENT window by issuing an offset query with `limit: @read_window`;
+  # Memory.session_history clamps that limit to `max_list_limit()`. If @read_window
+  # ever EXCEEDED that ceiling the offset query's limit would silently clamp down and
+  # return a MIDDLE slice — dropping the most-recent turns (where durable decisions
+  # accumulate) and breaking the temperature-0 idempotency US-29.2 depends on. Deriving
+  # it from the source of truth makes the coupling explicit and regression-proof.
+  @read_window Loopctl.Memory.max_list_limit()
 
   defp load_turns(scope, session_id) do
     # session_history/2 is scope-enforced: WHERE tenant_id AND session_id AND
@@ -320,6 +333,7 @@ defmodule Loopctl.Memory.Promoter do
       end
     end)
     |> Enum.uniq()
+    |> Enum.take(@max_cross_links)
   end
 
   defp collect_cross_link_ids(_), do: []
@@ -344,19 +358,32 @@ defmodule Loopctl.Memory.Promoter do
   # cross_link tenant validation (AC-29.1.5)
   # ===========================================================================
 
-  # Validate every candidate's cross_links against the CALLER's tenant in ONE
-  # batched query, then drop any id not owned by the tenant (foreign-tenant or
-  # non-existent) — never stored. Delegates to `Loopctl.Knowledge.visible_article_ids/3`
-  # (the Knowledge context owns the Article schema), keeping tenant-scoped article
-  # validation with the context that owns it rather than reaching across the boundary.
-  # A `nil` visibility arg means "every id in the list that exists in the tenant".
+  # Validate every candidate's cross_links against the CALLER's tenant AND its
+  # article visibility in ONE batched query, then drop any id not visible to the
+  # compiling subject (foreign-tenant, non-existent, OR another agent's
+  # private/owner article #163) — never stored. Delegates to
+  # `Loopctl.Knowledge.visible_article_ids/3` (the Knowledge context owns the
+  # Article schema), keeping tenant-scoped article validation with the context that
+  # owns it rather than reaching across the boundary.
+  #
+  # We thread `scope.subject_id` as the visibility agent id, mirroring
+  # `LoopctlWeb.ChangeController.filter_visible_changes/3` ("a link can't leak a
+  # private memory's id/edge"). For an agent-role key the subject IS the verified
+  # `agent_id` that Knowledge stamps into `metadata.agent_id`
+  # (`Loopctl.Memory.subject_id_for/1` ⇔ `ArticleController.bind_agent_identity/2`),
+  # so an agent can cross-link only shared articles plus its OWN private/owner
+  # articles — closing the defense-in-depth gap where a promoted candidate could
+  # otherwise carry an edge to another agent's private article in the same tenant.
+  # For a higher-role subject (whose subject is its key id, never stamped as an
+  # article `agent_id`) this restricts cross_links to shared articles — the safe
+  # direction for attacker-influenced content.
   defp validate_cross_links(candidates, scope) do
     all_ids =
       candidates
       |> Enum.flat_map(& &1.cross_links)
       |> Enum.uniq()
 
-    valid_ids = Knowledge.visible_article_ids(scope.tenant_id, all_ids, nil)
+    valid_ids = Knowledge.visible_article_ids(scope.tenant_id, all_ids, scope.subject_id)
 
     Enum.map(candidates, fn candidate ->
       %{candidate | cross_links: Enum.filter(candidate.cross_links, &(&1 in valid_ids))}
