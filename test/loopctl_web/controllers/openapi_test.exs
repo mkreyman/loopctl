@@ -62,19 +62,22 @@ defmodule LoopctlWeb.OpenApiTest do
 
       assert Map.has_key?(paths, "/api/v1/memory")
       assert Map.has_key?(paths, "/api/v1/memory/recall")
+      assert Map.has_key?(paths, "/api/v1/memory/promote")
       assert Map.has_key?(paths, "/api/v1/memory/{id}")
 
       # The verbs the controller declares: remember (POST), list (GET), recall
-      # (POST), forget (DELETE).
+      # (POST), promote (POST), forget (DELETE).
       assert Map.has_key?(paths["/api/v1/memory"], "post")
       assert Map.has_key?(paths["/api/v1/memory"], "get")
       assert Map.has_key?(paths["/api/v1/memory/recall"], "post")
+      assert Map.has_key?(paths["/api/v1/memory/promote"], "post")
       assert Map.has_key?(paths["/api/v1/memory/{id}"], "delete")
 
       # And the Memory* response schemas are registered under components.
       schemas = body["components"]["schemas"]
       assert Map.has_key?(schemas, "Memory")
       assert Map.has_key?(schemas, "MemoryRecallResponse")
+      assert Map.has_key?(schemas, "MemoryPromoteRequest")
     end
   end
 

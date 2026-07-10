@@ -103,8 +103,12 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # (derived from the key, never the body); own-memory delete is
                # subject-scoped and the tenant-wide (any-subject) list/delete
                # oversight path is superadmin-only. recall is a POST-shaped READ.
+               # promote (US-29.3) triggers the agent's own session→long-term
+               # promotion — same KB-tier agent surface, same (tenant, subject)
+               # key-derived scope, so it is allowlisted alongside its siblings.
                {:post, "/api/v1/memory"},
                {:post, "/api/v1/memory/recall"},
+               {:post, "/api/v1/memory/promote"},
                {:delete, "/api/v1/memory/:id"},
 
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,

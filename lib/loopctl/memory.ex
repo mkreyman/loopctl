@@ -483,6 +483,9 @@ defmodule Loopctl.Memory do
     * `:limit` — page size (clamped to `[1, #{@max_list_limit}]`, default #{@default_list_limit}).
     * `:offset` — pagination offset (default 0).
     * `:include_superseded` — include superseded rows (default `false`).
+    * `:source` — filter by provenance (`:promoted` | `:explicit`, or the string
+      forms; anything else is ignored → no filter). US-29.3 oversight of
+      promoted-vs-explicit memories.
 
   Returns `%{results: [memory], meta: %{total_count, limit, offset}}`. `total_count`
   is the TRUE scoped total (never silently capped by `limit`).
@@ -497,6 +500,7 @@ defmodule Loopctl.Memory do
       MemorySchema
       |> where([m], m.tenant_id == ^scope.tenant_id and m.subject_id == ^scope.subject_id)
       |> maybe_exclude_superseded_base(include_superseded?)
+      |> maybe_filter_source(opt(opts, :source, nil))
 
     total = AdminRepo.aggregate(base, :count, :id)
 
@@ -520,9 +524,10 @@ defmodule Loopctl.Memory do
   tenant can never see another's rows); the CALLER is responsible for gating this
   to superadmin keys — a non-superadmin must never reach this function.
 
-  Same options and `%{results, meta: %{total_count, limit, offset}}` envelope as
-  `list/2`. Runs on `AdminRepo` (BYPASSRLS) with an explicit `tenant_id` predicate,
-  mirroring the rest of this context.
+  Same options (including the `:source` promoted/explicit filter — so a superadmin
+  can filter oversight by provenance, US-29.3) and `%{results, meta: %{total_count,
+  limit, offset}}` envelope as `list/2`. Runs on `AdminRepo` (BYPASSRLS) with an
+  explicit `tenant_id` predicate, mirroring the rest of this context.
   """
   @spec list_all_subjects(String.t(), keyword() | map()) :: result_envelope()
   def list_all_subjects(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -534,6 +539,7 @@ defmodule Loopctl.Memory do
       MemorySchema
       |> where([m], m.tenant_id == ^tenant_id)
       |> maybe_exclude_superseded_base(include_superseded?)
+      |> maybe_filter_source(opt(opts, :source, nil))
 
     total = AdminRepo.aggregate(base, :count, :id)
 
@@ -1090,6 +1096,17 @@ defmodule Loopctl.Memory do
 
   defp maybe_exclude_superseded_base(query, false),
     do: where(query, [m], is_nil(m.superseded_by))
+
+  # Optional provenance filter for the list readers (US-29.3 promoted-vs-explicit
+  # oversight). Accepts the `:promoted`/`:explicit` atoms or their string forms;
+  # `nil` or any unrecognized value leaves the query unfiltered (no source filter).
+  defp maybe_filter_source(query, source) when source in [:promoted, "promoted"],
+    do: where(query, [m], m.source == :promoted)
+
+  defp maybe_filter_source(query, source) when source in [:explicit, "explicit"],
+    do: where(query, [m], m.source == :explicit)
+
+  defp maybe_filter_source(query, _), do: query
 
   defp normalize_tier(tier) when tier in [:session, :long_term], do: tier
   defp normalize_tier("session"), do: :session

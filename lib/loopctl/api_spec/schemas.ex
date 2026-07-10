@@ -3139,6 +3139,47 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule MemoryPromoteRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryPromoteRequest",
+      description:
+        "Params for POST /memory/promote. Scope (tenant_id/subject_id) is derived " <>
+          "from the API key — only `session_id` is read from the body.",
+      type: :object,
+      required: [:session_id],
+      properties: %{
+        session_id: %Schema{
+          type: :string,
+          description: "The session to promote into long-term memory."
+        }
+      }
+    })
+  end
+
+  defmodule MemoryPromoteResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "MemoryPromoteResponse",
+      description: "Confirmation that a session→long-term promotion was enqueued.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            job_id: %Schema{type: :integer, description: "The enqueued Oban job id."},
+            session_id: %Schema{type: :string},
+            status: %Schema{type: :string, enum: ["enqueued"]}
+          }
+        }
+      }
+    })
+  end
+
   defmodule MemoryResponse do
     @moduledoc false
     require OpenApiSpex
