@@ -140,6 +140,50 @@ defmodule Loopctl.ContextRetriever.Entity do
                               {source, MapSet.new(Enum.map(cols, &Atom.to_string/1))}
                             end)
 
+  # SERVER-defined per-source set of columns each backing table's generated
+  # `search_vector` tsvector column ACTUALLY covers. This MUST mirror the STORED
+  # generated columns created by
+  # `priv/repo/migrations/20260712000000_add_search_vectors_to_backing_tables.exs`
+  # — the migration is the DB truth, this constant is the code-side mirror the
+  # US-30.2 `ToolGenerator` and US-30.3 `Executor` consult.
+  #
+  # A search is authorized over an entity ONLY when every declared
+  # searchable-text column is present here (AC-30.3.4). Without this gate, an
+  # admin could legitimately declare an allowlisted string-ish column NOT covered
+  # by the vector (e.g. `stories.agent_status`, `projects.slug`) as
+  # `searchable: true` — the changeset validates the declared `type` against a
+  # fixed set, never against the vector coverage — and the executor's fixed
+  # `search_vector @@ ...` query would then silently search `title`/`description`
+  # instead of the declared column (under-match), returning wrong/empty results
+  # with no error.
+  @search_vector_columns %{
+    stories: [:title, :description],
+    projects: [:name, :description, :mission],
+    epics: [:title, :description]
+  }
+
+  # Compile-time guard: every search_vector column must name a known backing
+  # source AND itself be allowlisted for that source (a vector can never index a
+  # column an admin could not even declare). Keeps this mirror honest against
+  # `@column_allowlist`, so the two security constants cannot drift apart.
+  for {vector_source, vector_cols} <- @search_vector_columns do
+    unless vector_source in @backing_sources do
+      raise CompileError,
+        description:
+          "Loopctl.ContextRetriever.Entity @search_vector_columns names unknown source " <>
+            "#{inspect(vector_source)}"
+    end
+
+    unmatched = vector_cols -- Map.fetch!(@column_allowlist, vector_source)
+
+    unless unmatched == [] do
+      raise CompileError,
+        description:
+          "Loopctl.ContextRetriever.Entity @search_vector_columns for " <>
+            "#{inspect(vector_source)} includes non-allowlisted column(s) #{inspect(unmatched)}"
+    end
+  end
+
   schema "entity_definitions" do
     tenant_field()
     field :name, :string
@@ -206,6 +250,20 @@ defmodule Loopctl.ContextRetriever.Entity do
   """
   @spec column_allowlist() :: %{atom() => [atom()]}
   def column_allowlist, do: @column_allowlist
+
+  @doc """
+  Returns the per-source set of columns each backing table's generated
+  `search_vector` actually covers (source atom => list of column atoms).
+
+  Mirrors the STORED generated columns created by
+  `20260712000000_add_search_vectors_to_backing_tables.exs`. US-30.2's
+  `ToolGenerator` and US-30.3's `Executor` consult this to authorize an entity's
+  search tool ONLY when every declared searchable-text column is indexed by the
+  vector (AC-30.3.4) — so a declared-but-unindexed searchable column can never
+  silently search the wrong (vector-covered) columns.
+  """
+  @spec search_vector_columns() :: %{atom() => [atom()]}
+  def search_vector_columns, do: @search_vector_columns
 
   @doc """
   Reads a declared field element's raw value under `key`.

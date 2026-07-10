@@ -27,6 +27,7 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.ContextRetriever.Executor
+  alias Loopctl.ContextRetriever.MockAudit
   alias Loopctl.ContextRetriever.Registry
   alias Loopctl.ContextRetriever.Scope
   alias Loopctl.Projects.Project
@@ -296,6 +297,113 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
                Executor.run(scope_for(tenant), {"story", "estimated_hours", :filter}, %{
                  "estimated_hours" => "1.5"
                })
+    end
+  end
+
+  describe "TC-30.3.7 — mistyped filter value returns an empty page (no DB type error)" do
+    test "a non-numeric value for an integer-declared field yields zero rows via :no_match" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Has a sort key", number: "101"})
+
+      # sort_key is an allowlisted stories column declared here as an integer.
+      create_story_entity(tenant.id, [
+        %{name: "sort_key", type: :integer, filterable: true, searchable: false}
+      ])
+
+      # "not-a-number" cannot represent the declared integer type -> cast_value/2
+      # returns :no_match, so the executor returns an empty page WITHOUT issuing a
+      # query (never a DB type error).
+      assert {:ok, %{results: [], meta: meta}} =
+               Executor.run(scope_for(tenant), {"story", "sort_key", :filter}, %{
+                 "sort_key" => "not-a-number"
+               })
+
+      assert meta.total_count == 0
+
+      # Still audited (row_count 0) — the value never reached the DB.
+      assert [audit] = context_audits(tenant.id)
+      assert audit.metadata["row_count"] == 0
+    end
+
+    test "a nil filter value yields zero rows via :no_match" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Present", number: "101"})
+      create_story_entity(tenant.id, @story_fields)
+
+      # No value supplied for the declared field -> fetch_param returns nil ->
+      # cast_value(nil, _) is :no_match -> empty page, no query.
+      assert {:ok, %{results: [], meta: %{total_count: 0}}} =
+               Executor.run(scope_for(tenant), {"story", "title", :filter}, %{})
+    end
+  end
+
+  describe "AC-30.3.4 — search rejected when a declared searchable column is not vector-indexed" do
+    test "a searchable column outside the source search_vector returns :search_not_indexed" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Anything", number: "101"})
+
+      # agent_status is allowlisted + declarable as a string, but is NOT covered by
+      # the stories search_vector (title + description). The executor must REJECT
+      # the search rather than silently match against title/description.
+      create_story_entity(tenant.id, [
+        %{name: "agent_status", type: :string, filterable: false, searchable: true}
+      ])
+
+      assert {:error, :search_not_indexed} =
+               Executor.run(scope_for(tenant), {"story", nil, :search}, %{"query" => "anything"})
+
+      # Rejected before any query/audit.
+      assert context_audits(tenant.id) == []
+    end
+  end
+
+  describe "invalid-operation branches" do
+    test "search over an entity with no searchable text field returns :invalid_operation" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "x", number: "101"})
+
+      # Only a non-searchable filterable field declared -> no searchable columns.
+      create_story_entity(tenant.id, [
+        %{name: "number", type: :string, filterable: true, searchable: false}
+      ])
+
+      assert {:error, :invalid_operation} =
+               Executor.run(scope_for(tenant), {"story", nil, :search}, %{"query" => "x"})
+
+      assert context_audits(tenant.id) == []
+    end
+
+    test "an unknown operation is rejected with :invalid_operation" do
+      tenant = repo_tenant()
+      create_story_entity(tenant.id, @story_fields)
+
+      assert {:error, :invalid_operation} =
+               Executor.run(scope_for(tenant), {"story", "title", :bogus_op}, %{"title" => "x"})
+
+      assert context_audits(tenant.id) == []
+    end
+  end
+
+  describe "AC-30.3.6 — audit failure fails the read closed" do
+    test "when the audit write fails, run/3 returns {:error, :audit_failed} and no rows leak" do
+      tenant = repo_tenant()
+      seed_story(tenant.id, %{title: "Audited", number: "101"})
+      create_story_entity(tenant.id, @story_fields)
+
+      # Force the audit insert to fail for this call (overrides the DataCase default
+      # stub that delegates to the real Loopctl.Audit).
+      expect(MockAudit, :create_log_entry, fn _tenant_id, _attrs ->
+        {:error, :db_unavailable}
+      end)
+
+      assert {:error, :audit_failed} =
+               Executor.run(scope_for(tenant), {"story", "title", :filter}, %{
+                 "title" => "Audited"
+               })
+
+      # No rows disclosed to the caller AND no audit row persisted — chain of
+      # custody is preserved by failing closed.
+      assert context_audits(tenant.id) == []
     end
   end
 

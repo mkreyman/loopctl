@@ -13,6 +13,16 @@ Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
 Mox.defmock(Loopctl.MockProposalAssessor, for: Loopctl.Knowledge.ProposalAssessorBehaviour)
 Mox.defmock(Loopctl.MockMergeSynthesizer, for: Loopctl.Knowledge.MergeSynthesizerBehaviour)
+
+# US-30.3: Context-Retriever audit writer DI. The executor treats the audit write
+# as part of the read's correctness (AC-30.3.6 fail-closed). The DataCase default
+# stub delegates to the real Loopctl.Audit so existing executor tests still write
+# and read back real audit rows; the fail-closed test overrides create_log_entry/2
+# with Mox.expect/3 to return {:error, _}.
+Mox.defmock(Loopctl.ContextRetriever.MockAudit,
+  for: Loopctl.ContextRetriever.AuditBehaviour
+)
+
 # ArticleLinkingWorker's injectable similarity lookup. Lets the worker's linking-logic
 # unit tests feed deterministic candidate lists instead of exercising the real 250ms-timed
 # pgvector heavy read (the flake source). DataCase default-stubs `nearest/4` to return [].

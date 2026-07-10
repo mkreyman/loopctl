@@ -52,6 +52,22 @@ defmodule Loopctl.ContextRetriever.Executor do
   `20260712000000_add_search_vectors_to_backing_tables.exs` — NOT an on-the-fly
   `to_tsvector` sequential scan, and NOT `ILIKE`.
 
+  Because that vector covers a FIXED per-source column set (stories: title +
+  description; projects: name + description + mission; epics: title +
+  description), a search is authorized ONLY when every declared searchable-text
+  column is covered by the vector (`Entity.search_vector_columns/0`). A declared
+  searchable column the vector does not index (e.g. `stories.agent_status`,
+  `projects.slug` — allowlisted string-ish columns an admin may legitimately mark
+  `searchable`) is REJECTED with `{:error, :search_not_indexed}` rather than
+  silently searched against `title`/`description` (which would return wrong/empty
+  results with no error). This is the execute-time half of the generate-time
+  suppression in `ToolGenerator` (both enforce declared-searchable ⊆
+  vector-covered). Note the vector may cover MORE columns than the entity
+  declared searchable (e.g. an entity declaring only `title` still searches the
+  `description` component of the shared vector); this residual is bounded because
+  every vector column is itself server-allowlisted searchable text and results
+  are shaped to declared columns only.
+
   ## Pagination + result shaping (AC-30.3.5)
 
   Every query is bounded by a hard maximum page size
@@ -64,10 +80,17 @@ defmodule Loopctl.ContextRetriever.Executor do
   ## Audit (AC-30.3.6)
 
   Every executed query appends an `audit_log` entry
-  (`entity_type: "context_retrieval"`) via `Loopctl.Audit.create_log_entry/2`,
-  capturing tenant, actor, entity/field/operation, row count, and a SHA-256
-  digest of the params (raw param values are NOT stored — they may carry injection
-  payloads / PII).
+  (`entity_type: "context_retrieval"`) via the configured audit writer
+  (`Loopctl.Audit.create_log_entry/2` by default), capturing tenant, actor,
+  entity/field/operation, row count, and a SHA-256 digest of the params (raw
+  param values are NOT stored — they may carry injection payloads / PII).
+
+  The audit write is part of the read's correctness, NOT best-effort: AC-30.3.6
+  mandates that EVERY execution appends an audit record, so if the audit insert
+  fails `run/3` FAILS CLOSED with `{:error, :audit_failed}` and returns NO rows
+  to the caller. A model-driven read over business data is therefore never
+  disclosed without a persisted audit trail — the chain-of-custody guarantee
+  outweighs returning an already-fetched page.
 
   ## Fail-closed edges (AC-30.3.7)
 
@@ -112,7 +135,9 @@ defmodule Loopctl.ContextRetriever.Executor do
           | :unknown_entity
           | :field_not_allowlisted
           | :invalid_operation
+          | :search_not_indexed
           | :stale_entity
+          | :audit_failed
 
   @doc """
   Executes a generated Context-Retriever tool call.
@@ -134,7 +159,8 @@ defmodule Loopctl.ContextRetriever.Executor do
 
     * `{:ok, %{results: [map()], meta: %{total_count, limit, offset}}}`
     * `{:error, atom()}` where atom is one of `:no_tenant`, `:unknown_entity`,
-      `:field_not_allowlisted`, `:invalid_operation`, `:stale_entity`.
+      `:field_not_allowlisted`, `:invalid_operation`, `:search_not_indexed`,
+      `:stale_entity`, `:audit_failed`.
   """
   @spec run(Scope.t(), dispatch(), map()) :: {:ok, result()} | {:error, error()}
   def run(scope, dispatch, params \\ %{})
@@ -154,13 +180,22 @@ defmodule Loopctl.ContextRetriever.Executor do
 
       case run_query(tenant_id, schema, select_cols, plan, limit, offset) do
         {:ok, total_count, rows} ->
-          write_audit(scope, entity, operation, field, params, length(rows))
-
-          {:ok, %{results: rows, meta: %{total_count: total_count, limit: limit, offset: offset}}}
+          meta = %{total_count: total_count, limit: limit, offset: offset}
+          finalize_read(scope, entity, operation, field, params, rows, meta)
 
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  # AC-30.3.6: the audit write is part of the read's correctness. If it fails we
+  # FAIL CLOSED — no rows are returned without a persisted audit trail (chain of
+  # custody outweighs the already-fetched page).
+  defp finalize_read(scope, entity, operation, field, params, rows, meta) do
+    case write_audit(scope, entity, operation, field, params, length(rows)) do
+      :ok -> {:ok, %{results: rows, meta: meta}}
+      {:error, _reason} -> {:error, :audit_failed}
     end
   end
 
@@ -233,15 +268,15 @@ defmodule Loopctl.ContextRetriever.Executor do
         # No searchable TEXT field authorizes a search over this entity.
         {:error, :invalid_operation}
 
-      _cols ->
-        query_string = fetch_param(params, "query")
-
-        if is_binary(query_string) and String.trim(query_string) != "" do
-          {:ok, %{kind: :search, query_string: query_string}}
+      cols ->
+        if vector_covered?(entity, cols) do
+          search_plan(fetch_param(params, "query"))
         else
-          # A blank/absent query matches nothing; short-circuit to zero rows
-          # (websearch_to_tsquery('') would match nothing anyway).
-          {:ok, %{kind: :no_match}}
+          # AC-30.3.4: at least one declared searchable column is NOT covered by
+          # the source's fixed `search_vector`, so it cannot be indexed in v1.
+          # Reject rather than silently search the vector's (different) columns —
+          # the execute-time half of ToolGenerator's generate-time suppression.
+          {:error, :search_not_indexed}
         end
     end
   end
@@ -249,6 +284,19 @@ defmodule Loopctl.ContextRetriever.Executor do
   # Unknown operation, or a :filter with a nil/non-string field.
   defp build_plan(_operation, _field, _entity, _allowlist, _params),
     do: {:error, :invalid_operation}
+
+  # A non-blank query is a real search; a blank/absent query matches nothing and
+  # short-circuits to zero rows (websearch_to_tsquery('') would match nothing
+  # anyway), never touching the DB.
+  defp search_plan(query_string) when is_binary(query_string) do
+    if String.trim(query_string) == "" do
+      {:ok, %{kind: :no_match}}
+    else
+      {:ok, %{kind: :search, query_string: query_string}}
+    end
+  end
+
+  defp search_plan(_query_string), do: {:ok, %{kind: :no_match}}
 
   # The declared field element for `field_name`, or nil (→ not allowlisted).
   defp declared_field(%Entity{fields: fields}, field_name) do
@@ -268,6 +316,15 @@ defmodule Loopctl.ContextRetriever.Executor do
     |> Enum.map(&Entity.field_string_value(&1, "name"))
     |> Enum.map(&column_atom(&1, allowlist))
     |> Enum.reject(&is_nil/1)
+  end
+
+  # Every declared searchable column must be covered by the source's generated
+  # `search_vector` (`Entity.search_vector_columns/0`). Otherwise the fixed vector
+  # query would search columns the entity never declared, or miss the declared one
+  # entirely (AC-30.3.4). `cols` and the vector columns are both KNOWN atoms.
+  defp vector_covered?(%Entity{backing_source: source}, cols) do
+    vector_cols = Map.get(Entity.search_vector_columns(), source, [])
+    Enum.all?(cols, &(&1 in vector_cols))
   end
 
   # Resolve a validated string field name to a KNOWN column atom from the SERVER
@@ -371,19 +428,28 @@ defmodule Loopctl.ContextRetriever.Executor do
       }
     }
 
-    # Audit is best-effort observability, not part of the read's correctness; a
-    # failed audit insert must not fail the (already-completed) read.
-    case Audit.create_log_entry(scope.tenant_id, attrs) do
+    # AC-30.3.6: the audit write is part of the read's correctness. On failure we
+    # surface the error so `run/3` fails the read closed (returns no rows) rather
+    # than disclosing business data with no persisted audit trail.
+    case audit_writer().create_log_entry(scope.tenant_id, attrs) do
       {:ok, _} ->
         :ok
 
       {:error, reason} ->
-        Logger.warning(
-          "ContextRetriever.Executor failed to write audit entry: #{inspect(reason)}"
+        Logger.error(
+          "ContextRetriever.Executor failed to write audit entry — failing read closed: " <>
+            "#{inspect(reason)}"
         )
 
-        :ok
+        {:error, reason}
     end
+  end
+
+  # Config-based DI for the audit writer (CLAUDE.md DI convention). Defaults to
+  # `Loopctl.Audit`; `config/test.exs` maps it to a Mox mock so the fail-closed
+  # path is exercisable without forcing a real audit-insert failure.
+  defp audit_writer do
+    Application.get_env(:loopctl, :context_retriever_audit, Audit)
   end
 
   # SHA-256 digest of the params — raw values are NEVER stored (they may carry
