@@ -2,6 +2,60 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-10 — Agent Memory auto-promotion (Epic 29, Part 2)
+
+### Added
+
+- **Memory promotion pipeline** — compiles a session's short-term turns into durable
+  long-term `:promoted` memories without an explicit agent write. Triggered explicitly
+  (`POST /api/v1/memory/promote {session_id}` → `Loopctl.Memory.promote_session/1`) or
+  by the all-tenants cron `Loopctl.Workers.MemoryPromotionSweepWorker`; both enqueue the
+  per-session `Loopctl.Workers.MemoryPromotionWorker` (unique per
+  `(tenant_id, subject_id, session_id)`).
+  - **Idempotency spine** — a `session_promotions` watermark (session content hash) skips
+    an unchanged session WITHOUT an LLM call; re-running promotion adds no net rows
+    (measured including superseded).
+  - **Confidence gate + hash dedupe/supersede** — survivors above the confidence
+    threshold are written with their `confidence`, embedded synchronously at write time,
+    exact-deduped on `embedding_content_hash`, and near-dup superseded (source-scoped to
+    `:promoted`, never clobbering an `:explicit` memory).
+  - **Per-tenant budget** — a compiles/hour cap (atomic reservation incl. in-flight jobs)
+    returns HTTP 429 with NO LLM call when exceeded.
+  - **TTL-window invariant** — `sweep_interval < sweep_window < session_ttl`, sweep
+    promotes oldest-active-first to bound the golden-nugget-loss window.
+  - **Prompt-injection resistance** — session content is scope-enforced (the LLM never
+    sees foreign turns) and `cross_links` are tenant + visibility validated, so a
+    compromised model's foreign/fabricated article link is stripped before write.
+- **MCP tool** — `memory_promote` (compile a session; caller's own sessions only; scope
+  key-derived). The `/api/v1/memory/promote` endpoint renders at `/swaggerui`.
+- **Promotion-quality eval (US-29.5)** — `Loopctl.Memory.PromotionEval` scores the
+  compiler's precision/recall against a committed labeled dataset under a reserved,
+  structurally-excluded eval subject; calibration only, never gates promotion.
+- **Telemetry** — `[:loopctl, :memory_promotion, *]` events (`:swept` `:skipped`
+  `:compiled` `:gated_out` `:promoted` `:superseded` `:degraded` `:quota_exceeded`
+  `:budget_exceeded` `:failed` `:eval`) so a failing/budget-walled/degraded sweep is
+  observable, not silent.
+- **Docs** — [`docs/agent-memory.md`](docs/agent-memory.md) extended with the full
+  promotion lifecycle, the watermark/budget/TTL invariants, the confidence + eval story,
+  the prompt-injection stance, and the Claude Code Stop-hook recipe (cross-ref
+  `mkreyman/claude-config#85`, not implemented here);
+  [`docs/observability/promotion.md`](docs/observability/promotion.md) documents the
+  pipeline metrics.
+
+### Verified (US-29.6, terminal)
+
+- **Promotion e2e** (`Loopctl.Memory.PromotionE2ETest`) — a session promoted via
+  `POST /api/v1/memory/promote` is recall-able through BOTH the context and the API with
+  `source: :promoted`, `source_session_id`, and `confidence`.
+- **Idempotency + cross-scope** (`Loopctl.Memory.PromotionIsolationTest`) — re-promotion
+  (explicit + sweep) adds no net rows counting superseded (watermark skip); a promoted
+  `(tenant T, subject A)` memory is invisible to tenant U AND subject B via context, API
+  (recall / index / forget), with MCP scope-blindness proven in
+  `mcp-server/test/memory_tools.test.js`.
+- **Unattended safety** (`Loopctl.Memory.PromotionSafetyTest`) — injection produces no
+  cross-tenant-linked memory; an over-budget promote is 429 with no LLM call; a compile
+  failure emits `:failed` telemetry.
+
 ## [Unreleased] — 2026-07-09 — Agent Memory (Epic 28, Part 1)
 
 ### Added

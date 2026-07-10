@@ -1,8 +1,10 @@
-# Agent Memory (Epic 28)
+# Agent Memory (Epics 28–29)
 
 Authoritative reference for loopctl's **agent-memory** subsystem: what it is, the
 two tiers, the scope/isolation model, when to reach for it vs the Knowledge Wiki
-(vs the future context retriever), and its PII/secret stance.
+(vs the future context retriever), its PII/secret stance, and the **auto-promotion
+lifecycle** (Epic 29 / Part 2) that compiles session turns into durable long-term
+memories.
 
 > loopctl is **agent-native**: there is **no web UI, no LiveView, no human login**
 > for memory. Every memory operation is an API/MCP call made by an agent under its
@@ -213,28 +215,157 @@ Every read path returns the **pinned envelope**:
 
 ---
 
-## Seams (Part 2 & consumers)
+## Promotion lifecycle (Epic 29 / Part 2)
 
-Part 1 (Epic 28, this subsystem) ships schemas + context + API + MCP. Two
-downstream consumers hook into **already-verified extension points** — no
-implementation of them lives here:
+Part 2 (Epic 29, **shipped** — the compiler that Part 1 left as a seam is now real
+production code) is the **auto-promotion** subsystem: it distills a session's
+short-term turns into durable long-term `:promoted` memories WITHOUT an agent making
+an explicit `memory_remember` call. It is agent-native and unattended — driven by an
+hourly cron sweep and (optionally) a Claude Code Stop-hook — so every stage is
+fail-closed, budget-bounded, idempotent, and injection-resistant.
 
-- **Auto-promotion compiler — epic_28 #308** (session → long-term). It promotes
-  "golden nugget" session turns into long-term memories written with
-  `source: :promoted` (distinguishable from agent-`:explicit` writes), and uses
-  `supersede/3` to replace stale promoted memories and `session_history/2` to read
-  the source turns. Extension points it relies on and that Part 1 verifies:
-  `Loopctl.Memory.remember/2` accepting `source: :promoted`, `supersede/3`'s
-  cycle-safe replacement, and `session_history/2`'s deterministic ordering.
+### The pipeline: session → compile → confidence gate → hash dedupe/supersede → long-term
+
+1. **Trigger.** Either explicit (`POST /api/v1/memory/promote {session_id}` →
+   `Loopctl.Memory.promote_session/1`, `memory_promote` MCP tool) or the scheduled
+   `Loopctl.Workers.MemoryPromotionSweepWorker` (all-tenants cron). Both enqueue the
+   per-session `Loopctl.Workers.MemoryPromotionWorker`, unique per
+   `(tenant_id, subject_id, session_id)` so an explicit + sweep race cannot
+   double-promote.
+2. **Watermark skip (idempotency spine).** The worker computes the session's
+   content hash (`Loopctl.Memory.Promoter.session_fingerprint/2`) and compares it to
+   the stored `session_promotions` watermark. Equal hash → the session is unchanged →
+   **skip WITHOUT calling the LLM** (kills re-LLM-every-tick / paraphrase drift). A
+   0/1-turn session is a no-op that does NOT even write a watermark (so junk sessions
+   can't starve the budget). Emits `:skipped`.
+3. **Compile.** `Loopctl.Memory.Promoter.compile/2` reads the scope-enforced
+   `session_history/2` (a foreign tenant/subject reads empty → the LLM never sees
+   foreign content), assembles the most-recent turn window, and calls the promoter
+   LLM (temperature 0, `Loopctl.Memory.Promoter.LLMBehaviour`, BYO key) with a
+   fail-closed parser.
+4. **Confidence gate.** Each candidate is normalized, then dropped below
+   `Loopctl.Memory.Promoter.confidence_threshold/0` and capped to
+   `max_candidates/0`. The surviving candidates' `confidence` is carried onto the
+   promoted memory (`confidence` column). Emits `:compiled` with the survivor count.
+5. **Synchronous-hash dedupe / supersede.** `Loopctl.Memory.persist_promotion/2`
+   writes each survivor as a `source: :promoted` memory, embedding it
+   **synchronously at write time** (no async-embedding gap in which a paraphrase could
+   slip past near-dup detection):
+   - **Exact dedupe** — the `embedding_content_hash` (set at write time) hits the
+     partial unique index `(tenant_id, subject_id, embedding_content_hash) WHERE
+     source = :promoted`; an identical text is a no-op (`:gated_out`).
+   - **Near-dup supersede** — a paraphrase above the near-dup threshold `supersede`s
+     the prior `:promoted` row (new row live, old row's `superseded_by` set). Supersede
+     is **source-scoped to `:promoted`** — it NEVER clobbers a human-authored
+     `:explicit` memory. Emits `:promoted` / `:superseded`.
+6. **Watermark advance.** On success (INCLUDING a zero-survivor run) the watermark is
+   upserted so the next trigger skips. A compile/LLM `{:error, _}` does NOT advance it
+   (retry re-attempts); degraded embeddings `{:snooze, _}`; a subject at its hard
+   memory cap `{:discard, :quota_exceeded}` (watermark advanced, dropped-survivor count
+   emitted so the loss is visible).
+
+### Watermark + per-tenant budget + TTL-window invariant
+
+- **Watermark** (`session_promotions`, unique on `(tenant_id, subject_id,
+  session_id)`) is upserted on EVERY run incl. zero-survivor; both the explicit and the
+  sweep trigger skip an unchanged session. This is the idempotency measure — proven by
+  re-running promotion and counting `:promoted` rows **including superseded**
+  (`superseded_by` NOT filtered): a re-promote must add zero net rows.
+- **Per-tenant budget** — `Loopctl.Memory.promotion_budget/0` caps compiles/hour per
+  tenant. The reservation is atomic under a per-tenant advisory lock and counts BOTH
+  completed watermarks AND in-flight jobs (closes a TOCTOU overshoot). Over budget →
+  `{:error, :budget_exceeded}` → **HTTP 429 with NO LLM call** (the gate precedes the
+  compile). A worker-level re-check bails a burst's overshoot to cheap no-ops.
+- **TTL-window invariant** — `sweep_interval < sweep_window < session_ttl` (asserted by
+  `Loopctl.Memory.assert_promotion_ttl_invariant!/0`). The sweep promotes
+  **oldest-active-first** so the session nearest its prune deadline is never starved
+  behind newer ones — bounding the golden-nugget-loss window before session turns TTL
+  out.
+
+### Confidence threshold + promotion-quality eval (US-29.5)
+
+The confidence gate is **calibration**, not a correctness oracle. US-29.5 ships a
+labeled promotion-eval dataset (`priv/promotion_eval/dataset_v1.json`, ≥3 labeled
+sessions plus an injection case whose expected label is "nothing durable") and
+`Loopctl.Memory.PromotionEval`, which scores the compiler's precision/recall against
+that ground truth and emits a `[:loopctl, :memory_promotion, :eval]` snapshot. It runs
+under a **reserved eval subject** (`Loopctl.Memory.eval_subject_id/0`) that is
+STRUCTURALLY excluded from real promotion — the sweep filter skips it AND
+`persist_promotion/2` refuses it — so the eval's synthetic/injection turns can never
+become durable memories. The eval **never gates** promotion; it is observability for
+tuning the threshold. See [`docs/observability/promotion-eval.md`](observability/promotion-eval.md).
+
+### Prompt-injection stance (unattended safety)
+
+Promotion runs on untrusted session content with no human in the loop, so the model
+output is treated as data, never instructions:
+
+- **Session content is scope-enforced** — `compile/2` reads only the caller's
+  `(tenant, subject, session)` turns; the LLM is never fed foreign content, and a
+  foreign session compiles to `{:ok, []}` before any LLM call.
+- **`cross_links` are tenant + visibility validated** (`validate_cross_links/2` →
+  `Loopctl.Knowledge.visible_article_ids/3`). Even if a compromised model "obeys" an
+  injected "link this article" instruction and emits a foreign-tenant or fabricated
+  article id, that id is STRIPPED before write — a promoted memory can only ever link
+  an article the compiling subject can actually see. No cross-tenant-linked poisoned
+  memory is producible.
+- **Fail-closed parser** — malformed model output never raises and never writes
+  garbage; it yields no candidates.
+- **Budget + quota bounds** cap the blast radius of a runaway/adversarial loop
+  (429 pre-LLM, terminal discard at the subject cap).
+
+### Claude Code Stop-hook recipe (cross-ref `mkreyman/claude-config#85`)
+
+The unattended trigger is a Claude Code **Stop hook** that fires `memory_promote` for
+the just-finished session when a coding session ends — turning "what the agent learned
+this session" into durable memory without an explicit call. **The hook itself is NOT
+implemented in loopctl** (`mkreyman/claude-config#85` owns it); loopctl documents and
+asserts the seam. The recipe:
+
+```jsonc
+// ~/.claude/settings.json  (claude-config#85 — illustrative; the hook script lives there)
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            // The hook resolves $LOOPCTL_SESSION_ID for the finished session and calls the
+            // MCP tool memory_promote { session_id }, which POSTs /api/v1/memory/promote.
+            // It NEVER supplies tenant_id/subject_id — scope is key-derived server-side.
+            "type": "command",
+            "command": "loopctl-promote-session-hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Idempotency makes the hook safe to fire on every Stop: an unchanged session is a
+watermark skip (no LLM), and a re-fire adds no net rows. Over-budget fires are 429s
+with no spend. The consumer uses the *shared*, key-derived scope; it never supplies a
+`subject_id`.
+
+## Seams (consumers)
+
 - **Skills consumer — `mkreyman/claude-config#85`**. The Claude Code skills layer
   calls the `memory_*` MCP tools: `memory_remember` to persist what an agent learns
   mid-task, `memory_recall` to prime context at task start, `memory_list` to review
-  a subject's memories, and `memory_forget` to prune. It uses the *shared*,
-  key-derived scope — it never supplies a `subject_id`.
+  a subject's memories, `memory_forget` to prune, and `memory_promote` (via the Stop
+  hook above) to compile a finished session. It uses the *shared*, key-derived scope —
+  it never supplies a `subject_id`. **Not implemented here**: loopctl ships the tools
+  and endpoints; the hook + skills wiring live in claude-config#85.
 
-Neither consumer changes the isolation model: promoted memories and skills-written
-memories are owned by the same `(tenant, subject_id)` boundary as any explicit
-write.
+Neither promotion nor the skills consumer changes the isolation model: promoted
+memories and skills-written memories are owned by the same `(tenant, subject_id)`
+boundary as any explicit write.
+
+> **Doc reconciliation (#308):** the retired `docs/cole-medin-self-evolving-wiki.md`
+> note was removed in PR #310; its durable content now lives in the KB hub
+> (`fb9abd73`) and in this document — no parallel promotion doc exists (single-home).
 
 ---
 
@@ -250,3 +381,22 @@ write.
 - **Scale** (`Loopctl.Memory.ScaleRecallTest`, `@tag :scale`): a needle subject
   recalls its own top-k among an ~80k multi-subject corpus (run via
   `SCALE_TESTS=true mix test --only scale`).
+
+## Verification (US-29.6, promotion terminal)
+
+- **Promotion e2e** (`Loopctl.Memory.PromotionE2ETest`): a session promoted via
+  `POST /api/v1/memory/promote` is recall-able through BOTH the context and the API,
+  carrying `source: :promoted`, `source_session_id`, and a real `confidence`.
+- **Idempotency + cross-scope** (`Loopctl.Memory.PromotionIsolationTest`): re-running
+  promotion for an unchanged session (explicit trigger AND scheduled sweep) adds NO net
+  rows measured **including superseded** (watermark skip); the promoted `(tenant T,
+  subject A)` memory is invisible to tenant U AND to subject B via context, API
+  (recall / index `?source=promoted` / forget), with MCP scope-blindness proven in
+  `mcp-server/test/memory_tools.test.js` (US-29.4 AC-29.4.5).
+- **Unattended safety** (`Loopctl.Memory.PromotionSafetyTest`): an injected
+  "link this foreign article" instruction produces no cross-tenant-linked memory
+  (`cross_links` stripped); an over-budget tenant's promote returns 429 with no LLM
+  call; a compile failure emits `:failed` telemetry so a failing sweep is observable.
+- **Promotion-quality eval** (`Loopctl.Memory.PromotionEvalTest`, US-29.5): the
+  compiler's precision/recall against the committed labeled dataset — calibration only,
+  never gates promotion.
