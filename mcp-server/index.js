@@ -18,6 +18,7 @@ import {
   projectsPath,
   ingestionJobsPath,
   llmUsagePath,
+  memoryPath,
   parseJsonResponseBody,
 } from "./lib/http-helpers.js";
 import {
@@ -1070,8 +1071,11 @@ async function knowledgeCreate({
 // across sessions, running notes, in-flight task context. knowledge_* is the
 // curated, shared wiki. Scope (tenant_id/subject_id) is resolved SERVER-SIDE
 // from the API key (US-28.3) — these tools never accept or forward a
-// tenant_id/subject_id, so there is no way to express a cross-scope read
-// here even by mistake. Routes through the shared apiCall/witness client
+// tenant_id/subject_id, so there is no NON-SUPERADMIN way to express a
+// cross-scope read/write here even by mistake. (The one carve-out:
+// memory_list's `all_subjects` boolean IS a cross-subject read, but it is
+// enforced server-side and a no-op for a non-superadmin key — see its
+// description below.) Routes through the shared apiCall/witness client
 // (same as every other write tool), so witness/STH persistence + the
 // transparent 412 self-heal on a fresh MCP process apply automatically
 // (AC-28.4.3) — no bespoke witness code needed.
@@ -1086,6 +1090,7 @@ async function memoryRemember({
   role,
   content,
   expires_at,
+  metadata,
 }) {
   const payload = {};
   if (tier) payload.tier = tier;
@@ -1097,6 +1102,7 @@ async function memoryRemember({
   if (role) payload.role = role;
   if (content != null) payload.content = content;
   if (expires_at) payload.expires_at = expires_at;
+  if (metadata != null) payload.metadata = metadata;
 
   const result = await apiCall(
     "POST",
@@ -1125,16 +1131,11 @@ async function memoryRecall({ query, limit, include_superseded }) {
 }
 
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
-  const params = new URLSearchParams();
-  if (limit != null) params.set("limit", String(limit));
-  if (offset != null) params.set("offset", String(offset));
-  if (include_superseded != null) params.set("include_superseded", String(include_superseded));
-  // Superadmin-only server-side; a non-superadmin key sending this is ignored
-  // (falls back to its own subject) rather than erroring.
-  if (all_subjects != null) params.set("all_subjects", String(all_subjects));
-
-  const qs = params.toString();
-  const path = qs ? `/api/v1/memory?${qs}` : "/api/v1/memory";
+  // all_subjects is superadmin-only server-side; a non-superadmin key sending
+  // this is ignored (falls back to its own subject) rather than erroring — the
+  // one deliberate cross-subject read this MCP surface can express (module
+  // comment above), and only for a superadmin caller.
+  const path = memoryPath({ limit, offset, include_superseded, all_subjects });
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   // Surface meta.total_count/limit/offset (AC-28.4.4).
   return toContent(result);
@@ -3194,6 +3195,10 @@ const TOOLS = [
           type: "string",
           format: "date-time",
           description: "Prune deadline (required when tier=session).",
+        },
+        metadata: {
+          type: "object",
+          description: "Optional: arbitrary structured metadata to attach to the memory.",
         },
       },
       required: [],

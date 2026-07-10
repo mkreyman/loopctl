@@ -69,6 +69,24 @@ export function llmUsagePath({ from, to, limit, offset } = {}) {
 }
 
 /**
+ * Path for `memory_list`, honoring limit/offset/include_superseded/all_subjects
+ * (US-28.4). Routes through the shared `buildQuery` helper (rather than a local
+ * `URLSearchParams` mirror) so the query-string construction is exercised by the
+ * SAME code the server ships.
+ *
+ * @param {{ limit?: number, offset?: number, include_superseded?: boolean, all_subjects?: boolean }} [args]
+ * @returns {string}
+ */
+export function memoryPath({ limit, offset, include_superseded, all_subjects } = {}) {
+  return `/api/v1/memory${buildQuery([
+    ["limit", limit],
+    ["offset", offset],
+    ["include_superseded", include_superseded],
+    ["all_subjects", all_subjects],
+  ])}`;
+}
+
+/**
  * Defensively parse the raw text body of a JSON-content-type HTTP response
  * (#249, mcp-03).
  *

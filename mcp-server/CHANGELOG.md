@@ -23,7 +23,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   id (404, no existence leak, on a foreign-scope or unknown id). Scope
   (`tenant_id`/`subject_id`) is resolved server-side from the API key — none of
   the four tools' `inputSchema` accepts a `tenant_id`/`subject_id`, so there is
-  no way to even express a cross-scope read/write from the MCP layer. All four
+  no NON-SUPERADMIN way to express a cross-scope read/write from the MCP layer
+  (the one carve-out: `memory_list`'s `all_subjects` boolean IS a cross-subject
+  read, enforced server-side and a no-op for a non-superadmin key). All four
   route through the shared `apiCall`/witness client, so witness/STH persistence
   and the transparent bootstrap-412 self-heal (#298) apply automatically to a
   fresh MCP process's first memory write — no bespoke witness code was needed.

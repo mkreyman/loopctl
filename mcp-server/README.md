@@ -121,7 +121,7 @@ REST endpoint (`PATCH /api/v1/tenants/me/llm-config`), and the docs — so you (
 autonomous agent) can self-remediate without a human. Full agent-tenant lifecycle:
 [`docs/onboarding-agent-tenant.md`](../docs/onboarding-agent-tenant.md).
 
-## Tools (81)
+## Tools (82)
 
 ### Project Tools
 
@@ -223,11 +223,13 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 task context, recall across sessions — NOT the shared knowledge wiki. Use `memory_*` for that
 private per-scope state; use `knowledge_*` for curated knowledge other agents should see. Scope
 (`tenant_id`/`subject_id`) is resolved server-side from your API key — none of these tools accept
-a `tenant_id`/`subject_id`, so there is no way to read or write into another scope.
+a `tenant_id`/`subject_id`, so there is no NON-SUPERADMIN way to read or write into another
+scope. (The one carve-out: `memory_list`'s `all_subjects` boolean IS a cross-subject read, but
+it is enforced server-side and a no-op for a non-superadmin key — see below.)
 
 | Tool | Description |
 |---|---|
-| `memory_remember` | Write to your own working memory. `tier` selects the substrate: `long_term` (default; requires `text`, embedded asynchronously and later recalled by semantic similarity via `memory_recall`) or `session` (short-term; requires `session_id`, `content`, `expires_at` — pruned after expiry, not semantically recalled). Returns 201 with the stored memory. Optional: `confidence`, `tags`, `source_session_id` (long-term); `role` (session). |
+| `memory_remember` | Write to your own working memory. `tier` selects the substrate: `long_term` (default; requires `text`, embedded asynchronously and later recalled by semantic similarity via `memory_recall`) or `session` (short-term; requires `session_id`, `content`, `expires_at` — pruned after expiry, not semantically recalled). Returns 201 with the stored memory. Optional: `confidence`, `tags`, `source_session_id`, `metadata` (long-term); `role` (session). |
 | `memory_recall` | Semantically recall your own long-term memories most similar to `query`. When embedding generation is unavailable the response degrades to a recent-first text match with `meta.fallback: true` and a stable `meta.reason` (score is `null` on that path) — check `meta.fallback` before treating a short/empty result as a genuinely empty scope. `meta.total_count`/`meta.underfilled` are also returned. Optional: `limit`, `include_superseded`. |
 | `memory_list` | List your own long-term memories, newest first, paginated with `meta.total_count/limit/offset` (the true scoped count, never silently capped by `limit`). Optional: `limit`, `offset`, `include_superseded`, `all_subjects` (superadmin only; ignored for non-superadmin keys). |
 | `memory_forget` | Delete one of your own long-term memories by id. A foreign-subject, foreign-tenant, or unknown id returns 404 (no existence leak). Required: `id`. |

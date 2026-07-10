@@ -15,18 +15,27 @@
  *     AC-28.4.3, AC-28.4.5).
  *   - Behavioral tests: a minimal reimplementation of the handler bodies
  *     (mirroring index.js exactly) exercised against a mocked fetch, covering
- *     the remember->recall happy path (TC-28.4.1), an auth/witness failure
- *     (TC-28.4.4), and that recall/list meta (fallback/total_count) is
- *     surfaced (AC-28.4.4).
+ *     the remember->recall happy path (TC-28.4.1), a non-self-healing
+ *     auth/witness failure (TC-28.4.4), and that recall/list meta
+ *     (fallback/total_count) is surfaced (AC-28.4.4).
  *   - Scope isolation (TC-28.4.3 / AC-28.4.5): the memory tool inputSchemas
  *     must NOT accept tenant_id/subject_id, and handlers must never forward a
  *     body-supplied scope — the tool cannot even express a cross-scope read;
  *     scope is key-derived server-side (US-28.3's job to enforce there).
  *
- * The transparent-412-witness-retry mechanics are already covered end-to-end
- * against createWitnessClient in witness_sth.test.js; here we only need to
- * confirm the memory handlers go through apiCall (not a raw fetch), which the
- * source-assertion tests below do.
+ * TC-28.4.4 self-heal: the generic bootstrap-412 retry mechanics (single
+ * retry, error.code anchoring, persistence, coalescing) are covered end-to-end
+ * against createWitnessClient in witness_sth.test.js. That is NOT sufficient to
+ * call TC-28.4.4 verified for memory tools, though — this file additionally
+ * drives the shared witness client (imported directly from
+ * ../lib/witness-sth.js, the same module index.js's apiCall delegates to via
+ * witnessClientFor) through a `witness_bootstrap_already_consumed` 412 for a
+ * memory_remember-shaped POST and asserts the write ultimately succeeds (see
+ * "TC-28.4.4 self-heal" below). The one 412 test in the auth/witness-failure
+ * block below uses `witness_header_malformed` instead — a 412 code that is
+ * deliberately NOT self-healing (per witness-sth.js's error.code anchoring) —
+ * so it documents the error-surfacing case without contradicting the
+ * self-heal expectation for the bootstrap-grace code.
  */
 
 import { test, describe } from "node:test";
@@ -34,6 +43,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { memoryPath } from "../lib/http-helpers.js";
+import { createWitnessClient } from "../lib/witness-sth.js";
 
 const INDEX_SRC = readFileSync(
   path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.js"),
@@ -110,6 +121,7 @@ async function memoryRemember({
   role,
   content,
   expires_at,
+  metadata,
 }) {
   const payload = {};
   if (tier) payload.tier = tier;
@@ -121,6 +133,7 @@ async function memoryRemember({
   if (role) payload.role = role;
   if (content != null) payload.content = content;
   if (expires_at) payload.expires_at = expires_at;
+  if (metadata != null) payload.metadata = metadata;
 
   const result = await apiCall("POST", "/api/v1/memory", payload, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
@@ -141,14 +154,11 @@ async function memoryRecall({ query, limit, include_superseded }) {
 }
 
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
-  const params = new URLSearchParams();
-  if (limit != null) params.set("limit", String(limit));
-  if (offset != null) params.set("offset", String(offset));
-  if (include_superseded != null) params.set("include_superseded", String(include_superseded));
-  if (all_subjects != null) params.set("all_subjects", String(all_subjects));
-
-  const qs = params.toString();
-  const path = qs ? `/api/v1/memory?${qs}` : "/api/v1/memory";
+  // Routes through the REAL shared memoryPath helper (lib/http-helpers.js) —
+  // not a hand-copied URLSearchParams mirror — so this behavioral test
+  // exercises the same query-building code the server ships (finding: memory_list
+  // hand-rolls query-string building instead of the shared buildQuery helper).
+  const path = memoryPath({ limit, offset, include_superseded, all_subjects });
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
@@ -246,6 +256,62 @@ describe("TC-28.4.1: memory_remember -> memory_recall happy path", () => {
   });
 });
 
+describe("memory_remember: metadata parity with the /api/v1/memory HTTP API", () => {
+  test("forwards metadata to /api/v1/memory (the HTTP API accepts it; the MCP tool must not be narrower)", async () => {
+    setupEnv();
+    const memory = {
+      id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+      tier: "long_term",
+      text: "prefers Req over Tesla",
+      metadata: { source: "code_review", pr: 320 },
+    };
+    const calls = mockFetch({ data: memory }, 201);
+
+    const result = await memoryRemember({
+      tier: "long_term",
+      text: "prefers Req over Tesla",
+      metadata: { source: "code_review", pr: 320 },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(JSON.parse(calls[0].options.body), {
+      tier: "long_term",
+      text: "prefers Req over Tesla",
+      metadata: { source: "code_review", pr: 320 },
+    });
+    assert.equal(result.isError, undefined);
+  });
+
+  test("omits metadata entirely when not supplied (no `metadata: undefined` leaking into the payload)", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "x", tier: "long_term", text: "y" } }, 201);
+
+    await memoryRemember({ tier: "long_term", text: "y" });
+
+    assert.equal("metadata" in JSON.parse(calls[0].options.body), false);
+  });
+
+  test("memory_remember inputSchema exposes a metadata property (index.js source)", () => {
+    const start = INDEX_SRC.indexOf('name: "memory_remember",');
+    assert.ok(start !== -1, "memory_remember TOOLS entry must exist");
+    const nextEntry = INDEX_SRC.indexOf('\n    name: "', start + 20);
+    const entryEnd = nextEntry === -1 ? start + 4000 : nextEntry;
+    const schemaBlock = INDEX_SRC.slice(start, entryEnd);
+    assert.match(
+      schemaBlock,
+      /metadata:\s*\{\s*\n\s*type:\s*"object",/,
+      "memory_remember inputSchema must declare a metadata property (parity with the HTTP API's @memory_attr_keys)",
+    );
+  });
+
+  test("index.js memoryRemember forwards metadata to the payload", () => {
+    const start = INDEX_SRC.indexOf("async function memoryRemember(");
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+    assert.match(body, /if \(metadata != null\) payload\.metadata = metadata;/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // AC-28.4.4: recall/list surface meta (fallback flag/reason, total_count)
 // ---------------------------------------------------------------------------
@@ -302,6 +368,49 @@ describe("AC-28.4.4: memory_list surfaces total_count/limit/offset meta", () => 
 });
 
 // ---------------------------------------------------------------------------
+// memory_list routes through the shared memoryPath helper (lib/http-helpers.js),
+// not a hand-rolled URLSearchParams mirror — mirrors the projectsPath /
+// ingestionJobsPath / llmUsagePath pattern in mcp_arg_forwarding.test.js, so a
+// regression in this query-string logic fails CI instead of silently passing
+// against a hand-copied mirror.
+// ---------------------------------------------------------------------------
+
+describe("memory_list pagination (real memoryPath)", () => {
+  test("forwards limit/offset/include_superseded/all_subjects", () => {
+    const url = new URL(
+      `https://x${memoryPath({ limit: 10, offset: 5, include_superseded: true, all_subjects: true })}`,
+    );
+    assert.equal(url.pathname, "/api/v1/memory");
+    assert.equal(url.searchParams.get("limit"), "10");
+    assert.equal(url.searchParams.get("offset"), "5");
+    assert.equal(url.searchParams.get("include_superseded"), "true");
+    assert.equal(url.searchParams.get("all_subjects"), "true");
+  });
+
+  test("omits params when none are supplied", () => {
+    assert.equal(memoryPath(), "/api/v1/memory");
+    assert.equal(memoryPath({}), "/api/v1/memory");
+  });
+
+  test("index.js memoryList delegates to the shared memoryPath(...) (not a local URLSearchParams mirror)", () => {
+    const start = INDEX_SRC.indexOf("async function memoryList(");
+    assert.ok(start !== -1, "memoryList handler must exist");
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+
+    assert.match(
+      body,
+      /memoryPath\(\{ limit, offset, include_superseded, all_subjects \}\)/,
+      "memoryList must delegate to the shared memoryPath helper",
+    );
+    assert.ok(
+      !/new URLSearchParams\(\)/.test(body),
+      "memoryList must not hand-roll its own URLSearchParams query building",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TC-28.4.4: auth/witness failure surfaces a structured error
 // ---------------------------------------------------------------------------
 
@@ -318,10 +427,17 @@ describe("TC-28.4.4: auth/witness failure returns a structured error, not a thro
     assert.equal(parsed.status, 401);
   });
 
-  test("a 412 witness_bootstrap_already_consumed from memory_recall returns {error:true, status:412}", async () => {
+  // NOTE: this uses `witness_header_malformed` — a 412 code witness-sth.js
+  // deliberately does NOT self-heal (error.code anchoring, see
+  // createWitnessClient's retrySthFor) — NOT `witness_bootstrap_already_consumed`.
+  // The bootstrap-grace code IS self-healed transparently by the shared witness
+  // client; asserting an error result for THAT code would contradict TC-28.4.4's
+  // self-heal expectation. See the "TC-28.4.4 self-heal" describe block below for
+  // the case that exercises the real bootstrap-412 retry end-to-end.
+  test("a 412 witness_header_malformed (non-self-healing) from memory_recall returns {error:true, status:412}", async () => {
     setupEnv();
     mockFetch(
-      { error: { status: 412, code: "witness_bootstrap_already_consumed" } },
+      { error: { status: 412, code: "witness_header_malformed" } },
       412,
     );
 
@@ -341,6 +457,89 @@ describe("TC-28.4.4: auth/witness failure returns a structured error, not a thro
     assert.equal(result.isError, true);
     const parsed = JSON.parse(result.content[0].text);
     assert.equal(parsed.status, 404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-28.4.4 self-heal: the bootstrap-grace 412 is retried ONCE, transparently,
+// and the memory write ultimately succeeds — driven through the REAL shared
+// witness client (../lib/witness-sth.js), the same module index.js's apiCall
+// delegates to via witnessClientFor(key).send(...). This is what makes
+// TC-28.4.4's named expected result ("the 412 retry succeeds (self-heal) and
+// the memory is written") actually verified for a memory tool, rather than
+// only for the generic mechanics in witness_sth.test.js.
+// ---------------------------------------------------------------------------
+
+describe("TC-28.4.4 self-heal: memory_remember survives a bootstrap-grace 412", () => {
+  test("the SAME memory_remember-shaped POST is retried once by the shared witness client, and the write succeeds", async () => {
+    const STH = "5:AAAAAAAAAAAAAAAAAAAAAA";
+    const storedMemory = {
+      id: "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0",
+      tier: "long_term",
+      text: "prefers Req over Tesla",
+    };
+    let callCount = 0;
+    const calls = [];
+
+    const fetchImpl = async (url, options) => {
+      callCount += 1;
+      calls.push({ url, options });
+
+      if (callCount === 1) {
+        // First attempt hits the bootstrap-grace 412 — the one code the shared
+        // witness client transparently retries (error.code anchored).
+        const body = { error: { status: 412, code: "witness_bootstrap_already_consumed" } };
+        return {
+          status: 412,
+          headers: { get: (name) => (name.toLowerCase() === "x-loopctl-current-sth" ? STH : null) },
+          clone() {
+            return { async json() { return body; } };
+          },
+        };
+      }
+
+      // Retry succeeds — the memory is actually written.
+      return {
+        status: 201,
+        headers: {
+          get: (name) => {
+            const lower = name.toLowerCase();
+            if (lower === "x-loopctl-current-sth") return STH;
+            if (lower === "content-type") return "application/json";
+            return null;
+          },
+        },
+        async json() { return { data: storedMemory }; },
+        async text() { return JSON.stringify({ data: storedMemory }); },
+      };
+    };
+
+    const client = createWitnessClient({ fetchImpl });
+    const payload = { tier: "long_term", text: "prefers Req over Tesla" };
+
+    const response = await client.send({
+      url: `${BASE_URL}/api/v1/memory`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AGENT_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      serializedBody: JSON.stringify(payload),
+    });
+
+    // Exactly one transparent retry — the FIRST attempt bootstraps (no cached
+    // STH yet), the SECOND carries the learned STH and succeeds.
+    assert.equal(callCount, 2);
+    assert.equal(calls[0].options.headers["X-Loopctl-STH-Bootstrap"], "true");
+    assert.equal(calls[1].options.headers["X-Loopctl-Last-Known-STH"], STH);
+
+    // The retry's response is the one apiCall/memoryRemember would surface to
+    // the caller — the write succeeded, not an error.
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.deepEqual(body, { data: storedMemory });
+    assert.equal(client.getSTH(), STH);
   });
 });
 
@@ -457,7 +656,7 @@ describe("AC-28.4.1: four memory tools registered by the existing convention", (
     const listStart = INDEX_SRC.indexOf("async function memoryList(");
     const listBody = INDEX_SRC.slice(listStart, listStart + 900);
     assert.match(listBody, /apiCall\("GET", path, null, process\.env\.LOOPCTL_AGENT_KEY\)/);
-    assert.match(listBody, /`\/api\/v1\/memory\?\$\{qs\}`/);
+    assert.match(listBody, /memoryPath\(\{ limit, offset, include_superseded, all_subjects \}\)/);
 
     const forgetStart = INDEX_SRC.indexOf("async function memoryForget(");
     const forgetBody = INDEX_SRC.slice(forgetStart, forgetStart + 500);
