@@ -16,6 +16,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
+  alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
@@ -197,6 +198,19 @@ defmodule Loopctl.Fixtures do
         access_type: "get",
         metadata: %{},
         accessed_at: DateTime.utc_now()
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:entity, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        name: "entity_#{seq}",
+        backing_source: :stories,
+        fields: [%{name: "title", type: :string, filterable: true, searchable: true}]
       },
       Enum.into(attrs, %{})
     )
@@ -606,6 +620,28 @@ defmodule Loopctl.Fixtures do
     changeset =
       %Article{tenant_id: tenant_id, project_id: project_id}
       |> Article.create_changeset(data)
+
+    AdminRepo.insert!(changeset)
+  end
+
+  def fixture(:entity, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    data = build(:entity, attrs)
+
+    changeset =
+      %Entity{tenant_id: tenant_id}
+      |> Entity.create_changeset(data)
 
     AdminRepo.insert!(changeset)
   end
