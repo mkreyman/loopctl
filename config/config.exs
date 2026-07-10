@@ -286,7 +286,8 @@ config :loopctl, Oban,
        {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
        {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
        {"* * * * *", Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
-       {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker}
+       {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
+       {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker}
      ]},
     # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
     # Without Lifeline these rows stay `executing` forever — 110 such orphans (from

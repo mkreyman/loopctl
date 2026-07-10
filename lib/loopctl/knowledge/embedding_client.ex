@@ -34,15 +34,9 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.SystemConfig
 
   @default_base_url "https://api.openai.com/v1"
-
-  # Kept STRICTLY BELOW `Knowledge`'s Task.yield budget (review #10): a single
-  # attempt, no client-side retries. The embedding endpoint is fast; job-level retry
-  # is Oban's responsibility for the worker, and the query path fast-fails to
-  # keyword search. This guarantees a valid embed returns before the guard kills it.
-  @receive_timeout 4_000
-  @max_retries 0
 
   @impl true
   def generate_embedding(tenant_id, text) when is_binary(tenant_id) do
@@ -59,14 +53,21 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   defp post(tenant_id, api_key, model, text) do
     base_url = provider_config()[:base_url] || @default_base_url
 
+    # Kept STRICTLY BELOW `Knowledge`'s Task.yield budget (review #10): a single
+    # attempt, no client-side retries by default. The embedding endpoint is fast;
+    # job-level retry is Oban's responsibility for the worker, and the query path
+    # fast-fails to keyword search. This guarantees a valid embed returns before
+    # the guard kills it. Both knobs are DB-backed and live-tunable via
+    # Loopctl.SystemConfig; the in-code defaults match the seeded rows and apply on
+    # a cache miss (safe degrade) — keep any raised timeout under the yield budget.
     opts =
       [
         json: %{input: text, model: model},
         # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
         headers: [{"authorization", "Bearer #{api_key}"}],
         retry: :transient,
-        max_retries: @max_retries,
-        receive_timeout: @receive_timeout
+        max_retries: SystemConfig.get_int("embedding_max_retries", 0),
+        receive_timeout: SystemConfig.get_int("embedding_receive_timeout_ms", 4_000)
       ]
       |> maybe_put_plug()
 
