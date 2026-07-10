@@ -63,7 +63,15 @@ defmodule Loopctl.Memory.PromotionIsolationTest do
     |> AdminRepo.aggregate(:count, :id)
   end
 
+  # The stub TRACES every LLM invocation by messaging the test pid. This turns the
+  # idempotency proof from an OUTCOME check (no net rows) into a MECHANISM check: a
+  # re-trigger that reaches the LLM at all — even if exact-hash dedup then swallows the
+  # duplicate to keep the row count flat — is caught by `refute_received :llm_called`.
+  # Without this, a regressed watermark skip would fall through to compile → dedup and
+  # still pass green, leaving the watermark layer without a regression fence.
   defp stub_durable_candidate do
+    test_pid = self()
+
     json =
       JSON.encode!([
         %{
@@ -75,7 +83,10 @@ defmodule Loopctl.Memory.PromotionIsolationTest do
         }
       ])
 
-    Mox.stub(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts -> {:ok, json} end)
+    Mox.stub(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+      send(test_pid, :llm_called)
+      {:ok, json}
+    end)
   end
 
   defp seed_session(tenant_id, subject_id, session_id, contents) do
@@ -125,16 +136,30 @@ defmodule Loopctl.Memory.PromotionIsolationTest do
     after_first = count_promoted_including_superseded(tenant_t.id, subject_a)
     assert after_first == 1
 
+    # The first (real) promotion DID reach the LLM — proves the tracer is wired, so the
+    # `refute_received`s below are a genuine absence of an LLM call, not a dead assertion.
+    assert_received :llm_called
+
     # === Idempotency: re-promote the SAME unchanged session two ways ===========
+    # Each must skip at the WATERMARK layer (watermark_unchanged? → :skipped → :ok, with
+    # `Promoter.compile/2` never reached), NOT fall through to compile + exact-hash dedup.
+    # Both paths would leave the count-including-superseded flat, so the count alone can't
+    # tell them apart — `refute_received :llm_called` is what fences the watermark layer.
+    #
     # (a) explicit re-trigger — watermark match → skip, no LLM, no new row.
     assert conn |> promote(raw_a, "s1") |> json_response(202)
     assert count_promoted_including_superseded(tenant_t.id, subject_a) == after_first
+
+    refute_received :llm_called,
+                    "explicit re-promote must skip at the watermark, not call the LLM"
 
     # (b) scheduled sweep — watermark pre-filter skip → no new row.
     assert :ok = MemoryPromotionSweepWorker.perform(%Oban.Job{args: %{}})
 
     assert count_promoted_including_superseded(tenant_t.id, subject_a) == after_first,
            "re-promotion must add NO net rows counting superseded (watermark skip)"
+
+    refute_received :llm_called, "scheduled sweep must skip at the watermark, not call the LLM"
 
     # === Cross-scope isolation ================================================
     scope_a = %Scope{tenant_id: tenant_t.id, subject_id: subject_a, project_id: nil}
