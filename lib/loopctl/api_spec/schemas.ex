@@ -3108,6 +3108,13 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :string,
           format: :"date-time",
           description: "Prune deadline (tier=session)."
+        },
+        metadata: %Schema{
+          type: :object,
+          additionalProperties: true,
+          nullable: true,
+          description:
+            "Optional: arbitrary structured metadata to attach to the memory (either tier)."
         }
       }
     })

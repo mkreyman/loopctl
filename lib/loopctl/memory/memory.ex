@@ -39,6 +39,10 @@ defmodule Loopctl.Memory.Memory do
   - `source` — `:explicit` (default) or `:promoted` (written by the Part 2 compiler)
   - `source_session_id` — the session this memory was promoted from (nullable)
   - `tags` — array of strings, default `[]`
+  - `metadata` — extensible JSONB, default `%{}` (mirrors `SessionMemory.metadata`;
+    added so the generic `metadata` contract advertised by the memory HTTP API and
+    the `memory_remember` MCP tool actually persists for this, the DEFAULT tier —
+    see the review finding recorded on US-28.4)
   - `superseded_by` — self-reference to the memory that replaced this one (nullable)
   """
 
@@ -74,6 +78,7 @@ defmodule Loopctl.Memory.Memory do
     field :source, Ecto.Enum, values: @sources, default: :explicit
     field :source_session_id, :string
     field :tags, {:array, :string}, default: []
+    field :metadata, :map, default: %{}
 
     belongs_to :superseded_by_memory, __MODULE__,
       foreign_key: :superseded_by,
@@ -90,7 +95,8 @@ defmodule Loopctl.Memory.Memory do
     :confidence,
     :source,
     :source_session_id,
-    :tags
+    :tags,
+    :metadata
   ]
 
   @doc """
@@ -107,14 +113,18 @@ defmodule Loopctl.Memory.Memory do
   programmatically rather than casting it. (The Knowledge Wiki `Article` casts
   `project_id`, but a `Memory` is a stricter per-subject security boundary and
   matches `Story`, not `Article`, here.) `embedding` is never cast here — it is
-  populated asynchronously via `embedding_changeset/3` in US-28.2. Validates
-  required fields, `confidence` presence + range, and caps `text` byte size.
+  populated asynchronously via `embedding_changeset/3` in US-28.2. `metadata` is
+  cast (mirrors `SessionMemory`) so the generic `metadata` contract advertised by
+  the memory HTTP API / `memory_remember` MCP tool persists for this tier too.
+  Validates required fields, `confidence` presence + range, and caps `text` byte
+  size.
   """
   @spec create_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def create_changeset(memory \\ %__MODULE__{}, attrs) do
     memory
     |> cast(attrs, @cast_fields)
     |> normalize_nil(:tags, [])
+    |> normalize_nil(:metadata, %{})
     |> validate_required([:subject_id, :tenant_id, :text, :confidence])
     |> validate_subject_id()
     |> validate_text_byte_size()

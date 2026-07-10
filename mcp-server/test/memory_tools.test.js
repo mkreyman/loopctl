@@ -163,7 +163,16 @@ async function memoryList({ limit, offset, include_superseded, all_subjects }) {
   return toContent(result);
 }
 
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 async function memoryForget({ id }) {
+  if (typeof id !== "string" || !UUID_RE.test(id)) {
+    return {
+      content: [{ type: "text", text: "Error: id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
+
   const result = await apiCall(
     "DELETE",
     `/api/v1/memory/${id}`,
@@ -310,6 +319,63 @@ describe("memory_remember: metadata parity with the /api/v1/memory HTTP API", ()
     const body = INDEX_SRC.slice(start, end);
     assert.match(body, /if \(metadata != null\) payload\.metadata = metadata;/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Review finding (US-28.4): the load-bearing forwarded fields (recall's payload
+// build, remember's other nine forwards) had no source-assertion drift guard —
+// only the hand-kept local mirror above. A regression dropping one of these
+// forwards in the REAL index.js would keep this file's behavioral tests green
+// (they exercise the local copy) and slip past the regexes that existed. These
+// assertions read the real index.js source directly, closing that blind spot.
+// ---------------------------------------------------------------------------
+
+describe("source assertion: memoryRecall builds/forwards its full payload", () => {
+  test("index.js memoryRecall builds {query} and conditionally forwards limit/include_superseded", () => {
+    const start = INDEX_SRC.indexOf("async function memoryRecall(");
+    assert.ok(start !== -1, "memoryRecall handler must exist");
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+
+    assert.match(
+      body,
+      /const payload = \{ query \};/,
+      "memoryRecall must build the payload from `query`",
+    );
+    assert.match(
+      body,
+      /if \(limit != null\) payload\.limit = limit;/,
+      "memoryRecall must forward `limit` when present",
+    );
+    assert.match(
+      body,
+      /if \(include_superseded != null\) payload\.include_superseded = include_superseded;/,
+      "memoryRecall must forward `include_superseded` when present",
+    );
+  });
+});
+
+describe("source assertion: memoryRemember forwards every remaining field to the payload", () => {
+  const FIELD_FORWARDS = {
+    tier: /if \(tier\) payload\.tier = tier;/,
+    text: /if \(text != null\) payload\.text = text;/,
+    confidence: /if \(confidence != null\) payload\.confidence = confidence;/,
+    tags: /if \(tags\) payload\.tags = tags;/,
+    source_session_id: /if \(source_session_id\) payload\.source_session_id = source_session_id;/,
+    session_id: /if \(session_id\) payload\.session_id = session_id;/,
+    role: /if \(role\) payload\.role = role;/,
+    content: /if \(content != null\) payload\.content = content;/,
+    expires_at: /if \(expires_at\) payload\.expires_at = expires_at;/,
+  };
+
+  for (const [field, pattern] of Object.entries(FIELD_FORWARDS)) {
+    test(`index.js memoryRemember forwards ${field} to the payload`, () => {
+      const start = INDEX_SRC.indexOf("async function memoryRemember(");
+      const end = INDEX_SRC.indexOf("\n}\n", start);
+      const body = INDEX_SRC.slice(start, end);
+      assert.match(body, pattern, `memoryRemember must forward \`${field}\` to the payload`);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -557,6 +623,68 @@ describe("memory_forget: happy path", () => {
     assert.equal(options.method, "DELETE");
     assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
     assert.equal(result.isError, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review finding (US-28.4): memory_forget interpolates the caller-supplied `id`
+// into a destructive DELETE URL path with no UUID validation, unlike the file's
+// own proven UUID_RE guard (knowledgeAgentUsage, index.js). Fixed by validating
+// against UUID_RE before the network call — mirrored here in both the
+// behavioral mock and a source assertion against the real index.js.
+// ---------------------------------------------------------------------------
+
+describe("memory_forget: rejects a non-UUID id before touching the network (path-injection guard)", () => {
+  test("a path-traversal-shaped id is rejected with a structured error, no fetch call", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "x", deleted: true } }, 200);
+
+    const result = await memoryForget({ id: "../other-tenant/secret" });
+
+    assert.equal(calls.length, 0, "must not touch the network with an invalid id");
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /canonical UUID/);
+  });
+
+  test("a slash-shaped id is rejected with a structured error, no fetch call", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "x", deleted: true } }, 200);
+
+    const result = await memoryForget({ id: "abc/def" });
+
+    assert.equal(calls.length, 0);
+    assert.equal(result.isError, true);
+  });
+
+  test("a canonical UUID still passes through to apiCall", async () => {
+    setupEnv();
+    const id = "b50c9e38-aebe-4bbe-b8e6-bf2cb2b8afd0";
+    const calls = mockFetch({ data: { id, deleted: true } }, 200);
+
+    const result = await memoryForget({ id });
+
+    assert.equal(calls.length, 1);
+    assert.equal(result.isError, undefined);
+  });
+
+  test("index.js memoryForget validates id against UUID_RE before calling apiCall (source assertion)", () => {
+    const start = INDEX_SRC.indexOf("async function memoryForget(");
+    assert.ok(start !== -1, "memoryForget handler must exist");
+    const end = INDEX_SRC.indexOf("\n}\n", start);
+    const body = INDEX_SRC.slice(start, end);
+
+    assert.match(
+      body,
+      /if \(typeof id !== "string" \|\| !UUID_RE\.test\(id\)\)/,
+      "memoryForget must validate id against UUID_RE before the destructive DELETE (path-injection guard)",
+    );
+
+    const apiCallIndex = body.indexOf("apiCall(");
+    const guardIndex = body.indexOf("UUID_RE.test(id)");
+    assert.ok(
+      guardIndex !== -1 && guardIndex < apiCallIndex,
+      "the UUID_RE guard must run BEFORE the apiCall/network call, not after",
+    );
   });
 });
 

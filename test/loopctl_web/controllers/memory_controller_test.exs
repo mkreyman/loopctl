@@ -65,6 +65,57 @@ defmodule LoopctlWeb.MemoryControllerTest do
     end
   end
 
+  # --- Review finding (US-28.4): metadata must persist for the DEFAULT tier ---
+  #
+  # memory_remember/the HTTP API advertise a generic `metadata` param, but
+  # `create_changeset/2` used to cast metadata ONLY for `session_memories` — the
+  # default `long_term` tier silently dropped it (no column, no cast, no render).
+  # Prove the fix: metadata written on a long_term memory round-trips through
+  # both `POST /api/v1/memory` and the recall response.
+  describe "metadata persists on the default long_term tier (review finding)" do
+    test "a metadata map supplied on a long_term write is stored and rendered back", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      created =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{
+          "tier" => "long_term",
+          "text" => "prefers Req over Tesla",
+          "metadata" => %{"source" => "code_review", "pr" => 320}
+        })
+        |> json_response(201)
+
+      assert created["data"]["metadata"] == %{"source" => "code_review", "pr" => 320}
+
+      recall_body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "HTTP client preference"})
+        |> json_response(200)
+
+      assert %{"data" => [entry | _]} = recall_body
+      assert entry["memory"]["metadata"] == %{"source" => "code_review", "pr" => 320}
+    end
+
+    test "omitting metadata on a long_term write defaults it to an empty map", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      created =
+        conn
+        |> auth(raw)
+        |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "no metadata here"})
+        |> json_response(201)
+
+      assert created["data"]["metadata"] == %{}
+    end
+  end
+
   # --- TC-28.3.2: body-supplied subject ignored; cross-subject read impossible ---
 
   describe "cross-subject isolation (TC-28.3.2)" do

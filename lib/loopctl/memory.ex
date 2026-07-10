@@ -327,6 +327,7 @@ defmodule Loopctl.Memory do
         source: m.source,
         source_session_id: m.source_session_id,
         tags: m.tags,
+        metadata: m.metadata,
         superseded_by: m.superseded_by,
         inserted_at: m.inserted_at,
         updated_at: m.updated_at

@@ -1142,6 +1142,14 @@ async function memoryList({ limit, offset, include_superseded, all_subjects }) {
 }
 
 async function memoryForget({ id }) {
+  // Path-injection guard (mirrors knowledgeAgentUsage's UUID_RE check below).
+  if (typeof id !== "string" || !UUID_RE.test(id)) {
+    return {
+      content: [{ type: "text", text: "Error: id must be a canonical UUID (8-4-4-4-12 hex)." }],
+      isError: true,
+    };
+  }
+
   const result = await apiCall(
     "DELETE",
     `/api/v1/memory/${id}`,
