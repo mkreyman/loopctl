@@ -50,12 +50,9 @@ defmodule Loopctl.Memory.Promoter do
   session-content-hash idempotency.
   """
 
-  import Ecto.Query
-
   require Logger
 
-  alias Loopctl.AdminRepo
-  alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.Memory.Memory, as: MemorySchema
   alias Loopctl.Memory.Scope
@@ -99,12 +96,33 @@ defmodule Loopctl.Memory.Promoter do
     end
   end
 
+  @read_window 200
+
   defp load_turns(scope, session_id) do
     # session_history/2 is scope-enforced: WHERE tenant_id AND session_id AND
     # subject_id — a foreign tenant/subject yields results: []. Cap the read so a
-    # pathological session can't blow the LLM budget; oldest-first order is preserved.
-    %{results: results} = Memory.session_history(scope, session_id: session_id, limit: 200)
-    results
+    # pathological session can't blow the LLM budget.
+    #
+    # session_history/2 orders oldest-first, so a naive `limit: @read_window` would
+    # keep the OLDEST turns and drop everything after. Durable decisions/conclusions
+    # accumulate toward the END of a session, so we deliberately keep the MOST-RECENT
+    # `@read_window` turns (offset past the older ones) while preserving chronological
+    # order. Small sessions (<= window) take a single query.
+    %{results: results, meta: %{total_count: total}} =
+      Memory.session_history(scope, session_id: session_id, limit: @read_window)
+
+    if total > @read_window do
+      %{results: recent} =
+        Memory.session_history(scope,
+          session_id: session_id,
+          limit: @read_window,
+          offset: total - @read_window
+        )
+
+      recent
+    else
+      results
+    end
   end
 
   defp compile_turns(scope, turns) do
@@ -254,18 +272,24 @@ defmodule Loopctl.Memory.Promoter do
 
   defp clamp_confidence(c), do: c |> max(0.0) |> min(1.0)
 
-  # Structurally clean the cross_links list: keep only well-formed UUID strings.
-  # Tenant-ownership validation happens later (batched).
+  # Structurally clean the cross_links list: keep only well-formed UUIDs, KEEPING
+  # the canonical (lowercase) cast result — not the original string. Tenant-ownership
+  # validation later compares against `select a.id`, which returns canonical lowercase
+  # ids; keeping the original case here would silently drop an in-tenant link the LLM
+  # happened to emit in uppercase/mixed case. Tenant-ownership validation happens later
+  # (batched).
   defp collect_cross_link_ids(links) when is_list(links) do
     links
-    |> Enum.filter(&valid_uuid?/1)
+    |> Enum.flat_map(fn v ->
+      case Ecto.UUID.cast(v) do
+        {:ok, id} -> [id]
+        :error -> []
+      end
+    end)
     |> Enum.uniq()
   end
 
   defp collect_cross_link_ids(_), do: []
-
-  defp valid_uuid?(value) when is_binary(value), do: match?({:ok, _}, Ecto.UUID.cast(value))
-  defp valid_uuid?(_), do: false
 
   # ===========================================================================
   # Confidence gate + top-N cap (AC-29.1.4)
@@ -289,29 +313,21 @@ defmodule Loopctl.Memory.Promoter do
 
   # Validate every candidate's cross_links against the CALLER's tenant in ONE
   # batched query, then drop any id not owned by the tenant (foreign-tenant or
-  # non-existent) — never stored. Mirrors `Loopctl.Knowledge.get_article/3`'s
-  # AdminRepo tenant-scoped lookup, batched across all surviving candidates.
+  # non-existent) — never stored. Delegates to `Loopctl.Knowledge.visible_article_ids/3`
+  # (the Knowledge context owns the Article schema), keeping tenant-scoped article
+  # validation with the context that owns it rather than reaching across the boundary.
+  # A `nil` visibility arg means "every id in the list that exists in the tenant".
   defp validate_cross_links(candidates, scope) do
     all_ids =
       candidates
       |> Enum.flat_map(& &1.cross_links)
       |> Enum.uniq()
 
-    valid_ids = in_tenant_article_ids(all_ids, scope.tenant_id)
+    valid_ids = Knowledge.visible_article_ids(scope.tenant_id, all_ids, nil)
 
     Enum.map(candidates, fn candidate ->
       %{candidate | cross_links: Enum.filter(candidate.cross_links, &(&1 in valid_ids))}
     end)
-  end
-
-  defp in_tenant_article_ids([], _tenant_id), do: MapSet.new()
-
-  defp in_tenant_article_ids(ids, tenant_id) do
-    Article
-    |> where([a], a.id in ^ids and a.tenant_id == ^tenant_id)
-    |> select([a], a.id)
-    |> AdminRepo.all()
-    |> MapSet.new()
   end
 
   # ===========================================================================

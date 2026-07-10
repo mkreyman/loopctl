@@ -169,6 +169,24 @@ defmodule Loopctl.Memory.PromoterTest do
 
       assert {:ok, []} = Promoter.compile(scope_b, "s1")
     end
+
+    test "never reads another TENANT's session and never calls the LLM with foreign content" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      # Same subject_id + session_id across two DIFFERENT tenants: only tenant_a's
+      # session has turns. Compiling under tenant_b must see nothing (RLS/scope
+      # isolation), short-circuit to {:ok, []}, and never invoke the LLM.
+      scope_a = fixture(:memory_scope, tenant_id: tenant_a.id, subject_id: "A")
+      scope_b = fixture(:memory_scope, tenant_id: tenant_b.id, subject_id: "A")
+
+      seed_session(scope_a, "s1", ["A's tenant secret", "more of A's tenant secret"])
+
+      stub(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        flunk("LLM must not be called for a foreign-tenant session")
+      end)
+
+      assert {:ok, []} = Promoter.compile(scope_b, "s1")
+    end
   end
 
   describe "compile/2 — malformed output fails closed (TC-29.1.4)" do
@@ -219,6 +237,77 @@ defmodule Loopctl.Memory.PromoterTest do
       end)
 
       assert {:ok, []} = Promoter.compile(scope, "s1")
+    end
+  end
+
+  describe "compile/2 — parse + gate edge cases (TC-29.1.6)" do
+    test "keeps a candidate at exactly the confidence threshold (>= boundary)" do
+      tenant = fixture(:tenant)
+      scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
+      seed_session(scope, "s1", ["turn one", "turn two"])
+
+      # threshold is 0.5 (config/test.exs). A candidate AT the threshold must be
+      # kept (`>= threshold`); one just below must be dropped. Pins the boundary so
+      # a regression to strict `>` fails here.
+      expect(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        {:ok,
+         candidate_json([
+           %{text: "at-threshold", confidence: 0.5},
+           %{text: "below-threshold", confidence: 0.49}
+         ])}
+      end)
+
+      assert {:ok, candidates} = Promoter.compile(scope, "s1")
+      texts = Enum.map(candidates, & &1.text)
+      assert "at-threshold" in texts
+      refute "below-threshold" in texts
+    end
+
+    test "parses the object-wrapped {\"candidates\": [...]} response shape" do
+      tenant = fixture(:tenant)
+      scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
+      seed_session(scope, "s1", ["turn one", "turn two"])
+
+      # Some models wrap the array in an object; parse_candidates accepts that shape.
+      wrapped =
+        JSON.encode!(%{
+          "candidates" => [
+            %{
+              "text" => "wrapped-fact",
+              "when_to_apply" => "when relevant",
+              "tags" => ["t"],
+              "confidence" => 0.9,
+              "cross_links" => []
+            }
+          ]
+        })
+
+      expect(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        {:ok, wrapped}
+      end)
+
+      assert {:ok, [candidate]} = Promoter.compile(scope, "s1")
+      assert candidate.text == "wrapped-fact"
+    end
+
+    test "byte-caps multibyte text on a valid UTF-8 boundary (never invalid UTF-8)" do
+      tenant = fixture(:tenant)
+      scope = fixture(:memory_scope, tenant_id: tenant.id, subject_id: "A")
+      seed_session(scope, "s1", ["turn one", "turn two"])
+
+      # 4-byte grapheme repeated past the cap — truncating naively at a byte boundary
+      # would split a codepoint and yield invalid UTF-8, which would break the
+      # epic_28 memories.text insert in US-29.2.
+      max = MemorySchema.max_text_bytes()
+      oversized = String.duplicate("🎉", div(max, 4) + 500)
+
+      expect(Loopctl.MockPromoterLLM, :extract, fn _tenant_id, _content, _opts ->
+        {:ok, candidate_json([%{text: oversized, confidence: 0.9}])}
+      end)
+
+      assert {:ok, [candidate]} = Promoter.compile(scope, "s1")
+      assert byte_size(candidate.text) <= max
+      assert String.valid?(candidate.text)
     end
   end
 end
