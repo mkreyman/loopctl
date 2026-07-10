@@ -33,6 +33,15 @@ defmodule Loopctl.ContextRetriever.Entity do
     `%{"name" => ..., "type" => ..., "filterable" => bool, "searchable" => bool}`
     with per-element validation.
 
+  ## Reading a field element
+
+  Field elements may be atom-keyed (build path) or string-keyed (DB
+  round-trip). `field_value/2`, `field_string_value/2`, `filterable?/1`, and
+  `searchable?/1` are the canonical, public readers for that dual-key-shape
+  contract — other modules that need to inspect a declared field element
+  (e.g. `Loopctl.ContextRetriever.ToolGenerator`) MUST use these instead of
+  re-implementing their own key-shape handling.
+
   ## Relationships are OUT of scope for v1 (AC-30.1.6)
 
   Relationships / joins between entities are explicitly NOT persisted in v1 — no
@@ -197,6 +206,35 @@ defmodule Loopctl.ContextRetriever.Entity do
   """
   @spec column_allowlist() :: %{atom() => [atom()]}
   def column_allowlist, do: @column_allowlist
+
+  @doc """
+  Reads a declared field element's raw value under `key`.
+
+  `entity.fields` elements may be atom-keyed (build path, e.g. `%Entity{}`
+  literals in tests) or string-keyed (DB round-trip, since `fields` is
+  `{:array, :map}`). This is THE canonical reader for that dual-key-shape
+  contract — `Loopctl.ContextRetriever.ToolGenerator` (US-30.2) consumes it
+  rather than re-implementing its own copy, so both interpretations of this
+  security-root field-map shape stay in lockstep.
+  """
+  @spec field_value(map(), String.t()) :: term()
+  def field_value(map, key), do: value(map, key)
+
+  @doc """
+  Reads a declared field element's value under `key`, coerced to a string.
+
+  Returns `nil` if the value is absent or not string/atom.
+  """
+  @spec field_string_value(map(), String.t()) :: String.t() | nil
+  def field_string_value(map, key), do: string_value(map, key)
+
+  @doc "Whether a declared field element has `filterable: true`."
+  @spec filterable?(map()) :: boolean()
+  def filterable?(field), do: field_value(field, "filterable") == true
+
+  @doc "Whether a declared field element has `searchable: true`."
+  @spec searchable?(map()) :: boolean()
+  def searchable?(field), do: field_value(field, "searchable") == true
 
   # --- Private helpers ---
 
@@ -379,6 +417,7 @@ defmodule Loopctl.ContextRetriever.Entity do
   defp string_value(map, key) do
     case value(map, key) do
       v when is_binary(v) -> v
+      v when is_atom(v) and not is_nil(v) -> Atom.to_string(v)
       _ -> nil
     end
   end
