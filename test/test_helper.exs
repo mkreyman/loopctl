@@ -50,6 +50,13 @@ nightly_excluded = if System.get_env("SCALE_NIGHTLY"), do: [], else: [:scale_nig
 #     mix test --include pgbouncer test/loopctl/pgbouncer_startup_params_test.exs
 pgbouncer_excluded = if System.get_env("PGBOUNCER_URL"), do: [], else: [:pgbouncer]
 
+# :e2e — full cross-context journey tests (test/e2e/*) that exercise the
+# retrieval and chain-of-custody paths end-to-end via DataCase/ConnCase. They are
+# regular sandboxed async tests, but excluded from the default suite so the normal
+# `mix test` stays fast and focused; run them explicitly with `mix test --only e2e`
+# (or the `mix test.e2e` alias). `--only e2e` overrides this exclude.
+e2e_excluded = if System.get_env("E2E_TESTS"), do: [], else: [:e2e]
+
 # :requires_ipv6 — the SSRF IP-pinning Host-header regression test stands up a
 # loopback HTTP server bound to ::1 (the ONLY way to exercise Req.Finch.run/1's
 # IPv6 host-injection path). Probe ::1 bindability once; skip (not error) the
@@ -66,5 +73,6 @@ ipv6_excluded =
   end
 
 ExUnit.configure(
-  exclude: scale_excluded ++ nightly_excluded ++ pgbouncer_excluded ++ ipv6_excluded
+  exclude:
+    scale_excluded ++ nightly_excluded ++ pgbouncer_excluded ++ ipv6_excluded ++ e2e_excluded
 )
