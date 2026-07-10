@@ -408,5 +408,103 @@ defmodule LoopctlWeb.MemoryControllerTest do
       assert body["error"]["code"] == "impersonation_tenant_required"
       assert body["error"]["status"] == 422
     end
+
+    # A tenant-less superadmin hitting the OWN-scope actions (no all_subjects, POST
+    # create, POST recall) has tenant_id nil; without this guard the own-scope path
+    # would build a %Scope{tenant_id: nil} and Ecto would raise at query-build time
+    # ("comparing with nil is forbidden") -> a bare HTTP 500. Each must return the
+    # deterministic 422 impersonation envelope instead (AC-28.3.2 / .5).
+    test "own-scope list without X-Impersonate-Tenant returns 422, not a 500 crash", %{
+      conn: conn
+    } do
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      body =
+        conn
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory")
+        |> json_response(422)
+
+      assert body["error"]["code"] == "impersonation_tenant_required"
+      assert body["error"]["status"] == 422
+    end
+
+    test "own-scope create without X-Impersonate-Tenant returns 422, not a 500 crash", %{
+      conn: conn
+    } do
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      body =
+        conn
+        |> auth(raw_super)
+        |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "orphan note"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "impersonation_tenant_required"
+      assert body["error"]["status"] == 422
+    end
+
+    test "own-scope recall without X-Impersonate-Tenant returns 422, not a 500 crash", %{
+      conn: conn
+    } do
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+
+      body =
+        conn
+        |> auth(raw_super)
+        |> post(~p"/api/v1/memory/recall", %{"query" => "anything"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "impersonation_tenant_required"
+      assert body["error"]["status"] == 422
+    end
+  end
+
+  # --- Superadmin oversight is NOT frozen by a custody halt (AC-28.3.4) ---
+
+  describe "superadmin oversight during a custody halt" do
+    test "superadmin may still LIST and DELETE on a halted tenant, but agent writes stay 503" do
+      tenant = fixture(:tenant)
+      {raw_super, _super_key} = fixture(:api_key, %{role: :superadmin})
+      {raw_agent, _agent_key, agent} = agent_key(tenant.id)
+
+      target =
+        fixture(:memory, %{
+          tenant_id: tenant.id,
+          subject_id: to_string(agent.id),
+          text: "halted-tenant note"
+        })
+
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      # The halt still blocks the agent's own custody WRITE (AC-28.3.3 baseline).
+      agent_write =
+        base_conn()
+        |> auth(raw_agent)
+        |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "should not persist"})
+        |> json_response(503)
+
+      assert agent_write["error"]["code"] == "tenant_halted"
+
+      # Oversight LIST is NOT frozen — the operator retains visibility during a halt.
+      list_body =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> get(~p"/api/v1/memory?all_subjects=true")
+        |> json_response(200)
+
+      assert Enum.any?(list_body["data"], &(&1["id"] == target.id))
+
+      # Oversight DELETE is NOT frozen — the operator retains delete control.
+      del_body =
+        base_conn()
+        |> put_req_header("x-impersonate-tenant", tenant.id)
+        |> auth(raw_super)
+        |> delete(~p"/api/v1/memory/#{target.id}")
+        |> json_response(200)
+
+      assert del_body["data"]["deleted"] == true
+    end
   end
 end

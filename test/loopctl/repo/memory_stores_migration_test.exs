@@ -80,6 +80,15 @@ defmodule Loopctl.Repo.MemoryStoresMigrationTest do
       assert index_columns("memories", ["tenant_id", "subject_id"])
     end
 
+    # US-28.3 AC-28.3.4: the superadmin oversight reader `list_all_subjects/2` is
+    # tenant-scoped + subject-agnostic and orders `desc: inserted_at, desc: id`. The
+    # (tenant_id, subject_id) btree cannot serve that subject-agnostic ordering, so a
+    # dedicated (tenant_id, inserted_at DESC, id DESC) index backs the ordered page +
+    # tenant COUNT (migration 20260709000400).
+    test "has the (tenant_id, inserted_at DESC, id DESC) oversight index" do
+      assert index_columns("memories", ["tenant_id", "inserted_at DESC", "id DESC"])
+    end
+
     # A long-term memory is durable: deleting its project must fall it back to
     # tenant-wide scope (project_id = NULL), NOT destroy the memory. session
     # memories expire anyway, so they keep cascade delete.

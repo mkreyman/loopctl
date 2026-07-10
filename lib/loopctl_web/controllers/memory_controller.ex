@@ -271,9 +271,26 @@ defmodule LoopctlWeb.MemoryController do
   # Resolve the `(tenant_id, subject_id)` scope from the API key (NEVER the body)
   # and run `fun` with it. A subject that cannot be resolved is rejected with a
   # deterministic 422 rather than a null-scoped operation (AC-28.3.2).
+  #
+  # A tenant-less key (a superadmin without X-Impersonate-Tenant — api_key.ex
+  # forbids a superadmin tenant_id) has `tenant_id: nil`. `subject_id_for/1` still
+  # resolves a subject (the key id), so WITHOUT this guard the own-scope path would
+  # build a `%Scope{tenant_id: nil}` and every reachable action would evaluate
+  # `m.tenant_id == ^nil`, which Ecto raises at query-BUILD time ("comparing with
+  # nil is forbidden") — escaping as a bare HTTP 500. Guard it here, mirroring the
+  # index/2 + delete/2 oversight guards, so a tenant-less key gets the deterministic
+  # 422 impersonation envelope instead of a null-scoped op (AC-28.3.2 / .5).
   defp with_scope(conn, fun) do
     api_key = conn.assigns.current_api_key
 
+    if is_nil(api_key.tenant_id) do
+      impersonation_tenant_required(conn)
+    else
+      resolve_scope(conn, api_key, fun)
+    end
+  end
+
+  defp resolve_scope(conn, api_key, fun) do
     case Memory.subject_id_for(api_key) do
       {:ok, subject_id} ->
         fun.(%Scope{tenant_id: api_key.tenant_id, subject_id: subject_id, project_id: nil})
@@ -293,9 +310,12 @@ defmodule LoopctlWeb.MemoryController do
     end
   end
 
-  # Deterministic 422 for a superadmin oversight request that lacks an
-  # impersonation target (tenant_id nil). The oversight readers/deletes are
-  # tenant-scoped, so without a resolved tenant there is nothing to scope to.
+  # Deterministic 422 for a tenant-less key (a superadmin without an impersonation
+  # target). Every memory operation is tenant-scoped: oversight (all_subjects list /
+  # any-subject delete) AND the caller's own-scope create/recall/list/delete all need
+  # a resolved tenant_id. Without X-Impersonate-Tenant a superadmin's tenant_id is
+  # nil and there is nothing to scope to, so refuse deterministically rather than
+  # attempting a null-scoped op.
   defp impersonation_tenant_required(conn) do
     conn
     |> put_status(:unprocessable_entity)
@@ -304,9 +324,9 @@ defmodule LoopctlWeb.MemoryController do
         status: 422,
         code: "impersonation_tenant_required",
         message:
-          "A superadmin oversight request (all_subjects list / any-subject delete) " <>
-            "needs an impersonation target. Set the X-Impersonate-Tenant header so " <>
-            "the tenant scope can be resolved."
+          "A superadmin memory request needs an impersonation target (superadmin " <>
+            "keys are tenant-less). Set the X-Impersonate-Tenant header so the " <>
+            "tenant scope can be resolved."
       }
     })
   end
