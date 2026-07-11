@@ -342,7 +342,21 @@ defmodule Loopctl.Knowledge.OKF do
     "# Knowledge Update Log\n\n" <> body <> "\n"
   end
 
-  defp derive_description(article) do
+  @doc """
+  Derives a one-line, 160-char-capped summary for an article.
+
+  Public (extracted from the OKF index-file renderer, US-31.3 AC-31.3.1) so
+  other progressive-disclosure surfaces (`Loopctl.Knowledge.progressive_index/3`)
+  can build a compact stub without duplicating this logic. Prefers the
+  round-tripped `metadata["okf"]["description"]` (set on OKF import) and falls
+  back to the first non-heading line of the body, truncated to 160 bytes.
+
+  Takes anything with `:body`/`:metadata` fields (a full `%Article{}` or a bare
+  projection map carrying just those two) — callers that only need the summary
+  need not fetch/preload the rest of the article.
+  """
+  @spec derive_description(%{body: String.t() | nil, metadata: map() | nil}) :: String.t()
+  def derive_description(article) do
     okf = Map.get(article.metadata || %{}, "okf", %{})
 
     case Map.get(okf, "description") do
