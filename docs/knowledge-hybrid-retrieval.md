@@ -272,12 +272,13 @@ single home.
 
 - **End-to-end + negative control** (`test/loopctl/knowledge/hybrid_e2e_test.exs`):
   a governed curated refund-policy article suppresses an unrelated fuzzy chunk
-  (`:curated`, the curated article first in `results`); removing ONLY the
-  curated marker from the SAME corpus (same unrelated chunk, unchanged) flips the
-  result to `:retrieved` and surfaces the previously-suppressed chunk — proving
-  the curated article, not corpus composition, was what suppressed it. A niche,
-  non-curated topic falls to `:retrieved`. A near-but-wrong curated doc (below
-  threshold) is never mislabeled `:curated`.
+  (`:curated`, the curated article first in `results`); archiving that curated
+  article — removing it from the published search pool while leaving the
+  unrelated chunk unchanged — flips the result to `:retrieved` and surfaces the
+  previously-suppressed chunk — proving the governed answer's presence, not an
+  unrelated corpus change, was what suppressed it. A niche, non-curated topic
+  falls to `:retrieved`. A near-but-wrong curated doc (below threshold) is never
+  mislabeled `:curated`.
 - **Shape parity**: the `:curated` and `:retrieved` meta key sets are identical;
   a caller branches on `meta.provenance` alone.
 - **Tenant isolation across every surface** (context, progressive index/drill,

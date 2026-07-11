@@ -47,11 +47,11 @@ All notable changes to loopctl are documented here.
 - **Terminal e2e + negative control** (US-31.5,
   `test/loopctl/knowledge/hybrid_e2e_test.exs`) — a governed curated
   refund-policy article suppresses an unrelated fuzzy chunk (`:curated`, hoisted
-  first); removing ONLY the curated marker from the SAME corpus flips the result
-  to `:retrieved` and surfaces the previously-suppressed chunk, proving causation;
-  a niche non-curated topic falls to `:retrieved`; a near-but-wrong curated doc is
-  never mislabeled `:curated`; `:curated`/`:retrieved` meta share an identical key
-  shape. Tenant isolation is proven across the resolver, progressive index/drill,
+  first); archiving that curated article (removed from the published search
+  pool, unrelated chunk unchanged) flips the result to `:retrieved` and surfaces
+  the previously-suppressed chunk, proving causation; a niche non-curated topic
+  falls to `:retrieved`; a near-but-wrong curated doc is never mislabeled
+  `:curated`; `:curated`/`:retrieved` meta share an identical key shape. Tenant isolation is proven across the resolver, progressive index/drill,
   and the HTTP API; a system-scoped curated article participates without
   overriding a tenant's own; a superseded/conflicted curated article is never
   authoritative without the conflict surfaced.
