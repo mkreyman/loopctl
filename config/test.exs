@@ -307,6 +307,12 @@ config :loopctl, :full_content_byte_budget, 100_000
 # be exercised with ~11 nodes instead of 100+ (production default is 100).
 config :loopctl, :max_graph_nodes, 10
 
+# Progressive-disclosure caps (US-31.3) — small in tests so the top-K/hub caps
+# can be exercised with a handful of fixtures instead of production-scale
+# corpora (production defaults are 10 and 5 respectively).
+config :loopctl, :progressive_top_k, 3
+config :loopctl, :progressive_min_hub_relates_to, 3
+
 # Distant-pairs candidate caps — small in the DEFAULT async suite so the O(candidates²)
 # sample cap (and the bridge branch's SMALLER cap) can be exercised with a handful of articles
 # instead of 1000+/500. The bridge cap (10) is kept < the general cap (25) so the bridge-branch

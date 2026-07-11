@@ -54,6 +54,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.KbCuration
+  alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Projects.Project
@@ -638,37 +639,43 @@ defmodule Loopctl.Knowledge do
           {:ok, Article.t()} | {:error, :not_found}
   def get_article(tenant_id, article_id, opts \\ []) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
-      nil ->
-        {:error, :not_found}
+      nil -> {:error, :not_found}
+      article -> finalize_article_read(tenant_id, article, opts)
+    end
+  end
 
-      article ->
-        # Visibility enforcement (#163): a private/owner memory the caller doesn't
-        # own resolves to :not_found — no existence leak, no access recorded.
-        vis = Keyword.get(opts, :visibility_agent_id)
+  # Shared visibility/preload/access-tracking tail of an article fetch, once the
+  # row itself has been located (tenant-owned or, via `progressive_drill/3`'s
+  # system fallback, a system canonical). Factored out so BOTH scopes get
+  # identical visibility enforcement, link preloading, conflict-link filtering,
+  # and access recording — never duplicated ad hoc per caller.
+  defp finalize_article_read(tenant_id, article, opts) do
+    # Visibility enforcement (#163): a private/owner memory the caller doesn't
+    # own resolves to :not_found — no existence leak, no access recorded.
+    vis = Keyword.get(opts, :visibility_agent_id)
 
-        if visible_to_caller?(article, vis) do
-          article =
-            article
-            |> AdminRepo.preload(
-              outgoing_links: :target_article,
-              incoming_links: :source_article
-            )
-            |> filter_visible_links(vis)
-            |> drop_resolved_conflict_links(tenant_id)
+    if visible_to_caller?(article, vis) do
+      article =
+        article
+        |> AdminRepo.preload(
+          outgoing_links: :target_article,
+          incoming_links: :source_article
+        )
+        |> filter_visible_links(vis)
+        |> drop_resolved_conflict_links(tenant_id)
 
-          Analytics.record_access(
-            tenant_id,
-            article.id,
-            Keyword.get(opts, :api_key_id),
-            "get",
-            Keyword.get(opts, :access_metadata, %{}),
-            attribution_context(opts)
-          )
+      Analytics.record_access(
+        tenant_id,
+        article.id,
+        Keyword.get(opts, :api_key_id),
+        "get",
+        Keyword.get(opts, :access_metadata, %{}),
+        attribution_context(opts)
+      )
 
-          {:ok, article}
-        else
-          {:error, :not_found}
-        end
+      {:ok, article}
+    else
+      {:error, :not_found}
     end
   end
 
@@ -6884,6 +6891,348 @@ defmodule Loopctl.Knowledge do
       :knowledge_hybrid_curated_margin_keyword,
       @default_hybrid_curated_margin_keyword
     )
+  end
+
+  # --- Progressive disclosure (US-31.3) ---
+  #
+  # Composes ALREADY-SHIPPED subsystems into a bounded, topic-scoped stub index so
+  # an agent reads a compact capped list (id/title/category/one-line summary) and
+  # drills into only the chosen article(s), instead of over-retrieving many fuzzy
+  # chunks. Built from `search_keyword/3` (topic match), `list_curated_sources/2`
+  # (US-31.1 curated preference), a dedicated `:relates_to`-scoped hub-enrichment
+  # query (NOT the general `graph_traversal/3`, which follows every relationship
+  # type), and `Loopctl.Knowledge.OKF.derive_description/1` (the one-line summary).
+  # Deliberately NOT the OKF full-export Markdown (`OKF.export/2`'s `index.md`),
+  # which is a private, full-tenant, project-scoped listing bounded by
+  # `okf_max_buffered_export_articles` — not a topic-scoped stub source (#305/#306).
+
+  # Cap on the FINAL stub count returned by `progressive_index/3` (AC-31.3.2) — a
+  # densely-linked hub cannot flood the caller's context no matter how many
+  # curated neighbors it has. Configurable via `:progressive_top_k`.
+  @default_progressive_top_k 10
+
+  # Operational hub threshold (AC-31.3.4): an article counts as a hub when it has
+  # AT LEAST this many outgoing `:relates_to` article_links. Hubs are emergent
+  # (a link-degree fact), never a modeled type/field/tag. Configurable via
+  # `:progressive_min_hub_relates_to`.
+  @default_min_hub_relates_to 5
+
+  @doc """
+  The top-K cap on stubs returned by `progressive_index/3` (AC-31.3.2).
+  Configurable via `:progressive_top_k` in application config; defaults to
+  `#{@default_progressive_top_k}`.
+  """
+  @spec progressive_top_k() :: pos_integer()
+  def progressive_top_k,
+    do: Application.get_env(:loopctl, :progressive_top_k, @default_progressive_top_k)
+
+  @doc """
+  The outgoing `:relates_to` link-count threshold at which an article is treated
+  as an operational hub for `progressive_index/3` hub enrichment (AC-31.3.4).
+  Configurable via `:progressive_min_hub_relates_to` in application config;
+  defaults to `#{@default_min_hub_relates_to}`.
+  """
+  @spec min_hub_relates_to() :: pos_integer()
+  def min_hub_relates_to,
+    do:
+      Application.get_env(:loopctl, :progressive_min_hub_relates_to, @default_min_hub_relates_to)
+
+  @doc """
+  Progressive-disclosure entrypoint (US-31.3): for a topic/query, returns a
+  COMPACT, CAPPED set of stubs — never full bodies, never the OKF full-export
+  Markdown (AC-31.3.1).
+
+  ## How the index is built
+
+  1. **Seed** — `search_keyword/3` full-text-matches `topic` against published,
+     tenant-scoped articles (title/body), returning candidate ids/titles/categories
+     (no bodies). NOTE: this is a deliberate substitution for the
+     `knowledge_index` catalog browse named in the story/AC — `knowledge_index`
+     is a category/tag catalog with no topic scoping, so it cannot answer "for a
+     topic/query" on its own; `search_keyword/3` is the topic-scoped mechanism
+     that does. Caveat: a fuzzy `websearch_to_tsquery` match can silently omit a
+     curated article that is topically relevant but shares no lexical tokens
+     with `topic` and isn't linked from a lexically-matching hub — step 2's
+     `:relates_to` traversal partially (not fully) mitigates this by recovering
+     linked-but-lexically-disjoint neighbors.
+  2. **Hub enrichment** (opt-out via `hub_enrich: false`) — among the seeds, any
+     article with `>= min_hub_relates_to/0` outgoing `:relates_to` links is an
+     operational hub (AC-31.3.4; hubs are not a modeled type). Its `:relates_to`
+     targets are fetched bounded by `max_graph_neighbors_per_node/0` (the SAME
+     fan-out cap `graph_traversal/3` uses elsewhere — mirrored, not
+     re-implemented) and filtered down to the CURATED subset via
+     `list_curated_sources/2`.
+  3. **Curated preference** (AC-31.3.4) — governed curated sources (US-31.1,
+     tenant-own-first, system canonicals participate per AC-31.1.3) are sorted
+     ahead of non-curated matches.
+  4. **Cap** — the combined, deduped candidate list is capped at `top_k`
+     (AC-31.3.2); only the SURVIVING capped ids are read back (title/category/body)
+     to derive each one-line summary — a dense hub's uncapped neighbors are never
+     fetched at all.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID (from the auth principal)
+  - `topic` -- free-text query/topic string (same constraints as
+    `search_keyword/3`: non-empty, <= 500 chars)
+  - `opts` -- keyword list:
+    - `:limit` -- top-K cap override (default `progressive_top_k/0`)
+    - `:seed_limit` -- how many keyword-search seeds to consider before hub
+      enrichment/capping (default 5x the effective top-K)
+    - `:hub_enrich` -- set `false` to disable `:relates_to` hub enrichment and
+      return only direct topic matches (default `true`)
+    - `:category` -- restrict seed matching to a single category atom
+    - `:visibility_agent_id` -- the calling agent's id (#163). Forwarded to the
+      seed `search_keyword/3` call and re-applied to hub-neighbor discovery and
+      the final stub projection, so another agent's `private`/`owner` memory
+      never surfaces as an index stub within the same tenant. `nil` (the
+      default, used by non-agent/higher-role callers) is a no-op — everything
+      is visible.
+
+  ## Returns
+
+  - `{:ok, %{stubs: [%{id:, title:, category:, summary:}], meta: %{top_k:,
+    candidate_count:, truncated:}}}` -- `truncated` is `true` when the
+    (deduped) candidate pool exceeded `top_k` before capping
+  - `{:error, :empty_query}` / `{:error, :bad_request, String.t()}` -- same as
+    `search_keyword/3` (an empty/oversized topic is rejected before any query runs)
+  """
+  @spec progressive_index(Ecto.UUID.t(), String.t() | nil, keyword()) ::
+          {:ok, %{stubs: [map()], meta: map()}}
+          | {:error, atom()}
+          | {:error, atom(), String.t()}
+  def progressive_index(tenant_id, topic, opts \\ []) when is_binary(tenant_id) do
+    # Clamped exactly like `search_keyword/3`'s own `:limit` (AC-31.3.2's
+    # "bounded" top-K must hold even for an explicit caller override, not just
+    # the default -- otherwise a densely-linked hub could still flood context).
+    top_k =
+      opts |> Keyword.get(:limit, progressive_top_k()) |> max(1) |> min(@max_relevance_page_size)
+
+    seed_limit = Keyword.get(opts, :seed_limit, top_k * 5)
+    hub_enrich? = Keyword.get(opts, :hub_enrich, true)
+    category = Keyword.get(opts, :category)
+    vis = Keyword.get(opts, :visibility_agent_id)
+
+    with {:ok, %{results: seed_results}} <-
+           search_keyword(tenant_id, topic,
+             status: :published,
+             limit: seed_limit,
+             category: category,
+             visibility_agent_id: vis,
+             _skip_record_access: true
+           ) do
+      seed_ids = Enum.map(seed_results, & &1.id)
+
+      hub_neighbor_ids =
+        if hub_enrich? do
+          progressive_hub_neighbor_ids(tenant_id, seed_ids, vis)
+        else
+          []
+        end
+
+      candidate_ids = Enum.uniq(seed_ids ++ hub_neighbor_ids)
+
+      # Membership-only scan restricted to the (already small, capped) candidate
+      # pool -- never the tenant's entire curated/system-canonical corpus. Mirrors
+      # the `ids: raw_target_ids` scoping `progressive_hub_neighbor_ids/3` already
+      # uses below.
+      curated_ids =
+        tenant_id
+        |> list_curated_sources(select: :id, ids: candidate_ids)
+        |> MapSet.new()
+
+      {curated_first, rest} = Enum.split_with(candidate_ids, &MapSet.member?(curated_ids, &1))
+      capped_ids = Enum.take(curated_first ++ rest, top_k)
+
+      stubs =
+        tenant_id
+        |> fetch_stub_projection(capped_ids, vis)
+        |> order_stubs(capped_ids)
+        |> Enum.map(&build_stub/1)
+
+      {:ok,
+       %{
+         stubs: stubs,
+         meta: %{
+           top_k: top_k,
+           candidate_count: length(candidate_ids),
+           truncated: length(candidate_ids) > top_k
+         }
+       }}
+    end
+  end
+
+  # Hub-enrichment neighbor discovery (AC-31.3.4): finds which of the seed
+  # articles are operational hubs (>= min_hub_relates_to/0 outgoing :relates_to
+  # links), pulls their :relates_to targets bounded by the SAME per-node fan-out
+  # cap `graph_traversal/3` uses, then narrows to the curated subset — never
+  # returning a raw (potentially unbounded-fan-out) neighbor set uncurated.
+  #
+  # `vis` (#163): the hub targets are discovered via `ArticleLink`/
+  # `list_curated_sources/2`, NEITHER of which is visibility-scoped, so a
+  # private/owner memory reachable via a `:relates_to` edge is re-filtered here
+  # before it can ever reach the candidate pool.
+  defp progressive_hub_neighbor_ids(_tenant_id, [], _vis), do: []
+
+  defp progressive_hub_neighbor_ids(tenant_id, seed_ids, vis) do
+    hub_ids = operational_hub_ids(tenant_id, seed_ids, min_hub_relates_to())
+
+    raw_target_ids =
+      tenant_id
+      |> hub_relates_to_targets(hub_ids, max_graph_neighbors_per_node())
+      |> Enum.uniq()
+
+    tenant_id
+    |> list_curated_sources(select: :id, ids: raw_target_ids)
+    |> filter_visible_candidate_ids(vis)
+  end
+
+  defp filter_visible_candidate_ids([], _vis), do: []
+  defp filter_visible_candidate_ids(ids, nil), do: ids
+
+  defp filter_visible_candidate_ids(ids, vis) do
+    from(a in Article, where: a.id in ^ids, select: a.id)
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.all()
+  end
+
+  # Articles among `seed_ids` with >= `min_count` outgoing :relates_to links
+  # (the operational hub definition, AC-31.3.4 — never a modeled type). The only
+  # caller (`progressive_hub_neighbor_ids/3`) already short-circuits an empty
+  # `seed_ids`, so this always receives a non-empty list.
+  defp operational_hub_ids(tenant_id, seed_ids, min_count) do
+    from(l in ArticleLink,
+      where: l.tenant_id == ^tenant_id,
+      where: l.relationship_type == :relates_to,
+      where: l.source_article_id in ^seed_ids,
+      group_by: l.source_article_id,
+      having: count(l.id) >= ^min_count,
+      select: l.source_article_id
+    )
+    |> AdminRepo.all()
+  end
+
+  # Depth-1 :relates_to targets of EVERY hub in `hub_ids`, bounded PER HUB at
+  # the SQL level by `ROW_NUMBER() OVER (PARTITION BY source_article_id ...) <=
+  # fanout_limit` -- the same fan-out cap (mirrors the `JOIN LATERAL ... LIMIT`
+  # bound `execute_graph_traversal/4` uses, without pulling in the general
+  # multi-hop/all-relationship-type traversal), but in ONE round-trip regardless
+  # of hub count instead of one query per hub (review finding: bounded N+1).
+  defp hub_relates_to_targets(_tenant_id, [], _fanout_limit), do: []
+
+  defp hub_relates_to_targets(tenant_id, hub_ids, fanout_limit) do
+    ranked =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :relates_to,
+        where: l.source_article_id in ^hub_ids,
+        select: %{
+          target_article_id: l.target_article_id,
+          rank:
+            over(row_number(),
+              partition_by: l.source_article_id,
+              order_by: [asc: l.inserted_at, asc: l.id]
+            )
+        }
+      )
+
+    from(r in subquery(ranked),
+      where: r.rank <= ^fanout_limit,
+      select: r.target_article_id
+    )
+    |> AdminRepo.all()
+  end
+
+  # Body/metadata projection for ONLY the (already-capped) final candidate ids —
+  # a dense hub's uncapped neighbors never reach this query. `tenant_id or scope
+  # == :system` mirrors the explicit tenant-plus-system-canonical predicate used
+  # throughout this module (AC-31.3.4 tenant isolation; system participates per
+  # US-31.1 AC-31.1.3). `maybe_filter_by_visibility/2` is the LAST line of
+  # defense-in-depth for #163: the seed and hub-neighbor pools are already
+  # visibility-filtered upstream (`search_keyword/3`, `filter_visible_candidate_ids/2`),
+  # but this is the query that actually reads title/body — it must never trust
+  # the caller wired only one of those two upstream gates correctly.
+  defp fetch_stub_projection(_tenant_id, [], _vis), do: []
+
+  defp fetch_stub_projection(tenant_id, ids, vis) do
+    from(a in Article,
+      where: a.id in ^ids,
+      where: a.tenant_id == ^tenant_id or a.scope == :system,
+      select: %{
+        id: a.id,
+        title: a.title,
+        category: a.category,
+        body: a.body,
+        metadata: a.metadata
+      }
+    )
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.all()
+  end
+
+  # `WHERE id IN (...)` has no defined row order — re-impose the curated-first,
+  # capped candidate order the caller already computed.
+  defp order_stubs(articles, ordered_ids) do
+    by_id = Map.new(articles, &{&1.id, &1})
+
+    ordered_ids
+    |> Enum.map(&Map.get(by_id, &1))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp build_stub(article) do
+    %{
+      id: article.id,
+      title: article.title,
+      category: article.category,
+      summary: OKF.derive_description(article)
+    }
+  end
+
+  @doc """
+  Drill step (US-31.3, AC-31.3.3): fetches the full body of a single article a
+  `progressive_index/3` stub pointed at, scope-enforced exactly like a direct
+  fetch.
+
+  Mirrors `progressive_index/3`'s OWN scope (AC-31.3.3 vs AC-31.3.4
+  consistency): `progressive_index/3` surfaces both tenant-owned articles AND
+  system-scope (`tenant_id: nil`) curated canonicals (`fetch_stub_projection/3`
+  reads `where a.tenant_id == ^tenant_id or a.scope == :system`), so the drill
+  step must be able to open EITHER. It tries the tenant-scoped fetch first
+  (`get_article/3`); only when that misses does it fall back to the
+  system-scope-by-id lookup (the same predicate `fetch_curatable_article/2`
+  uses for curation) so a system canonical's `tenant_id: nil` never falls
+  through to a false `:not_found`. A tenant-owned article never matches the
+  system-scope fallback (system articles require `scope: :system`), so tenant
+  isolation is unaffected — the fallback only ever *widens* what a tenant-scoped
+  `:not_found` was allowed to catch, onto the same system-canonical set the
+  index already surfaces.
+  """
+  @spec progressive_drill(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()} | {:error, :not_found}
+  def progressive_drill(tenant_id, article_id, opts \\ []) do
+    case get_article(tenant_id, article_id, opts) do
+      {:error, :not_found} -> drill_system_canonical(tenant_id, article_id, opts)
+      result -> result
+    end
+  end
+
+  defp drill_system_canonical(tenant_id, article_id, opts) do
+    # `status == :published` (mirrors `get_system_article_by_slug/1` and
+    # `list_system_articles/1`) -- this is the ONLY tenant-facing read path for
+    # a system canonical's body (get_article/2 requires a tenant_id match,
+    # which nil-tenant system rows never satisfy), so unlike
+    # `fetch_curatable_article/2` (the privileged, role-gated curation path
+    # that legitimately needs drafts), this must never expose a draft or
+    # archived system canonical by id.
+    case AdminRepo.one(
+           from(a in Article,
+             where: a.id == ^article_id and a.scope == :system and a.status == :published
+           )
+         ) do
+      nil -> {:error, :not_found}
+      article -> finalize_article_read(tenant_id, article, opts)
+    end
   end
 
   # --- Circuit breaker for embedding generation ---

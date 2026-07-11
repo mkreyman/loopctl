@@ -37,7 +37,8 @@
     "Hub is emergent (>= N outgoing :relates_to links via article_link), not a field/category/tag.",
     "Cap traversal fan-out (the code already bounds high-degree hub fan-out elsewhere — mirror it).",
     "Tenant scoping is explicit-predicate on AdminRepo/HeavyRead.",
-    "Tests use Loopctl.Fixtures.fixture/2 with explicit article_link rows (not a nonexistent hub type)."
+    "Tests use Loopctl.Fixtures.fixture/2 with explicit article_link rows (not a nonexistent hub type).",
+    "IMPLEMENTATION NOTE (review, US-31.3): the seed step actually implemented is search_keyword/3 (a websearch_to_tsquery full-text matcher), NOT the knowledge_index controller/context named above -- knowledge_index is a category/tag CATALOG browse with no topic scoping, so it cannot satisfy AC-31.3.1's 'for a topic/query' requirement as-is. search_keyword/3 was substituted deliberately as the topic-scoped seed; article_link :relates_to traversal (this story's other named building block) is implemented as designed. Caveat: a fuzzy tsquery can silently omit a curated article that is topically relevant but shares no lexical tokens with the query and is not linked from a lexically-matching hub -- the hub traversal partially mitigates by recovering linked-but-lexically-disjoint neighbors, but does not fully close the gap. Documented here explicitly per review finding rather than left as a silent building-block swap."
   ],
   "dependencies": ["US-31.1"],
   "estimated_tokens": 280000

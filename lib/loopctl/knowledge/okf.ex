@@ -342,7 +342,24 @@ defmodule Loopctl.Knowledge.OKF do
     "# Knowledge Update Log\n\n" <> body <> "\n"
   end
 
-  defp derive_description(article) do
+  @doc """
+  Derives a one-line, 160-byte-capped summary for an article.
+
+  Public (extracted from the OKF index-file renderer, US-31.3 AC-31.3.1) so
+  other progressive-disclosure surfaces (`Loopctl.Knowledge.progressive_index/3`)
+  can build a compact stub without duplicating this logic. Prefers the
+  round-tripped `metadata["okf"]["description"]` (set on OKF import) --
+  returned AS-IS, untruncated, since it's an author-supplied one-liner, not
+  body text that needs clipping -- and otherwise falls back to the first
+  non-heading line of the body, truncated to 160 bytes (plus a 3-byte "…"
+  suffix when truncation occurs).
+
+  Takes anything with `:body`/`:metadata` fields (a full `%Article{}` or a bare
+  projection map carrying just those two) — callers that only need the summary
+  need not fetch/preload the rest of the article.
+  """
+  @spec derive_description(%{body: String.t() | nil, metadata: map() | nil}) :: String.t()
+  def derive_description(article) do
     okf = Map.get(article.metadata || %{}, "okf", %{})
 
     case Map.get(okf, "description") do
@@ -359,8 +376,32 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
+  # Byte-bounded (not grapheme-bounded) truncation: `String.slice/3` counts
+  # GRAPHEMES, so for multibyte text (accents, emoji) slicing to `max`
+  # graphemes can produce a result several times larger than `max` BYTES --
+  # exactly the opposite of what a byte cap promises. Walk graphemes and stop
+  # accumulating the instant the NEXT one would push byte_size over `max`, so
+  # the returned (pre-ellipsis) string never exceeds `max` bytes regardless of
+  # encoding width.
   defp truncate(str, max) when byte_size(str) <= max, do: str
-  defp truncate(str, max), do: String.slice(str, 0, max) <> "…"
+
+  defp truncate(str, max) do
+    str
+    |> String.graphemes()
+    |> Enum.reduce_while({[], 0}, fn grapheme, {acc, size} ->
+      new_size = size + byte_size(grapheme)
+
+      if new_size > max do
+        {:halt, {acc, size}}
+      else
+        {:cont, {[grapheme | acc], new_size}}
+      end
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+    |> Enum.join()
+    |> Kernel.<>("…")
+  end
 
   # ---------------------------------------------------------------------------
   # Import
