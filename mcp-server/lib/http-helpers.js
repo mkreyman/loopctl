@@ -147,8 +147,17 @@ export function specToMcpTool(spec) {
  * `limit`/`offset` pagination pass through when present. Nullish args are omitted
  * so unset params never override server defaults.
  *
+ * Filter-value sourcing (US-30.5 fix): the US-30.2 ToolGenerator emits the filter
+ * tool's input_schema with the value argument under the FIELD-NAME key (e.g.
+ * `{status}`, `required: ["status"]`) — there is NO `value` property. A
+ * schema-compliant agent therefore calls `cr_filter_project_by_status({status:
+ * "active"})`. So read the value from the field-named arg FIRST, falling back to a
+ * literal `value` arg (the shape the controller also accepts) for tolerance.
+ * Reading only `args.value` would drop every real agent-supplied filter value and
+ * dispatch an empty filter that silently returns zero rows.
+ *
  * @param {{ entity: string, field?: string|null, operation: string }} metadata
- * @param {{ value?: unknown, query?: unknown, limit?: number, offset?: number }} [args]
+ * @param {Record<string, unknown>} [args]
  * @returns {object}
  */
 export function buildRetrieveBody(metadata, args = {}) {
@@ -156,7 +165,9 @@ export function buildRetrieveBody(metadata, args = {}) {
 
   if (metadata.operation === "filter") {
     body.field = metadata.field;
-    if (args.value !== undefined) body.value = args.value;
+    const fieldArg = metadata.field != null ? args[metadata.field] : undefined;
+    const filterValue = fieldArg !== undefined ? fieldArg : args.value;
+    if (filterValue !== undefined) body.value = filterValue;
   } else if (metadata.operation === "search") {
     if (args.query !== undefined) body.query = args.query;
   }

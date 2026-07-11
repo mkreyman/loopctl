@@ -297,14 +297,33 @@ describe("http-helpers: retrieve path + spec/body mappers (single source of trut
     assert.equal(specToMcpTool(null), null);
   });
 
-  test("buildRetrieveBody (filter) uses metadata field + args.value, omits nullish", () => {
+  // The REAL agent contract: the US-30.2 schema puts the value under the
+  // field-named key (`required: ["status"]`, no `value` property), so a
+  // schema-compliant agent calls the tool with `{ status: "active" }`.
+  test("buildRetrieveBody (filter) sources the value from the schema field-named arg", () => {
+    const spec = filterProjectByStatusSpec();
+    // Build the args exactly as a schema-compliant agent would: the required key.
+    const [requiredKey] = spec.input_schema.required;
+    const body = buildRetrieveBody(spec.metadata, { [requiredKey]: "active" });
+    assert.deepEqual(body, { op: "filter", field: "status", value: "active" });
+  });
+
+  test("buildRetrieveBody (filter) still tolerates a literal {value:...} arg", () => {
     const body = buildRetrieveBody(filterProjectByStatusSpec().metadata, { value: "active" });
+    assert.deepEqual(body, { op: "filter", field: "status", value: "active" });
+  });
+
+  test("buildRetrieveBody (filter) prefers the field-named arg over a stray value arg", () => {
+    const body = buildRetrieveBody(filterProjectByStatusSpec().metadata, {
+      status: "active",
+      value: "ignored",
+    });
     assert.deepEqual(body, { op: "filter", field: "status", value: "active" });
   });
 
   test("buildRetrieveBody (filter) passes limit/offset when present", () => {
     const body = buildRetrieveBody(filterProjectByStatusSpec().metadata, {
-      value: "active",
+      status: "active",
       limit: 10,
       offset: 20,
     });
@@ -319,7 +338,7 @@ describe("http-helpers: retrieve path + spec/body mappers (single source of trut
   test("buildRetrieveBody dispatches by metadata.operation, NOT by splitting the name", () => {
     // entity + field both contain underscores — name-splitting would be ambiguous.
     const metadata = { entity: "work_order", field: "customer_name", operation: "filter" };
-    const body = buildRetrieveBody(metadata, { value: "acme" });
+    const body = buildRetrieveBody(metadata, { customer_name: "acme" });
     assert.deepEqual(body, { op: "filter", field: "customer_name", value: "acme" });
   });
 });
@@ -357,9 +376,10 @@ describe("TC-30.5.1: ListTools merges generated + static", () => {
 // ---------------------------------------------------------------------------
 
 describe("TC-30.5.2: generic dispatch of a cr_ call; static tool still works", () => {
-  test("cr_filter_project_by_status {value:'active'} POSTs to /retrieve/project", async () => {
+  test("cr_filter_project_by_status {status:'active'} POSTs the value to /retrieve/project", async () => {
+    const spec = filterProjectByStatusSpec();
     const calls = mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
+      "/api/v1/retrieve/tools": { body: { data: [spec] } },
       "/api/v1/retrieve/project": {
         body: { results: [{ id: "p1", status: "active" }], meta: { total_count: 1, limit: 50, offset: 0 } },
       },
@@ -367,7 +387,12 @@ describe("TC-30.5.2: generic dispatch of a cr_ call; static tool still works", (
     const rt = makeRuntime(STATIC_TOOLS);
     await rt.listTools(); // populate metadata
 
-    const result = await rt.callGeneratedTool("cr_filter_project_by_status", { value: "active" });
+    // Drive the call with the SCHEMA-REQUIRED field-named key a real agent emits
+    // (`required: ["status"]`), NOT a non-schema `{ value }` arg. This exercises
+    // the real agent-to-MCP contract; before the US-30.5 fix the value was
+    // dropped and the POST body carried no value (empty page).
+    const [requiredKey] = spec.input_schema.required;
+    const result = await rt.callGeneratedTool("cr_filter_project_by_status", { [requiredKey]: "active" });
     assert.equal(result.isError, undefined);
 
     const post = calls.find((c) => new URL(c.url).pathname === "/api/v1/retrieve/project");
@@ -482,8 +507,8 @@ describe("TC-30.5.5: witness/STH + auth parity with static reads", () => {
 
     // Static read (as knowledge_search does) — same shared apiCall + agent key.
     await apiCall("GET", "/api/v1/knowledge/search?q=x", null, process.env.LOOPCTL_AGENT_KEY);
-    // Generated call.
-    await rt.callGeneratedTool("cr_filter_project_by_status", { value: "active" });
+    // Generated call, driven with the schema-required field-named key.
+    await rt.callGeneratedTool("cr_filter_project_by_status", { status: "active" });
 
     const staticCall = calls.find((c) => new URL(c.url).pathname === "/api/v1/knowledge/search");
     const genCall = calls.find((c) => new URL(c.url).pathname === "/api/v1/retrieve/project");
