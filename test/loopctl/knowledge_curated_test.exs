@@ -12,6 +12,7 @@ defmodule Loopctl.KnowledgeCuratedTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
 
@@ -124,6 +125,38 @@ defmodule Loopctl.KnowledgeCuratedTest do
 
       assert {:error, :not_found} = Knowledge.mark_curated(tenant_b.id, article.id, [])
     end
+
+    test "mark_curated writes an article.curated audit event under the tenant" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {:ok, marked} =
+        Knowledge.mark_curated(tenant.id, article.id, actor_label: "user:admin")
+
+      audit = audit_event(article.id, "article.curated")
+      assert audit.tenant_id == tenant.id
+      assert audit.actor_label == "user:admin"
+      assert audit.new_state["curated_at"] == DateTime.to_iso8601(marked.curated_at)
+    end
+
+    test "unmark_curated writes an article.uncurated audit event" do
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id)
+
+      {:ok, _unmarked} = Knowledge.unmark_curated(tenant.id, curated.id)
+
+      audit = audit_event(curated.id, "article.uncurated")
+      assert audit.tenant_id == tenant.id
+      assert is_nil(audit.new_state["curated_at"])
+    end
+
+    test "system-scope curation writes a GLOBAL (tenant_id nil) audit event" do
+      tenant = fixture(:tenant)
+      system = curated_system_article(%{title: "Global Canonical"}, tenant.id)
+
+      audit = audit_event(system.id, "article.curated")
+      assert is_nil(audit.tenant_id)
+    end
   end
 
   describe "authoritative curated excludes draft/superseded/conflicted (TC-31.1.2)" do
@@ -168,6 +201,40 @@ defmodule Loopctl.KnowledgeCuratedTest do
       refute Knowledge.authoritative_curated?(curated)
       refute curated.id in ids(Knowledge.list_curated_sources(tenant.id))
     end
+
+    test "authoritative_curated?/1 does not crash on a system canonical (tenant_id nil)" do
+      tenant = fixture(:tenant)
+      system = curated_system_article(%{title: "System Canonical"}, tenant.id)
+
+      # Regression: article_in_open_conflict?/1 used to compare `l.tenant_id == ^nil`,
+      # which Ecto rejects at runtime. A curated, non-conflicted system canonical MUST
+      # be authoritative (AC-31.1.3) rather than raising.
+      assert is_nil(system.tenant_id)
+      assert Knowledge.curated?(system)
+      assert Knowledge.authoritative_curated?(system)
+    end
+
+    test "a system canonical in an OPEN potential_conflict is not authoritative" do
+      tenant = fixture(:tenant)
+      system = curated_system_article(%{title: "Disputed System"}, tenant.id)
+
+      other =
+        curated_system_article(%{title: "Rival System", body: "rival"}, tenant.id)
+
+      # A system-scoped auto-generated conflict pair (links live under the tenant that
+      # surfaced them; correlation is by article id, so the system member still matches).
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: system.id,
+        target_article_id: other.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+
+      assert Knowledge.curated?(system)
+      refute Knowledge.authoritative_curated?(system)
+      refute system.id in ids(Knowledge.list_curated_sources(tenant.id))
+    end
   end
 
   describe "system-scope precedence (TC-31.1.3 / AC-31.1.3)" do
@@ -203,6 +270,43 @@ defmodule Loopctl.KnowledgeCuratedTest do
 
       assert system.id in ids(Knowledge.list_curated_sources(tenant_a.id))
     end
+
+    test "a tenant's own curated-but-conflicted topic still suppresses the system canonical" do
+      # AC-31.1.3 x AC-31.1.4 interaction: the tenant OWNS "Topic Z" (curated+published)
+      # but that own article is itself in an open conflict. It is excluded from the RESULT
+      # (AC-31.1.4), yet ownership is computed independently of conflict status, so the
+      # system canonical on the same topic is STILL suppressed — a system answer never
+      # overrides the tenant's own (disputed) answer. Net: neither surfaces; the conflict
+      # must be resolved first.
+      tenant_a = fixture(:tenant)
+
+      system = curated_system_article(%{title: "Topic Z", body: "system answer"}, tenant_a.id)
+
+      tenant_own =
+        curated_article(tenant_a.id, %{
+          title: "Topic Z",
+          body: "tenant answer",
+          category: :reference
+        })
+
+      rival =
+        fixture(:article, %{tenant_id: tenant_a.id, status: :published, title: "Topic Z Rival"})
+
+      fixture(:article_link, %{
+        tenant_id: tenant_a.id,
+        source_article_id: tenant_own.id,
+        target_article_id: rival.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+
+      result_ids = ids(Knowledge.list_curated_sources(tenant_a.id))
+
+      # The conflicted tenant-own article is excluded (AC-31.1.4)...
+      refute tenant_own.id in result_ids
+      # ...and the system canonical on the same owned topic is STILL suppressed (AC-31.1.3).
+      refute system.id in result_ids
+    end
   end
 
   describe "list_curated_sources/2 tenant isolation (TC-31.1.4 / AC-31.1.5)" do
@@ -237,4 +341,12 @@ defmodule Loopctl.KnowledgeCuratedTest do
   end
 
   defp ids(articles), do: Enum.map(articles, & &1.id)
+
+  defp audit_event(article_id, action) do
+    from(a in AuditLog,
+      where: a.entity_type == "article" and a.entity_id == ^article_id,
+      where: a.action == ^action
+    )
+    |> AdminRepo.one!()
+  end
 end
