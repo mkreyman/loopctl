@@ -258,6 +258,20 @@ config :loopctl, :max_long_term_memories_per_subject, 30
 # (`{:error, :entity_limit}`) is testable without inserting 50 rows.
 config :loopctl, :max_entity_definitions_per_tenant, 3
 
+# US-30.3: a small Context Retriever max page size so the pagination-cap path is
+# testable (TC-30.3.5) without seeding 100+ rows.
+config :loopctl, :context_retriever_max_page_size, 5
+
+# US-30.3: a small max pagination offset so the offset-cap path is testable
+# without a deep-offset scan.
+config :loopctl, :context_retriever_max_offset, 50
+
+# US-30.3: Context-Retriever audit writer DI. Resolves to a Mox mock whose
+# DataCase default stub delegates to the real Loopctl.Audit — so existing
+# executor tests write genuine audit rows, while the fail-closed test overrides
+# it to force an {:error, _} and assert run/3 returns {:error, :audit_failed}.
+config :loopctl, :context_retriever_audit, Loopctl.ContextRetriever.MockAudit
+
 # DI: Use mock knowledge extractor in tests
 config :loopctl, :knowledge_extractor, Loopctl.MockExtractor
 

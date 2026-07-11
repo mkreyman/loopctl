@@ -87,7 +87,9 @@ defmodule Loopctl.ContextRetriever.ToolGeneratorTest do
 
       assert status_spec.input_schema["required"] == ["status"]
       assert status_spec.input_schema["properties"]["limit"] == %{"type" => "integer"}
-      assert status_spec.input_schema["properties"]["cursor"] == %{"type" => "string"}
+      # Pagination is offset-based to match the US-30.3 executor (AC-30.3.5).
+      assert status_spec.input_schema["properties"]["offset"] == %{"type" => "integer"}
+      refute Map.has_key?(status_spec.input_schema["properties"], "cursor")
     end
 
     test "search tool input schema requires query and exposes pagination", %{specs: specs} do
@@ -96,7 +98,9 @@ defmodule Loopctl.ContextRetriever.ToolGeneratorTest do
       assert search_spec.input_schema["required"] == ["query"]
       assert search_spec.input_schema["properties"]["query"] == %{"type" => "string"}
       assert search_spec.input_schema["properties"]["limit"] == %{"type" => "integer"}
-      assert search_spec.input_schema["properties"]["cursor"] == %{"type" => "string"}
+      # Pagination is offset-based to match the US-30.3 executor (AC-30.3.5).
+      assert search_spec.input_schema["properties"]["offset"] == %{"type" => "integer"}
+      refute Map.has_key?(search_spec.input_schema["properties"], "cursor")
     end
   end
 
@@ -258,6 +262,42 @@ defmodule Loopctl.ContextRetriever.ToolGeneratorTest do
 
       assert search_spec
       assert search_spec.metadata.searchable_fields == ["description"]
+    end
+  end
+
+  describe "specs_for/1 — AC-30.3.4 (search tool suppressed when a searchable field is not vector-indexed)" do
+    test "a searchable text field not covered by the source search_vector suppresses the search tool" do
+      # agent_status is an allowlisted stories column (so it may be declared) that
+      # the generated search_vector (title + description) does NOT cover. Declaring
+      # it searchable must NOT produce a search tool the executor would answer over
+      # title/description instead.
+      entity = %Entity{
+        name: "story",
+        backing_source: :stories,
+        fields: [
+          %{name: "agent_status", type: "string", filterable: false, searchable: true}
+        ]
+      }
+
+      assert ToolGenerator.specs_for(entity) == []
+    end
+
+    test "a mix of vector-covered and non-covered searchable fields still suppresses the tool" do
+      # title IS covered but agent_status is not; because the fixed vector cannot
+      # index agent_status, the whole search tool is suppressed rather than emit
+      # one that silently omits the declared-but-unindexed column.
+      entity = %Entity{
+        name: "story",
+        backing_source: :stories,
+        fields: [
+          %{name: "title", type: "string", filterable: false, searchable: true},
+          %{name: "agent_status", type: "string", filterable: false, searchable: true}
+        ]
+      }
+
+      specs = ToolGenerator.specs_for(entity)
+
+      refute Enum.any?(specs, &(&1.name == "cr_search_story"))
     end
   end
 

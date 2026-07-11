@@ -216,6 +216,14 @@ defmodule Loopctl.DataCase do
       {:error, :not_configured}
     end)
 
+    # US-30.3: Context-Retriever audit writer. The DEFAULT delegates to the real
+    # Loopctl.Audit so every existing executor test writes and reads back a genuine
+    # audit row unchanged. The fail-closed test overrides this with Mox.expect/3 to
+    # return {:error, _} and assert run/3 returns {:error, :audit_failed}.
+    Mox.stub(Loopctl.ContextRetriever.MockAudit, :create_log_entry, fn tenant_id, attrs ->
+      Loopctl.Audit.create_log_entry(tenant_id, attrs)
+    end)
+
     # Epic 28 (#179): default Req.Test stub for the shared tenant-scoped Anthropic
     # client. Returns an empty-articles Messages response with a zero-usage block so
     # any incidental call to a REAL Claude module (only when a tenant key is
