@@ -5,24 +5,34 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
-### Agent Memory (`memory_*`) vs Knowledge Wiki (`knowledge_*`)
+### `retrieve_*` (Context Retriever) vs `knowledge_*` (Wiki) vs `memory_*` (Memory)
 
-loopctl has TWO stores an agent can write to — pick by ownership + lifecycle
-(full reference: `docs/agent-memory.md`):
+loopctl has THREE agent information surfaces — pick by WHAT THE DATA IS (full
+references: `docs/context-retriever.md`, `docs/agent-memory.md`):
 
-- **`memory_*` — Agent Memory**: PRIVATE to your `(tenant, subject_id)` scope
-  (`Loopctl.Memory`; tables `memories`/`session_memories`). Use for facts,
-  preferences, and observations THIS agent learned about ITS task/user and needs
-  to recall later. `long_term` = vector-embedded + semantically recalled; `session`
-  = chronological + TTL-pruned. Tools: `memory_remember`, `memory_recall`,
-  `memory_list`, `memory_forget`.
-- **`knowledge_*` — Knowledge Wiki**: SHARED, curated tenant knowledge, deduped and
+- **`retrieve_*` — Context Retriever** (Epic 30; `Loopctl.ContextRetriever`, table
+  `entity_definitions`): GOVERNED, structured access to loopctl's own live ROWS
+  (`projects`/`stories`/`epics`). An admin declares a tenant-scoped **entity**
+  (typed, server-allowlisted fields) over `/api/v1/entities`; per-entity
+  `cr_filter_*`/`cr_search_*` tools are generated dynamically and appended to
+  ListTools from `GET /api/v1/retrieve/tools`; a `cr_*` call dispatches to
+  `POST /api/v1/retrieve/:entity`. Parameterized (never model SQL), dual
+  tenant-scoped, allowlist-shaped, audited (fail-closed), rate-limited. Use to
+  query live operational state by a structured filter or full-text search.
+- **`memory_*` — Agent Memory** (Epic 28; `Loopctl.Memory`; tables
+  `memories`/`session_memories`): PRIVATE to your `(tenant, subject_id)` scope.
+  Use for facts, preferences, and observations THIS agent learned about ITS
+  task/user and needs to recall later. `long_term` = vector-embedded +
+  semantically recalled; `session` = chronological + TTL-pruned. Tools:
+  `memory_remember`, `memory_recall`, `memory_list`, `memory_forget`.
+- **`knowledge_*` — Knowledge Wiki**: SHARED, curated tenant DOCUMENTS, deduped and
   linked. Use when the insight is worth ANOTHER agent reading.
 
-Rule of thumb: *worth another agent reading?* → `knowledge_create`; *a fact only I
-need to recall about my own work?* → `memory_remember`. Scope is key-derived — you
-never pass `tenant_id`/`subject_id`. Do NOT conflate `Loopctl.Memory` (Epic 28)
-with the article-level agent-memory *metadata* (`memory_type`/`visibility`) on the
+Rule of thumb: *live structured business row?* → `retrieve_*`; *worth another
+agent reading?* → `knowledge_create`; *a fact only I need to recall about my own
+work?* → `memory_remember`. Scope is key-derived — you never pass
+`tenant_id`/`subject_id`. Do NOT conflate `Loopctl.Memory` (Epic 28) with the
+article-level agent-memory *metadata* (`memory_type`/`visibility`) on the
 Knowledge `articles` table (#163) — different subsystems.
 
 ### Phoenix v1.8 guidelines

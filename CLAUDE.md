@@ -257,6 +257,33 @@ I need to recall about my own work?"* → `memory_remember`. Scope is derived fr
 your key server-side — you never pass `tenant_id`/`subject_id`. loopctl is
 agent-native (no memory UI); operator oversight is the superadmin API path.
 
+## Epic 30: Context Retriever — three surfaces (`retrieve_*` vs `knowledge_*` vs `memory_*`)
+
+Epic 30 adds a THIRD agent information surface (`Loopctl.ContextRetriever`, tables
+`entity_definitions`) alongside the Knowledge Wiki and Agent Memory. Full
+reference: [`docs/context-retriever.md`](docs/context-retriever.md). Pick by what
+the data IS:
+
+- **`retrieve_*` (Context Retriever)** — GOVERNED, structured access to loopctl's
+  own live rows (`projects`/`stories`/`epics`). A tenant admin declares an
+  **entity** (typed, server-allowlisted fields) over `/api/v1/entities`; the
+  generator emits per-entity `cr_filter_*`/`cr_search_*` tools (dynamic,
+  per-tenant, appended to ListTools from `GET /api/v1/retrieve/tools`); a `cr_*`
+  call dispatches to `POST /api/v1/retrieve/:entity`. Every query is
+  parameterized (no model SQL), dual tenant-scoped (RLS `loopctl_app` role +
+  explicit predicate), execute-time allowlist-rechecked, shaped to declared
+  columns only, audited (fail-closed), and rate-limited. Use when you'd query
+  live operational state by a structured filter or full-text search.
+- **`knowledge_*` (Knowledge Wiki)** — SHARED, curated tenant DOCUMENTS. Use when
+  the insight is worth another agent reading.
+- **`memory_*` (Agent Memory)** — PRIVATE `(tenant, subject_id)` working memory.
+  Use for facts only THIS agent needs to recall about its own work.
+
+Rule of thumb: *live structured business row?* → `retrieve_*`. *worth another
+agent reading?* → `knowledge_create`. *a fact only I need?* → `memory_remember`.
+Defining an entity is a security root (role ≥ `user` + human-anchor); querying is
+authenticated-only. You never pass `tenant_id` — scope is key-derived.
+
 ## Elixir / Phoenix guidelines
 
 These are the stock `phx.new` rules, condensed. Each line is a hard rule.
