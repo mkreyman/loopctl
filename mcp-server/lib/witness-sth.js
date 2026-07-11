@@ -186,6 +186,7 @@ export function bootstrapRetrySth(status, currentSthHeader) {
  *   getuid?: () => number,
  *   pid?: number,
  *   timeoutMs?: number,
+ *   makeTimeoutSignal?: (ms: number) => (AbortSignal|undefined),
  * }} [deps]
  */
 export function createWitnessClient({
@@ -195,6 +196,10 @@ export function createWitnessClient({
   getuid,
   pid,
   timeoutMs = 30_000,
+  // Injectable so tests can observe the EFFECTIVE per-attempt timeout (an
+  // AbortSignal from AbortSignal.timeout does not expose its ms). Production uses
+  // the real timer.
+  makeTimeoutSignal = (ms) => AbortSignal.timeout(ms),
 } = {}) {
   // Load any persisted STH so a FRESH process sends a real header on request #1
   // and skips the bootstrap-grace 412 entirely.
@@ -213,10 +218,13 @@ export function createWitnessClient({
     if (statePath && fs) persistSth(statePath, sth, { fs, pid });
   }
 
-  async function attempt({ url, method, headers, serializedBody }) {
+  async function attempt({ url, method, headers, serializedBody, timeoutMs: reqTimeoutMs }) {
     // Witness protocol: echo the cached STH, or (never seen one) request a
     // one-time bootstrap. A fresh AbortSignal per attempt so the retry gets its
-    // own timeout budget.
+    // own timeout budget. A per-request `timeoutMs` (e.g. the SHORT budget the
+    // init-time ListTools generated-tools fetch uses so a backend blip degrades to
+    // static quickly instead of blocking connection setup for the full 30s)
+    // overrides the client default.
     const withWitness = { ...headers };
     if (lastKnownSTH) withWitness["X-Loopctl-Last-Known-STH"] = lastKnownSTH;
     else withWitness["X-Loopctl-STH-Bootstrap"] = "true";
@@ -224,7 +232,7 @@ export function createWitnessClient({
     const options = {
       method,
       headers: withWitness,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: makeTimeoutSignal(reqTimeoutMs ?? timeoutMs),
     };
     if (serializedBody !== undefined) options.body = serializedBody;
 

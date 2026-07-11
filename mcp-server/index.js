@@ -25,6 +25,10 @@ import {
   createWitnessClient,
   resolveSthStatePath,
 } from "./lib/witness-sth.js";
+import {
+  createGeneratedToolsRuntime,
+  GENERATED_TOOL_PREFIX,
+} from "./lib/generated-tools.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -61,6 +65,11 @@ const SERVER_VERSION = JSON.parse(
 // transparent retry above). The write is atomic + symlink-safe (temp + rename).
 const WITNESS_FS = { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync };
 
+// Default per-request HTTP timeout. Individual calls may pass a SHORTER budget via
+// `apiCall(..., { timeoutMs })` — e.g. the init-time generated-tools listing fetch,
+// which must degrade to static tools quickly rather than block connection setup.
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
 // One witness client PER API KEY (#298 review HIGH-2): the STH is per-tenant and
 // each key resolves to a tenant server-side, so distinct keys must NOT share an
 // in-memory cache or a state file (a collision causes spurious 409s + false
@@ -77,7 +86,7 @@ function witnessClientFor(apiKey) {
       fs: WITNESS_FS,
       getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined,
       pid: process.pid,
-      timeoutMs: 30_000,
+      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     });
     witnessClients.set(apiKey, client);
   }
@@ -104,7 +113,7 @@ function resolveKey(keyOverride) {
   );
 }
 
-async function apiCall(method, path, body, keyOverride, { exactKey = false } = {}) {
+async function apiCall(method, path, body, keyOverride, { exactKey = false, timeoutMs } = {}) {
   const url = `${getBaseUrl()}${path}`;
   // Secret-managing tools pass exactKey:true so the request uses the EXACT
   // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
@@ -137,10 +146,11 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false } = {
   // attempt's Response; we keep body parsing / error shaping here.
   let response;
   try {
-    response = await witnessClientFor(key).send({ url, method, headers, serializedBody });
+    response = await witnessClientFor(key).send({ url, method, headers, serializedBody, timeoutMs });
   } catch (err) {
     if (err.name === "TimeoutError") {
-      return { error: true, status: 0, body: "Request timed out after 30s" };
+      const secs = Math.max(1, Math.round((timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) / 1000));
+      return { error: true, status: 0, body: `Request timed out after ${secs}s` };
     }
     const cause = err.cause?.message ? ` (${err.cause.message})` : "";
     return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
@@ -4468,6 +4478,41 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Context Retriever — dynamic per-tenant generated tools (US-30.5)
+// ---------------------------------------------------------------------------
+//
+// Epic 30 lets a tenant declare ENTITIES whose schema auto-generates agent tools
+// (`cr_filter_<entity>_by_<field>`, `cr_search_<entity>`) over governed loopctl
+// data. Those specs are generated SERVER-SIDE per tenant, so the MCP server can't
+// hard-code them in the static TOOLS array — it must fetch them at ListTools time
+// and append them, then dispatch any unknown `cr_`-prefixed CallTool to one
+// generic executor endpoint.
+//
+// Trust model: the stdio MCP process is ONE-TENANT-PER-PROCESS — the process key
+// (LOOPCTL_AGENT_KEY) resolves to a tenant server-side, and GET /retrieve/tools
+// returns ONLY that tenant's generated specs. The client never picks a tenant, so
+// cross-tenant listing/calling is impossible by construction (AC-30.5.3). Both the
+// listing fetch and the generic call ride the SAME `apiCall` path as static read
+// tools, so they carry identical auth + witness/STH headers (AC-30.5.4).
+
+// The generated-tools runtime (fetch + short-timeout/negative-TTL cache + generic
+// dispatch) lives in lib/generated-tools.js so its caching/TTL/negative-cache and
+// error-classification edge cases are exercised DIRECTLY by the test suite rather
+// than a hand-copied mirror. We wire the SHIPPED `apiCall` + static tool names +
+// `toContent` into it here. The process key (LOOPCTL_AGENT_KEY) is read per-call via
+// a getter so it rides the SAME auth + witness/STH path as every static read tool
+// (AC-30.5.4), and the static-name set powers the defense-in-depth drop of any spec
+// that isn't `cr_`-prefixed or that collides with a built-in tool name.
+const generatedToolsRuntime = createGeneratedToolsRuntime({
+  apiCall,
+  agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  staticToolNames: new Set(TOOLS.map((t) => t.name)),
+  toContent,
+});
+
+const { fetchGeneratedTools, callGeneratedTool } = generatedToolsRuntime;
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
@@ -4481,9 +4526,13 @@ const server = new Server(
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // Static hand-maintained tools PLUS the calling tenant's per-tenant generated
+  // Context Retriever tools (US-30.5). fetchGeneratedTools degrades to the static
+  // tools (returns []/cache) on any fetch failure, so listing never errors.
+  const generated = await fetchGeneratedTools();
+  return { tools: [...TOOLS, ...generated] };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -4753,6 +4802,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await getAcceptanceCriteria(args);
 
     default:
+      // Per-tenant generated Context Retriever tools (US-30.5) are not in the
+      // static switch — dispatch any unknown `cr_`-prefixed name generically to
+      // the /retrieve/:entity executor. Static tools are handled above, so this
+      // never regresses them (AC-30.5.2).
+      if (typeof name === "string" && name.startsWith(GENERATED_TOOL_PREFIX)) {
+        return await callGeneratedTool(name, args);
+      }
       throw new Error(`Unknown tool: ${name}`);
   }
 });

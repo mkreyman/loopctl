@@ -5,6 +5,62 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.40.0 — 2026-07-10 (US-30.5 — dynamic per-tenant Context Retriever tools)
+
+### Added
+
+- **Dynamic MCP tool listing.** `ListTools` now returns the static hand-maintained
+  tools PLUS the calling tenant's **generated** Context Retriever tools (Epic 30),
+  fetched at listing time from `GET /api/v1/retrieve/tools` through the shared
+  authenticated `apiCall` (agent key, same witness/STH path as every read tool).
+  When a tenant declares an entity, loopctl auto-generates
+  `cr_filter_<entity>_by_<field>` and `cr_search_<entity>` tools over its
+  allowlisted columns; those now appear in the agent's tool list automatically. If
+  the `/retrieve/tools` fetch fails, the listing **degrades to the static tools**
+  (logged, never errors the whole listing). The dynamic fetch uses a **short (5s)
+  timeout** and a **positive (30s) + negative (5s) in-process cache** so a
+  Context-Retriever backend blip degrades to the static surface fast and does NOT
+  re-issue a blocking fetch on every subsequent `ListTools`.
+- **Generic dispatch of `cr_`-prefixed calls.** `CallTool` now routes any unknown
+  tool name starting with `cr_` to a single generic handler that POSTs to `POST
+  /api/v1/retrieve/:entity`. The `(entity, field, operation)` are read from the
+  STRUCTURED metadata carried on each generated spec (US-30.2), never by splitting
+  the tool name (entity/field names contain underscores). Static tools dispatch
+  exactly as before — no regression. Resolving a generated-tool call whose name
+  isn't yet cached **forces one fresh `/retrieve/tools` fetch** (bypassing the warm
+  TTL) so a tool created server-side since the last listing resolves instead of
+  being reported as unknown; a call that stays unresolved returns **503
+  temporarily-unavailable** when the tools fetch itself failed (retryable) versus a
+  definitive **404** only when the listing was healthy and the name is genuinely not
+  this tenant's.
+
+### Review hardening
+
+- **Short timeout + negative caching for the init-time listing fetch.** `ListTools`
+  is agent-blocking at connection setup; the generated-tools fetch now carries its
+  own short `AbortSignal` budget and negative-caches failures, so a backend outage
+  can't stall the whole tool surface (all static tools included) with repeated
+  full-timeout blocking fetches. Per-request timeout override threaded through the
+  shared `apiCall` → witness client.
+- **Defense-in-depth on the `cr_` invariant.** The prefix is re-checked at
+  listing/metadata population, not only at dispatch: any server spec whose name
+  isn't `cr_`-prefixed, or that collides with a static tool name, is dropped and
+  logged — closing a tool-confusion / description-spoofing vector where
+  tenant-controlled text could be shown under a trusted built-in tool's identity.
+- **Extracted `lib/generated-tools.js`.** The fetch/cache/TTL/negative-cache/
+  dispatch runtime moved out of the non-importable `index.js` entry point into a
+  side-effect-free module (like `lib/http-helpers.js`), so its edge cases are
+  exercised DIRECTLY by the test suite instead of a hand-copied mirror.
+
+### Security / trust model
+
+- Generated tools are **tenant-scoped by construction**: the stdio MCP process is
+  one-tenant-per-process, so `/retrieve/tools` returns only the process key's
+  tenant's specs and a generic call executes under that key's scope. The client
+  never selects a tenant. Both the listing fetch and the generic call ride the
+  SAME `apiCall`/witness path as static reads, so they carry identical
+  auth + witness/STH headers — no second, weaker HTTP path was introduced.
+
 ## 2.38.0 — 2026-07-10 (US-29.4 — memory_promote tool)
 
 ### Added

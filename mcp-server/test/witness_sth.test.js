@@ -402,6 +402,42 @@ describe("createWitnessClient — cold-start singleflight (MEDIUM-6)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// createWitnessClient.send — per-request timeout override (US-30.5)
+// ---------------------------------------------------------------------------
+
+describe("createWitnessClient.send — per-request timeout override", () => {
+  const req = { url: "https://x/api/v1/tenants/me", method: "GET", headers: {} };
+
+  // Inject makeTimeoutSignal so we can observe the EFFECTIVE per-attempt timeout an
+  // AbortSignal.timeout would use but does not expose.
+  function captureTimeouts(clientOpts = {}) {
+    const timeouts = [];
+    const { fetchImpl } = spyFetch([fakeResponse(200, { "x-loopctl-current-sth": STH_A })]);
+    const client = createWitnessClient({
+      fetchImpl,
+      makeTimeoutSignal: (ms) => {
+        timeouts.push(ms);
+        return undefined;
+      },
+      ...clientOpts,
+    });
+    return { client, timeouts };
+  }
+
+  test("a per-request timeoutMs overrides the client default", async () => {
+    const { client, timeouts } = captureTimeouts({ timeoutMs: 30_000 });
+    await client.send({ ...req, timeoutMs: 5_000 });
+    assert.deepEqual(timeouts, [5_000], "short per-request budget used, not the 30s default");
+  });
+
+  test("without a per-request timeoutMs the client default applies", async () => {
+    const { client, timeouts } = captureTimeouts({ timeoutMs: 12_345 });
+    await client.send(req);
+    assert.deepEqual(timeouts, [12_345]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Persistence lifecycle (with the in-memory fs)
 // ---------------------------------------------------------------------------
 
@@ -497,7 +533,7 @@ describe("#298 wiring: per-key witness client", () => {
   test("apiCall sends through the per-key client and passes the symlink-safe fs", () => {
     assert.match(
       INDEX_SRC,
-      /await witnessClientFor\(key\)\.send\(\{ url, method, headers, serializedBody \}\)/,
+      /await witnessClientFor\(key\)\.send\(\{ url, method, headers, serializedBody, timeoutMs \}\)/,
     );
     assert.match(
       INDEX_SRC,
