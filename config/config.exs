@@ -458,6 +458,14 @@ config :loopctl, :knowledge_lint_max_conflict_promotions, 500
 # linking logic can be unit-tested deterministically off the timed heavy-read path.
 config :loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch
 
+# Hybrid resolver (US-31.2): a curated candidate wins `:curated` ONLY when its
+# final_score clears this ABSOLUTE threshold AND beats the best retrieved
+# candidate by at least this margin (see Knowledge.resolve_provenance/4) — a curated
+# doc that is merely semantically near a query it doesn't answer must fall to
+# `:retrieved`, never a false-authoritative claim (#305/#306).
+config :loopctl, :knowledge_hybrid_curated_threshold, 0.75
+config :loopctl, :knowledge_hybrid_curated_margin, 0.1
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

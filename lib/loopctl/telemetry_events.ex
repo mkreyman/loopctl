@@ -133,6 +133,30 @@ defmodule Loopctl.TelemetryEvents do
   """
   def knowledge_semantic_fallback, do: [:loopctl, :knowledge, :semantic_fallback]
 
+  @doc """
+  A hybrid-resolver (US-31.2, `Loopctl.Knowledge.hybrid_search/3`) provenance
+  decision fired. Turns the two dimensions `maybe_record_search_access/5` structurally
+  CANNOT observe — a MISS (empty result page — `article_access_events.article_id` is
+  NOT NULL) and a keyless call (no `api_key_id` to attribute a DB row to) — into an
+  always-emitted signal, so "curated vs retrieved" and "hit vs miss" stay observable
+  per tenant even off the `article_access_events`/`RetrievalMetrics` path.
+
+  Fires on EVERY `hybrid_search/3` call, regardless of result-page emptiness or
+  `:api_key_id` presence.
+
+  ## Payload (id/atom/bool only — NEVER article content or the query text)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{tenant_id, provenance, hit}` where `provenance` is `"curated"` |
+      `"retrieved"` (a BOUNDED 2-value tag) and `hit` is `true`/`false` (the page was
+      non-empty / empty).
+
+  Aggregated by `Loopctl.Telemetry.ScaleMetrics` as a counter tagged by
+  `[:provenance, :hit, :tenant_id]` (tenant cap-gated, same convention as the other
+  scale counters).
+  """
+  def knowledge_hybrid_provenance, do: [:loopctl, :knowledge, :hybrid_provenance]
+
   @doc "Returns all defined event names for attachment"
   def all_events do
     [
@@ -146,7 +170,8 @@ defmodule Loopctl.TelemetryEvents do
       audit_log_write(),
       vector_search_under_fill(),
       db_error(),
-      knowledge_semantic_fallback()
+      knowledge_semantic_fallback(),
+      knowledge_hybrid_provenance()
     ]
   end
 end
