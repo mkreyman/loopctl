@@ -33,92 +33,21 @@ defmodule Loopctl.E2E.ContextRetrieverJourneyTest do
 
   setup :verify_on_exit!
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
-  alias Loopctl.Projects.Project
-  alias Loopctl.Repo
-  alias Loopctl.Tenants.Tenant
-  alias Loopctl.WorkBreakdown.Epic
-  alias Loopctl.WorkBreakdown.Story
-
-  import Ecto.Query
+  import Loopctl.ContextRetrieverE2EHelpers
 
   @tenant_marker "crjourney-"
 
   setup_all do
-    sweep_marker_tenants()
-    on_exit(&sweep_marker_tenants/0)
+    sweep_marker_tenants(@tenant_marker)
+    on_exit(fn -> sweep_marker_tenants(@tenant_marker) end)
     :ok
   end
 
-  defp sweep_marker_tenants do
-    Sandbox.unboxed_run(AdminRepo, fn ->
-      AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{@tenant_marker}%")))
-    end)
-  end
-
-  # A committed, human-anchored tenant visible to BOTH the AdminRepo auth path and
-  # the Repo executor path (see moduledoc).
-  defp commit_tenant do
-    seq = System.unique_integer([:positive])
-    id = Ecto.UUID.generate()
-
-    Sandbox.unboxed_run(AdminRepo, fn ->
-      %Tenant{}
-      |> Tenant.create_changeset(%{
-        name: "T#{seq}",
-        slug: "#{@tenant_marker}#{seq}",
-        email: "#{@tenant_marker}#{seq}@example.com"
-      })
-      |> Ecto.Changeset.put_change(:id, id)
-      |> Ecto.Changeset.put_change(:trust_tier, :human_anchored)
-      |> AdminRepo.insert!()
-    end)
-
-    AdminRepo.get!(Tenant, id)
-  end
-
-  defp user_key(tenant_id) do
-    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :user})
-    raw
-  end
-
-  defp agent_key(tenant_id) do
-    agent = fixture(:agent, %{tenant_id: tenant_id})
-    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
-    raw
-  end
-
-  # Backing rows are seeded on the Repo connection (the executor reads via
-  # Repo.with_tenant). A story needs a project + epic; the committed tenant
-  # satisfies the FK, the Repo inserts roll back at test exit.
-  defp seed_project(tenant_id, attrs \\ %{}) do
-    %Project{tenant_id: tenant_id}
-    |> Project.create_changeset(build(:project, attrs))
-    |> Repo.insert!()
-  end
-
-  defp seed_epic(tenant_id, project_id) do
-    %Epic{tenant_id: tenant_id, project_id: project_id}
-    |> Epic.create_changeset(build(:epic, %{}))
-    |> Repo.insert!()
-  end
-
-  defp seed_story(tenant_id, attrs) do
-    project = seed_project(tenant_id)
-    epic = seed_epic(tenant_id, project.id)
-
-    %Story{tenant_id: tenant_id, project_id: project.id, epic_id: epic.id}
-    |> Story.create_changeset(build(:story, attrs))
-    |> Repo.insert!()
-  end
-
-  defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
-
-  # A fresh conn carrying the witness STH header (each dispatched request needs its
-  # own conn).
-  defp fresh_conn,
-    do: put_req_header(build_conn(), "x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
+  # The committed-tenant scaffolding (sweep, commit_tenant, *_key, seed_*, auth,
+  # fresh_conn) is single-sourced in `Loopctl.ContextRetrieverE2EHelpers` so its
+  # security-critical semantics stay identical to the security suite. Only the
+  # per-suite slug marker differs.
+  defp commit_tenant, do: commit_tenant(@tenant_marker)
 
   # Mirror of the MCP client's `buildRetrieveBody(metadata, args)`
   # (`mcp-server/lib/http-helpers.js`): derive the `POST /retrieve/:entity` body

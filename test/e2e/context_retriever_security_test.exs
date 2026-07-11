@@ -34,86 +34,27 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import Loopctl.ContextRetrieverE2EHelpers
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.ContextRetriever.Registry
-  alias Loopctl.Projects.Project
   alias Loopctl.Repo
-  alias Loopctl.Tenants.Tenant
-  alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
   @tenant_marker "crsec-"
 
   setup_all do
-    sweep_marker_tenants()
-    on_exit(&sweep_marker_tenants/0)
+    sweep_marker_tenants(@tenant_marker)
+    on_exit(fn -> sweep_marker_tenants(@tenant_marker) end)
     :ok
   end
 
-  defp sweep_marker_tenants do
-    Sandbox.unboxed_run(AdminRepo, fn ->
-      AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{@tenant_marker}%")))
-    end)
-  end
-
-  defp commit_tenant do
-    seq = System.unique_integer([:positive])
-    id = Ecto.UUID.generate()
-
-    Sandbox.unboxed_run(AdminRepo, fn ->
-      %Tenant{}
-      |> Tenant.create_changeset(%{
-        name: "T#{seq}",
-        slug: "#{@tenant_marker}#{seq}",
-        email: "#{@tenant_marker}#{seq}@example.com"
-      })
-      |> Ecto.Changeset.put_change(:id, id)
-      |> Ecto.Changeset.put_change(:trust_tier, :human_anchored)
-      |> AdminRepo.insert!()
-    end)
-
-    AdminRepo.get!(Tenant, id)
-  end
-
-  defp user_key(tenant_id) do
-    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :user})
-    raw
-  end
-
-  defp agent_key(tenant_id) do
-    agent = fixture(:agent, %{tenant_id: tenant_id})
-    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
-    raw
-  end
-
-  defp seed_project(tenant_id, attrs \\ %{}) do
-    %Project{tenant_id: tenant_id}
-    |> Project.create_changeset(build(:project, attrs))
-    |> Repo.insert!()
-  end
-
-  defp seed_epic(tenant_id, project_id) do
-    %Epic{tenant_id: tenant_id, project_id: project_id}
-    |> Epic.create_changeset(build(:epic, %{}))
-    |> Repo.insert!()
-  end
-
-  defp seed_story(tenant_id, attrs) do
-    project = seed_project(tenant_id)
-    epic = seed_epic(tenant_id, project.id)
-
-    %Story{tenant_id: tenant_id, project_id: project.id, epic_id: epic.id}
-    |> Story.create_changeset(build(:story, attrs))
-    |> Repo.insert!()
-  end
-
-  defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
-
-  defp fresh_conn,
-    do: put_req_header(build_conn(), "x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
+  # The committed-tenant scaffolding (sweep, commit_tenant, *_key, seed_*, auth,
+  # fresh_conn) is single-sourced in `Loopctl.ContextRetrieverE2EHelpers` so its
+  # security-critical semantics stay identical to the journey suite. Only the
+  # per-suite slug marker differs.
+  defp commit_tenant, do: commit_tenant(@tenant_marker)
 
   # A `story` entity: title (filterable + searchable), number (filterable).
   defp define_story_entity(user_key) do
@@ -177,6 +118,17 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
 
       assert %{"results" => [], "meta" => %{"total_count" => 0}} = json_response(filter_inj, 200)
 
+      # POSITIVE CONTROL for SEARCH: the seeded marker is genuinely searchable
+      # (title is a searchable field), so the 0-row injection search below means
+      # "injection was neutralized", not "search matches nothing / is broken".
+      legit_search =
+        fresh_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/story", %{"op" => "search", "query" => marker})
+
+      assert %{"results" => [_one], "meta" => %{"total_count" => 1}} =
+               json_response(legit_search, 200)
+
       # Injection in a SEARCH query → literal tsquery term, matches nothing, and
       # the table is NOT dropped.
       search_inj =
@@ -189,8 +141,15 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
 
       assert %{"results" => [], "meta" => %{"total_count" => 0}} = json_response(search_inj, 200)
 
-      # The stories table still exists and is queryable — the payload was a literal.
-      assert Repo.aggregate(from(s in Story), :count, :id) >= 0
+      # The stories table still exists (a DROP would make this raise). Count is
+      # tenant-scoped via Repo.with_tenant/2 so RLS (ENABLE, loopctl_app role)
+      # cannot legitimately hide the row: our seeded story survives the payload.
+      assert {:ok, story_count} =
+               Repo.with_tenant(tenant.id, fn ->
+                 Repo.aggregate(from(s in Story), :count, :id)
+               end)
+
+      assert story_count >= 1
     end
   end
 
