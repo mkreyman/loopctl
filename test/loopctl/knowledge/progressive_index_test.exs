@@ -210,6 +210,40 @@ defmodule Loopctl.Knowledge.ProgressiveIndexTest do
       assert drilled.id == marked.id
       assert drilled.body == "system body"
     end
+
+    test "drill rejects a draft or archived system canonical by id (review finding, medium)" do
+      tenant = fixture(:tenant)
+
+      {:ok, draft_system} =
+        Knowledge.create_article(
+          tenant.id,
+          %{
+            scope: :system,
+            status: :draft,
+            category: :reference,
+            title: "Draft System Canonical",
+            body: "draft system body"
+          }
+        )
+
+      {:ok, archived_system} =
+        Knowledge.create_article(
+          tenant.id,
+          %{
+            scope: :system,
+            status: :archived,
+            category: :reference,
+            title: "Archived System Canonical",
+            body: "archived system body"
+          }
+        )
+
+      # Neither is reachable via the tenant-scoped get_article/3 path (nil
+      # tenant_id), so the ONLY way to probe this is the system-canonical
+      # fallback drill_system_canonical/3 exercises directly.
+      assert {:error, :not_found} = Knowledge.progressive_drill(tenant.id, draft_system.id)
+      assert {:error, :not_found} = Knowledge.progressive_drill(tenant.id, archived_system.id)
+    end
   end
 
   # --- AC-31.3.2: the cap is configurable and documented ---
@@ -218,6 +252,21 @@ defmodule Loopctl.Knowledge.ProgressiveIndexTest do
     test "read from application config, overridable in config/test.exs" do
       assert Knowledge.progressive_top_k() == 3
       assert Knowledge.min_hub_relates_to() == 3
+    end
+
+    test "an oversized :limit override is clamped to max_relevance_page_size/0 (review finding, low)" do
+      tenant = fixture(:tenant)
+      topic = "ClampedLimitTopicEFGHI"
+
+      fixture(:article, %{tenant_id: tenant.id, status: :published, title: topic})
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.progressive_index(tenant.id, topic,
+                 limit: 1_000_000,
+                 hub_enrich: false
+               )
+
+      assert meta.top_k == Knowledge.max_relevance_page_size()
     end
 
     test "a :limit opt overrides the default top-K cap" do
@@ -301,6 +350,105 @@ defmodule Loopctl.Knowledge.ProgressiveIndexTest do
                Knowledge.progressive_index(tenant.id, topic, hub_enrich: false)
 
       assert Enum.map(stubs, & &1.id) == [hub.id]
+    end
+  end
+
+  # --- #163 agent-visibility enforcement (review finding, high) ---
+
+  describe "progressive_index/3 - agent visibility scope (#163)" do
+    test "another agent's private/owner memory never surfaces as an index stub" do
+      tenant = fixture(:tenant)
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+      topic = "PrivateMemoryTopicLMNOP"
+
+      private =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "#{topic} Private Memory",
+          body: "PRIVATE BODY — must not leak",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+        })
+
+      shared =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "#{topic} Shared"
+        })
+
+      # A caller with no visibility_agent_id (higher role) sees everything.
+      assert {:ok, %{stubs: unscoped_stubs}} = Knowledge.progressive_index(tenant.id, topic)
+      unscoped_ids = Enum.map(unscoped_stubs, & &1.id)
+      assert private.id in unscoped_ids
+      assert shared.id in unscoped_ids
+
+      # The NON-owning agent must never see the private memory's stub -- no
+      # title, no body-derived summary.
+      assert {:ok, %{stubs: other_stubs}} =
+               Knowledge.progressive_index(tenant.id, topic,
+                 visibility_agent_id: to_string(other_agent.id)
+               )
+
+      other_ids = Enum.map(other_stubs, & &1.id)
+      refute private.id in other_ids
+      assert shared.id in other_ids
+      refute Enum.any?(other_stubs, fn stub -> stub.title == "#{topic} Private Memory" end)
+
+      # The OWNER, by contrast, does see its own private memory's stub.
+      assert {:ok, %{stubs: owner_stubs}} =
+               Knowledge.progressive_index(tenant.id, topic,
+                 visibility_agent_id: to_string(owner_agent.id)
+               )
+
+      assert private.id in Enum.map(owner_stubs, & &1.id)
+    end
+
+    test "a private memory reachable only via hub :relates_to traversal is filtered for a non-owning agent" do
+      tenant = fixture(:tenant)
+      owner_agent = fixture(:agent, %{tenant_id: tenant.id})
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+      topic = "HubPrivateNeighborTopicRSTU"
+
+      hub =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "#{topic} Hub"
+        })
+
+      private_neighbor =
+        curated_article(tenant.id, %{
+          title: "Private Neighbor #{topic}",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner_agent.id)}
+        })
+
+      relates_to(tenant.id, hub, private_neighbor)
+
+      # min_hub_relates_to is configured to 3 in test.exs -- pad two more
+      # outgoing :relates_to links so `hub` clears the operational-hub
+      # threshold and enrichment actually runs.
+      for n <- 1..2 do
+        padding = curated_article(tenant.id, %{title: "Padding Target #{n} #{topic}"})
+        relates_to(tenant.id, hub, padding)
+      end
+
+      assert {:ok, %{stubs: other_stubs}} =
+               Knowledge.progressive_index(tenant.id, topic,
+                 limit: 10,
+                 visibility_agent_id: to_string(other_agent.id)
+               )
+
+      refute private_neighbor.id in Enum.map(other_stubs, & &1.id)
+
+      assert {:ok, %{stubs: owner_stubs}} =
+               Knowledge.progressive_index(tenant.id, topic,
+                 limit: 10,
+                 visibility_agent_id: to_string(owner_agent.id)
+               )
+
+      assert private_neighbor.id in Enum.map(owner_stubs, & &1.id)
     end
   end
 

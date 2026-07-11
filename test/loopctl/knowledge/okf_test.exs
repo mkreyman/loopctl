@@ -59,6 +59,56 @@ defmodule Loopctl.Knowledge.OKFTest do
     end
   end
 
+  describe "derive_description/1 (US-31.3 AC-31.3.1; review finding, low: byte cap vs multibyte text)" do
+    test "an ASCII body line under 160 bytes is returned as-is" do
+      article = %{body: "A short summary line.", metadata: %{}}
+
+      assert OKF.derive_description(article) == "A short summary line."
+    end
+
+    test "a body line is truncated to <= 160 bytes plus the ellipsis, never 160 GRAPHEMES" do
+      # 200 multibyte graphemes (é is 2 bytes in UTF-8) -- slicing by grapheme
+      # count (the old, buggy behavior) would return 160 of these (320 bytes),
+      # blowing well past the documented 160-byte cap.
+      long_multibyte_line = String.duplicate("é", 200)
+      article = %{body: long_multibyte_line, metadata: %{}}
+
+      summary = OKF.derive_description(article)
+
+      # Byte size of the truncated portion (excluding the 3-byte "…" ellipsis)
+      # must not exceed the 160-byte cap.
+      ellipsis = "…"
+      without_ellipsis = String.trim_trailing(summary, ellipsis)
+      assert byte_size(without_ellipsis) <= 160
+      assert String.ends_with?(summary, ellipsis)
+      # Sanity: genuinely truncated, not the full 200-grapheme/400-byte input.
+      assert String.length(without_ellipsis) < 200
+    end
+
+    test "an untruncated multibyte line at or under the byte cap is returned without an ellipsis" do
+      # 79 "é" graphemes = 158 bytes, under the 160-byte cap -- must round-trip
+      # unchanged (no ellipsis appended).
+      short_multibyte_line = String.duplicate("é", 79)
+      article = %{body: short_multibyte_line, metadata: %{}}
+
+      assert OKF.derive_description(article) == short_multibyte_line
+    end
+
+    test "the metadata['okf']['description'] path returns the description verbatim, untruncated" do
+      # Documented (not just implied): an author-supplied OKF description is
+      # returned as-is even when it exceeds the 160-byte cap that applies to
+      # the body-derived fallback -- it isn't body text needing clipping.
+      long_description = String.duplicate("word ", 60)
+
+      article = %{
+        body: "irrelevant body",
+        metadata: %{"okf" => %{"description" => long_description}}
+      }
+
+      assert OKF.derive_description(article) == long_description
+    end
+  end
+
   describe "build_bundle/2 cap (#2 TOCTOU: enforced on the MATERIALIZED set)" do
     test "exactly at the cap succeeds; one over rejects (peek-and-reject, no silent truncation)" do
       tenant = fixture(:tenant)

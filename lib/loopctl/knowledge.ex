@@ -6982,6 +6982,12 @@ defmodule Loopctl.Knowledge do
     - `:hub_enrich` -- set `false` to disable `:relates_to` hub enrichment and
       return only direct topic matches (default `true`)
     - `:category` -- restrict seed matching to a single category atom
+    - `:visibility_agent_id` -- the calling agent's id (#163). Forwarded to the
+      seed `search_keyword/3` call and re-applied to hub-neighbor discovery and
+      the final stub projection, so another agent's `private`/`owner` memory
+      never surfaces as an index stub within the same tenant. `nil` (the
+      default, used by non-agent/higher-role callers) is a no-op — everything
+      is visible.
 
   ## Returns
 
@@ -6996,23 +7002,30 @@ defmodule Loopctl.Knowledge do
           | {:error, atom()}
           | {:error, atom(), String.t()}
   def progressive_index(tenant_id, topic, opts \\ []) when is_binary(tenant_id) do
-    top_k = Keyword.get(opts, :limit, progressive_top_k())
+    # Clamped exactly like `search_keyword/3`'s own `:limit` (AC-31.3.2's
+    # "bounded" top-K must hold even for an explicit caller override, not just
+    # the default -- otherwise a densely-linked hub could still flood context).
+    top_k =
+      opts |> Keyword.get(:limit, progressive_top_k()) |> max(1) |> min(@max_relevance_page_size)
+
     seed_limit = Keyword.get(opts, :seed_limit, top_k * 5)
     hub_enrich? = Keyword.get(opts, :hub_enrich, true)
     category = Keyword.get(opts, :category)
+    vis = Keyword.get(opts, :visibility_agent_id)
 
     with {:ok, %{results: seed_results}} <-
            search_keyword(tenant_id, topic,
              status: :published,
              limit: seed_limit,
              category: category,
+             visibility_agent_id: vis,
              _skip_record_access: true
            ) do
       seed_ids = Enum.map(seed_results, & &1.id)
 
       hub_neighbor_ids =
         if hub_enrich? do
-          progressive_hub_neighbor_ids(tenant_id, seed_ids)
+          progressive_hub_neighbor_ids(tenant_id, seed_ids, vis)
         else
           []
         end
@@ -7021,7 +7034,7 @@ defmodule Loopctl.Knowledge do
 
       # Membership-only scan restricted to the (already small, capped) candidate
       # pool -- never the tenant's entire curated/system-canonical corpus. Mirrors
-      # the `ids: raw_target_ids` scoping `progressive_hub_neighbor_ids/2` already
+      # the `ids: raw_target_ids` scoping `progressive_hub_neighbor_ids/3` already
       # uses below.
       curated_ids =
         tenant_id
@@ -7033,7 +7046,7 @@ defmodule Loopctl.Knowledge do
 
       stubs =
         tenant_id
-        |> fetch_stub_projection(capped_ids)
+        |> fetch_stub_projection(capped_ids, vis)
         |> order_stubs(capped_ids)
         |> Enum.map(&build_stub/1)
 
@@ -7054,9 +7067,14 @@ defmodule Loopctl.Knowledge do
   # links), pulls their :relates_to targets bounded by the SAME per-node fan-out
   # cap `graph_traversal/3` uses, then narrows to the curated subset — never
   # returning a raw (potentially unbounded-fan-out) neighbor set uncurated.
-  defp progressive_hub_neighbor_ids(_tenant_id, []), do: []
+  #
+  # `vis` (#163): the hub targets are discovered via `ArticleLink`/
+  # `list_curated_sources/2`, NEITHER of which is visibility-scoped, so a
+  # private/owner memory reachable via a `:relates_to` edge is re-filtered here
+  # before it can ever reach the candidate pool.
+  defp progressive_hub_neighbor_ids(_tenant_id, [], _vis), do: []
 
-  defp progressive_hub_neighbor_ids(tenant_id, seed_ids) do
+  defp progressive_hub_neighbor_ids(tenant_id, seed_ids, vis) do
     hub_ids = operational_hub_ids(tenant_id, seed_ids, min_hub_relates_to())
 
     raw_target_ids =
@@ -7064,12 +7082,23 @@ defmodule Loopctl.Knowledge do
       |> hub_relates_to_targets(hub_ids, max_graph_neighbors_per_node())
       |> Enum.uniq()
 
-    list_curated_sources(tenant_id, select: :id, ids: raw_target_ids)
+    tenant_id
+    |> list_curated_sources(select: :id, ids: raw_target_ids)
+    |> filter_visible_candidate_ids(vis)
+  end
+
+  defp filter_visible_candidate_ids([], _vis), do: []
+  defp filter_visible_candidate_ids(ids, nil), do: ids
+
+  defp filter_visible_candidate_ids(ids, vis) do
+    from(a in Article, where: a.id in ^ids, select: a.id)
+    |> maybe_filter_by_visibility(vis)
+    |> AdminRepo.all()
   end
 
   # Articles among `seed_ids` with >= `min_count` outgoing :relates_to links
   # (the operational hub definition, AC-31.3.4 — never a modeled type). The only
-  # caller (`progressive_hub_neighbor_ids/2`) already short-circuits an empty
+  # caller (`progressive_hub_neighbor_ids/3`) already short-circuits an empty
   # `seed_ids`, so this always receives a non-empty list.
   defp operational_hub_ids(tenant_id, seed_ids, min_count) do
     from(l in ArticleLink,
@@ -7118,10 +7147,14 @@ defmodule Loopctl.Knowledge do
   # a dense hub's uncapped neighbors never reach this query. `tenant_id or scope
   # == :system` mirrors the explicit tenant-plus-system-canonical predicate used
   # throughout this module (AC-31.3.4 tenant isolation; system participates per
-  # US-31.1 AC-31.1.3).
-  defp fetch_stub_projection(_tenant_id, []), do: []
+  # US-31.1 AC-31.1.3). `maybe_filter_by_visibility/2` is the LAST line of
+  # defense-in-depth for #163: the seed and hub-neighbor pools are already
+  # visibility-filtered upstream (`search_keyword/3`, `filter_visible_candidate_ids/2`),
+  # but this is the query that actually reads title/body — it must never trust
+  # the caller wired only one of those two upstream gates correctly.
+  defp fetch_stub_projection(_tenant_id, [], _vis), do: []
 
-  defp fetch_stub_projection(tenant_id, ids) do
+  defp fetch_stub_projection(tenant_id, ids, vis) do
     from(a in Article,
       where: a.id in ^ids,
       where: a.tenant_id == ^tenant_id or a.scope == :system,
@@ -7133,6 +7166,7 @@ defmodule Loopctl.Knowledge do
         metadata: a.metadata
       }
     )
+    |> maybe_filter_by_visibility(vis)
     |> AdminRepo.all()
   end
 
@@ -7162,7 +7196,7 @@ defmodule Loopctl.Knowledge do
 
   Mirrors `progressive_index/3`'s OWN scope (AC-31.3.3 vs AC-31.3.4
   consistency): `progressive_index/3` surfaces both tenant-owned articles AND
-  system-scope (`tenant_id: nil`) curated canonicals (`fetch_stub_projection/2`
+  system-scope (`tenant_id: nil`) curated canonicals (`fetch_stub_projection/3`
   reads `where a.tenant_id == ^tenant_id or a.scope == :system`), so the drill
   step must be able to open EITHER. It tries the tenant-scoped fetch first
   (`get_article/3`); only when that misses does it fall back to the
@@ -7184,7 +7218,18 @@ defmodule Loopctl.Knowledge do
   end
 
   defp drill_system_canonical(tenant_id, article_id, opts) do
-    case AdminRepo.one(from(a in Article, where: a.id == ^article_id and a.scope == :system)) do
+    # `status == :published` (mirrors `get_system_article_by_slug/1` and
+    # `list_system_articles/1`) -- this is the ONLY tenant-facing read path for
+    # a system canonical's body (get_article/2 requires a tenant_id match,
+    # which nil-tenant system rows never satisfy), so unlike
+    # `fetch_curatable_article/2` (the privileged, role-gated curation path
+    # that legitimately needs drafts), this must never expose a draft or
+    # archived system canonical by id.
+    case AdminRepo.one(
+           from(a in Article,
+             where: a.id == ^article_id and a.scope == :system and a.status == :published
+           )
+         ) do
       nil -> {:error, :not_found}
       article -> finalize_article_read(tenant_id, article, opts)
     end
