@@ -111,6 +111,19 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/memory/promote"},
                {:delete, "/api/v1/memory/:id"},
 
+               # Context Retriever (Epic 30, US-30.4) — `POST /retrieve/:entity` is a
+               # POST-shaped READ (a governed filter/search over the tenant's OWN
+               # structured records), NOT a mutation. Querying is the floor-agent /
+               # KB-tier surface (AC-30.4.2), so gating it behind human-anchor would
+               # make an agent-rooted tenant unable to query its own data — the
+               # opposite of intent. The executor dual tenant-scopes every read (RLS +
+               # explicit predicate) and re-validates the field against the SERVER
+               # allowlist, so no data crosses tenants. DEFINING/mutating an entity
+               # definition (POST/PATCH/DELETE /entities) IS tier-gated — see
+               # ContextRetrieverController's RequireHumanAnchor plug — so those routes
+               # are (correctly) absent from this allowlist and asserted to 403.
+               {:post, "/api/v1/retrieve/:entity"},
+
                # UI test runs (#4/#5 reviewed rationale): a QA/tooling surface,
                # NOT work-breakdown state. Every route is nested under
                # `/projects/:project_id/...` and creating a project

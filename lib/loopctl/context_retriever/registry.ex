@@ -32,6 +32,7 @@ defmodule Loopctl.ContextRetriever.Registry do
   alias Ecto.Multi
   alias Loopctl.Audit
   alias Loopctl.ContextRetriever.Entity
+  alias Loopctl.ContextRetriever.ToolGenerator
   alias Loopctl.Repo
 
   @default_max_entities 50
@@ -60,6 +61,26 @@ defmodule Loopctl.ContextRetriever.Registry do
       end)
 
     entities
+  end
+
+  @doc """
+  Returns the generated agent tool specs for ALL of `tenant_id`'s entity
+  definitions — the US-30.2 `ToolGenerator` fanned out over `for_tenant/1`.
+
+  This is THE canonical context entry point for a tenant's tool surface. Both
+  the US-30.4 HTTP layer (`GET /api/v1/retrieve/tools`) and the US-30.5 MCP
+  dynamic tool listing call this instead of re-deriving the
+  `for_tenant/1 |> Enum.flat_map(&ToolGenerator.specs_for/1)` fan-out themselves,
+  so the Context-Retriever domain fan-out stays inside the context rather than
+  leaking into the thin JSON controller. Scope-enforced via `for_tenant/1` (RLS):
+  another tenant's entities never contribute. A tenant with no definitions (or
+  only fieldless-after-filter definitions) gets `[]`.
+  """
+  @spec tool_specs(Ecto.UUID.t()) :: [ToolGenerator.spec()]
+  def tool_specs(tenant_id) when is_binary(tenant_id) do
+    tenant_id
+    |> for_tenant()
+    |> Enum.flat_map(&ToolGenerator.specs_for/1)
   end
 
   @doc """
@@ -186,9 +207,186 @@ defmodule Loopctl.ContextRetriever.Registry do
     end
   end
 
+  @doc """
+  Returns `tenant_id`'s entity definition with id `id`, or `nil`.
+
+  Scope-enforced via RLS + an explicit `tenant_id` predicate: an id belonging to
+  a different tenant returns `nil` (no cross-tenant existence leak). A
+  syntactically invalid UUID returns `nil` rather than raising, so a controller
+  can map a bad path id to a clean 404.
+  """
+  @spec get_entity_by_id(Ecto.UUID.t(), String.t()) :: Entity.t() | nil
+  def get_entity_by_id(tenant_id, id) when is_binary(tenant_id) and is_binary(id) do
+    case Ecto.UUID.cast(id) do
+      {:ok, uuid} ->
+        {:ok, entity} =
+          Repo.with_tenant(tenant_id, fn ->
+            Repo.get_by(Entity, id: uuid, tenant_id: tenant_id)
+          end)
+
+        entity
+
+      :error ->
+        nil
+    end
+  end
+
+  @doc """
+  Updates `tenant_id`'s entity definition `id` from `attrs` (US-30.4 PATCH).
+
+  Re-validates via `Entity.update_changeset/2` — the SAME security validations
+  as create (SERVER column allowlist, safe-identifier regex, type/boolean
+  checks) — so a PATCH can never relax the allowlist. The per-tenant COUNT cap
+  is NOT re-run (an update does not add a row), so this path is advisory-lock
+  free. `tenant_id` is set programmatically on the fetched struct, never cast.
+
+  Runs as an `Ecto.Multi` so the RLS context set, the scoped fetch, the update,
+  and the `"updated"` audit entry share ONE transaction (and a
+  `unique_constraint` on a renamed entity is caught as `{:error, changeset}`).
+  `opts` supplies the audit actor (see `create_entity/3`).
+
+  Returns `{:ok, entity}`, `{:error, :not_found}` (unknown/foreign id), or
+  `{:error, changeset}`.
+  """
+  @spec update_entity(Ecto.UUID.t(), String.t(), map(), keyword()) ::
+          {:ok, Entity.t()} | {:error, :not_found | Ecto.Changeset.t() | term()}
+  def update_entity(tenant_id, id, attrs, opts \\ [])
+      when is_binary(tenant_id) and is_binary(id) and is_map(attrs) and is_list(opts) do
+    case Ecto.UUID.cast(id) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, uuid} ->
+        Multi.new()
+        |> put_rls(tenant_id)
+        |> fetch_entity(tenant_id, uuid)
+        |> Multi.update(:entity, fn %{fetch: entity} ->
+          Entity.update_changeset(entity, attrs)
+        end)
+        |> Audit.log_in_multi(:audit, fn %{fetch: before, entity: entity} ->
+          audit_attrs(tenant_id, entity, "updated", opts, %{
+            old_state: state_snapshot(before),
+            new_state: state_snapshot(entity)
+          })
+        end)
+        |> finish_entity_write()
+    end
+  end
+
+  @doc """
+  Deletes `tenant_id`'s entity definition `id` (US-30.4 DELETE).
+
+  Runs as an `Ecto.Multi` so the RLS context set, the scoped fetch, the delete,
+  and the `"deleted"` audit entry share ONE transaction. `opts` supplies the
+  audit actor (see `create_entity/3`).
+
+  Returns `{:ok, entity}` (the deleted row) or `{:error, :not_found}` (unknown/
+  foreign id).
+  """
+  @spec delete_entity(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, Entity.t()} | {:error, :not_found | term()}
+  def delete_entity(tenant_id, id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(id) and is_list(opts) do
+    case Ecto.UUID.cast(id) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, uuid} ->
+        Multi.new()
+        |> put_rls(tenant_id)
+        |> fetch_entity(tenant_id, uuid)
+        |> Multi.delete(:entity, fn %{fetch: entity} -> entity end)
+        |> Audit.log_in_multi(:audit, fn %{entity: entity} ->
+          audit_attrs(tenant_id, entity, "deleted", opts, %{old_state: state_snapshot(entity)})
+        end)
+        |> finish_entity_write()
+    end
+  end
+
   @doc "Configurable per-tenant cap on entity definitions."
   @spec max_entities() :: pos_integer()
   def max_entities do
     Application.get_env(:loopctl, :max_entity_definitions_per_tenant, @default_max_entities)
+  end
+
+  # Run the update/delete Multi and normalize its result. The `:entity` changeset
+  # branch is only reachable from `update_entity/4` (a delete never re-validates);
+  # `delete_entity/3` simply never produces it.
+  defp finish_entity_write(multi) do
+    multi
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{entity: entity}} -> {:ok, entity}
+      {:error, :fetch, :not_found, _changes} -> {:error, :not_found}
+      {:error, :entity, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  # --- Shared Multi steps (update/delete) ---
+
+  # Set the RLS context (`SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`) so
+  # the scoped fetch, the write, and the audit insert all run RLS-scoped to this
+  # tenant — mirroring `create_entity/3`'s `:rls` step.
+  defp put_rls(multi, tenant_id) do
+    Multi.run(multi, :rls, fn _repo, _changes ->
+      Repo.set_rls_context(tenant_id)
+      {:ok, :ok}
+    end)
+  end
+
+  # Fetch the row inside the transaction, scoped by RLS + an explicit tenant
+  # predicate (defense-in-depth on this security-root read). A missing/foreign id
+  # short-circuits the Multi with `{:error, :not_found}`.
+  #
+  # `lock: "FOR UPDATE"` serializes this fetch against a concurrent update/delete
+  # of the same row. Without it, a concurrent transaction committing a delete
+  # between this fetch and the subsequent `Multi.update`/`Multi.delete` makes the
+  # write match 0 rows and Ecto RAISES `Ecto.StaleEntryError` (→ 500). The row
+  # lock forces a concurrent delete to serialize: it either commits first (our
+  # re-read under READ COMMITTED then finds no row → clean `{:error, :not_found}`
+  # → 404) or blocks behind our lock until we commit. Either way the write always
+  # matches the locked row and never goes stale.
+  defp fetch_entity(multi, tenant_id, uuid) do
+    Multi.run(multi, :fetch, fn repo, _changes ->
+      query =
+        from(e in Entity,
+          where: e.id == ^uuid and e.tenant_id == ^tenant_id,
+          lock: "FOR UPDATE"
+        )
+
+      case repo.one(query) do
+        %Entity{} = entity -> {:ok, entity}
+        nil -> {:error, :not_found}
+      end
+    end)
+  end
+
+  # Build the audit attrs for an update/delete, merging the actor from `opts`
+  # (mirrors `create_entity/3`'s audit block) with the caller-supplied state.
+  defp audit_attrs(tenant_id, entity, action, opts, extra) do
+    Map.merge(
+      %{
+        tenant_id: tenant_id,
+        entity_type: "entity_definition",
+        entity_id: entity.id,
+        action: action,
+        actor_type: Keyword.get(opts, :actor_type, "api_key"),
+        actor_id: Keyword.get(opts, :actor_id),
+        actor_label: Keyword.get(opts, :actor_label),
+        metadata: Keyword.get(opts, :metadata, %{})
+      },
+      extra
+    )
+  end
+
+  # A compact, JSON-safe snapshot of an entity for the audit trail (no raw
+  # tenant_id/custody columns — just the declared surface).
+  defp state_snapshot(%Entity{} = entity) do
+    %{
+      "name" => entity.name,
+      "backing_source" => to_string(entity.backing_source),
+      "field_count" => length(entity.fields)
+    }
   end
 end
