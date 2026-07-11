@@ -2596,9 +2596,21 @@ defmodule Loopctl.Knowledge do
     unbounded). Precedence suppression is applied IN THE QUERY (correlated
     subquery), so `:limit` bounds the FINAL result set, not a pre-suppression pull.
     Use it when the caller (e.g. the US-31.2 resolver) wants a bounded result.
+  - `:select` -- set `:id` for a body-less projection that returns a plain list of
+    article UUIDs (`[Ecto.UUID.t()]`) instead of full `%Article{}` structs. Use this
+    for identity/membership checks (e.g. the US-31.2 hybrid resolver's curated-id
+    lookup) so per-query cost no longer scales with the curated corpus's article
+    BODIES — only ids leave the database. Default (`nil`/anything else) returns full
+    structs, unchanged. Combined with `:select, :id`, the `order_by` is also dropped
+    (a MapSet has no order) — pure wasted sort work otherwise.
+  - `:ids` -- restrict the scan to this list of article UUIDs (e.g. a caller's
+    already-fetched candidate pool). Use this WITH `select: :id` so per-query cost
+    scales with the caller's candidate set, not the tenant's entire curated/system-
+    canonical corpus (US-31.2's `curated_source_ids/2` is the reference caller).
+    Default (`nil`) scans the full curated corpus, unchanged.
 
   Results are ordered tenant-own-first (tenant rows before system canonicals), then
-  most-recently-updated.
+  most-recently-updated (unless `select: :id` drops the order, see above).
 
   ## Consistency & scaling notes
 
@@ -2608,15 +2620,35 @@ defmodule Loopctl.Knowledge do
   `mark_curated` could open between two reads, and (b) removes the previously
   unbounded full curated-title scan — ownership is now evaluated per candidate row
   via the partial index `articles_curated_published_idx`, so `:limit` genuinely
-  bounds the work. This still returns full `%Article{}` structs (including bodies);
-  if the curated corpus grows into a hot path, add cursor pagination or a body-less
-  projection before this becomes a bottleneck.
+  bounds the work. Pass `select: :id` (above) for a body-less projection when only
+  membership/identity is needed — the default remains full `%Article{}` structs
+  (including bodies) for callers that need the whole record.
   """
-  @spec list_curated_sources(Ecto.UUID.t(), keyword()) :: [Article.t()]
+  @spec list_curated_sources(Ecto.UUID.t(), keyword()) :: [Article.t()] | [Ecto.UUID.t()]
   def list_curated_sources(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    include_system = Keyword.get(opts, :include_system, true)
     category = Keyword.get(opts, :category)
     limit = Keyword.get(opts, :limit)
+    ids = Keyword.get(opts, :ids)
+
+    base =
+      tenant_id
+      |> curated_sources_base_query(category, opts)
+      |> maybe_filter_curated_by_category(category)
+      |> maybe_filter_curated_by_ids(ids)
+      |> maybe_limit_curated(limit)
+
+    case Keyword.get(opts, :select) do
+      # `order_by` is pure wasted sort work once the result is collapsed into a
+      # MapSet (order is irrelevant to membership) — dropped here so an `:ids`-scoped
+      # membership check (e.g. `curated_source_ids/2`) never pays for a corpus-wide
+      # sort it never uses (review finding, US-31.2).
+      :id -> base |> exclude(:order_by) |> select([a], a.id) |> AdminRepo.all()
+      _ -> AdminRepo.all(base)
+    end
+  end
+
+  defp curated_sources_base_query(tenant_id, category, opts) do
+    include_system = Keyword.get(opts, :include_system, true)
 
     scope_filter =
       if include_system do
@@ -2634,29 +2666,38 @@ defmodule Loopctl.Knowledge do
         dynamic([a], a.tenant_id == ^tenant_id)
       end
 
-    base =
-      from(a in Article,
-        as: :article,
-        where: a.status == :published,
-        where: not is_nil(a.curated_at),
-        where: ^scope_filter,
-        # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
-        where: not exists(open_conflict_subquery(tenant_id)),
-        # Tenant-own-first: tenant rows (tenant_id NOT NULL, so `IS NULL` = false)
-        # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest.
-        order_by: [asc: fragment("? IS NULL", a.tenant_id), desc: a.updated_at, asc: a.id]
-      )
-
-    base =
-      case category do
-        nil -> base
-        cat -> from(a in base, where: a.category == ^cat)
-      end
-
-    base = if is_integer(limit) and limit > 0, do: from(a in base, limit: ^limit), else: base
-
-    AdminRepo.all(base)
+    from(a in Article,
+      as: :article,
+      where: a.status == :published,
+      where: not is_nil(a.curated_at),
+      where: ^scope_filter,
+      # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
+      where: not exists(open_conflict_subquery(tenant_id)),
+      # Tenant-own-first: tenant rows (tenant_id NOT NULL, so `IS NULL` = false)
+      # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest.
+      order_by: [asc: fragment("? IS NULL", a.tenant_id), desc: a.updated_at, asc: a.id]
+    )
   end
+
+  defp maybe_filter_curated_by_category(query, nil), do: query
+
+  defp maybe_filter_curated_by_category(query, category),
+    do: from(a in query, where: a.category == ^category)
+
+  # Membership scope (US-31.2 fix): restricts the curated-corpus scan to only the
+  # given article ids (e.g. the hybrid resolver's <=200-candidate pool) instead of
+  # materializing the tenant's ENTIRE curated/system-canonical universe just to test
+  # membership of a small candidate set. `nil` (the default) is a no-op — every other
+  # caller keeps scanning the full curated corpus unaffected.
+  defp maybe_filter_curated_by_ids(query, nil), do: query
+
+  defp maybe_filter_curated_by_ids(query, ids) when is_list(ids),
+    do: from(a in query, where: a.id in ^ids)
+
+  defp maybe_limit_curated(query, limit) when is_integer(limit) and limit > 0,
+    do: from(a in query, limit: ^limit)
+
+  defp maybe_limit_curated(query, _limit), do: query
 
   # Subquery correlated on the outer :article binding: TRUE when the article is a
   # member of an auto-generated :potential_conflict pair that has NOT yet been
@@ -6352,9 +6393,19 @@ defmodule Loopctl.Knowledge do
         {r.id, Map.put(r, :final_score, sem_weight * r.normalized_score)}
       end)
 
+    # For a candidate found in BOTH pools, `Map.merge(kw, sem)` keeps EACH side's
+    # exclusive raw fields (kw's raw `:relevance_score`/`:snippet`, sem's raw
+    # `:similarity_score`) instead of silently dropping one — the hybrid resolver
+    # (US-31.2) needs both raw, ABSOLUTE (non-pool-relative) scores to survive on the
+    # merged result map so it never has to fall back to the pool-normalized
+    # `:final_score` for its curated-confidence decision (see `absolute_score/1`).
+    # `:final_score` itself is explicitly overridden to the correct weighted SUM
+    # (Map.merge alone would have just taken sem's half).
     merged =
       Map.merge(kw_map, sem_map, fn _id, kw, sem ->
-        Map.put(kw, :final_score, kw.final_score + sem.final_score)
+        kw
+        |> Map.merge(sem)
+        |> Map.put(:final_score, kw.final_score + sem.final_score)
       end)
 
     sorted =
@@ -6415,6 +6466,424 @@ defmodule Loopctl.Knowledge do
       |> Enum.take(limit)
 
     %{results: paginated, limit: limit, offset: offset}
+  end
+
+  # --- Hybrid resolver (US-31.2) ---
+  #
+  # Composes the ALREADY-SHIPPED retrieval (`search_combined/3`) and curated
+  # (`list_curated_sources/2` / US-31.1) subsystems into a single resolution layer.
+  # Does NOT re-architect embeddings or add a migration (#305/#306).
+
+  @default_hybrid_curated_threshold 0.75
+  @default_hybrid_curated_margin 0.1
+  # Keyword-scale (bounded `raw / (raw + 1)` transform of `ts_rank_cd`, see
+  # `normalize_keyword_score/1`) threshold/margin — deliberately a DIFFERENT default
+  # than the semantic-scale pair above. Calibrated against real `ts_rank_cd` output
+  # (verified empirically): a confidently-matching, normal-length curated doc lands
+  # around `~0.67`, while a merely-incidental single mention deep in an unrelated
+  # document lands around `~0.29` — `0.5` cleanly separates the two with margin on
+  # both sides.
+  @default_hybrid_curated_threshold_keyword 0.5
+  @default_hybrid_curated_margin_keyword 0.1
+
+  @doc """
+  Hybrid resolver (US-31.2): returns a **curated** answer ONLY when a governed curated
+  source (US-31.1) actually answers the query — else falls back to **retrieval**
+  (`search_combined/3`). Every response carries `meta.provenance` (`:curated` |
+  `:retrieved`) so a caller branches on that FIELD alone, never on which subsystem
+  answered (the literal fix for #305's "no caller-side RAG-or-curated branching").
+
+  The harvested failure this guards against is WORSE than a plain RAG miss: a curated
+  doc that is semantically near a query it does NOT answer, mislabeled authoritative,
+  is a confidently-wrong answer that is now trusted. So `:curated` requires ALL of:
+
+    * the curated candidate's ABSOLUTE confidence score (see `absolute_score/1` below
+      — never a pool-relative, min-max-normalized score) clears the absolute
+      confidence threshold FOR ITS OWN SCALE (config
+      `:knowledge_hybrid_curated_threshold`, default `#{@default_hybrid_curated_threshold}`,
+      for a semantic/cosine match; `:knowledge_hybrid_curated_threshold_keyword`,
+      default `#{@default_hybrid_curated_threshold_keyword}`, for a keyword-only
+      match), AND
+    * it beats the best NON-curated candidate's absolute score by the matching margin
+      (config `:knowledge_hybrid_curated_margin` /
+      `:knowledge_hybrid_curated_margin_keyword`, defaults
+      `#{@default_hybrid_curated_margin}` / `#{@default_hybrid_curated_margin_keyword}`),
+      AND
+    * it is authoritative (published, not superseded, not in an open
+      `:potential_conflict` — enforced by `list_curated_sources/2`, US-31.1).
+
+  Otherwise the response is `:retrieved` — a near-but-wrong curated doc that is
+  semantically close but below threshold, or not competitive against retrieval, NEVER
+  wins `:curated`. See `resolve_provenance/4` for the pure decision rule.
+
+  ## Absolute, not pool-relative, scoring (AC-31.2.1/.2 — critical fix)
+
+  `final_score` (built by `merge_results/5`) is a min-max-NORMALIZED, pool-RELATIVE
+  score: a lone or top candidate in an otherwise-sparse pool always normalizes to
+  `1.0` regardless of its TRUE similarity/relevance — that would let a curated doc
+  win `:curated` at "confidence 1.0" even when it barely relates to the query. The
+  provenance decision therefore scores every candidate via `absolute_score/1`, which
+  reads the RAW, un-normalized field straight off the result map: `:similarity_score`
+  (`1 - cosine_distance`, already on an absolute, bounded `0..1` scale) when present,
+  else a BOUNDED transform of the raw `:relevance_score` (`ts_rank_cd`, itself
+  unbounded — confirmed empirically up to ~2.0 for a short, title-exact match) — see
+  `normalize_keyword_score/1`. `merge_results/5` preserves BOTH raw fields on every
+  merged candidate (not just the winning half) specifically so this is always possible
+  in "combined" mode.
+
+  Cosine similarity and (normalized) `ts_rank_cd` are DIFFERENT, incommensurable
+  scales — comparing them with ONE raw threshold/margin pair would either make the
+  keyword branch practically unreachable (a realistic keyword-confident match sits
+  well below a cosine-tuned `0.75`) or let an unnaturally high/low score on one scale
+  distort a cross-scale margin subtraction. `hybrid_curated_threshold_and_margin/1`
+  therefore selects the config pair matching the WINNING curated candidate's OWN
+  scale (finding, US-31.2) — the threshold/margin is never compared across scales.
+
+  ## Resolved over the ranked pool, independent of the caller's page (AC-31.2.1/.2)
+
+  The provenance decision is made over the FULL ranked candidate pool (up to
+  `#{@max_relevance_page_size}` per side, the same cap `search_combined/3` already
+  uses for its sub-searches) — NOT the caller's paginated page. A genuinely-answering
+  curated source ranked outside the caller's requested `:limit`/`:offset` window is
+  still found and scored; a caller-supplied `:offset` shifts only which page of
+  `results` comes BACK, never which candidates the resolver reasons over. When
+  `:curated` wins, the winning article is additionally hoisted to the FRONT of the
+  (still full, still ranked) pool BEFORE pagination — so `meta.provenance == :curated`
+  always means `results |> List.first()` (at `offset: 0`) IS that curated answer,
+  never a decoy that merely out-ranked it on the pool-relative `:final_score` (the
+  "label != payload" defect this resolver exists to prevent, #305).
+
+  ## Tenant isolation (AC-31.2.6)
+
+  `tenant_id` is threaded into BOTH `search_combined/3` (retrieval) AND
+  `list_curated_sources/2` (curated identification) — both run on `AdminRepo`/
+  `HeavyRead` (BYPASSRLS). RLS does NOT backstop these reads; the explicit predicate
+  in each function is the sole isolation boundary.
+
+  ## Degradation honesty (AC-31.2.4, SOUL rule 7)
+
+  This function does NOT re-implement `search_combined/3`'s embedding degradation — it
+  reuses it. When embeddings are unavailable, `search_combined/3` already falls back to
+  keyword-only (`meta.fallback: true`, `meta.search_mode: "keyword_only"`) and the
+  curated candidate's absolute (normalized `ts_rank_cd`) score in that pool is compared
+  against the matching KEYWORD-scale threshold: a curated source still confidently
+  identifiable by keyword can win `:curated`; a merely-incidental keyword hit (low raw
+  rank) falls to `:retrieved`, same as a weak semantic match would. Never a silent
+  empty, never a false `:curated` under degraded matching.
+
+  ## Shape parity (AC-31.2.3)
+
+  Both provenance branches return the IDENTICAL map shape: `results` is the caller's
+  requested page of the SAME ranked pool used for scoring — reordered (curated winner
+  hoisted to the front) rather than re-filtered when `:curated` wins, so per-result
+  keys are identical by construction regardless of provenance — and `meta` is always
+  `search_combined/3`'s own meta (with `:limit`/`:offset` overridden to the caller's
+  actual requested page) merged with exactly `%{provenance: ..., confidence: ...,
+  curated_article_id: ...}` — no key ever appears on only one branch (`curated_article_id`
+  is `nil` on the `:retrieved` branch).
+
+  ## Provenance metrics (AC-31.2.5)
+
+  The retrieval pool's OWN search-access recording is suppressed
+  (`_skip_record_access: true` on the inner `search_combined/3` call, mirroring how
+  `do_combined_search/5` already dedupes its own sub-search recordings) and replaced
+  with a SINGLE recording (scoped to the caller's returned page) tagged
+  `mode: "hybrid_curated"` or `mode: "hybrid_retrieved"` in the `ArticleAccessEvent`
+  metadata — an additive extension of the existing mode tags (`"keyword"`,
+  `"semantic"`, `"combined"`). This rides the existing
+  `Loopctl.Knowledge.RetrievalMetrics` / `article_access_events` pipeline (see its
+  `curated_searched`/`retrieved_searched` breakdown), so "prefer-curated silently
+  hiding better retrieval" is observable per tenant without a new table. That DB-backed
+  recording still requires a non-empty page + `:api_key_id` (an inherited constraint of
+  `article_access_events`, whose `article_id`/`api_key_id` are NOT NULL); a MISS
+  (empty page) or a keyless call additionally emits a bare
+  `[:loopctl, :knowledge, :hybrid_provenance]` telemetry count (tenant/provenance/hit
+  only — no article/query content) so that dimension stays observable too (closes the
+  gap the DB recording structurally cannot).
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `query_string` -- the search query text
+  - `opts` -- forwarded to `search_combined/3` (`:keyword_weight`, `:semantic_weight`,
+    `:project_id`, `:category`, `:status`, `:tags`, `:limit`, `:offset`,
+    `:api_key_id`, `:project_id`/`:story_id` attribution)
+
+  ## Returns
+
+  - `{:ok, %{results: [map()], meta: map()}}` -- `meta.provenance` is `:curated` or
+    `:retrieved`. `meta.confidence` is the winning candidate's ABSOLUTE score for that
+    SAME provenance class (0.0 when there are no results at all, or when `:retrieved`
+    won with no genuine non-curated competitor in the pool) — never a rejected
+    candidate from the OTHER provenance class. `meta.curated_article_id` is the
+    winning curated article's id when `meta.provenance == :curated` (and it is
+    guaranteed to be present, first, in `results`), else `nil`.
+  - `{:error, :invalid_weights}` / `{:error, :empty_query}` / `{:error, atom(),
+    String.t()}` -- propagated unchanged from `search_combined/3`
+  """
+  @spec hybrid_search(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+          | {:error, :invalid_weights}
+          | {:error, :empty_query}
+          | {:error, atom(), String.t()}
+  def hybrid_search(tenant_id, query_string, opts \\ []) when is_binary(tenant_id) do
+    requested_limit = Keyword.get(opts, :limit, 10)
+    requested_offset = Keyword.get(opts, :offset, 0)
+
+    # Force the INNER search over the full ranked pool (offset 0, the same cap
+    # `search_combined/3`'s own sub-searches already use) so the provenance decision
+    # below reasons over the top of the ranked pool, never just the caller's
+    # requested page — a curated source ranked outside `:limit`/beyond `:offset` is
+    # still found and scored (AC-31.2.1/.2, fixes the pagination-scoped defect).
+    pool_opts =
+      opts
+      |> Keyword.put(:_skip_record_access, true)
+      |> Keyword.put(:limit, @max_relevance_page_size)
+      |> Keyword.put(:offset, 0)
+
+    with {:ok, %{results: pool_results, meta: pool_meta}} <-
+           search_combined(tenant_id, query_string, pool_opts) do
+      curated_ids = curated_source_ids(tenant_id, pool_results)
+      scores = candidate_scores(pool_results)
+
+      {curated_candidates, retrieved_candidates} =
+        Enum.split_with(pool_results, &MapSet.member?(curated_ids, &1.id))
+
+      best_curated = Enum.max_by(curated_candidates, &Map.fetch!(scores, &1.id), fn -> nil end)
+      curated_score = best_curated && Map.fetch!(scores, best_curated.id)
+      best_retrieved_score = best_score(retrieved_candidates, scores)
+
+      {threshold, margin} = hybrid_curated_threshold_and_margin(best_curated)
+
+      provenance = resolve_provenance(curated_score, best_retrieved_score, threshold, margin)
+
+      # (finding: mislabeled-authoritative decoy) When `:curated` wins, the winning
+      # curated article MUST actually be present — and first — in the returned page,
+      # never just a label attached to whatever the pool-relative ranking happened to
+      # place in the requested window. Reordering the FULL pool (not just the page)
+      # keeps `results` sourced from the same ranked pool for every offset (AC-31.2.3
+      # shape parity is unaffected — same map shape, just reordered).
+      {ordered_pool, confidence, curated_article_id} =
+        case provenance do
+          :curated ->
+            {hoist_to_front(pool_results, best_curated.id), curated_score, best_curated.id}
+
+          :retrieved ->
+            # (finding: mislabeled confidence) `best_retrieved_score` — NEVER
+            # `best_score(pool_results, scores)`, which would report a REJECTED
+            # curated candidate's score (a different provenance class) as if it were
+            # the winning retrieved candidate's confidence.
+            {pool_results, best_retrieved_score, nil}
+        end
+
+      page = paginate_results(ordered_pool, limit: requested_limit, offset: requested_offset)
+
+      maybe_record_search_access(
+        tenant_id,
+        page.results,
+        query_string,
+        opts,
+        hybrid_search_mode(provenance)
+      )
+
+      emit_hybrid_provenance(tenant_id, provenance, page.results != [])
+
+      {:ok,
+       %{
+         results: page.results,
+         meta:
+           Map.merge(pool_meta, %{
+             provenance: provenance,
+             confidence: confidence,
+             # Always present on BOTH branches (nil for `:retrieved`) so a caller can
+             # locate the curated answer via `meta.curated_article_id` even when the
+             # ranked pool's own ordering places it outside `results` — the actionable
+             # pointer this finding required alongside the hoist above.
+             curated_article_id: curated_article_id,
+             limit: page.limit,
+             offset: page.offset
+           })
+       }}
+    end
+  end
+
+  # Moves the winning curated candidate to the FRONT of the pool (stable order for
+  # everything else) — called ONLY when provenance is `:curated`, so a caller
+  # branching on `meta.provenance` can always trust `results |> List.first()` is the
+  # curated, authoritative answer, never a decoy that happened to out-rank it on the
+  # pool-relative `:final_score` (finding, US-31.2).
+  defp hoist_to_front(pool_results, curated_id) do
+    {winner, rest} = Enum.split_with(pool_results, &(&1.id == curated_id))
+    winner ++ rest
+  end
+
+  # Body-less/id-only curated lookup (finding 5): `list_curated_sources/2` defaults to
+  # returning full `%Article{}` structs (including bodies), which the resolver would
+  # otherwise discard entirely except for `.id`. `select: :id` keeps this a per-query
+  # hot path cheap regardless of how large the curated corpus grows. Scoped to the
+  # POOL's own ids (`:ids`) — NEVER the tenant's full curated/system-canonical corpus
+  # — so per-query cost scales with the <=200-candidate pool, not the curated corpus
+  # (review finding, US-31.2).
+  defp curated_source_ids(_tenant_id, []), do: MapSet.new()
+
+  defp curated_source_ids(tenant_id, pool_results) do
+    pool_ids = Enum.map(pool_results, & &1.id)
+    tenant_id |> list_curated_sources(select: :id, ids: pool_ids) |> MapSet.new()
+  end
+
+  # Builds an id -> ABSOLUTE (non-pool-relative) score index used ONLY for the
+  # provenance decision — `results` themselves are unaffected (AC-31.2.3 shape
+  # parity). See `absolute_score/1` for why this reads raw fields instead of the
+  # pool-normalized `:final_score`/`:normalized_score`.
+  defp candidate_scores(results) do
+    Map.new(results, fn r -> {r.id, absolute_score(r)} end)
+  end
+
+  # The ABSOLUTE, per-candidate confidence signal (critical fix, AC-31.2.1/.2): NEVER
+  # the pool-relative, min-max-normalized `:final_score`/`:normalized_score` — those
+  # force a lone/top candidate in a sparse pool to normalize to `1.0` regardless of its
+  # TRUE similarity, which is exactly the false-confident-curated failure this resolver
+  # exists to prevent.
+  #
+  # Prefers the raw `:similarity_score` (`1 - cosine_distance`, already on an absolute
+  # 0..1 scale — see `search_semantic/3`) when the candidate was found in the semantic
+  # pool; falls back to a BOUNDED transform of the raw `:relevance_score` (`ts_rank_cd`
+  # — see `search_keyword/3`) for a keyword-only candidate. Both are ABSOLUTE (computed
+  # independently of what else is in the pool), unlike `normalize_scores/2`'s output.
+  # `merge_results/5` preserves BOTH raw fields on a candidate found in both pools, so
+  # this always has the more-precisely-bounded semantic signal available when there is
+  # one.
+  defp absolute_score(%{similarity_score: score}) when is_number(score), do: score
+
+  defp absolute_score(%{relevance_score: score}) when is_number(score),
+    do: normalize_keyword_score(score)
+
+  defp absolute_score(_result), do: 0.0
+
+  # `ts_rank_cd` is RAW/UNBOUNDED (a short, heavily-title-weighted match can exceed
+  # `1.0` — confirmed empirically up to ~2.0 for a title-exact match) — unlike cosine
+  # similarity's bounded `0..1` scale. Applying the same saturating transform
+  # Postgres's own `ts_rank_cd(..., normalization => 8)` uses (`rank / (rank + 1)`)
+  # keeps the keyword-scale absolute score an ABSOLUTE (non-pool-relative — still a
+  # pure function of the one raw score, never of what else is in the pool) but BOUNDED
+  # `0..1` value: `meta.confidence` can no longer silently exceed `1.0` in keyword-only
+  # mode, and the value is at least magnitude-comparable to cosine similarity (review
+  # finding, US-31.2). This does NOT change `search_keyword/3`'s own public
+  # `:relevance_score` field (still raw ts_rank_cd) — the transform is applied ONLY at
+  # this resolver's own confidence/threshold boundary.
+  defp normalize_keyword_score(raw) when is_number(raw) and raw > 0, do: raw / (raw + 1)
+  defp normalize_keyword_score(_raw), do: 0.0
+
+  defp best_score([], _scores), do: 0.0
+
+  defp best_score(results, scores),
+    do: results |> Enum.map(&Map.fetch!(scores, &1.id)) |> Enum.max()
+
+  # Two INCOMPARABLE score scales feed `absolute_score/1` (bounded cosine similarity
+  # vs. the bounded-but-differently-distributed keyword transform above) — a single
+  # raw threshold/margin pair compared against BOTH scales interchangeably was the
+  # defect (review finding, US-31.2). Selects the config pair matching the WINNING
+  # curated candidate's OWN scale (mirroring `absolute_score/1`'s semantic-first
+  # priority for a candidate present in both sub-pools); `nil` (no curated candidate at
+  # all) is scale-irrelevant since `resolve_provenance/4` short-circuits to
+  # `:retrieved` on a `nil` curated score regardless of which pair is passed.
+  defp hybrid_curated_threshold_and_margin(%{similarity_score: score}) when is_number(score) do
+    {hybrid_curated_threshold(), hybrid_curated_margin()}
+  end
+
+  defp hybrid_curated_threshold_and_margin(%{relevance_score: score}) when is_number(score) do
+    {hybrid_curated_threshold_keyword(), hybrid_curated_margin_keyword()}
+  end
+
+  defp hybrid_curated_threshold_and_margin(_candidate) do
+    {hybrid_curated_threshold(), hybrid_curated_margin()}
+  end
+
+  defp hybrid_search_mode(:curated), do: "hybrid_curated"
+  defp hybrid_search_mode(:retrieved), do: "hybrid_retrieved"
+
+  # Bare telemetry signal for AC-31.2.5's hit/miss + keyless observability gap
+  # (finding 6): `maybe_record_search_access/5` structurally CANNOT record a MISS
+  # (empty page — `article_id` is NOT NULL on `article_access_events`) or a keyless
+  # call (no `api_key_id` to attribute to), so those two dimensions would otherwise be
+  # invisible. This fires UNCONDITIONALLY (regardless of page emptiness or api key
+  # presence) so an operator can attach a handler (or the `ScaleMetrics` counter) and
+  # see EVERY provenance decision, not just the ones that happened to produce a
+  # recordable DB row. Payload is id/atom/bool only — never article content or the
+  # query text.
+  defp emit_hybrid_provenance(tenant_id, provenance, hit?) do
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.knowledge_hybrid_provenance(),
+      %{count: 1},
+      %{tenant_id: tenant_id, provenance: Atom.to_string(provenance), hit: hit?}
+    )
+
+    :ok
+  end
+
+  @doc """
+  Pure resolution rule (TC-31.2.4) behind `hybrid_search/3` — no DB, unit-testable in
+  isolation.
+
+  `:curated` iff `curated_score` is present AND clears `threshold` AND beats
+  `best_retrieved_score` by at least `margin`; `:retrieved` otherwise (including when
+  `curated_score` is `nil` — no authoritative curated candidate was in the pool at
+  all). This is the SINGLE, non-contradictory decision: AC-31.2.1 ("above threshold")
+  and AC-31.2.2 ("beats retrieval by a margin, not superseded/conflicted") are both
+  folded in here — the caller is responsible for only ever passing an ALREADY
+  authoritative (`list_curated_sources/2`-filtered) `curated_score`, so the
+  superseded/conflicted leg never reaches this pure function as a false positive.
+
+  `threshold`/`margin` MUST already be scale-matched to `curated_score`/
+  `best_retrieved_score` by the caller (`hybrid_search/3` does this via
+  `hybrid_curated_threshold_and_margin/1`) — cosine similarity and (normalized)
+  `ts_rank_cd` are different scales, and this function does no scale reasoning of its
+  own; it only compares whatever numbers it is given.
+  """
+  @spec resolve_provenance(number() | nil, number(), number(), number()) ::
+          :curated | :retrieved
+  def resolve_provenance(nil, _best_retrieved_score, _threshold, _margin), do: :retrieved
+
+  def resolve_provenance(curated_score, best_retrieved_score, threshold, margin)
+      when is_number(curated_score) and is_number(best_retrieved_score) and
+             is_number(threshold) and is_number(margin) do
+    if curated_score >= threshold and curated_score - best_retrieved_score >= margin do
+      :curated
+    else
+      :retrieved
+    end
+  end
+
+  defp hybrid_curated_threshold do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_threshold,
+      @default_hybrid_curated_threshold
+    )
+  end
+
+  defp hybrid_curated_margin do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_margin,
+      @default_hybrid_curated_margin
+    )
+  end
+
+  defp hybrid_curated_threshold_keyword do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_threshold_keyword,
+      @default_hybrid_curated_threshold_keyword
+    )
+  end
+
+  defp hybrid_curated_margin_keyword do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_margin_keyword,
+      @default_hybrid_curated_margin_keyword
+    )
   end
 
   # --- Circuit breaker for embedding generation ---

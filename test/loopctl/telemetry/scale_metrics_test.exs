@@ -32,14 +32,17 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.db.error.count",
     "loopctl.heavy_read_repo.query.duration",
     "loopctl.knowledge.vector_search.under_fill.count",
-    "loopctl.knowledge.semantic_fallback.count"
+    "loopctl.knowledge.semantic_fallback.count",
+    "loopctl.knowledge.hybrid_provenance.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
   # set — especially an unbounded `:article_id` or a raw vector/body — is a hard fail.
   # `:reason` (#297 semantic-fallback counter) is a BOUNDED, sanitized tag set (never a
-  # key/body/query), so it is a safe dimension.
-  @allowed_tags MapSet.new([:endpoint, :mapped_code, :tenant_id, :reason])
+  # key/body/query), so it is a safe dimension. `:provenance` (`"curated"`/`"retrieved"`)
+  # and `:hit` (`true`/`false`) — US-31.2's hybrid-provenance counter — are likewise
+  # small, fixed-cardinality dimensions.
+  @allowed_tags MapSet.new([:endpoint, :mapped_code, :tenant_id, :reason, :provenance, :hit])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
 
@@ -113,6 +116,19 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert ScaleMetrics.semantic_fallback_tags(%{}) == %{reason: "unknown"}
     end
 
+    test "the hybrid-provenance counter (US-31.2) is tagged by provenance, hit, and tenant_id" do
+      counter = metric("loopctl.knowledge.hybrid_provenance.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert MapSet.new(counter.tags) == MapSet.new([:provenance, :hit, :tenant_id])
+
+      # Defaults are bounded/never blank when metadata is missing keys (tenant_id's
+      # gated value is exercised separately in the "tenant-label cap gate" describe,
+      # which explicitly controls the gate so this assertion isn't order-dependent).
+      assert ScaleMetrics.hybrid_provenance_tags(%{}).provenance == "unknown"
+      refute ScaleMetrics.hybrid_provenance_tags(%{}).hit
+    end
+
     test "histogram buckets are the documented bounded set" do
       hist = metric("loopctl.heavy_read_repo.query.duration")
 
@@ -180,6 +196,24 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       assert ScaleMetrics.scale_tags(%{endpoint: :x, mapped_code: "y", tenant_id: nil}).tenant_id ==
                :_aggregated
+    end
+
+    test "hybrid_provenance_tags/1 reuses the SAME cap-gated tenant_id collapse" do
+      gate_off()
+
+      assert ScaleMetrics.hybrid_provenance_tags(%{
+               provenance: "curated",
+               hit: true,
+               tenant_id: "t-123"
+             }) == %{provenance: "curated", hit: true, tenant_id: :_aggregated}
+
+      gate_on()
+
+      assert ScaleMetrics.hybrid_provenance_tags(%{
+               provenance: "retrieved",
+               hit: false,
+               tenant_id: "t-123"
+             }) == %{provenance: "retrieved", hit: false, tenant_id: "t-123"}
     end
 
     test "tenant_id over the cap is bounded to cardinality 1 across many distinct tenants" do

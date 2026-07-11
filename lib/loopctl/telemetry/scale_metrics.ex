@@ -133,6 +133,21 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         description: "Semantic search degraded to keyword-only / contributed nothing, by reason.",
         tags: [:reason],
         tag_values: &semantic_fallback_tags/1
+      ),
+
+      # 5. Hybrid-resolver provenance counter (US-31.2, finding 6): every
+      #    `hybrid_search/3` decision, by `provenance` (curated/retrieved) and `hit`
+      #    (non-empty/empty page). Fires unconditionally (unlike the
+      #    `article_access_events` recording, which cannot represent a MISS or a
+      #    keyless call), so the hit/miss + keyless dimension stays observable. MAY
+      #    carry a cap-gated `tenant_id` (sentinel when over cap).
+      counter("loopctl.knowledge.hybrid_provenance.count",
+        event_name: [:loopctl, :knowledge, :hybrid_provenance],
+        measurement: :count,
+        description:
+          "Hybrid resolver (US-31.2) provenance decisions, by provenance, hit/miss, and tenant.",
+        tags: [:provenance, :hit, :tenant_id],
+        tag_values: &hybrid_provenance_tags/1
       )
     ]
   end
@@ -146,6 +161,21 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @spec semantic_fallback_tags(map()) :: map()
   def semantic_fallback_tags(metadata) do
     %{reason: Map.get(metadata, :reason, "unknown")}
+  end
+
+  @doc """
+  `tag_values` for the hybrid-provenance counter (US-31.2). `provenance` and `hit` are
+  small, fixed-cardinality dimensions (2 values each) so they need no cap gate;
+  `tenant_id` reuses the SAME cap-gated sentinel collapse as the other two counters
+  (`gated_tenant_id/1`) to keep its cardinality bounded identically.
+  """
+  @spec hybrid_provenance_tags(map()) :: map()
+  def hybrid_provenance_tags(metadata) do
+    %{
+      provenance: Map.get(metadata, :provenance, "unknown"),
+      hit: Map.get(metadata, :hit, false),
+      tenant_id: gated_tenant_id(metadata)
+    }
   end
 
   @doc """

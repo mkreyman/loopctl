@@ -459,6 +459,31 @@ defmodule Loopctl.KnowledgeCuratedTest do
     end
   end
 
+  describe "list_curated_sources/2 - select: :id body-less projection (US-31.2 finding 5)" do
+    test "select: :id returns a plain list of UUIDs, not full %Article{} structs" do
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id, %{title: "Body-less Projection Target"})
+      _other = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      full_result = Knowledge.list_curated_sources(tenant.id)
+      id_result = Knowledge.list_curated_sources(tenant.id, select: :id)
+
+      assert Enum.all?(full_result, &match?(%Loopctl.Knowledge.Article{}, &1))
+      assert id_result == [curated.id]
+      refute match?([%Loopctl.Knowledge.Article{} | _], id_result)
+    end
+
+    test "select: :id still honors every filter (category, include_system, limit, tenant scope)" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      a_curated = curated_article(tenant_a.id, %{title: "A doc for id projection"})
+      _b_curated = curated_article(tenant_b.id, %{title: "B doc for id projection"})
+
+      assert Knowledge.list_curated_sources(tenant_a.id, select: :id) == [a_curated.id]
+    end
+  end
+
   defp ids(articles), do: Enum.map(articles, & &1.id)
 
   defp audit_event(article_id, action) do
