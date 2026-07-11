@@ -202,6 +202,13 @@ defmodule Loopctl.Knowledge.ProgressiveIndexTest do
       assert {:ok, %{stubs: stubs}} = Knowledge.progressive_index(tenant.id, topic)
       ids = Enum.map(stubs, & &1.id)
       assert marked.id in ids
+
+      # AC-31.3.3 vs AC-31.3.4 consistency (review finding): a system-scope stub
+      # the index surfaces must actually be openable by drill — a `tenant_id: nil`
+      # system canonical must not fall through to a false {:error, :not_found}.
+      assert {:ok, drilled} = Knowledge.progressive_drill(tenant.id, marked.id)
+      assert drilled.id == marked.id
+      assert drilled.body == "system body"
     end
   end
 
@@ -231,6 +238,47 @@ defmodule Loopctl.Knowledge.ProgressiveIndexTest do
       assert length(stubs) == 2
       assert meta.top_k == 2
       assert meta.truncated == true
+    end
+
+    test "per-hub :relates_to fan-out is capped at max_graph_neighbors_per_node/0, not the hub's full degree" do
+      tenant = fixture(:tenant)
+      topic = "FanoutCapTopicUVWXY"
+
+      hub =
+        fixture(:article, %{tenant_id: tenant.id, status: :published, title: "#{topic} Hub"})
+
+      fanout_cap = Knowledge.max_graph_neighbors_per_node()
+      # Degree well past the cap (and past min_hub_relates_to == 3) so the LIMIT
+      # is actually exercised -- if it were removed, all of these would surface.
+      extra = 5
+      total_targets = fanout_cap + extra
+
+      # Titles deliberately DO NOT contain `topic` -- only `hub` is a direct
+      # search_keyword seed; every target is reachable ONLY via hub traversal,
+      # isolating the fan-out cap from the unrelated top-K stub cap.
+      targets =
+        for n <- 1..total_targets do
+          target = curated_article(tenant.id, %{title: "Fanout Target #{n}"})
+          relates_to(tenant.id, hub, target)
+          target
+        end
+
+      # Override :limit well above total_targets so the top-K cap cannot mask
+      # the fan-out cap's effect.
+      assert {:ok, %{stubs: stubs, meta: meta}} =
+               Knowledge.progressive_index(tenant.id, topic, limit: total_targets + 5)
+
+      # Candidate pool = 1 seed (hub) + fanout_cap neighbors -- never the full
+      # degree of `total_targets` links.
+      assert meta.candidate_count == 1 + fanout_cap
+      assert length(stubs) == 1 + fanout_cap
+      assert meta.truncated == false
+
+      surfaced_target_ids = stubs |> Enum.map(& &1.id) |> MapSet.new() |> MapSet.delete(hub.id)
+      all_target_ids = MapSet.new(targets, & &1.id)
+
+      assert MapSet.size(surfaced_target_ids) == fanout_cap
+      assert MapSet.subset?(surfaced_target_ids, all_target_ids)
     end
   end
 

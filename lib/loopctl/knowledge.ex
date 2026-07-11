@@ -639,37 +639,43 @@ defmodule Loopctl.Knowledge do
           {:ok, Article.t()} | {:error, :not_found}
   def get_article(tenant_id, article_id, opts \\ []) do
     case AdminRepo.get_by(Article, id: article_id, tenant_id: tenant_id) do
-      nil ->
-        {:error, :not_found}
+      nil -> {:error, :not_found}
+      article -> finalize_article_read(tenant_id, article, opts)
+    end
+  end
 
-      article ->
-        # Visibility enforcement (#163): a private/owner memory the caller doesn't
-        # own resolves to :not_found — no existence leak, no access recorded.
-        vis = Keyword.get(opts, :visibility_agent_id)
+  # Shared visibility/preload/access-tracking tail of an article fetch, once the
+  # row itself has been located (tenant-owned or, via `progressive_drill/3`'s
+  # system fallback, a system canonical). Factored out so BOTH scopes get
+  # identical visibility enforcement, link preloading, conflict-link filtering,
+  # and access recording — never duplicated ad hoc per caller.
+  defp finalize_article_read(tenant_id, article, opts) do
+    # Visibility enforcement (#163): a private/owner memory the caller doesn't
+    # own resolves to :not_found — no existence leak, no access recorded.
+    vis = Keyword.get(opts, :visibility_agent_id)
 
-        if visible_to_caller?(article, vis) do
-          article =
-            article
-            |> AdminRepo.preload(
-              outgoing_links: :target_article,
-              incoming_links: :source_article
-            )
-            |> filter_visible_links(vis)
-            |> drop_resolved_conflict_links(tenant_id)
+    if visible_to_caller?(article, vis) do
+      article =
+        article
+        |> AdminRepo.preload(
+          outgoing_links: :target_article,
+          incoming_links: :source_article
+        )
+        |> filter_visible_links(vis)
+        |> drop_resolved_conflict_links(tenant_id)
 
-          Analytics.record_access(
-            tenant_id,
-            article.id,
-            Keyword.get(opts, :api_key_id),
-            "get",
-            Keyword.get(opts, :access_metadata, %{}),
-            attribution_context(opts)
-          )
+      Analytics.record_access(
+        tenant_id,
+        article.id,
+        Keyword.get(opts, :api_key_id),
+        "get",
+        Keyword.get(opts, :access_metadata, %{}),
+        attribution_context(opts)
+      )
 
-          {:ok, article}
-        else
-          {:error, :not_found}
-        end
+      {:ok, article}
+    else
+      {:error, :not_found}
     end
   end
 
@@ -6940,7 +6946,15 @@ defmodule Loopctl.Knowledge do
 
   1. **Seed** — `search_keyword/3` full-text-matches `topic` against published,
      tenant-scoped articles (title/body), returning candidate ids/titles/categories
-     (no bodies).
+     (no bodies). NOTE: this is a deliberate substitution for the
+     `knowledge_index` catalog browse named in the story/AC — `knowledge_index`
+     is a category/tag catalog with no topic scoping, so it cannot answer "for a
+     topic/query" on its own; `search_keyword/3` is the topic-scoped mechanism
+     that does. Caveat: a fuzzy `websearch_to_tsquery` match can silently omit a
+     curated article that is topically relevant but shares no lexical tokens
+     with `topic` and isn't linked from a lexically-matching hub — step 2's
+     `:relates_to` traversal partially (not fully) mitigates this by recovering
+     linked-but-lexically-disjoint neighbors.
   2. **Hub enrichment** (opt-out via `hub_enrich: false`) — among the seeds, any
      article with `>= min_hub_relates_to/0` outgoing `:relates_to` links is an
      operational hub (AC-31.3.4; hubs are not a modeled type). Its `:relates_to`
@@ -6995,7 +7009,6 @@ defmodule Loopctl.Knowledge do
              _skip_record_access: true
            ) do
       seed_ids = Enum.map(seed_results, & &1.id)
-      curated_ids = tenant_id |> list_curated_sources(select: :id) |> MapSet.new()
 
       hub_neighbor_ids =
         if hub_enrich? do
@@ -7005,6 +7018,15 @@ defmodule Loopctl.Knowledge do
         end
 
       candidate_ids = Enum.uniq(seed_ids ++ hub_neighbor_ids)
+
+      # Membership-only scan restricted to the (already small, capped) candidate
+      # pool -- never the tenant's entire curated/system-canonical corpus. Mirrors
+      # the `ids: raw_target_ids` scoping `progressive_hub_neighbor_ids/2` already
+      # uses below.
+      curated_ids =
+        tenant_id
+        |> list_curated_sources(select: :id, ids: candidate_ids)
+        |> MapSet.new()
 
       {curated_first, rest} = Enum.split_with(candidate_ids, &MapSet.member?(curated_ids, &1))
       capped_ids = Enum.take(curated_first ++ rest, top_k)
@@ -7038,8 +7060,8 @@ defmodule Loopctl.Knowledge do
     hub_ids = operational_hub_ids(tenant_id, seed_ids, min_hub_relates_to())
 
     raw_target_ids =
-      hub_ids
-      |> Enum.flat_map(&hub_relates_to_targets(tenant_id, &1, max_graph_neighbors_per_node()))
+      tenant_id
+      |> hub_relates_to_targets(hub_ids, max_graph_neighbors_per_node())
       |> Enum.uniq()
 
     list_curated_sources(tenant_id, select: :id, ids: raw_target_ids)
@@ -7061,18 +7083,33 @@ defmodule Loopctl.Knowledge do
     |> AdminRepo.all()
   end
 
-  # Depth-1 :relates_to targets of a single hub, bounded at the SQL level by
-  # `ORDER BY ... LIMIT fanout_limit` — the fan-out cap itself (mirrors the
-  # `JOIN LATERAL ... LIMIT` bound `execute_graph_traversal/4` uses, without
-  # pulling in the general multi-hop/all-relationship-type traversal).
-  defp hub_relates_to_targets(tenant_id, hub_article_id, fanout_limit) do
-    from(l in ArticleLink,
-      where: l.tenant_id == ^tenant_id,
-      where: l.relationship_type == :relates_to,
-      where: l.source_article_id == ^hub_article_id,
-      order_by: [asc: l.inserted_at, asc: l.id],
-      limit: ^fanout_limit,
-      select: l.target_article_id
+  # Depth-1 :relates_to targets of EVERY hub in `hub_ids`, bounded PER HUB at
+  # the SQL level by `ROW_NUMBER() OVER (PARTITION BY source_article_id ...) <=
+  # fanout_limit` -- the same fan-out cap (mirrors the `JOIN LATERAL ... LIMIT`
+  # bound `execute_graph_traversal/4` uses, without pulling in the general
+  # multi-hop/all-relationship-type traversal), but in ONE round-trip regardless
+  # of hub count instead of one query per hub (review finding: bounded N+1).
+  defp hub_relates_to_targets(_tenant_id, [], _fanout_limit), do: []
+
+  defp hub_relates_to_targets(tenant_id, hub_ids, fanout_limit) do
+    ranked =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :relates_to,
+        where: l.source_article_id in ^hub_ids,
+        select: %{
+          target_article_id: l.target_article_id,
+          rank:
+            over(row_number(),
+              partition_by: l.source_article_id,
+              order_by: [asc: l.inserted_at, asc: l.id]
+            )
+        }
+      )
+
+    from(r in subquery(ranked),
+      where: r.rank <= ^fanout_limit,
+      select: r.target_article_id
     )
     |> AdminRepo.all()
   end
@@ -7123,13 +7160,35 @@ defmodule Loopctl.Knowledge do
   `progressive_index/3` stub pointed at, scope-enforced exactly like a direct
   fetch.
 
-  A thin, explicitly-named delegate to `get_article/3` — the drill step loads
-  ONLY what the index pointed at, never more.
+  Mirrors `progressive_index/3`'s OWN scope (AC-31.3.3 vs AC-31.3.4
+  consistency): `progressive_index/3` surfaces both tenant-owned articles AND
+  system-scope (`tenant_id: nil`) curated canonicals (`fetch_stub_projection/2`
+  reads `where a.tenant_id == ^tenant_id or a.scope == :system`), so the drill
+  step must be able to open EITHER. It tries the tenant-scoped fetch first
+  (`get_article/3`); only when that misses does it fall back to the
+  system-scope-by-id lookup (the same predicate `fetch_curatable_article/2`
+  uses for curation) so a system canonical's `tenant_id: nil` never falls
+  through to a false `:not_found`. A tenant-owned article never matches the
+  system-scope fallback (system articles require `scope: :system`), so tenant
+  isolation is unaffected — the fallback only ever *widens* what a tenant-scoped
+  `:not_found` was allowed to catch, onto the same system-canonical set the
+  index already surfaces.
   """
   @spec progressive_drill(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
-  def progressive_drill(tenant_id, article_id, opts \\ []),
-    do: get_article(tenant_id, article_id, opts)
+  def progressive_drill(tenant_id, article_id, opts \\ []) do
+    case get_article(tenant_id, article_id, opts) do
+      {:error, :not_found} -> drill_system_canonical(tenant_id, article_id, opts)
+      result -> result
+    end
+  end
+
+  defp drill_system_canonical(tenant_id, article_id, opts) do
+    case AdminRepo.one(from(a in Article, where: a.id == ^article_id and a.scope == :system)) do
+      nil -> {:error, :not_found}
+      article -> finalize_article_read(tenant_id, article, opts)
+    end
+  end
 
   # --- Circuit breaker for embedding generation ---
 
