@@ -6,8 +6,11 @@ defmodule Mix.Tasks.Loopctl.SeedContextEntities do
   Thin wrapper over `Loopctl.ContextRetriever.Dogfood.seed_default_entities/2`.
   Each definition is persisted through the vetted
   `Loopctl.ContextRetriever.Registry.create_entity/3` path (SERVER column
-  allowlist + per-tenant cap + RLS + audit). Idempotent — re-running skips
-  definitions whose name already exists for the tenant.
+  allowlist + per-tenant cap + RLS + audit). Idempotent — re-running returns an
+  unchanged definition as-is, reconciles a drifted one in place, and never
+  commits a partial set near the entity cap (see the module's "Idempotency,
+  drift reconciliation, and the entity cap"). The audit entries are attributed as
+  `actor_type: "system"` (an operator-invoked task, not an API key).
 
   ## Usage
 
@@ -64,6 +67,7 @@ defmodule Mix.Tasks.Loopctl.SeedContextEntities do
     ensure_tenant_exists!(tenant_id)
 
     case Dogfood.seed_default_entities(tenant_id,
+           actor_type: "system",
            actor_label: "mix loopctl.seed_context_entities",
            metadata: %{"source" => "dogfood_seed_task"}
          ) do

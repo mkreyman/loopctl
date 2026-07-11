@@ -52,9 +52,11 @@ defmodule Loopctl.ContextRetriever.DogfoodTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.ContextRetriever.Dogfood
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.ContextRetriever.Executor
+  alias Loopctl.ContextRetriever.Registry
   alias Loopctl.ContextRetriever.Scope
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
@@ -204,6 +206,111 @@ defmodule Loopctl.ContextRetriever.DogfoodTest do
       assert first.stories.id == second.stories.id
       assert first.projects.id == second.projects.id
       assert first.epics.id == second.epics.id
+    end
+
+    test "an unchanged definition is not spuriously updated on re-seed" do
+      tenant = repo_tenant()
+
+      assert {:ok, first} = Dogfood.seed_default_entities(tenant.id)
+      assert {:ok, second} = Dogfood.seed_default_entities(tenant.id)
+
+      # No reconciliation fired for an already-canonical row: same id AND same
+      # updated_at (an in-place update would bump the timestamp).
+      assert first.projects.id == second.projects.id
+      assert first.projects.updated_at == second.projects.updated_at
+
+      # And no "updated" audit entry was written — only the original "created".
+      {:ok, actions} =
+        Repo.with_tenant(tenant.id, fn ->
+          Repo.all(
+            from(a in AuditLog,
+              where: a.entity_type == "entity_definition" and a.entity_id == ^first.projects.id,
+              select: a.action
+            )
+          )
+        end)
+
+      assert actions == ["created"]
+    end
+
+    test "reconciles a drifted definition in place (id preserved, canonical fields restored)" do
+      tenant = repo_tenant()
+
+      assert {:ok, first} = Dogfood.seed_default_entities(tenant.id)
+      project_id = first.projects.id
+
+      # Drift: shrink the persisted `project` definition to a single allowlisted
+      # field via the vetted PATCH path (simulates an out-of-band edit or a
+      # definition-set change that a plain idempotent re-seed would ignore).
+      assert {:ok, drifted} =
+               Registry.update_entity(tenant.id, project_id, %{
+                 fields: [%{name: "status", type: "string", filterable: true, searchable: false}]
+               })
+
+      assert length(drifted.fields) == 1
+
+      # Re-seed reconciles the drift back to the canonical 4-field shape, in place.
+      assert {:ok, second} = Dogfood.seed_default_entities(tenant.id)
+      assert second.projects.id == project_id
+
+      restored = MapSet.new(second.projects.fields, &Entity.field_string_value(&1, "name"))
+      assert restored == MapSet.new(["status", "name", "description", "mission"])
+
+      # The reconciliation is audited as an in-place update (security-root change).
+      {:ok, actions} =
+        Repo.with_tenant(tenant.id, fn ->
+          Repo.all(
+            from(a in AuditLog,
+              where: a.entity_type == "entity_definition" and a.entity_id == ^project_id,
+              select: a.action,
+              order_by: a.inserted_at
+            )
+          )
+        end)
+
+      assert "updated" in actions
+    end
+
+    test "near the entity cap, seeding is all-or-nothing (no partial committed set)" do
+      # config/test.exs caps entities at 3 — exactly the dogfood count. Pre-seed
+      # one UNRELATED entity so creating all three dogfood definitions would exceed
+      # the cap; the pre-flight headroom check must reject up front, committing none.
+      tenant = repo_tenant()
+
+      assert {:ok, _extra} =
+               Registry.create_entity(tenant.id, %{
+                 name: "extra",
+                 backing_source: :projects,
+                 fields: [%{name: "status", type: "string", filterable: true, searchable: false}]
+               })
+
+      assert {:error, {"project", :entity_limit}} = Dogfood.seed_default_entities(tenant.id)
+
+      # No partial set landed — only the pre-seeded "extra" exists.
+      names = tenant.id |> Registry.for_tenant() |> Enum.map(& &1.name) |> MapSet.new()
+      assert names == MapSet.new(["extra"])
+    end
+
+    test "forwards actor_type to the audit trail (mix task attributes as \"system\")" do
+      tenant = repo_tenant()
+
+      assert {:ok, %{projects: project}} =
+               Dogfood.seed_default_entities(tenant.id,
+                 actor_type: "system",
+                 actor_label: "mix loopctl.seed_context_entities"
+               )
+
+      {:ok, [audit]} =
+        Repo.with_tenant(tenant.id, fn ->
+          Repo.all(
+            from(a in AuditLog,
+              where: a.entity_type == "entity_definition" and a.entity_id == ^project.id
+            )
+          )
+        end)
+
+      assert audit.actor_type == "system"
+      assert audit.actor_label == "mix loopctl.seed_context_entities"
     end
   end
 
