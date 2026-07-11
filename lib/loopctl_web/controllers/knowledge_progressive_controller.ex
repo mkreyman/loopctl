@@ -1,0 +1,202 @@
+defmodule LoopctlWeb.KnowledgeProgressiveController do
+  @moduledoc """
+  Controller for progressive-disclosure knowledge retrieval (US-31.3, surfaced by
+  US-31.4).
+
+  - `GET /api/v1/knowledge/progressive_index` -- a bounded, topic-scoped list of
+    compact stubs (id/title/category/summary, NO bodies), capped at top-K (agent+)
+  - `GET /api/v1/knowledge/progressive/:id` -- drill into one stub, returning the
+    full article body, scope-enforced (agent+)
+
+  This is the "index then drill" half of the hybrid interface: an agent first
+  pulls a cheap, capped index of what's relevant to a topic, then opens only the
+  article(s) it needs — keeping context small. Thin transport over
+  `Loopctl.Knowledge.progressive_index/3` and `Loopctl.Knowledge.progressive_drill/3`.
+  Additive only — existing `knowledge_*` endpoints are unchanged.
+  """
+
+  use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
+
+  alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.Visibility
+
+  action_fallback LoopctlWeb.FallbackController
+
+  plug LoopctlWeb.Plugs.RequireRole, role: :agent
+
+  tags(["Knowledge Wiki"])
+
+  @valid_categories Ecto.Enum.values(Article, :category)
+
+  operation(:index,
+    summary: "Progressive-disclosure index",
+    description:
+      "Returns a bounded, topic-scoped list of compact stubs " <>
+        "(id/title/category/summary — never bodies), capped at top-K, with " <>
+        "curated sources preferred and hub-linked neighbors enriched in. Use it to " <>
+        "cheaply survey what's relevant to a topic, then drill into only the " <>
+        "article(s) you need via GET /knowledge/progressive/:id. `meta.truncated` " <>
+        "is true when the candidate pool exceeded top-K. Role: agent+.",
+    parameters: [
+      topic: [
+        in: :query,
+        type: :string,
+        description: "The topic to index (max 500 characters). Required.",
+        required: true
+      ],
+      category: [
+        in: :query,
+        type: :string,
+        description: "Optional: filter by category.",
+        required: false
+      ],
+      limit: [
+        in: :query,
+        type: :integer,
+        description: "Optional: top-K override (clamped to the configured cap).",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Progressive index stubs", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :array,
+               description: "Compact stubs: id, title, category, summary (no bodies)."
+             },
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{
+                 top_k: %OpenApiSpex.Schema{type: :integer},
+                 candidate_count: %OpenApiSpex.Schema{type: :integer},
+                 truncated: %OpenApiSpex.Schema{type: :boolean}
+               }
+             }
+           }
+         }},
+      400 => {"Bad request", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/progressive_index"
+  def index(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    with {:ok, category} <- validate_category(params["category"]) do
+      opts =
+        []
+        |> maybe_add_opt(:category, category)
+        |> maybe_add_limit(params["limit"])
+        |> Keyword.merge(Visibility.scope_opts(conn))
+
+      case Knowledge.progressive_index(tenant_id, coerce_topic(params["topic"]), opts) do
+        {:ok, result} ->
+          json(conn, LoopctlWeb.KnowledgeProgressiveJSON.index(result))
+
+        {:error, :empty_query} ->
+          {:error, :bad_request, "Query parameter 'topic' is required and cannot be empty"}
+
+        {:error, :bad_request, msg} ->
+          {:error, :bad_request, msg}
+      end
+    end
+  end
+
+  operation(:drill,
+    summary: "Progressive-disclosure drill",
+    description:
+      "Fetches the full body of a single article a progressive index stub pointed " <>
+        "at, scope-enforced exactly like a direct fetch. Resolves both " <>
+        "tenant-owned articles and published system canonicals (the same set the " <>
+        "index surfaces). Role: agent+.",
+    parameters: [
+      id: [
+        in: :path,
+        type: :string,
+        description: "Article UUID to drill into.",
+        required: true
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Full article", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{
+               type: :object,
+               description: "The full article, including body."
+             }
+           }
+         }},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/progressive/:id"
+  def drill(conn, %{"id" => article_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key_id = conn.assigns.current_api_key.id
+
+    # Thread api_key_id so finalize_article_read/Analytics.record_access attributes
+    # the body read (parity with ArticleController.show and the hybrid endpoint) —
+    # without it, every progressive-drill read is an audit/analytics blind spot.
+    opts = Keyword.merge([api_key_id: api_key_id], Visibility.scope_opts(conn))
+
+    with {:ok, article} <-
+           Knowledge.progressive_drill(tenant_id, article_id, opts) do
+      json(conn, %{data: LoopctlWeb.ArticleJSON.article_data(article)})
+    end
+  end
+
+  # Coerce `topic` to a binary at the transport boundary (mirror the hybrid
+  # controller's `trim_query/1`). A malformed query string like `?topic[]=x`
+  # makes Plug parse the param as a list; passing that straight to
+  # `progressive_index` -> `search_keyword` -> `String.trim/1` would raise a
+  # FunctionClauseError -> HTTP 500. Coercing a non-binary to "" yields a clean
+  # `{:error, :empty_query}` -> 400 instead.
+  defp coerce_topic(topic) when is_binary(topic), do: topic
+  defp coerce_topic(_), do: ""
+
+  # Only ever called with a validated `:category` (nil or an atom), so no
+  # empty-string clause is needed here.
+  defp maybe_add_opt(opts, _key, nil), do: opts
+  defp maybe_add_opt(opts, key, value), do: [{key, value} | opts]
+
+  defp validate_category(nil), do: {:ok, nil}
+  defp validate_category(""), do: {:ok, nil}
+
+  defp validate_category(category) when is_binary(category) do
+    atom = String.to_existing_atom(category)
+    if atom in @valid_categories, do: {:ok, atom}, else: invalid_category()
+  rescue
+    ArgumentError -> invalid_category()
+  end
+
+  defp validate_category(_), do: invalid_category()
+
+  defp invalid_category do
+    valid = Enum.map_join(@valid_categories, ", ", &to_string/1)
+    {:error, :bad_request, "Invalid category. Valid categories: #{valid}"}
+  end
+
+  defp maybe_add_limit(opts, nil), do: opts
+
+  defp maybe_add_limit(opts, value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} -> [{:limit, max(int, 1)} | opts]
+      _ -> opts
+    end
+  end
+
+  defp maybe_add_limit(opts, value) when is_integer(value), do: [{:limit, max(value, 1)} | opts]
+  defp maybe_add_limit(opts, _), do: opts
+end

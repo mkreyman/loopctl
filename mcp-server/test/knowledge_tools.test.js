@@ -77,6 +77,39 @@ function toContent(result) {
   };
 }
 
+// Mirrors index.js llmRemediationNotice / withRemediationNotice exactly so the
+// hybrid handler copy below exercises the SAME remediation-wrapping the real tool
+// applies (the missing-embedding-key / keyword-only fallback surfacing the
+// hybrid_search docstring promises). Without this the copy diverged from index.js
+// (it ended at toContent) and the wrapper was covered by zero tests.
+function llmRemediationNotice(result) {
+  const rem =
+    (result &&
+      result.error === true &&
+      result.body &&
+      result.body.error &&
+      result.body.error.remediation) ||
+    (result && result.meta && result.meta.remediation) ||
+    null;
+
+  if (!rem || rem.action !== "configure_llm") return null;
+
+  const missing = Array.isArray(rem.missing) ? rem.missing.join(", ") : rem.missing;
+  return (
+    `ACTION REQUIRED — BYO LLM key not configured (missing: ${missing}). ` +
+    `${rem.message || ""} Provision it ONCE with the ${rem.mcp_tool} MCP tool, e.g. ` +
+    `${rem.example} (REST: ${rem.api}). Requires your user-role key (LOOPCTL_USER_KEY). ` +
+    `Docs: ${rem.docs}`
+  ).replace(/\s+/g, " ").trim();
+}
+
+function withRemediationNotice(result) {
+  const base = toContent(result);
+  const notice = llmRemediationNotice(result);
+  if (!notice) return base;
+  return { ...base, content: [{ type: "text", text: notice }, ...base.content] };
+}
+
 // ---------------------------------------------------------------------------
 // Handler implementations (mirror index.js exactly)
 // ---------------------------------------------------------------------------
@@ -195,6 +228,53 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, mode, 
   if (limit != null) params.set("limit", String(limit));
   if (offset != null) params.set("offset", String(offset));
   const result = await apiCall("GET", `/api/v1/knowledge/search?${params}`, null, process.env.LOOPCTL_AGENT_KEY);
+  return toContent(result);
+}
+
+// US-31.4 — mirrors index.js knowledgeHybridSearch (POST, agent key, JSON body).
+// Ends with withRemediationNotice (NOT toContent) to match the real handler: the
+// combined pool underneath can degrade to keyword-only with a meta.remediation the
+// tool must surface prominently.
+async function knowledgeHybridSearch({ query, project_id, category, tags, match, limit, offset }) {
+  const bodyPayload = { query };
+  if (project_id) bodyPayload.project_id = project_id;
+  if (category) bodyPayload.category = category;
+  if (tags) bodyPayload.tags = tags;
+  if (match) bodyPayload.match = match;
+  if (limit != null) bodyPayload.limit = limit;
+  if (offset != null) bodyPayload.offset = offset;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/hybrid_search",
+    bodyPayload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return withRemediationNotice(result);
+}
+
+// US-31.4 — mirrors index.js knowledgeProgressiveIndex (GET, agent key).
+async function knowledgeProgressiveIndex({ topic, category, limit }) {
+  const params = new URLSearchParams();
+  if (topic != null) params.set("topic", topic);
+  if (category) params.set("category", category);
+  if (limit != null) params.set("limit", String(limit));
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/progressive_index?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+// US-31.4 — mirrors index.js knowledgeProgressiveDrill (GET, agent key).
+async function knowledgeProgressiveDrill({ article_id }) {
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/progressive/${article_id}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
   return toContent(result);
 }
 
@@ -1268,5 +1348,186 @@ describe("knowledge_conflicts (route-the-findings review surface)", () => {
     const parsed = new URL(calls[0].url);
     assert.equal(parsed.pathname, "/api/v1/knowledge/conflicts");
     assert.equal(parsed.search, "");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// US-31.4: hybrid retrieval + progressive disclosure MCP tools (TC-31.4.2)
+// ---------------------------------------------------------------------------
+
+describe("US-31.4: knowledge_hybrid_search", () => {
+  test("POSTs the query as a JSON body with the agent key", async () => {
+    setupEnv();
+    const calls = mockFetch({
+      data: [{ id: "a1", title: "Refund Policy" }],
+      meta: { provenance: "curated", confidence: 0.92, curated_article_id: "a1" },
+    });
+
+    await knowledgeHybridSearch({ query: "refund policy", limit: 5, offset: 0, match: "any" });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    assert.equal(new URL(url).pathname, "/api/v1/knowledge/hybrid_search");
+    const sent = JSON.parse(options.body);
+    assert.equal(sent.query, "refund policy");
+    assert.equal(sent.limit, 5);
+    assert.equal(sent.offset, 0);
+    assert.equal(sent.match, "any");
+  });
+
+  test("preserves provenance=curated verbatim at the MCP boundary (AC-31.4.3)", async () => {
+    setupEnv();
+    mockFetch({
+      data: [{ id: "a1", title: "Refund Policy" }],
+      meta: { provenance: "curated", confidence: 0.92, curated_article_id: "a1" },
+    });
+
+    const result = await knowledgeHybridSearch({ query: "refund policy" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    assert.equal(parsed.meta.provenance, "curated");
+    assert.equal(parsed.meta.curated_article_id, "a1");
+    assert.equal(parsed.data[0].id, "a1");
+    assert.equal(result.isError, undefined);
+  });
+
+  test("preserves provenance=retrieved verbatim at the MCP boundary (AC-31.4.3)", async () => {
+    setupEnv();
+    mockFetch({
+      data: [{ id: "b7", title: "Some Match" }],
+      meta: { provenance: "retrieved", confidence: 0.41, curated_article_id: null },
+    });
+
+    const result = await knowledgeHybridSearch({ query: "onboarding" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    assert.equal(parsed.meta.provenance, "retrieved");
+    assert.equal(parsed.meta.curated_article_id, null);
+  });
+
+  test("omits optional fields from the body when not supplied", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: { provenance: "retrieved" } });
+
+    await knowledgeHybridSearch({ query: "x" });
+
+    const sent = JSON.parse(calls[0].options.body);
+    assert.deepEqual(Object.keys(sent), ["query"]);
+  });
+
+  test("surfaces the missing-embedding-key remediation as the leading content block (keyword-only fallback)", async () => {
+    setupEnv();
+    // The combined pool degraded to keyword-only: 200 with a meta.remediation the
+    // hybrid tool must surface PROMINENTLY (same contract as knowledge_search).
+    mockFetch({
+      data: [{ id: "b7", title: "Some Match" }],
+      meta: {
+        provenance: "retrieved",
+        curated_article_id: null,
+        search_mode: "keyword_only",
+        fallback: true,
+        fallback_reason: "no_embedding_key",
+        remediation: {
+          action: "configure_llm",
+          missing: ["embedding"],
+          message: "Semantic ranking is disabled.",
+          mcp_tool: "set_llm_config",
+          example: "set_llm_config({ ... })",
+          api: "POST /api/v1/llm-config",
+          docs: "https://loopctl.com/docs/byo-llm",
+        },
+      },
+    });
+
+    const result = await knowledgeHybridSearch({ query: "refund policy" });
+
+    // The remediation rides in FRONT of the JSON payload — a regression that
+    // dropped withRemediationNotice (back to toContent) would fail here.
+    assert.match(result.content[0].text, /ACTION REQUIRED/);
+    assert.match(result.content[0].text, /set_llm_config/);
+    // The original payload is preserved as a following content block.
+    const parsed = JSON.parse(result.content[result.content.length - 1].text);
+    assert.equal(parsed.meta.provenance, "retrieved");
+    assert.equal(parsed.meta.fallback_reason, "no_embedding_key");
+  });
+});
+
+describe("US-31.4: knowledge_progressive_index and knowledge_progressive_drill", () => {
+  test("index GETs progressive_index with the topic and returns capped stubs", async () => {
+    setupEnv();
+    const calls = mockFetch({
+      data: [
+        { id: "s1", title: "Stub 1", category: "reference", summary: "..." },
+        { id: "s2", title: "Stub 2", category: "pattern", summary: "..." },
+      ],
+      meta: { top_k: 3, candidate_count: 6, truncated: true },
+    });
+
+    const result = await knowledgeProgressiveIndex({ topic: "refunds", limit: 3 });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(options.method, "GET");
+    assert.equal(options.headers.Authorization, `Bearer ${AGENT_KEY}`);
+    const parsed = new URL(url);
+    assert.equal(parsed.pathname, "/api/v1/knowledge/progressive_index");
+    assert.equal(parsed.searchParams.get("topic"), "refunds");
+    assert.equal(parsed.searchParams.get("limit"), "3");
+
+    const out = JSON.parse(result.content[0].text);
+    assert.equal(out.meta.truncated, true);
+    assert.equal(out.data.length, 2);
+    // Stubs carry no body.
+    assert.equal(out.data[0].body, undefined);
+  });
+
+  test("drill GETs progressive/:id and returns the full article body", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: { id: "s1", title: "Stub 1", body: "full body here" } });
+
+    const result = await knowledgeProgressiveDrill({ article_id: "s1" });
+
+    assert.equal(calls.length, 1);
+    const { url, options } = calls[0];
+    assert.equal(options.method, "GET");
+    assert.equal(new URL(url).pathname, "/api/v1/knowledge/progressive/s1");
+
+    const out = JSON.parse(result.content[0].text);
+    assert.equal(out.data.body, "full body here");
+  });
+});
+
+describe("US-31.4: ListTools — new tools present, existing knowledge tools unchanged", () => {
+  const indexPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.js");
+  const indexSource = readFileSync(indexPath, "utf8");
+
+  test("the three new tools are registered (def + dispatch case)", () => {
+    for (const name of [
+      "knowledge_hybrid_search",
+      "knowledge_progressive_index",
+      "knowledge_progressive_drill",
+    ]) {
+      assert.ok(indexSource.includes(`name: "${name}"`), `${name} tool definition present`);
+      assert.ok(indexSource.includes(`case "${name}":`), `${name} dispatch case present`);
+    }
+  });
+
+  test("existing knowledge tools remain registered (additive, unchanged surface)", () => {
+    for (const name of ["knowledge_search", "knowledge_get", "knowledge_context", "knowledge_list"]) {
+      assert.ok(indexSource.includes(`name: "${name}"`), `${name} still present`);
+      assert.ok(indexSource.includes(`case "${name}":`), `${name} dispatch still present`);
+    }
+  });
+
+  test("hybrid_search docstring explains provenance and when to prefer it over knowledge_search", () => {
+    // Locate the hybrid tool's description block.
+    const idx = indexSource.indexOf('name: "knowledge_hybrid_search"');
+    assert.ok(idx > 0);
+    const block = indexSource.slice(idx, idx + 2000);
+    assert.ok(/curated/i.test(block), "mentions curated provenance");
+    assert.ok(/retrieved/i.test(block), "mentions retrieved provenance");
+    assert.ok(/knowledge_search/.test(block), "explains preference vs knowledge_search");
   });
 });

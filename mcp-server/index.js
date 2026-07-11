@@ -962,6 +962,52 @@ async function knowledgeSearch({ q, project_id, story_id, category, tags, match,
   return withRemediationNotice(result);
 }
 
+async function knowledgeHybridSearch({ query, project_id, category, tags, match, limit, offset }) {
+  const bodyPayload = { query };
+  if (project_id) bodyPayload.project_id = project_id;
+  if (category) bodyPayload.category = category;
+  if (tags) bodyPayload.tags = tags;
+  if (match) bodyPayload.match = match;
+  if (limit != null) bodyPayload.limit = limit;
+  if (offset != null) bodyPayload.offset = offset;
+
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/hybrid_search",
+    bodyPayload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  // meta.provenance ("curated" | "retrieved") is the load-bearing field and rides
+  // through toContent verbatim. Same missing-embedding-key remediation surfacing as
+  // knowledge_search, since hybrid runs the combined pool underneath.
+  return withRemediationNotice(result);
+}
+
+async function knowledgeProgressiveIndex({ topic, category, limit }) {
+  const params = new URLSearchParams();
+  if (topic != null) params.set("topic", topic);
+  if (category) params.set("category", category);
+  if (limit != null) params.set("limit", String(limit));
+
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/progressive_index?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function knowledgeProgressiveDrill({ article_id }) {
+  const result = await apiCall(
+    "GET",
+    `/api/v1/knowledge/progressive/${article_id}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeList({
   project_id,
   category,
@@ -3006,6 +3052,109 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_hybrid_search",
+    description:
+      "Resolve a topic to a SINGLE best answer WITH provenance — the hybrid " +
+      "retrieval entrypoint. Runs the combined keyword+semantic search over the full " +
+      "ranked pool, then decides whether a governed CURATED source actually answers. " +
+      "The verdict is meta.provenance: 'curated' means a curated, canonical article " +
+      "answers — TRUST IT (it is guaranteed first in the results and meta.curated_article_id " +
+      "points at it); 'retrieved' means no curated source cleared the bar, so the answer " +
+      "is the best semantic/keyword match (a fuzzy fallback — verify before relying on it, " +
+      "meta.curated_article_id is null). meta.confidence is the winning candidate's absolute " +
+      "score for its provenance class. Prefer this over knowledge_search when you want ONE " +
+      "trustworthy answer plus its provenance rather than a ranked list to triage yourself; " +
+      "use knowledge_search when you want to browse/enumerate matches. Additive — existing " +
+      "knowledge tools are unchanged. If semantic ranking is unavailable it degrades to " +
+      "keyword-only (meta.fallback/fallback_reason), same as knowledge_search.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "The topic/question to resolve (max 500 characters). Required.",
+        },
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: scope to a project UUID.",
+        },
+        category: {
+          type: "string",
+          description: "Optional: filter by category.",
+        },
+        tags: {
+          type: "string",
+          description: "Optional: comma-separated tags to filter by.",
+        },
+        match: {
+          type: "string",
+          enum: ["any", "all"],
+          description: "Optional: tag match mode — 'any' (default, OR) or 'all' (AND, every tag).",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: max results to return (default 10).",
+        },
+        offset: {
+          type: "integer",
+          description: "Optional: results to skip for pagination (default 0).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "knowledge_progressive_index",
+    description:
+      "Progressive disclosure — get a CHEAP, capped index of what's relevant to a topic " +
+      "(compact stubs: id/title/category/summary, NO bodies), then open only what you need " +
+      "with knowledge_progressive_drill. Curated sources are preferred and hub-linked " +
+      "neighbors are enriched in; results are capped at a configured top-K (meta.truncated " +
+      "is true when the candidate pool exceeded it). Use this to survey a topic without " +
+      "flooding your context with full article bodies — it's the index half of the hybrid " +
+      "interface. Follow up on a stub's id with knowledge_progressive_drill to read the body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          description: "The topic to index (max 500 characters). Required.",
+        },
+        category: {
+          type: "string",
+          description: "Optional: filter by category.",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional: top-K override (clamped to the configured cap).",
+        },
+      },
+      required: ["topic"],
+    },
+  },
+  {
+    name: "knowledge_progressive_drill",
+    description:
+      "Drill into one stub from knowledge_progressive_index — returns the FULL article " +
+      "body for the given id, scope-enforced. Resolves both tenant-owned articles and " +
+      "published system canonicals (the same set the index surfaces). This is the drill " +
+      "half of progressive disclosure: index cheaply, then open only the article(s) you " +
+      "need. (knowledge_get works for tenant articles too; use this to also reach the " +
+      "system canonicals the progressive index can surface.)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          format: "uuid",
+          description: "The UUID of the article to open (from a progressive index stub).",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
@@ -4653,6 +4802,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_search":
       return await knowledgeSearch(args);
+
+    case "knowledge_hybrid_search":
+      return await knowledgeHybridSearch(args);
+
+    case "knowledge_progressive_index":
+      return await knowledgeProgressiveIndex(args);
+
+    case "knowledge_progressive_drill":
+      return await knowledgeProgressiveDrill(args);
 
     case "knowledge_list":
       return await knowledgeList(args);
