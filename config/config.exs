@@ -388,6 +388,14 @@ config :loopctl, :context_retriever_max_page_size, 100
 # paging still works up to this generous bound.
 config :loopctl, :context_retriever_max_offset, 100_000
 
+# Epic 30 / US-30.4: per-tenant rate limit on the model-invoked
+# `POST /api/v1/retrieve/:entity` endpoint (in ADDITION to the global per-key/
+# per-tenant request limiter). Bounds how often a single tenant may fire the
+# Context Retriever executor within a rolling window so a looping/hostile agent
+# cannot flood it; over-limit returns 429 without executing.
+config :loopctl, :context_retriever_retrieve_rate_window_ms, 60_000
+config :loopctl, :context_retriever_retrieve_rate_limit, 120
+
 # L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
 # it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
 # (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF

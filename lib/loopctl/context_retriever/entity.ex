@@ -234,6 +234,21 @@ defmodule Loopctl.ContextRetriever.Entity do
     )
   end
 
+  @doc """
+  Changeset for updating an existing entity definition (US-30.4 PATCH).
+
+  Applies the EXACT same security validations as `create_changeset/2` — the
+  SERVER column allowlist, the safe-identifier regex, the field-type/boolean
+  checks, the field-key normalization, the non-empty/max-fields caps, and the
+  per-tenant unique name — so a PATCH can never relax the allowlist that a
+  create was held to. `tenant_id` is NEVER cast (it stays on the struct). A
+  partial update (e.g. only `fields`) keeps the row's existing `name`/
+  `backing_source` via `validate_required` reading the struct data, so callers
+  need not resend unchanged columns.
+  """
+  @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def update_changeset(%__MODULE__{} = entity, attrs), do: create_changeset(entity, attrs)
+
   @doc "Returns the list of valid backing sources."
   @spec backing_sources() :: [atom()]
   def backing_sources, do: @backing_sources

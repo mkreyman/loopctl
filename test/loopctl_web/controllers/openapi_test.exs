@@ -79,6 +79,36 @@ defmodule LoopctlWeb.OpenApiTest do
       assert Map.has_key?(schemas, "MemoryRecallResponse")
       assert Map.has_key?(schemas, "MemoryPromoteRequest")
     end
+
+    # US-30.4 (AC-30.4.5) — the Context Retriever endpoints (Epic 30) must render
+    # in the OpenAPI spec (declared via `operation(...)` in
+    # ContextRetrieverController) so they show up at /swaggerui.
+    test "includes the Context Retriever (Epic 30) endpoints", %{conn: conn} do
+      body = conn |> get("/api/v1/openapi") |> json_response(200)
+      paths = body["paths"]
+
+      assert Map.has_key?(paths, "/api/v1/entities")
+      assert Map.has_key?(paths, "/api/v1/entities/{id}")
+      assert Map.has_key?(paths, "/api/v1/retrieve/tools")
+      assert Map.has_key?(paths, "/api/v1/retrieve/{entity}")
+
+      # The verbs each route declares.
+      assert Map.has_key?(paths["/api/v1/entities"], "get")
+      assert Map.has_key?(paths["/api/v1/entities"], "post")
+      assert Map.has_key?(paths["/api/v1/entities/{id}"], "get")
+      assert Map.has_key?(paths["/api/v1/entities/{id}"], "patch")
+      assert Map.has_key?(paths["/api/v1/entities/{id}"], "delete")
+      assert Map.has_key?(paths["/api/v1/retrieve/tools"], "get")
+      assert Map.has_key?(paths["/api/v1/retrieve/{entity}"], "post")
+
+      # And the Context Retriever schemas are registered under components.
+      schemas = body["components"]["schemas"]
+      assert Map.has_key?(schemas, "EntityDefinition")
+      assert Map.has_key?(schemas, "EntityDefinitionRequest")
+      assert Map.has_key?(schemas, "EntityDefinitionListResponse")
+      assert Map.has_key?(schemas, "RetrieveToolsResponse")
+      assert Map.has_key?(schemas, "RetrieveResponse")
+    end
   end
 
   describe "GET /swaggerui" do

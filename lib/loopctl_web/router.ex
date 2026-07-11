@@ -318,6 +318,17 @@ defmodule LoopctlWeb.Router do
     get "/memory", MemoryController, :index
     delete "/memory/:id", MemoryController, :delete
 
+    # Context Retriever (Epic 30, US-30.4) — entity-definition CRUD + the
+    # model-invoked query surface. Literal /retrieve/tools MUST precede the
+    # parameterized /retrieve/:entity so it is not captured as an :entity.
+    get "/entities", ContextRetrieverController, :index
+    post "/entities", ContextRetrieverController, :create
+    get "/entities/:id", ContextRetrieverController, :show
+    patch "/entities/:id", ContextRetrieverController, :update
+    delete "/entities/:id", ContextRetrieverController, :delete
+    get "/retrieve/tools", ContextRetrieverController, :tools
+    post "/retrieve/:entity", ContextRetrieverController, :retrieve
+
     # Knowledge Wiki (Epic 19)
     # Publish workflow routes (must precede resources to avoid route conflicts)
     post "/articles/:id/publish", ArticleWorkflowController, :publish

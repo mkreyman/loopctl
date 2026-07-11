@@ -3326,4 +3326,187 @@ defmodule Loopctl.ApiSpec.Schemas do
       }
     })
   end
+
+  # ---------- Context Retriever (Epic 30, US-30.4) ----------
+
+  defmodule EntityDefinitionField do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EntityDefinitionField",
+      description:
+        "A single declared field on an entity definition. `name` must be a column " <>
+          "in the SERVER per-source allowlist; `type` is one of the allowed field " <>
+          "types. `filterable`/`searchable` gate which tools the field generates.",
+      type: :object,
+      required: [:name, :type],
+      properties: %{
+        name: %Schema{type: :string, description: "Allowlisted column name (snake_case)."},
+        type: %Schema{
+          type: :string,
+          enum: ["string", "integer", "boolean", "float", "datetime"]
+        },
+        filterable: %Schema{type: :boolean, description: "Generate a filter tool. Default false."},
+        searchable: %Schema{
+          type: :boolean,
+          description: "Contribute to the entity's full-text search tool. Default false."
+        }
+      }
+    })
+  end
+
+  defmodule EntityDefinition do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EntityDefinition",
+      description:
+        "A tenant-authored entity definition: a named, typed view over a " <>
+          "loopctl-internal backing source (projects/stories/epics). Its declared " <>
+          "fields ARE the executor's field allowlist.",
+      type: :object,
+      properties: %{
+        id: %Schema{type: :string, format: :uuid},
+        tenant_id: %Schema{type: :string, format: :uuid},
+        name: %Schema{type: :string},
+        backing_source: %Schema{type: :string, enum: ["projects", "stories", "epics"]},
+        fields: %Schema{type: :array, items: EntityDefinitionField},
+        inserted_at: %Schema{type: :string, format: :"date-time"},
+        updated_at: %Schema{type: :string, format: :"date-time"}
+      }
+    })
+  end
+
+  defmodule EntityDefinitionRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EntityDefinitionRequest",
+      description:
+        "Params for POST/PATCH /entities. `tenant_id` is derived from the API key " <>
+          "and any tenant_id in the body is ignored. On PATCH, omitted top-level " <>
+          "fields keep their current value.",
+      type: :object,
+      properties: %{
+        name: %Schema{type: :string, description: "Entity name, unique per tenant."},
+        backing_source: %Schema{type: :string, enum: ["projects", "stories", "epics"]},
+        fields: %Schema{type: :array, items: EntityDefinitionField}
+      }
+    })
+  end
+
+  defmodule EntityDefinitionResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EntityDefinitionResponse",
+      description: "A single entity definition wrapped in `data`.",
+      type: :object,
+      properties: %{data: EntityDefinition}
+    })
+  end
+
+  defmodule EntityDefinitionListResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "EntityDefinitionListResponse",
+      description: "The calling tenant's entity definitions.",
+      type: :object,
+      properties: %{data: %Schema{type: :array, items: EntityDefinition}}
+    })
+  end
+
+  defmodule RetrieveToolSpec do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RetrieveToolSpec",
+      description:
+        "A generated agent tool spec (from the tenant's entity definitions). " <>
+          "`input_schema` is a JSON Schema for the tool's params; `metadata` is the " <>
+          "executor dispatch contract (entity/backing_source/field/operation).",
+      type: :object,
+      properties: %{
+        name: %Schema{type: :string, description: "Tool name, prefixed `cr_`."},
+        description: %Schema{type: :string},
+        input_schema: %Schema{type: :object, additionalProperties: true},
+        metadata: %Schema{type: :object, additionalProperties: true}
+      }
+    })
+  end
+
+  defmodule RetrieveToolsResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RetrieveToolsResponse",
+      description:
+        "The generated tool specs for the CALLING tenant only — another tenant's " <>
+          "entities never appear.",
+      type: :object,
+      properties: %{data: %Schema{type: :array, items: RetrieveToolSpec}}
+    })
+  end
+
+  defmodule RetrieveRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RetrieveRequest",
+      description:
+        "Params for POST /retrieve/:entity. `field` + `op` select the operation " <>
+          "(`filter` needs the matched field's value in `value`; `search` needs " <>
+          "`query`). Any `tenant_id` in the body is ignored (scope is from the key).",
+      type: :object,
+      properties: %{
+        field: %Schema{type: :string, description: "Field to filter on (op=filter)."},
+        op: %Schema{type: :string, enum: ["filter", "search"], description: "Operation."},
+        operation: %Schema{
+          type: :string,
+          enum: ["filter", "search"],
+          description: "Alias for `op`."
+        },
+        value: %Schema{description: "Filter value (op=filter)."},
+        query: %Schema{type: :string, description: "Search string (op=search)."},
+        limit: %Schema{type: :integer, description: "Page size (clamped to the server max)."},
+        offset: %Schema{type: :integer, description: "Records to skip (clamped)."}
+      }
+    })
+  end
+
+  defmodule RetrieveResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RetrieveResponse",
+      description:
+        "A page of allowlisted-column result maps plus pagination meta. Only the " <>
+          "entity's declared columns appear in each result.",
+      type: :object,
+      properties: %{
+        results: %Schema{
+          type: :array,
+          items: %Schema{type: :object, additionalProperties: true}
+        },
+        meta: %Schema{
+          type: :object,
+          properties: %{
+            total_count: %Schema{type: :integer},
+            limit: %Schema{type: :integer},
+            offset: %Schema{type: :integer}
+          }
+        }
+      }
+    })
+  end
 end
