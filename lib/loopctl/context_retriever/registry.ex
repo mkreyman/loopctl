@@ -32,6 +32,7 @@ defmodule Loopctl.ContextRetriever.Registry do
   alias Ecto.Multi
   alias Loopctl.Audit
   alias Loopctl.ContextRetriever.Entity
+  alias Loopctl.ContextRetriever.ToolGenerator
   alias Loopctl.Repo
 
   @default_max_entities 50
@@ -60,6 +61,26 @@ defmodule Loopctl.ContextRetriever.Registry do
       end)
 
     entities
+  end
+
+  @doc """
+  Returns the generated agent tool specs for ALL of `tenant_id`'s entity
+  definitions — the US-30.2 `ToolGenerator` fanned out over `for_tenant/1`.
+
+  This is THE canonical context entry point for a tenant's tool surface. Both
+  the US-30.4 HTTP layer (`GET /api/v1/retrieve/tools`) and the US-30.5 MCP
+  dynamic tool listing call this instead of re-deriving the
+  `for_tenant/1 |> Enum.flat_map(&ToolGenerator.specs_for/1)` fan-out themselves,
+  so the Context-Retriever domain fan-out stays inside the context rather than
+  leaking into the thin JSON controller. Scope-enforced via `for_tenant/1` (RLS):
+  another tenant's entities never contribute. A tenant with no definitions (or
+  only fieldless-after-filter definitions) gets `[]`.
+  """
+  @spec tool_specs(Ecto.UUID.t()) :: [ToolGenerator.spec()]
+  def tool_specs(tenant_id) when is_binary(tenant_id) do
+    tenant_id
+    |> for_tenant()
+    |> Enum.flat_map(&ToolGenerator.specs_for/1)
   end
 
   @doc """

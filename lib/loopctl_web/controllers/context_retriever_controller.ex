@@ -44,10 +44,10 @@ defmodule LoopctlWeb.ContextRetrieverController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.ContextRetriever.Entity
   alias Loopctl.ContextRetriever.Executor
   alias Loopctl.ContextRetriever.Registry
   alias Loopctl.ContextRetriever.Scope
-  alias Loopctl.ContextRetriever.ToolGenerator
   alias LoopctlWeb.AuditContext
   alias Plug.Conn.Status
 
@@ -76,6 +76,32 @@ defmodule LoopctlWeb.ContextRetrieverController do
   # Overridable via config; kept generous (a real agent bursts) but finite.
   @retrieve_rate_window_ms 60_000
   @retrieve_rate_limit 120
+
+  # Reserved param keys the US-30.3 Executor reads for search/pagination
+  # (`params["query"]` / `params["limit"]` / `params["offset"]`). `exec_params/2`
+  # writes a `:filter` field's value into that SAME string-keyed param namespace,
+  # so a filterable column literally named one of these would clobber (or be
+  # clobbered by) the caller's search/pagination value — silently mis-paginating.
+  # No phase-1 backing source allowlists such a column, so the coupling is latent
+  # today; the compile-time guard below ASSERTS that, so a future
+  # `Entity.@column_allowlist` addition of a `query`/`limit`/`offset` column fails
+  # loudly here (mirroring the compile-time guards in `Entity`/`ToolGenerator`)
+  # instead of regressing into a silent mis-pagination.
+  @reserved_exec_keys ~w(query limit offset)
+
+  for {source, cols} <- Entity.column_allowlist() do
+    collisions = Enum.filter(cols, &(Atom.to_string(&1) in @reserved_exec_keys))
+
+    unless collisions == [] do
+      raise CompileError,
+        description:
+          "LoopctlWeb.ContextRetrieverController: backing source #{inspect(source)} allowlists " <>
+            "column(s) #{inspect(collisions)} that collide with the reserved Executor param " <>
+            "keys #{inspect(@reserved_exec_keys)}. `exec_params/2` shares one param namespace " <>
+            "with the executor's search/pagination reads, so such a column would silently " <>
+            "mis-paginate. Namespace the filter value into a dedicated slot before adding it."
+    end
+  end
 
   operation(:create,
     summary: "Create an entity definition",
@@ -239,12 +265,10 @@ defmodule LoopctlWeb.ContextRetrieverController do
   @doc "GET /api/v1/retrieve/tools"
   def tools(conn, _params) do
     with_tenant(conn, fn tenant_id ->
-      specs =
-        tenant_id
-        |> Registry.for_tenant()
-        |> Enum.flat_map(&ToolGenerator.specs_for/1)
-
-      json(conn, %{data: specs})
+      # Per-tenant tool-spec fan-out lives in the context (Registry.tool_specs/1),
+      # not inline here — keeps this a thin JSON layer and gives US-30.5's MCP
+      # client one canonical entry point (see the moduledoc).
+      json(conn, %{data: Registry.tool_specs(tenant_id)})
     end)
   end
 

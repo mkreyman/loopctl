@@ -202,6 +202,44 @@ defmodule Loopctl.ContextRetriever.RegistryTest do
     end
   end
 
+  describe "tool_specs/1 — per-tenant tool-spec fan-out (US-30.4/US-30.5 entry point)" do
+    test "fans ToolGenerator over all of the tenant's definitions" do
+      tenant = repo_tenant()
+
+      {:ok, _} =
+        Registry.create_entity(tenant.id, %{
+          name: "story",
+          backing_source: :stories,
+          fields: [%{name: "title", type: :string, filterable: true, searchable: false}]
+        })
+
+      {:ok, _} =
+        Registry.create_entity(tenant.id, %{
+          name: "project",
+          backing_source: :projects,
+          fields: [%{name: "status", type: :string, filterable: true, searchable: false}]
+        })
+
+      names = tenant.id |> Registry.tool_specs() |> Enum.map(& &1.name)
+      assert "cr_filter_story_by_title" in names
+      assert "cr_filter_project_by_status" in names
+    end
+
+    test "is []-scoped to the caller tenant (no cross-tenant specs)" do
+      tenant_a = repo_tenant()
+      tenant_b = repo_tenant()
+
+      {:ok, _} =
+        Registry.create_entity(tenant_a.id, %{
+          name: "story",
+          backing_source: :stories,
+          fields: @valid_fields
+        })
+
+      assert Registry.tool_specs(tenant_b.id) == []
+    end
+  end
+
   describe "create_entity/2 — per-tenant cap (AC-30.1.5)" do
     test "over-cap creation returns {:error, :entity_limit} and inserts no row" do
       # config/test.exs sets :max_entity_definitions_per_tenant to 3.

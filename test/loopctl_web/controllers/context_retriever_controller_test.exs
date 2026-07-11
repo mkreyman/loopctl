@@ -96,6 +96,14 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     raw
   end
 
+  # An orchestrator-role key (role 2 < user 3). Deliberately elevated to write
+  # work-breakdown data, but NOT to define entity definitions (a security root) —
+  # so define/mutate must 403 it, exactly like an agent key (AC-30.4.2).
+  defp orchestrator_key(tenant_id) do
+    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :orchestrator})
+    raw
+  end
+
   # Seed a backing project on the Repo connection (the executor reads via
   # Repo.with_tenant). Status defaults to :active.
   defp seed_project(tenant_id, attrs \\ %{}) do
@@ -107,6 +115,29 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
   # A "project" entity exposing a filterable `status` field.
   defp project_status_fields do
     [%{name: "status", type: "string", filterable: true, searchable: false}]
+  end
+
+  # `status` filterable + `slug` declared but NOT filterable. Exercises the
+  # execute-time allowlist re-check: a raw `/retrieve` naming `slug` op:"filter"
+  # must be rejected (422 field_not_allowlisted), never executed.
+  defp project_status_and_unfilterable_slug_fields do
+    [
+      %{name: "status", type: "string", filterable: true, searchable: false},
+      %{name: "slug", type: "string", filterable: false, searchable: false}
+    ]
+  end
+
+  # A "project" entity exposing a vector-covered searchable text field (`name` is
+  # in the projects search_vector) — authorizes the op:"search" path.
+  defp project_searchable_name_fields do
+    [%{name: "name", type: "string", filterable: false, searchable: true}]
+  end
+
+  # A "project" entity declaring `slug` searchable — allowlisted, but NOT covered
+  # by the projects search_vector (name/description/mission). A raw op:"search"
+  # must be rejected (422 search_not_indexed), never silently searched.
+  defp project_unindexed_searchable_slug_fields do
+    [%{name: "slug", type: "string", filterable: false, searchable: true}]
   end
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -166,6 +197,78 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
   end
 
+  # --- TC-30.4.1b: GET index + show over HTTP ---
+
+  describe "TC-30.4.1: GET /entities (index) and GET /entities/:id (show)" do
+    test "index lists the tenant's definitions ordered by name", %{conn: _conn} do
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      # Two definitions with names that sort z-before-a to prove ordering.
+      base_conn()
+      |> auth(user)
+      |> post(~p"/api/v1/entities", %{
+        "name" => "zeta",
+        "backing_source" => "projects",
+        "fields" => project_status_fields()
+      })
+      |> json_response(201)
+
+      base_conn()
+      |> auth(user)
+      |> post(~p"/api/v1/entities", %{
+        "name" => "alpha",
+        "backing_source" => "projects",
+        "fields" => project_status_fields()
+      })
+      |> json_response(201)
+
+      # Query-role (agent) may list — index requires only authentication.
+      resp = base_conn() |> auth(agent) |> get(~p"/api/v1/entities")
+      %{"data" => data} = json_response(resp, 200)
+
+      names = Enum.map(data, & &1["name"])
+      assert names == ["alpha", "zeta"]
+      assert Enum.all?(data, &(&1["backing_source"] == "projects"))
+    end
+
+    test "show returns one definition by id (query role allowed)", %{conn: conn} do
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      created = create_project_entity(conn, user, project_status_fields())
+      %{"data" => %{"id" => id}} = json_response(created, 201)
+
+      resp = base_conn() |> auth(agent) |> get(~p"/api/v1/entities/#{id}")
+      assert %{"data" => data} = json_response(resp, 200)
+      assert data["id"] == id
+      assert data["name"] == "project"
+    end
+
+    test "show is 404 for an unknown id", %{conn: _conn} do
+      tenant = commit_tenant()
+      agent = agent_key(tenant.id)
+
+      resp = base_conn() |> auth(agent) |> get(~p"/api/v1/entities/#{Ecto.UUID.generate()}")
+      assert json_response(resp, 404)
+    end
+
+    test "show is 404 for another tenant's id (no cross-tenant read over HTTP)", %{conn: conn} do
+      tenant_t = commit_tenant()
+      tenant_u = commit_tenant()
+      user_t = user_key(tenant_t.id)
+      agent_u = agent_key(tenant_u.id)
+
+      created = create_project_entity(conn, user_t, project_status_fields())
+      %{"data" => %{"id" => id}} = json_response(created, 201)
+
+      resp = base_conn() |> auth(agent_u) |> get(~p"/api/v1/entities/#{id}")
+      assert json_response(resp, 404)
+    end
+  end
+
   # --- TC-30.4.2: role gating ---
 
   describe "TC-30.4.2: role gating" do
@@ -175,6 +278,40 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
       resp = create_project_entity(conn, agent, project_status_fields())
       assert json_response(resp, 403)
+    end
+
+    test "orchestrator key cannot create an entity (403, role 2 < user 3)", %{conn: conn} do
+      # AC-30.4.2: define/mutate is 403 for orchestrator too. An orchestrator is
+      # deliberately elevated to write work-breakdown data (CLAUDE.md), but an
+      # entity definition is the executor's field allowlist (a security root), so
+      # RequireRole role: :user must still block it — the more meaningful negative
+      # case than the below-floor agent.
+      tenant = commit_tenant()
+      orchestrator = orchestrator_key(tenant.id)
+
+      resp = create_project_entity(conn, orchestrator, project_status_fields())
+      assert json_response(resp, 403)
+    end
+
+    test "orchestrator key cannot PATCH or DELETE an entity (403)", %{conn: conn} do
+      # The same role gate covers the other define/mutate verbs. Create as a user,
+      # then prove an orchestrator key is refused on both PATCH and DELETE.
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      orchestrator = orchestrator_key(tenant.id)
+
+      created = create_project_entity(conn, user, project_status_fields())
+      %{"data" => %{"id" => id}} = json_response(created, 201)
+
+      patched =
+        base_conn()
+        |> auth(orchestrator)
+        |> patch(~p"/api/v1/entities/#{id}", %{"fields" => project_status_fields()})
+
+      assert json_response(patched, 403)
+
+      deleted = base_conn() |> auth(orchestrator) |> delete(~p"/api/v1/entities/#{id}")
+      assert json_response(deleted, 403)
     end
 
     test "retrieve with no key is 401 (never a below-agent 403)", %{conn: conn} do
@@ -260,6 +397,127 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
         })
 
       assert json_response(resp, 429)
+    end
+  end
+
+  # --- TC-30.4.6: execute-time allowlist re-check (the raw-/retrieve bypass close) ---
+
+  describe "TC-30.4.6: execute-time field-allowlist rejection" do
+    test "op:filter naming a declared-but-non-filterable field is 422, not executed",
+         %{conn: conn} do
+      # `slug` is declared on the entity but `filterable: false`. The generate-time
+      # tool surface never exposes a filter tool for it, but a raw POST can still
+      # name it — the executor's execute-time re-check must REJECT it (422
+      # field_not_allowlisted), never run the query. This is the most
+      # security-relevant branch of the story (the raw-/retrieve bypass close).
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_status_and_unfilterable_slug_fields())
+      seed_project(tenant.id)
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{
+          "field" => "slug",
+          "op" => "filter",
+          "value" => "anything"
+        })
+
+      assert %{"error" => %{"code" => "field_not_allowlisted"}} = json_response(resp, 422)
+    end
+
+    test "op:filter naming a field the entity never declares is 422", %{conn: conn} do
+      # `mission` is a server-allowlisted projects column, but this entity does not
+      # declare it — the executor rejects it the same way (never executed).
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_status_fields())
+      seed_project(tenant.id)
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{
+          "field" => "mission",
+          "op" => "filter",
+          "value" => "anything"
+        })
+
+      assert %{"error" => %{"code" => "field_not_allowlisted"}} = json_response(resp, 422)
+    end
+  end
+
+  # --- TC-30.4.7: op:"search" over HTTP ---
+
+  describe "TC-30.4.7: retrieve op:search" do
+    test "search over a vector-covered text field returns 200 with results + meta",
+         %{conn: conn} do
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_searchable_name_fields())
+      seed_project(tenant.id, %{name: "Photosynthesis research initiative"})
+      seed_project(tenant.id, %{name: "Unrelated ledger tooling"})
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{
+          "op" => "search",
+          "query" => "photosynthesis"
+        })
+
+      assert %{"results" => results, "meta" => meta} = json_response(resp, 200)
+      assert results == [%{"name" => "Photosynthesis research initiative"}]
+      assert meta["total_count"] == 1
+      # Shaped to declared columns only.
+      refute Enum.any?(results, &Map.has_key?(&1, "tenant_id"))
+    end
+
+    test "search over a declared-but-unindexed searchable field is 422 search_not_indexed",
+         %{conn: conn} do
+      # `slug` is allowlisted + declared searchable, but NOT covered by the
+      # projects search_vector (name/description/mission). The generate-time tool
+      # surface suppresses the search tool, but a raw POST op:"search" must be
+      # rejected (422 search_not_indexed), never silently searched against the
+      # vector's different columns.
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_unindexed_searchable_slug_fields())
+      seed_project(tenant.id)
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{
+          "op" => "search",
+          "query" => "anything"
+        })
+
+      assert %{"error" => %{"code" => "search_not_indexed"}} = json_response(resp, 422)
+    end
+
+    test "an unknown op is 422 invalid_operation", %{conn: conn} do
+      tenant = commit_tenant()
+      user = user_key(tenant.id)
+      agent = agent_key(tenant.id)
+
+      create_project_entity(conn, user, project_status_fields())
+
+      resp =
+        base_conn()
+        |> auth(agent)
+        |> post(~p"/api/v1/retrieve/project", %{"op" => "sort", "field" => "status"})
+
+      assert %{"error" => %{"code" => "invalid_operation"}} = json_response(resp, 422)
     end
   end
 
