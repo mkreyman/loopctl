@@ -42,13 +42,13 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
 
-  # Two orthogonal "directions" + a midpoint, mirroring the pattern in
-  # knowledge_hybrid_test.exs / knowledge_semantic_search_test.exs: cosine
-  # similarity of identical directions is 1.0, orthogonal directions is 0.0, and
-  # the midpoint sits at ~0.7033 to either — deterministic enough to sit safely
-  # below the 0.75 default threshold without floating-point flakiness.
+  # A "direction" + a midpoint, mirroring the pattern in knowledge_hybrid_test.exs
+  # / knowledge_semantic_search_test.exs: cosine similarity of identical
+  # directions is 1.0, and the midpoint sits at ~0.7033 to it — deterministic
+  # enough to sit safely below the 0.75 default threshold without
+  # floating-point flakiness, while still representing a genuinely near
+  # (not orthogonal) chunk.
   @direction_a List.duplicate(1.0, 768) ++ List.duplicate(0.0, 768)
-  @direction_b List.duplicate(0.0, 768) ++ List.duplicate(1.0, 768)
   @direction_medium List.duplicate(0.5, 768) ++ List.duplicate(0.5, 768)
 
   defp auth_conn(conn, raw_key) do
@@ -104,9 +104,16 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
         })
         |> then(&set_embedding(tenant.id, &1, @direction_a))
 
-      # A fuzzy, non-curated chunk on a DIFFERENT axis — never touched by the
-      # negative control below, so any change in outcome is attributable ONLY to
-      # the curated article's presence/absence.
+      # A fuzzy, non-curated chunk that sits NEAR the query in embedding space
+      # (@direction_medium, ~0.7033 cosine to the query — the same near-miss
+      # vector used by the below-threshold test further down) rather than
+      # orthogonal to it. This is what docs/knowledge-hybrid-retrieval.md:20-26
+      # actually describes as the harvested failure: a chunk close enough that
+      # naive RAG search surfaces it with substantial confidence, not a
+      # zero-similarity chunk that would honestly show up as low-confidence on
+      # its own. It is never touched by the negative control below, so any
+      # change in outcome is attributable ONLY to the curated article's
+      # presence/absence.
       unrelated =
         fixture(:article, %{
           tenant_id: tenant.id,
@@ -114,7 +121,7 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
           body: "How long orders take to ship across different carriers.",
           status: :published
         })
-        |> then(&set_embedding(tenant.id, &1, @direction_b))
+        |> then(&set_embedding(tenant.id, &1, @direction_medium))
 
       query = "refund policy"
       stub_embeddings_by_query(%{query => @direction_a})
@@ -133,9 +140,11 @@ defmodule Loopctl.Knowledge.HybridE2ETest do
       # (d) NEGATIVE CONTROL — the SAME corpus, with ONLY the curated article now
       # ABSENT (archived: excluded from the published search pool, same as if the
       # governed answer had never been written). This is the literal harvested
-      # failure this epic exists to prevent: with no governed answer, the merely
-      # nearby (orthogonal-embedding) chunk becomes the best available answer —
-      # honestly labeled :retrieved, never silently trusted as :curated.
+      # failure this epic exists to prevent: with no governed answer, the
+      # semantically-near (~0.7033 cosine, below the 0.75 curated threshold but
+      # far from zero) chunk becomes the best available answer, surfaced at
+      # substantial confidence — honestly labeled :retrieved, never silently
+      # trusted as :curated.
       assert {:ok, _archived} = Knowledge.archive_article(tenant.id, curated.id)
 
       assert {:ok, %{results: without_curated, meta: meta_without_curated}} =
