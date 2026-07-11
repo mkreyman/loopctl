@@ -5,6 +5,36 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.40.0 — 2026-07-10 (US-30.5 — dynamic per-tenant Context Retriever tools)
+
+### Added
+
+- **Dynamic MCP tool listing.** `ListTools` now returns the static hand-maintained
+  tools PLUS the calling tenant's **generated** Context Retriever tools (Epic 30),
+  fetched at listing time from `GET /api/v1/retrieve/tools` through the shared
+  authenticated `apiCall` (agent key, same witness/STH path as every read tool).
+  When a tenant declares an entity, loopctl auto-generates
+  `cr_filter_<entity>_by_<field>` and `cr_search_<entity>` tools over its
+  allowlisted columns; those now appear in the agent's tool list automatically. If
+  the `/retrieve/tools` fetch fails, the listing **degrades to the static tools**
+  (logged, never errors the whole listing). A short (30s) in-process cache bounds
+  the extra latency the dynamic fetch adds to `ListTools`.
+- **Generic dispatch of `cr_`-prefixed calls.** `CallTool` now routes any unknown
+  tool name starting with `cr_` to a single generic handler that POSTs to `POST
+  /api/v1/retrieve/:entity`. The `(entity, field, operation)` are read from the
+  STRUCTURED metadata carried on each generated spec (US-30.2), never by splitting
+  the tool name (entity/field names contain underscores). Static tools dispatch
+  exactly as before — no regression.
+
+### Security / trust model
+
+- Generated tools are **tenant-scoped by construction**: the stdio MCP process is
+  one-tenant-per-process, so `/retrieve/tools` returns only the process key's
+  tenant's specs and a generic call executes under that key's scope. The client
+  never selects a tenant. Both the listing fetch and the generic call ride the
+  SAME `apiCall`/witness path as static reads, so they carry identical
+  auth + witness/STH headers — no second, weaker HTTP path was introduced.
+
 ## 2.38.0 — 2026-07-10 (US-29.4 — memory_promote tool)
 
 ### Added

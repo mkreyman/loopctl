@@ -1176,8 +1176,11 @@ describe("AC-28.4.5: existing knowledge_*/story tools remain unchanged", () => {
     }
   });
 
-  test("ListToolsRequestSchema returns the TOOLS array as-is (append-only exposure)", () => {
-    assert.match(INDEX_SRC, /server\.setRequestHandler\(ListToolsRequestSchema, async \(\) => \(\{\s*\n\s*tools: TOOLS,/);
+  test("ListToolsRequestSchema exposes the full static TOOLS array (append-only)", () => {
+    // US-30.5 made ListTools dynamic: it now returns the static TOOLS array PLUS
+    // the tenant's generated Context Retriever tools (`[...TOOLS, ...generated]`).
+    // The static tools are still exposed in full and come first — append-only.
+    assert.match(INDEX_SRC, /tools:\s*\[\.\.\.TOOLS,\s*\.\.\.generated\]/);
   });
 });
 

@@ -123,6 +123,10 @@ autonomous agent) can self-remediate without a human. Full agent-tenant lifecycl
 
 ## Tools (84)
 
+> Plus **per-tenant generated Context Retriever tools** (`cr_*`) appended
+> dynamically at runtime — see [Dynamic per-tenant Context Retriever
+> tools](#dynamic-per-tenant-context-retriever-tools-epic-30) below.
+
 ### Project Tools
 
 | Tool | Description |
@@ -279,6 +283,26 @@ it is enforced server-side and a no-op for a non-superadmin key — see below.)
 |---|---|
 | `list_routes` | List all available API routes on the loopctl server. |
 | `get_system_articles` | List or fetch system-scoped (global, cross-tenant) wiki articles. Public — no auth required. Optional: `slug` (fetch one), `category`. |
+
+### Dynamic per-tenant Context Retriever tools (Epic 30)
+
+Beyond the static tools above, the server appends **per-tenant generated tools** to
+`ListTools` at runtime. When your tenant declares an **entity** (`POST
+/api/v1/entities`), loopctl auto-generates governed query tools over that entity's
+allowlisted columns, and this MCP server fetches them from `GET
+/api/v1/retrieve/tools` and lists them alongside the static tools:
+
+| Generated tool | What it does |
+|---|---|
+| `cr_filter_<entity>_by_<field>` | Filter that entity's records where `<field>` equals a value. Params: the field value + `limit`/`offset`. |
+| `cr_search_<entity>` | Full-text search across that entity's searchable text fields. Params: `query` + `limit`/`offset`. |
+
+These are **tenant-scoped**: the listing reflects only the tenant of the process
+key (`LOOPCTL_AGENT_KEY`), resolved server-side — you never pass a tenant. A
+`cr_`-prefixed call is dispatched generically to `POST /api/v1/retrieve/:entity`
+through the same authenticated + witness/STH path as every static read tool. If the
+`/retrieve/tools` fetch fails, listing degrades to the static tools (never errors).
+The generated-tool count per tenant is bounded by the per-tenant entity cap.
 
 ### Dispatch & Chain of Custody (v2) Tools
 

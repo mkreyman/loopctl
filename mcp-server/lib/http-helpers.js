@@ -87,6 +87,87 @@ export function memoryPath({ limit, offset, include_superseded, all_subjects } =
 }
 
 /**
+ * Path for the Context Retriever generated-tool specs (US-30.5, US-30.4).
+ * The literal `/retrieve/tools` route is fixed and carries no query params — the
+ * calling tenant is resolved SERVER-SIDE from the API key, never from the client,
+ * so there is nothing for the client to parameterize here (AC-30.5.3/AC-30.5.4).
+ *
+ * @returns {string}
+ */
+export function retrieveToolsPath() {
+  return "/api/v1/retrieve/tools";
+}
+
+/**
+ * Path for executing a generated tool against a single entity (US-30.5, US-30.4).
+ * `entity` comes from the STRUCTURED metadata on a generated tool spec (never by
+ * splitting the tool name — entity/field names contain underscores), so it is
+ * encoded defensively.
+ *
+ * @param {string} entity
+ * @returns {string}
+ */
+export function retrieveEntityPath(entity) {
+  return `/api/v1/retrieve/${encodeURIComponent(entity)}`;
+}
+
+/**
+ * Map a raw generated-tool spec (as returned by GET /api/v1/retrieve/tools —
+ * `{ name, description, input_schema, metadata }`) into the MCP tool shape the
+ * ListTools handler must return (`{ name, description, inputSchema }`). The server
+ * emits snake_case `input_schema`; MCP expects camelCase `inputSchema`.
+ *
+ * Returns null for a malformed spec (no string `name`) so a single bad entry is
+ * skipped rather than corrupting the whole listing.
+ *
+ * @param {{ name?: unknown, description?: unknown, input_schema?: unknown }} spec
+ * @returns {{ name: string, description: string, inputSchema: object } | null}
+ */
+export function specToMcpTool(spec) {
+  if (!spec || typeof spec.name !== "string") return null;
+  return {
+    name: spec.name,
+    description: typeof spec.description === "string" ? spec.description : "",
+    inputSchema:
+      spec.input_schema && typeof spec.input_schema === "object"
+        ? spec.input_schema
+        : { type: "object", properties: {} },
+  };
+}
+
+/**
+ * Build the POST /api/v1/retrieve/:entity request body for a generated-tool call
+ * from the tool's STRUCTURED dispatch metadata (US-30.2 — `{ entity, field,
+ * operation }`) plus the caller's runtime `args`. The (entity, field, operation)
+ * come from metadata, NOT from splitting the tool name (AC-30.5.2), so entity and
+ * field names containing underscores dispatch unambiguously.
+ *
+ * The body shape matches the US-30.4 controller (`RetrieveRequest`): `op` selects
+ * the operation; `filter` carries `field` + `value`, `search` carries `query`;
+ * `limit`/`offset` pagination pass through when present. Nullish args are omitted
+ * so unset params never override server defaults.
+ *
+ * @param {{ entity: string, field?: string|null, operation: string }} metadata
+ * @param {{ value?: unknown, query?: unknown, limit?: number, offset?: number }} [args]
+ * @returns {object}
+ */
+export function buildRetrieveBody(metadata, args = {}) {
+  const body = { op: metadata.operation };
+
+  if (metadata.operation === "filter") {
+    body.field = metadata.field;
+    if (args.value !== undefined) body.value = args.value;
+  } else if (metadata.operation === "search") {
+    if (args.query !== undefined) body.query = args.query;
+  }
+
+  if (args.limit != null) body.limit = args.limit;
+  if (args.offset != null) body.offset = args.offset;
+
+  return body;
+}
+
+/**
  * Defensively parse the raw text body of a JSON-content-type HTTP response
  * (#249, mcp-03).
  *
