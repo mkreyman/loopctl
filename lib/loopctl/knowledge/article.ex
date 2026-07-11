@@ -65,6 +65,15 @@ defmodule Loopctl.Knowledge.Article do
     # that lets ArticleEmbeddingWorker skip re-calling the paid provider on retry.
     field :embedding_content_hash, :string
 
+    # GOVERNED curated (authoritative) marker (US-31.1). Deliberately EXCLUDED from
+    # `@cast_fields` and `update_changeset/2` — writable ONLY via `curation_changeset/3`
+    # (invoked from `Loopctl.Knowledge.mark_curated/3`), mirroring the `embedding`
+    # isolation precedent. This is what stops an agent from self-promoting its own
+    # article to "authoritative" (agents CAN set `category`/`metadata`, so those are
+    # never sufficient — see `Loopctl.Knowledge.curated?/1`).
+    field :curated_at, :utc_datetime_usec
+    field :curated_by, :string
+
     has_many :outgoing_links, Loopctl.Knowledge.ArticleLink, foreign_key: :source_article_id
     has_many :incoming_links, Loopctl.Knowledge.ArticleLink, foreign_key: :target_article_id
 
@@ -254,6 +263,39 @@ defmodule Loopctl.Knowledge.Article do
     article
     |> change(%{embedding: embedding, embedding_content_hash: content_hash})
     |> validate_embedding_dimensions()
+  end
+
+  @doc """
+  Changeset for setting or clearing the GOVERNED curated marker (US-31.1).
+
+  This is the ONLY changeset that may modify `:curated_at`/`:curated_by`. Neither
+  `create_changeset/2` nor `update_changeset/2` includes them in their cast fields,
+  so an agent writing an ordinary create/update — even one that freely sets
+  `category`/`metadata` — cannot make its own article "curated" (authoritative).
+  The marker is written exclusively through the admin/curation-gated
+  `Loopctl.Knowledge.mark_curated/3` context path.
+
+  ## Parameters
+
+  - `article` -- an existing `%Article{}` struct
+  - `curated_at` -- a `DateTime` (mark) or `nil` (unmark)
+  - `curated_by` -- optional advisory actor label (e.g. `"user:admin"`); ignored
+    (forced `nil`) when unmarking
+
+  ## Returns
+
+  An `Ecto.Changeset` carrying only the marker changes.
+  """
+  @spec curation_changeset(%__MODULE__{}, DateTime.t() | nil, String.t() | nil) ::
+          Ecto.Changeset.t()
+  def curation_changeset(article, curated_at, curated_by \\ nil)
+
+  def curation_changeset(article, nil, _curated_by) do
+    change(article, %{curated_at: nil, curated_by: nil})
+  end
+
+  def curation_changeset(article, %DateTime{} = curated_at, curated_by) do
+    change(article, %{curated_at: curated_at, curated_by: curated_by})
   end
 
   # --- Private validations ---

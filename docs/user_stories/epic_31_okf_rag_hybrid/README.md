@@ -68,6 +68,39 @@ Unlike epics 28–30, this is a **resolution layer on top of existing code**: `k
 - **Deferred (v2, tracked):** #306's freshness/novelty index ranking is out of scope for v1 (noted
   here rather than silently dropped).
 
+## US-31.1 implementation notes (shipped)
+
+The "curated" marker was implemented as a **dedicated non-castable column**, not config.
+Round-1 review concluded a governed marker is required and that `metadata` is unsafe (it is
+cast freely by `Article.create_changeset/2`/`update_changeset/2`), so:
+
+- **Marker:** `articles.curated_at :utc_datetime_usec` (+ advisory `curated_by :string`),
+  added by `20260712010000_add_curated_marker_to_articles.exs`. Both are EXCLUDED from
+  `Article`'s `@cast_fields` and writable ONLY via `Article.curation_changeset/3` — the same
+  isolation technique as `:embedding`. An agent create/update that sets `curated_at`,
+  `curated_by`, or `metadata["curated"]` cannot self-promote (proven by tests).
+- **Governed writer:** `Loopctl.Knowledge.mark_curated/3` / `unmark_curated/3` — the ONLY
+  writers, each audited (`article.curated`/`article.uncurated`) and logged to the
+  `KbCuration` feed. Marking is a trust gate: any HTTP surface reaching it must be role-gated
+  at `:user`+ (the domain fn is the non-castable half; the role check is the transport half).
+  HTTP exposure is deferred to US-31.4.
+- **Pure predicate:** `Knowledge.curated?/1` — `status == :published AND curated_at != nil`,
+  no DB call (unit-testable on an in-memory struct). Category may be a filter, never
+  sufficient alone.
+- **Scoped listing:** `Knowledge.list_curated_sources/2` — tenant's own curated-published
+  UNION system-scoped curated-published, via the explicit
+  `where a.tenant_id == ^tenant_id or a.scope == :system` predicate on AdminRepo (never RLS).
+- **System vs tenant precedence (AC-31.1.3):** a system canonical (`scope: :system`,
+  `tenant_id` nil) MAY participate as curated, but a tenant's OWN curated article on the same
+  topic (case-insensitive title) WINS — the system one is suppressed from that tenant's
+  result and never overrides the tenant's fresher/own answer. System canonicals on topics the
+  tenant has not curated still participate. System articles never leak as another tenant's
+  private content (surfaced only via the explicit `or a.scope == :system` opt-in).
+- **Conflict exclusion (AC-31.1.4):** `Knowledge.authoritative_curated?/1` and
+  `list_curated_sources/2` exclude an article in an OPEN `:potential_conflict` (an
+  auto-generated conflict link with no `conflict_resolutions` row) — the pure `curated?/1`
+  stays marker+status only.
+
 ## Provenance
 
 Second Brain hub `820602df` (Cloud Codes — "Google OKF + RAG: The Ultimate AI Agent Architecture",

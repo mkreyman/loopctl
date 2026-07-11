@@ -2333,6 +2333,325 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # --- Curated sources (US-31.1) ---
+
+  @doc """
+  Pure predicate: is this article a GOVERNED "curated" (authoritative) source?
+
+  An article is curated **iff** it is `:published` AND carries the governed
+  curated marker (`curated_at` is set). The marker is writable ONLY via the
+  admin/curation-gated `mark_curated/3` path (it is absent from
+  `Article`'s cast fields) — so an agent CANNOT self-promote its own article to
+  authoritative merely by choosing a `:reference`/`:playbook` `category` or by
+  setting a `metadata` flag. Category may be used as an additional *filter* by
+  callers, but is never sufficient on its own.
+
+  This function is deliberately **pure** — it inspects only the struct, does no
+  DB call, and is unit-testable with an in-memory `%Article{}`. It knows only
+  `status` + marker. The heavier authoritativeness rules (excluding an article in
+  an OPEN `:potential_conflict`, and tenant-over-system precedence) live in
+  `list_curated_sources/2` / `authoritative_curated?/1`, which do the DB work.
+
+  ## System vs tenant scope (see also `list_curated_sources/2`)
+
+  A system-scoped canonical article (`scope: :system`, `tenant_id` nil) MAY be
+  curated and participate in the hybrid path. But a tenant's OWN curated article
+  on the same topic takes precedence — a system canonical never overrides a
+  tenant's fresher/own answer. System articles never leak as another tenant's
+  private content: they are only ever surfaced via the explicit
+  `or a.scope == :system` predicate in `list_curated_sources/2`.
+
+  ## Examples
+
+      iex> Knowledge.curated?(%Article{status: :published, curated_at: ~U[2026-07-10 00:00:00.000000Z]})
+      true
+
+      iex> Knowledge.curated?(%Article{status: :published, curated_at: nil})
+      false
+
+      iex> Knowledge.curated?(%Article{status: :draft, curated_at: ~U[2026-07-10 00:00:00.000000Z]})
+      false
+  """
+  @spec curated?(Article.t()) :: boolean()
+  def curated?(%Article{status: :published, curated_at: %DateTime{}}), do: true
+  def curated?(%Article{}), do: false
+
+  @doc """
+  Governed setter: marks an article as curated (authoritative).
+
+  This is the ONLY writer of the curated marker. It writes through the dedicated
+  `Article.curation_changeset/3` (the marker is NOT in the ordinary cast fields),
+  records an `article.curated` audit event, and appends a `KbCuration` feed entry.
+
+  Marking authoritative is a **trust gate** (the hybrid resolver, US-31.2, prefers
+  curated answers), so the HTTP surface that reaches this MUST be role-gated at
+  `:user` or above — do not expose it at `:agent`. The non-castable marker is the
+  domain-layer half of the gate; the role check is the transport half.
+
+  Marking is allowed regardless of the article's current status, but `curated?/1`
+  only reports `true` once the article is `:published`.
+
+  ## Parameters
+
+  - `tenant_id` -- the owning tenant UUID (pass `nil` for a `scope: :system` article)
+  - `article_id` -- the article UUID
+  - `opts` -- `:actor_id`, `:actor_label`, `:actor_type`, and `:at` (mark time)
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success
+  - `{:error, :not_found}` if not found / wrong tenant
+  - `{:error, %Ecto.Changeset{}}` on a write failure
+  """
+  @spec mark_curated(Ecto.UUID.t() | nil, Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+  def mark_curated(tenant_id, article_id, opts \\ []) do
+    at = Keyword.get(opts, :at) || DateTime.utc_now()
+    actor_label = Keyword.get(opts, :actor_label)
+    changeset_fun = fn article -> Article.curation_changeset(article, at, actor_label) end
+
+    write_curation(tenant_id, article_id, changeset_fun, "article.curated", opts)
+  end
+
+  @doc """
+  Governed setter: clears an article's curated marker (the inverse of `mark_curated/3`).
+
+  Reversible + audited, same governance as `mark_curated/3`. Returns the same shapes.
+  """
+  @spec unmark_curated(Ecto.UUID.t() | nil, Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+  def unmark_curated(tenant_id, article_id, opts \\ []) do
+    changeset_fun = fn article -> Article.curation_changeset(article, nil, nil) end
+    write_curation(tenant_id, article_id, changeset_fun, "article.uncurated", opts)
+  end
+
+  defp write_curation(tenant_id, article_id, changeset_fun, action, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
+    with {:ok, article} <- fetch_curatable_article(tenant_id, article_id) do
+      changeset = changeset_fun.(article)
+
+      multi =
+        Multi.new()
+        |> Multi.update(:article, changeset)
+        |> Audit.log_in_multi(:audit, fn %{article: updated} ->
+          %{
+            tenant_id: updated.tenant_id,
+            entity_type: "article",
+            entity_id: updated.id,
+            action: action,
+            actor_type: actor_type,
+            actor_id: actor_id,
+            actor_label: actor_label,
+            old_state: %{"curated_at" => marker_iso(article.curated_at)},
+            new_state: %{"curated_at" => marker_iso(updated.curated_at)}
+          }
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{article: updated}} ->
+          KbCuration.record(
+            updated.tenant_id,
+            curation_kind(action),
+            curation_summary(action, updated),
+            refs: [updated.id],
+            actor: actor_label
+          )
+
+          {:ok, updated}
+
+        {:error, :article, changeset, _} ->
+          {:error, changeset}
+      end
+    end
+  end
+
+  defp marker_iso(nil), do: nil
+  defp marker_iso(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+
+  defp curation_kind("article.curated"), do: "curated"
+  defp curation_kind("article.uncurated"), do: "uncurated"
+
+  defp curation_summary("article.curated", article),
+    do: "Marked article #{article.id} (#{article.title}) as curated"
+
+  defp curation_summary("article.uncurated", article),
+    do: "Cleared curated marker on article #{article.id} (#{article.title})"
+
+  # Fetches an article for curation. A tenant article is scoped by tenant_id; a
+  # system article (tenant_id nil) is fetched by its system scope. Never crosses
+  # tenants — a wrong tenant_id resolves to :not_found.
+  defp fetch_curatable_article(nil, article_id) do
+    case AdminRepo.one(from(a in Article, where: a.id == ^article_id and a.scope == :system)) do
+      nil -> {:error, :not_found}
+      article -> {:ok, article}
+    end
+  end
+
+  defp fetch_curatable_article(tenant_id, article_id) when is_binary(tenant_id) do
+    case AdminRepo.one(
+           from(a in Article, where: a.id == ^article_id and a.tenant_id == ^tenant_id)
+         ) do
+      nil -> {:error, :not_found}
+      article -> {:ok, article}
+    end
+  end
+
+  @doc """
+  Lists the AUTHORITATIVE curated sources visible to a tenant.
+
+  Returns the tenant's OWN curated, published articles UNIONed with system-scoped
+  (`scope: :system`, `tenant_id` nil) curated, published articles — the set the
+  hybrid resolver (US-31.2) may prefer.
+
+  Governance / correctness rules baked in:
+
+    * **Explicit tenant predicate, never RLS.** Like every Knowledge read, this
+      runs on `AdminRepo` (BYPASSRLS) scoped by an explicit
+      `where a.tenant_id == ^tenant_id or a.scope == :system` — system articles
+      are opted in *only* by that `or`, and one tenant never sees another tenant's
+      private curated articles.
+    * **Only published + governed marker.** Drafts, archived, and superseded
+      articles are excluded (`curated?/1` semantics, enforced in SQL).
+    * **Open conflicts excluded (AC-31.1.4).** An article in an OPEN
+      `:potential_conflict` (an auto-generated conflict link with no
+      `conflict_resolutions` row) is NOT returned as authoritative — the conflict
+      must be surfaced/resolved first (ties to US-31.2 AC-31.2.6).
+    * **Tenant precedence (AC-31.1.3).** When a tenant's own curated article and a
+      system canonical share a topic (case-insensitive title), the tenant's own
+      wins and the system one is suppressed from the result — a system canonical
+      never overrides a tenant's own answer. System canonicals on topics the
+      tenant has NOT curated are still returned (they participate).
+
+  ## Options
+
+  - `:category` -- restrict to a single category atom
+  - `:include_system` -- set `false` to exclude system canonicals (default `true`)
+
+  Results are ordered tenant-own-first, then most-recently-updated.
+  """
+  @spec list_curated_sources(Ecto.UUID.t(), keyword()) :: [Article.t()]
+  def list_curated_sources(tenant_id, opts \\ []) when is_binary(tenant_id) do
+    include_system = Keyword.get(opts, :include_system, true)
+    category = Keyword.get(opts, :category)
+
+    scope_filter =
+      if include_system do
+        dynamic([a], a.tenant_id == ^tenant_id or a.scope == :system)
+      else
+        dynamic([a], a.tenant_id == ^tenant_id)
+      end
+
+    base =
+      from(a in Article,
+        as: :article,
+        where: a.status == :published,
+        where: not is_nil(a.curated_at),
+        where: ^scope_filter,
+        # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
+        where: not exists(open_conflict_subquery()),
+        order_by: [desc: a.updated_at, asc: a.id]
+      )
+
+    base =
+      case category do
+        nil -> base
+        cat -> from(a in base, where: a.category == ^cat)
+      end
+
+    base
+    |> AdminRepo.all()
+    |> apply_tenant_precedence(tenant_id)
+  end
+
+  # Subquery correlated on the outer :article binding: TRUE when the article is a
+  # member of an auto-generated :potential_conflict pair that has NOT yet been
+  # resolved (no conflict_resolutions row either direction). Mirrors the open-conflict
+  # definition in list_potential_conflicts/2.
+  defp open_conflict_subquery do
+    from(l in ArticleLink,
+      as: :link,
+      where: l.relationship_type == :potential_conflict,
+      where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+      where:
+        l.source_article_id == parent_as(:article).id or
+          l.target_article_id == parent_as(:article).id,
+      where:
+        not exists(
+          from(r in ConflictResolution,
+            where:
+              r.tenant_id == parent_as(:link).tenant_id and
+                ((r.source_article_id == parent_as(:link).source_article_id and
+                    r.target_article_id == parent_as(:link).target_article_id) or
+                   (r.source_article_id == parent_as(:link).target_article_id and
+                      r.target_article_id == parent_as(:link).source_article_id))
+          )
+        ),
+      select: 1
+    )
+  end
+
+  # AC-31.1.3 tenant precedence: when a tenant's own curated article and a system
+  # canonical share a topic (case-insensitive title), the tenant's own wins and the
+  # system one is dropped. Tenant-own rows are kept unconditionally.
+  defp apply_tenant_precedence(articles, tenant_id) do
+    owned_topics =
+      articles
+      |> Enum.filter(&(&1.tenant_id == tenant_id))
+      |> Enum.map(&topic_key/1)
+      |> MapSet.new()
+
+    Enum.reject(articles, fn a ->
+      a.scope == :system and MapSet.member?(owned_topics, topic_key(a))
+    end)
+  end
+
+  defp topic_key(%Article{title: title}) when is_binary(title),
+    do: title |> String.trim() |> String.downcase()
+
+  defp topic_key(%Article{}), do: nil
+
+  @doc """
+  Authoritative-curated check for a single article (AC-31.1.4).
+
+  Unlike the pure `curated?/1` (status + marker only), this additionally excludes
+  an article that is in an OPEN `:potential_conflict` — such an article is NOT
+  treated as authoritative until the conflict is surfaced/resolved. Does a DB
+  lookup for the open conflict; the conflict is scoped to the article's own tenant.
+  """
+  @spec authoritative_curated?(Article.t()) :: boolean()
+  def authoritative_curated?(%Article{} = article) do
+    curated?(article) and not article_in_open_conflict?(article)
+  end
+
+  # TRUE when the article is a member of an unresolved auto-generated
+  # :potential_conflict pair within its own tenant.
+  defp article_in_open_conflict?(%Article{id: article_id, tenant_id: tenant_id}) do
+    query =
+      from(l in ArticleLink,
+        as: :link,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
+        where:
+          not exists(
+            from(r in ConflictResolution,
+              where:
+                r.tenant_id == parent_as(:link).tenant_id and
+                  ((r.source_article_id == parent_as(:link).source_article_id and
+                      r.target_article_id == parent_as(:link).target_article_id) or
+                     (r.source_article_id == parent_as(:link).target_article_id and
+                        r.target_article_id == parent_as(:link).source_article_id))
+            )
+          )
+      )
+
+    AdminRepo.exists?(query)
+  end
+
   # --- Publish Workflow ---
 
   @doc """
