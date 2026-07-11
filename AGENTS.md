@@ -5,10 +5,11 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
-### `retrieve_*` (Context Retriever) vs `knowledge_*` (Wiki) vs `memory_*` (Memory)
+### `retrieve_*` (Context Retriever) vs `knowledge_*` (Wiki, incl. hybrid retrieval) vs `memory_*` (Memory)
 
 loopctl has THREE agent information surfaces — pick by WHAT THE DATA IS (full
-references: `docs/context-retriever.md`, `docs/agent-memory.md`):
+references: `docs/context-retriever.md`, `docs/agent-memory.md`,
+`docs/knowledge-hybrid-retrieval.md`):
 
 - **`retrieve_*` — Context Retriever** (Epic 30; `Loopctl.ContextRetriever`, table
   `entity_definitions`): GOVERNED, structured access to loopctl's own live ROWS
@@ -27,13 +28,25 @@ references: `docs/context-retriever.md`, `docs/agent-memory.md`):
   `memory_remember`, `memory_recall`, `memory_list`, `memory_forget`.
 - **`knowledge_*` — Knowledge Wiki**: SHARED, curated tenant DOCUMENTS, deduped and
   linked. Use when the insight is worth ANOTHER agent reading.
+  - **`knowledge_hybrid_search`** (Epic 31): resolves a query to a governed
+    **curated** answer (ONLY when its absolute confidence clears a scale-matched
+    threshold + margin over retrieval, and it is authoritative — not
+    superseded/conflicted) else falls back to semantic/keyword **retrieval** — one
+    shape carrying `meta.provenance` (`curated`/`retrieved`); never branch on
+    which subsystem answered, branch on `meta.provenance`.
+  - **`knowledge_progressive_index`/`knowledge_progressive_drill`** (Epic 31): a
+    cheap, top-K-capped, curated-preferred topic browse (compact stubs, then a
+    full-body drill) — NOT a substitute for `hybrid_search`'s semantic/governed
+    resolution (a fuzzy topic can miss a lexically-dissimilar curated article).
 
 Rule of thumb: *live structured business row?* → `retrieve_*`; *worth another
 agent reading?* → `knowledge_create`; *a fact only I need to recall about my own
-work?* → `memory_remember`. Scope is key-derived — you never pass
-`tenant_id`/`subject_id`. Do NOT conflate `Loopctl.Memory` (Epic 28) with the
-article-level agent-memory *metadata* (`memory_type`/`visibility`) on the
-Knowledge `articles` table (#163) — different subsystems.
+work?* → `memory_remember`; *might have a governed answer, need to know if it's
+authoritative or "best guess"?* → `knowledge_hybrid_search`. Scope is key-derived
+— you never pass `tenant_id`/`subject_id`. Do NOT conflate `Loopctl.Memory`
+(Epic 28) with the article-level agent-memory *metadata*
+(`memory_type`/`visibility`) on the Knowledge `articles` table (#163) —
+different subsystems.
 
 ### Phoenix v1.8 guidelines
 
