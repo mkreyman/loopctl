@@ -37,7 +37,10 @@ defmodule Loopctl.KnowledgeCuratedTest do
       )
 
     assert is_nil(article.tenant_id)
-    {:ok, marked} = Knowledge.mark_curated(nil, article.id, actor_label: "superadmin")
+
+    {:ok, marked} =
+      Knowledge.mark_curated(nil, article.id, actor_label: "superadmin", scope: :system)
+
     marked
   end
 
@@ -157,6 +160,94 @@ defmodule Loopctl.KnowledgeCuratedTest do
       audit = audit_event(system.id, "article.curated")
       assert is_nil(audit.tenant_id)
     end
+
+    test "nil-tenant curation is REJECTED without an explicit scope: :system opt-in" do
+      tenant = fixture(:tenant)
+
+      {:ok, system} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Accidental Global",
+          body: "b",
+          category: :reference,
+          scope: :system,
+          status: :published
+        })
+
+      # An accidental/missing tenant context (nil) must NOT silently curate a GLOBAL
+      # canonical — the system path requires a deliberate scope: :system.
+      assert {:error, :system_scope_required} = Knowledge.mark_curated(nil, system.id, [])
+      assert {:error, :system_scope_required} = Knowledge.unmark_curated(nil, system.id, [])
+
+      # Reload: the marker was never written.
+      reloaded = AdminRepo.get!(Article, system.id)
+      assert is_nil(reloaded.curated_at)
+      refute Knowledge.curated?(reloaded)
+
+      # The deliberate path works.
+      assert {:ok, marked} =
+               Knowledge.mark_curated(nil, system.id, scope: :system, actor_label: "superadmin")
+
+      assert Knowledge.curated?(marked)
+    end
+  end
+
+  describe "curated marker invalidation on content edit (US-31.1 poisoning defense)" do
+    test "editing the BODY of a curated article clears the marker, forcing re-curation" do
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id, %{body: "approved body"})
+      assert Knowledge.curated?(curated)
+
+      {:ok, edited} = Knowledge.update_article(tenant.id, curated.id, %{body: "poisoned body"})
+
+      # The governed marker was invalidated by the content change: the poisoned
+      # body is NOT authoritative until re-curated through the governed path.
+      assert is_nil(edited.curated_at)
+      refute Knowledge.curated?(edited)
+      refute edited.id in ids(Knowledge.list_curated_sources(tenant.id))
+    end
+
+    test "editing the TITLE of a curated article clears the marker" do
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id, %{title: "Approved Title"})
+
+      {:ok, edited} = Knowledge.update_article(tenant.id, curated.id, %{title: "Changed Title"})
+
+      assert is_nil(edited.curated_at)
+      refute Knowledge.curated?(edited)
+    end
+
+    test "publishing a curated DRAFT via the ordinary edit path clears the marker" do
+      tenant = fixture(:tenant)
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      {:ok, marked} = Knowledge.mark_curated(tenant.id, draft.id, [])
+
+      # Marker set but not yet effective (draft).
+      refute is_nil(marked.curated_at)
+      refute Knowledge.curated?(marked)
+
+      # Agent self-publishing via update must NOT flip it live under the admin marker.
+      {:ok, published} = Knowledge.update_article(tenant.id, draft.id, %{status: :published})
+
+      assert is_nil(published.curated_at)
+      refute Knowledge.curated?(published)
+    end
+
+    test "a pure metadata/tags edit PRESERVES the curated marker" do
+      tenant = fixture(:tenant)
+      curated = curated_article(tenant.id)
+      assert Knowledge.curated?(curated)
+
+      {:ok, edited} =
+        Knowledge.update_article(tenant.id, curated.id, %{
+          tags: ["a", "b"],
+          metadata: %{"note" => "unrelated"}
+        })
+
+      # No title/body/status change → the curator's approval still stands.
+      assert edited.curated_at == curated.curated_at
+      assert Knowledge.curated?(edited)
+      assert edited.id in ids(Knowledge.list_curated_sources(tenant.id))
+    end
   end
 
   describe "authoritative curated excludes draft/superseded/conflicted (TC-31.1.2)" do
@@ -234,6 +325,34 @@ defmodule Loopctl.KnowledgeCuratedTest do
       assert Knowledge.curated?(system)
       refute Knowledge.authoritative_curated?(system)
       refute system.id in ids(Knowledge.list_curated_sources(tenant.id))
+    end
+
+    test "one tenant's conflict over a system canonical does NOT retract it for OTHER tenants" do
+      # A system canonical is shared by every tenant. Tenant A opens a conflict link
+      # referencing it. The open-conflict exclusion is correlated on the CALLER's
+      # tenant, so the canonical is suppressed only in TENANT A's list — tenant B
+      # (uninvolved) still sees the global canonical. (Guards against a cross-tenant
+      # global retraction via a single tenant's dispute.)
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      system = curated_system_article(%{title: "Shared Canonical"}, tenant_a.id)
+      other = curated_system_article(%{title: "Rival Shared", body: "rival"}, tenant_a.id)
+
+      # Conflict link lives under tenant_a only.
+      fixture(:article_link, %{
+        tenant_id: tenant_a.id,
+        source_article_id: system.id,
+        target_article_id: other.id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.95}
+      })
+
+      # Tenant A (the disputing tenant): canonical is withheld.
+      refute system.id in ids(Knowledge.list_curated_sources(tenant_a.id))
+
+      # Tenant B (uninvolved): the global canonical STILL participates.
+      assert system.id in ids(Knowledge.list_curated_sources(tenant_b.id))
     end
   end
 

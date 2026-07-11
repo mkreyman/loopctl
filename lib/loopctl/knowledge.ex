@@ -2401,21 +2401,31 @@ defmodule Loopctl.Knowledge do
     operation. The audit event is written with `tenant_id: nil` (global scope; the
     superadmin API is the oversight path) and NO per-tenant `KbCuration` feed line is
     written — that feed is per-tenant and a system canonical belongs to no tenant.
+    Because the global path is destructive of the "trust curated" guarantee for
+    EVERY tenant, the caller MUST pass `scope: :system` to use it; a bare `nil`
+    `tenant_id` (e.g. from a missing tenant context) is rejected with
+    `{:error, :system_scope_required}` rather than silently curating a global
+    canonical. That domain guard is defense in depth — the transport layer
+    (US-31.4) still MUST role-gate the system path at superadmin/WebAuthn.
 
   ## Parameters
 
-  - `tenant_id` -- the owning tenant UUID (pass `nil` for a `scope: :system` article)
+  - `tenant_id` -- the owning tenant UUID (pass `nil` WITH `scope: :system` for a
+    system canonical)
   - `article_id` -- the article UUID
-  - `opts` -- `:actor_id`, `:actor_label`, `:actor_type`, and `:at` (mark time)
+  - `opts` -- `:actor_id`, `:actor_label`, `:actor_type`, `:at` (mark time), and
+    `:scope` (`:system` REQUIRED when `tenant_id` is `nil`)
 
   ## Returns
 
   - `{:ok, %Article{}}` on success
   - `{:error, :not_found}` if not found / wrong tenant
+  - `{:error, :system_scope_required}` if `tenant_id` is `nil` without `scope: :system`
   - `{:error, %Ecto.Changeset{}}` on a write failure
   """
   @spec mark_curated(Ecto.UUID.t() | nil, Ecto.UUID.t(), keyword()) ::
-          {:ok, Article.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :not_found | :system_scope_required | Ecto.Changeset.t()}
   def mark_curated(tenant_id, article_id, opts \\ []) do
     at = Keyword.get(opts, :at) || DateTime.utc_now()
     actor_label = Keyword.get(opts, :actor_label)
@@ -2432,7 +2442,8 @@ defmodule Loopctl.Knowledge do
   `article.uncurated` audit event. Returns the same shapes.
   """
   @spec unmark_curated(Ecto.UUID.t() | nil, Ecto.UUID.t(), keyword()) ::
-          {:ok, Article.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+          {:ok, Article.t()}
+          | {:error, :not_found | :system_scope_required | Ecto.Changeset.t()}
   def unmark_curated(tenant_id, article_id, opts \\ []) do
     changeset_fun = fn article -> Article.curation_changeset(article, nil, nil) end
     write_curation(tenant_id, article_id, changeset_fun, "article.uncurated", opts)
@@ -2443,7 +2454,8 @@ defmodule Loopctl.Knowledge do
     actor_label = Keyword.get(opts, :actor_label)
     actor_type = Keyword.get(opts, :actor_type, "api_key")
 
-    with {:ok, article} <- fetch_curatable_article(tenant_id, article_id) do
+    with :ok <- authorize_curation_scope(tenant_id, opts),
+         {:ok, article} <- fetch_curatable_article(tenant_id, article_id) do
       changeset = changeset_fun.(article)
 
       multi =
@@ -2493,6 +2505,24 @@ defmodule Loopctl.Knowledge do
   defp curation_summary("article.uncurated", article),
     do: "Cleared curated marker on article #{article.id} (#{article.title})"
 
+  # US-31.1 defense in depth: curating a system-scoped canonical (tenant_id nil) is
+  # a GLOBAL, all-tenant-visible authoritative operation. Reaching that path with a
+  # nil tenant_id must be DELIBERATE, never accidental — an unset/missing tenant
+  # context (a common bug shape) would otherwise silently curate a global article.
+  # The caller must therefore explicitly declare `scope: :system` to use the
+  # nil-tenant path; a nil tenant_id without it is rejected. This is orthogonal to
+  # (and does not replace) the transport-layer role gate that US-31.4 must add:
+  # tenant curation at role `:user`+, system curation at superadmin/WebAuthn.
+  defp authorize_curation_scope(nil, opts) do
+    if Keyword.get(opts, :scope) == :system do
+      :ok
+    else
+      {:error, :system_scope_required}
+    end
+  end
+
+  defp authorize_curation_scope(tenant_id, _opts) when is_binary(tenant_id), do: :ok
+
   # Fetches an article for curation. A tenant article is scoped by tenant_id; a
   # system article (tenant_id nil) is fetched by its system scope. Never crosses
   # tenants — a wrong tenant_id resolves to :not_found.
@@ -2531,38 +2561,56 @@ defmodule Loopctl.Knowledge do
     * **Open conflicts excluded (AC-31.1.4).** An article in an OPEN
       `:potential_conflict` (an auto-generated conflict link with no
       `conflict_resolutions` row) is NOT returned as authoritative — the conflict
-      must be surfaced/resolved first (ties to US-31.2 AC-31.2.6).
+      must be surfaced/resolved first (ties to US-31.2 AC-31.2.6). The conflict
+      link is correlated to the CALLER's `tenant_id` (see `open_conflict_subquery/1`)
+      so one tenant's dispute over a shared system canonical cannot retract that
+      global canonical from OTHER tenants' lists.
     * **Tenant precedence (AC-31.1.3).** When a tenant's own curated article and a
-      system canonical share a topic (case-insensitive title), the tenant's own
-      wins and the system one is suppressed from the result — a system canonical
-      never overrides a tenant's own answer. System canonicals on topics the
-      tenant has NOT curated are still returned (they participate). Ownership is
-      computed INDEPENDENTLY of open-conflict status (see `tenant_owned_topics/2`):
-      if the tenant's own curated article on a topic is itself in an open conflict,
-      it is excluded from the RESULT (AC-31.1.4) but STILL suppresses the system
-      canonical — so on a topic the tenant owns-but-is-disputing, neither surfaces
-      and the conflict must be resolved first, rather than papering over the
-      tenant's disputed answer with the system one.
+      system canonical share a topic (case-insensitive EXACT title — a v1
+      interpretation; see below), the tenant's own wins and the system one is
+      suppressed from the result — a system canonical never overrides a tenant's
+      own answer. System canonicals on topics the tenant has NOT curated are still
+      returned (they participate). Ownership is folded into the main query as a
+      correlated `NOT EXISTS` (see `tenant_owns_topic_subquery/2`) evaluated
+      INDEPENDENTLY of open-conflict status: if the tenant's own curated article on
+      a topic is itself in an open conflict, it is excluded from the RESULT
+      (AC-31.1.4) but STILL suppresses the system canonical — so on a topic the
+      tenant owns-but-is-disputing, neither surfaces and the conflict must be
+      resolved first, rather than papering over the tenant's disputed answer with
+      the system one.
+
+  ## Topic identity (v1 scope)
+
+  "Same topic" for precedence is keyed on the article's **case-insensitive,
+  trimmed title** (exact equality). Two curated articles about the same conceptual
+  topic under DIFFERENT titles are treated as distinct topics and both surface.
+  Broader (semantic) topic identity is deliberately OUT OF SCOPE for US-31.1 and
+  belongs to the US-31.2 hybrid resolver's blending layer, which has embeddings;
+  callers here must not assume title-equality captures semantic sameness.
 
   ## Options
 
   - `:category` -- restrict to a single category atom
   - `:include_system` -- set `false` to exclude system canonicals (default `true`)
-  - `:limit` -- cap the number of rows PULLED from the DB (a positive integer;
-    default unbounded). Precedence suppression runs after the pull, so the returned
-    list may be shorter than `:limit`. Use it when the caller (e.g. the US-31.2
-    resolver) wants a bounded pull rather than the whole curated set.
+  - `:limit` -- cap the number of rows returned (a positive integer; default
+    unbounded). Precedence suppression is applied IN THE QUERY (correlated
+    subquery), so `:limit` bounds the FINAL result set, not a pre-suppression pull.
+    Use it when the caller (e.g. the US-31.2 resolver) wants a bounded result.
 
   Results are ordered tenant-own-first (tenant rows before system canonicals), then
   most-recently-updated.
 
-  ## Scaling note
+  ## Consistency & scaling notes
 
-  This returns full `%Article{}` structs (including bodies) and applies tenant
-  precedence in memory. It is bounded in practice by the partial index
-  `articles_curated_published_idx` and the small-curated-set assumption; the
-  `:limit` opt is the pressure valve. If the curated corpus grows into a hot path,
-  add cursor pagination or a body-less projection before this becomes a bottleneck.
+  Precedence is computed in a SINGLE query (one snapshot): the tenant-ownership
+  suppression is a correlated `NOT EXISTS` on the same `%Article{}` scan rather than
+  a second, independent read. This (a) removes the torn-view window a concurrent
+  `mark_curated` could open between two reads, and (b) removes the previously
+  unbounded full curated-title scan — ownership is now evaluated per candidate row
+  via the partial index `articles_curated_published_idx`, so `:limit` genuinely
+  bounds the work. This still returns full `%Article{}` structs (including bodies);
+  if the curated corpus grows into a hot path, add cursor pagination or a body-less
+  projection before this becomes a bottleneck.
   """
   @spec list_curated_sources(Ecto.UUID.t(), keyword()) :: [Article.t()]
   def list_curated_sources(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -2572,7 +2620,16 @@ defmodule Loopctl.Knowledge do
 
     scope_filter =
       if include_system do
-        dynamic([a], a.tenant_id == ^tenant_id or a.scope == :system)
+        # A system canonical participates ONLY when the tenant does not OWN the same
+        # topic (AC-31.1.3). Folding the ownership check here (rather than a second
+        # in-memory pass over a separately-read owned-topic set) keeps the whole
+        # precedence decision in one atomic snapshot and bounded by :limit.
+        dynamic(
+          [a],
+          a.tenant_id == ^tenant_id or
+            (a.scope == :system and
+               not exists(tenant_owns_topic_subquery(tenant_id, category)))
+        )
       else
         dynamic([a], a.tenant_id == ^tenant_id)
       end
@@ -2584,7 +2641,7 @@ defmodule Loopctl.Knowledge do
         where: not is_nil(a.curated_at),
         where: ^scope_filter,
         # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
-        where: not exists(open_conflict_subquery()),
+        where: not exists(open_conflict_subquery(tenant_id)),
         # Tenant-own-first: tenant rows (tenant_id NOT NULL, so `IS NULL` = false)
         # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest.
         order_by: [asc: fragment("? IS NULL", a.tenant_id), desc: a.updated_at, asc: a.id]
@@ -2598,23 +2655,21 @@ defmodule Loopctl.Knowledge do
 
     base = if is_integer(limit) and limit > 0, do: from(a in base, limit: ^limit), else: base
 
-    # Owned topics are computed independently of the open-conflict exclusion above,
-    # so a tenant's disputed-but-owned topic still suppresses the system canonical.
-    owned_topics =
-      if include_system, do: tenant_owned_topics(tenant_id, category), else: MapSet.new()
-
-    base
-    |> AdminRepo.all()
-    |> apply_tenant_precedence(owned_topics)
+    AdminRepo.all(base)
   end
 
   # Subquery correlated on the outer :article binding: TRUE when the article is a
   # member of an auto-generated :potential_conflict pair that has NOT yet been
-  # resolved (no conflict_resolutions row either direction). Mirrors the open-conflict
-  # definition in list_potential_conflicts/2.
-  defp open_conflict_subquery do
+  # resolved (no conflict_resolutions row either direction). The link is scoped to
+  # `tenant_id` (the CALLER's tenant) so one tenant's unresolved dispute over a
+  # shared system canonical (article ids are global) cannot retract that canonical
+  # from ANOTHER tenant's list. For a tenant's own article the link necessarily
+  # lives under that same tenant, so this predicate is a no-op restriction there.
+  # Mirrors the open-conflict definition in list_potential_conflicts/2.
+  defp open_conflict_subquery(tenant_id) do
     from(l in ArticleLink,
       as: :link,
+      where: l.tenant_id == ^tenant_id,
       where: l.relationship_type == :potential_conflict,
       where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
       where:
@@ -2641,48 +2696,32 @@ defmodule Loopctl.Knowledge do
     )
   end
 
-  # AC-31.1.3 tenant precedence: drop a system canonical whose topic (case-insensitive
-  # title) the tenant OWNS. `owned_topics` is precomputed from the tenant's own curated
-  # articles independently of conflict status (tenant_owned_topics/2), so a disputed but
-  # tenant-owned topic still suppresses the system answer. Tenant-own rows are kept as-is.
-  defp apply_tenant_precedence(articles, owned_topics) do
-    Enum.reject(articles, fn a ->
-      a.scope == :system and MapSet.member?(owned_topics, topic_key(a))
-    end)
-  end
-
-  # Topics (case-insensitive titles) the tenant OWNS via its own curated + published
-  # articles. Computed INDEPENDENTLY of open-conflict status (AC-31.1.3): if the tenant's
-  # own answer on a topic is currently in an unresolved conflict it is excluded from the
-  # RESULT (AC-31.1.4) yet must STILL suppress a same-topic system canonical, so ownership
-  # cannot be derived from the (conflict-filtered) surviving rows — it is queried here.
-  defp tenant_owned_topics(tenant_id, category) do
+  # AC-31.1.3 tenant precedence, folded into list_curated_sources/2's main scan.
+  # Correlated on the outer :article binding: TRUE when the CALLER's tenant OWNS the
+  # outer article's topic — i.e. has its OWN curated + published article whose topic
+  # (case-insensitive, trimmed title) matches. Evaluated INDEPENDENTLY of open-conflict
+  # status: a tenant's disputed-but-owned topic (excluded from the RESULT by the
+  # open-conflict filter) STILL suppresses a same-topic system canonical, so ownership
+  # is queried directly here rather than derived from the conflict-filtered rows.
+  # Applied only to `a.scope == :system` candidates, so tenant-own rows are unaffected.
+  # Topic equality uses `lower(btrim(title))` on both sides — the SQL analogue of the
+  # documented v1 case-insensitive exact-title key; the partial index
+  # `articles_curated_published_idx` bounds the correlated lookup.
+  defp tenant_owns_topic_subquery(tenant_id, category) do
     query =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.status == :published,
-        where: not is_nil(a.curated_at),
-        select: a.title
+      from(o in Article,
+        where: o.tenant_id == ^tenant_id,
+        where: o.status == :published,
+        where: not is_nil(o.curated_at),
+        where: fragment("lower(btrim(?)) = lower(btrim(?))", o.title, parent_as(:article).title),
+        select: 1
       )
 
-    query =
-      case category do
-        nil -> query
-        cat -> from(a in query, where: a.category == ^cat)
-      end
-
-    query
-    |> AdminRepo.all()
-    |> Enum.map(&normalize_topic/1)
-    |> MapSet.new()
+    case category do
+      nil -> query
+      cat -> from(o in query, where: o.category == ^cat)
+    end
   end
-
-  defp topic_key(%Article{title: title}), do: normalize_topic(title)
-
-  defp normalize_topic(title) when is_binary(title),
-    do: title |> String.trim() |> String.downcase()
-
-  defp normalize_topic(_), do: nil
 
   @doc """
   Authoritative-curated check for a single article (AC-31.1.4).

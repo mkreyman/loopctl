@@ -178,6 +178,23 @@ defmodule Loopctl.Knowledge.Article do
 
   Allows partial updates to title, body, category, status, tags,
   metadata, and project_id. Same constraints as create_changeset.
+
+  ## Curated-marker invalidation (US-31.1, poisoning defense)
+
+  The governed curated marker (`curated_at`/`curated_by`) attests that a curator
+  approved a SPECIFIC published-content snapshot as authoritative. Any ordinary,
+  agent-reachable edit through this changeset that changes the article's `:title`,
+  `:body`, or `:status` therefore **clears the marker** — see
+  `clear_curated_marker_on_content_change/1`. This closes the edit-after-curate
+  poisoning class: an agent cannot overwrite a curated article's body (or flip a
+  curated draft to `:published`) and keep the authoritative marker; re-curation
+  must go back through the governed `Loopctl.Knowledge.mark_curated/3` path against
+  the final published content. Pure metadata/tags/category/project edits preserve
+  the marker (they do not change what the curator approved).
+
+  This is defense in depth alongside the fact that the marker is NOT castable here:
+  `mark_curated/3`'s `curation_changeset/3` is the only writer, and this changeset
+  is the only in-place clearer.
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(article, attrs) do
@@ -189,6 +206,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_tags()
     |> validate_metadata()
     |> validate_agent_metadata()
+    |> clear_curated_marker_on_content_change()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
@@ -296,6 +314,28 @@ defmodule Loopctl.Knowledge.Article do
 
   def curation_changeset(article, %DateTime{} = curated_at, curated_by) do
     change(article, %{curated_at: curated_at, curated_by: curated_by})
+  end
+
+  # US-31.1 poisoning defense: any in-place edit that changes the article's
+  # title, body, or status invalidates a previously-set governed curated marker,
+  # forcing re-curation through mark_curated/3 against the final content. Only acts
+  # when the article currently carries a marker AND a content/lifecycle field is
+  # actually changing (a no-op edit or a pure metadata/tags edit keeps the marker).
+  # `:curated_at`/`:curated_by` are NOT in this changeset's cast list, so these
+  # put_change calls — not caller input — are the only way they change here.
+  defp clear_curated_marker_on_content_change(changeset) do
+    content_or_status_changed? =
+      Enum.any?([:title, :body, :status], &Map.has_key?(changeset.changes, &1))
+
+    already_curated? = not is_nil(get_field(changeset, :curated_at))
+
+    if content_or_status_changed? and already_curated? do
+      changeset
+      |> put_change(:curated_at, nil)
+      |> put_change(:curated_by, nil)
+    else
+      changeset
+    end
   end
 
   # --- Private validations ---
