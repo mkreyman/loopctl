@@ -20,15 +20,15 @@ import {
   llmUsagePath,
   memoryPath,
   parseJsonResponseBody,
-  retrieveToolsPath,
-  retrieveEntityPath,
-  specToMcpTool,
-  buildRetrieveBody,
 } from "./lib/http-helpers.js";
 import {
   createWitnessClient,
   resolveSthStatePath,
 } from "./lib/witness-sth.js";
+import {
+  createGeneratedToolsRuntime,
+  GENERATED_TOOL_PREFIX,
+} from "./lib/generated-tools.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -65,6 +65,11 @@ const SERVER_VERSION = JSON.parse(
 // transparent retry above). The write is atomic + symlink-safe (temp + rename).
 const WITNESS_FS = { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync };
 
+// Default per-request HTTP timeout. Individual calls may pass a SHORTER budget via
+// `apiCall(..., { timeoutMs })` — e.g. the init-time generated-tools listing fetch,
+// which must degrade to static tools quickly rather than block connection setup.
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
 // One witness client PER API KEY (#298 review HIGH-2): the STH is per-tenant and
 // each key resolves to a tenant server-side, so distinct keys must NOT share an
 // in-memory cache or a state file (a collision causes spurious 409s + false
@@ -81,7 +86,7 @@ function witnessClientFor(apiKey) {
       fs: WITNESS_FS,
       getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined,
       pid: process.pid,
-      timeoutMs: 30_000,
+      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     });
     witnessClients.set(apiKey, client);
   }
@@ -108,7 +113,7 @@ function resolveKey(keyOverride) {
   );
 }
 
-async function apiCall(method, path, body, keyOverride, { exactKey = false } = {}) {
+async function apiCall(method, path, body, keyOverride, { exactKey = false, timeoutMs } = {}) {
   const url = `${getBaseUrl()}${path}`;
   // Secret-managing tools pass exactKey:true so the request uses the EXACT
   // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
@@ -141,10 +146,11 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false } = {
   // attempt's Response; we keep body parsing / error shaping here.
   let response;
   try {
-    response = await witnessClientFor(key).send({ url, method, headers, serializedBody });
+    response = await witnessClientFor(key).send({ url, method, headers, serializedBody, timeoutMs });
   } catch (err) {
     if (err.name === "TimeoutError") {
-      return { error: true, status: 0, body: "Request timed out after 30s" };
+      const secs = Math.max(1, Math.round((timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) / 1000));
+      return { error: true, status: 0, body: `Request timed out after ${secs}s` };
     }
     const cause = err.cause?.message ? ` (${err.cause.message})` : "";
     return { error: true, status: 0, body: `Network error: ${err.message}${cause}` };
@@ -4489,117 +4495,22 @@ const TOOLS = [
 // listing fetch and the generic call ride the SAME `apiCall` path as static read
 // tools, so they carry identical auth + witness/STH headers (AC-30.5.4).
 
-const GENERATED_TOOL_PREFIX = "cr_";
+// The generated-tools runtime (fetch + short-timeout/negative-TTL cache + generic
+// dispatch) lives in lib/generated-tools.js so its caching/TTL/negative-cache and
+// error-classification edge cases are exercised DIRECTLY by the test suite rather
+// than a hand-copied mirror. We wire the SHIPPED `apiCall` + static tool names +
+// `toContent` into it here. The process key (LOOPCTL_AGENT_KEY) is read per-call via
+// a getter so it rides the SAME auth + witness/STH path as every static read tool
+// (AC-30.5.4), and the static-name set powers the defense-in-depth drop of any spec
+// that isn't `cr_`-prefixed or that collides with a built-in tool name.
+const generatedToolsRuntime = createGeneratedToolsRuntime({
+  apiCall,
+  agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+  staticToolNames: new Set(TOOLS.map((t) => t.name)),
+  toContent,
+});
 
-// Short in-process cache: ListTools now makes an HTTP call, so cache the fetched
-// specs briefly to bound repeated-listing latency. Degrade-to-static is still the
-// hard requirement — a fetch failure never poisons the cache (we keep whatever we
-// had, empty at first) and never errors the whole listing.
-const GENERATED_TOOLS_CACHE_TTL_MS = 30_000;
-let generatedToolsCache = { tools: [], fetchedAt: 0 };
-
-// name -> STRUCTURED dispatch metadata (`{ entity, field, operation, ... }`, from
-// US-30.2). The generic dispatcher resolves (entity, field, operation) from THIS
-// map, never by splitting the tool name (entity/field names contain underscores,
-// so name-splitting is ambiguous — AC-30.5.2). Repopulated on every successful
-// /retrieve/tools fetch.
-let generatedToolMetadata = new Map();
-
-/**
- * Fetch the calling tenant's generated tool specs from GET /api/v1/retrieve/tools
- * (via the shared authenticated `apiCall`, agent+ key) and map them to the MCP
- * `{ name, description, inputSchema }` shape. On ANY failure (thrown, or an
- * `{ error: true }` result) this logs and returns the last-known (possibly empty)
- * cache so ListTools degrades to the static tools rather than erroring the whole
- * listing (AC-30.5.1 / TC-30.5.4). Also (re)populates `generatedToolMetadata`.
- *
- * @returns {Promise<Array<{ name: string, description: string, inputSchema: object }>>}
- */
-async function fetchGeneratedTools() {
-  const now = Date.now();
-  if (generatedToolsCache.fetchedAt !== 0 && now - generatedToolsCache.fetchedAt < GENERATED_TOOLS_CACHE_TTL_MS) {
-    return generatedToolsCache.tools;
-  }
-
-  let result;
-  try {
-    result = await apiCall("GET", retrieveToolsPath(), null, process.env.LOOPCTL_AGENT_KEY);
-  } catch (err) {
-    console.error(`loopctl: failed to fetch generated tools, degrading to static tools: ${err.message}`);
-    return generatedToolsCache.tools;
-  }
-
-  if (result && result.error === true) {
-    const detail = typeof result.body === "string" ? result.body : JSON.stringify(result.body);
-    console.error(
-      `loopctl: failed to fetch generated tools (HTTP ${result.status}), degrading to static tools: ${detail}`,
-    );
-    return generatedToolsCache.tools;
-  }
-
-  const specs = result && Array.isArray(result.data) ? result.data : [];
-  const tools = [];
-  const metadata = new Map();
-  for (const spec of specs) {
-    const tool = specToMcpTool(spec);
-    if (!tool) continue;
-    tools.push(tool);
-    if (spec.metadata && typeof spec.metadata === "object") {
-      metadata.set(spec.name, spec.metadata);
-    }
-  }
-
-  generatedToolMetadata = metadata;
-  generatedToolsCache = { tools, fetchedAt: now };
-  return tools;
-}
-
-/**
- * Resolve a `cr_`-prefixed tool name to its STRUCTURED dispatch metadata,
- * lazily (re)fetching the specs if the name isn't already known (e.g. CallTool
- * arriving before any ListTools). A name that stays unresolved after a fresh
- * fetch is genuinely unknown to THIS tenant — the generic handler treats it as an
- * unknown tool (which is exactly how a cross-tenant `cr_` name presents, since the
- * fetch only ever returns the process key's tenant — AC-30.5.3 / TC-30.5.3).
- *
- * @param {string} name
- * @returns {Promise<object|null>}
- */
-async function resolveGeneratedToolMetadata(name) {
-  if (generatedToolMetadata.has(name)) return generatedToolMetadata.get(name);
-  await fetchGeneratedTools();
-  return generatedToolMetadata.get(name) || null;
-}
-
-/**
- * Generic dispatcher for a per-tenant generated tool. Resolves the tool's
- * (entity, field, operation) from STRUCTURED metadata (never by name-splitting —
- * AC-30.5.2), builds the US-30.4 request body, and POSTs to
- * /api/v1/retrieve/:entity via the SAME `apiCall` path (hence the SAME auth +
- * witness/STH headers) as every static read tool (AC-30.5.4 / TC-30.5.5). An
- * unresolvable name returns a structured "unknown tool" error result.
- *
- * @param {string} name
- * @param {object} [args]
- */
-async function callGeneratedTool(name, args = {}) {
-  const metadata = await resolveGeneratedToolMetadata(name);
-  if (!metadata || typeof metadata.entity !== "string" || typeof metadata.operation !== "string") {
-    return toContent({
-      error: true,
-      status: 404,
-      body: `Unknown tool: ${name}. No generated tool by that name is available to this tenant.`,
-    });
-  }
-
-  const result = await apiCall(
-    "POST",
-    retrieveEntityPath(metadata.entity),
-    buildRetrieveBody(metadata, args),
-    process.env.LOOPCTL_AGENT_KEY,
-  );
-  return toContent(result);
-}
+const { fetchGeneratedTools, callGeneratedTool } = generatedToolsRuntime;
 
 // ---------------------------------------------------------------------------
 // MCP Server

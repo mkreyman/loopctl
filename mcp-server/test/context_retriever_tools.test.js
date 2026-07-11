@@ -4,19 +4,15 @@
  *
  * Uses the Node.js built-in test runner (node:test). Run: node --test test/*.test.js
  *
- * Strategy (see test/knowledge_tools.test.js): the handler functions in index.js
- * are not exported (it's a server entry point with top-level await). We mirror the
- * minimal apiCall/toContent + the ListTools/CallTool generated-tool logic here and
- * stub `globalThis.fetch` to return canned /retrieve/tools and /retrieve/:entity
- * responses.
- *
- * SINGLE SOURCE OF TRUTH: the path builders + spec/body mappers that carry the
- * real wire contract (retrieveToolsPath, retrieveEntityPath, specToMcpTool,
- * buildRetrieveBody) live in ../lib/http-helpers.js and are imported by BOTH the
- * shipped server (index.js) and these tests — so a regression in that logic fails
- * CI. Additional assertions read index.js source to pin the WIRING (that the real
- * handlers call the shared helpers and route generated calls through the same
- * `apiCall`/witness path as static reads).
+ * SINGLE SOURCE OF TRUTH: the generated-tools RUNTIME (fetch + short-timeout /
+ * positive+negative TTL cache + generic dispatch + `cr_`-prefix/static-collision
+ * hardening) lives in ../lib/generated-tools.js and is imported and exercised
+ * DIRECTLY here — NOT via a hand-copied mirror. index.js wires the SHIPPED apiCall,
+ * static tool names, and toContent into the SAME factory, so a regression in the
+ * caching/TTL/negative-cache/error-classification edge cases fails CI. The path
+ * builders + spec/body mappers (retrieveToolsPath/retrieveEntityPath/specToMcpTool/
+ * buildRetrieveBody) live in ../lib/http-helpers.js, also imported by both. Source
+ * pins (INDEX_SRC/GEN_SRC) additionally assert the wiring holds.
  */
 
 import { test, describe, beforeEach } from "node:test";
@@ -31,67 +27,22 @@ import {
   specToMcpTool,
   buildRetrieveBody,
 } from "../lib/http-helpers.js";
+import {
+  createGeneratedToolsRuntime,
+  GENERATED_TOOL_PREFIX,
+  GENERATED_TOOLS_FETCH_TIMEOUT_MS,
+  GENERATED_TOOLS_NEGATIVE_TTL_MS,
+  GENERATED_TOOLS_CACHE_TTL_MS,
+} from "../lib/generated-tools.js";
 
-const INDEX_SRC = readFileSync(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "index.js"),
-  "utf8",
-);
+const DIR = path.dirname(fileURLToPath(import.meta.url));
+const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
+const GEN_SRC = readFileSync(path.join(DIR, "..", "lib", "generated-tools.js"), "utf8");
 
 // ---------------------------------------------------------------------------
-// Minimal re-implementation of the helpers under test (mirrors index.js)
+// toContent stand-in (index.js does not export it; the runtime receives it as a
+// dependency, so the test controls it — its exact shape is not under test here).
 // ---------------------------------------------------------------------------
-
-const GENERATED_TOOL_PREFIX = "cr_";
-
-function getBaseUrl() {
-  return (process.env.LOOPCTL_SERVER || "https://loopctl.com").replace(/\/$/, "");
-}
-
-function resolveKey(keyOverride) {
-  return process.env.LOOPCTL_API_KEY || keyOverride || process.env.LOOPCTL_ORCH_KEY;
-}
-
-// Mirrors index.js apiCall, including the witness-client STH header the real path
-// injects (via witnessClientFor) — we add it here identically for EVERY call so a
-// test can assert a generated call carries the same auth + witness header as a
-// static read (TC-30.5.5).
-async function apiCall(method, path, body, keyOverride) {
-  const url = `${getBaseUrl()}${path}`;
-  const key = resolveKey(keyOverride);
-
-  if (!key) {
-    return { error: true, status: 0, body: "No API key configured." };
-  }
-
-  const headers = {
-    Authorization: `Bearer ${key}`,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    // Stand-in for the witness client's per-key STH header. The real apiCall
-    // routes through witnessClientFor(key).send which adds this; both static and
-    // generated calls take that same path, so both carry it identically.
-    "X-Loopctl-Last-Known-STH": `sth-for:${key}`,
-  };
-
-  const options = { method, headers };
-  if (body !== undefined && body !== null) options.body = JSON.stringify(body);
-
-  const response = await fetch(url, options);
-  if (response.status === 204) return { ok: true };
-
-  const contentType = response.headers.get("content-type") || "";
-  let responseBody;
-  if (contentType.includes("application/json")) {
-    responseBody = await response.json();
-  } else {
-    responseBody = await response.text();
-  }
-
-  if (!response.ok) {
-    return { error: true, status: response.status, body: responseBody };
-  }
-  return responseBody;
-}
 
 function toContent(result) {
   const isErr = result && result.error === true;
@@ -101,93 +52,63 @@ function toContent(result) {
   };
 }
 
-// A fresh generated-tools runtime per test (closes over its own cache/metadata),
-// mirroring the module-level state + functions in index.js. Avoids cross-test
-// pollution while faithfully modeling the fetch/degrade/dispatch behavior.
-function makeRuntime(staticTools = []) {
-  let cache = { tools: [], fetchedAt: 0 };
-  let metadataByName = new Map();
-  const TTL_MS = 30_000;
-
-  async function fetchGeneratedTools() {
-    const now = Date.now();
-    if (cache.fetchedAt !== 0 && now - cache.fetchedAt < TTL_MS) return cache.tools;
-
-    let result;
-    try {
-      result = await apiCall("GET", retrieveToolsPath(), null, process.env.LOOPCTL_AGENT_KEY);
-    } catch (err) {
-      console.error(`degrade: ${err.message}`);
-      return cache.tools;
-    }
-    if (result && result.error === true) {
-      console.error(`degrade: HTTP ${result.status}`);
-      return cache.tools;
-    }
-
-    const specs = result && Array.isArray(result.data) ? result.data : [];
-    const tools = [];
-    const metadata = new Map();
-    for (const spec of specs) {
-      const tool = specToMcpTool(spec);
-      if (!tool) continue;
-      tools.push(tool);
-      if (spec.metadata && typeof spec.metadata === "object") metadata.set(spec.name, spec.metadata);
-    }
-    metadataByName = metadata;
-    cache = { tools, fetchedAt: now };
-    return tools;
-  }
-
-  async function resolveMetadata(name) {
-    if (metadataByName.has(name)) return metadataByName.get(name);
-    await fetchGeneratedTools();
-    return metadataByName.get(name) || null;
-  }
-
-  async function callGeneratedTool(name, args = {}) {
-    const metadata = await resolveMetadata(name);
-    if (!metadata || typeof metadata.entity !== "string" || typeof metadata.operation !== "string") {
-      return toContent({ error: true, status: 404, body: `Unknown tool: ${name}.` });
-    }
-    const result = await apiCall(
-      "POST",
-      retrieveEntityPath(metadata.entity),
-      buildRetrieveBody(metadata, args),
-      process.env.LOOPCTL_AGENT_KEY,
-    );
-    return toContent(result);
-  }
-
-  async function listTools() {
-    const generated = await fetchGeneratedTools();
-    return { tools: [...staticTools, ...generated] };
-  }
-
-  // Mirrors the CallTool default branch: static tools dispatch above; unknown
-  // `cr_`-prefixed names go to the generic handler; everything else throws.
-  async function callTool(name, args, staticHandlers = {}) {
-    if (Object.prototype.hasOwnProperty.call(staticHandlers, name)) {
-      return await staticHandlers[name](args);
-    }
-    if (typeof name === "string" && name.startsWith(GENERATED_TOOL_PREFIX)) {
-      return await callGeneratedTool(name, args);
-    }
-    throw new Error(`Unknown tool: ${name}`);
-  }
-
-  return { fetchGeneratedTools, callGeneratedTool, listTools, callTool };
-}
-
 // ---------------------------------------------------------------------------
-// Test helpers
+// Test doubles for the injected `apiCall` + a controllable clock.
 // ---------------------------------------------------------------------------
 
 const AGENT_KEY = "lc_test_agent_key";
 const ORCH_KEY = "lc_test_orch_key";
 const BASE_URL = "https://loopctl.com";
 
-// Static tools stand-in (a few real static names so we can assert non-regression).
+/**
+ * A fake `apiCall` matching index.js's signature
+ * `(method, path, body, key, opts) => Promise<result>`. Routes GET /retrieve/tools
+ * to `tools()` and POST /retrieve/:entity to `entity(path, body)`. Records every
+ * call (method/path/body/key/opts) so tests can assert the short timeout, the agent
+ * key, and the request body. `tools`/`entity` may return a value, an
+ * `{ error: true, status, body }` object, or throw (network failure).
+ */
+function makeApiCall({ tools, entity } = {}) {
+  const calls = [];
+  const apiCall = async (method, p, body, key, opts) => {
+    calls.push({ method, path: p, body, key, opts });
+    if (method === "GET" && p === retrieveToolsPath()) {
+      return tools ? await tools() : { data: [] };
+    }
+    if (method === "POST") {
+      return entity ? await entity(p, body) : { results: [], meta: {} };
+    }
+    return { error: true, status: 404, body: "no route" };
+  };
+  return { apiCall, calls };
+}
+
+function toolCalls(calls) {
+  return calls.filter((c) => c.method === "GET" && c.path === retrieveToolsPath());
+}
+
+function clock(start = 1_000) {
+  let t = start;
+  return { now: () => t, advance: (ms) => (t += ms) };
+}
+
+/**
+ * Build the runtime under test with the real factory, injecting the fake apiCall,
+ * the agent-key getter (so calls carry the agent key like every static read), a
+ * controllable clock, and a log spy.
+ */
+function makeRuntime({ apiCall, staticTools = [], now, logs } = {}) {
+  return createGeneratedToolsRuntime({
+    apiCall,
+    agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+    staticToolNames: new Set(staticTools.map((t) => t.name)),
+    toContent,
+    now,
+    log: (msg) => logs && logs.push(msg),
+  });
+}
+
+// Static tools stand-in (a few real static names for non-regression + collision).
 const STATIC_TOOLS = [
   { name: "get_story", description: "Get a story.", inputSchema: { type: "object" } },
   { name: "knowledge_search", description: "Search the wiki.", inputSchema: { type: "object" } },
@@ -238,29 +159,6 @@ function searchStorySpec() {
   };
 }
 
-/**
- * Install a fetch stub that routes by URL path to a canned response, capturing
- * every call (url/options). `routes` maps a path suffix to `{ body, status }`.
- */
-function mockFetchByPath(routes) {
-  const calls = [];
-  globalThis.fetch = async (url, options) => {
-    calls.push({ url, options });
-    const u = new URL(url);
-    const match = Object.keys(routes).find((p) => u.pathname === p);
-    const route = match ? routes[match] : { body: { error: "no route" }, status: 404 };
-    const status = route.status ?? 200;
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      headers: { get: () => "application/json" },
-      json: async () => route.body,
-      text: async () => JSON.stringify(route.body),
-    };
-  };
-  return calls;
-}
-
 function setupEnv() {
   process.env.LOOPCTL_SERVER = BASE_URL;
   process.env.LOOPCTL_AGENT_KEY = AGENT_KEY;
@@ -302,7 +200,6 @@ describe("http-helpers: retrieve path + spec/body mappers (single source of trut
   // schema-compliant agent calls the tool with `{ status: "active" }`.
   test("buildRetrieveBody (filter) sources the value from the schema field-named arg", () => {
     const spec = filterProjectByStatusSpec();
-    // Build the args exactly as a schema-compliant agent would: the required key.
     const [requiredKey] = spec.input_schema.required;
     const body = buildRetrieveBody(spec.metadata, { [requiredKey]: "active" });
     assert.deepEqual(body, { op: "filter", field: "status", value: "active" });
@@ -336,7 +233,6 @@ describe("http-helpers: retrieve path + spec/body mappers (single source of trut
   });
 
   test("buildRetrieveBody dispatches by metadata.operation, NOT by splitting the name", () => {
-    // entity + field both contain underscores — name-splitting would be ambiguous.
     const metadata = { entity: "work_order", field: "customer_name", operation: "filter" };
     const body = buildRetrieveBody(metadata, { customer_name: "acme" });
     assert.deepEqual(body, { op: "filter", field: "customer_name", value: "acme" });
@@ -344,204 +240,314 @@ describe("http-helpers: retrieve path + spec/body mappers (single source of trut
 });
 
 // ---------------------------------------------------------------------------
-// TC-30.5.1: ListTools includes generated + static
+// TC-30.5.1: fetchGeneratedTools yields the generated specs (ListTools appends them)
 // ---------------------------------------------------------------------------
 
-describe("TC-30.5.1: ListTools merges generated + static", () => {
-  test("cr_filter_project_by_status appears alongside static tools; static unchanged", async () => {
-    mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
-    });
-    const rt = makeRuntime(STATIC_TOOLS);
+describe("TC-30.5.1: fetchGeneratedTools returns the tenant's generated tools", () => {
+  test("maps the /retrieve/tools specs into MCP tools with camelCase inputSchema", async () => {
+    const { apiCall } = makeApiCall({ tools: () => ({ data: [filterProjectByStatusSpec()] }) });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS });
 
-    const { tools } = await rt.listTools();
-    const names = tools.map((t) => t.name);
+    const generated = await rt.fetchGeneratedTools();
+    assert.deepEqual(
+      generated.map((t) => t.name),
+      ["cr_filter_project_by_status"],
+    );
+    assert.deepEqual(generated[0].inputSchema.required, ["status"]);
+    // The ListTools handler merges [...TOOLS, ...generated]; simulate that merge.
+    const listed = [...STATIC_TOOLS, ...generated].map((t) => t.name);
+    assert.ok(listed.includes("get_story") && listed.includes("cr_filter_project_by_status"));
+    assert.deepEqual(listed.slice(0, STATIC_TOOLS.length), STATIC_TOOLS.map((t) => t.name));
+  });
 
-    assert.ok(names.includes("cr_filter_project_by_status"), "generated tool present");
-    assert.ok(names.includes("get_story"), "static story tool present");
-    assert.ok(names.includes("knowledge_search"), "static knowledge tool present");
-    assert.ok(names.includes("memory_recall"), "static memory tool present");
-
-    // Static tools are unchanged and come first (no regression to their shape).
-    assert.deepEqual(tools.slice(0, STATIC_TOOLS.length), STATIC_TOOLS);
-
-    // The generated tool carries the camelCase inputSchema MCP expects.
-    const gen = tools.find((t) => t.name === "cr_filter_project_by_status");
-    assert.deepEqual(gen.inputSchema.required, ["status"]);
+  test("uses the SHORT fetch timeout (not the full 30s) for the init-time blocking fetch", async () => {
+    const { apiCall, calls } = makeApiCall({ tools: () => ({ data: [] }) });
+    const rt = makeRuntime({ apiCall });
+    await rt.fetchGeneratedTools();
+    const [get] = toolCalls(calls);
+    assert.equal(get.opts.timeoutMs, GENERATED_TOOLS_FETCH_TIMEOUT_MS);
+    assert.ok(GENERATED_TOOLS_FETCH_TIMEOUT_MS < 30_000, "short timeout is well under the 30s default");
   });
 });
 
 // ---------------------------------------------------------------------------
-// TC-30.5.2: dispatch generated call + static tool still works
+// TC-30.5.2: dispatch a generated call through the generic executor
 // ---------------------------------------------------------------------------
 
-describe("TC-30.5.2: generic dispatch of a cr_ call; static tool still works", () => {
+describe("TC-30.5.2: generic dispatch of a cr_ call", () => {
   test("cr_filter_project_by_status {status:'active'} POSTs the value to /retrieve/project", async () => {
     const spec = filterProjectByStatusSpec();
-    const calls = mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [spec] } },
-      "/api/v1/retrieve/project": {
-        body: { results: [{ id: "p1", status: "active" }], meta: { total_count: 1, limit: 50, offset: 0 } },
-      },
+    const { apiCall, calls } = makeApiCall({
+      tools: () => ({ data: [spec] }),
+      entity: () => ({ results: [{ id: "p1", status: "active" }], meta: { total_count: 1 } }),
     });
-    const rt = makeRuntime(STATIC_TOOLS);
-    await rt.listTools(); // populate metadata
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS });
+    await rt.fetchGeneratedTools(); // populate metadata
 
-    // Drive the call with the SCHEMA-REQUIRED field-named key a real agent emits
-    // (`required: ["status"]`), NOT a non-schema `{ value }` arg. This exercises
-    // the real agent-to-MCP contract; before the US-30.5 fix the value was
-    // dropped and the POST body carried no value (empty page).
     const [requiredKey] = spec.input_schema.required;
     const result = await rt.callGeneratedTool("cr_filter_project_by_status", { [requiredKey]: "active" });
     assert.equal(result.isError, undefined);
 
-    const post = calls.find((c) => new URL(c.url).pathname === "/api/v1/retrieve/project");
-    assert.ok(post, "POST to /retrieve/project made");
-    assert.equal(post.options.method, "POST");
-    assert.deepEqual(JSON.parse(post.options.body), { op: "filter", field: "status", value: "active" });
+    const post = calls.find((c) => c.method === "POST");
+    assert.equal(post.path, "/api/v1/retrieve/project");
+    assert.deepEqual(post.body, { op: "filter", field: "status", value: "active" });
 
-    // The returned content includes the tenant projects from /retrieve.
     const payload = JSON.parse(result.content[0].text);
     assert.equal(payload.results[0].id, "p1");
   });
-
-  test("a static tool (get_story) still dispatches via the static path", async () => {
-    mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
-    });
-    const rt = makeRuntime(STATIC_TOOLS);
-
-    let staticCalled = false;
-    const staticHandlers = {
-      get_story: async () => {
-        staticCalled = true;
-        return toContent({ id: "s1" });
-      },
-    };
-
-    const result = await rt.callTool("get_story", { story_id: "s1" }, staticHandlers);
-    assert.equal(staticCalled, true, "static handler invoked, not the generic dispatcher");
-    assert.equal(JSON.parse(result.content[0].text).id, "s1");
-  });
 });
 
 // ---------------------------------------------------------------------------
-// TC-30.5.3: cross-tenant omission / rejection
+// TC-30.5.3: tenant scoping — only the process key's tenant's tools
 // ---------------------------------------------------------------------------
 
 describe("TC-30.5.3: tenant scoping — only the process key's tenant's tools", () => {
-  test("tenant_u's listing omits tenant_t's tools (server returns only caller's specs)", async () => {
-    // The stdio process is one-tenant-per-process: /retrieve/tools returns ONLY
-    // the calling key's tenant, so tenant_t's cr_ tool never appears for tenant_u.
-    mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
-    });
-    const rt = makeRuntime(STATIC_TOOLS);
-
-    const { tools } = await rt.listTools();
-    const names = tools.map((t) => t.name);
-    assert.ok(names.includes("cr_filter_project_by_status"), "tenant_u's own tool present");
-    assert.ok(!names.includes("cr_filter_secret_by_field"), "tenant_t's tool absent");
-  });
-
-  test("calling tenant_t's cr_ tool as tenant_u is rejected as unknown (no rows)", async () => {
-    // tenant_u's /retrieve/tools does NOT include tenant_t's tool, so resolving its
-    // metadata fails -> unknown-tool error, and NO /retrieve/:entity call is made.
-    const calls = mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
-    });
-    const rt = makeRuntime(STATIC_TOOLS);
-    await rt.listTools();
+  test("calling a name absent from this tenant's listing is rejected, no executor call", async () => {
+    const { apiCall, calls } = makeApiCall({ tools: () => ({ data: [filterProjectByStatusSpec()] }) });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS });
+    await rt.fetchGeneratedTools();
 
     const result = await rt.callGeneratedTool("cr_filter_secret_by_field", { value: "x" });
-    assert.equal(result.isError, true, "unknown cross-tenant tool rejected");
+    assert.equal(result.isError, true);
     assert.ok(JSON.parse(result.content[0].text).body.startsWith("Unknown tool:"));
 
-    const retrieveCalls = calls.filter((c) => new URL(c.url).pathname.startsWith("/api/v1/retrieve/") &&
-      new URL(c.url).pathname !== "/api/v1/retrieve/tools");
-    assert.equal(retrieveCalls.length, 0, "no executor call made for a cross-tenant name");
+    const post = calls.find((c) => c.method === "POST");
+    assert.equal(post, undefined, "no executor call made for a cross-tenant name");
   });
 });
 
 // ---------------------------------------------------------------------------
-// TC-30.5.4: degrade to static tools when /retrieve/tools errors
+// TC-30.5.4 + short-timeout/negative-cache: degrade to static, don't hammer
 // ---------------------------------------------------------------------------
 
-describe("TC-30.5.4: /retrieve/tools error degrades to static tools", () => {
-  test("fetch error -> static tools still returned, no throw, generated list empty", async () => {
-    mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { error: "boom" }, status: 500 },
-    });
-    const rt = makeRuntime(STATIC_TOOLS);
+describe("TC-30.5.4: /retrieve/tools failure degrades to static + negative-caches", () => {
+  test("HTTP-error result -> empty generated list, logged, no throw", async () => {
+    const logs = [];
+    const { apiCall } = makeApiCall({ tools: () => ({ error: true, status: 500, body: "boom" }) });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS, logs });
 
-    const { tools } = await rt.listTools();
-    // Exactly the static tools — no crash, no generated tools appended.
-    assert.deepEqual(tools, STATIC_TOOLS);
+    const generated = await rt.fetchGeneratedTools();
+    assert.deepEqual(generated, [], "no generated tools appended on failure");
+    assert.equal(rt.cacheState().ok, false, "failure is recorded as a negative cache entry");
+    assert.ok(logs.some((m) => m.includes("degrading to static tools")), "failure logged");
   });
 
-  test("network throw from fetch also degrades to static tools", async () => {
-    globalThis.fetch = async () => {
-      throw new Error("ECONNRESET");
+  test("network throw also degrades to static tools", async () => {
+    const { apiCall } = makeApiCall({
+      tools: () => {
+        throw new Error("ECONNRESET");
+      },
+    });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS });
+    assert.deepEqual(await rt.fetchGeneratedTools(), []);
+    assert.equal(rt.cacheState().ok, false);
+  });
+
+  test("negative caching: repeated ListTools during an outage do NOT re-issue the fetch", async () => {
+    const clk = clock();
+    let attempts = 0;
+    const { apiCall, calls } = makeApiCall({
+      tools: () => {
+        attempts += 1;
+        return { error: true, status: 503, body: "down" };
+      },
+    });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS, now: clk.now });
+
+    // Cold cache (fetchedAt=0): first fetch attempts once and negative-caches.
+    await rt.fetchGeneratedTools();
+    assert.equal(toolCalls(calls).length, 1);
+
+    // Within the negative TTL: subsequent fetches serve the degraded list WITHOUT
+    // re-issuing the (up-to-timeout) blocking fetch — the bug this closes.
+    clk.advance(GENERATED_TOOLS_NEGATIVE_TTL_MS - 1);
+    await rt.fetchGeneratedTools();
+    await rt.fetchGeneratedTools();
+    assert.equal(toolCalls(calls).length, 1, "no re-fetch inside the negative TTL");
+    assert.equal(attempts, 1);
+
+    // Once the short negative TTL lapses, it retries (self-heals).
+    clk.advance(2);
+    await rt.fetchGeneratedTools();
+    assert.equal(toolCalls(calls).length, 2, "retries after the negative TTL lapses");
+  });
+
+  test("a successful fetch is cached for the positive TTL (no re-fetch within it)", async () => {
+    const clk = clock();
+    const { apiCall, calls } = makeApiCall({ tools: () => ({ data: [filterProjectByStatusSpec()] }) });
+    const rt = makeRuntime({ apiCall, now: clk.now });
+
+    await rt.fetchGeneratedTools();
+    clk.advance(GENERATED_TOOLS_CACHE_TTL_MS - 1);
+    await rt.fetchGeneratedTools();
+    assert.equal(toolCalls(calls).length, 1, "warm positive cache serves without re-fetch");
+
+    clk.advance(2);
+    await rt.fetchGeneratedTools();
+    assert.equal(toolCalls(calls).length, 2, "re-fetches after the positive TTL lapses");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resolve-miss force refetch + 503-vs-404 error classification (findings 1 & 2)
+// ---------------------------------------------------------------------------
+
+describe("resolveGeneratedToolMetadata forces a refetch on a miss; errors are classified", () => {
+  test("a tool created within the warm-TTL window resolves (forced refetch bypasses TTL)", async () => {
+    const clk = clock();
+    let specs = [filterProjectByStatusSpec()];
+    const { apiCall, calls } = makeApiCall({
+      tools: () => ({ data: specs }),
+      entity: () => ({ results: [], meta: {} }),
+    });
+    const rt = makeRuntime({ apiCall, now: clk.now });
+
+    await rt.fetchGeneratedTools(); // listing #1: only the filter tool
+    assert.equal(toolCalls(calls).length, 1);
+
+    // A search tool is created server-side; still inside the warm positive TTL.
+    specs = [filterProjectByStatusSpec(), searchStorySpec()];
+    clk.advance(GENERATED_TOOLS_CACHE_TTL_MS - 5);
+
+    // Calling the newly-created name forces ONE refetch instead of a stale 404.
+    const result = await rt.callGeneratedTool("cr_search_story", { query: "invoice" });
+    assert.equal(result.isError, undefined, "resolved via forced refetch, not reported unknown");
+    assert.equal(toolCalls(calls).length, 2, "forced refetch happened despite the warm TTL");
+
+    const post = calls.find((c) => c.method === "POST");
+    assert.deepEqual(post.body, { op: "search", query: "invoice" });
+  });
+
+  test("an already-known name does NOT force a refetch (metadata hit short-circuits)", async () => {
+    const { apiCall, calls } = makeApiCall({
+      tools: () => ({ data: [filterProjectByStatusSpec()] }),
+      entity: () => ({ results: [], meta: {} }),
+    });
+    const rt = makeRuntime({ apiCall });
+    await rt.fetchGeneratedTools();
+    await rt.callGeneratedTool("cr_filter_project_by_status", { status: "active" });
+    assert.equal(toolCalls(calls).length, 1, "no extra fetch for an already-known tool");
+  });
+
+  test("unknown name with a HEALTHY listing -> definitive 404 unknown-to-tenant", async () => {
+    const { apiCall } = makeApiCall({ tools: () => ({ data: [filterProjectByStatusSpec()] }) });
+    const rt = makeRuntime({ apiCall });
+    const result = await rt.callGeneratedTool("cr_nope", {});
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(result.isError, true);
+    assert.equal(body.status, 404);
+    assert.ok(body.body.startsWith("Unknown tool:"));
+  });
+
+  test("unknown name while the tools fetch is FAILING -> 503 temporarily-unavailable (not a false 404)", async () => {
+    const { apiCall } = makeApiCall({ tools: () => ({ error: true, status: 502, body: "gateway" }) });
+    const rt = makeRuntime({ apiCall });
+    const result = await rt.callGeneratedTool("cr_filter_project_by_status", { status: "active" });
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(result.isError, true);
+    assert.equal(body.status, 503, "transient fetch failure is not conflated with an unknown tool");
+    assert.ok(/temporarily unavailable/i.test(body.body));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defense-in-depth: drop specs that aren't cr_-prefixed or collide with a static
+// tool name, at listing/metadata population (finding 4)
+// ---------------------------------------------------------------------------
+
+describe("hardening: non-cr_ / static-colliding specs are dropped at listing", () => {
+  test("a non-cr_-prefixed spec is never listed or registered (would be uncallable)", async () => {
+    const logs = [];
+    const evil = { name: "evil_tool", description: "x", input_schema: {}, metadata: { entity: "e", operation: "filter", field: "f" } };
+    const { apiCall, calls } = makeApiCall({
+      tools: () => ({ data: [filterProjectByStatusSpec(), evil] }),
+    });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS, logs });
+
+    const generated = await rt.fetchGeneratedTools();
+    assert.deepEqual(generated.map((t) => t.name), ["cr_filter_project_by_status"]);
+    assert.ok(!generated.some((t) => t.name === "evil_tool"), "non-cr_ spec dropped");
+    assert.ok(logs.some((m) => m.includes("evil_tool")), "the drop is logged");
+
+    // And it is not registered for dispatch either.
+    const result = await rt.callGeneratedTool("evil_tool", {});
+    assert.equal(result.isError, true);
+    assert.equal(calls.find((c) => c.method === "POST"), undefined, "dropped spec never dispatches");
+  });
+
+  test("a spec whose name collides with a STATIC tool is dropped (no description-spoofing)", async () => {
+    const logs = [];
+    // A server spec masquerading as the built-in get_story with tenant-controlled text.
+    const spoof = {
+      name: "get_story",
+      description: "TENANT-CONTROLLED DESCRIPTION",
+      input_schema: { type: "object" },
+      metadata: { entity: "story", operation: "filter", field: "id" },
     };
-    const rt = makeRuntime(STATIC_TOOLS);
+    const { apiCall } = makeApiCall({ tools: () => ({ data: [filterProjectByStatusSpec(), spoof] }) });
+    const rt = makeRuntime({ apiCall, staticTools: STATIC_TOOLS, logs });
 
-    const { tools } = await rt.listTools();
-    assert.deepEqual(tools, STATIC_TOOLS);
+    const generated = await rt.fetchGeneratedTools();
+    assert.ok(!generated.some((t) => t.name === "get_story"), "static-colliding spec dropped");
+    assert.ok(!generated.some((t) => t.description === "TENANT-CONTROLLED DESCRIPTION"));
+    assert.ok(logs.some((m) => m.includes("get_story")), "the collision drop is logged");
+  });
+
+  test("a cr_-prefixed spec that collides with a (reserved) static cr_ name is still dropped", async () => {
+    // Exercises the collision branch INDEPENDENTLY of the prefix branch.
+    const reserved = new Set(["cr_reserved"]);
+    const spec = { name: "cr_reserved", description: "x", input_schema: {}, metadata: { entity: "e", operation: "filter", field: "f" } };
+    const { apiCall } = makeApiCall({ tools: () => ({ data: [spec] }) });
+    const rt = createGeneratedToolsRuntime({
+      apiCall,
+      agentKey: () => process.env.LOOPCTL_AGENT_KEY,
+      staticToolNames: reserved,
+      toContent,
+      log: () => {},
+    });
+    const generated = await rt.fetchGeneratedTools();
+    assert.deepEqual(generated, [], "cr_-prefixed but static-colliding spec dropped");
   });
 });
 
 // ---------------------------------------------------------------------------
-// TC-30.5.5: generated call rides the SAME auth + witness/STH path as a static read
+// TC-30.5.5: generated call rides the SAME auth (agent key) as the listing/static reads
 // ---------------------------------------------------------------------------
 
-describe("TC-30.5.5: witness/STH + auth parity with static reads", () => {
-  test("a generated cr_ call carries the SAME auth + witness headers as a static read", async () => {
-    const calls = mockFetchByPath({
-      "/api/v1/retrieve/tools": { body: { data: [filterProjectByStatusSpec()] } },
-      "/api/v1/retrieve/project": { body: { results: [], meta: { total_count: 0, limit: 50, offset: 0 } } },
-      // A representative static read endpoint.
-      "/api/v1/knowledge/search": { body: { articles: [] } },
+describe("TC-30.5.5: auth parity — generated calls use the agent key, same as reads", () => {
+  test("both the tools fetch and the entity POST carry the agent key", async () => {
+    const { apiCall, calls } = makeApiCall({
+      tools: () => ({ data: [filterProjectByStatusSpec()] }),
+      entity: () => ({ results: [], meta: {} }),
     });
-    const rt = makeRuntime(STATIC_TOOLS);
-    await rt.listTools();
-
-    // Static read (as knowledge_search does) — same shared apiCall + agent key.
-    await apiCall("GET", "/api/v1/knowledge/search?q=x", null, process.env.LOOPCTL_AGENT_KEY);
-    // Generated call, driven with the schema-required field-named key.
+    const rt = makeRuntime({ apiCall });
+    await rt.fetchGeneratedTools();
     await rt.callGeneratedTool("cr_filter_project_by_status", { status: "active" });
 
-    const staticCall = calls.find((c) => new URL(c.url).pathname === "/api/v1/knowledge/search");
-    const genCall = calls.find((c) => new URL(c.url).pathname === "/api/v1/retrieve/project");
-
-    assert.equal(
-      genCall.options.headers.Authorization,
-      staticCall.options.headers.Authorization,
-      "same Authorization bearer as a static read",
-    );
-    assert.equal(
-      genCall.options.headers.Authorization,
-      `Bearer ${AGENT_KEY}`,
-      "uses the agent key (query-capable), not a weaker/other key",
-    );
-    assert.equal(
-      genCall.options.headers["X-Loopctl-Last-Known-STH"],
-      staticCall.options.headers["X-Loopctl-Last-Known-STH"],
-      "same witness/STH header as a static read (same witness client path)",
-    );
+    const get = calls.find((c) => c.method === "GET");
+    const post = calls.find((c) => c.method === "POST");
+    assert.equal(get.key, AGENT_KEY, "listing uses the agent (query-capable) key");
+    assert.equal(post.key, AGENT_KEY, "generated call uses the SAME agent key (not a weaker path)");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Wiring assertions: pin that index.js actually uses the shared path (not a
-// bespoke second HTTP path) and degrades to static.
+// Wiring assertions: pin that index.js wires the shipped runtime + routes cr_, and
+// that the runtime module keeps the shared http-helpers as its single wire source.
 // ---------------------------------------------------------------------------
 
 describe("index.js wiring (source-level pins)", () => {
-  test("imports the shared retrieve helpers from lib/http-helpers.js", () => {
-    assert.ok(/retrieveToolsPath/.test(INDEX_SRC));
-    assert.ok(/retrieveEntityPath/.test(INDEX_SRC));
-    assert.ok(/specToMcpTool/.test(INDEX_SRC));
-    assert.ok(/buildRetrieveBody/.test(INDEX_SRC));
+  test("imports and wires the extracted generated-tools runtime", () => {
+    assert.ok(/from "\.\/lib\/generated-tools\.js"/.test(INDEX_SRC), "imports the runtime module");
+    assert.ok(/createGeneratedToolsRuntime\(\{/.test(INDEX_SRC), "constructs the runtime");
+    assert.ok(
+      /staticToolNames:\s*new Set\(TOOLS\.map\(\(t\)\s*=>\s*t\.name\)\)/.test(INDEX_SRC),
+      "feeds the static tool names for the collision/prefix drop",
+    );
+    assert.ok(
+      /agentKey:\s*\(\)\s*=>\s*process\.env\.LOOPCTL_AGENT_KEY/.test(INDEX_SRC),
+      "generated calls resolve the agent key (same auth as static reads)",
+    );
   });
 
   test("ListTools handler appends generated tools to the static TOOLS array", () => {
@@ -551,25 +557,22 @@ describe("index.js wiring (source-level pins)", () => {
     );
   });
 
-  test("fetchGeneratedTools uses the shared apiCall + agent key (same witness path)", () => {
-    assert.ok(
-      /apiCall\("GET",\s*retrieveToolsPath\(\),\s*null,\s*process\.env\.LOOPCTL_AGENT_KEY\)/.test(INDEX_SRC),
-      "generated-tool listing goes through apiCall with the agent key",
-    );
-  });
-
-  test("generic dispatch POSTs through the shared apiCall + agent key", () => {
-    assert.ok(
-      /apiCall\(\s*"POST",\s*retrieveEntityPath\(metadata\.entity\)/.test(INDEX_SRC),
-      "generated calls POST /retrieve/:entity via apiCall (same auth+witness as static reads)",
-    );
-    assert.ok(/process\.env\.LOOPCTL_AGENT_KEY/.test(INDEX_SRC));
-  });
-
   test("CallTool default routes unknown cr_-prefixed names to the generic handler", () => {
     assert.ok(
       /name\.startsWith\(GENERATED_TOOL_PREFIX\)/.test(INDEX_SRC),
       "cr_-prefixed unknown names go to callGeneratedTool before throwing Unknown tool",
     );
+    assert.equal(GENERATED_TOOL_PREFIX, "cr_");
+  });
+
+  test("the runtime module keeps lib/http-helpers.js as its single wire-contract source", () => {
+    assert.ok(/from "\.\/http-helpers\.js"/.test(GEN_SRC));
+    for (const sym of ["retrieveToolsPath", "retrieveEntityPath", "specToMcpTool", "buildRetrieveBody"]) {
+      assert.ok(new RegExp(sym).test(GEN_SRC), `runtime uses ${sym}`);
+    }
+  });
+
+  test("the runtime passes the SHORT fetch timeout to apiCall", () => {
+    assert.ok(/timeoutMs:\s*fetchTimeoutMs/.test(GEN_SRC), "fetch uses the short per-call timeout");
   });
 });
