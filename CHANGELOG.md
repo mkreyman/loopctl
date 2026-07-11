@@ -2,6 +2,60 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-11 — OKF-curated + RAG Hybrid Knowledge Retrieval (Epic 31)
+
+### Added
+
+- **Hybrid knowledge retrieval** — `Loopctl.Knowledge.hybrid_search/3`
+  (`POST /api/v1/knowledge/hybrid_search`, MCP tool `knowledge_hybrid_search`)
+  composes the already-shipped retrieval (`search_combined/3`) and curated-source
+  identification (`list_curated_sources/2`, US-31.1) subsystems into a single
+  resolution layer: `:curated` wins ONLY when a governed curated source's
+  ABSOLUTE (never pool-relative, min-max-normalized) confidence score clears a
+  scale-matched threshold AND beats the best retrieved candidate by a margin AND
+  is authoritative (published, not superseded, not in an open
+  `:potential_conflict`); otherwise `:retrieved`. Both branches return an
+  identical `results`/`meta` key shape carrying `meta.provenance`
+  (`:curated`/`:retrieved`), `meta.confidence`, and `meta.curated_article_id` — a
+  caller branches on `meta.provenance` alone, never on which subsystem answered.
+  See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).
+  - **Curated-source identification** (US-31.1) — a GOVERNED, non-self-assignable
+    `articles.curated_at`/`curated_by` marker (excluded from `@cast_fields`),
+    written only by `Knowledge.mark_curated/3` / `unmark_curated/3` (audited).
+    Content edits (title/body/publish) invalidate the marker, forcing
+    re-curation. `list_curated_sources/2` applies system-scope precedence (a
+    tenant's own curated answer always wins over a `scope: :system` canonical on
+    the same topic) and excludes superseded/conflicted articles.
+  - **Progressive disclosure** (US-31.3) — `Knowledge.progressive_index/3` /
+    `progressive_drill/3` (`GET /api/v1/knowledge/progressive_index` /
+    `GET /api/v1/knowledge/progressive/:id`, MCP tools
+    `knowledge_progressive_index` / `knowledge_progressive_drill`): a bounded,
+    top-K-capped topic index of compact stubs (curated-preferred, one hop of
+    `:relates_to` hub enrichment), then a full-body drill.
+- **Docs** — new
+  [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md) (the
+  resolution rule, provenance contract, progressive disclosure, and the
+  three-layer model positioning hybrid retrieval within the Knowledge Wiki
+  alongside Agent Memory and the Context Retriever); README/CLAUDE.md/AGENTS.md
+  extended. **#305 and #306 describe the same feature** — recommend closing one
+  as a duplicate rather than tracking separately; the "#305 reconcile
+  `docs/cole-medin-self-evolving-wiki.md`" item is already satisfied by the
+  epics 28–30 reconciliation (KB hub `fb9abd73`/`3ee5f890`).
+
+### Verification
+
+- **Terminal e2e + negative control** (US-31.5,
+  `test/loopctl/knowledge/hybrid_e2e_test.exs`) — a governed curated
+  refund-policy article suppresses an unrelated fuzzy chunk (`:curated`, hoisted
+  first); archiving that curated article (removed from the published search
+  pool, unrelated chunk unchanged) flips the result to `:retrieved` and surfaces
+  the previously-suppressed chunk, proving causation; a niche non-curated topic
+  falls to `:retrieved`; a near-but-wrong curated doc is never mislabeled
+  `:curated`; `:curated`/`:retrieved` meta share an identical key shape. Tenant isolation is proven across the resolver, progressive index/drill,
+  and the HTTP API; a system-scoped curated article participates without
+  overriding a tenant's own; a superseded/conflicted curated article is never
+  authoritative without the conflict surfaced.
+
 ## [Unreleased] — 2026-07-10 — Context Retriever (Epic 30)
 
 ### Added

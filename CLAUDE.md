@@ -284,6 +284,32 @@ agent reading?* → `knowledge_create`. *a fact only I need?* → `memory_rememb
 Defining an entity is a security root (role ≥ `user` + human-anchor); querying is
 authenticated-only. You never pass `tenant_id` — scope is key-derived.
 
+## Epic 31: Hybrid (curated + RAG) Knowledge Retrieval
+
+Epic 31 adds a **capability of the Knowledge Wiki layer** — not a fourth agent
+surface — that resolves a query to EITHER a governed **curated** answer OR a
+semantic/keyword **retrieval** result, on one uniform shape carrying
+`meta.provenance` (`:curated`/`:retrieved`). Full reference:
+[`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).
+
+- **`Loopctl.Knowledge.hybrid_search/3`** (`knowledge_hybrid_search` tool /
+  `POST /api/v1/knowledge/hybrid_search`) — `:curated` wins ONLY when a governed
+  curated source's ABSOLUTE (never pool-relative) confidence score clears a
+  scale-matched threshold AND beats the best retrieved candidate by a margin AND
+  is authoritative (not superseded/conflicted). Otherwise `:retrieved` — a
+  near-but-wrong curated doc NEVER wins by default just because a pool is
+  sparse. Both branches share identical `results`/`meta` key sets — callers
+  branch on `meta.provenance` alone, never on which subsystem answered.
+- **Progressive disclosure** (`knowledge_progressive_index` /
+  `knowledge_progressive_drill`, `GET /api/v1/knowledge/progressive_index` /
+  `GET /api/v1/knowledge/progressive/:id`) — a cheap, top-K-capped, curated-
+  preferred topic browse (compact stubs, no bodies) with one hop of `:relates_to`
+  hub enrichment, then a full-body drill into a chosen stub. A fuzzy/paraphrased
+  topic can miss a lexically-dissimilar curated article — use `hybrid_search/3`
+  when you need the governed provenance decision instead.
+- **#305/#306 are the same feature** (this epic implements both) — recommend
+  closing one as a duplicate of the other rather than tracking them separately.
+
 ## Elixir / Phoenix guidelines
 
 These are the stock `phx.new` rules, condensed. Each line is a hard rule.

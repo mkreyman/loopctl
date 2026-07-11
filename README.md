@@ -46,6 +46,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 - **CLI** -- escript binary for all operations (`loopctl status`, `loopctl claim`, `loopctl verify`)
 - **Token cost intelligence** -- agents report token usage per story; per-agent efficiency rankings, configurable budgets, and anomaly detection prevent runaway costs across long sprints
 - **Agent memory** -- per-agent private working memory (Epic 28): short-term session turns (TTL-pruned) plus long-term, vector-embedded facts recalled by semantic similarity, isolated per `(tenant, subject_id)` and distinct from the shared Knowledge Wiki. See [`docs/agent-memory.md`](docs/agent-memory.md).
+- **Hybrid (curated + RAG) knowledge retrieval** -- a single Knowledge Wiki entrypoint (Epic 31) that prefers a governed curated answer when one genuinely answers a query, else falls back to semantic/keyword retrieval, returning `provenance` (`curated`/`retrieved`) on one uniform shape so callers never branch on which subsystem answered. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).
 - **OpenAPI 3.0** -- self-documenting API with Swagger UI for agent discovery
 
 ## Concepts
@@ -68,6 +69,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | **Memory Promotion** | Unattended compilation of a session's short-term turns into durable long-term `:promoted` memories (via `POST /api/v1/memory/promote`, the `memory_promote` tool, or an hourly sweep). Watermark-idempotent, per-tenant budget-bounded, confidence-gated, hash-deduped/superseded, and prompt-injection-resistant. See [`docs/agent-memory.md`](docs/agent-memory.md). |
 | **Subject** | The owner of a memory scope, derived server-side from the API key: an agent key's `agent_id` (so rotated keys share one memory), else the key's own id. Never client-supplied. |
 | **Context Retriever** | Governed, auto-generated agent query access to loopctl's own STRUCTURED records (`projects`/`stories`/`epics`). An admin declares a tenant-scoped **entity** (typed, server-allowlisted fields); the generator emits per-entity `cr_filter_*`/`cr_search_*` tools; the executor runs the query parameterized, dual-tenant-scoped, allowlist-shaped, audited (fail-closed), and rate-limited — never model-authored SQL. The third of loopctl's three agent layers (Knowledge Wiki / Agent Memory / Context Retriever). See [`docs/context-retriever.md`](docs/context-retriever.md). |
+| **Hybrid Retrieval** | A Knowledge Wiki entrypoint (`knowledge_hybrid_search`) that resolves a query to EITHER a governed curated answer OR a semantic/keyword retrieval result, on one shape carrying `provenance` (`curated`/`retrieved`), `confidence`, and `curated_article_id`. Prevents a curated doc that doesn't actually answer the query from winning by default in a sparse pool (absolute, not pool-relative, scoring). Paired with progressive disclosure (`knowledge_progressive_index`/`knowledge_progressive_drill`) for cheap topic browsing. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md). |
 
 ## Tech Stack
 
@@ -856,6 +858,9 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_unused_articles` | Published articles with zero accesses | orchestrator |
 | `knowledge_curation_log` | Human-readable feed of KB curation adjustments (gate/supersede/merge/dismiss); recorded only while tenant `settings.kb_curation_log` is on | orchestrator |
 | `knowledge_retrieval_metrics` | Daily retrieval-precision time series (search → open follow-through) | orchestrator |
+| `knowledge_hybrid_search` | Resolve a query to a governed **curated** answer when one genuinely answers it, else falls back to semantic/keyword **retrieval** — one shape with `meta.provenance` (`curated`/`retrieved`), `confidence`, `curated_article_id`. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md). | agent |
+| `knowledge_progressive_index` | Compact, top-K-capped topic stubs (id/title/category/summary, no bodies), curated-preferred, hub-linked one hop via `:relates_to`. Follow up with `knowledge_progressive_drill`. | agent |
+| `knowledge_progressive_drill` | Fetch the full body of one stub returned by `knowledge_progressive_index`. | agent |
 | `memory_remember` | Write agent MEMORY (private to the caller's `(tenant, subject)` scope) — a `long_term` fact (embedded, semantically recalled) or a `session` turn. NOT the shared Knowledge Wiki — use `knowledge_create` for curated tenant knowledge. | agent |
 | `memory_recall` | Semantically recall the caller's OWN long-term memories by `query` (degrades to a scoped text match, never a silent empty). Private memory, not `knowledge_search`. | agent |
 | `memory_list` | List the caller's OWN long-term memories (paginated); superadmin `all_subjects=true` lists a tenant's every subject. | agent |
