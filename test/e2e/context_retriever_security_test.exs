@@ -11,7 +11,11 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
     (b) a non-allowlisted field is rejected on EVERY surface (define-time AND
         execute-time);
     (c) cross-tenant define/list/query isolation via context, API, and the
-        MCP-equivalent tool-listing/dispatch surface — with a positive control;
+        MCP-equivalent tool-listing/dispatch surface — covering BOTH entity-
+        DEFINITION isolation (B's key 404s on A's entity name) AND ROW-LEVEL
+        scoping (B defines its own identically-named entity over the same backing
+        source, yet a filter for A's title returns none of A's rows), each with a
+        positive control;
     (d) no undeclared column leaks (only declared fields returned);
     (e) an `audit_log` record exists per `/retrieve` execution;
     (f) `/retrieve` is rate-limited (429, unexecuted).
@@ -247,6 +251,7 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
       tenant_b = commit_tenant()
       user_a = user_key(tenant_a.id)
       agent_a = agent_key(tenant_a.id)
+      user_b = user_key(tenant_b.id)
       agent_b = agent_key(tenant_b.id)
 
       %{"data" => %{"id" => entity_id}} = define_story_entity(user_a)
@@ -296,6 +301,49 @@ defmodule Loopctl.E2E.ContextRetrieverSecurityTest do
         })
 
       assert json_response(cross, 404)
+
+      # ISOLATION — ROW-LEVEL scoping (the 404 above only proves entity-DEFINITION
+      # isolation; it short-circuits on `unknown_entity` BEFORE the executor's RLS
+      # + `where tenant_id == scope.tenant_id` row filter runs). So B now defines
+      # its OWN identically-named `story` entity over the SAME `stories` backing
+      # source and seeds its own row. With the entity resolvable for B, a filter
+      # for A's title must exercise — and be stopped by — the row predicate, not
+      # entity resolution.
+      %{"data" => %{"id" => entity_id_b}} = define_story_entity(user_b)
+      # B's entity is genuinely B's, not a view onto A's definition.
+      refute entity_id_b == entity_id
+      seed_story(tenant_b.id, %{title: "TenantB own story", number: "301"})
+
+      # POSITIVE CONTROL — B's own row is retrievable through B's entity, so the
+      # empty A-title result below means "A's rows are RLS-scoped out", not
+      # "B's executor path is broken / matches nothing".
+      b_own =
+        fresh_conn()
+        |> auth(agent_b)
+        |> post(~p"/api/v1/retrieve/story", %{
+          "op" => "filter",
+          "field" => "title",
+          "value" => "TenantB own story"
+        })
+
+      assert %{"results" => [%{"number" => "301"}], "meta" => %{"total_count" => 1}} =
+               json_response(b_own, 200)
+
+      # ROW SCOPING — B filters for A's exact title against an identically-named
+      # entity over the same table: A's row (number 101) is NOT returned. This
+      # directly proves RLS + the explicit tenant_id predicate deny B a peer
+      # tenant's ROWS, independent of entity-definition isolation.
+      b_cross_rows =
+        fresh_conn()
+        |> auth(agent_b)
+        |> post(~p"/api/v1/retrieve/story", %{
+          "op" => "filter",
+          "field" => "title",
+          "value" => "TenantA secret story"
+        })
+
+      assert %{"results" => [], "meta" => %{"total_count" => 0}} =
+               json_response(b_cross_rows, 200)
     end
   end
 

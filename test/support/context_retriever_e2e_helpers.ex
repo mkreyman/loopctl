@@ -15,10 +15,25 @@ defmodule Loopctl.ContextRetrieverE2EHelpers do
     * seeding backing rows on the `Loopctl.Repo` connection the RLS-scoped
       executor (`Repo.with_tenant/2`, `SET LOCAL ROLE loopctl_app`) reads.
 
-  The `marker` argument to `sweep_marker_tenants/1` and `commit_tenant/1` is the
+  The `base` argument to `sweep_marker_tenants/1` and `commit_tenant/1` is the
   per-suite slug prefix (e.g. `"crjourney-"`, `"crsec-"`) so each suite's
-  committed tenants are swept independently. See either suite's moduledoc for
-  WHY a committed tenant + `async: false` are required.
+  committed tenants are swept independently. Internally each base is narrowed to
+  a PER-RUN marker (`base <> run_nonce <> "-"`, see `run_marker/1`) so the
+  BYPASSRLS sweep only ever deletes tenants THIS run created. See either suite's
+  moduledoc for WHY a committed tenant + `async: false` are required.
+
+  ## Why the sweep is run-scoped (not just prefix-scoped)
+
+  `sweep_marker_tenants/1` runs `AdminRepo.delete_all` (BYPASSRLS) over COMMITTED
+  tenants at each suite's `setup_all`/`on_exit`. A static prefix (`"crsec-%"`)
+  is safe within ONE run — the e2e suites are `async: false` and per-tenant slugs
+  carry a `System.unique_integer` suffix — but NOT across two runs sharing one
+  physical Postgres (parallel CI jobs, or a dev running e2e while CI does): one
+  run's `setup_all` sweep would delete the other run's live tenants mid-flight,
+  orphaning committed api_keys/agents/stories into FK-failure flakiness. Narrowing
+  the marker to `run_marker/1` (the BEAM's OS pid — stable within a `mix test`
+  run, distinct across concurrent runs) confines every sweep to the tenants the
+  current run committed.
   """
 
   import Ecto.Query
@@ -34,8 +49,20 @@ defmodule Loopctl.ContextRetrieverE2EHelpers do
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
-  @doc "Deletes every committed tenant whose slug starts with `marker` (module-boundary cleanup)."
-  def sweep_marker_tenants(marker) do
+  @doc """
+  Narrows a per-suite slug `base` (e.g. `"crsec-"`) to a PER-RUN marker
+  (`base <> os_pid <> "-"`). `System.pid/0` is the BEAM's OS process id: one per
+  `mix test` invocation (shared by every suite in that run) and distinct across
+  concurrent runs sharing a physical Postgres — so the BYPASSRLS sweep never
+  clobbers another run's live committed tenants. The pid is digits-only, keeping
+  the slug within `Tenant`'s `^[a-z0-9][a-z0-9-]*[a-z0-9]$` / 63-char rules.
+  """
+  def run_marker(base), do: "#{base}#{System.pid()}-"
+
+  @doc "Deletes every committed tenant this RUN created under `base` (module-boundary cleanup)."
+  def sweep_marker_tenants(base) do
+    marker = run_marker(base)
+
     Sandbox.unboxed_run(AdminRepo, fn ->
       AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{marker}%")))
     end)
@@ -43,11 +70,12 @@ defmodule Loopctl.ContextRetrieverE2EHelpers do
 
   @doc """
   Inserts a committed, human-anchored tenant visible to BOTH the AdminRepo auth
-  path and the Repo executor path. Slug is prefixed with `marker` so it is swept
-  at module boundaries.
+  path and the Repo executor path. Slug carries the per-run marker (`base` scoped
+  by `run_marker/1`) so it is swept only by THIS run's `sweep_marker_tenants/1`.
   """
-  def commit_tenant(marker) do
+  def commit_tenant(base) do
     seq = System.unique_integer([:positive])
+    marker = run_marker(base)
     id = Ecto.UUID.generate()
 
     Sandbox.unboxed_run(AdminRepo, fn ->
