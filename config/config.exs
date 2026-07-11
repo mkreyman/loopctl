@@ -459,12 +459,33 @@ config :loopctl, :knowledge_lint_max_conflict_promotions, 500
 config :loopctl, :article_similarity_search, Loopctl.Knowledge.VectorSearch
 
 # Hybrid resolver (US-31.2): a curated candidate wins `:curated` ONLY when its
-# final_score clears this ABSOLUTE threshold AND beats the best retrieved
-# candidate by at least this margin (see Knowledge.resolve_provenance/4) — a curated
-# doc that is merely semantically near a query it doesn't answer must fall to
+# `Knowledge.absolute_score/1` — the RAW cosine similarity_score (bounded 0..1) for a
+# semantic match, or a bounded raw/(raw+1) transform of the raw ts_rank_cd
+# relevance_score for a keyword match — clears this ABSOLUTE threshold AND beats the
+# best retrieved candidate's absolute score by at least this margin (see
+# Knowledge.resolve_provenance/4). This is NEVER final_score (a pool-relative,
+# min-max-NORMALIZED 0..1 value built by merge_results/5 — a lone/top candidate in a
+# sparse pool always normalizes to 1.0 regardless of its true similarity, which is
+# exactly the false-confident-curated failure this threshold exists to prevent). A
+# curated doc that is merely semantically near a query it doesn't answer must fall to
 # `:retrieved`, never a false-authoritative claim (#305/#306).
+#
+# This pair is the SEMANTIC-scale (cosine similarity) threshold/margin. Cosine
+# similarity and ts_rank_cd are different, incommensurable scales, so the
+# KEYWORD-scale pair below is separate and must never be conflated with this one.
 config :loopctl, :knowledge_hybrid_curated_threshold, 0.75
 config :loopctl, :knowledge_hybrid_curated_margin, 0.1
+
+# Hybrid resolver (US-31.2), KEYWORD scale: applied instead of the semantic-scale pair
+# above when the winning curated candidate's absolute score comes from the bounded
+# raw/(raw+1) transform of ts_rank_cd (a keyword-only match — see
+# Knowledge.normalize_keyword_score/1), never the raw unbounded ts_rank_cd itself.
+# Calibrated against real ts_rank_cd output: a confidently-matching, normal-length
+# curated doc lands around ~0.67 after the transform, while a merely-incidental single
+# mention deep in an unrelated document lands around ~0.29 — 0.5 cleanly separates the
+# two with margin on both sides.
+config :loopctl, :knowledge_hybrid_curated_threshold_keyword, 0.5
+config :loopctl, :knowledge_hybrid_curated_margin_keyword, 0.1
 
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax

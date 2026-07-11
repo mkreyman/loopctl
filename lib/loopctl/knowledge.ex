@@ -2601,10 +2601,16 @@ defmodule Loopctl.Knowledge do
     for identity/membership checks (e.g. the US-31.2 hybrid resolver's curated-id
     lookup) so per-query cost no longer scales with the curated corpus's article
     BODIES — only ids leave the database. Default (`nil`/anything else) returns full
-    structs, unchanged.
+    structs, unchanged. Combined with `:select, :id`, the `order_by` is also dropped
+    (a MapSet has no order) — pure wasted sort work otherwise.
+  - `:ids` -- restrict the scan to this list of article UUIDs (e.g. a caller's
+    already-fetched candidate pool). Use this WITH `select: :id` so per-query cost
+    scales with the caller's candidate set, not the tenant's entire curated/system-
+    canonical corpus (US-31.2's `curated_source_ids/2` is the reference caller).
+    Default (`nil`) scans the full curated corpus, unchanged.
 
   Results are ordered tenant-own-first (tenant rows before system canonicals), then
-  most-recently-updated.
+  most-recently-updated (unless `select: :id` drops the order, see above).
 
   ## Consistency & scaling notes
 
@@ -2622,15 +2628,21 @@ defmodule Loopctl.Knowledge do
   def list_curated_sources(tenant_id, opts \\ []) when is_binary(tenant_id) do
     category = Keyword.get(opts, :category)
     limit = Keyword.get(opts, :limit)
+    ids = Keyword.get(opts, :ids)
 
     base =
       tenant_id
       |> curated_sources_base_query(category, opts)
       |> maybe_filter_curated_by_category(category)
+      |> maybe_filter_curated_by_ids(ids)
       |> maybe_limit_curated(limit)
 
     case Keyword.get(opts, :select) do
-      :id -> base |> select([a], a.id) |> AdminRepo.all()
+      # `order_by` is pure wasted sort work once the result is collapsed into a
+      # MapSet (order is irrelevant to membership) — dropped here so an `:ids`-scoped
+      # membership check (e.g. `curated_source_ids/2`) never pays for a corpus-wide
+      # sort it never uses (review finding, US-31.2).
+      :id -> base |> exclude(:order_by) |> select([a], a.id) |> AdminRepo.all()
       _ -> AdminRepo.all(base)
     end
   end
@@ -2671,6 +2683,16 @@ defmodule Loopctl.Knowledge do
 
   defp maybe_filter_curated_by_category(query, category),
     do: from(a in query, where: a.category == ^category)
+
+  # Membership scope (US-31.2 fix): restricts the curated-corpus scan to only the
+  # given article ids (e.g. the hybrid resolver's <=200-candidate pool) instead of
+  # materializing the tenant's ENTIRE curated/system-canonical universe just to test
+  # membership of a small candidate set. `nil` (the default) is a no-op — every other
+  # caller keeps scanning the full curated corpus unaffected.
+  defp maybe_filter_curated_by_ids(query, nil), do: query
+
+  defp maybe_filter_curated_by_ids(query, ids) when is_list(ids),
+    do: from(a in query, where: a.id in ^ids)
 
   defp maybe_limit_curated(query, limit) when is_integer(limit) and limit > 0,
     do: from(a in query, limit: ^limit)
@@ -6454,6 +6476,15 @@ defmodule Loopctl.Knowledge do
 
   @default_hybrid_curated_threshold 0.75
   @default_hybrid_curated_margin 0.1
+  # Keyword-scale (bounded `raw / (raw + 1)` transform of `ts_rank_cd`, see
+  # `normalize_keyword_score/1`) threshold/margin — deliberately a DIFFERENT default
+  # than the semantic-scale pair above. Calibrated against real `ts_rank_cd` output
+  # (verified empirically): a confidently-matching, normal-length curated doc lands
+  # around `~0.67`, while a merely-incidental single mention deep in an unrelated
+  # document lands around `~0.29` — `0.5` cleanly separates the two with margin on
+  # both sides.
+  @default_hybrid_curated_threshold_keyword 0.5
+  @default_hybrid_curated_margin_keyword 0.1
 
   @doc """
   Hybrid resolver (US-31.2): returns a **curated** answer ONLY when a governed curated
@@ -6468,10 +6499,15 @@ defmodule Loopctl.Knowledge do
 
     * the curated candidate's ABSOLUTE confidence score (see `absolute_score/1` below
       — never a pool-relative, min-max-normalized score) clears the absolute
-      confidence threshold (config `:knowledge_hybrid_curated_threshold`, default
-      `#{@default_hybrid_curated_threshold}`), AND
-    * it beats the best NON-curated candidate's absolute score by a margin (config
-      `:knowledge_hybrid_curated_margin`, default `#{@default_hybrid_curated_margin}`),
+      confidence threshold FOR ITS OWN SCALE (config
+      `:knowledge_hybrid_curated_threshold`, default `#{@default_hybrid_curated_threshold}`,
+      for a semantic/cosine match; `:knowledge_hybrid_curated_threshold_keyword`,
+      default `#{@default_hybrid_curated_threshold_keyword}`, for a keyword-only
+      match), AND
+    * it beats the best NON-curated candidate's absolute score by the matching margin
+      (config `:knowledge_hybrid_curated_margin` /
+      `:knowledge_hybrid_curated_margin_keyword`, defaults
+      `#{@default_hybrid_curated_margin}` / `#{@default_hybrid_curated_margin_keyword}`),
       AND
     * it is authoritative (published, not superseded, not in an open
       `:potential_conflict` — enforced by `list_curated_sources/2`, US-31.1).
@@ -6488,10 +6524,20 @@ defmodule Loopctl.Knowledge do
   win `:curated` at "confidence 1.0" even when it barely relates to the query. The
   provenance decision therefore scores every candidate via `absolute_score/1`, which
   reads the RAW, un-normalized field straight off the result map: `:similarity_score`
-  (`1 - cosine_distance`, already on an absolute 0..1 scale) when present, else the
-  raw `:relevance_score` (`ts_rank_cd`, absolute/non-pool-relative though unbounded).
-  `merge_results/5` preserves BOTH raw fields on every merged candidate (not just the
-  winning half) specifically so this is always possible in "combined" mode.
+  (`1 - cosine_distance`, already on an absolute, bounded `0..1` scale) when present,
+  else a BOUNDED transform of the raw `:relevance_score` (`ts_rank_cd`, itself
+  unbounded — confirmed empirically up to ~2.0 for a short, title-exact match) — see
+  `normalize_keyword_score/1`. `merge_results/5` preserves BOTH raw fields on every
+  merged candidate (not just the winning half) specifically so this is always possible
+  in "combined" mode.
+
+  Cosine similarity and (normalized) `ts_rank_cd` are DIFFERENT, incommensurable
+  scales — comparing them with ONE raw threshold/margin pair would either make the
+  keyword branch practically unreachable (a realistic keyword-confident match sits
+  well below a cosine-tuned `0.75`) or let an unnaturally high/low score on one scale
+  distort a cross-scale margin subtraction. `hybrid_curated_threshold_and_margin/1`
+  therefore selects the config pair matching the WINNING curated candidate's OWN
+  scale (finding, US-31.2) — the threshold/margin is never compared across scales.
 
   ## Resolved over the ranked pool, independent of the caller's page (AC-31.2.1/.2)
 
@@ -6500,7 +6546,12 @@ defmodule Loopctl.Knowledge do
   uses for its sub-searches) — NOT the caller's paginated page. A genuinely-answering
   curated source ranked outside the caller's requested `:limit`/`:offset` window is
   still found and scored; a caller-supplied `:offset` shifts only which page of
-  `results` comes BACK, never which candidates the resolver reasons over.
+  `results` comes BACK, never which candidates the resolver reasons over. When
+  `:curated` wins, the winning article is additionally hoisted to the FRONT of the
+  (still full, still ranked) pool BEFORE pagination — so `meta.provenance == :curated`
+  always means `results |> List.first()` (at `offset: 0`) IS that curated answer,
+  never a decoy that merely out-ranked it on the pool-relative `:final_score` (the
+  "label != payload" defect this resolver exists to prevent, #305).
 
   ## Tenant isolation (AC-31.2.6)
 
@@ -6514,20 +6565,22 @@ defmodule Loopctl.Knowledge do
   This function does NOT re-implement `search_combined/3`'s embedding degradation — it
   reuses it. When embeddings are unavailable, `search_combined/3` already falls back to
   keyword-only (`meta.fallback: true`, `meta.search_mode: "keyword_only"`) and the
-  curated candidate's absolute (raw `ts_rank_cd`) score in that pool is compared
-  against the SAME absolute threshold: a curated source still confidently identifiable
-  by keyword can win `:curated`; a merely-incidental keyword hit (low raw rank) falls
-  to `:retrieved`, same as a weak semantic match would. Never a silent empty, never a
-  false `:curated` under degraded matching.
+  curated candidate's absolute (normalized `ts_rank_cd`) score in that pool is compared
+  against the matching KEYWORD-scale threshold: a curated source still confidently
+  identifiable by keyword can win `:curated`; a merely-incidental keyword hit (low raw
+  rank) falls to `:retrieved`, same as a weak semantic match would. Never a silent
+  empty, never a false `:curated` under degraded matching.
 
   ## Shape parity (AC-31.2.3)
 
   Both provenance branches return the IDENTICAL map shape: `results` is the caller's
-  requested page of the SAME ranked pool used for scoring (so per-result keys are
-  identical by construction — nothing is added/removed based on provenance), and
-  `meta` is always `search_combined/3`'s own meta (with `:limit`/`:offset` overridden
-  to the caller's actual requested page) merged with exactly `%{provenance: ...,
-  confidence: ...}` — no key ever appears on only one branch.
+  requested page of the SAME ranked pool used for scoring — reordered (curated winner
+  hoisted to the front) rather than re-filtered when `:curated` wins, so per-result
+  keys are identical by construction regardless of provenance — and `meta` is always
+  `search_combined/3`'s own meta (with `:limit`/`:offset` overridden to the caller's
+  actual requested page) merged with exactly `%{provenance: ..., confidence: ...,
+  curated_article_id: ...}` — no key ever appears on only one branch (`curated_article_id`
+  is `nil` on the `:retrieved` branch).
 
   ## Provenance metrics (AC-31.2.5)
 
@@ -6559,8 +6612,12 @@ defmodule Loopctl.Knowledge do
   ## Returns
 
   - `{:ok, %{results: [map()], meta: map()}}` -- `meta.provenance` is `:curated` or
-    `:retrieved`, `meta.confidence` is the winning candidate's ABSOLUTE score (0.0 when
-    there are no results at all)
+    `:retrieved`. `meta.confidence` is the winning candidate's ABSOLUTE score for that
+    SAME provenance class (0.0 when there are no results at all, or when `:retrieved`
+    won with no genuine non-curated competitor in the pool) — never a rejected
+    candidate from the OTHER provenance class. `meta.curated_article_id` is the
+    winning curated article's id when `meta.provenance == :curated` (and it is
+    guaranteed to be present, first, in `results`), else `nil`.
   - `{:error, :invalid_weights}` / `{:error, :empty_query}` / `{:error, atom(),
     String.t()}` -- propagated unchanged from `search_combined/3`
   """
@@ -6586,7 +6643,7 @@ defmodule Loopctl.Knowledge do
 
     with {:ok, %{results: pool_results, meta: pool_meta}} <-
            search_combined(tenant_id, query_string, pool_opts) do
-      curated_ids = curated_source_ids(tenant_id)
+      curated_ids = curated_source_ids(tenant_id, pool_results)
       scores = candidate_scores(pool_results)
 
       {curated_candidates, retrieved_candidates} =
@@ -6596,21 +6653,30 @@ defmodule Loopctl.Knowledge do
       curated_score = best_curated && Map.fetch!(scores, best_curated.id)
       best_retrieved_score = best_score(retrieved_candidates, scores)
 
-      provenance =
-        resolve_provenance(
-          curated_score,
-          best_retrieved_score,
-          hybrid_curated_threshold(),
-          hybrid_curated_margin()
-        )
+      {threshold, margin} = hybrid_curated_threshold_and_margin(best_curated)
 
-      confidence =
+      provenance = resolve_provenance(curated_score, best_retrieved_score, threshold, margin)
+
+      # (finding: mislabeled-authoritative decoy) When `:curated` wins, the winning
+      # curated article MUST actually be present — and first — in the returned page,
+      # never just a label attached to whatever the pool-relative ranking happened to
+      # place in the requested window. Reordering the FULL pool (not just the page)
+      # keeps `results` sourced from the same ranked pool for every offset (AC-31.2.3
+      # shape parity is unaffected — same map shape, just reordered).
+      {ordered_pool, confidence, curated_article_id} =
         case provenance do
-          :curated -> curated_score
-          :retrieved -> best_score(pool_results, scores)
+          :curated ->
+            {hoist_to_front(pool_results, best_curated.id), curated_score, best_curated.id}
+
+          :retrieved ->
+            # (finding: mislabeled confidence) `best_retrieved_score` — NEVER
+            # `best_score(pool_results, scores)`, which would report a REJECTED
+            # curated candidate's score (a different provenance class) as if it were
+            # the winning retrieved candidate's confidence.
+            {pool_results, best_retrieved_score, nil}
         end
 
-      page = paginate_results(pool_results, limit: requested_limit, offset: requested_offset)
+      page = paginate_results(ordered_pool, limit: requested_limit, offset: requested_offset)
 
       maybe_record_search_access(
         tenant_id,
@@ -6629,6 +6695,11 @@ defmodule Loopctl.Knowledge do
            Map.merge(pool_meta, %{
              provenance: provenance,
              confidence: confidence,
+             # Always present on BOTH branches (nil for `:retrieved`) so a caller can
+             # locate the curated answer via `meta.curated_article_id` even when the
+             # ranked pool's own ordering places it outside `results` — the actionable
+             # pointer this finding required alongside the hoist above.
+             curated_article_id: curated_article_id,
              limit: page.limit,
              offset: page.offset
            })
@@ -6636,12 +6707,28 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # Moves the winning curated candidate to the FRONT of the pool (stable order for
+  # everything else) — called ONLY when provenance is `:curated`, so a caller
+  # branching on `meta.provenance` can always trust `results |> List.first()` is the
+  # curated, authoritative answer, never a decoy that happened to out-rank it on the
+  # pool-relative `:final_score` (finding, US-31.2).
+  defp hoist_to_front(pool_results, curated_id) do
+    {winner, rest} = Enum.split_with(pool_results, &(&1.id == curated_id))
+    winner ++ rest
+  end
+
   # Body-less/id-only curated lookup (finding 5): `list_curated_sources/2` defaults to
   # returning full `%Article{}` structs (including bodies), which the resolver would
   # otherwise discard entirely except for `.id`. `select: :id` keeps this a per-query
-  # hot path cheap regardless of how large the curated corpus grows.
-  defp curated_source_ids(tenant_id) do
-    tenant_id |> list_curated_sources(select: :id) |> MapSet.new()
+  # hot path cheap regardless of how large the curated corpus grows. Scoped to the
+  # POOL's own ids (`:ids`) — NEVER the tenant's full curated/system-canonical corpus
+  # — so per-query cost scales with the <=200-candidate pool, not the curated corpus
+  # (review finding, US-31.2).
+  defp curated_source_ids(_tenant_id, []), do: MapSet.new()
+
+  defp curated_source_ids(tenant_id, pool_results) do
+    pool_ids = Enum.map(pool_results, & &1.id)
+    tenant_id |> list_curated_sources(select: :id, ids: pool_ids) |> MapSet.new()
   end
 
   # Builds an id -> ABSOLUTE (non-pool-relative) score index used ONLY for the
@@ -6660,19 +6747,57 @@ defmodule Loopctl.Knowledge do
   #
   # Prefers the raw `:similarity_score` (`1 - cosine_distance`, already on an absolute
   # 0..1 scale — see `search_semantic/3`) when the candidate was found in the semantic
-  # pool; falls back to the raw `:relevance_score` (`ts_rank_cd` — see `search_keyword/3`)
-  # for a keyword-only candidate. Both are ABSOLUTE (computed independently of what
-  # else is in the pool), unlike `normalize_scores/2`'s output. `merge_results/5`
-  # preserves BOTH raw fields on a candidate found in both pools, so this always has
-  # the more-precisely-bounded semantic signal available when there is one.
+  # pool; falls back to a BOUNDED transform of the raw `:relevance_score` (`ts_rank_cd`
+  # — see `search_keyword/3`) for a keyword-only candidate. Both are ABSOLUTE (computed
+  # independently of what else is in the pool), unlike `normalize_scores/2`'s output.
+  # `merge_results/5` preserves BOTH raw fields on a candidate found in both pools, so
+  # this always has the more-precisely-bounded semantic signal available when there is
+  # one.
   defp absolute_score(%{similarity_score: score}) when is_number(score), do: score
-  defp absolute_score(%{relevance_score: score}) when is_number(score), do: score
+
+  defp absolute_score(%{relevance_score: score}) when is_number(score),
+    do: normalize_keyword_score(score)
+
   defp absolute_score(_result), do: 0.0
+
+  # `ts_rank_cd` is RAW/UNBOUNDED (a short, heavily-title-weighted match can exceed
+  # `1.0` — confirmed empirically up to ~2.0 for a title-exact match) — unlike cosine
+  # similarity's bounded `0..1` scale. Applying the same saturating transform
+  # Postgres's own `ts_rank_cd(..., normalization => 8)` uses (`rank / (rank + 1)`)
+  # keeps the keyword-scale absolute score an ABSOLUTE (non-pool-relative — still a
+  # pure function of the one raw score, never of what else is in the pool) but BOUNDED
+  # `0..1` value: `meta.confidence` can no longer silently exceed `1.0` in keyword-only
+  # mode, and the value is at least magnitude-comparable to cosine similarity (review
+  # finding, US-31.2). This does NOT change `search_keyword/3`'s own public
+  # `:relevance_score` field (still raw ts_rank_cd) — the transform is applied ONLY at
+  # this resolver's own confidence/threshold boundary.
+  defp normalize_keyword_score(raw) when is_number(raw) and raw > 0, do: raw / (raw + 1)
+  defp normalize_keyword_score(_raw), do: 0.0
 
   defp best_score([], _scores), do: 0.0
 
   defp best_score(results, scores),
     do: results |> Enum.map(&Map.fetch!(scores, &1.id)) |> Enum.max()
+
+  # Two INCOMPARABLE score scales feed `absolute_score/1` (bounded cosine similarity
+  # vs. the bounded-but-differently-distributed keyword transform above) — a single
+  # raw threshold/margin pair compared against BOTH scales interchangeably was the
+  # defect (review finding, US-31.2). Selects the config pair matching the WINNING
+  # curated candidate's OWN scale (mirroring `absolute_score/1`'s semantic-first
+  # priority for a candidate present in both sub-pools); `nil` (no curated candidate at
+  # all) is scale-irrelevant since `resolve_provenance/4` short-circuits to
+  # `:retrieved` on a `nil` curated score regardless of which pair is passed.
+  defp hybrid_curated_threshold_and_margin(%{similarity_score: score}) when is_number(score) do
+    {hybrid_curated_threshold(), hybrid_curated_margin()}
+  end
+
+  defp hybrid_curated_threshold_and_margin(%{relevance_score: score}) when is_number(score) do
+    {hybrid_curated_threshold_keyword(), hybrid_curated_margin_keyword()}
+  end
+
+  defp hybrid_curated_threshold_and_margin(_candidate) do
+    {hybrid_curated_threshold(), hybrid_curated_margin()}
+  end
 
   defp hybrid_search_mode(:curated), do: "hybrid_curated"
   defp hybrid_search_mode(:retrieved), do: "hybrid_retrieved"
@@ -6708,6 +6833,12 @@ defmodule Loopctl.Knowledge do
   folded in here — the caller is responsible for only ever passing an ALREADY
   authoritative (`list_curated_sources/2`-filtered) `curated_score`, so the
   superseded/conflicted leg never reaches this pure function as a false positive.
+
+  `threshold`/`margin` MUST already be scale-matched to `curated_score`/
+  `best_retrieved_score` by the caller (`hybrid_search/3` does this via
+  `hybrid_curated_threshold_and_margin/1`) — cosine similarity and (normalized)
+  `ts_rank_cd` are different scales, and this function does no scale reasoning of its
+  own; it only compares whatever numbers it is given.
   """
   @spec resolve_provenance(number() | nil, number(), number(), number()) ::
           :curated | :retrieved
@@ -6736,6 +6867,22 @@ defmodule Loopctl.Knowledge do
       :loopctl,
       :knowledge_hybrid_curated_margin,
       @default_hybrid_curated_margin
+    )
+  end
+
+  defp hybrid_curated_threshold_keyword do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_threshold_keyword,
+      @default_hybrid_curated_threshold_keyword
+    )
+  end
+
+  defp hybrid_curated_margin_keyword do
+    Application.get_env(
+      :loopctl,
+      :knowledge_hybrid_curated_margin_keyword,
+      @default_hybrid_curated_margin_keyword
     )
   end
 

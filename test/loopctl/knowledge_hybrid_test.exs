@@ -126,19 +126,31 @@ defmodule Loopctl.KnowledgeHybridTest do
 
       assert Enum.any?(results, &(&1.id == weak_curated.id))
       assert meta.provenance == :retrieved
-      assert meta.confidence < 0.75
-      assert meta.confidence > 0.0
+
+      # meta.confidence is scoped to the :retrieved provenance CLASS (finding: a
+      # :retrieved response must never report a rejected CURATED candidate's score as
+      # if it belonged to a genuine retrieval winner — a different provenance class).
+      # Here the sole pool candidate is the rejected curated article itself, so there
+      # is no genuine non-curated competitor at all: confidence is honestly 0.0, even
+      # though `results` still (correctly) surfaces that below-threshold article as
+      # the best answer we have.
+      assert meta.confidence == 0.0
     end
   end
 
-  # --- Regression (review finding 4): the curated/retrieved decision must be resolved
-  # over the top of the RANKED POOL, independent of the caller's `:limit`/`:offset`
-  # page window — a curated source that answers but ranks outside the default page
-  # must still be identified, and a caller-supplied `:offset` must shift only which
-  # page of `results` comes back, never the provenance decision itself.
+  # --- Regression (review finding 4, later hardened by the "label != payload"
+  # hoist-to-front fix): the curated/retrieved decision must be resolved over the top
+  # of the RANKED POOL, independent of the caller's `:limit`/`:offset` page window — a
+  # curated source that answers but ranks outside the default page must still be
+  # identified. Once identified, the winning curated article is additionally hoisted
+  # to the FRONT of the (still full) pool BEFORE pagination — never left as a mere
+  # label with no corresponding payload in `results` — so `meta.provenance ==
+  # :curated` always means `results |> List.first()` (at the default `offset: 0`) IS
+  # that curated answer, never one of the keyword-heavy decoys that merely out-ranked
+  # it on the pool-relative `:final_score`.
 
-  describe "hybrid_search/3 - resolved over the ranked pool, independent of pagination (finding 4)" do
-    test "a curated source ranked outside the default page is still identified; :offset shifts only the page, never the decision" do
+  describe "hybrid_search/3 - resolved over pool, curated winner hoisted to front (finding 4 + decoy fix)" do
+    test "a curated source ranked outside the default page is identified AND hoisted to front; a deeper offset never re-surfaces it" do
       tenant = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant.id)
 
@@ -174,22 +186,28 @@ defmodule Loopctl.KnowledgeHybridTest do
 
       stub_embeddings_by_query(%{query => @direction_a})
 
-      # Default page (limit 10, offset 0): the curated doc — ranked 13th by the
-      # keyword-heavy combined score — is NOT in the returned page, yet the resolver
-      # still finds and scores it correctly.
+      # Default page (limit 10, offset 0): the curated doc ranks 13th by the
+      # keyword-heavy combined `:final_score` — but the resolver still finds and
+      # scores it correctly, AND hoists it to the front of the returned page (it is
+      # `List.first/1`, not merely present somewhere in the pool) so a caller trusting
+      # `results[0]` as "the curated answer" is never handed a decoy instead.
       assert {:ok, %{results: page1, meta: meta1}} =
                Knowledge.hybrid_search(tenant.id, query,
                  keyword_weight: 0.9,
                  semantic_weight: 0.1
                )
 
-      refute Enum.any?(page1, &(&1.id == curated.id))
       assert meta1.provenance == :curated
       assert meta1.confidence == 1.0
+      assert meta1.curated_article_id == curated.id
+      assert %{id: curated_id} = List.first(page1)
+      assert curated_id == curated.id
 
-      # A deeper page (offset 10) now reaches the curated doc — but the DECISION
-      # (provenance/confidence) is identical: the offset shifted only which page came
-      # back, never which candidates the resolver reasoned over.
+      # A deeper page (offset 10) shifts to the tail of the reordered pool — the
+      # curated winner (now pinned at position 0) does NOT reappear on a later page,
+      # but the DECISION (provenance/confidence/curated_article_id) is identical: the
+      # offset shifted only which page came back, never which candidates the resolver
+      # reasoned over nor which one won.
       assert {:ok, %{results: page2, meta: meta2}} =
                Knowledge.hybrid_search(tenant.id, query,
                  keyword_weight: 0.9,
@@ -197,9 +215,10 @@ defmodule Loopctl.KnowledgeHybridTest do
                  offset: 10
                )
 
-      assert Enum.any?(page2, &(&1.id == curated.id))
+      refute Enum.any?(page2, &(&1.id == curated.id))
       assert meta2.provenance == :curated
       assert meta2.confidence == 1.0
+      assert meta2.curated_article_id == curated.id
     end
   end
 
@@ -266,10 +285,15 @@ defmodule Loopctl.KnowledgeHybridTest do
         assert Map.has_key?(retrieved_result, field)
       end
 
-      for key <- [:provenance, :confidence, :search_mode] do
+      for key <- [:provenance, :confidence, :search_mode, :curated_article_id] do
         assert Map.has_key?(curated_meta, key)
         assert Map.has_key?(retrieved_meta, key)
       end
+
+      # curated_article_id is the actionable pointer (finding: mislabeled-authoritative
+      # decoy) — present with a real id when :curated won, nil on the :retrieved branch.
+      assert curated_meta.curated_article_id == curated.id
+      assert retrieved_meta.curated_article_id == nil
     end
   end
 
