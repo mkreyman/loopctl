@@ -379,4 +379,78 @@ defmodule Loopctl.ContextRetriever.EntityTest do
       refute Map.has_key?(field, "blob")
     end
   end
+
+  describe "update_changeset/2 — security: allowlist re-validated against the RESOLVED source" do
+    # Regression: a partial PATCH that flips ONLY `backing_source` (leaving the
+    # retained fields unchanged) must still re-check those fields against the NEW
+    # source's column allowlist. Otherwise a projects-only column (`mission`)
+    # survives a switch to `:stories`, persisting a definition that violates the
+    # security-root invariant `declared_fields ⊆ column_allowlist[backing_source]`.
+    test "rejects a backing_source-only change that strands a now-unallowlisted field" do
+      stored = %Entity{
+        tenant_id: Ecto.UUID.generate(),
+        name: "proj",
+        backing_source: :projects,
+        fields: [
+          %{"name" => "mission", "type" => "string", "filterable" => true, "searchable" => false}
+        ]
+      }
+
+      cs = Entity.update_changeset(stored, %{"backing_source" => "stories"})
+
+      refute cs.valid?
+      assert Enum.any?(errors_on(cs).fields, &(&1 =~ "not an allowed column"))
+      # And the invalid source flip is NOT quietly retained as a valid change.
+      assert Ecto.Changeset.get_change(cs, :backing_source) == :stories
+    end
+
+    test "accepts a backing_source-only change when the retained fields are allowlisted for the new source" do
+      # `title`/`description` are allowlisted for BOTH projects and stories, so a
+      # source flip that keeps only cross-allowlisted fields is legitimate.
+      stored = %Entity{
+        tenant_id: Ecto.UUID.generate(),
+        name: "thing",
+        backing_source: :projects,
+        fields: [
+          %{
+            "name" => "description",
+            "type" => "string",
+            "filterable" => true,
+            "searchable" => true
+          }
+        ]
+      }
+
+      cs = Entity.update_changeset(stored, %{"backing_source" => "stories"})
+
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :backing_source) == :stories
+    end
+
+    test "still rejects a fields-only PATCH that declares an unallowlisted column" do
+      stored = %Entity{
+        tenant_id: Ecto.UUID.generate(),
+        name: "story",
+        backing_source: :stories,
+        fields: [
+          %{"name" => "title", "type" => "string", "filterable" => true, "searchable" => false}
+        ]
+      }
+
+      cs =
+        Entity.update_changeset(stored, %{
+          "fields" => [
+            %{
+              "name" => "tenant_id",
+              "type" => "string",
+              "filterable" => true,
+              "searchable" => false
+            }
+          ]
+        })
+
+      refute cs.valid?
+      assert Enum.any?(errors_on(cs).fields, &(&1 =~ "not an allowed column"))
+    end
+  end
 end

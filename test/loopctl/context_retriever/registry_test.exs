@@ -291,4 +291,60 @@ defmodule Loopctl.ContextRetriever.RegistryTest do
                })
     end
   end
+
+  describe "update_entity/4 — allowlist re-validation + clean not-found" do
+    test "a backing_source-only PATCH re-validates retained fields and does NOT persist an allowlist violation" do
+      tenant = repo_tenant()
+
+      {:ok, entity} =
+        Registry.create_entity(tenant.id, %{
+          name: "proj",
+          backing_source: :projects,
+          fields: [%{name: "mission", type: :string, filterable: true, searchable: false}]
+        })
+
+      # `mission` is a projects-only column; flipping to :stories must be rejected
+      # (it is NOT in the stories allowlist), and nothing may be persisted.
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Registry.update_entity(tenant.id, entity.id, %{"backing_source" => "stories"})
+
+      assert Enum.any?(errors_on(cs).fields, &(&1 =~ "not an allowed column"))
+
+      # The stored row is unchanged: still :projects with `mission`.
+      reloaded = Registry.get_entity(tenant.id, "proj")
+      assert reloaded.backing_source == :projects
+      assert [%{"name" => "mission"}] = reloaded.fields
+    end
+
+    test "returns :not_found for an unknown id (clean 404, not a raise)" do
+      tenant = repo_tenant()
+
+      assert {:error, :not_found} =
+               Registry.update_entity(tenant.id, Ecto.UUID.generate(), %{"name" => "renamed"})
+    end
+  end
+
+  describe "delete_entity/3 — clean not-found" do
+    test "deletes an existing entity" do
+      tenant = repo_tenant()
+
+      {:ok, entity} =
+        Registry.create_entity(tenant.id, %{
+          name: "story",
+          backing_source: :stories,
+          fields: @valid_fields
+        })
+
+      assert {:ok, deleted} = Registry.delete_entity(tenant.id, entity.id)
+      assert deleted.id == entity.id
+      assert Registry.get_entity(tenant.id, "story") == nil
+    end
+
+    test "returns :not_found for an unknown id (clean 404, not a raise)" do
+      tenant = repo_tenant()
+
+      assert {:error, :not_found} =
+               Registry.delete_entity(tenant.id, Ecto.UUID.generate())
+    end
+  end
 end

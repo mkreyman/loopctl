@@ -338,9 +338,24 @@ defmodule Loopctl.ContextRetriever.Registry do
   # Fetch the row inside the transaction, scoped by RLS + an explicit tenant
   # predicate (defense-in-depth on this security-root read). A missing/foreign id
   # short-circuits the Multi with `{:error, :not_found}`.
+  #
+  # `lock: "FOR UPDATE"` serializes this fetch against a concurrent update/delete
+  # of the same row. Without it, a concurrent transaction committing a delete
+  # between this fetch and the subsequent `Multi.update`/`Multi.delete` makes the
+  # write match 0 rows and Ecto RAISES `Ecto.StaleEntryError` (→ 500). The row
+  # lock forces a concurrent delete to serialize: it either commits first (our
+  # re-read under READ COMMITTED then finds no row → clean `{:error, :not_found}`
+  # → 404) or blocks behind our lock until we commit. Either way the write always
+  # matches the locked row and never goes stale.
   defp fetch_entity(multi, tenant_id, uuid) do
     Multi.run(multi, :fetch, fn repo, _changes ->
-      case repo.get_by(Entity, id: uuid, tenant_id: tenant_id) do
+      query =
+        from(e in Entity,
+          where: e.id == ^uuid and e.tenant_id == ^tenant_id,
+          lock: "FOR UPDATE"
+        )
+
+      case repo.one(query) do
         %Entity{} = entity -> {:ok, entity}
         nil -> {:error, :not_found}
       end

@@ -355,12 +355,22 @@ defmodule Loopctl.ContextRetriever.Entity do
     end
   end
 
+  # Validate the RESOLVED fields against the RESOLVED backing_source
+  # UNCONDITIONALLY (via `get_field`, not `validate_change`). `validate_change`
+  # only fires when `:fields` is in the changeset's *changes*, so a partial PATCH
+  # that flips ONLY `backing_source` (leaving the retained fields unchanged) would
+  # otherwise skip the per-source column-allowlist check and persist a definition
+  # whose stored fields are NOT allowlisted for its new source — breaking the
+  # security-root invariant `declared_fields ⊆ column_allowlist[backing_source]`.
+  # Reading both via `get_field` re-checks the fields-vs-source pair on every
+  # write regardless of which of the two actually changed.
   defp validate_fields(changeset) do
     source = get_field(changeset, :backing_source)
+    fields = get_field(changeset, :fields)
 
-    validate_change(changeset, :fields, fn :fields, fields ->
-      field_list_errors(fields, source)
-    end)
+    fields
+    |> field_list_errors(source)
+    |> Enum.reduce(changeset, fn {key, message}, cs -> add_error(cs, key, message) end)
   end
 
   defp field_list_errors(fields, _source) when not is_list(fields) do
