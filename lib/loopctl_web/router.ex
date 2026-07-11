@@ -365,6 +365,16 @@ defmodule LoopctlWeb.Router do
     # Knowledge Search (unified keyword / semantic / combined)
     get "/knowledge/search", KnowledgeSearchController, :search
 
+    # Hybrid retrieval (curated-first, retrieval fallback, with provenance) — US-31.4.
+    # POST (vs the GET search endpoint) carries the richer JSON body.
+    post "/knowledge/hybrid_search", KnowledgeHybridSearchController, :hybrid_search
+
+    # Progressive disclosure (US-31.3/31.4): compact topic index, then drill into one
+    # article's body. The literal `progressive_index` path is registered BEFORE the
+    # parameterized `progressive/:id` drill so it can never be shadowed.
+    get "/knowledge/progressive_index", KnowledgeProgressiveController, :index
+    get "/knowledge/progressive/:id", KnowledgeProgressiveController, :drill
+
     # Knowledge Context (deep-read with recency scoring and linked refs)
     get "/knowledge/context", KnowledgeContextController, :context
 

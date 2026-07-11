@@ -87,6 +87,14 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/knowledge/bulk-delete"},
                {:post, "/api/v1/knowledge/conflicts/resolve"},
                {:post, "/api/v1/knowledge/novelty"},
+               # Hybrid retrieval (US-31.4) — a POST-shaped READ over the wiki
+               # (curated-first, retrieval-fallback resolution with provenance),
+               # NOT a mutation. It surfaces `Knowledge.hybrid_search/3`, is
+               # role: agent+ (mirroring GET /knowledge/search), and is
+               # tenant-scoped from the key — part of the KB-tier read surface an
+               # agent-rooted tenant is the intended user of. POST (vs GET) only
+               # because it carries a richer JSON body.
+               {:post, "/api/v1/knowledge/hybrid_search"},
                {:post, "/api/v1/knowledge/okf/import"},
                {:post, "/api/v1/knowledge/ingest"},
                {:post, "/api/v1/knowledge/ingest/batch"},

@@ -5,6 +5,29 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.41.0 — 2026-07-11 (US-31.4 — hybrid retrieval + progressive disclosure tools)
+
+### Added
+
+- **`knowledge_hybrid_search`** — single hybrid retrieval entrypoint over
+  `POST /api/v1/knowledge/hybrid_search`. Runs the combined keyword+semantic search
+  over the full ranked pool, then decides whether a governed **curated** source
+  actually answers, returning `meta.provenance` (`curated` | `retrieved`),
+  `meta.confidence`, and `meta.curated_article_id`. Provenance rides through the MCP
+  boundary verbatim — a curated answer stays flagged `curated`, a retrieved answer
+  `retrieved`. Prefer over `knowledge_search` when you want one trustworthy answer
+  plus its provenance instead of a ranked list to triage. Degrades to keyword-only
+  like `knowledge_search` when embeddings are unavailable.
+- **`knowledge_progressive_index`** — progressive disclosure: a cheap, capped index
+  of compact stubs (`id`/`title`/`category`/`summary`, no bodies) for a topic,
+  curated-preferred and hub-enriched, over `GET /api/v1/knowledge/progressive_index`.
+- **`knowledge_progressive_drill`** — opens one stub's full body over
+  `GET /api/v1/knowledge/progressive/:id`, resolving both tenant-owned articles and
+  published system canonicals.
+- All three ride the existing authenticated/witness pipeline (agent key, shared
+  `apiCall` + witness-STH). Additive only — existing `knowledge_*` tools are
+  unchanged. Tool count 73 → 76.
+
 ## 2.40.0 — 2026-07-10 (US-30.5 — dynamic per-tenant Context Retriever tools)
 
 ### Added
