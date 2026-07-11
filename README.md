@@ -67,6 +67,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | **Agent Memory** | An agent subject's private working memory, isolated per `(tenant, subject_id)`: short-term **session** turns (chronological, TTL-pruned) and long-term, vector-embedded **facts** (semantically recalled, supersede/forget lifecycle). Distinct from the shared Knowledge Wiki. |
 | **Memory Promotion** | Unattended compilation of a session's short-term turns into durable long-term `:promoted` memories (via `POST /api/v1/memory/promote`, the `memory_promote` tool, or an hourly sweep). Watermark-idempotent, per-tenant budget-bounded, confidence-gated, hash-deduped/superseded, and prompt-injection-resistant. See [`docs/agent-memory.md`](docs/agent-memory.md). |
 | **Subject** | The owner of a memory scope, derived server-side from the API key: an agent key's `agent_id` (so rotated keys share one memory), else the key's own id. Never client-supplied. |
+| **Context Retriever** | Governed, auto-generated agent query access to loopctl's own STRUCTURED records (`projects`/`stories`/`epics`). An admin declares a tenant-scoped **entity** (typed, server-allowlisted fields); the generator emits per-entity `cr_filter_*`/`cr_search_*` tools; the executor runs the query parameterized, dual-tenant-scoped, allowlist-shaped, audited (fail-closed), and rate-limited — never model-authored SQL. The third of loopctl's three agent layers (Knowledge Wiki / Agent Memory / Context Retriever). See [`docs/context-retriever.md`](docs/context-retriever.md). |
 
 ## Tech Stack
 
@@ -860,6 +861,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `memory_list` | List the caller's OWN long-term memories (paginated); superadmin `all_subjects=true` lists a tenant's every subject. | agent |
 | `memory_forget` | Delete one of the caller's OWN memories by id (404 cross-scope, no existence leak). | agent |
 | `memory_promote` | Compile a session's short-term memory into durable long-term memory (async job; caller's own sessions only) | agent |
+| `cr_filter_*` / `cr_search_*` | **Dynamically generated** Context Retriever tools (one per filterable field + one search tool per entity). Appended to ListTools per-tenant from `GET /api/v1/retrieve/tools`; a `cr_`-prefixed call dispatches generically to `POST /api/v1/retrieve/:entity`. Governed structured-data reads over `projects`/`stories`/`epics` — parameterized, tenant-scoped, allowlist-shaped, audited. Entity definitions are authored over `/api/v1/entities` (user + human-anchor). See [`docs/context-retriever.md`](docs/context-retriever.md). | agent |
 | `get_system_articles` | List/fetch system-scoped wiki articles (public) | none |
 | `dispatch` | Mint an ephemeral key for a sub-agent dispatch (Chain of Custody v2) | orchestrator |
 | `recover_cap` | Re-mint a capability token after a session crash | agent |

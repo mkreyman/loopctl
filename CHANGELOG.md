@@ -2,6 +2,55 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-07-10 — Context Retriever (Epic 30)
+
+### Added
+
+- **Context Retriever** — a governed, auto-generated agent query surface over
+  loopctl's own STRUCTURED records (`projects`/`stories`/`epics`), the third of
+  loopctl's three agent information layers (Knowledge Wiki / Agent Memory /
+  Context Retriever). See [`docs/context-retriever.md`](docs/context-retriever.md).
+  - **Entity registry** (`Loopctl.ContextRetriever.Entity`/`Registry`, table
+    `entity_definitions`) — a tenant admin declares a named **entity** (typed
+    `fields` + a backing source) over `POST/PATCH/DELETE /api/v1/entities`. The
+    definition IS the executor's field allowlist, bounded by a SERVER per-source
+    column allowlist that excludes `tenant_id`/`metadata`/custody columns. Defining
+    requires role ≥ `user` + a human-anchored tenant; per-tenant entity count and
+    fields-per-entity are capped. Relationships/joins are out of scope for v1.
+  - **Tool generator** (`ToolGenerator`) — emits per-entity `cr_filter_<entity>_by_<field>`
+    tools (one per filterable field) and a `cr_search_<entity>` tool when a declared
+    searchable TEXT field is covered by the source's `search_vector`; served at
+    `GET /api/v1/retrieve/tools`.
+  - **Executor** (`Executor.run/3`, the security boundary) — `POST /api/v1/retrieve/:entity`
+    runs a filter/search parameterized (Ecto-pinned values / `websearch_to_tsquery`
+    — never model SQL), dual tenant-scoped (RLS `loopctl_app` role + explicit
+    predicate), execute-time allowlist-rechecked, shaped to declared columns only,
+    audited fail-closed (`audit_log` `entity_type: "context_retrieval"`; no rows
+    without a persisted audit trail), and per-tenant rate-limited (429 over-limit,
+    unexecuted). Injection payloads match literally; pagination size + offset are
+    capped.
+- **MCP dynamic tool listing** — `mcp-server/lib/generated-tools.js` fetches the
+  tenant's `cr_*` specs, appends them to ListTools (TTL-cached, negative-cached on
+  outage, non-`cr_`/static-colliding specs dropped), and dispatches a `cr_*` call
+  to `POST /api/v1/retrieve/:entity` under the same agent key as static reads.
+- **Docs** — new [`docs/context-retriever.md`](docs/context-retriever.md) (the
+  three-layer model, architecture, security model, surfaces); README/CLAUDE.md/AGENTS.md
+  extended to a three-way `retrieve_*` vs `knowledge_*` vs `memory_*` decision
+  guide. The #309 "reconcile `docs/cole-medin-self-evolving-wiki.md`" item was
+  already satisfied (removed PR #310; content in KB hub `fb9abd73`); the epic folder
+  is `epic_30`.
+
+### Verification
+
+- **Terminal e2e + security** (US-30.7) — `Loopctl.E2E.ContextRetrieverJourneyTest`
+  (define → ListTools → filter + search via API and the MCP-derived body agree,
+  tenant-scoped) and `Loopctl.E2E.ContextRetrieverSecurityTest` (injection in
+  filter + search match literally; non-allowlist rejected on every surface;
+  cross-tenant define/list/query isolation via context/API/MCP with a positive
+  control; no undeclared-column leak; an audit record per execution; `/retrieve`
+  429 over-limit) — both run under the non-owner app role. All Context Retriever
+  endpoints render at `/swaggerui`.
+
 ## [Unreleased] — 2026-07-10 — Agent Memory auto-promotion (Epic 29, Part 2)
 
 ### Added
