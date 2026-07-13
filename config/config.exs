@@ -417,6 +417,18 @@ config :loopctl, :context_retriever_retrieve_rate_limit, 120
 # residual. Enable ONLY inside an egress-restricted, ephemeral sandbox.
 config :loopctl, :enable_local_test_runner, false
 
+# US-33.7 — Flag-guarded RLS-Repo reroute pilot (Epic 33, DB Connection Topology).
+# DEFAULT OFF. When true, `Loopctl.WorkBreakdown.Stories.list_stories_by_project/3`
+# reads through the RLS `Loopctl.Repo` (via `Repo.with_tenant/2`) instead of the
+# BYPASSRLS `Loopctl.AdminRepo`. This is a SECURITY-BOUNDARY change: the RLS path
+# keeps the explicit `where s.tenant_id == ^tenant_id` predicate (belt-and-suspenders)
+# AND relies on RLS enforcement, and fails closed (zero rows) on a missing tenant
+# context. Kept OFF in prod unless the prod `Repo` role is verified to lack BYPASSRLS
+# (AC-33.7.4). A rollback is this config flip alone — no deploy dependency. The
+# blanket reroute of all OLTP through the RLS Repo remains OUT OF SCOPE (a separate
+# future epic); this pilot is its parity + cost evidence base (AC-33.7.6).
+config :loopctl, :rls_reroute_list_stories_by_project, false
+
 # DI: Article category classifier for the reclassification backfill
 # (KnowledgeReclassifyWorker). Overridden in test env.
 config :loopctl, :category_classifier, Loopctl.Knowledge.ClaudeCategoryClassifier

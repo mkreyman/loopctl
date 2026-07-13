@@ -17,6 +17,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
@@ -285,24 +286,81 @@ defmodule Loopctl.WorkBreakdown.Stories do
     limit = opts |> Keyword.get(:limit, 100) |> max(1) |> min(500)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
-    base_query =
-      Story
-      |> where([s], s.tenant_id == ^tenant_id)
-      |> scope_by_project(project_id)
-      |> apply_project_filters(opts)
+    # US-33.7 pilot: pick the read path. Default is the BYPASSRLS `AdminRepo`
+    # (today's behavior). The `:strategy` opt is an explicit selector so both
+    # branches can be exercised in-test without `Application.put_env`; when it is
+    # absent the strategy is resolved from the default-OFF config flag at call time.
+    strategy = Keyword.get(opts, :strategy, default_list_stories_strategy())
+
+    list_stories_by_project(strategy, tenant_id, project_id, opts, limit, offset)
+  end
+
+  # RLS path resolved from config unless the caller passed an explicit `:strategy`.
+  defp default_list_stories_strategy do
+    if Application.get_env(:loopctl, :rls_reroute_list_stories_by_project, false) do
+      :rls
+    else
+      :admin
+    end
+  end
+
+  # AdminRepo path (default) — BYPASSRLS pool, unchanged from before the pilot.
+  defp list_stories_by_project(:admin, tenant_id, project_id, opts, limit, offset) do
+    base_query = project_stories_query(tenant_id, project_id, opts)
 
     total = AdminRepo.aggregate(base_query, :count, :id)
-
-    stories =
-      base_query
-      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
-      # never skips or duplicates rows sharing a sort_key.
-      |> order_by([s], asc: s.sort_key, asc: s.id)
-      |> limit(^limit)
-      |> offset(^offset)
-      |> AdminRepo.all()
+    stories = base_query |> paginate_project_stories(limit, offset) |> AdminRepo.all()
 
     {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+  end
+
+  # RLS path fail-closed guard (AC-33.7.3 / TC-33.7.3): a missing or blank tenant
+  # context yields ZERO rows, never cross-tenant rows and never a leaking error.
+  # `Repo.with_tenant/2` guards `is_binary(tenant_id)`, and building the base query
+  # with a blank `tenant_id` against the `:binary_id` column would raise a
+  # CastError — so short-circuit BEFORE constructing or executing anything.
+  defp list_stories_by_project(:rls, tenant_id, _project_id, _opts, limit, offset)
+       when not is_binary(tenant_id) or tenant_id == "" do
+    {:ok, %{data: [], total: 0, limit: limit, offset: offset}}
+  end
+
+  # RLS path (US-33.7 pilot) — RLS `Repo` pool via `with_tenant/2`. RLS is the
+  # primary enforcement (`tenant_id = current_tenant_id()`); the explicit
+  # `where s.tenant_id == ^tenant_id` predicate in `project_stories_query/3` is kept
+  # as defense-in-depth (mirrors `ContextRetriever.Executor`). Both count and page
+  # run inside ONE tenant-scoped transaction. A DB error fails closed (zero rows).
+  defp list_stories_by_project(:rls, tenant_id, project_id, opts, limit, offset) do
+    base_query = project_stories_query(tenant_id, project_id, opts)
+    page_query = paginate_project_stories(base_query, limit, offset)
+
+    Repo.with_tenant(tenant_id, fn ->
+      total = Repo.aggregate(base_query, :count, :id)
+      stories = Repo.all(page_query)
+      {total, stories}
+    end)
+    |> case do
+      {:ok, {total, stories}} ->
+        {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+
+      {:error, _reason} ->
+        {:ok, %{data: [], total: 0, limit: limit, offset: offset}}
+    end
+  end
+
+  defp project_stories_query(tenant_id, project_id, opts) do
+    Story
+    |> where([s], s.tenant_id == ^tenant_id)
+    |> scope_by_project(project_id)
+    |> apply_project_filters(opts)
+  end
+
+  defp paginate_project_stories(query, limit, offset) do
+    query
+    # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+    # never skips or duplicates rows sharing a sort_key.
+    |> order_by([s], asc: s.sort_key, asc: s.id)
+    |> limit(^limit)
+    |> offset(^offset)
   end
 
   # --- Private helpers ---
