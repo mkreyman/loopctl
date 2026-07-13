@@ -16,7 +16,8 @@ defmodule Loopctl.DbCapacityTest do
   alias Loopctl.Repo
 
   test "prod pool sizes match the runtime.exs env-var defaults" do
-    assert DbCapacity.prod_pool_sizes() == %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
+    # US-33.6: rebalanced toward the AdminRepo hot path (budget-neutral — same totals).
+    assert DbCapacity.prod_pool_sizes() == %{repo: 7, admin_repo: 6, heavy_read_repo: 8}
     assert DbCapacity.per_node_total() == 21
     assert DbCapacity.steady_total(2) == 42
   end
@@ -31,6 +32,13 @@ defmodule Loopctl.DbCapacityTest do
   test "peak budget = steady + one overlap node + per-node notifier + fixed ops" do
     # 2 nodes: 42 steady + 21 overlap + 2 notifier(1/node) + 2 fixed = 67.
     assert DbCapacity.peak_total(2) == 67
+  end
+
+  test "TC-33.6.1: peak budget at EXPECTED_APP_NODES stays strictly under max_connections with margin" do
+    # Computed, not hand-asserted: the rebalance is budget-neutral (per-node total 21
+    # unchanged), so peak(2) stays 67 with comfortable margin under the verified 100.
+    assert DbCapacity.peak_total(2) == 67
+    assert DbCapacity.peak_total(2) < DbCapacity.verified_live_max_connections()
   end
 
   test "the PEAK budget fits within the LIVE max_connections and the verified value (TC-27.11.3)" do

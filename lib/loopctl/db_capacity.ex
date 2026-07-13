@@ -21,7 +21,13 @@ defmodule Loopctl.DbCapacity do
   require Logger
 
   # Production default pool sizes = the env-var defaults in config/runtime.exs.
-  @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
+  #
+  # US-33.6: rebalanced toward the AdminRepo hot path (every authenticated request runs
+  # ~5 AdminRepo queries, 2 writes, on this BYPASSRLS pool) while the RLS Repo pool sat
+  # nearly idle. Conservative, budget-neutral shift: AdminRepo 3 -> 6, Repo 10 -> 7 (cedes
+  # idle headroom), HeavyReadRepo untouched. per_node_total/peak_total/max_supported_nodes
+  # are unchanged (21/67/3) — see the sizing comment in config/runtime.exs.
+  @prod_pool_sizes %{repo: 7, admin_repo: 6, heavy_read_repo: 8}
 
   # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s reads + a reserve for long-held
   # streamed-export checkouts (US-27.16). fast + reserve == the pool size.
