@@ -649,6 +649,9 @@ defmodule Loopctl.Tenants do
     case result do
       {:ok, %{update_tenant: updated_tenant}} ->
         TenantKeys.invalidate(tenant.id)
+        # US-33.3: the cached api_key snapshots carry the tenant's
+        # audit_signing_public_key — bust them so a rotation is reflected at once.
+        Auth.invalidate_tenant_key_cache(tenant.id)
         {:ok, updated_tenant}
 
       {:error, _step, reason, _changes} ->
@@ -717,6 +720,7 @@ defmodule Loopctl.Tenants do
         tenant
         |> Ecto.Changeset.change(custody_halted_at: DateTime.utc_now())
         |> AdminRepo.update()
+        |> bust_key_cache_on_update()
 
       error ->
         error
@@ -731,6 +735,7 @@ defmodule Loopctl.Tenants do
         tenant
         |> Ecto.Changeset.change(custody_halted_at: nil)
         |> AdminRepo.update()
+        |> bust_key_cache_on_update()
 
       error ->
         error
@@ -756,6 +761,7 @@ defmodule Loopctl.Tenants do
     tenant
     |> Tenant.update_changeset(attrs)
     |> AdminRepo.update()
+    |> bust_key_cache_on_update()
   end
 
   @doc """
@@ -784,6 +790,7 @@ defmodule Loopctl.Tenants do
     tenant
     |> Tenant.status_changeset(:suspended)
     |> AdminRepo.update()
+    |> bust_key_cache_on_update()
   end
 
   @doc """
@@ -794,6 +801,7 @@ defmodule Loopctl.Tenants do
     tenant
     |> Tenant.status_changeset(:active)
     |> AdminRepo.update()
+    |> bust_key_cache_on_update()
   end
 
   @doc """
@@ -892,6 +900,7 @@ defmodule Loopctl.Tenants do
     tenant
     |> Tenant.update_changeset(attrs)
     |> AdminRepo.update()
+    |> bust_key_cache_on_update()
   end
 
   @doc """
@@ -1103,6 +1112,19 @@ defmodule Loopctl.Tenants do
 
     Map.put(stats, :tenant, tenant)
   end
+
+  # US-33.3: the api-key cache stores each api_key WITH its :tenant preloaded, so a
+  # tenant-row mutation leaves those cached snapshots stale (status,
+  # custody_halted_at, trust_tier are all authorization-relevant and read off the
+  # preloaded tenant by the auth pipeline). Bust the tenant's cached keys on every
+  # successful tenant update so the change takes effect on the very next request
+  # rather than after the TTL. A failed update is passed through untouched.
+  defp bust_key_cache_on_update({:ok, %Tenant{} = tenant} = result) do
+    Auth.invalidate_tenant_key_cache(tenant.id)
+    result
+  end
+
+  defp bust_key_cache_on_update(other), do: other
 
   defp merge_settings(tenant, attrs) do
     case Map.get(attrs, "settings") || Map.get(attrs, :settings) do

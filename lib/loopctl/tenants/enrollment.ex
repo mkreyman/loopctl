@@ -130,7 +130,7 @@ defmodule Loopctl.Tenants.Enrollment do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{authenticator: auth, reloaded_tenant: tenant, flip_tier: {flipped, _}}} ->
-        {:ok, %{tenant: tenant, authenticator: auth, upgraded: flipped == 1}}
+        on_enroll_success(tenant_id, tenant, auth, flipped)
 
       {:error, :tenant, :not_found, _changes} ->
         {:error, :not_found}
@@ -147,6 +147,16 @@ defmodule Loopctl.Tenants.Enrollment do
       {:error, _step, reason, _changes} ->
         {:error, reason}
     end
+  end
+
+  # US-33.3: a first-device enrollment flips the tenant to :human_anchored. The
+  # api-key cache stores each key WITH its :tenant preloaded (trust_tier is read by
+  # RequireHumanAnchor), so bust the tenant's cached keys on an upgrade — the
+  # change must gate custody ops on the very next request, not after the TTL.
+  defp on_enroll_success(tenant_id, tenant, auth, flipped) do
+    upgraded? = flipped == 1
+    if upgraded?, do: Loopctl.Auth.invalidate_tenant_key_cache(tenant_id)
+    {:ok, %{tenant: tenant, authenticator: auth, upgraded: upgraded?}}
   end
 
   # Under-lock backup-enrollment gate. A first enrollment (locked tier still

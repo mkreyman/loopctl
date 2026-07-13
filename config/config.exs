@@ -125,6 +125,14 @@ config :loopctl,
   scale_alert_p95_latency_ms: 2_000,
   scale_alert_under_fill_rate_per_min: 30
 
+# US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
+# defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
+# mutate writer busts the key_hash entry in-band. A cached entry is re-validated
+# against the DB after at most this long even absent an explicit invalidation, so
+# any missed path self-heals within the TTL (AC-33.3.4). Default 60s (within the
+# 30-60s range the AC specifies); overridable per-env.
+config :loopctl, Loopctl.Auth.ApiKeyCache, ttl_ms: :timer.seconds(60)
+
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
 config :loopctl, Loopctl.AdminRepo,

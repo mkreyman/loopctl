@@ -246,8 +246,16 @@ defmodule Loopctl.Dispatches do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{revoke_dispatches: count}} -> {:ok, count}
-      {:error, _step, reason, _} -> {:error, reason}
+      {:ok, %{revoke_dispatches: count}} ->
+        # SECURITY (AC-33.3.2): the update_all cascade bypasses changesets, so bust
+        # the api-key cache explicitly for every revoked key_hash. The dispatch
+        # query above selects only {id, api_key_id} (no key_hash), so resolve the
+        # hashes for the revoked key_ids and invalidate each cluster-wide.
+        Loopctl.Auth.invalidate_key_cache_by_ids(key_ids)
+        {:ok, count}
+
+      {:error, _step, reason, _} ->
+        {:error, reason}
     end
   end
 

@@ -11,6 +11,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches.Dispatch
 
@@ -37,15 +38,24 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
     dispatch_ids = Enum.map(expired, & &1.id)
     key_ids = expired |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1)
 
-    AdminRepo.transaction(fn ->
-      {d_count, _} =
-        from(d in Dispatch, where: d.id in ^dispatch_ids)
-        |> AdminRepo.update_all(set: [revoked_at: now])
+    result =
+      AdminRepo.transaction(fn ->
+        {d_count, _} =
+          from(d in Dispatch, where: d.id in ^dispatch_ids)
+          |> AdminRepo.update_all(set: [revoked_at: now])
 
-      revoke_keys(key_ids, now)
+        revoke_keys(key_ids, now)
 
-      Logger.info("RevokeExpiredDispatchesWorker: revoked #{d_count} expired dispatches")
-    end)
+        Logger.info("RevokeExpiredDispatchesWorker: revoked #{d_count} expired dispatches")
+      end)
+
+    # SECURITY (AC-33.3.2): the update_all cascade bypasses changesets, so bust the
+    # api-key cache explicitly for every revoked key_hash AFTER commit. The expired
+    # dispatch query selects only {id, api_key_id} (no key_hash), so resolve the
+    # hashes for the revoked key_ids and invalidate each cluster-wide.
+    if match?({:ok, _}, result), do: Auth.invalidate_key_cache_by_ids(key_ids)
+
+    result
   end
 
   defp revoke_keys([], _now), do: :ok

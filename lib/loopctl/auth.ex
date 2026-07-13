@@ -25,6 +25,7 @@ defmodule Loopctl.Auth do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Auth.ApiKeyCache
 
   @key_prefix "lc_"
   @random_bytes 30
@@ -58,8 +59,15 @@ defmodule Loopctl.Auth do
       |> Ecto.Changeset.put_change(:key_prefix, key_prefix)
 
     case AdminRepo.insert(changeset) do
-      {:ok, api_key} -> {:ok, {raw_key, api_key}}
-      {:error, changeset} -> {:error, changeset}
+      {:ok, api_key} ->
+        # A brand-new key_hash has nothing cached, but invalidate defensively to
+        # cover the (astronomically unlikely) re-created-hash path and to keep the
+        # rule "every key writer busts its key_hash" uniform (AC-33.3.3).
+        ApiKeyCache.invalidate_cluster(api_key.key_hash)
+        {:ok, {raw_key, api_key}}
+
+      {:error, changeset} ->
+        {:error, changeset}
     end
   end
 
@@ -68,11 +76,56 @@ defmodule Loopctl.Auth do
 
   Returns `{:ok, %ApiKey{}}` with preloaded tenant on success.
   Returns `{:error, :unauthorized}` if the key is not found, revoked, or expired.
+
+  READ-THROUGH CACHED (US-33.3): the resolved `%ApiKey{}` (with `:tenant`
+  preloaded) is served from a supervised ETS cache keyed by `key_hash`,
+  converting a per-request AdminRepo SELECT into a per-change one. On a HIT the
+  SQL `revoked_at`/`expires_at` guards are no longer applied, so they are
+  re-enforced against wall-clock now on the cached struct (`valid_now?/1`,
+  AC-33.3.5) — a cached-but-now-expired/revoked key is rejected exactly like an
+  uncached one. On a MISS the generation is captured BEFORE the DB load and
+  passed to `put/3`, so a revoke/rotation that invalidates during the load is
+  detected and the repopulation rejected (never serve a revoked key). Every
+  revoke/rotate/mutate writer invalidates the `key_hash` entry in-band, with a
+  bounded TTL as the defense-in-depth backstop. See `Loopctl.Auth.ApiKeyCache`.
+
+  The per-request `last_used_at` UPDATE still fires on every request — this
+  story removes ONLY the SELECT (AC-33.3.6; US-33.4 owns debouncing the write).
   """
   @spec verify_api_key(String.t()) :: {:ok, ApiKey.t()} | {:error, :unauthorized}
   def verify_api_key(raw_key) when is_binary(raw_key) do
     key_hash = hash_key(raw_key)
 
+    case ApiKeyCache.fetch(key_hash) do
+      {:ok, %ApiKey{} = api_key} ->
+        # HIT: the SQL guards were not applied, so re-enforce revoked_at/
+        # expires_at against wall-clock now before trusting the cached struct.
+        if valid_now?(api_key),
+          do: verify_and_touch(api_key, key_hash),
+          else: {:error, :unauthorized}
+
+      :miss ->
+        # Capture the generation BEFORE the DB read so a concurrent invalidation
+        # rejects this (possibly stale) repopulation at the next fetch/1.
+        generation = ApiKeyCache.generation(key_hash)
+
+        case load_active_api_key(key_hash) do
+          nil ->
+            {:error, :unauthorized}
+
+          api_key ->
+            # Cache only POSITIVE resolutions (the SQL guards already excluded
+            # revoked/expired rows), so a revoked/expired key is never cached.
+            ApiKeyCache.put(key_hash, api_key, generation)
+            verify_and_touch(api_key, key_hash)
+        end
+    end
+  end
+
+  # Uncached DB read of the ACTIVE (non-revoked, non-expired) api_key for a hash,
+  # with :tenant preloaded (custody_halted_at). Mirrors the guards that make a
+  # cache HIT safe to re-enforce in `valid_now?/1`.
+  defp load_active_api_key(key_hash) do
     query =
       from ak in ApiKey,
         where: ak.key_hash == ^key_hash,
@@ -80,11 +133,16 @@ defmodule Loopctl.Auth do
         where: is_nil(ak.expires_at) or ak.expires_at > ^DateTime.utc_now(),
         preload: [:tenant]
 
-    case AdminRepo.one(query) do
-      nil -> {:error, :unauthorized}
-      api_key -> verify_and_touch(api_key, key_hash)
-    end
+    AdminRepo.one(query)
   end
+
+  # Re-enforces the SQL WHERE guards on a cache HIT: active iff not revoked AND
+  # (no expiry OR expiry still in the future).
+  defp valid_now?(%ApiKey{revoked_at: revoked_at}) when not is_nil(revoked_at), do: false
+  defp valid_now?(%ApiKey{expires_at: nil}), do: true
+
+  defp valid_now?(%ApiKey{expires_at: expires_at}),
+    do: DateTime.compare(expires_at, DateTime.utc_now()) == :gt
 
   defp verify_and_touch(api_key, key_hash) do
     # Constant-time comparison to prevent timing-based side channels.
@@ -107,6 +165,54 @@ defmodule Loopctl.Auth do
     api_key
     |> ApiKey.revoke_changeset()
     |> AdminRepo.update()
+    |> tap_invalidate(api_key.key_hash)
+  end
+
+  # SECURITY (AC-33.3.2/.3): bust the cached entry for this key_hash the moment a
+  # revoke/rotate write commits, cluster-wide, so the very next request re-loads
+  # read-through (and the wall-clock guards reject a revoked/expired key) instead
+  # of serving the stale cached struct until the TTL.
+  defp tap_invalidate({:ok, _} = result, key_hash) do
+    ApiKeyCache.invalidate_cluster(key_hash)
+    result
+  end
+
+  defp tap_invalidate(other, _key_hash), do: other
+
+  @doc """
+  Busts the api-key cache entry for each api_key id in `ids`, cluster-wide.
+
+  For the cascade writers (`Loopctl.Dispatches.revoke/2`, the expired-dispatch
+  worker, agent binding) that mutate/revoke keys via `update_all` or by id and do
+  NOT have the `key_hash` in hand — the caches are keyed by `key_hash`, so this
+  resolves the hashes for the given ids and invalidates each (US-33.3).
+  """
+  @spec invalidate_key_cache_by_ids([Ecto.UUID.t()]) :: :ok
+  def invalidate_key_cache_by_ids([]), do: :ok
+
+  def invalidate_key_cache_by_ids(ids) when is_list(ids) do
+    from(ak in ApiKey, where: ak.id in ^ids, select: ak.key_hash)
+    |> AdminRepo.all()
+    |> Enum.each(&ApiKeyCache.invalidate_cluster/1)
+  end
+
+  @doc """
+  Busts the api-key cache for ALL of a tenant's keys, cluster-wide.
+
+  The cache stores each api_key WITH its `:tenant` preloaded (carrying
+  authorization-relevant tenant fields: `status`, `custody_halted_at`,
+  `trust_tier` — read by `ResolveApiKey`, `CheckCustodyHalt`, and
+  `RequireHumanAnchor`). A tenant-row mutation therefore leaves those cached
+  snapshots stale, so every tenant-auth mutation (suspend/activate, custody
+  halt/clear, WebAuthn trust-tier upgrade, audit-key rotation) calls this so the
+  change takes effect on the very next request rather than after the TTL
+  (US-33.3, composes with US-33.2).
+  """
+  @spec invalidate_tenant_key_cache(Ecto.UUID.t()) :: :ok
+  def invalidate_tenant_key_cache(tenant_id) when is_binary(tenant_id) do
+    from(ak in ApiKey, where: ak.tenant_id == ^tenant_id, select: ak.key_hash)
+    |> AdminRepo.all()
+    |> Enum.each(&ApiKeyCache.invalidate_cluster/1)
   end
 
   @doc """
@@ -170,6 +276,7 @@ defmodule Loopctl.Auth do
     api_key
     |> ApiKey.expire_changeset(expires_at)
     |> AdminRepo.update()
+    |> tap_invalidate(api_key.key_hash)
   end
 
   @doc """

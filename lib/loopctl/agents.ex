@@ -20,6 +20,7 @@ defmodule Loopctl.Agents do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Audit
+  alias Loopctl.Auth
   alias Loopctl.Webhooks.EventGenerator
 
   @doc """
@@ -90,6 +91,11 @@ defmodule Loopctl.Agents do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{agent: agent}} ->
+        # US-33.3: binding an agent MUTATES the api_key (sets agent_id — a
+        # scope-relevant change, AC-33.3.3). Bust the cached entry so the next
+        # request sees the bound key (e.g. the "already has an agent" 409 guard),
+        # not the stale pre-bind snapshot.
+        Auth.invalidate_key_cache_by_ids(List.wrap(api_key_id))
         {:ok, agent}
 
       {:error, :agent, changeset, _changes} ->
