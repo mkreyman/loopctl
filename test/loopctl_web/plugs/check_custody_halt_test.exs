@@ -15,7 +15,35 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
   """
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Auth.ApiKey
+  alias LoopctlWeb.Plugs.CheckCustodyHalt
+
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  # Attaches a `tenants`-SELECT probe SCOPED to one tenant_id so it never catches
+  # parallel async tests' queries (the handler is attached VM-globally). Sends
+  # `{ref, :tenants_query}` to the test process for each matching AdminRepo query.
+  defp attach_tenants_probe(tenant_id) do
+    {:ok, tenant_id_bin} = Ecto.UUID.dump(tenant_id)
+    test_pid = self()
+    ref = make_ref()
+    handler_id = "check-custody-halt-probe-#{inspect(ref)}"
+
+    :telemetry.attach(
+      handler_id,
+      [:loopctl, :admin_repo, :query],
+      fn _event, _measurements, metadata, _config ->
+        if metadata[:source] == "tenants" and
+             tenant_id_bin in List.wrap(metadata[:params]) do
+          send(test_pid, {ref, :tenants_query})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref
+  end
 
   # api_keys.agent_id is a FK to agents, so mint a real agent per agent key.
   defp agent_key(tenant_id) do
@@ -117,6 +145,74 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
       # CheckCustodyHalt re-SELECT would make this two.
       assert_receive {^ref, :tenants_query}
       refute_receive {^ref, :tenants_query}
+    end
+  end
+
+  # Direct `call/2` unit tests (SetTenantTest / RequireHumanAnchorTest style) for
+  # the two AC-enumerated branches the integration tests above cannot reach: every
+  # minted-key request preloads a tenant, so those only exercise the `%Tenant{}`
+  # fast path (check_custody_halt.ex:79). These drive the defensive DB fallback and
+  # the tenant-less early return directly.
+  describe "call/2 branch coverage (US-33.2)" do
+    test "TC-33.2.5: refetch fallback enforces the halt via a DB read when no current_tenant is assigned",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+      ref = attach_tenants_probe(tenant.id)
+
+      # AC-33.2.1 defensive path: current_api_key carries the tenant_id, but NO
+      # current_tenant struct is in assigns — the plug must fall back to
+      # Tenants.get_tenant/1 and STILL enforce the halt (guards the "silently
+      # returns conn without enforcing" regression).
+      api_key = %ApiKey{tenant_id: tenant.id, role: :agent}
+
+      result =
+        conn
+        |> assign(:current_api_key, api_key)
+        |> CheckCustodyHalt.call([])
+
+      assert result.halted
+      assert result.status == 503
+      assert Jason.decode!(result.resp_body)["error"]["code"] == "tenant_halted"
+
+      # Proves the fallback actually hit the DB (contrast: TC-33.2.4's fast path
+      # issues the SELECT via the ResolveApiKey preload, not here).
+      assert_receive {^ref, :tenants_query}
+    end
+
+    test "TC-33.2.6: refetch fallback passes a non-halted tenant through (DB read, no halt)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      ref = attach_tenants_probe(tenant.id)
+      api_key = %ApiKey{tenant_id: tenant.id, role: :agent}
+
+      result =
+        conn
+        |> assign(:current_api_key, api_key)
+        |> CheckCustodyHalt.call([])
+
+      refute result.halted
+      assert is_nil(result.status)
+      assert_receive {^ref, :tenants_query}
+    end
+
+    test "TC-33.2.7: a tenant-less superadmin key passes the halt check untouched (nil tenant_id early return)",
+         %{conn: conn} do
+      # AC-33.2.3: standalone superadmin (nil tenant_id, current_tenant nil) hits the
+      # is_nil(tenant_id) -> conn guard BEFORE check_tenant_halt/2 — so it reaches the
+      # controller and, structurally, issues no tenants SELECT for the halt check.
+      api_key = %ApiKey{tenant_id: nil, role: :superadmin}
+
+      result =
+        conn
+        |> assign(:current_api_key, api_key)
+        |> assign(:current_tenant, nil)
+        |> CheckCustodyHalt.call([])
+
+      # Returned unchanged (not halted, no status/body set) — proceeds to the controller.
+      refute result.halted
+      assert is_nil(result.status)
+      assert is_nil(result.resp_body)
     end
   end
 
