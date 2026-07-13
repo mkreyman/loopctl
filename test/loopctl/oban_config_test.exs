@@ -21,6 +21,29 @@ defmodule Loopctl.ObanConfigTest do
                audit: 3
              ]
     end
+
+    test "TC-32.2.4: OBAN_QUEUE_<NAME> env var overrides the matching queue's width" do
+      System.put_env("OBAN_QUEUE_DEFAULT", "42")
+
+      try do
+        assert Keyword.get(ObanConfig.queues(), :default) == 42
+      after
+        System.delete_env("OBAN_QUEUE_DEFAULT")
+      end
+    end
+
+    test "TC-32.2.4: unrelated queues stay at their default while one is overridden" do
+      System.put_env("OBAN_QUEUE_WEBHOOKS", "99")
+
+      try do
+        queues = ObanConfig.queues()
+        assert Keyword.get(queues, :webhooks) == 99
+        assert Keyword.get(queues, :default) == 10
+        assert Keyword.get(queues, :audit) == 3
+      after
+        System.delete_env("OBAN_QUEUE_WEBHOOKS")
+      end
+    end
   end
 
   describe "queue_size/2" do

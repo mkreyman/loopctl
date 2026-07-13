@@ -9,24 +9,18 @@ defmodule Loopctl.ObanConfig do
 
   `config/runtime.exs` sets `config :loopctl, Oban, queues: Loopctl.ObanConfig.queues()`
   at the top level (outside any prod-only guard) so every queue is re-listed from
-  env-or-default in every environment. Elixir `Config` REPLACES (rather than deep-
-  merges) the `queues:` value, so omitting a queue here would silently drop it — hence
-  `queues/0` always returns the full keyword list, one entry per default queue.
+  env-or-default in every environment. Elixir `Config` DEEP-MERGES (rather than
+  replaces) the `queues:` value, so a queue key present in config.exs but omitted here
+  would actually be PRESERVED, not dropped — `queues/0` still always returns the full
+  keyword list, one entry per default queue, so every queue stays env-tunable rather
+  than silently falling back to its compile-time (non-tunable) width.
   """
 
-  # Single source of truth for default widths — MUST match config/config.exs's
-  # `config :loopctl, Oban, queues: [...]` (AC-32.2.3). Sum = 33.
-  @default_queues [
-    default: 10,
-    webhooks: 5,
-    cleanup: 2,
-    analytics: 3,
-    maintenance: 2,
-    embeddings: 5,
-    knowledge: 5,
-    memory: 3,
-    audit: 3
-  ]
+  # Default widths are derived directly from config/config.exs's compile-time
+  # `config :loopctl, Oban, queues: [...]` (AC-32.2.3) rather than hand-copied, so
+  # adding/removing/resizing a queue there flows here automatically with zero drift
+  # risk. Sum = 38 (10+5+2+3+2+5+5+3+3).
+  @default_queues Application.compile_env(:loopctl, Oban)[:queues]
 
   @doc """
   Resolves the full Oban `queues` keyword list from `OBAN_QUEUE_<NAME>` env vars,
