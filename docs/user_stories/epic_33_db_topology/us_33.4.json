@@ -1,0 +1,53 @@
+{
+  "id": "US-33.4",
+  "title": "Debounce last_seen_at / last_used_at touch-writes off the request path",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Removes the 2 per-request WRITES from the AdminRepo hot path — the write-amplification the roadmap calls out as row-lock contention + dead-tuple bloat.",
+  "background": {
+    "reference": "GH #348. Every authenticated request issues UPDATE api_keys.last_used_at (Auth.update_last_used, lib/loopctl/auth.ex:197) and UPDATE agents.last_seen_at (Agents.touch_last_seen, lib/loopctl/agents.ex:161) — both on AdminRepo (pool 3). A fast-looping agent hammers the SAME rows, causing row-lock contention and dead-tuple bloat.",
+    "includes": "These two timestamps are observational (‘when did this key/agent last act’) — they do not need per-request precision. Writing them on every request turns every READ request into 2 hot-row WRITES on the tiny AdminRepo pool."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "coalesce last_seen_at / last_used_at updates into an in-memory buffer flushed periodically (batched) instead of writing on every request",
+    "so_that": "the per-request write amplification and hot-row lock contention on the AdminRepo pool is removed while last-seen/last-used stay accurate to within the flush interval"
+  },
+  "rationale": "last_seen_at/last_used_at are liveness heuristics, not custody-critical facts, so a few seconds of staleness is harmless — but writing them synchronously on every request doubles the AdminRepo write load and concentrates it on a handful of hot rows (one api_key, one agent per busy agent), producing lock contention and table bloat. Buffering the latest timestamp per id and flushing in one batched UPDATE per interval collapses N per-request writes into one periodic write per active id.",
+  "acceptance_criteria": [
+    { "id": "AC-33.4.1", "description": "A supervised buffer (ETS + a periodic flusher GenServer, or an existing debounce mechanism) records the latest last_seen_at per agent id and last_used_at per api_key id in memory on each request (no DB write on the request path). A flusher periodically writes the buffered maxima in a batched UPDATE (e.g. update_all over the buffered ids, or upsert), then clears the flushed entries.", "status": "pending" },
+    { "id": "AC-33.4.2", "description": "The request path no longer performs the two touch UPDATEs synchronously; the plug/context records into the buffer instead. Net per-request AdminRepo writes for touch = 0.", "status": "pending" },
+    { "id": "AC-33.4.3", "description": "Flush is batched and tenant-safe: writes are grouped so one flush issues O(1) statements (or O(scopes)), not O(ids); each UPDATE is correctly scoped (by id, which is globally unique) so no cross-tenant write. monotonic: a flush only advances a timestamp forward (never regresses last_seen/last_used to an older value than what's in the DB).", "status": "pending" },
+    { "id": "AC-33.4.4", "description": "Bounded staleness: flush interval is config (default a few seconds). last_seen_at/last_used_at are at most one interval stale — documented and acceptable for a liveness heuristic. On graceful shutdown the buffer is flushed; on crash, at most one interval of buffered touches is lost (acceptable — best-effort).", "status": "pending" },
+    { "id": "AC-33.4.5", "description": "No semantic consumer of last_seen_at/last_used_at requires per-request freshness — verify (grep) that nothing gates auth/custody on an exact last_used_at; if something does, it is out of scope or must read through the buffer. Document the audit.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.4.1", "name": "request records touch in buffer, no synchronous UPDATE", "type": "integration",
+      "preconditions": ["tenant + agent + api_key fixtures", "buffer/flusher started"],
+      "steps": ["make an authenticated request", "before a flush, inspect the DB row"],
+      "expected_results": ["no synchronous last_used/last_seen UPDATE occurred on the request path (assert via query count or buffer contents); the buffer holds the pending timestamp"], "status": "pending" },
+    { "id": "TC-33.4.2", "name": "flush writes the latest buffered timestamp (batched, monotonic)", "type": "integration",
+      "preconditions": ["several requests for the same agent+key buffered"],
+      "steps": ["trigger a flush"],
+      "expected_results": ["one batched UPDATE advances last_seen_at/last_used_at to the newest buffered value; the value only moves forward"], "status": "pending" },
+    { "id": "TC-33.4.3", "name": "multiple ids flushed in one batch", "type": "integration",
+      "preconditions": ["requests for 3 different agents buffered"],
+      "steps": ["trigger a flush"],
+      "expected_results": ["all 3 agents updated in O(1)/O(scopes) statements, each to its own newest timestamp"], "status": "pending" },
+    { "id": "TC-33.4.4", "name": "tenant isolation preserved", "type": "integration",
+      "preconditions": ["agents in tenant_a and tenant_b buffered"],
+      "steps": ["flush"],
+      "expected_results": ["each agent's own row updated; no cross-tenant write (ids are unique)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Buffer: ETS keyed by {:agent, id} / {:api_key, id} holding max timestamp; flusher GenServer on a config interval (Process.send_after) does update_all grouped by table. Supervise in application.ex.",
+    "Plug UpdateLastSeen (lib/loopctl_web/plugs/update_last_seen.ex) + Agents.touch_last_seen (agents.ex:161) + Auth.update_last_used (auth.ex:197) are the write sites to redirect into the buffer.",
+    "Monotonic UPDATE: `set last_seen_at = GREATEST(last_seen_at, $buffered)` or a WHERE guard so a delayed flush can't move it backward.",
+    "Config-based DI for the interval; flush on terminate/ shutdown. No Application.put_env in tests.",
+    "This composes with US-33.3 (which removes the SELECT); together the touch path becomes read-cache + buffered-write.",
+    "Best-effort semantics: acceptable to lose <1 interval of touches on crash; DO NOT use this pattern for any custody/audit write."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 340000
+}

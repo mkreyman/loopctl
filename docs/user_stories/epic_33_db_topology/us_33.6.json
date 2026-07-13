@@ -1,0 +1,48 @@
+{
+  "id": "US-33.6",
+  "title": "Rebalance Repo/AdminRepo pool sizes against measured checkout-wait; keep DbCapacity in lockstep",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Do AFTER US-33.1 (metrics) and ideally after 33.2-33.4 relieve the AdminRepo hot path — resize from data, not guesswork; must stay within the verified 100-connection budget.",
+  "background": {
+    "reference": "GH #348. runtime.exs prod pools: Repo=POOL_SIZE/10, AdminRepo=ADMIN_POOL_SIZE/3, HeavyReadRepo=HEAVY_READ_POOL_SIZE/8 (per-node total 21). DbCapacity (lib/loopctl/db_capacity.ex) hardcodes @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8} and is pinned by db_capacity_test.exs; @verified_live_max_connections 100.",
+    "includes": "The AdminRepo pool (3) carries the auth hot path while the RLS Repo pool (10) is nearly idle — capacity is sized backwards vs where load lands. US-33.1 adds the per-pool queue_time metric needed to right-size."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "rebalance the Repo and AdminRepo pool sizes based on the measured per-pool checkout-wait, keeping DbCapacity's budget model and the 100-connection ceiling consistent",
+    "so_that": "connection capacity is allocated where load actually lands (AdminRepo hot path) without exceeding the verified max_connections or breaking the per-node budget math"
+  },
+  "rationale": "With the hot path relieved (33.2-33.4) and per-pool checkout-wait now measured (33.1), pool sizes should reflect real contention: AdminRepo likely needs more than 3 (it carries auth + OLTP), while the idle RLS Repo can cede headroom — all within the verified 100-connection ceiling and the per-node budget the DbCapacity model enforces. Sizing must stay coupled to DbCapacity or the boot-time budget check and the max-nodes math silently drift.",
+  "acceptance_criteria": [
+    { "id": "AC-33.6.1", "description": "Pool sizes (Repo/AdminRepo, and HeavyRead if touched) are re-derived from the US-33.1 checkout-wait data and updated in runtime.exs via the existing env-var/default mechanism. The new per-node total × peak-deploy-overlap + notifier + fixed_ops stays STRICTLY under @verified_live_max_connections (100) at EXPECTED_APP_NODES — computed, not asserted by hand.", "status": "pending" },
+    { "id": "AC-33.6.2", "description": "DbCapacity @prod_pool_sizes is updated to match the new runtime.exs defaults (db_capacity_test.exs enforces lockstep); max_supported_nodes/peak_total recomputed and the test updated to the new expected values.", "status": "pending" },
+    { "id": "AC-33.6.3", "description": "The boot-time warn_if_over_budget/0 (SHOW max_connections) still runs and logs; the new totals do not trip it. queue_target/queue_interval are left as-is unless the data shows they need adjustment (documented if changed).", "status": "pending" },
+    { "id": "AC-33.6.4", "description": "Change is config-only and reversible via env vars (POOL_SIZE / ADMIN_POOL_SIZE / HEAVY_READ_POOL_SIZE) — an operator can revert a bad size without a deploy. pgbouncer-safe parameter guard (config_pgbouncer_safe_parameters_test) still passes.", "status": "pending" },
+    { "id": "AC-33.6.5", "description": "The PR documents the BEFORE/AFTER checkout-wait rationale (from 33.1 metrics or, if metrics not yet populated in prod, a conservative rebalance that only moves idle Repo headroom to AdminRepo while staying budget-neutral).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.6.1", "name": "DbCapacity peak stays under the 100-connection ceiling", "type": "unit",
+      "preconditions": ["new pool sizes configured"],
+      "steps": ["compute DbCapacity.peak_total at EXPECTED_APP_NODES"],
+      "expected_results": ["peak_total < 100 (verified max_connections) with margin"], "status": "pending" },
+    { "id": "TC-33.6.2", "name": "DbCapacity and runtime.exs stay in lockstep", "type": "unit",
+      "preconditions": [],
+      "steps": ["compare @prod_pool_sizes to the runtime.exs defaults"],
+      "expected_results": ["they match (db_capacity_test passes with the new numbers)"], "status": "pending" },
+    { "id": "TC-33.6.3", "name": "max_supported_nodes recomputed correctly", "type": "unit",
+      "preconditions": ["new sizes"],
+      "steps": ["call DbCapacity.max_supported_nodes"],
+      "expected_results": ["returns the correctly-derived node count for the new per-node total"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: config/runtime.exs (pool defaults), lib/loopctl/db_capacity.ex (@prod_pool_sizes + recompute), test/loopctl/db_capacity_test.exs (update expected numbers).",
+    "Budget math: peak = per_node_total*nodes + per_node_total (deploy overlap) + notifier*nodes + fixed_ops; keep < 100. Prefer moving Repo headroom to AdminRepo to stay budget-neutral if prod metrics aren't yet conclusive.",
+    "Do NOT add startup :parameters (pgbouncer FATAL) — statement_timeout stays per-query SET LOCAL.",
+    "Reversible via env vars; no migration.",
+    "If 33.1 metrics aren't populated in prod at implementation time, make a conservative budget-neutral shift and note that a data-driven follow-up can tune further."
+  ],
+  "dependencies": ["US-33.1"],
+  "estimated_tokens": 220000
+}

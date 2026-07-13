@@ -1,0 +1,47 @@
+{
+  "id": "US-33.2",
+  "title": "Drop the redundant tenant re-SELECT in CheckCustodyHalt (reuse loaded tenant)",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Pure win, lowest risk: removes 1 of 5 per-request AdminRepo queries with no behavior change.",
+  "background": {
+    "reference": "GH #348. Pipeline lib/loopctl_web/router.ex:20-31. ResolveApiKey/Auth.verify_api_key already loads api_key with preload: [:tenant] (lib/loopctl/auth.ex:83), populating current_api_key/current_tenant assigns. CheckCustodyHalt then calls Tenants.get_tenant/1 (lib/loopctl/tenants.ex:680, AdminRepo.get) purely to read custody_halted_at.",
+    "includes": "Every authenticated request performs a 5th AdminRepo SELECT to re-fetch the tenant that was ALREADY loaded (with custody_halted_at) by the api-key preload earlier in the same pipeline."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "have CheckCustodyHalt read custody_halted_at from the tenant already loaded into conn assigns instead of re-SELECTing it",
+    "so_that": "each authenticated request drops from 5 to 4 AdminRepo queries with zero change to custody-halt enforcement"
+  },
+  "rationale": "The custody-halt plug re-selects the tenant row that the api-key resolution already loaded microseconds earlier in the same request, spending a scarce AdminRepo connection to read a field that is already in memory. Reusing the assign is a behavior-preserving removal of a per-request round-trip on the 3-connection pool — the cheapest, safest reduction in the epic.",
+  "acceptance_criteria": [
+    { "id": "AC-33.2.1", "description": "CheckCustodyHalt reads custody_halted_at from the already-populated `current_tenant` (or `current_api_key.tenant`) assign when present, and only falls back to a DB fetch if the tenant is not in assigns (defensive — e.g. an unauthenticated/edge path). The custody-halt decision (halt when custody_halted_at is set) is byte-for-byte identical.", "status": "pending" },
+    { "id": "AC-33.2.2", "description": "The api-key preload continues to include :tenant with custody_halted_at populated; confirm the assign carries the field the plug needs (add to preload/select if it was being dropped).", "status": "pending" },
+    { "id": "AC-33.2.3", "description": "No weakening of enforcement: a request from a custody-halted tenant is still blocked with the same status/error; a non-halted tenant still passes. Superadmin/tenant-less (tenant_id nil) paths behave as before.", "status": "pending" },
+    { "id": "AC-33.2.4", "description": "Freshness note: reusing the preloaded tenant means custody_halted_at reflects its value at api-key resolution time (same request, microseconds earlier) — document that this is acceptable because both reads are within the same request and a halt set mid-request is caught on the next request.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.2.1", "name": "custody-halted tenant is blocked without a re-SELECT", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant, custody_halted_at: now)", "{key,_} = fixture(:api_key, tenant_id: tenant.id, role: :agent)"],
+      "steps": ["make an authenticated request with key"],
+      "expected_results": ["request is blocked by custody halt (same status/error as before)", "no additional Tenants.get_tenant SELECT is issued for the halt check (assert via query count/telemetry or by asserting the plug uses the assign)"], "status": "pending" },
+    { "id": "TC-33.2.2", "name": "non-halted tenant passes", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant, custody_halted_at: nil)", "{key,_} = fixture(:api_key, tenant_id: tenant.id, role: :agent)"],
+      "steps": ["make an authenticated request"],
+      "expected_results": ["request proceeds to the controller normally"], "status": "pending" },
+    { "id": "TC-33.2.3", "name": "tenant isolation preserved", "type": "integration",
+      "preconditions": ["tenant_a halted, tenant_b not; keys for each"],
+      "steps": ["request as tenant_a (blocked), request as tenant_b (passes)"],
+      "expected_results": ["halt is per-tenant, driven by each request's own loaded tenant"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Plug: lib/loopctl_web/plugs/check_custody_halt.ex; assigns set by ResolveApiKey/SetTenant. current_api_key preload: lib/loopctl/auth.ex:83.",
+    "Read custody_halted_at from conn.assigns.current_tenant (or current_api_key.tenant); guard with a nil-fallback to the existing Tenants.get_tenant/1 so no path regresses.",
+    "Ensure the :tenant preload/select includes custody_halted_at (Ecto: struct field access, not map access).",
+    "Behavior-preserving: keep the exact halt response. Add a query-count assertion if the test support exposes one; otherwise assert the plug path uses the assign.",
+    "No migration, no new config."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 150000
+}
