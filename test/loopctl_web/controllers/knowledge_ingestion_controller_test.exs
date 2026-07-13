@@ -858,7 +858,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
   # --- Partial index backing the COUNT/list (AC-34.6.1) ---
 
   describe "oban_jobs_ingestion_tenant_idx partial index (AC-34.6.1)" do
-    test "the partial expression index exists with the expected predicate" do
+    test "the composite partial expression index exists with the expected predicate" do
       %{rows: rows} =
         Loopctl.AdminRepo.query!(
           "SELECT indexdef FROM pg_indexes WHERE indexname = $1",
@@ -871,6 +871,13 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # Indexes the args->>'tenant_id' expression, partial to the ingestion worker.
       assert indexdef =~ "args ->> 'tenant_id'"
       assert indexdef =~ "Loopctl.Workers.ContentIngestionWorker"
+
+      # COMPOSITE shape (migration 20260713020000): the ORDER BY columns follow the
+      # equality-matched tenant column so the ordered list is answered by an ordered
+      # index scan (no full Sort). Pins the shape so a regression to the single-column
+      # index — which would reintroduce the sort-heavy ordered list — fails here.
+      assert indexdef =~ "inserted_at DESC"
+      assert indexdef =~ "id DESC"
     end
 
     test "the planner chooses the partial index for the real ingestion COUNT predicate" do
@@ -912,6 +919,53 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
 
       assert plan =~ "oban_jobs_ingestion_tenant_idx",
              "expected EXPLAIN to use the partial index, got:\n#{plan}"
+    end
+
+    test "the composite index answers the ordered list page without a full Sort" do
+      tenant = keyed_tenant()
+      now = DateTime.utc_now()
+
+      for n <- 1..5 do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      # Same eligibility technique as the COUNT test: on the tiny sandbox dataset the
+      # planner would seq-scan + Sort purely on row count, so disable seq scan for THIS
+      # transaction and assert the composite partial index oban_jobs_ingestion_tenant_idx
+      # ((args->>'tenant_id'), inserted_at DESC, id DESC) can SUPPLY the ORDER BY — the
+      # ordered page is an Index Scan feeding Limit with NO Sort node. If the index
+      # regressed to single-column (no ordering columns), the planner would need a full
+      # Sort even with seq scan disabled and this would fail — the regression guard for
+      # US-34.6's "ordered list stays a range scan, not a sort" finding.
+      Loopctl.AdminRepo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Loopctl.AdminRepo.query!(
+          """
+          EXPLAIN (FORMAT TEXT)
+          SELECT id, state, args, inserted_at, completed_at, errors FROM oban_jobs
+          WHERE worker = 'Loopctl.Workers.ContentIngestionWorker'
+            AND args->>'tenant_id' = $1
+          ORDER BY inserted_at DESC, id DESC
+          LIMIT 20 OFFSET 0
+          """,
+          [tenant.id]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "oban_jobs_ingestion_tenant_idx",
+             "expected the ordered list EXPLAIN to use the composite index, got:\n#{plan}"
+
+      refute plan =~ "Sort",
+             "expected the composite index to supply the ORDER BY (no Sort node), got:\n#{plan}"
     end
   end
 end

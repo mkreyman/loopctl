@@ -592,6 +592,11 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     total_query = select(base, [j], count(j.id))
     total = HeavyRead.one(tenant_id, total_query, HeavyRead.opts(:ingestion_jobs)) || 0
 
+    # The ORDER BY matches the trailing columns of the composite partial index
+    # oban_jobs_ingestion_tenant_idx ((args->>'tenant_id'), inserted_at DESC, id DESC)
+    # WHERE worker = ContentIngestionWorker (migration 20260713020000), so after the
+    # equality-matched tenant column the planner answers this ordered page with an ordered
+    # Index Scan feeding Limit — NO full Sort, even for a tenant with a large history.
     rows_query =
       base
       |> order_by([j], desc: j.inserted_at, desc: j.id)
