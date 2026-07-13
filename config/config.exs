@@ -424,9 +424,15 @@ config :loopctl, :enable_local_test_runner, false
 # keeps the explicit `where s.tenant_id == ^tenant_id` predicate (belt-and-suspenders)
 # AND relies on RLS enforcement, and fails closed (zero rows) on a missing tenant
 # context. Kept OFF in prod unless the prod `Repo` role is verified to lack BYPASSRLS
-# (AC-33.7.4). A rollback is this config flip alone — no deploy dependency. The
-# blanket reroute of all OLTP through the RLS Repo remains OUT OF SCOPE (a separate
-# future epic); this pilot is its parity + cost evidence base (AC-33.7.6).
+# (AC-33.7.4). The blanket reroute of all OLTP through the RLS Repo remains OUT OF
+# SCOPE (a separate future epic); this pilot is its parity + cost evidence base
+# (AC-33.7.6).
+#
+# This line is the compile-time DEFAULT (dev/test + a safe OFF baseline). In PROD the
+# value is driven at RUNTIME by the `RLS_REROUTE_LIST_STORIES_BY_PROJECT` env var in
+# config/runtime.exs — so flipping it on, or rolling it back, is an env-var change +
+# restart with NO rebuild/redeploy of the release (AC-33.7.5), matching the sibling
+# Epic-33 knobs (HEAVY_READ_STATEMENT_TIMEOUT_MS, POOL_SIZE, SCALE_ALERT_*).
 config :loopctl, :rls_reroute_list_stories_by_project, false
 
 # DI: Article category classifier for the reclassification backfill

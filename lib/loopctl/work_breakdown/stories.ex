@@ -269,6 +269,13 @@ defmodule Loopctl.WorkBreakdown.Stories do
   - `:epic_id` -- filter to a specific epic within the project
   - `:limit` -- max stories to return (default 100, max 500)
   - `:offset` -- how many stories to skip (default 0)
+  - `:strategy` -- read-path selector, `:admin` | `:rls` (US-33.7 pilot). This is a
+    SECURITY-PATH selector: `:admin` reads through the BYPASSRLS `AdminRepo`,
+    `:rls` reads through the RLS `Repo` via `Repo.with_tenant/2`. It exists so the
+    release-gate tests can exercise BOTH paths without `Application.put_env`. When
+    OMITTED (the normal caller contract), the path is resolved from the default-OFF
+    `:rls_reroute_list_stories_by_project` flag at call time — production callers
+    should NOT pass `:strategy` and let the flag decide.
 
   ## Returns
 
@@ -328,23 +335,29 @@ defmodule Loopctl.WorkBreakdown.Stories do
   # primary enforcement (`tenant_id = current_tenant_id()`); the explicit
   # `where s.tenant_id == ^tenant_id` predicate in `project_stories_query/3` is kept
   # as defense-in-depth (mirrors `ContextRetriever.Executor`). Both count and page
-  # run inside ONE tenant-scoped transaction. A DB error fails closed (zero rows).
+  # run inside ONE tenant-scoped transaction.
+  #
+  # DB-error semantics: this fun never calls `Repo.rollback/1`, so `with_tenant/2`
+  # (a `Repo.transaction/1`) always returns `{:ok, {total, stories}}` on the happy
+  # path. A DB error inside `Repo.aggregate/2` or `Repo.all/1` RAISES `Postgrex.Error`,
+  # which rolls back and RE-RAISES out of the transaction — it propagates as a 500,
+  # exactly like the `:admin` path's uncaught `AdminRepo` calls. We deliberately do
+  # NOT swallow that into an empty page: masking a DB failure as "zero rows" would
+  # hide the error and could look like a (wrong) fail-closed. Fail LOUD, at parity
+  # with the AdminRepo path; RLS/tenant fail-closed is handled by the guard clause
+  # above and by RLS itself, not by catching DB errors here.
   defp list_stories_by_project(:rls, tenant_id, project_id, opts, limit, offset) do
     base_query = project_stories_query(tenant_id, project_id, opts)
     page_query = paginate_project_stories(base_query, limit, offset)
 
-    Repo.with_tenant(tenant_id, fn ->
-      total = Repo.aggregate(base_query, :count, :id)
-      stories = Repo.all(page_query)
-      {total, stories}
-    end)
-    |> case do
-      {:ok, {total, stories}} ->
-        {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+    {:ok, {total, stories}} =
+      Repo.with_tenant(tenant_id, fn ->
+        total = Repo.aggregate(base_query, :count, :id)
+        stories = Repo.all(page_query)
+        {total, stories}
+      end)
 
-      {:error, _reason} ->
-        {:ok, %{data: [], total: 0, limit: limit, offset: offset}}
-    end
+    {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
   end
 
   defp project_stories_query(tenant_id, project_id, opts) do

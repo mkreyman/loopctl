@@ -29,6 +29,20 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
   correctness of the RLS path is proven directly. Isolation/fail-closed tests seed
   via `Repo` only (the connection the RLS path reads on) so RLS is actually
   exercised.
+
+  ## Proving RLS *itself* enforces (TC-33.7.5)
+
+  The TC-33.7.1/2/3 reads all flow through `project_stories_query/3`, which ALWAYS
+  includes an explicit `where s.tenant_id == ^tenant_id`. That predicate alone would
+  explain a green isolation result even if RLS were silently a no-op (prod role
+  unexpectedly `BYPASSRLS`, or the `SET LOCAL ROLE` switch removed) — the exact
+  silently-passing failure mode AC-33.7.3 calls out. Likewise the fail-closed guard
+  clause in `Stories` short-circuits BEFORE `with_tenant/2` runs, so TC-33.7.3 proves
+  the APP guard fails closed, not the RLS layer. TC-33.7.5 closes both gaps by reading
+  WITHOUT the explicit tenant predicate: (a) inside `Repo.with_tenant/2` across two
+  tenants' projects, asserting RLS alone returns only the current tenant's rows; and
+  (b) under `SET LOCAL ROLE <rls_role>` with NO `app.current_tenant_id` set, asserting
+  RLS alone fails closed to zero rows. If RLS were a no-op, both tests would fail.
   """
   use Loopctl.DataCase, async: false
 
@@ -244,6 +258,61 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert default_page == explicit_admin_page
       assert default_page.total == 2
       assert Enum.map(default_page.data, & &1.number) == ["1.1", "1.2"]
+    end
+  end
+
+  describe "TC-33.7.5 — RLS itself enforces isolation, independent of the explicit predicate" do
+    test "RLS alone filters cross-tenant rows when the query carries NO tenant predicate" do
+      # Two tenants' rows on the SAME Repo connection the RLS path reads on.
+      {ids_a, _} = seed_tree(Repo, [%{number: "1.1", title: "Alpha only"}])
+      {ids_b, _} = seed_tree(Repo, [%{number: "1.1", title: "Beta only"}])
+
+      # Read under tenant A's RLS context, but with a query that spans BOTH tenants'
+      # projects and includes NO `where s.tenant_id == ...` predicate. The ONLY thing
+      # that can exclude tenant B's row here is RLS itself (SET LOCAL ROLE <rls_role> +
+      # `tenant_id = current_tenant_id()`). If RLS were silently a no-op, BOTH rows
+      # would come back and this test would fail — which is precisely what the parity
+      # suite (which always carries the explicit predicate) cannot detect.
+      assert {:ok, rows} =
+               Repo.with_tenant(ids_a.tenant, fn ->
+                 Repo.all(
+                   from(s in Story,
+                     where: s.project_id in ^[ids_a.project, ids_b.project],
+                     order_by: [asc: s.sort_key]
+                   )
+                 )
+               end)
+
+      # `with_tenant/2`'s SET LOCAL ROLE persists for the rest of the sandbox
+      # transaction; reset to the owner role so DataCase teardown is unaffected.
+      Repo.query!("RESET ROLE")
+
+      assert Enum.map(rows, & &1.title) == ["Alpha only"]
+      assert Enum.all?(rows, &(&1.tenant_id == ids_a.tenant))
+      refute Enum.any?(rows, &(&1.tenant_id == ids_b.tenant))
+    end
+
+    test "RLS alone fails closed to zero rows when no app.current_tenant_id is set" do
+      {ids, _} = seed_tree(Repo, [%{number: "1.1", title: "Present"}])
+
+      rls_role = Application.get_env(:loopctl, :rls_role)
+
+      # Enter the non-owner RLS role but DELIBERATELY do NOT set app.current_tenant_id.
+      # `current_tenant_id()` then returns NULL, so the `tenant_id = current_tenant_id()`
+      # policy matches nothing. The query carries NO tenant predicate, so a zero-row
+      # result proves the RLS LAYER fails closed on missing tenant context — distinct
+      # from the app-layer guard clause in `Stories`, which short-circuits before
+      # `with_tenant/2` and is what TC-33.7.3 exercises. If RLS were a no-op, the seeded
+      # row would leak through here.
+      assert {:ok, rows} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET LOCAL ROLE #{rls_role}", [])
+                 Repo.all(from(s in Story, where: s.project_id == ^ids.project))
+               end)
+
+      Repo.query!("RESET ROLE")
+
+      assert rows == []
     end
   end
 end

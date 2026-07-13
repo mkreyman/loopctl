@@ -187,6 +187,15 @@ if config_env() == :prod do
 
   config :loopctl, :slow_query_threshold_ms, slow_query_threshold_ms
 
+  # US-33.7 — Flag-guarded RLS-Repo reroute pilot (AC-33.7.5). Read at RUNTIME from an
+  # env var so flipping the pilot ON, or rolling it back, is an env-var change + restart
+  # with NO release rebuild/redeploy. Overrides the compile-time OFF default in
+  # config/config.exs. Truthy values: "true" or "1" (anything else, incl. unset, is OFF).
+  # Kept OFF until the prod `Repo` role is verified to lack BYPASSRLS (AC-33.7.4).
+  config :loopctl,
+         :rls_reroute_list_stories_by_project,
+         System.get_env("RLS_REROUTE_LIST_STORIES_BY_PROJECT") in ~w(true 1)
+
   # US-27.15: enable the supervised Prometheus reporter in prod. It binds the
   # INTERNAL `:9568/metrics` port (NEVER the public 8080 http_service) which Fly's
   # managed Prometheus scrapes over the private 6PN network (see the fly.toml
