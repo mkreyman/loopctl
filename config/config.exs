@@ -133,6 +133,13 @@ config :loopctl,
 # 30-60s range the AC specifies); overridable per-env.
 config :loopctl, Loopctl.Auth.ApiKeyCache, ttl_ms: :timer.seconds(60)
 
+# US-33.4: flush interval (ms) for the debounced liveness touch buffer
+# (agents.last_seen_at / api_keys.last_used_at). Per-request touch-writes are
+# collapsed into one batched, monotonic UPDATE per active id every interval, so
+# these liveness heuristics are at most one interval stale (AC-33.4.4). Default a
+# few seconds; overridable per-env.
+config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.seconds(5)
+
 # AdminRepo shares the same database but uses a role with BYPASSRLS in production.
 # In dev/test, it uses the same credentials as Repo.
 config :loopctl, Loopctl.AdminRepo,

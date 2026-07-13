@@ -63,14 +63,6 @@ defmodule Loopctl.Auth.ApiKey do
   end
 
   @doc """
-  Changeset for updating last_used_at timestamp.
-  """
-  @spec touch_changeset(%__MODULE__{}) :: Ecto.Changeset.t()
-  def touch_changeset(api_key) do
-    change(api_key, last_used_at: DateTime.utc_now())
-  end
-
-  @doc """
   Changeset for setting expires_at (used during key rotation).
   """
   @spec expire_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()

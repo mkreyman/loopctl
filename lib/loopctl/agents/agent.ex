@@ -81,14 +81,6 @@ defmodule Loopctl.Agents.Agent do
   end
 
   @doc """
-  Changeset for updating last_seen_at timestamp.
-  """
-  @spec touch_changeset(%__MODULE__{}, DateTime.t()) :: Ecto.Changeset.t()
-  def touch_changeset(agent, now) do
-    change(agent, last_seen_at: now)
-  end
-
-  @doc """
   Returns the list of valid agent types.
   """
   @spec agent_types() :: [atom()]

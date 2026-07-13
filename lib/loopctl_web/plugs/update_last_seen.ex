@@ -1,12 +1,15 @@
 defmodule LoopctlWeb.Plugs.UpdateLastSeen do
   @moduledoc """
-  Updates the `last_seen_at` timestamp for authenticated agents.
+  Records the `last_seen_at` timestamp for authenticated agents.
 
   On every authenticated API call where the API key has an `agent_id`,
-  this plug updates the corresponding agent's `last_seen_at` field.
+  this plug records the corresponding agent's `last_seen_at` touch into the
+  debounced `Loopctl.TouchBuffer` (US-33.4). It performs NO synchronous DB write
+  on the request path — a supervised periodic flusher persists the buffered
+  maxima in a single batched UPDATE. Uses the DI clock for testability.
 
-  The update is best-effort -- failures are logged but do not block
-  the request pipeline. Uses the DI clock for testability.
+  The touch is best-effort -- recording never raises and never blocks the
+  request pipeline.
 
   ## Placement
 
@@ -15,8 +18,6 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeen do
   """
 
   @behaviour Plug
-
-  require Logger
 
   alias Loopctl.Agents
 
@@ -30,15 +31,7 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeen do
       )
       when is_binary(agent_id) and is_binary(tenant_id) do
     now = clock().utc_now()
-
-    case Agents.touch_last_seen(tenant_id, agent_id, now) do
-      {:ok, _agent} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Failed to update last_seen_at for agent #{agent_id}: #{inspect(reason)}")
-    end
-
+    :ok = Agents.touch_last_seen(tenant_id, agent_id, now)
     conn
   end
 

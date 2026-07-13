@@ -50,6 +50,13 @@ defmodule Loopctl.Application do
       # After PubSub + AdminRepo: it subscribes in init and its values preload
       # :tenant (custody_halted_at) for the CheckCustodyHalt plug (US-33.2).
       Loopctl.Auth.ApiKeyCache,
+      # US-33.4: owns the ETS buffer that debounces the two per-request liveness
+      # touch-writes (agents.last_seen_at, api_keys.last_used_at) off the auth
+      # hot path — the request records into ETS and a periodic flusher writes the
+      # buffered maxima in one batched, monotonic UPDATE. After AdminRepo (it
+      # writes via AdminRepo at flush); stable owner survives the request/Task/
+      # Oban process that recorded a touch.
+      Loopctl.TouchBuffer,
       LoopctlWeb.Endpoint
     ]
 

@@ -18,7 +18,8 @@ defmodule Loopctl.Auth do
   1. Hash the provided raw key with SHA-256
   2. Look up by `key_hash`
   3. Reject if revoked or expired
-  4. Update `last_used_at` on success
+  4. Record a debounced `last_used_at` touch on success (US-33.4 — no
+     synchronous write on the request path)
   """
 
   import Ecto.Query
@@ -26,6 +27,7 @@ defmodule Loopctl.Auth do
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.ApiKeyCache
+  alias Loopctl.TouchBuffer
 
   @key_prefix "lc_"
   @random_bytes 30
@@ -89,8 +91,11 @@ defmodule Loopctl.Auth do
   revoke/rotate/mutate writer invalidates the `key_hash` entry in-band, with a
   bounded TTL as the defense-in-depth backstop. See `Loopctl.Auth.ApiKeyCache`.
 
-  The per-request `last_used_at` UPDATE still fires on every request — this
-  story removes ONLY the SELECT (AC-33.3.6; US-33.4 owns debouncing the write).
+  The per-request `last_used_at` UPDATE is debounced off the hot path (US-33.4):
+  `verify_and_touch/2` records the touch into `Loopctl.TouchBuffer` (no
+  synchronous AdminRepo write) and a periodic batched flush advances the row.
+  Combined with the read-through cache (US-33.3), the auth touch path is now net
+  ZERO AdminRepo statements per request.
   """
   @spec verify_api_key(String.t()) :: {:ok, ApiKey.t()} | {:error, :unauthorized}
   def verify_api_key(raw_key) when is_binary(raw_key) do
@@ -148,10 +153,14 @@ defmodule Loopctl.Auth do
     # Constant-time comparison to prevent timing-based side channels.
     # Both sides are SHA-256 hex strings of equal length.
     if Plug.Crypto.secure_compare(api_key.key_hash, key_hash) do
-      case update_last_used(api_key) do
-        {:ok, updated} -> {:ok, updated}
-        _error -> {:ok, api_key}
-      end
+      # US-33.4: the per-request `last_used_at` UPDATE is debounced off the hot
+      # path — record the touch into the batched buffer (no synchronous
+      # AdminRepo write) instead of updating the row here. Reflect `now` on the
+      # in-memory struct for response fidelity (callers/serializers see a fresh
+      # `last_used_at`); the DB row is advanced by the periodic batched flush.
+      now = DateTime.utc_now()
+      TouchBuffer.record_api_key(api_key.id, now)
+      {:ok, %{api_key | last_used_at: now}}
     else
       {:error, :unauthorized}
     end
@@ -323,11 +332,5 @@ defmodule Loopctl.Auth do
   @spec hash_key(String.t()) :: String.t()
   def hash_key(raw_key) do
     :crypto.hash(:sha256, raw_key) |> Base.encode16(case: :lower)
-  end
-
-  defp update_last_used(api_key) do
-    api_key
-    |> ApiKey.touch_changeset()
-    |> AdminRepo.update()
   end
 end
