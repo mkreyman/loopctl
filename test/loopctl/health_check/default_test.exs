@@ -87,4 +87,158 @@ defmodule Loopctl.HealthCheck.DefaultTest do
       assert result.status == baseline.status
     end
   end
+
+  describe "check/0 — Oban orphan backlog readiness signal (US-34.2)" do
+    test "TC-34.2.1: orphan count above threshold degrades checks.oban_orphans, adds reasons.oban_orphans, flips ready, and leaves liveness (status/database/oban) untouched" do
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        {:ok, 0}
+      end)
+
+      assert {:ok, baseline} = Default.check()
+
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        {:ok, 11}
+      end)
+
+      assert {:ok, degraded} = Default.check()
+
+      assert degraded.checks.oban_orphans == "error"
+
+      # Review finding: the exact count/threshold are NOT disclosed in the reason
+      # string — both /health and /health/ready are unauthenticated, so any
+      # internet caller could otherwise read the live stuck-job count and the
+      # configured trip point directly off the response body.
+      assert degraded.reasons == %{
+               oban_orphans: "oban executing-orphan count exceeds configured threshold"
+             }
+
+      assert degraded.ready == false
+
+      # Critical regression guard (AC-34.2.2): a queue backlog must NOT depool a node
+      # from Fly's LB — liveness (`status`) and the database/oban checks are UNCHANGED
+      # by the orphan-count result.
+      assert degraded.status == baseline.status
+      assert degraded.checks.database == baseline.checks.database
+      assert degraded.checks.oban == baseline.checks.oban
+    end
+
+    test "TC-34.2.2: no orphans / below threshold reports checks.oban_orphans = ok, no reasons.oban_orphans key, and ready tracks status" do
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        {:ok, 0}
+      end)
+
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban_orphans == "ok"
+      refute Map.has_key?(result, :reasons)
+      assert result.ready == (result.status == "ok")
+    end
+
+    test "TC-34.2.2b: a count at exactly the threshold does not degrade (only EXCEEDING the threshold does)" do
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        {:ok, 10}
+      end)
+
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban_orphans == "ok"
+      refute Map.has_key?(result, :reasons)
+    end
+
+    test "review finding: `:not_yet_polled` (the brief window before US-34.1's poller has run once) is treated as ok, not degraded" do
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        :not_yet_polled
+      end)
+
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban_orphans == "ok"
+      refute Map.has_key?(result, :reasons)
+    end
+
+    test "AC-34.2.3 defensive rescue (NOT story TC-34.2.3 — see the dedicated check_oban/0 hard-error test below): an orphan-count checker raising degrades cleanly instead of crashing" do
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        {:ok, 0}
+      end)
+
+      assert {:ok, baseline} = Default.check()
+
+      Mox.expect(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+        raise "boom"
+      end)
+
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban_orphans == "error"
+      assert result.ready == false
+      assert result.status == baseline.status
+    end
+
+    test "TC-34.2.3: an unresponsive queue producer is still a hard error (retained behavior) — real Oban.check_queue/1, no DI seam, no mocking" do
+      # check_oban/0 is completely UNCHANGED by this story — it still calls the
+      # real `Oban.check_queue(queue: :default)` with no DI seam. Under this
+      # suite's `testing: :inline` Oban config (config/test.exs) there is no live
+      # queue producer registered, so the real call genuinely returns `nil`
+      # (verified directly: `Oban.check_queue(queue: :default) == nil` here) —
+      # exercising check_oban/0's existing `_ -> {"error"}` hard-error branch for
+      # real, not via a mock. This is the actual "queue-responsive ping still
+      # hard-errors" case the story's TC-34.2.3 asks for.
+      assert Oban.check_queue(queue: :default) == nil
+
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban == "error"
+      assert result.status == "degraded"
+      assert result.ready == false
+    end
+
+    test "TC-34.2.1 (real rows, end-to-end): real orphaned oban_jobs rows counted via the real query (no Mox override) degrade checks.oban_orphans and flip ready" do
+      alias Loopctl.Telemetry.ScaleMetrics
+
+      threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
+      health_threshold = 10
+      now = DateTime.utc_now()
+
+      # 11 real stale `:executing` rows — above both the AGE threshold (marks them as
+      # orphans) and the COUNT threshold (11 > 10) — inserted directly, no mocking.
+      for _ <- 1..(health_threshold + 1) do
+        %Oban.Job{
+          worker: "Loopctl.Workers.IdempotencyCleanupWorker",
+          queue: "default",
+          args: %{},
+          state: "executing",
+          attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
+        }
+        |> Repo.insert!()
+      end
+
+      # A recent executing job is legitimately mid-flight, NOT an orphan — confirms
+      # the real query's age filter, not just its count(*).
+      %Oban.Job{
+        worker: "Loopctl.Workers.IdempotencyCleanupWorker",
+        queue: "default",
+        args: %{},
+        state: "executing",
+        attempted_at: DateTime.add(now, -1, :second)
+      }
+      |> Repo.insert!()
+
+      # No Mox.expect here — `stub_all_defaults/0` (data_case.ex) delegates
+      # `Loopctl.MockObanOrphanCountChecker.cached_executing_orphan_count/0` to a
+      # fresh call to the REAL `ScaleMetrics.count_oban_executing_orphans/0`
+      # (deliberately NOT the `:persistent_term` cache — see the stub's comment),
+      # so `Default.check/0` exercises the full chain: real rows -> real query ->
+      # real count -> ready=false, scoped to this test's own sandboxed transaction.
+      assert {:ok, result} = Default.check()
+
+      assert result.checks.oban_orphans == "error"
+
+      # Review finding: the exact count/threshold are NOT disclosed publicly.
+      assert result.reasons == %{
+               oban_orphans: "oban executing-orphan count exceeds configured threshold"
+             }
+
+      assert result.ready == false
+    end
+  end
 end

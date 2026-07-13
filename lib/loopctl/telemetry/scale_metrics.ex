@@ -347,12 +347,23 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   import Telemetry.Metrics
 
+  @behaviour Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour
+
   require Logger
 
   alias Loopctl.Repo
   alias Loopctl.Tenants
 
   @persistent_term_key {__MODULE__, :tenant_label?}
+
+  # US-34.2 (review finding): the `:persistent_term` slot `poll_oban_executing_orphans/0`
+  # writes on every SUCCESSFUL poll, and `cached_executing_orphan_count/0` reads —
+  # lets `Loopctl.HealthCheck.Default`'s orphan sub-check reuse the last-polled value
+  # instead of issuing its OWN fresh `Repo.transaction` + `SELECT count(*)` on every
+  # `/health`/`/health/ready` hit (the shared `check/0` backs BOTH the continuous,
+  # unauthenticated liveness probe AND readiness — a fresh DB round-trip on every
+  # liveness hit is unwarranted request-amplification pressure on the Ecto pool).
+  @executing_orphan_cache_key {__MODULE__, :cached_executing_orphan_count}
 
   # The fixed sentinel a `tenant_id` label collapses to when the gate is OFF (over the
   # tenant-count cap, or the gate is unseeded). Keeps the tenant label's cardinality at
@@ -989,46 +1000,115 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   @doc """
   Counts `oban_jobs` rows stuck in state `executing` whose `attempted_at` is older
-  than the configured orphan threshold, and emits a single (untagged) telemetry
-  measurement (US-34.1, AC-34.1.2).
+  than the configured orphan AGE threshold (`oban_metrics_orphan_threshold_minutes/0`).
 
-  Same defensive/bounded-interval contract as `poll_oban_queue_state/0` — a single
-  `SET LOCAL statement_timeout`-wrapped `Loopctl.Repo` query (review finding —
-  moved off the tiny `AdminRepo` pool alongside the other poller), catch-all
-  rescue, `Logger.warning` + poll-failure counter + `:ok` on failure, never
-  crashing the shared poller. The age comparison (`attempted_at < now() - N
-  minutes`) is done IN SQL, not in Elixir, so only genuinely stale rows are
-  counted. Always returns `:ok`.
+  Extracted from `poll_oban_executing_orphans/0` (US-34.2, AC-34.2.3) originally so
+  `Loopctl.HealthCheck.Default`'s `check_oban_orphans/0` health sub-check could
+  reuse the EXACT same bounded, tz-correct query rather than duplicating it.
+
+  Post-review (US-34.2, request-amplification finding): the health check no longer
+  calls this directly on every `/health`/`/health/ready` hit — it reads
+  `cached_executing_orphan_count/0`'s `:persistent_term` cache instead (populated
+  by `poll_oban_executing_orphans/0` below, unchanged 10s cadence), so this
+  function's only remaining caller in dev/prod is the poller. It stays public and
+  directly callable (unchanged signature/behavior) because
+  `test/support/data_case.ex`'s default Mox stub for
+  `Loopctl.MockObanOrphanCountChecker.cached_executing_orphan_count/0` deliberately
+  calls THIS fresh-query function rather than the shared `:persistent_term` cache —
+  reading the true global cache from every async `DataCase` test would leak state
+  across concurrently running tests (the cache is one VM-wide slot, not
+  per-sandboxed-transaction); calling this function fresh keeps each test scoped to
+  its own sandboxed connection, exactly like every other health sub-check's default
+  stub.
+
+  Deliberately does NOT rescue here: `poll_oban_executing_orphans/0` keeps its own
+  catch-all rescue around this call (US-34.1 behavior, unchanged). `statement_timeout`
+  (set via `SET LOCAL` below) only bounds the query AFTER a connection is checked
+  out — under pool pressure the checkout wait itself would fall back to the Ecto
+  pool's default (~15s). The `:timeout` option below bounds `Repo.transaction/2`'s
+  checkout-and-run the same way `check_database/0` bounds its own call with an
+  explicit `timeout: 5_000`.
   """
-  @spec poll_oban_executing_orphans() :: :ok
-  def poll_oban_executing_orphans do
+  @spec count_oban_executing_orphans() :: non_neg_integer()
+  def count_oban_executing_orphans do
     timeout_ms = oban_metrics_poll_statement_timeout_ms()
     threshold_minutes = oban_metrics_orphan_threshold_minutes()
 
+    # `:timeout` bounds this transaction's checkout-and-run the same way
+    # `check_database/0` bounds its `SQL.query/4` call with `timeout: 5_000` — see
+    # the moduledoc above. `statement_timeout` (SET LOCAL below) only bounds the
+    # query itself, AFTER a connection is already checked out.
     {:ok, count} =
-      Repo.transaction(fn ->
-        Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
+      Repo.transaction(
+        fn ->
+          Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
 
-        # `attempted_at` is a `timestamp without time zone` column populated by
-        # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
-        # with no tz attached. `now()` is `timestamptz`; comparing it directly
-        # against a naive column implicitly casts `now()` using the CONNECTION's
-        # `TimeZone` GUC (e.g. Fly Postgres defaults can be non-UTC), which skews
-        # the comparison by that offset. `now() AT TIME ZONE 'UTC'` converts to a
-        # naive UTC wall-clock timestamp first, matching what's actually stored.
-        %{rows: [[count]]} =
-          Repo.query!(
-            """
-            SELECT count(*)
-            FROM oban_jobs
-            WHERE state = 'executing'
-              AND attempted_at < (now() AT TIME ZONE 'UTC') - ($1 * interval '1 minute')
-            """,
-            [threshold_minutes]
-          )
+          # `attempted_at` is a `timestamp without time zone` column populated by
+          # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
+          # with no tz attached. `now()` is `timestamptz`; comparing it directly
+          # against a naive column implicitly casts `now()` using the CONNECTION's
+          # `TimeZone` GUC (e.g. Fly Postgres defaults can be non-UTC), which skews
+          # the comparison by that offset. `now() AT TIME ZONE 'UTC'` converts to a
+          # naive UTC wall-clock timestamp first, matching what's actually stored.
+          %{rows: [[count]]} =
+            Repo.query!(
+              """
+              SELECT count(*)
+              FROM oban_jobs
+              WHERE state = 'executing'
+                AND attempted_at < (now() AT TIME ZONE 'UTC') - ($1 * interval '1 minute')
+              """,
+              [threshold_minutes]
+            )
 
-        count
-      end)
+          count
+        end,
+        timeout: 5_000
+      )
+
+    count
+  end
+
+  @doc """
+  Reads the `:executing`-orphan count that `poll_oban_executing_orphans/0` cached
+  in `:persistent_term` on its last SUCCESSFUL poll (US-34.2 review finding).
+
+  `Loopctl.HealthCheck.Default.check_oban_orphans/0` calls this (via the
+  `Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour` DI seam) instead of
+  `count_oban_executing_orphans/0` directly — the health check backs BOTH the
+  continuous, unauthenticated `/health` liveness probe and `/health/ready`, so
+  issuing a fresh `Repo.transaction` + `SELECT count(*)` on every hit is
+  unwarranted request-amplification pressure on the Ecto pool; reading a cache
+  the poller already refreshes every 10s (`telemetry_poller`'s `period: 10_000`)
+  costs a lock-free `:persistent_term.get/2` instead.
+
+  Returns `{:ok, count}` once at least one poll has completed, or
+  `:not_yet_polled` in the brief window between app boot and the poller's first
+  tick — `telemetry_poller`'s `init_delay: 0` schedules that first collection
+  essentially immediately (not after the full 10s period), so this window is
+  sub-second in practice, not a sustained gap.
+
+  Never touches the database itself. A FAILED poll intentionally leaves the
+  prior cached value in place (identical staleness semantics to the
+  `last_value/2` Prometheus gauge this same count also feeds) — the cache is
+  never reset to a false "no orphans" reading just because a poll cycle failed.
+
+  Implements the `Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour` callback.
+  """
+  @impl true
+  @spec cached_executing_orphan_count() :: {:ok, non_neg_integer()} | :not_yet_polled
+  def cached_executing_orphan_count do
+    case :persistent_term.get(@executing_orphan_cache_key, :not_yet_polled) do
+      :not_yet_polled -> :not_yet_polled
+      count when is_integer(count) -> {:ok, count}
+    end
+  end
+
+  @spec poll_oban_executing_orphans() :: :ok
+  def poll_oban_executing_orphans do
+    count = count_oban_executing_orphans()
+
+    :persistent_term.put(@executing_orphan_cache_key, count)
 
     :telemetry.execute([:loopctl, :oban, :jobs, :executing_orphan, :count], %{count: count}, %{})
 
@@ -1037,7 +1117,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     e ->
       Logger.warning(
         "Oban executing-orphan poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
-          "the executing_orphan gauge simply keeps its last-recorded value until the next poll"
+          "the executing_orphan gauge AND the health-check cache simply keep their last-recorded " <>
+          "value until the next successful poll"
       )
 
       emit_oban_poll_error(:executing_orphans, e)

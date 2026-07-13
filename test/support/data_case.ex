@@ -18,6 +18,7 @@ defmodule Loopctl.DataCase do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Telemetry.ScaleAlerts
+  alias Loopctl.Telemetry.ScaleMetrics
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -79,6 +80,19 @@ defmodule Loopctl.DataCase do
     # degraded-branch test overrides this with Mox.expect/3.
     Mox.stub(Loopctl.MockScaleAlertsConfigChecker, :config_status, fn ->
       ScaleAlerts.config_status()
+    end)
+
+    # US-34.2: default delegates to the real count_oban_executing_orphans/0 — a
+    # FRESH, per-call query scoped to THIS test's own sandboxed transaction — so
+    # the healthy path (no orphans present) and end-to-end tests inserting real
+    # `oban_jobs` rows are both exercised unchanged. Deliberately NOT
+    # `ScaleMetrics.cached_executing_orphan_count/0` (what production resolves to
+    # via the real `ScaleMetrics` module): that reads a single VM-wide
+    # `:persistent_term` slot, which is NOT sandboxed per test — stubbing the
+    # default to it would leak orphan counts across concurrently running async
+    # tests. The degraded-branch test overrides this with Mox.expect/3.
+    Mox.stub(Loopctl.MockObanOrphanCountChecker, :cached_executing_orphan_count, fn ->
+      {:ok, ScaleMetrics.count_oban_executing_orphans()}
     end)
 
     Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->
