@@ -43,6 +43,12 @@ defmodule LoopctlWeb.Endpoint do
     only: LoopctlWeb.static_paths(),
     raise_on_missing_only: code_reloading?
 
+  # Tidewave runtime-introspection MCP (dev-only), mounted above code reloading
+  # so its /tidewave/mcp endpoint is available to editor MCP clients in dev.
+  if Mix.env() == :dev do
+    plug Tidewave
+  end
+
   # Code reloading can be explicitly enabled under the
   # :code_reloader configuration of your endpoint.
   if code_reloading? do
