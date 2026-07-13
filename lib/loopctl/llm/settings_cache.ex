@@ -15,11 +15,38 @@ defmodule Loopctl.Llm.SettingsCache do
   ## Design (mirrors `Loopctl.Knowledge.EmbeddingCircuitBreaker` / `ExportConcurrency`)
 
   A single GenServer owns a `:public`, `:named_table`, `read_concurrency: true` ETS
-  table. Callers read/write it DIRECTLY (`fetch/1`, `put/2`, `invalidate/1`) — the
+  table. Callers read/write it DIRECTLY (`fetch/1`, `put/3`, `invalidate/1`) — the
   GenServer is NEVER on the hot path and can't bottleneck provider throughput. It
   exists ONLY to own the table so it survives the transient request/Task/Oban
   process that populated it. No DB access happens in the GenServer, so there is no
   Ecto Sandbox ownership concern in tests.
+
+  ## Never-stale under the read-through repopulation race (AC-32.3.3)
+
+  Plain cache-aside (invalidate-then-repopulate) has a well-known staleness race:
+  a reader can MISS, snapshot the OLD row in its `SELECT`, then a writer commits
+  the NEW row and invalidates (a no-op — the entry is already absent), and only
+  THEN the slow reader `put`s its now-stale struct — which would persist until the
+  next write. That breaks the "NEVER serves stale credentials" invariant right
+  after a key rotation (exactly when the entry is empty and an agent is looping).
+
+  We close it with a per-tenant **generation counter** and optimistic version
+  checking (the classic check-then-act fix — put the authority in one atomic op).
+  Each entry is stamped `{tenant_id, value, generation}` with the generation
+  captured BEFORE the DB read (see `Loopctl.Llm.get_settings/1`). `invalidate/1`
+  atomically BUMPS the tenant's generation (`:ets.update_counter`). `fetch/1` trusts
+  an entry ONLY when its stamp still equals the current generation. Therefore:
+
+    * a reader whose snapshot preceded a committed write captured a generation
+      strictly LESS than the post-invalidate one, so its `put` lands with a stale
+      stamp and is NEVER trusted — the next read simply reloads (no staleness); and
+    * a reader whose capture followed the invalidate necessarily read the committed
+      NEW row, so its stamp equals the current generation and its value is fresh.
+
+  No interleaving yields a trusted-but-stale entry, so no fallback TTL is needed:
+  `invalidate` (the generation bump), not the wall clock, is the authority. The
+  bump is atomic, so the guard needs no serialization through the GenServer — the
+  hot read/write paths stay lock-free.
 
   ## Security (AC-32.3.5)
 
@@ -59,13 +86,23 @@ defmodule Loopctl.Llm.SettingsCache do
 
   Returns `{:ok, value}` on a cache HIT — where `value` is the cached
   `TenantLlmSettings.t()` OR `nil` (negative cache for a tenant with no row) — or
-  `:miss` when there is no entry (caller should load read-through and `put/2`).
+  `:miss` when there is no entry OR the entry is STALE (its stamped generation no
+  longer matches the tenant's current generation — an `invalidate/1` fired after the
+  entry's underlying DB read, so it is rejected rather than served). On a `:miss`
+  the caller loads read-through and `put/3`s under a freshly captured generation.
   """
   @spec fetch(Ecto.UUID.t()) :: {:ok, term()} | :miss
   def fetch(tenant_id) when is_binary(tenant_id) do
     case :ets.lookup(@table, tenant_id) do
-      [{^tenant_id, value}] -> {:ok, value}
-      [] -> :miss
+      [{^tenant_id, value, stamp}] ->
+        # Optimistic version check: trust the entry only if no invalidation has
+        # bumped the generation since the value's DB read (AC-32.3.3). A mismatch
+        # means a concurrent rotation raced this entry's repopulation — treat as a
+        # miss so the caller reloads, never serving the stale struct.
+        if stamp == current_generation(tenant_id), do: {:ok, value}, else: :miss
+
+      [] ->
+        :miss
     end
   rescue
     # The table only vanishes if the owner is (transiently) down mid-restart; a
@@ -74,24 +111,56 @@ defmodule Loopctl.Llm.SettingsCache do
   end
 
   @doc """
-  Stores the resolved settings `value` (a `TenantLlmSettings.t()` or `nil`) for
-  `tenant_id` in ETS. Called from the caller process on a read-through miss.
+  Returns the tenant's current cache generation — capture this BEFORE a read-through
+  DB load and pass it to `put/3`, so a rotation that invalidates during the load is
+  detected and the repopulation rejected at `fetch/1` (never serves stale).
   """
-  @spec put(Ecto.UUID.t(), term()) :: :ok
-  def put(tenant_id, value) when is_binary(tenant_id) do
-    :ets.insert(@table, {tenant_id, value})
+  @spec generation(Ecto.UUID.t()) :: non_neg_integer()
+  def generation(tenant_id) when is_binary(tenant_id) do
+    current_generation(tenant_id)
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc """
+  Stores the resolved settings `value` (a `TenantLlmSettings.t()` or `nil`) for
+  `tenant_id` in ETS, stamped with `read_generation` (the generation captured
+  BEFORE the value's DB read). Called from the caller process on a read-through
+  miss. The entry is only ever SERVED while `read_generation` still matches the
+  tenant's current generation, so a repopulation that raced a concurrent
+  invalidation is silently ignored on the next `fetch/1`.
+  """
+  @spec put(Ecto.UUID.t(), term(), non_neg_integer()) :: :ok
+  def put(tenant_id, value, read_generation)
+      when is_binary(tenant_id) and is_integer(read_generation) do
+    :ets.insert(@table, {tenant_id, value, read_generation})
     :ok
   rescue
     ArgumentError -> :ok
   end
 
   @doc """
-  Invalidates the cached entry for `tenant_id` (delete → next read repopulates
-  read-through). Called from the settings write path within the same call so the
-  next read reflects the change; never serves stale credentials.
+  Convenience `put` that stamps `value` with the tenant's CURRENT generation.
+
+  Prefer `put/3` with a generation captured before the DB read on the read-through
+  path — this arity is for direct/manual population where no concurrent DB snapshot
+  is in flight (e.g. seeding a known-fresh value in tests).
+  """
+  @spec put(Ecto.UUID.t(), term()) :: :ok
+  def put(tenant_id, value) when is_binary(tenant_id) do
+    put(tenant_id, value, generation(tenant_id))
+  end
+
+  @doc """
+  Invalidates the cached entry for `tenant_id`: atomically BUMPS the tenant's
+  generation (so any in-flight read-through that captured the prior generation has
+  its `put` rejected at `fetch/1`), then deletes the entry so the next read
+  repopulates read-through. Called from the settings write path within the same
+  call so the next read reflects the change; never serves stale credentials.
   """
   @spec invalidate(Ecto.UUID.t()) :: :ok
   def invalidate(tenant_id) when is_binary(tenant_id) do
+    bump_generation(tenant_id)
     :ets.delete(@table, tenant_id)
     :ok
   rescue
@@ -108,6 +177,26 @@ defmodule Loopctl.Llm.SettingsCache do
 
   @doc false
   def table_name, do: @table
+
+  # --- Private ---
+
+  # A tenant's generation lives under a distinct `{:gen, tenant_id}` key — a 2-tuple
+  # key that a binary-`tenant_id` `fetch/1` lookup can never match, so it never
+  # collides with a cached-settings entry. Defaults to 0 for a tenant that has never
+  # been invalidated.
+  defp current_generation(tenant_id) do
+    case :ets.lookup(@table, {:gen, tenant_id}) do
+      [{{:gen, ^tenant_id}, gen}] -> gen
+      [] -> 0
+    end
+  end
+
+  # Atomically increment the tenant's generation (creating it at 1 on first bump).
+  # `:ets.update_counter/4` is lock-free and serializes concurrent invalidations, so
+  # the generation is a monotonic authority no reader can observe half-applied.
+  defp bump_generation(tenant_id) do
+    :ets.update_counter(@table, {:gen, tenant_id}, {2, 1}, {{:gen, tenant_id}, 0})
+  end
 
   # --- Server callbacks ---
 

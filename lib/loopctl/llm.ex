@@ -85,6 +85,11 @@ defmodule Loopctl.Llm do
   Cloak decrypt into a per-change one. On a miss it loads from the DB, caches, and
   returns; `upsert_settings/2` invalidates the entry so a read never serves stale
   credentials. Signature and return shape are unchanged.
+
+  The cache generation is captured BEFORE the DB load and passed to `put/3`, so a
+  concurrent rotation that invalidates during the load bumps the generation and the
+  (now-possibly-stale) repopulation is rejected at the next `fetch/1` — closing the
+  read-through repopulation race (AC-32.3.3, never serve stale).
   """
   @spec get_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
   def get_settings(tenant_id) when is_binary(tenant_id) do
@@ -93,8 +98,9 @@ defmodule Loopctl.Llm do
         value
 
       :miss ->
+        generation = SettingsCache.generation(tenant_id)
         settings = load_settings(tenant_id)
-        SettingsCache.put(tenant_id, settings)
+        SettingsCache.put(tenant_id, settings, generation)
         settings
     end
   end
