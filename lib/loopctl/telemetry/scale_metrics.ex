@@ -258,14 +258,23 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
     18. **Oban queue/state gauge** (US-34.1, AC-34.1.1) —
         `loopctl.oban.jobs.count`, a `last_value/2` GAUGE keyed by `[:state, :queue]`
-        — BOTH bounded, fixed sets (Oban's 7-value state enum; the 9 queues declared
-        in `config :loopctl, Oban, queues: [...]`) — NEVER tenant/args-derived.
+        — BOTH bounded, fixed sets (`Oban.Job.states/0`'s 8-value state enum; the 9
+        queues declared in `config :loopctl, Oban, queues: [...]`, resolved at call
+        time via `Application.get_env/2`) — NEVER tenant/args-derived.
         `poll_oban_queue_state/0` runs
-        `SELECT state, queue, count(*) FROM oban_jobs GROUP BY state, queue` and emits
-        one `[:loopctl, :oban, :jobs, :count]` measurement per row, so `last_value`
-        records/overwrites one series per `{state, queue}` pair every poll (a drained
-        combination simply keeps its last-seen value, e.g. 0, rather than vanishing —
-        the correct gauge semantics for "how many jobs are in this state right now").
+        `SELECT state, queue, count(*) FROM oban_jobs GROUP BY state, queue`, then
+        ZERO-FILLS: it emits one `[:loopctl, :oban, :jobs, :count]` measurement for
+        EVERY `{state, queue}` pair in the full 8x9 matrix, substituting `count: 0`
+        for any pair the `GROUP BY` did not return a row for (a `count(*) GROUP BY`
+        can only ever return rows with count >= 1, so the zero case is never present
+        in `rows` — it must be synthesized). A drained combination is therefore
+        explicitly reset to `0` every poll cycle rather than retaining a stale
+        last-seen value — the correct gauge semantics for "how many jobs are in this
+        state right now" (a `last_value/2` gauge itself has no expiry; without this
+        zero-fill a drained `{state, queue}` pair would read stale-high forever). The
+        one exception is a poll that FAILS outright (DB fault, `rescue`d below): no
+        measurement fires that cycle, so the gauge intentionally keeps its prior
+        reading until the next successful poll — there is no fresher truth to report.
     19. **`:executing`-older-than-N-min orphan gauge** (US-34.1, AC-34.1.2) —
         `loopctl.oban.jobs.executing_orphan.count`, an UNTAGGED `last_value/2` gauge.
         `poll_oban_executing_orphans/0` counts `oban_jobs` rows in state `executing`
@@ -532,11 +541,13 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       # 18. Oban queue/state gauge (US-34.1, AC-34.1.1). `poll_oban_queue_state/0` (a
       #     periodic measurement wired into
       #     `LoopctlWeb.Telemetry.periodic_measurements/0`) runs a single
-      #     `GROUP BY state, queue` poll against the GLOBAL `oban_jobs` table and emits
-      #     one measurement per row. `last_value/2` is a Prometheus GAUGE — every poll
-      #     records/overwrites the series for that `{state, queue}` pair, so a drained
-      #     combination keeps its last-seen value (e.g. 0) instead of vanishing. Both
-      #     tags are BOUNDED, FIXED sets (Oban's 7-value state enum; the 9 configured
+      #     `GROUP BY state, queue` poll against the GLOBAL `oban_jobs` table, then
+      #     ZERO-FILLS the full state x queue matrix (emitting `count: 0` for any pair
+      #     the GROUP BY didn't return) before emitting. `last_value/2` is a
+      #     Prometheus GAUGE — every poll records/overwrites the series for that
+      #     `{state, queue}` pair, so a drained combination is explicitly reset to `0`
+      #     instead of retaining a stale non-zero reading. Both tags are BOUNDED,
+      #     FIXED sets (`Oban.Job.states/0`'s 8-value state enum; the 9 configured
       #     queues) — NEVER tenant/args-derived (AC-34.1.5).
       last_value("loopctl.oban.jobs.count",
         event_name: [:loopctl, :oban, :jobs, :count],
@@ -746,8 +757,36 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   end
 
   @doc """
-  Polls `oban_jobs` for per-`{state, queue}` counts and emits one telemetry
-  measurement per row (US-34.1, AC-34.1.1).
+  The fixed, bounded set of Oban job states (`Oban.Job.states/0` — 8 values),
+  used to zero-fill the per-`{state, queue}` gauge every poll cycle so a drained
+  combination reports `0` instead of a `last_value/2` gauge retaining a stale
+  non-zero reading forever (US-34.1, AC-34.1.1).
+  """
+  @spec oban_states() :: [atom()]
+  def oban_states, do: Oban.Job.states()
+
+  @doc """
+  The fixed, bounded set of configured Oban queue names, resolved at CALL time
+  via `Application.get_env/2` (never `Application.compile_env/2` — queue WIDTHS
+  are env-tunable at runtime per `Loopctl.ObanConfig`/`config/runtime.exs`, but
+  the set of queue NAMES itself is static across every environment). Used
+  together with `oban_states/0` to zero-fill the per-`{state, queue}` gauge —
+  this also structurally bounds the `:queue` label to the configured set, so an
+  unconfigured/ad-hoc queue name can never appear as a Prometheus series
+  (US-34.1, AC-34.1.1/.5).
+  """
+  @spec oban_queues() :: [atom()]
+  def oban_queues do
+    :loopctl
+    |> Application.get_env(Oban, [])
+    |> Keyword.get(:queues, [])
+    |> Keyword.keys()
+  end
+
+  @doc """
+  Polls `oban_jobs` for per-`{state, queue}` counts and emits one ZERO-FILLED
+  telemetry measurement for every pair in the full `oban_states/0` x
+  `oban_queues/0` matrix (US-34.1, AC-34.1.1).
 
   This is a `telemetry_poller` periodic measurement (wired in
   `LoopctlWeb.Telemetry.periodic_measurements/0`, the SAME shared process that
@@ -761,12 +800,24 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   #{@default_oban_metrics_poll_timeout_ms}ms) so a slow poll can never itself
   saturate the pool (AC-34.1.3).
 
+  A `GROUP BY count(*)` can only ever return rows with count >= 1 — it never
+  returns a row for a `{state, queue}` pair with zero jobs. So the returned rows
+  are folded into a lookup map, then EVERY pair in `oban_states/0` x
+  `oban_queues/0` is emitted, substituting `count: 0` for any pair absent from
+  that lookup. Without this, a `last_value/2` gauge (which has no expiry — it
+  just overwrites its ETS entry, `TelemetryMetricsPrometheus.Core.LastValue`)
+  would retain a drained pair's last non-zero reading forever, indistinguishable
+  from a genuinely-stuck backlog.
+
   Defensive: narrowly rescues ONLY the known DB-fault classes (`Postgrex.Error`,
   `DBConnection.ConnectionError`, `DBConnection.OwnershipError` — the same set
   `refresh_tenant_label_gate/0` rescues), logs a warning, and returns `:ok` without
   emitting any telemetry — `telemetry_poller` does NOT isolate measurements from
   each other, so an uncaught raise here would crash the shared poller (TC-34.1.3).
-  Always returns `:ok`.
+  On a FAILED poll (as opposed to a successful poll that finds zero rows), no
+  zero-fill happens either — the gauge intentionally keeps its last-recorded
+  value until the next successful poll, since a failed query has no fresher
+  truth to report. Always returns `:ok`.
   """
   @spec poll_oban_queue_state() :: :ok
   def poll_oban_queue_state do
@@ -782,12 +833,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         rows
       end)
 
-    Enum.each(rows, fn [state, queue, count] ->
+    counts = Map.new(rows, fn [state, queue, count] -> {{state, queue}, count} end)
+
+    for state <- oban_states(), queue <- oban_queues() do
+      state_str = Atom.to_string(state)
+      queue_str = Atom.to_string(queue)
+      count = Map.get(counts, {state_str, queue_str}, 0)
+
       :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: count}, %{
-        state: state,
-        queue: queue
+        state: state_str,
+        queue: queue_str
       })
-    end)
+    end
 
     :ok
   rescue

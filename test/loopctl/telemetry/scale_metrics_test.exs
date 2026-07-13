@@ -833,6 +833,28 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert ScaleMetrics.oban_metrics_orphan_threshold_minutes() == 45
     end
 
+    test "oban_states/0 returns Oban.Job.states/0's full 8-value enum (review finding: was documented as 7)" do
+      assert ScaleMetrics.oban_states() == Oban.Job.states()
+      assert length(ScaleMetrics.oban_states()) == 8
+    end
+
+    test "oban_queues/0 returns the configured queue names, resolved at call time" do
+      configured =
+        :loopctl
+        |> Application.get_env(Oban, [])
+        |> Keyword.get(:queues, [])
+        |> Keyword.keys()
+
+      assert ScaleMetrics.oban_queues() == configured
+      assert length(ScaleMetrics.oban_queues()) == 9
+    end
+
+    # The DB-backed zero-fill / drain-to-zero behavior of poll_oban_queue_state/0
+    # itself is covered in oban_metrics_poller_test.exs (TC-34.1.1b/c), which uses
+    # `Loopctl.DataCase` for AdminRepo sandbox isolation — this file is
+    # intentionally pure/no-DB (see moduledoc), so it only covers the fixed
+    # matrix inputs (`oban_states/0`/`oban_queues/0`) here.
+
     test "the reporter round-trip: both gauges record and scrape end to end" do
       reporter_name = :"scale_metrics_oban_gauges_test_#{System.unique_integer([:positive])}"
 

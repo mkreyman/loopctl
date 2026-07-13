@@ -6,6 +6,16 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
 
     * TC-34.1.1 — rows in a couple of states (`available`, `completed`) → the
       per-{state, queue} telemetry measurement reflects the actual counts.
+    * TC-34.1.1b — zero-fill: a `{state, queue}` pair with NO rows still emits an
+      explicit `count: 0` measurement every poll (review finding fix — a
+      `last_value/2` gauge has no expiry, so without an explicit zero-fill a
+      drained pair would read stale-high forever).
+    * TC-34.1.1c — drain-to-zero: a pair that HAD jobs, then drains to none,
+      reads `0` on the very next poll rather than retaining the prior non-zero
+      reading.
+    * TC-34.1.1d — the `:queue` label is structurally bounded to
+      `ScaleMetrics.oban_queues/0` (the configured set) — a job in an
+      unconfigured/ad-hoc queue name never produces a Prometheus series.
     * TC-34.1.2 — one stale `executing` row (attempted_at older than the orphan
       threshold) + one recent `executing` row → the orphan gauge counts ONLY the
       stale one.
@@ -18,6 +28,15 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   Rows are inserted through `AdminRepo` too, on the SAME sandboxed connection/
   transaction the pollers query — the standard cross-repo-visibility fix already
   used by `knowledge_ingestion_controller_test.exs`'s tenant-isolation tests.
+
+  Tests use a REAL configured queue name (from `ScaleMetrics.oban_queues/0`)
+  rather than an ad-hoc `"test_queue_N"` string: `poll_oban_queue_state/0` now
+  zero-fills and emits ONLY the fixed `oban_states/0` x `oban_queues/0` matrix,
+  so an unconfigured queue name would never produce ANY measurement (by design —
+  AC-34.1.5). Sandbox isolation (each async test owns its own transaction/
+  connection) is what actually prevents cross-test interference, not the queue
+  name — the old per-test-unique name was defensive belt-and-suspenders, not a
+  correctness requirement.
 
   `async: false`: the executing_orphan gauge is UNTAGGED (a single global telemetry
   channel + Prometheus series), and `:telemetry.attach/4` registers by EVENT NAME
@@ -34,10 +53,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     test "emits a telemetry measurement per {state, queue} reflecting actual oban_jobs counts" do
       test_pid = self()
       handler_id = "test-oban-queue-state-#{System.unique_integer([:positive])}"
-      # A per-test unique queue name disambiguates this test's rows/measurements
-      # from any other test's concurrent poll (belt-and-suspenders on top of
-      # async: false above).
-      queue = "test_queue_#{System.unique_integer([:positive])}"
+      queue = configured_queue()
 
       :telemetry.attach(
         handler_id,
@@ -59,6 +75,106 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       assert_receive {:oban_queue_state, %{state: "available", queue: ^queue}, %{count: 2}}, 1000
       assert_receive {:oban_queue_state, %{state: "completed", queue: ^queue}, %{count: 1}}, 1000
     end
+
+    test "zero-fills: a {state, queue} pair with no rows still emits count: 0 (TC-34.1.1b)" do
+      test_pid = self()
+      handler_id = "test-oban-zero-fill-#{System.unique_integer([:positive])}"
+      [queue_a, queue_b | _] = ScaleMetrics.oban_queues() |> Enum.map(&Atom.to_string/1)
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :jobs, :count],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:oban_queue_state, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # Only ONE row exists at all: {available, queue_a}. Every other pair in the
+      # matrix — including {available, queue_b} and {completed, queue_a} — has NO
+      # backing row, so the GROUP BY never returns them, yet the poller must still
+      # emit an explicit count: 0 for each (the fix under test).
+      insert_job(state: "available", queue: queue_a)
+
+      assert ScaleMetrics.poll_oban_queue_state() == :ok
+
+      assert_receive {:oban_queue_state, %{state: "available", queue: ^queue_a}, %{count: 1}},
+                     1000
+
+      assert_receive {:oban_queue_state, %{state: "available", queue: ^queue_b}, %{count: 0}},
+                     1000
+
+      assert_receive {:oban_queue_state, %{state: "completed", queue: ^queue_a}, %{count: 0}},
+                     1000
+    end
+
+    test "drain-to-zero: a pair that held jobs reads 0 on the next poll once drained (TC-34.1.1c)" do
+      test_pid = self()
+      handler_id = "test-oban-drain-#{System.unique_integer([:positive])}"
+      queue = configured_queue()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :jobs, :count],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:oban_queue_state, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      %{id: job_id} = insert_job(state: "available", queue: queue)
+
+      assert ScaleMetrics.poll_oban_queue_state() == :ok
+
+      assert_receive {:oban_queue_state, %{state: "available", queue: ^queue}, %{count: 1}}, 1000
+
+      # Drain the queue entirely (simulates Oban completing/removing the job).
+      AdminRepo.delete_all(from(j in Oban.Job, where: j.id == ^job_id))
+
+      assert ScaleMetrics.poll_oban_queue_state() == :ok
+
+      # Without the zero-fill fix, `last_value/2` would retain the stale count: 1
+      # forever since no row (not even a zero row) is ever emitted for a drained
+      # pair by a bare GROUP BY count(*).
+      assert_receive {:oban_queue_state, %{state: "available", queue: ^queue}, %{count: 0}}, 1000
+    end
+
+    test "the :queue label is bounded to the configured set — an ad-hoc queue name never emits (TC-34.1.1d)" do
+      test_pid = self()
+      handler_id = "test-oban-unconfigured-queue-#{System.unique_integer([:positive])}"
+      ad_hoc_queue = "totally_unconfigured_queue_#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :jobs, :count],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:oban_queue_state, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      insert_job(state: "available", queue: ad_hoc_queue)
+
+      assert ScaleMetrics.poll_oban_queue_state() == :ok
+
+      refute_receive {:oban_queue_state, %{queue: ^ad_hoc_queue}, _measurements}, 500
+    end
+  end
+
+  # A real, currently-configured Oban queue name (from `ScaleMetrics.oban_queues/0`)
+  # — asserted to actually be a member so a future queue-list change fails this
+  # helper loudly instead of silently testing a stale/removed queue.
+  defp configured_queue do
+    queues = ScaleMetrics.oban_queues() |> Enum.map(&Atom.to_string/1)
+    queue = "analytics"
+    assert queue in queues
+    queue
   end
 
   describe "poll_oban_executing_orphans/0 (AC-34.1.2, TC-34.1.2)" do

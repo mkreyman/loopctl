@@ -143,7 +143,11 @@ defmodule LoopctlWeb.Telemetry do
     ]
   end
 
-  defp periodic_measurements do
+  # Public (mirrors `metrics/0` above) so the wiring itself is testable — a test
+  # asserts the two US-34.1 Oban poller MFAs are present here, closing the gap
+  # where the metric DEFINITIONS and poller FUNCTIONS were each tested in
+  # isolation but nothing asserted either was actually wired into the 10s tick.
+  def periodic_measurements do
     # NOTE: `telemetry_poller` runs every measurement in its OWN process and does NOT
     # isolate them — an uncaught raise in any measurement crashes the shared poller (and
     # with it the gate refresh). So EVERY measurement added here MUST be self-rescuing.
