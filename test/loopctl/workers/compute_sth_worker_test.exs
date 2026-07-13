@@ -29,8 +29,12 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
   end
 
   # Mirrors the jitter derivation in ComputeSthWorker (AC-32.5.2): bounded,
-  # deterministic-per-tenant, independent of the unique dedup key.
-  defp expected_jitter(tenant_id), do: rem(:erlang.phash2(tenant_id), 56)
+  # deterministic-per-tenant, independent of the unique dedup key. The window
+  # itself is pulled from `ComputeSthWorker.jitter_window_seconds/0` (the
+  # implementation's single source of truth) so this can never silently drift
+  # from `@jitter_window_seconds` if the window is retuned.
+  defp expected_jitter(tenant_id),
+    do: rem(:erlang.phash2(tenant_id), ComputeSthWorker.jitter_window_seconds())
 
   describe "perform/1 with mode: all_tenants" do
     test "TC-32.5.1: one job per active tenant via batch, each within the jitter window" do
@@ -58,19 +62,26 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
       assert Enum.sort(enqueued_tenant_ids) == Enum.sort([active_1.id, active_2.id, active_3.id])
       refute inactive.id in enqueued_tenant_ids
 
+      max_jitter = ComputeSthWorker.jitter_window_seconds() - 1
+
       for job <- tenant_jobs do
         tenant_id = job.args["tenant_id"]
         diff = DateTime.diff(job.scheduled_at, now)
         expected = expected_jitter(tenant_id)
 
-        assert diff in 0..55
         # `scheduled_at` is computed from `utc_now()` at build time (after
         # `now` was captured above), and DateTime.diff truncates to whole
         # seconds -- so diff normally equals `expected` but can be
-        # `expected + 1` if wall-clock time crosses a second boundary
-        # between capturing `now` and building the job. Tolerate that one
-        # second of build-time elapsed rather than asserting exact equality.
+        # `expected + 1` if wall-clock time crosses a second boundary between
+        # capturing `now` and building the job. A single hard bound tolerates
+        # that one second of build-time elapsed while still enforcing
+        # AC-32.5.2's [0, max_jitter] production bound: at `expected ==
+        # max_jitter` the tolerated `expected + 1` is `max_jitter + 1`, so the
+        # hard bound must extend one second past `max_jitter` too (previously
+        # two separate assertions contradicted each other exactly at that
+        # boundary).
         assert diff in expected..(expected + 1)
+        assert diff in 0..(max_jitter + 1)
       end
     end
 

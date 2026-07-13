@@ -56,7 +56,16 @@ defmodule Loopctl.Workers.ComputeSthWorker do
     |> Enum.map(fn tenant_id ->
       __MODULE__.new(%{"tenant_id" => tenant_id}, schedule_in: jitter(tenant_id))
     end)
-    |> Oban.insert_all()
+    # US-32.5 review fix: `Oban.insert_all/1` -> `Repo.insert_all/3` with NO
+    # internal chunking (Oban.Engines.Basic.insert_all_jobs/3). Job.to_map/1
+    # emits ~10 non-nil columns per job, so one un-chunked INSERT hits
+    # Postgres's 65535 bind-parameter limit around ~6.5k active tenants,
+    # failing the ENTIRE fanout (zero STHs computed for any tenant that
+    # minute) instead of degrading gracefully. Chunking collapses N tenants
+    # to ceil(N/5000) round-trips -- still far fewer than the old one-insert-
+    # per-tenant loop -- while removing the crash ceiling entirely.
+    |> Enum.chunk_every(5_000)
+    |> Enum.each(&Oban.insert_all/1)
 
     :ok
   end
@@ -82,6 +91,13 @@ defmodule Loopctl.Workers.ComputeSthWorker do
       :ok
     end
   end
+
+  @doc """
+  The jitter window (seconds) used by `jitter/1`, exposed so callers (and
+  tests) have a single source of truth instead of mirroring the private
+  `@jitter_window_seconds` module attribute.
+  """
+  def jitter_window_seconds, do: @jitter_window_seconds
 
   # US-32.5 (AC-32.5.2): bounded, deterministic-per-tenant jitter in
   # [0, @jitter_window_seconds - 1] seconds. Deliberately NOT `:rand` at the
