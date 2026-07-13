@@ -26,10 +26,13 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   consuming them, so the signal terminated in a no-op handler-less event — invisible
   to Prometheus/dashboards despite already being emitted. See "Wiring emitted-but-dead
   events (US-34.4)" below for the full inventory, including the events deliberately
-  left OUT of scope with a cited reason. `scale_metrics/0` now returns 17 metrics
-  total.
+  left OUT of scope with a cited reason. US-34.1 adds TWO more, purely-additive
+  gauges: a periodic per-{state, queue} poll of `oban_jobs` (nothing previously
+  exported ANY Oban queue/state metric) and an `:executing`-older-than-N-min orphan
+  gauge — see "Oban queue/state gauges + `:executing` orphan gauge (US-34.1)" below.
+  `scale_metrics/0` now returns 19 metrics total.
 
-  ## The metrics (17 total)
+  ## The metrics (19 total)
 
     1. **Timeout / DB-error counter** — `loopctl.db.error.count`, keyed by
        `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`). `mapped_code`
@@ -225,12 +228,58 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       truncation volume is expected to correlate with the already-instrumented
       `loopctl.knowledge.vector_search.under_fill.count`/hybrid-provenance
       signals rather than needing its own series.
+
+  ## Oban queue/state gauges + `:executing` orphan gauge (US-34.1)
+
+  Before this story NOTHING exported any `oban_jobs` state metric — the exact blind
+  spot that let 110 jobs sit stuck `:executing` for days (2026-06-22 → 2026-07-10)
+  before anyone noticed (the incident that motivated adding `Oban.Plugins.Lifeline`,
+  see `config/config.exs`). `oban_jobs` is a GLOBAL table — it has NO `tenant_id`
+  column (only `args` carries one, per-job, inside a JSON blob) — so this is
+  infrastructure observability, not tenant-scoped data.
+
+  Two periodic pollers (wired into `LoopctlWeb.Telemetry.periodic_measurements/0`,
+  the SAME shared `telemetry_poller` process that already refreshes the tenant-label
+  gate every 10s) run a single lightweight raw-SQL query each against `Loopctl.AdminRepo`
+  (never `Loopctl.HeavyRead`, which structurally REJECTS any query whose base table
+  lacks a `tenant_id` Ecto field — `oban_jobs` is not even an Ecto-queryable schema
+  here, it's raw SQL, following the `Loopctl.IndexHealth` precedent). Each poll wraps
+  its query in an `AdminRepo.transaction/1` that first issues a per-query
+  `SET LOCAL statement_timeout` (config `:oban_metrics_poll_statement_timeout_ms`,
+  default #{2_000}ms) — NEVER a connection-startup `:parameters` override, which
+  Fly MPG's pgbouncer rejects with `FATAL 08P01` (the US-27.13 outage class). Both
+  pollers are defensive: `poll_oban_queue_state/0` and
+  `poll_oban_executing_orphans/0` each narrowly rescue ONLY the known DB-fault
+  classes (`Postgrex.Error`, `DBConnection.ConnectionError`,
+  `DBConnection.OwnershipError` — the same set `refresh_tenant_label_gate/0`
+  rescues), `Logger.warning` and return `:ok` — `telemetry_poller` runs every
+  measurement in ONE shared process and does NOT isolate them, so an uncaught raise
+  here would crash the poller and, with it, the tenant-label gate refresh (TC-34.1.3).
+
+    18. **Oban queue/state gauge** (US-34.1, AC-34.1.1) —
+        `loopctl.oban.jobs.count`, a `last_value/2` GAUGE keyed by `[:state, :queue]`
+        — BOTH bounded, fixed sets (Oban's 7-value state enum; the 9 queues declared
+        in `config :loopctl, Oban, queues: [...]`) — NEVER tenant/args-derived.
+        `poll_oban_queue_state/0` runs
+        `SELECT state, queue, count(*) FROM oban_jobs GROUP BY state, queue` and emits
+        one `[:loopctl, :oban, :jobs, :count]` measurement per row, so `last_value`
+        records/overwrites one series per `{state, queue}` pair every poll (a drained
+        combination simply keeps its last-seen value, e.g. 0, rather than vanishing —
+        the correct gauge semantics for "how many jobs are in this state right now").
+    19. **`:executing`-older-than-N-min orphan gauge** (US-34.1, AC-34.1.2) —
+        `loopctl.oban.jobs.executing_orphan.count`, an UNTAGGED `last_value/2` gauge.
+        `poll_oban_executing_orphans/0` counts `oban_jobs` rows in state `executing`
+        whose `attempted_at` is older than `:oban_metrics_orphan_threshold_minutes`
+        (default #{45} minutes — deliberately ABOVE the Lifeline `rescue_after` window,
+        30 min, so a non-zero reading means Lifeline is falling behind or a job is
+        genuinely wedged past Lifeline's own rescue point, not merely mid-flight).
   """
 
   import Telemetry.Metrics
 
   require Logger
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Tenants
 
   @persistent_term_key {__MODULE__, :tenant_label?}
@@ -242,12 +291,26 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   @default_tenant_label_cap 1_000
 
+  # US-34.1: per-query SET LOCAL statement_timeout for the two Oban pollers below —
+  # short and bounded (AC-34.1.3), so a slow poll can never itself saturate the
+  # AdminRepo pool. Configurable via :oban_metrics_poll_statement_timeout_ms.
+  @default_oban_metrics_poll_timeout_ms 2_000
+
+  # US-34.1: the `:executing` orphan gauge's age threshold (minutes). Deliberately
+  # ABOVE the Lifeline `rescue_after` window (30 min, config/config.exs) so a
+  # non-zero reading means Lifeline is genuinely falling behind or a job is wedged
+  # past Lifeline's own rescue point — not merely a job that is still mid-flight.
+  # Configurable via :oban_metrics_orphan_threshold_minutes.
+  @default_oban_metrics_orphan_threshold_minutes 45
+
   @doc """
-  All 17 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  All 19 scale metrics: the original US-27.15 trio, #297's semantic-fallback
   counter, US-31.2's hybrid-provenance counter, US-33.1's two per-pool checkout
-  `queue_time` distributions, and US-34.4's ten emitted-but-dead-event counters
+  `queue_time` distributions, US-34.4's ten emitted-but-dead-event counters
   (LLM/embedding-blocked, index-health, secrets/witness/memory-promotion
-  degradation signals). Appended to `LoopctlWeb.Telemetry.metrics/0`.
+  degradation signals), and US-34.1's two Oban queue/state gauges (per-{state,
+  queue} counts + the `:executing` orphan gauge). Appended to
+  `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
@@ -464,6 +527,37 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         description:
           "Memory-promotion enqueues refused for hitting the tenant compiles/hour budget.",
         tags: []
+      ),
+
+      # 18. Oban queue/state gauge (US-34.1, AC-34.1.1). `poll_oban_queue_state/0` (a
+      #     periodic measurement wired into
+      #     `LoopctlWeb.Telemetry.periodic_measurements/0`) runs a single
+      #     `GROUP BY state, queue` poll against the GLOBAL `oban_jobs` table and emits
+      #     one measurement per row. `last_value/2` is a Prometheus GAUGE — every poll
+      #     records/overwrites the series for that `{state, queue}` pair, so a drained
+      #     combination keeps its last-seen value (e.g. 0) instead of vanishing. Both
+      #     tags are BOUNDED, FIXED sets (Oban's 7-value state enum; the 9 configured
+      #     queues) — NEVER tenant/args-derived (AC-34.1.5).
+      last_value("loopctl.oban.jobs.count",
+        event_name: [:loopctl, :oban, :jobs, :count],
+        measurement: :count,
+        description: "Oban job counts by state and queue (periodic GROUP BY poll).",
+        tags: [:state, :queue],
+        tag_values: &oban_queue_state_tags/1
+      ),
+
+      # 19. Oban `:executing`-older-than-N-min orphan gauge (US-34.1, AC-34.1.2).
+      #     `poll_oban_executing_orphans/0` counts jobs stuck in `executing` whose
+      #     `attempted_at` is older than the configured threshold (default ABOVE the
+      #     Lifeline `rescue_after` window) — the signal that Lifeline is falling
+      #     behind or a job is genuinely wedged (the 110-orphan / 17-day stall that
+      #     motivated adding Lifeline in the first place). UNTAGGED — a single global
+      #     count, never tenant-scoped.
+      last_value("loopctl.oban.jobs.executing_orphan.count",
+        event_name: [:loopctl, :oban, :jobs, :executing_orphan, :count],
+        measurement: :count,
+        description: "Oban jobs stuck in :executing older than the orphan threshold.",
+        tags: []
       )
     ]
   end
@@ -635,6 +729,158 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @spec memory_promotion_failed_tags(map()) :: map()
   def memory_promotion_failed_tags(metadata) do
     %{stage: Map.get(metadata, :stage) || "unknown"}
+  end
+
+  @doc """
+  `tag_values` for the Oban queue/state gauge (US-34.1). Both `state` and `queue`
+  are bounded, fixed sets sourced directly from the poller's GROUP BY row — NEVER
+  derived from job `args`/tenant. Defaults a missing key to `"unknown"` so this can
+  never raise even when invoked directly with a partial map.
+  """
+  @spec oban_queue_state_tags(map()) :: map()
+  def oban_queue_state_tags(metadata) do
+    %{
+      state: Map.get(metadata, :state, "unknown"),
+      queue: Map.get(metadata, :queue, "unknown")
+    }
+  end
+
+  @doc """
+  Polls `oban_jobs` for per-`{state, queue}` counts and emits one telemetry
+  measurement per row (US-34.1, AC-34.1.1).
+
+  This is a `telemetry_poller` periodic measurement (wired in
+  `LoopctlWeb.Telemetry.periodic_measurements/0`, the SAME shared process that
+  refreshes the tenant-label gate every 10s). It runs a SINGLE lightweight
+  `SELECT state, queue, count(*) FROM oban_jobs GROUP BY state, queue` against
+  `Loopctl.AdminRepo` (raw SQL — `oban_jobs` is a GLOBAL table with no `tenant_id`
+  column, so `Loopctl.HeavyRead` would structurally reject it; follows the
+  `Loopctl.IndexHealth` raw-SQL-on-AdminRepo precedent), wrapped in a transaction
+  that first issues a per-query `SET LOCAL statement_timeout`
+  (`:oban_metrics_poll_statement_timeout_ms`, default
+  #{@default_oban_metrics_poll_timeout_ms}ms) so a slow poll can never itself
+  saturate the pool (AC-34.1.3).
+
+  Defensive: narrowly rescues ONLY the known DB-fault classes (`Postgrex.Error`,
+  `DBConnection.ConnectionError`, `DBConnection.OwnershipError` — the same set
+  `refresh_tenant_label_gate/0` rescues), logs a warning, and returns `:ok` without
+  emitting any telemetry — `telemetry_poller` does NOT isolate measurements from
+  each other, so an uncaught raise here would crash the shared poller (TC-34.1.3).
+  Always returns `:ok`.
+  """
+  @spec poll_oban_queue_state() :: :ok
+  def poll_oban_queue_state do
+    timeout_ms = oban_metrics_poll_statement_timeout_ms()
+
+    {:ok, rows} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
+
+        %{rows: rows} =
+          AdminRepo.query!("SELECT state, queue, count(*) FROM oban_jobs GROUP BY state, queue")
+
+        rows
+      end)
+
+    Enum.each(rows, fn [state, queue, count] ->
+      :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: count}, %{
+        state: state,
+        queue: queue
+      })
+    end)
+
+    :ok
+  rescue
+    e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+      Logger.warning(
+        "Oban queue/state poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
+          "the oban.jobs.count gauge simply keeps its last-recorded value until the next poll"
+      )
+
+      :ok
+  end
+
+  @doc """
+  Counts `oban_jobs` rows stuck in state `executing` whose `attempted_at` is older
+  than the configured orphan threshold, and emits a single (untagged) telemetry
+  measurement (US-34.1, AC-34.1.2).
+
+  Same defensive/bounded-interval contract as `poll_oban_queue_state/0` — a single
+  `SET LOCAL statement_timeout`-wrapped `AdminRepo` query, narrowly rescued on DB
+  faults, `Logger.warning` + `:ok` on failure, never crashing the shared poller
+  (TC-34.1.3). The age comparison (`attempted_at < now() - N minutes`) is done IN
+  SQL, not in Elixir, so only genuinely stale rows are counted. Always returns `:ok`.
+  """
+  @spec poll_oban_executing_orphans() :: :ok
+  def poll_oban_executing_orphans do
+    timeout_ms = oban_metrics_poll_statement_timeout_ms()
+    threshold_minutes = oban_metrics_orphan_threshold_minutes()
+
+    {:ok, count} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
+
+        # `attempted_at` is a `timestamp without time zone` column populated by
+        # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
+        # with no tz attached. `now()` is `timestamptz`; comparing it directly
+        # against a naive column implicitly casts `now()` using the CONNECTION's
+        # `TimeZone` GUC (e.g. Fly Postgres defaults can be non-UTC), which skews
+        # the comparison by that offset. `now() AT TIME ZONE 'UTC'` converts to a
+        # naive UTC wall-clock timestamp first, matching what's actually stored.
+        %{rows: [[count]]} =
+          AdminRepo.query!(
+            """
+            SELECT count(*)
+            FROM oban_jobs
+            WHERE state = 'executing'
+              AND attempted_at < (now() AT TIME ZONE 'UTC') - ($1 * interval '1 minute')
+            """,
+            [threshold_minutes]
+          )
+
+        count
+      end)
+
+    :telemetry.execute([:loopctl, :oban, :jobs, :executing_orphan, :count], %{count: count}, %{})
+
+    :ok
+  rescue
+    e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+      Logger.warning(
+        "Oban executing-orphan poll failed (#{inspect(e.__struct__)}); skipping this cycle — " <>
+          "the executing_orphan gauge simply keeps its last-recorded value until the next poll"
+      )
+
+      :ok
+  end
+
+  @doc """
+  The configured per-poll `SET LOCAL statement_timeout` (ms) for the two Oban
+  pollers above (`:oban_metrics_poll_statement_timeout_ms`, default
+  #{@default_oban_metrics_poll_timeout_ms}).
+  """
+  @spec oban_metrics_poll_statement_timeout_ms() :: pos_integer()
+  def oban_metrics_poll_statement_timeout_ms do
+    Application.get_env(
+      :loopctl,
+      :oban_metrics_poll_statement_timeout_ms,
+      @default_oban_metrics_poll_timeout_ms
+    )
+  end
+
+  @doc """
+  The configured `:executing`-orphan age threshold, in minutes
+  (`:oban_metrics_orphan_threshold_minutes`, default
+  #{@default_oban_metrics_orphan_threshold_minutes} — above the Lifeline
+  `rescue_after` window).
+  """
+  @spec oban_metrics_orphan_threshold_minutes() :: pos_integer()
+  def oban_metrics_orphan_threshold_minutes do
+    Application.get_env(
+      :loopctl,
+      :oban_metrics_orphan_threshold_minutes,
+      @default_oban_metrics_orphan_threshold_minutes
+    )
   end
 
   # The cap gate read on the hot path: a lock-free O(1) persistent_term lookup,

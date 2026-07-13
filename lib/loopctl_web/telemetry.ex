@@ -153,7 +153,17 @@ defmodule LoopctlWeb.Telemetry do
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
       # path needs no DB hit. This is the ONLY DB read in the gating mechanism.
-      {ScaleMetrics, :refresh_tenant_label_gate, []}
+      {ScaleMetrics, :refresh_tenant_label_gate, []},
+
+      # US-34.1 (AC-34.1.1/.3): per-{state, queue} poll of the GLOBAL `oban_jobs`
+      # table, feeding the `loopctl.oban.jobs.count` gauge. Self-rescuing (narrow
+      # DB-fault classes only) per the note above.
+      {ScaleMetrics, :poll_oban_queue_state, []},
+
+      # US-34.1 (AC-34.1.2/.3): the `:executing`-older-than-N-min orphan poll,
+      # feeding the `loopctl.oban.jobs.executing_orphan.count` gauge. Same
+      # self-rescuing contract.
+      {ScaleMetrics, :poll_oban_executing_orphans, []}
     ]
   end
 end

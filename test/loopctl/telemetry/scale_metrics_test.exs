@@ -60,7 +60,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.memory_promotion.failed.count",
     "loopctl.memory_promotion.degraded.count",
     "loopctl.memory_promotion.quota_exceeded.count",
-    "loopctl.memory_promotion.budget_exceeded.count"
+    "loopctl.memory_promotion.budget_exceeded.count",
+    "loopctl.oban.jobs.count",
+    "loopctl.oban.jobs.executing_orphan.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -91,7 +93,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :purpose,
                   :state,
                   :op,
-                  :stage
+                  :stage,
+                  :state,
+                  :queue
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -782,6 +786,84 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert scrape =~ ~s(loopctl_memory_promotion_quota_exceeded_count 1)
       assert scrape =~ ~s(loopctl_memory_promotion_budget_exceeded_count 1)
 
+      assert Process.alive?(pid)
+    end
+  end
+
+  describe "Oban queue/state + executing_orphan gauges (US-34.1, AC-34.1.1/.2/.5)" do
+    test "loopctl.oban.jobs.count is a last_value GAUGE tagged by state and queue ONLY" do
+      gauge = metric("loopctl.oban.jobs.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :jobs, :count]
+      assert MapSet.new(gauge.tags) == MapSet.new([:state, :queue])
+      refute :tenant_id in gauge.tags
+    end
+
+    test "loopctl.oban.jobs.executing_orphan.count is a last_value GAUGE, UNTAGGED" do
+      gauge = metric("loopctl.oban.jobs.executing_orphan.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :jobs, :executing_orphan, :count]
+      assert gauge.tags == []
+    end
+
+    test "oban_queue_state_tags/1 passes through present state/queue, defaults missing to \"unknown\"" do
+      assert ScaleMetrics.oban_queue_state_tags(%{state: "available", queue: "default"}) == %{
+               state: "available",
+               queue: "default"
+             }
+
+      assert ScaleMetrics.oban_queue_state_tags(%{}) == %{state: "unknown", queue: "unknown"}
+    end
+
+    test "oban_queue_state_tags/1 never tags tenant_id even if one leaks into metadata" do
+      tags =
+        ScaleMetrics.oban_queue_state_tags(%{
+          state: "executing",
+          queue: "webhooks",
+          tenant_id: "t-1"
+        })
+
+      refute Map.has_key?(tags, :tenant_id)
+    end
+
+    test "poller config accessors default to the documented bounded values" do
+      assert ScaleMetrics.oban_metrics_poll_statement_timeout_ms() == 2_000
+      assert ScaleMetrics.oban_metrics_orphan_threshold_minutes() == 45
+    end
+
+    test "the reporter round-trip: both gauges record and scrape end to end" do
+      reporter_name = :"scale_metrics_oban_gauges_test_#{System.unique_integer([:positive])}"
+
+      metrics = [
+        metric("loopctl.oban.jobs.count"),
+        metric("loopctl.oban.jobs.executing_orphan.count")
+      ]
+
+      pid =
+        start_supervised!(
+          {TelemetryMetricsPrometheus.Core,
+           [metrics: metrics, name: reporter_name, start_async: false]}
+        )
+
+      :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: 3}, %{
+        state: "available",
+        queue: "default"
+      })
+
+      :telemetry.execute(
+        [:loopctl, :oban, :jobs, :executing_orphan, :count],
+        %{count: 1},
+        %{}
+      )
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter_name)
+
+      # TelemetryMetricsPrometheus renders tags in ALPHABETICAL order, not
+      # declaration order — `queue` before `state`.
+      assert scrape =~ ~s(loopctl_oban_jobs_count{queue="default",state="available"} 3)
+      assert scrape =~ ~s(loopctl_oban_jobs_executing_orphan_count 1)
       assert Process.alive?(pid)
     end
   end
