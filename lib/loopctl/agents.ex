@@ -146,29 +146,28 @@ defmodule Loopctl.Agents do
   end
 
   @doc """
-  Updates the `last_seen_at` timestamp for an agent.
+  Records a debounced `last_seen_at` touch for an agent (US-33.4).
 
-  This is a best-effort operation -- failures are logged but do not
-  propagate to the caller. Used by the UpdateLastSeen plug.
+  This no longer performs a synchronous DB write on the request path. It records
+  `now` into `Loopctl.TouchBuffer` (an in-memory ETS buffer, no `AdminRepo`
+  SELECT and no UPDATE); a supervised periodic flusher writes the buffered maxima
+  in one batched, monotonic `UPDATE`. `last_seen_at` is a liveness heuristic, so
+  bounded staleness (at most one flush interval) is acceptable. Best-effort — it
+  never raises and never blocks the request. Used by the `UpdateLastSeen` plug.
+
+  `tenant_id` is accepted for the caller's convenience but is not needed for
+  scoping: `agent_id` is a globally-unique UUID, so the flush's `WHERE id = ...`
+  is self-scoping (no cross-tenant write is possible).
 
   ## Parameters
 
-  - `tenant_id` -- the tenant UUID
+  - `tenant_id` -- the tenant UUID (unused; agent_id is globally unique)
   - `agent_id` -- the agent UUID
   - `now` -- the current timestamp
   """
-  @spec touch_last_seen(Ecto.UUID.t(), Ecto.UUID.t(), DateTime.t()) ::
-          {:ok, Agent.t()} | {:error, term()}
-  def touch_last_seen(tenant_id, agent_id, now) do
-    case AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id) do
-      nil ->
-        {:error, :not_found}
-
-      agent ->
-        agent
-        |> Agent.touch_changeset(now)
-        |> AdminRepo.update()
-    end
+  @spec touch_last_seen(Ecto.UUID.t(), Ecto.UUID.t(), DateTime.t()) :: :ok
+  def touch_last_seen(_tenant_id, agent_id, %DateTime{} = now) do
+    Loopctl.TouchBuffer.record_agent(agent_id, now)
   end
 
   @allowed_sort_fields ~w(name agent_type status last_seen_at inserted_at)

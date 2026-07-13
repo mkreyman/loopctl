@@ -13,9 +13,9 @@ defmodule Loopctl.Auth.ApiKeyCache do
   that revokes/rotates/mutates a key invalidates the entry so the next request
   re-loads read-through.
 
-  This module removes ONLY the SELECT. The per-request `last_used_at` UPDATE
-  (`Loopctl.Auth` `update_last_used/1`) is untouched and still fires on every
-  request — US-33.4 owns debouncing that write (AC-33.3.6).
+  This module removes the per-request SELECT. The per-request `last_used_at`
+  UPDATE is debounced off the hot path by `Loopctl.TouchBuffer` (US-33.4), so
+  together the auth touch path is now net ZERO AdminRepo statements per request.
 
   ## Security — a stale cache must NEVER authenticate a revoked/rotated key
 

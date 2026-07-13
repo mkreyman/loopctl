@@ -4,16 +4,23 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeenTest do
   setup :verify_on_exit!
 
   alias Loopctl.Agents
+  alias Loopctl.TouchBuffer
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
   describe "UpdateLastSeen plug" do
-    test "updates last_seen_at for agent-role API key with agent_id", %{conn: conn} do
+    test "records last_seen_at into the buffer with no synchronous DB write (US-33.4)",
+         %{conn: conn} do
       tenant = fixture(:tenant)
       agent = fixture(:agent, %{tenant_id: tenant.id, name: "seen-agent"})
       initial_last_seen = agent.last_seen_at
+
+      # The real request path (record_agent) writes the process-wide singleton
+      # buffer; drop this agent's entry on exit so the shared singleton does not
+      # accumulate stale keys across the async suite.
+      on_exit(fn -> :ets.delete(TouchBuffer.table_name(), {:agent, agent.id}) end)
 
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
@@ -31,9 +38,17 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeenTest do
 
       assert json_response(conn, 200)
 
-      # Verify last_seen_at was updated to a newer timestamp
-      {:ok, updated} = Agents.get_agent(tenant.id, agent.id)
-      assert DateTime.compare(updated.last_seen_at, initial_last_seen) in [:gt, :eq]
+      # AC-33.4.2: the request path performs NO synchronous last_seen_at UPDATE —
+      # the DB row is unchanged from registration until a flush.
+      {:ok, unchanged} = Agents.get_agent(tenant.id, agent.id)
+      assert DateTime.compare(unchanged.last_seen_at, initial_last_seen) == :eq
+
+      # AC-33.4.1: the touch was recorded into the in-memory buffer (a pending ts
+      # >= registration time) instead.
+      assert {:ok, %DateTime{} = pending} =
+               TouchBuffer.peek(TouchBuffer.table_name(), {:agent, agent.id})
+
+      assert DateTime.compare(pending, initial_last_seen) in [:gt, :eq]
     end
 
     test "does not update for API key without agent_id", %{conn: conn} do

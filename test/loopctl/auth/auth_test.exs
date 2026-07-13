@@ -5,6 +5,7 @@ defmodule Loopctl.AuthTest do
 
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.TouchBuffer
 
   describe "generate_api_key/1" do
     test "generates API key with raw key and persisted record" do
@@ -77,6 +78,43 @@ defmodule Loopctl.AuthTest do
       assert verified.tenant.id == tenant.id
       # last_used_at should be set on verification
       assert %DateTime{} = verified.last_used_at
+    end
+
+    # TC-33.4.1 / AC-33.4.2 for the auth path: verify_api_key debounces the
+    # last_used_at touch — it records into the batched TouchBuffer and performs
+    # NO synchronous UPDATE, so the persisted row is unchanged until a flush.
+    # The in-memory struct still reflects `now` for response fidelity.
+    test "debounces last_used_at: records into buffer, no synchronous DB write (AC-33.4.2)" do
+      tenant = fixture(:tenant)
+
+      {:ok, {raw_key, original}} =
+        Auth.generate_api_key(%{
+          tenant_id: tenant.id,
+          name: "touch-debounce-test",
+          role: :user
+        })
+
+      # Clean the shared app-tree singleton buffer for this key on exit (the real
+      # verify_and_touch write site records into the process-wide singleton).
+      on_exit(fn ->
+        :ets.delete(TouchBuffer.table_name(), {:api_key, original.id})
+      end)
+
+      # Pre-request persisted value (whatever generate_api_key left it as).
+      {:ok, before} = Auth.get_api_key(tenant.id, original.id)
+
+      assert {:ok, %ApiKey{} = verified} = Auth.verify_api_key(raw_key)
+
+      # Response fidelity: the returned struct reflects a fresh last_used_at...
+      assert %DateTime{} = verified.last_used_at
+
+      # AC-33.4.2: ...but the DB row is UNCHANGED — no synchronous UPDATE.
+      {:ok, reloaded} = Auth.get_api_key(tenant.id, original.id)
+      assert reloaded.last_used_at == before.last_used_at
+
+      # AC-33.4.1: the touch was recorded into the batched buffer instead.
+      assert {:ok, %DateTime{}} =
+               TouchBuffer.peek(TouchBuffer.table_name(), {:api_key, original.id})
     end
 
     test "rejects revoked key" do

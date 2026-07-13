@@ -166,18 +166,31 @@ defmodule Loopctl.AgentsTest do
   end
 
   describe "touch_last_seen/3" do
-    test "updates last_seen_at timestamp" do
+    test "records the touch into the debounced buffer (no synchronous DB write, US-33.4)" do
       tenant = fixture(:tenant)
       agent = fixture(:agent, %{tenant_id: tenant.id})
+      initial = agent.last_seen_at
       now = DateTime.utc_now()
 
-      assert {:ok, updated} = Agents.touch_last_seen(tenant.id, agent.id, now)
-      assert updated.last_seen_at != nil
-    end
+      # touch_last_seen records into the process-wide singleton buffer; drop this
+      # agent's entry on exit so the shared singleton does not accumulate stale
+      # keys across the async suite.
+      on_exit(fn ->
+        :ets.delete(Loopctl.TouchBuffer.table_name(), {:agent, agent.id})
+      end)
 
-    test "returns not_found for nonexistent agent" do
-      tenant = fixture(:tenant)
-      assert {:error, :not_found} = Agents.touch_last_seen(tenant.id, uuid(), DateTime.utc_now())
+      # Records into the buffer and returns :ok (no AdminRepo SELECT/UPDATE).
+      assert :ok = Agents.touch_last_seen(tenant.id, agent.id, now)
+
+      # The buffer holds the pending timestamp...
+      assert {:ok, %DateTime{} = pending} =
+               Loopctl.TouchBuffer.peek(Loopctl.TouchBuffer.table_name(), {:agent, agent.id})
+
+      assert DateTime.compare(pending, now) == :eq
+
+      # ...and the DB row is unchanged until a flush (bounded-staleness heuristic).
+      {:ok, unchanged} = Agents.get_agent(tenant.id, agent.id)
+      assert DateTime.compare(unchanged.last_seen_at, initial) == :eq
     end
   end
 

@@ -52,6 +52,14 @@ config :loopctl, Loopctl.HeavyReadRepo,
 # tests stay sub-second.
 config :loopctl, :heavy_read_statement_timeout_ms, 250
 
+# US-33.4: set the touch-buffer flush interval very high in tests so the
+# app-tree singleton NEVER auto-flushes during a run — its timer would fire in
+# the GenServer process without a checked-out sandbox connection and could drain
+# other async tests' buffered entries. Tests drive an isolated per-test buffer
+# instance and flush it explicitly in-process (which owns the sandbox
+# connection); integration tests assert on the buffer contents directly.
+config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.hours(1)
+
 # Keep the L3 local test runner DISABLED in tests (it clones repos + runs
 # `mix test` on untrusted code). TestRunner's tests exercise the disabled path
 # and the validation-rejection paths WITHOUT ever cloning a real repo; input
