@@ -178,6 +178,40 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   @spec webhook_url() :: String.t() | nil
   def webhook_url, do: Application.get_env(:loopctl, :scale_alert_webhook_url)
 
+  @doc """
+  Pure config-guard (US-32.4): validates that a webhook URL is configured whenever
+  scale alerts are enabled. A misconfigured deploy (`scale_alerts_enabled: true` with no
+  `SCALE_ALERT_WEBHOOK_URL`) silently disables the firing path — the breach is only
+  logged, never delivered — so an operator believes alerting is on when it is not. This
+  function is the pure guard surfaced by `Loopctl.HealthCheck.Default` so a misconfigured
+  deploy fails its health check (readiness-flag approach, NOT a boot-raise: raising in
+  `runtime.exs` could take a live fleet down on a bad deploy; a degraded health check
+  fails the deploy's smoke/health gate without killing running nodes).
+
+  Takes config as ARGS (not read internally) so it is unit-testable without
+  `Application.put_env`. Blank (empty/whitespace-only) URLs are treated as unset. The
+  error reason names the env var only — never a URL value (no secret is logged).
+  """
+  @spec config_status(boolean(), String.t() | nil) :: :ok | {:error, String.t()}
+  def config_status(false, _url), do: :ok
+
+  def config_status(true, url) do
+    if blank?(url) do
+      {:error, "scale alerts enabled but SCALE_ALERT_WEBHOOK_URL is not set"}
+    else
+      :ok
+    end
+  end
+
+  @doc "Zero-arg convenience: `config_status/2` fed from the live app env."
+  @spec config_status() :: :ok | {:error, String.t()}
+  def config_status do
+    config_status(Application.get_env(:loopctl, :scale_alerts_enabled, false), webhook_url())
+  end
+
+  defp blank?(nil), do: true
+  defp blank?(url) when is_binary(url), do: String.trim(url) == ""
+
   # The webhook delivery client — the SAME DI key the webhook worker uses, so the test
   # mock applies. Operator/system-scoped: only the DeliveryBehaviour POST is reused, NOT
   # the tenant-scoped EventGenerator.
