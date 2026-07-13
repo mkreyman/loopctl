@@ -18,7 +18,7 @@
   "acceptance_criteria": [
     { "id": "AC-32.5.1", "description": "The all_tenants branch builds one list of `ComputeSthWorker.new(%{\"tenant_id\" => id}, schedule_in: jitter)` changesets and enqueues them via a single `Oban.insert_all/1` (or `Oban.insert_all/2`), replacing the per-tenant `Oban.insert/1` loop.", "status": "pending" },
     { "id": "AC-32.5.2", "description": "Each per-tenant job gets a bounded, deterministic-per-run jitter `schedule_in` in [0, 55] seconds (stay within the 1-minute cadence) derived per index/tenant so the jobs spread across the minute rather than all at :00. No use of :rand at module level that would break Oban unique/dedup.", "status": "pending" },
-    { "id": "AC-32.5.3", "description": "Behavior parity: still enqueues exactly one job per ACTIVE tenant (status == :active), and the per-tenant branch (sth_needed? / sign_and_store_tree_head) is UNCHANGED. If Oban unique options are present, insert_all respects them (no duplicate storms).", "status": "pending" },
+    { "id": "AC-32.5.3", "description": "Behavior parity: still enqueues exactly one job per ACTIVE tenant (status == :active), and the per-tenant branch (sth_needed? / sign_and_store_tree_head) is UNCHANGED. CORRECTION (post-implementation review): on the Basic Oban engine (what this app runs), `Oban.insert_all/1` does NOT honor `unique` options -- only the Smart Engine (Oban Pro) does. This worker's `unique: [fields: [:worker, :args], period: 30]` is therefore inert on the fanout path; duplicate-per-tenant enqueues are prevented from causing duplicate STHs by `AuditChain.sth_needed?/1`'s idempotency, not by Oban uniqueness. Do not treat the original 'no duplicate storms via unique' clause as satisfied.", "status": "pending" },
     { "id": "AC-32.5.4", "description": "Empty tenant list is handled (insert_all of [] is a no-op, returns :ok, no crash).", "status": "pending" }
   ],
   "test_cases": [
@@ -38,7 +38,7 @@
   "technical_notes": [
     "Oban.insert_all takes a list of Oban.Job changesets (Worker.new/2); build them with schedule_in: seconds.",
     "Jitter without Math.random at compile time: derive from rem(:erlang.phash2(tenant_id), 56) or the enumeration index — stable within a run, spreads across the minute, and won't interfere with Oban :unique keys.",
-    "Preserve any existing unique/replace options on ComputeSthWorker.new; if the worker is @unique, insert_all still honors it.",
+    "Preserve any existing unique/replace options on ComputeSthWorker.new for single-job inserts. CORRECTION (post-implementation review): this claim ('if the worker is @unique, insert_all still honors it') is FALSE on the Basic engine -- Oban.insert_all/1 only honors `unique` on the Smart Engine (Oban Pro); verified against Oban 2.21.1 / Oban.Engines.Basic in this app. Duplicate-per-tenant jobs from the fanout are made harmless by AuditChain.sth_needed?/1's idempotency, not by `unique`.",
     "This is a fanout-only change; do NOT touch AuditChain.sth_needed?/sign_and_store_tree_head (incremental Merkle is Epic 3).",
     "Oban testing: config/test.exs uses testing: :inline — assert enqueued jobs with Oban.Testing helpers (all_enqueued/assert_enqueued) rather than relying on execution timing."
   ],
