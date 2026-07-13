@@ -27,6 +27,27 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # CONCURRENTLY cannot run inside a transaction. Purely additive — safe on the live prod
   # DB. Does NOT touch RLS, ownership, or the existing (tenant_id, expires_at) index
   # (other per-tenant lookups still use it).
+  # VERIFICATION (AC-32.1.2) — EXPLAIN of the worker's exact predicate
+  # (`WHERE revoked_at IS NULL AND expires_at < now()`) uses this partial index,
+  # not a Seq Scan. Two captures:
+  #
+  #   * Empty table, planner forced to reveal usability (`SET LOCAL
+  #     enable_seqscan = off`) — the deterministic form asserted by the ExUnit
+  #     guard `RevokeExpiredDispatchesWorkerTest`:
+  #
+  #       Index Scan using dispatches_expires_at_active_index on dispatches d0
+  #         Index Cond: (expires_at < now())
+  #
+  #   * ~20k seeded rows (small selective expired set), DEFAULT planner
+  #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale:
+  #
+  #       Index Scan using dispatches_expires_at_active_index on dispatches d
+  #         (cost=0.29..16.72 rows=86 width=32)
+  #         Index Cond: (expires_at < now())
+  #
+  # On a near-empty dev/test table the DEFAULT planner correctly prefers a Seq
+  # Scan (fewer pages than an index descent); the index's value is realized as
+  # the table grows, which the seeded capture above confirms.
   @disable_ddl_transaction true
   @disable_migration_lock true
 

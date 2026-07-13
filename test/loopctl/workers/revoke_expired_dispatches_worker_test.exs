@@ -4,11 +4,16 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   "revoke expired dispatches" Oban sweep.
 
   US-32.1 adds ONLY a partial index (`dispatches (expires_at) WHERE
-  revoked_at IS NULL`) matching the sweep's predicate. Index USAGE is a planner
-  concern (verified out-of-band with EXPLAIN), so the ExUnit guard asserts the
-  worker's OBSERVABLE behavior is unchanged: it revokes exactly the expired,
-  non-revoked dispatches (and cascades to their api_keys), leaves active and
-  already-revoked rows untouched, and does so cross-tenant by design.
+  revoked_at IS NULL`) matching the sweep's predicate. Two guards cover it:
+
+    * behavior parity — the worker revokes exactly the expired, non-revoked
+      dispatches (and cascades to their api_keys), leaves active and
+      already-revoked rows untouched, and does so cross-tenant by design;
+    * index usage (AC-32.1.2) — `EXPLAIN` of the worker's exact predicate plans
+      as an Index Scan on the new partial index, never a Seq Scan. Index choice
+      is a planner concern (cost-based, sensitive to table size), so this guard
+      makes the assertion deterministic at any scale rather than relying on
+      out-of-band evidence — see the describe block below for the how/why.
 
   Dispatches are created through the real `Loopctl.Dispatches.create_dispatch/3`
   API (which mints + links a real api_key) so the cascade parity is exercised,
@@ -22,6 +27,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   import Ecto.Query
   import Loopctl.Fixtures
 
+  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches
@@ -101,6 +107,48 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
 
       reloaded = AdminRepo.get!(Dispatch, dispatch.id)
       assert DateTime.compare(reloaded.revoked_at, earlier_revoked_at) == :eq
+    end
+  end
+
+  describe "partial index dispatches_expires_at_active_index (AC-32.1.2)" do
+    test "the sweep's predicate plans as an Index Scan on the partial index, never a Seq Scan" do
+      # Mirror the worker's EXACT sweep predicate (RevokeExpiredDispatchesWorker.perform/1):
+      #   from(d in Dispatch, where: is_nil(d.revoked_at) and d.expires_at < ^now, ...)
+      # so this EXPLAIN exercises the identical query shape that runs every 60s.
+      now = DateTime.utc_now()
+
+      query =
+        from(d in Dispatch,
+          where: is_nil(d.revoked_at) and d.expires_at < ^now,
+          select: %{id: d.id, api_key_id: d.api_key_id}
+        )
+
+      # The test dispatches table is ~empty, so the DEFAULT planner correctly prefers
+      # a Seq Scan (scanning a handful of pages beats an index descent) — a naturally
+      # chosen Index Scan is only observable at scale. What AC-32.1.2 actually asserts
+      # is that the index MATCHES the predicate and is USABLE by the planner; we prove
+      # that deterministically at any table size by disabling seq scans for this
+      # transaction and confirming the only remaining plan is an index scan on our
+      # partial index (with the expected `expires_at <` Index Cond). Verified out of
+      # band that at ~20k rows the DEFAULT planner picks this same index unprompted
+      # (Index Scan, rows~86) — captured in the migration's verification note.
+      #
+      # `SET LOCAL` + the EXPLAIN must run on the SAME pinned connection, so both
+      # go inside one `Repo.transaction`. `Ecto.Adapters.SQL.explain/3` checks out
+      # its OWN connection and would miss the `SET LOCAL`, so we render the worker's
+      # query to SQL and EXPLAIN it directly on this connection instead.
+      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
+
+      {:ok, plan} =
+        AdminRepo.transaction(fn ->
+          AdminRepo.query!("SET LOCAL enable_seqscan = off")
+          %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
+          Enum.map_join(rows, "\n", fn [line] -> line end)
+        end)
+
+      assert plan =~ "Index Scan using dispatches_expires_at_active_index"
+      assert plan =~ "Index Cond: (expires_at <"
+      refute plan =~ "Seq Scan"
     end
   end
 end
