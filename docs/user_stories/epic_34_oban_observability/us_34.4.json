@@ -1,0 +1,47 @@
+{
+  "id": "US-34.4",
+  "title": "Wire emitted-but-dead telemetry events into exported metrics",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Several degradation signals are already emitted but terminate in no-ops — free observability that's currently thrown away.",
+  "background": {
+    "reference": "GH #349. Emitted-but-unconsumed telemetry: [:loopctl, :llm, :blocked] (llm.ex:264), [:loopctl, :embedding, :skipped_no_key] (article_embedding_worker.ex:144, memory_embedding_worker.ex:132), [:loopctl, :index_health, :invalid] (index_health.ex:103), plus [:loopctl, :secrets, :orphan_cleanup_failed], [:loopctl, :witness, :divergence]/:bootstrap_already_consumed, [:loopctl, :knowledge, :keyset_byte_truncated], [:loopctl, :memory_promotion, *] (promotion_telemetry.ex:48).",
+    "includes": "The producers already fire these events at the right moments; no metric or handler consumes them, so provider blocks, missing-key embedding skips, invalid HNSW indexes, and witness divergences are invisible to monitoring."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "export the already-emitted degradation telemetry events as Prometheus counters with bounded tags",
+    "so_that": "provider blocks, embedding skips, invalid indexes, and witness/secrets anomalies show up on dashboards instead of being silently dropped"
+  },
+  "rationale": "These events are the cheapest possible observability — the instrumentation already exists at the exact right code sites; only the metric definition is missing. Wiring them into ScaleMetrics.metrics/0 turns latent, discarded signals into live counters, and feeds US-34.3's provider-error alert.",
+  "acceptance_criteria": [
+    { "id": "AC-34.4.1", "description": "ScaleMetrics/metrics defines counters for at least: [:loopctl, :llm, :blocked], [:loopctl, :embedding, :skipped_no_key], [:loopctl, :index_health, :invalid]. Each is exported to Prometheus with BOUNDED tags (a small fixed label set — e.g. provider or reason — NEVER tenant_id/args/free-text).", "status": "pending" },
+    { "id": "AC-34.4.2", "description": "The additional dead events ([:loopctl, :secrets, :orphan_cleanup_failed], [:loopctl, :witness, :divergence]/:bootstrap_already_consumed, [:loopctl, :knowledge, :keyset_byte_truncated], [:loopctl, :memory_promotion, *]) are either wired similarly OR explicitly listed as out-of-scope with a reason (no silent omission).", "status": "pending" },
+    { "id": "AC-34.4.3", "description": "The [:loopctl, :llm, :blocked] (and any provider-error) counter is shaped so US-34.3's provider-error-rate alert can consume it without double-counting; coordinate the event/metric contract between the two stories.", "status": "pending" },
+    { "id": "AC-34.4.4", "description": "Purely additive; no producer code changes except (if needed) adding a bounded metadata tag to an emit site. A cardinality test asserts tags are bounded.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.4.1", "name": "llm.blocked increments a counter", "type": "unit",
+      "preconditions": ["metric attached"],
+      "steps": ["execute :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{provider: \"anthropic\"})"],
+      "expected_results": ["counter defined in metrics/0; handler runs without error; bounded tags"], "status": "pending" },
+    { "id": "TC-34.4.2", "name": "embedding.skipped_no_key + index_health.invalid counters exist", "type": "unit",
+      "preconditions": [],
+      "steps": ["inspect metrics/0"],
+      "expected_results": ["counters defined for both events with bounded tags"], "status": "pending" },
+    { "id": "TC-34.4.3", "name": "no unbounded tag", "type": "unit",
+      "preconditions": [],
+      "steps": ["inspect the new metrics' :tags"],
+      "expected_results": ["no tenant_id / args / free-text tags"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "File: lib/loopctl/telemetry/scale_metrics.ex (+ merged into LoopctlWeb.Telemetry.metrics/0).",
+    "Prefer Telemetry.Metrics.counter/sum with a small tag set; confirm each emit site's metadata carries a bounded label (add one if missing, keep it bounded).",
+    "Cardinality is the multi-tenant risk — test bounded tags for each.",
+    "Coordinate the llm.blocked/provider-error contract with US-34.3.",
+    "No Application.put_env in tests; drive via :telemetry.execute."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 220000
+}

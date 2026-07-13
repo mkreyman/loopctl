@@ -1,0 +1,52 @@
+{
+  "id": "US-34.3",
+  "title": "Three ScaleAlerts signals: Repo queue_time p95, job discard/retry rate, provider-error rate",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "The alerting that would have made every other incident non-silent. US-33.1 already exports Repo queue_time; this adds the alert.",
+  "background": {
+    "reference": "GH #349. ScaleAlerts (lib/loopctl/telemetry/scale_alerts.ex) fires on 3 signals today (db_statement_timeout_rate, heavy_read_p95_latency_ms, under_fill_rate; attach_handlers/1 at :304-313). US-33.1 added per-pool queue_time telemetry ([:loopctl, :repo, :query]) to scale_metrics but ScaleAlerts does not ingest it.",
+    "includes": "The canonical 'one heavy agent' leading indicator (primary Repo checkout queue_time) is now measured but not ALERTED. There is no discard/retry-rate signal (Oban job failures) and no provider-error-rate signal (the 429/transport_error storm)."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "fire ScaleAlerts on (a) primary-Repo queue_time p95, (b) fleet-wide Oban job discard/retry rate, and (c) provider-error rate",
+    "so_that": "the three leading indicators of the known incident classes page me at breach instead of being discovered after the fact"
+  },
+  "rationale": "loopctl already has the alert machinery (windowed breach detection + delivery) but only watches 3 signals, none of which is the primary-pool checkout wait, Oban failure rate, or provider throttling — the exact precursors of the incidents this epic exists to prevent. Adding these three ingests to the existing ScaleAlerts pipeline closes the detection gap with the plumbing that already works.",
+  "acceptance_criteria": [
+    { "id": "AC-34.3.1", "description": "(a) A signal on primary Repo checkout queue_time p95 (from [:loopctl, :repo, :query] queue_time, the metric US-33.1 emits) fires when p95 over the window exceeds a configurable threshold. Uses the existing bucketed-p95 approach (mirror heavy_read_p95_latency_ms).", "status": "pending" },
+    { "id": "AC-34.3.2", "description": "(b) A signal on fleet-wide Oban job discard/retry rate: attach to [:oban, :job, :exception] (and/or discard) telemetry, window the count/min, fire above a threshold. Bounded tags (no per-tenant/per-args).", "status": "pending" },
+    { "id": "AC-34.3.3", "description": "(c) A signal on provider-error rate: window provider failures (from the LLM/embedding error telemetry — coordinate with US-34.4's wiring of [:loopctl, :llm, :blocked] / provider errors) and fire above a threshold.", "status": "pending" },
+    { "id": "AC-34.3.4", "description": "All three plug into the existing ScaleAlerts windowing + edge-fire + delivery path (scale_alerts.ex step/5); thresholds are config (mirroring the existing @thresholds). No change to the 3 existing signals.", "status": "pending" },
+    { "id": "AC-34.3.5", "description": "Additive + bounded-cardinality; a signal handler error never propagates into the emitting code path (defensive attach).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.3.1", "name": "Repo queue_time p95 breach fires", "type": "integration",
+      "preconditions": ["ScaleAlerts started; delivery mocked"],
+      "steps": ["feed [:loopctl, :repo, :query] events with high queue_time above threshold over the window"],
+      "expected_results": ["the queue_time alert fires once on breach (edge-triggered), with the delivery client called"], "status": "pending" },
+    { "id": "TC-34.3.2", "name": "Oban discard/retry rate breach fires", "type": "integration",
+      "preconditions": ["ScaleAlerts started"],
+      "steps": ["emit [:oban, :job, :exception] events above the per-min threshold"],
+      "expected_results": ["the discard-rate alert fires on breach"], "status": "pending" },
+    { "id": "TC-34.3.3", "name": "provider-error rate breach fires", "type": "integration",
+      "preconditions": ["ScaleAlerts started"],
+      "steps": ["emit provider-error telemetry above threshold"],
+      "expected_results": ["the provider-error alert fires on breach"], "status": "pending" },
+    { "id": "TC-34.3.4", "name": "no false fire under threshold", "type": "integration",
+      "preconditions": ["ScaleAlerts started"],
+      "steps": ["feed sub-threshold events for all three"],
+      "expected_results": ["no alert fires"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "File: lib/loopctl/telemetry/scale_alerts.ex — extend @thresholds + attach_handlers/1 + step/5; reuse the windowing/bucketing already there (heavy_read p95 is the template for (a)).",
+    "(b) attaches to Oban's [:oban, :job, :exception]/[:oban, :job, :stop] with state=discarded; window per-minute.",
+    "(c) coordinate with US-34.4 so the provider-error event is emitted+consumed once; do not double-count.",
+    "Config thresholds; delivery via the existing (US-34.5-hardened) path. Defensive handlers, bounded tags.",
+    "No Application.put_env in tests; drive via emitted telemetry + mocked delivery."
+  ],
+  "dependencies": ["US-34.1"],
+  "estimated_tokens": 340000
+}

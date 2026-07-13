@@ -1,0 +1,50 @@
+{
+  "id": "US-34.5",
+  "title": "Harden ScaleAlerts delivery: retry with backoff + periodic re-notify while a breach persists",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "An alert that's dropped or fires exactly once is nearly as bad as no alert. fail-loud-on-missing-URL (US-32.4) is already done — this is the delivery reliability.",
+  "background": {
+    "reference": "GH #349. ScaleAlerts delivery (lib/loopctl/telemetry/scale_alerts.ex:415-443): synchronous in-process delivery_client().deliver(...); on {:error,_} it only logs :warning and returns :ok (435-441) — no retry, no Oban, no backoff. step/5 (380-395) is pure edge-trigger fire-once with debounce on sustained breach ('do not re-fire').",
+    "includes": "A single dropped webhook POST is lost forever, and a breach that persists for hours pages once at the edge and never again — so a still-firing incident goes quiet."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have alert deliveries retry with backoff and re-notify periodically while a breach is still active",
+    "so_that": "a transient webhook failure doesn't silently drop an alert and a sustained incident keeps reminding me instead of going quiet after the first page"
+  },
+  "rationale": "The alert pipeline's last mile is its weakest: a best-effort synchronous POST that's logged-and-forgotten on failure, and a fire-once edge trigger. Both mean a real, ongoing incident can become invisible — the exact failure mode this epic exists to eliminate. Routing delivery through the existing Oban webhook-delivery path (with backoff) and adding a bounded periodic re-notify makes alerting durable and persistent without spamming.",
+  "acceptance_criteria": [
+    { "id": "AC-34.5.1", "description": "Alert delivery is retried with backoff on failure — preferably by enqueuing through the existing Oban webhook-delivery worker path (WebhookDeliveryWorker or equivalent) rather than the synchronous in-process POST, so a transient failure retries per Oban's backoff instead of being logged-and-dropped.", "status": "pending" },
+    { "id": "AC-34.5.2", "description": "While a breach remains active, the alert re-notifies on a bounded periodic interval (config, e.g. every N minutes) instead of firing exactly once — with a sane floor so it can't spam. On clearing below threshold it re-arms (and optionally sends a resolved notice).", "status": "pending" },
+    { "id": "AC-34.5.3", "description": "Backward compatible: the existing edge-fire semantics (fire on false→true) are preserved; this adds re-notify and durable delivery, not a behavior change to WHICH breaches fire. The 3 existing signals and the US-34.3 signals all benefit uniformly.", "status": "pending" },
+    { "id": "AC-34.5.4", "description": "The nil-URL / disabled paths remain safe (no delivery attempts; US-32.4 readiness guard unchanged). Delivery via the config-based delivery_client behaviour DI is preserved (mockable in tests).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.5.1", "name": "failed delivery is retried (not dropped)", "type": "integration",
+      "preconditions": ["ScaleAlerts started; delivery client mocked to fail once then succeed (or an Oban job enqueued)"],
+      "steps": ["trigger a breach"],
+      "expected_results": ["delivery is retried/enqueued with backoff rather than logged-and-forgotten; eventually delivered"], "status": "pending" },
+    { "id": "TC-34.5.2", "name": "sustained breach re-notifies periodically", "type": "integration",
+      "preconditions": ["a breach held active across the re-notify interval"],
+      "steps": ["advance time past the re-notify interval while still breached"],
+      "expected_results": ["a second notification fires (bounded), not silence after the first"], "status": "pending" },
+    { "id": "TC-34.5.3", "name": "clears and re-arms below threshold", "type": "integration",
+      "preconditions": ["breach then recovery"],
+      "steps": ["breach, then drop below threshold"],
+      "expected_results": ["re-arms; a later breach fires again"], "status": "pending" },
+    { "id": "TC-34.5.4", "name": "disabled/nil-url attempts no delivery", "type": "unit",
+      "preconditions": ["scale_alerts enabled false OR url nil"],
+      "steps": ["trigger a breach condition"],
+      "expected_results": ["no delivery attempt; US-32.4 readiness behavior intact"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "File: lib/loopctl/telemetry/scale_alerts.ex (delivery + step/5 re-notify state). Reuse Loopctl.Workers.WebhookDeliveryWorker (or the webhooks delivery behaviour) for durable retry/backoff.",
+    "Re-notify: track last-notified-at per signal in the alert state; re-fire only after the interval AND while still breached; floor to prevent spam.",
+    "Keep delivery behind the config delivery_client DI so tests mock it; no Application.put_env.",
+    "Do not change which breaches fire (edge semantics preserved); add durability + persistence."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 300000
+}

@@ -1,0 +1,46 @@
+{
+  "id": "US-34.2",
+  "title": "Surface Oban orphan/queue health in the /health degraded path",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "Today /health reports HEALTHY for a queue full of orphans — the check is a shallow liveness ping.",
+  "background": {
+    "reference": "GH #349. HealthCheck.Default.check_oban/0 (lib/loopctl/health_check/default.ex:75-82) only calls Oban.check_queue(queue: :default) and checks it responds with a :paused key — a GenServer ping, not queue health. health_controller.ex:44-59 drives 503 off status (db+oban).",
+    "includes": "The Oban health check cannot detect the exact failure that motivated Lifeline: jobs wedged :executing / a growing backlog. It returns ok as long as the queue process answers."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have the Oban health check report degraded when the orphan (stuck-executing) count exceeds a threshold",
+    "so_that": "a stalled queue shows up as a degraded readiness/health signal instead of a green check that hides the problem"
+  },
+  "rationale": "A health check that only pings the queue GenServer gives false confidence — it was green throughout the 17-day orphan stall. Folding the orphan count (from US-34.1's signal) into the health check's degraded path makes a wedged queue a first-class, visible health state, consistent with how db/oban already gate readiness.",
+  "acceptance_criteria": [
+    { "id": "AC-34.2.1", "description": "check_oban (or a new sub-check) computes the :executing-older-than-N-minutes orphan count and reports degraded (not ok) when it exceeds a configurable threshold; below threshold it stays ok. The existing queue-responsive ping is retained (a non-responsive queue is still a hard error).", "status": "pending" },
+    { "id": "AC-34.2.2", "description": "The orphan-degraded state is surfaced consistently with the existing liveness-vs-readiness split (default.ex:9-28): decide and document whether orphan-degraded belongs in liveness /health (affects Fly LB depool) or readiness /health/ready. Prefer NOT depooling a node from Fly's LB for a queue backlog (a node with a backlog can still serve requests) — route it to the readiness/degraded reason, not a liveness 503, unless justified.", "status": "pending" },
+    { "id": "AC-34.2.3", "description": "The check is cheap (reuses US-34.1's already-polled orphan value or a bounded query) and defensive (a check error does not crash the health endpoint; it degrades gracefully).", "status": "pending" },
+    { "id": "AC-34.2.4", "description": "Threshold is config; default chosen so a normal transient backlog does not flap the health state. No change to db/scale_alerts checks.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.2.1", "name": "orphan pile-up reports degraded", "type": "integration",
+      "preconditions": ["oban_jobs with orphan count above threshold"],
+      "steps": ["run the health check"],
+      "expected_results": ["oban sub-check reports degraded with an orphan reason; overall status/readiness reflects it per the chosen liveness/readiness split"], "status": "pending" },
+    { "id": "TC-34.2.2", "name": "healthy queue reports ok", "type": "integration",
+      "preconditions": ["no orphans, queue responsive"],
+      "steps": ["run the health check"],
+      "expected_results": ["oban check ok; /health 200"], "status": "pending" },
+    { "id": "TC-34.2.3", "name": "unresponsive queue is still a hard error", "type": "unit",
+      "preconditions": ["simulate check_queue failing/raising"],
+      "steps": ["run check_oban"],
+      "expected_results": ["reports error (retained behavior)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/health_check/default.ex (check_oban), lib/loopctl_web/controllers/health_controller.ex (readiness vs liveness wiring).",
+    "Reuse the orphan measurement from US-34.1 if available (avoid a second query); else a bounded count with a short timeout.",
+    "Respect the documented liveness/readiness rationale (default.ex:9-28) — do not turn a benign backlog into a Fly-LB depool.",
+    "Config-based DI threshold; defensive rescue; no Application.put_env in tests."
+  ],
+  "dependencies": ["US-34.1"],
+  "estimated_tokens": 200000
+}
