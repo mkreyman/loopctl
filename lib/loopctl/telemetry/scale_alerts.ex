@@ -83,6 +83,8 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   """
   use GenServer
 
+  @behaviour Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour
+
   require Logger
 
   alias Loopctl.Telemetry.ScaleAlerts.Window
@@ -184,13 +186,22 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   `SCALE_ALERT_WEBHOOK_URL`) silently disables the firing path — the breach is only
   logged, never delivered — so an operator believes alerting is on when it is not. This
   function is the pure guard surfaced by `Loopctl.HealthCheck.Default` so a misconfigured
-  deploy fails its health check (readiness-flag approach, NOT a boot-raise: raising in
-  `runtime.exs` could take a live fleet down on a bad deploy; a degraded health check
-  fails the deploy's smoke/health gate without killing running nodes).
+  deploy fails a READINESS signal (readiness-flag approach, NOT a boot-raise: raising in
+  `runtime.exs` could take a live fleet down on a bad deploy).
+
+  IMPORTANT (post-review correction): this guard does NOT flip `/health`'s top-level
+  `status` — `fly.toml` wires plain `GET /health` as the CONTINUOUS load-balancer
+  liveness check (10s interval, `min_machines_running: 1`), not a deploy-only smoke
+  probe, so coupling a benign config-only concern to it would let a missing webhook URL
+  depool an otherwise-healthy fleet. Instead it is surfaced as `checks.scale_alerts` /
+  `reasons.scale_alerts` (visible, non-blocking for routing) AND folded into the
+  separate `ready` field that only `GET /health/ready` acts on — a genuine deploy-time
+  smoke gate, distinct from the liveness probe. See `Loopctl.HealthCheck.Default`.
 
   Takes config as ARGS (not read internally) so it is unit-testable without
-  `Application.put_env`. Blank (empty/whitespace-only) URLs are treated as unset. The
-  error reason names the env var only — never a URL value (no secret is logged).
+  `Application.put_env`. Blank (empty/whitespace-only, or any non-binary) URLs are
+  treated as unset. The error reason names the env var only — never a URL value (no
+  secret is logged).
   """
   @spec config_status(boolean(), String.t() | nil) :: :ok | {:error, String.t()}
   def config_status(false, _url), do: :ok
@@ -204,6 +215,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   end
 
   @doc "Zero-arg convenience: `config_status/2` fed from the live app env."
+  @impl Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour
   @spec config_status() :: :ok | {:error, String.t()}
   def config_status do
     config_status(Application.get_env(:loopctl, :scale_alerts_enabled, false), webhook_url())
@@ -211,6 +223,11 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   defp blank?(nil), do: true
   defp blank?(url) when is_binary(url), do: String.trim(url) == ""
+
+  # Fail-safe catch-all: a non-nil, non-binary config value (e.g. a charlist or atom
+  # from a config typo) is treated as unset rather than raising — `check_scale_alerts/0`
+  # in `Loopctl.HealthCheck.Default` must degrade cleanly, never crash the endpoint.
+  defp blank?(_other), do: true
 
   # The webhook delivery client — the SAME DI key the webhook worker uses, so the test
   # mock applies. Operator/system-scoped: only the DeliveryBehaviour POST is reused, NOT

@@ -228,6 +228,10 @@ config :phoenix,
 # DI: Use mock health checker in tests
 config :loopctl, :health_checker, Loopctl.MockHealthChecker
 
+# US-32.4: scale-alerts config-guard DI (Loopctl.HealthCheck.Default's degraded-branch
+# coverage). Default stub in DataCase delegates to the real config_status/0.
+config :loopctl, :scale_alerts_config_checker, Loopctl.MockScaleAlertsConfigChecker
+
 # DI: Use mock rate limiter in tests
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 

@@ -40,6 +40,13 @@ defmodule Loopctl.Telemetry.ScaleAlertsConfigTest do
       assert {:error, reason} = ScaleAlerts.config_status(true, nil)
       refute reason =~ "http"
     end
+
+    test "enabled + a non-binary config value (e.g. a config typo) degrades cleanly instead of raising" do
+      assert {:error, reason} = ScaleAlerts.config_status(true, :not_a_string)
+      assert reason =~ "SCALE_ALERT_WEBHOOK_URL"
+
+      assert {:error, _reason} = ScaleAlerts.config_status(true, ~c"charlist")
+    end
   end
 
   describe "config_status/0" do

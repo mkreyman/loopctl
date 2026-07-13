@@ -224,6 +224,22 @@ else
   fail "health" "/health never returned 200 after 10 attempts"
 fi
 
+# --- Readiness poll (US-32.4 config-guard gate) --------------------------------
+#
+# GET /health/ready additionally folds in the scale-alerts config-guard (scale
+# alerts enabled but no SCALE_ALERT_WEBHOOK_URL configured) — see
+# Loopctl.HealthCheck.Default's moduledoc. /health above deliberately EXCLUDES
+# this so a benign config-only issue never depools an otherwise-healthy node
+# from Fly's continuous load-balancer check. But US-32.4's whole point is that
+# the misconfig is "caught at deploy time" — a readiness signal nothing polls is
+# a deferral of that promise. This is the automated consumer: a real misconfig
+# fails this assertion and turns THIS smoke run (the post-deploy detector) RED,
+# same as any other smoke failure.
+http GET "$BASE_URL/health/ready"
+assert "readiness (scale-alerts config-guard, US-32.4)" 200 \
+  '(.ready // (.status == "ok")) == true' \
+  '.ready is true (falls back to .status=="ok" for a health_checker impl that omits ready)'
+
 # --- KB retrieval crown jewels (authed, read-only) -----------------------------
 #
 # VISIBILITY INVARIANT the count/search thresholds rely on: LOOPCTL_SMOKE_KEY is

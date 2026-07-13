@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -67,9 +68,17 @@ defmodule Loopctl.DataCase do
       {:ok,
        %{
          status: "ok",
+         ready: true,
          version: "0.1.0-test",
          checks: %{database: "ok", oban: "ok"}
        }}
+    end)
+
+    # US-32.4: default delegates to the real config_status/0 so the healthy path
+    # (scale_alerts_enabled: false in config/test.exs) is exercised unchanged. The
+    # degraded-branch test overrides this with Mox.expect/3.
+    Mox.stub(Loopctl.MockScaleAlertsConfigChecker, :config_status, fn ->
+      ScaleAlerts.config_status()
     end)
 
     Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->

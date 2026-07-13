@@ -35,6 +35,16 @@ primary_region = "lax"
   [http_service.http_options]
     h2_backend = false
 
+  # LIVENESS ONLY — this is the CONTINUOUS check that decides whether a running node
+  # stays in the load-balancer's traffic rotation (10s interval, every node, forever).
+  # It intentionally targets plain /health (liveness: database + oban only), never
+  # /health/ready (US-32.4's deploy-time smoke gate for the scale-alerts config-guard).
+  # A benign, purely observational misconfig (scale alerts enabled, no webhook URL) must
+  # never depool an otherwise-healthy node — see Loopctl.HealthCheck.Default's moduledoc.
+  # GET /health/ready is deliberately NOT wired into THIS continuous check for that
+  # reason, but it is not left unpolled: scripts/smoke.sh (the CI post-deploy detector,
+  # .github/workflows/ci.yml `smoke` job) asserts it explicitly after every deploy, so a
+  # genuine misconfig still turns the deploy pipeline RED.
   [[http_service.checks]]
     interval = "10s"
     timeout = "2s"

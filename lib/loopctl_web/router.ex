@@ -63,11 +63,15 @@ defmodule LoopctlWeb.Router do
     end
   end
 
-  # Health check — unauthenticated JSON, outside /api/v1
+  # Health check — unauthenticated JSON, outside /api/v1.
+  # /health = LIVENESS (Fly's continuous http_service check, fly.toml).
+  # /health/ready = READINESS (US-32.4 deploy-time smoke gate; NOT wired into fly.toml —
+  # see Loopctl.HealthCheck.Default's moduledoc for why the two must stay decoupled).
   scope "/", LoopctlWeb do
     pipe_through :api
 
     get "/health", HealthController, :check
+    get "/health/ready", HealthController, :ready
   end
 
   # US-26.0.4 — RFC 8615 discovery endpoint (unauthenticated)
