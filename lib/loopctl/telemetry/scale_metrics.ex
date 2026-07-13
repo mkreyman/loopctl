@@ -4,21 +4,24 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   Turns the structured signals epic 27 already emits — `db_statement_timeout`
   (US-27.3), heavy-read latency (US-27.4), and recall under-fill (US-27.6b) — into
-  three aggregated metrics a reporter can scrape, so a degradation TREND is visible
+  aggregated metrics a reporter can scrape, so a degradation TREND is visible
   before it becomes an incident (instead of grepping 7-day logs after users hit it).
 
-  The three metrics are MERGED into `LoopctlWeb.Telemetry.metrics/0` and exposed to
+  These metrics are MERGED into `LoopctlWeb.Telemetry.metrics/0` and exposed to
   Fly's managed Prometheus by the reporter on the internal `:9568/metrics` port.
+  `scale_metrics/0` has grown past its original US-27.15 scope as later stories
+  added observability signals to the same list: #297 added the semantic-fallback
+  counter and US-31.2 added the hybrid-provenance counter (both already present
+  before this branch); US-33.1 adds TWO more, purely-additive metrics: per-pool
+  connection-checkout `queue_time` distributions for `Loopctl.Repo` (the RLS pool,
+  size 10) and `Loopctl.AdminRepo` (the BYPASSRLS pool, size 3). Ecto already emits
+  `queue_time` (native time spent WAITING for a pooled connection) on every query
+  telemetry event; before this branch only `heavy_read_repo.query.duration` was
+  scraped, so there was no way to see where checkout contention lands between the
+  two pools. See "Per-pool checkout queue_time (US-33.1)" below. `scale_metrics/0`
+  now returns 7 metrics total.
 
-  US-33.1 adds TWO more, purely-additive metrics: per-pool connection-checkout
-  `queue_time` distributions for `Loopctl.Repo` (the RLS pool, size 10) and
-  `Loopctl.AdminRepo` (the BYPASSRLS pool, size 3). Ecto already emits `queue_time`
-  (native time spent WAITING for a pooled connection) on every query telemetry event;
-  today only `heavy_read_repo.query.duration` is scraped, so there is no way to see
-  where checkout contention lands between the two pools. See "Per-pool checkout
-  queue_time (US-33.1)" below.
-
-  ## The three metrics
+  ## The metrics (7 total)
 
     1. **Timeout / DB-error counter** — `loopctl.db.error.count`, keyed by
        `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`). `mapped_code`
@@ -33,6 +36,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     3. **Under-fill counter** — `loopctl.knowledge.vector_search.under_fill.count`,
        keyed by `[:endpoint]` (+ a cap-gated `:tenant_id`). Sourced from
        `[:loopctl, :knowledge, :vector_search, :under_fill]` (US-27.6b).
+    4. **Semantic-fallback counter** (#297) — `loopctl.knowledge.semantic_fallback.count`,
+       keyed by `[:reason]` ONLY (no `:tenant_id` — the reason set is fixed and
+       small). Sourced from `[:loopctl, :knowledge, :semantic_fallback]`.
+    5. **Hybrid-provenance counter** (US-31.2) — `loopctl.knowledge.hybrid_provenance.count`,
+       keyed by `[:provenance, :hit]` (+ a cap-gated `:tenant_id`). Sourced from
+       `[:loopctl, :knowledge, :hybrid_provenance]`.
+    6. **RLS-pool checkout `queue_time` distribution** (US-33.1) —
+       `loopctl.repo.checkout.queue_time`, with a static `[:repo]` tag (no cap gate
+       needed). Sourced from the Ecto query event `[:loopctl, :repo, :query]`.
+    7. **AdminRepo-pool checkout `queue_time` distribution** (US-33.1) —
+       `loopctl.admin_repo.checkout.queue_time`, with a static `[:repo]` tag (no cap
+       gate needed). Sourced from `[:loopctl, :admin_repo, :query]`.
 
   ## Bounded cardinality (AC-27.15.3) — the no-leak contract
 
@@ -88,7 +103,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @default_tenant_label_cap 1_000
 
   @doc """
-  The three scale metrics (US-27.15). Appended to `LoopctlWeb.Telemetry.metrics/0`.
+  All 7 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  counter, US-31.2's hybrid-provenance counter, and US-33.1's two per-pool
+  checkout `queue_time` distributions. Appended to `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
