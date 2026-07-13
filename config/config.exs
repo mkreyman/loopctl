@@ -129,6 +129,13 @@ config :loopctl,
   # `telemetry_poller` instance in LoopctlWeb.Telemetry (NOT the shared
   # tenant-label-gate poller — a review finding flagged inheriting that cadence as a
   # deviation from the AC's "bounded interval (config)" wording).
+  # - oban_metrics_poll_enabled: start the SUPERVISED oban poller child. ON by
+  #   default (purely additive in prod/dev). Forced OFF in :test (config/test.exs)
+  #   — a review finding: the poller fires at boot via `dispatch_oban_stats/0`'s
+  #   `Loopctl.MockObanStats` Mox seam, before any ExUnit test process holds the
+  #   private-mode allowance, so it would raise `Mox.UnexpectedCallError` on every
+  #   collect for the whole suite. Integration coverage instead calls
+  #   `dispatch_oban_stats/0` directly (scale_metrics_oban_test.exs).
   # - oban_metrics_poll_interval_ms: how often oban_jobs is polled. Kept at the same
   #   10s default as the shared poller (no behavior change), but now a dedicated knob
   #   so the cadence of this specific, heavier (unindexed GROUP BY aggregate) query
@@ -145,6 +152,7 @@ config :loopctl,
   #   equating the threshold to rescue_after would conflate that steady state with
   #   "Lifeline is falling behind / a job is wedged" (the actual alert condition this
   #   gauge exists to signal, feeding US-34.3 alerting).
+  oban_metrics_poll_enabled: true,
   oban_metrics_poll_interval_ms: 10_000,
   oban_metrics_query_timeout_ms: 5_000,
   oban_metrics_orphan_threshold_minutes: 40

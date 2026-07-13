@@ -480,6 +480,17 @@ config :loopctl, :batch_item_validation_timeout_ms, 200
 # poller-resilience test overrides a callback with Mox.expect/3 to raise.
 config :loopctl, :oban_stats_query, Loopctl.MockObanStats
 
+# US-34.1 review finding: the background oban poller is NOT started in :test (see
+# `oban_metrics_poll_enabled` in config/config.exs for the full rationale) — its
+# `telemetry_poller` fires at boot, before any ExUnit process owns the private-mode
+# `Loopctl.MockObanStats` Mox allowance, so an always-on poller would raise
+# `Mox.UnexpectedCallError` on every collect for the whole suite (and, given the
+# widened rescue in `ScaleMetrics.dispatch_oban_stats/0`, would just log-and-skip
+# forever rather than crash — permanently freezing the gauge). Integration
+# coverage of the poll itself lives in `scale_metrics_oban_test.exs`, which calls
+# `dispatch_oban_stats/0` directly from the owning test process.
+config :loopctl, :oban_metrics_poll_enabled, false
+
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
 # is unit-tested with deterministic candidate lists — never through the real pgvector kNN,

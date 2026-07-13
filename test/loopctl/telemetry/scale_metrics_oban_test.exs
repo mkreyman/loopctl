@@ -171,10 +171,16 @@ defmodule Loopctl.Telemetry.ScaleMetricsObanTest do
       assert events == []
     end
 
-    test "an unexpected (non-DB) exception still propagates — the narrow rescue never masks a real bug" do
+    test "an unexpected (non-DB) exception is ALSO rescued (logs + :ok, review finding #1)" do
       expect(Loopctl.MockObanStats, :job_state_counts, fn -> raise ArgumentError, "boom" end)
 
-      assert_raise ArgumentError, fn -> ScaleMetrics.dispatch_oban_stats() end
+      log =
+        capture_log(fn ->
+          assert ScaleMetrics.dispatch_oban_stats() == :ok
+        end)
+
+      assert log =~ "oban_jobs metrics poll failed"
+      assert log =~ "ArgumentError"
     end
   end
 end

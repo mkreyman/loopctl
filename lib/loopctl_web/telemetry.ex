@@ -29,19 +29,41 @@ defmodule LoopctlWeb.Telemetry do
           {:telemetry_poller,
            measurements: periodic_measurements(), period: 10_000, name: :loopctl_telemetry_poller},
           id: :loopctl_telemetry_poller
-        ),
-        # US-34.1: the Oban `oban_jobs` poll runs on its OWN `telemetry_poller`
-        # instance, with an INDEPENDENTLY configurable interval
-        # (`:oban_metrics_poll_interval_ms`, default 10s) rather than inheriting the
-        # tenant-label-gate poller's cadence above (AC-34.1.3 calls for a "bounded
-        # interval (config)"). Two `:telemetry_poller` instances can coexist under one
-        # Supervisor as long as each has a distinct `:name` (registered by
-        # `:telemetry_poller`'s own `start_link/1`) and a distinct Supervisor child
-        # `:id` (both default to `:telemetry_poller` otherwise, which would collide) —
-        # `Supervisor.child_spec/2` overrides the id for exactly that reason. This also
-        # shrinks the blast radius from the shared-poller crash risk documented on
-        # `ScaleMetrics.dispatch_oban_stats/0`: a raise here can no longer take down
-        # `refresh_tenant_label_gate/0`'s poller (still self-rescued regardless).
+        )
+      ] ++ oban_poller_children() ++ reporter_children() ++ scale_alerts_children()
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # US-34.1: the Oban `oban_jobs` poll runs on its OWN `telemetry_poller` instance,
+  # with an INDEPENDENTLY configurable interval (`:oban_metrics_poll_interval_ms`,
+  # default 10s) rather than inheriting the tenant-label-gate poller's cadence above
+  # (AC-34.1.3 calls for a "bounded interval (config)"). Two `:telemetry_poller`
+  # instances can coexist under one Supervisor as long as each has a distinct
+  # `:name` (registered by `:telemetry_poller`'s own `start_link/1`) and a distinct
+  # Supervisor child `:id` (both default to `:telemetry_poller` otherwise, which
+  # would collide) — `Supervisor.child_spec/2` overrides the id for exactly that
+  # reason. Splitting the poller also shrinks the blast radius from the shared-
+  # poller failure-mode documented on `ScaleMetrics.dispatch_oban_stats/0`: a raise
+  # there can no longer touch `refresh_tenant_label_gate/0`'s poller (still
+  # self-rescued regardless, and self-rescued WIDE per the same doc).
+  #
+  # Gated on `:oban_metrics_poll_enabled` (default true; forced `false` in
+  # `config/test.exs`) — review finding (US-34.1): `dispatch_oban_stats/0` polls
+  # through the `Loopctl.MockObanStats` Mox DI seam, and `telemetry_poller`'s
+  # `init_delay` defaults to 0, so an always-on poller fires `:collect` at boot,
+  # BEFORE any ExUnit test process owns the private-mode Mox allowance. The
+  # resulting `Mox.UnexpectedCallError` is not in `dispatch_oban_stats/0`'s rescue
+  # set's spirit (it's a test-harness artifact, not a poll fault) and — per the
+  # same widened-rescue fix above — would otherwise be caught, logged once, and
+  # PERMANENTLY drop the gauge for the rest of the suite (and re-log every
+  # interval). Omitting the child in `:test` (same pattern as `reporter_children/0`
+  # / `scale_alerts_children/0` below) keeps the suite quiet and the gauge intact;
+  # the poller -> dispatch_oban_stats/0 -> DB wiring is covered directly by
+  # `scale_metrics_oban_test.exs`, which calls `dispatch_oban_stats/0` in-process.
+  defp oban_poller_children do
+    if oban_metrics_poll_enabled?() do
+      [
         Supervisor.child_spec(
           {:telemetry_poller,
            measurements: oban_periodic_measurements(),
@@ -49,9 +71,14 @@ defmodule LoopctlWeb.Telemetry do
            name: :loopctl_oban_telemetry_poller},
           id: :loopctl_oban_telemetry_poller
         )
-      ] ++ reporter_children() ++ scale_alerts_children()
+      ]
+    else
+      []
+    end
+  end
 
-    Supervisor.init(children, strategy: :one_for_one)
+  defp oban_metrics_poll_enabled? do
+    Application.get_env(:loopctl, :oban_metrics_poll_enabled, true)
   end
 
   # US-27.15: the Prometheus reporter is a SUPERVISED child that binds the internal
@@ -171,11 +198,15 @@ defmodule LoopctlWeb.Telemetry do
   end
 
   defp periodic_measurements do
-    # NOTE: `telemetry_poller` runs every measurement in its OWN process and does NOT
-    # isolate them — an uncaught raise in any measurement crashes ITS poller. So EVERY
-    # measurement added here MUST be self-rescuing. `refresh_tenant_label_gate/0`
-    # guards its only raising op (the DB count) with try/rescue (fail-soft to a
-    # bounded gate); keep that invariant for future additions to THIS poller.
+    # NOTE: `telemetry_poller` does NOT crash its poller process on a raising
+    # measurement — it catches the raise, logs one error, and then PERMANENTLY
+    # drops that measurement from poller state (never retried, no restart to
+    # recover it). So EVERY measurement added here MUST rescue for itself, or an
+    # uncaught raise silently disables it for the rest of the BEAM's lifetime.
+    # `refresh_tenant_label_gate/0` guards its only raising op (the DB count) with
+    # try/rescue (fail-soft to a bounded gate); keep that invariant — and rescue
+    # WIDE, not just the DB-error classes (see `ScaleMetrics.dispatch_oban_stats/0`
+    # for the fuller rationale) — for future additions to THIS poller.
     [
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
@@ -184,10 +215,13 @@ defmodule LoopctlWeb.Telemetry do
     ]
   end
 
-  # US-34.1: split onto its OWN `telemetry_poller` instance (see `init/1`) so its
-  # cadence is independently configurable and a raise here can never crash the
-  # tenant-label-gate poller above. `dispatch_oban_stats/0` is fully self-rescuing
-  # regardless (a poll error logs + skips rather than crashing this poller).
+  # US-34.1: split onto its OWN `telemetry_poller` instance (see `init/1` /
+  # `oban_poller_children/0`, gated off in `:test`) so its cadence is independently
+  # configurable and a fault here can never touch the tenant-label-gate poller
+  # above. `dispatch_oban_stats/0` is fully self-rescuing regardless — and WIDE
+  # (any exception, not just DB-error classes), because `telemetry_poller` reacts
+  # to an uncaught raise by permanently dropping the measurement rather than
+  # crashing/restarting this poller.
   defp oban_periodic_measurements do
     [
       # US-34.1: poll oban_jobs for per-(state, queue) counts + the :executing orphan

@@ -141,11 +141,17 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       `[:loopctl, :oban, :orphans]` measurement (unaffected by zero-fill: it is a
       scalar that always emits, including 0).
 
-  `telemetry_poller` does NOT isolate measurements running on the SAME poller
-  instance, so `dispatch_oban_stats/0` is self-rescuing regardless (AC-34.1.3) — a
-  DB/connection fault during either query is caught, logged at `:warning`, and the
-  poll is skipped for that interval (the Prometheus gauges simply hold their
-  last-scraped value; no metric corruption).
+  `telemetry_poller` does NOT crash its poller GenServer on a raising measurement —
+  `make_measurement/1` catches `Class:Reason`, logs one error, and the poller
+  process survives. But surviving is not enough: `handle_info(:collect, ...)` then
+  drops the raising measurement from poller state and never retries it, so an
+  UNCAUGHT raise here would PERMANENTLY disable this gauge for the life of the
+  BEAM (worse than a crash, which `:one_for_one` would restart) — silently, after
+  one log line. So `dispatch_oban_stats/0` rescues `ANY` exception itself
+  (AC-34.1.3): a fault during either query is caught, logged at `:warning`, and the
+  poll is skipped for that interval — the Prometheus gauges simply hold their
+  last-scraped value (no metric corruption) and the NEXT interval's poll still
+  runs.
   """
 
   import Telemetry.Metrics
@@ -287,10 +293,10 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       ),
 
       # 9. Oban `:executing` orphan gauge (US-34.1, AC-34.1.2): jobs stuck `executing`
-      #    past the configured threshold (default 30 min, matching
-      #    Oban.Plugins.Lifeline's rescue_after) — the signal that Lifeline is falling
-      #    behind or a job is genuinely wedged. Untagged — a single scalar value, so
-      #    there is no cardinality question at all.
+      #    past the configured threshold (default 40 min, deliberately above
+      #    Oban.Plugins.Lifeline's 30-minute rescue_after) — the signal that Lifeline is
+      #    falling behind or a job is genuinely wedged. Untagged — a single scalar value,
+      #    so there is no cardinality question at all.
       last_value("loopctl.oban.executing_orphans.count",
         event_name: [:loopctl, :oban, :orphans],
         measurement: :count,
@@ -494,13 +500,16 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   poller instance in `LoopctlWeb.Telemetry` (`:oban_metrics_poll_interval_ms`,
   default 10s — independently configurable from the tenant-label-gate poller).
 
-  Self-rescuing (AC-34.1.3 / TC-34.1.3): `telemetry_poller` does NOT isolate
-  measurements running on the SAME poller instance — an uncaught raise here would
-  crash this poller. A DB/connection fault during either query is caught (the same
-  NARROW exception set as the tenant gate, so a genuine programmer error still
-  surfaces), logged at `:warning`, and this returns `:ok` WITHOUT emitting — the
-  Prometheus gauges simply hold their last-scraped value until the next successful
-  poll (no metric corruption).
+  Self-rescuing (AC-34.1.3 / TC-34.1.3), and DELIBERATELY WIDE: `telemetry_poller`
+  catches any raise from a periodic measurement itself, but its recovery is to log
+  once and drop that measurement from poller state FOREVER — it does not retry, and
+  the poller process never crashes, so `:one_for_one` never gets a chance to
+  restart it either. An uncaught raise here would therefore permanently freeze both
+  gauges at their last-scraped value for the rest of the BEAM's lifetime, which is
+  worse than a crash. So this rescues ANY exception (not just the DB-connection
+  classes) — logs at `:warning` and returns `:ok` WITHOUT emitting, leaving the
+  Prometheus gauges holding their last-scraped value until the next poll interval,
+  which still runs.
   """
   @spec dispatch_oban_stats() :: :ok
   def dispatch_oban_stats do
@@ -508,7 +517,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     emit_oban_executing_orphans()
     :ok
   rescue
-    e in [Postgrex.Error, DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+    e ->
       Logger.warning(
         "oban_jobs metrics poll failed (#{inspect(e.__struct__)}); skipping this interval"
       )

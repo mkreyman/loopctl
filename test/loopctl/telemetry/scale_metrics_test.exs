@@ -531,24 +531,29 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert :ets.info(:loopctl_scale_alerts) == :undefined
     end
 
-    test "the Oban oban_jobs poll runs on its OWN telemetry_poller instance (US-34.1 review fix)" do
+    test "the Oban oban_jobs poll's OWN telemetry_poller is NOT auto-started in :test (US-34.1 review fix)" do
+      refute Application.get_env(:loopctl, :oban_metrics_poll_enabled, true),
+             "oban_metrics_poll_enabled must stay false in :test — an always-on poller fires " <>
+               "dispatch_oban_stats/0 (and its Loopctl.MockObanStats Mox call) at boot, before " <>
+               "any ExUnit test process holds the private-mode allowance, raising " <>
+               "Mox.UnexpectedCallError on every collect for the whole suite"
+
       children = Supervisor.which_children(LoopctlWeb.Telemetry)
       child_ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
 
-      # Two DISTINCT poller child ids — proves the Oban poll is no longer sharing the
-      # tenant-label-gate poller's process/cadence (a raise in one can't crash the other).
+      # The tenant-label-gate poller is unaffected — still its own, independently
+      # registered, running process (proving the two-poller split still holds; the
+      # oban poller is simply omitted rather than sharing this process/cadence).
       assert :loopctl_telemetry_poller in child_ids
-      assert :loopctl_oban_telemetry_poller in child_ids
 
-      # And each is a genuinely distinct, independently-registered, running process.
+      refute :loopctl_oban_telemetry_poller in child_ids,
+             "the oban poller must not be supervised in :test — " <>
+               "scale_metrics_oban_test.exs exercises dispatch_oban_stats/0 directly instead"
+
       tenant_gate_pid = Process.whereis(:loopctl_telemetry_poller)
-      oban_pid = Process.whereis(:loopctl_oban_telemetry_poller)
-
       assert is_pid(tenant_gate_pid)
-      assert is_pid(oban_pid)
-      assert tenant_gate_pid != oban_pid
       assert Process.alive?(tenant_gate_pid)
-      assert Process.alive?(oban_pid)
+      assert Process.whereis(:loopctl_oban_telemetry_poller) == nil
     end
   end
 
