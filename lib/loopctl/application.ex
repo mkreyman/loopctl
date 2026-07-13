@@ -37,6 +37,11 @@ defmodule Loopctl.Application do
       # long-lived owner (it would otherwise be created by a transient request/job/Task
       # and vanish when that process died — silently resetting the breaker).
       Loopctl.Knowledge.EmbeddingCircuitBreaker,
+      # US-32.3: owns the ETS table caching resolved+decrypted per-tenant LLM
+      # settings so a per-provider-call DB read + Cloak decrypt becomes a
+      # per-change one. Stable owner survives the request/Task/Oban process that
+      # populated an entry; invalidated on the settings write path.
+      Loopctl.Llm.SettingsCache,
       LoopctlWeb.Endpoint
     ]
 

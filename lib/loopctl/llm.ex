@@ -49,6 +49,7 @@ defmodule Loopctl.Llm do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.HeavyRead
+  alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent
 
@@ -78,9 +79,32 @@ defmodule Loopctl.Llm do
 
   The `api_key` field on the returned struct is decrypted plaintext — treat it as
   a secret. Prefer `resolve/2` for LLM call sites.
+
+  READ-THROUGH CACHED (US-32.3): the resolved+decrypted struct (or `nil`) is served
+  from a supervised ETS cache keyed by `tenant_id`, converting a per-call DB read +
+  Cloak decrypt into a per-change one. On a miss it loads from the DB, caches, and
+  returns; `upsert_settings/2` invalidates the entry so a read never serves stale
+  credentials. Signature and return shape are unchanged.
   """
   @spec get_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
   def get_settings(tenant_id) when is_binary(tenant_id) do
+    case SettingsCache.fetch(tenant_id) do
+      {:ok, value} ->
+        value
+
+      :miss ->
+        settings = load_settings(tenant_id)
+        SettingsCache.put(tenant_id, settings)
+        settings
+    end
+  end
+
+  # Direct, UNCACHED DB read of the tenant's settings row. Used on the cache-miss
+  # read-through path AND by the write path (`upsert_settings/2`), which must fetch
+  # the existing row uncached so a cached (possibly negative) entry can never leak
+  # into the insert_or_update changeset.
+  @spec load_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
+  defp load_settings(tenant_id) when is_binary(tenant_id) do
     AdminRepo.get_by(TenantLlmSettings, tenant_id: tenant_id)
   end
 
@@ -103,7 +127,10 @@ defmodule Loopctl.Llm do
     attrs = normalize_keys(attrs)
     api_key = Map.get(attrs, :api_key)
     embedding_api_key = Map.get(attrs, :embedding_api_key)
-    existing = get_settings(tenant_id)
+    # UNCACHED read on the WRITE path: `get_settings/1` is now cached (and may hold a
+    # negative `nil` entry), so fetch the existing row directly from the DB — a stale
+    # or negative cached struct must never seed the insert_or_update changeset (US-32.3).
+    existing = load_settings(tenant_id)
 
     changeset =
       (existing || %TenantLlmSettings{tenant_id: tenant_id})
@@ -122,8 +149,15 @@ defmodule Loopctl.Llm do
     end)
     |> AdminRepo.transaction()
     |> case do
-      {:ok, %{settings: settings}} -> {:ok, settings}
-      {:error, :settings, changeset, _} -> {:error, changeset}
+      {:ok, %{settings: settings}} ->
+        # Invalidate AFTER commit so the next read repopulates read-through with the
+        # fresh row — never serves stale credentials (US-32.3, AC-32.3.3). This is
+        # the sole settings-mutation path, so it is the only cache-busting point.
+        SettingsCache.invalidate(tenant_id)
+        {:ok, settings}
+
+      {:error, :settings, changeset, _} ->
+        {:error, changeset}
     end
   end
 
