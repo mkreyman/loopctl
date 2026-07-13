@@ -32,6 +32,17 @@ config :loopctl, LoopctlWeb.Endpoint,
     websocket_options: [max_fragmented_message_size: 64_000]
   ]
 
+# Oban queue widths are env-driven (US-32.2) so an operator can retune a hot/starved
+# queue during an incident via `fly secrets set OBAN_QUEUE_<NAME>` + restart, no deploy.
+# Each defaults to its config.exs value when unset. NB: total worker concurrency (sum of
+# widths, default 33) shares the Repo pool (POOL_SIZE, default 10 — see the Repo config
+# below and `Loopctl.DbCapacity`). Widths far above the connection budget will queue on
+# checkout; operators own this tradeoff — no hard cap is enforced here. This runs in
+# EVERY env (not just prod) so defaults hold under `testing: :inline` (config/test.exs)
+# with zero env vars required; `queues:` REPLACES (not merges) the compile-time list, so
+# `Loopctl.ObanConfig.queues/0` always re-lists all queues to avoid silently dropping one.
+config :loopctl, Oban, queues: Loopctl.ObanConfig.queues()
+
 # Cloak Vault — key from environment in all environments where CLOAK_KEY is set.
 # In production, CLOAK_KEY is required — startup fails if it is missing.
 if config_env() == :prod do
