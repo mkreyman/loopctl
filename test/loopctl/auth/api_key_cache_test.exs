@@ -5,6 +5,7 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.ApiKeyCache
+  alias Loopctl.Workers.RevokeExpiredDispatchesWorker
 
   import Ecto.Query
   import ExUnit.CaptureLog
@@ -138,6 +139,26 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
 
       assert Auth.verify_api_key(raw) == {:error, :unauthorized}
     end
+
+    test "the RevokeExpiredDispatchesWorker release-gate path busts the cache for expired dispatch keys" do
+      tenant = fixture(:tenant)
+
+      # A key linked to a dispatch that is already past its expiry.
+      {raw, ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+      past = DateTime.add(DateTime.utc_now(), -120, :second)
+      _dispatch = dispatch_for(tenant.id, ak.id, past)
+
+      # Populate the cache read-through.
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
+
+      # The cron worker revokes the expired dispatch + its api_key and MUST bust the
+      # cache in-band (AC-33.3.2) — deleting worker line 56 would leave this green
+      # only because of the assertion below.
+      assert :ok = RevokeExpiredDispatchesWorker.perform(%Oban.Job{args: %{}})
+
+      # Immediately unauthorized on the very next request, not after the TTL.
+      assert Auth.verify_api_key(raw) == {:error, :unauthorized}
+    end
   end
 
   describe "SECURITY — invalidate on rotate/mutate (TC-33.3.3)" do
@@ -228,6 +249,67 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
     end
   end
 
+  describe "generation-entry memory bound (technical-notes)" do
+    test "an idle generation entry is reaped by the sweep, capping memory" do
+      {_raw, ak} = fixture(:api_key, role: :agent)
+
+      # The first invalidation creates the {:gen, key_hash} counter entry.
+      :ok = ApiKeyCache.invalidate(ak.key_hash)
+
+      assert [{{:gen, _}, _gen, _reap}] =
+               :ets.lookup(ApiKeyCache.table_name(), {:gen, ak.key_hash})
+
+      # Force its reap deadline into the past (models "idle beyond the bump grace").
+      past = System.monotonic_time(:millisecond) - 1
+      true = :ets.update_element(ApiKeyCache.table_name(), {:gen, ak.key_hash}, {3, past})
+
+      send(Process.whereis(ApiKeyCache), :sweep)
+      _ = :sys.get_state(ApiKeyCache)
+
+      assert :ets.lookup(ApiKeyCache.table_name(), {:gen, ak.key_hash}) == []
+    end
+
+    test "a freshly-bumped generation entry is NOT reaped (deadline refreshed on bump)" do
+      {_raw, ak} = fixture(:api_key, role: :agent)
+
+      :ok = ApiKeyCache.invalidate(ak.key_hash)
+      # Force the deadline into the past...
+      past = System.monotonic_time(:millisecond) - 1
+      true = :ets.update_element(ApiKeyCache.table_name(), {:gen, ak.key_hash}, {3, past})
+      # ...then a fresh bump refreshes it to the future, surviving the sweep.
+      :ok = ApiKeyCache.invalidate(ak.key_hash)
+
+      send(Process.whereis(ApiKeyCache), :sweep)
+      _ = :sys.get_state(ApiKeyCache)
+
+      assert [{{:gen, _}, _gen, _reap}] =
+               :ets.lookup(ApiKeyCache.table_name(), {:gen, ak.key_hash})
+    end
+
+    test "reaping a generation entry preserves the never-stale invariant" do
+      {_raw, ak} = fixture(:api_key, role: :agent)
+
+      # A key bumped at least once: the gen entry is present at gen >= 1, so there
+      # is no in-flight stamp-0 reader for it.
+      :ok = ApiKeyCache.invalidate(ak.key_hash)
+      gen = ApiKeyCache.generation(ak.key_hash)
+      assert gen >= 1
+
+      # Reap the (idle) gen entry -> current generation resets to the 0 default.
+      past = System.monotonic_time(:millisecond) - 1
+      true = :ets.update_element(ApiKeyCache.table_name(), {:gen, ak.key_hash}, {3, past})
+      send(Process.whereis(ApiKeyCache), :sweep)
+      _ = :sys.get_state(ApiKeyCache)
+      assert ApiKeyCache.generation(ak.key_hash) == 0
+
+      # A value stamped with the pre-reap generation (>= 1) can never equal the
+      # post-reap 0 default, so a late stale repopulation is still rejected — the
+      # reap does not resurrect a stale HIT.
+      :ok = ApiKeyCache.put(ak.key_hash, ak, gen)
+      assert ApiKeyCache.fetch(ak.key_hash) == :miss
+    end
+  end
+
   describe "tenant isolation (TC-33.3.5)" do
     test "revoking tenant A's key leaves tenant B's cached key unaffected" do
       a = fixture(:tenant)
@@ -247,6 +329,73 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
       assert Auth.verify_api_key(raw_a) == {:error, :unauthorized}
       assert {:ok, %ApiKey{tenant_id: tenant_b_id}} = Auth.verify_api_key(raw_b)
       assert tenant_b_id == b.id
+    end
+  end
+
+  describe "tenant-row + agent-binding invalidation (AC-33.3.3/.5)" do
+    test "suspending a tenant busts its cached keys (custody/status fields compose with US-33.2)" do
+      tenant = fixture(:tenant)
+      {raw, ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      # Cache the key WITH its :tenant preloaded (status/custody_halted_at).
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
+      assert {:ok, _} = ApiKeyCache.fetch(ak.key_hash)
+
+      # A tenant-row mutation leaves the cached preloaded :tenant stale, so it must
+      # bust the tenant's cached keys (invalidate_tenant_key_cache).
+      {:ok, _suspended} = Loopctl.Tenants.suspend_tenant(tenant)
+
+      assert ApiKeyCache.fetch(ak.key_hash) == :miss
+    end
+
+    test "halting a tenant's custody busts its cached keys" do
+      tenant = fixture(:tenant)
+      {raw, ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
+      assert {:ok, _} = ApiKeyCache.fetch(ak.key_hash)
+
+      {:ok, _halted} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      assert ApiKeyCache.fetch(ak.key_hash) == :miss
+    end
+
+    test "binding an agent to a key busts that key's cached entry (agent_id scope change)" do
+      tenant = fixture(:tenant)
+      {raw, ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
+      assert {:ok, _} = ApiKeyCache.fetch(ak.key_hash)
+
+      {:ok, _agent} =
+        Loopctl.Agents.register_agent(
+          tenant.id,
+          %{name: "bound-worker", agent_type: :implementer},
+          api_key_id: ak.id
+        )
+
+      assert ApiKeyCache.fetch(ak.key_hash) == :miss
+    end
+
+    test "the tenant fan-out is bounded to ACTIVE keys — a revoked key_hash is not bumped" do
+      tenant = fixture(:tenant)
+      {active_raw, active_ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+      {_revoked_raw, revoked_ak} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
+
+      # Cache the active key; revoke the other (revoke bumps its generation once).
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(active_raw)
+      {:ok, _} = Auth.revoke_api_key(revoked_ak)
+      revoked_gen_before = ApiKeyCache.generation(revoked_ak.key_hash)
+      active_gen_before = ApiKeyCache.generation(active_ak.key_hash)
+
+      # A tenant mutation fans out invalidation. With the revoked filter (finding-2),
+      # only the ACTIVE key's generation advances; the revoked key — never cached, so
+      # never needing a bust — is excluded, capping the fan-out under Epic 33's
+      # accumulation of revoked ephemeral dispatch keys.
+      {:ok, _suspended} = Loopctl.Tenants.suspend_tenant(tenant)
+
+      assert ApiKeyCache.generation(revoked_ak.key_hash) == revoked_gen_before
+      assert ApiKeyCache.generation(active_ak.key_hash) > active_gen_before
     end
   end
 
@@ -311,8 +460,9 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
   end
 
   # Insert a dispatch row directly (uncast tenant_id/api_key_id) so we can exercise
-  # the Dispatches.revoke/2 cascade without the full mint ceremony.
-  defp dispatch_for(tenant_id, api_key_id) do
+  # the Dispatches.revoke/2 cascade without the full mint ceremony. `expires_at`
+  # defaults to the future; pass a past value to exercise the expired-dispatch sweep.
+  defp dispatch_for(tenant_id, api_key_id, expires_at \\ nil) do
     now = DateTime.utc_now()
 
     %Loopctl.Dispatches.Dispatch{}
@@ -321,7 +471,7 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
       api_key_id: api_key_id,
       role: :agent,
       lineage_path: [],
-      expires_at: DateTime.add(now, 3600, :second),
+      expires_at: expires_at || DateTime.add(now, 3600, :second),
       created_at: now
     })
     |> AdminRepo.insert!()

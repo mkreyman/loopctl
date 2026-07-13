@@ -75,6 +75,31 @@ defmodule Loopctl.Auth.ApiKeyCache do
   generation, so its `put` lands with a stale stamp and is never trusted — the
   next read reloads and rejects the revoked key.
 
+  ## Bounded memory — BOTH entry kinds self-evict
+
+  Two kinds of rows live in the table, and neither grows without bound:
+
+    * **Value entries** `{key_hash, value, generation, expires_at}` are
+      TTL-bounded — lazily missed on read past their expiry and actively swept.
+    * **Generation entries** `{{:gen, key_hash}, gen, reap_after}` are created
+      on the first `invalidate/1` of a `key_hash` and are the crux above, so
+      they cannot be deleted eagerly with the value: a bump must OUTLIVE any
+      in-flight read-through that snapshotted a pre-bump generation, or the
+      staleness race reopens. Instead each generation entry carries a
+      `reap_after` deadline set to `now + @gen_reap_grace_ms` on every bump. A
+      read-through is a single indexed AdminRepo SELECT (sub-second); the grace
+      is the value TTL plus a generous read-through margin, so by the time a
+      generation entry is reaped every value entry stamped before its last bump
+      has already TTL-expired — reaping resets the generation to the `0` default
+      only once no live entry could match it (proof: a matching stale value
+      would need stamp `0`, but a stamp-`0` value is only produced while the
+      generation entry is ABSENT, and it is present-and-un-reaped for the whole
+      grace window). A hot, repeatedly-revoked `key_hash` keeps its counter
+      (each bump refreshes `reap_after`); an idle one is swept. This caps the
+      generation-entry set to roughly the distinct `key_hash`es invalidated
+      within one grace window rather than every `key_hash` ever invalidated for
+      the node lifetime (US-33.3 technical-notes memory-bound requirement).
+
   ## Cross-node invalidation
 
   The table is `:named_table` (node-LOCAL); Erlang clustering does NOT share
@@ -111,6 +136,16 @@ defmodule Loopctl.Auth.ApiKeyCache do
   # invalidation is via the generation bump + PubSub; this is only the backstop.
   @ttl_ms Application.compile_env(:loopctl, [__MODULE__, :ttl_ms], :timer.seconds(60))
   @sweep_interval_ms :timer.seconds(30)
+
+  # Generation entries must OUTLIVE any in-flight read-through that captured a
+  # pre-bump generation, or the never-stale invariant reopens (see moduledoc
+  # "Bounded memory"). A read-through is one indexed AdminRepo SELECT (sub-second);
+  # we reap a generation entry only once it has been idle (un-bumped) for the value
+  # TTL PLUS this read-through margin, guaranteeing every value entry stamped before
+  # its last bump has already TTL-expired. Bumping refreshes the deadline so a
+  # repeatedly-invalidated key_hash keeps its counter; an idle counter is swept.
+  @gen_reap_margin_ms :timer.seconds(30)
+  @gen_reap_grace_ms @ttl_ms + @gen_reap_margin_ms
 
   # --- Client API ---
 
@@ -246,21 +281,28 @@ defmodule Loopctl.Auth.ApiKeyCache do
 
   # --- Private ---
 
-  # A key_hash's generation lives under a distinct `{:gen, key_hash}` 2-tuple key
-  # that a binary-`key_hash` `fetch/1` lookup can never match, so it never
-  # collides with a cached-value entry. Defaults to 0 for a hash never
-  # invalidated.
+  # A key_hash's generation lives under a distinct `{:gen, key_hash}` tuple key
+  # (a 3-tuple `{{:gen, key_hash}, gen, reap_after}`) that a binary-`key_hash`
+  # `fetch/1` lookup can never match, so it never collides with a cached-value
+  # entry. Defaults to 0 for a hash never invalidated.
   defp current_generation(key_hash) do
     case :ets.lookup(@table, {:gen, key_hash}) do
-      [{{:gen, ^key_hash}, gen}] -> gen
+      [{{:gen, ^key_hash}, gen, _reap_after}] -> gen
       [] -> 0
     end
   end
 
-  # Atomically increment the generation (creating it at 1 on first bump).
-  # `:ets.update_counter/4` is lock-free and serializes concurrent invalidations.
+  # Atomically increment the generation (creating it at 1 on first bump) and
+  # refresh its reap deadline so an actively-invalidated key_hash keeps its
+  # counter while an idle one is later swept (see moduledoc "Bounded memory").
+  # `:ets.update_counter/4` is lock-free and serializes concurrent invalidations;
+  # the default seeds a future `reap_after` so a freshly-created entry is never
+  # eligible for the sweep before its bump is observable.
   defp bump_generation(key_hash) do
-    :ets.update_counter(@table, {:gen, key_hash}, {2, 1}, {{:gen, key_hash}, 0})
+    reap_after = now_ms() + @gen_reap_grace_ms
+    gen = :ets.update_counter(@table, {:gen, key_hash}, {2, 1}, {{:gen, key_hash}, 0, reap_after})
+    :ets.update_element(@table, {:gen, key_hash}, {3, reap_after})
+    gen
   end
 
   # Monotonic clock (not affected by wall-clock jumps) for TTL comparisons.
@@ -327,12 +369,22 @@ defmodule Loopctl.Auth.ApiKeyCache do
   end
 
   # Actively evict expired entries so cached auth material does not linger past
-  # the TTL. Only the 4-tuple value entries carry an expiry; the 2-tuple
-  # `{:gen, _}` generation entries never match this head.
+  # the TTL, AND reap generation entries idle beyond their bump grace so they do
+  # not accumulate for the node lifetime (see moduledoc "Bounded memory").
+  #
+  #   * Value entries `{key_hash, value, gen, expires_at}` (4-tuple) evict once
+  #     `expires_at <= now`.
+  #   * Generation entries `{{:gen, key_hash}, gen, reap_after}` (3-tuple, tuple
+  #     key) reap once `reap_after <= now` — only after the value TTL + margin
+  #     since the last bump, so the never-stale invariant is preserved.
+  #
+  # The heads are disjoint (4-tuple binary key vs 3-tuple `{:gen, _}` key), so
+  # neither spec ever matches the other kind.
   defp sweep_expired do
     now = now_ms()
-    match_spec = [{{:_, :_, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
-    :ets.select_delete(@table, match_spec)
+    value_spec = [{{:_, :_, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
+    gen_spec = [{{{:gen, :_}, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
+    :ets.select_delete(@table, value_spec) + :ets.select_delete(@table, gen_spec)
   rescue
     ArgumentError -> 0
   end

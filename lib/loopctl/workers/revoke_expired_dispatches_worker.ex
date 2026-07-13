@@ -44,24 +44,36 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
           from(d in Dispatch, where: d.id in ^dispatch_ids)
           |> AdminRepo.update_all(set: [revoked_at: now])
 
-        revoke_keys(key_ids, now)
+        key_hashes = revoke_keys(key_ids, now)
 
         Logger.info("RevokeExpiredDispatchesWorker: revoked #{d_count} expired dispatches")
+
+        key_hashes
       end)
 
     # SECURITY (AC-33.3.2): the update_all cascade bypasses changesets, so bust the
-    # api-key cache explicitly for every revoked key_hash AFTER commit. The expired
-    # dispatch query selects only {id, api_key_id} (no key_hash), so resolve the
-    # hashes for the revoked key_ids and invalidate each cluster-wide.
-    if match?({:ok, _}, result), do: Auth.invalidate_key_cache_by_ids(key_ids)
+    # api-key cache explicitly for every revoked key_hash AFTER commit. The hashes
+    # came back from the revoke statement itself (`select: k.key_hash`), so no
+    # second AdminRepo lookup competes for the pool this cache relieves (US-33.3,
+    # finding-4 remediation).
+    case result do
+      {:ok, key_hashes} -> Auth.invalidate_key_cache_by_hashes(key_hashes)
+      _ -> :ok
+    end
 
     result
   end
 
-  defp revoke_keys([], _now), do: :ok
+  defp revoke_keys([], _now), do: []
 
   defp revoke_keys(key_ids, now) do
-    from(k in ApiKey, where: k.id in ^key_ids and is_nil(k.revoked_at))
-    |> AdminRepo.update_all(set: [revoked_at: now])
+    {_count, key_hashes} =
+      from(k in ApiKey,
+        where: k.id in ^key_ids and is_nil(k.revoked_at),
+        select: k.key_hash
+      )
+      |> AdminRepo.update_all(set: [revoked_at: now])
+
+    key_hashes
   end
 end

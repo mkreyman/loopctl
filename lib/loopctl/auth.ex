@@ -193,7 +193,22 @@ defmodule Loopctl.Auth do
   def invalidate_key_cache_by_ids(ids) when is_list(ids) do
     from(ak in ApiKey, where: ak.id in ^ids, select: ak.key_hash)
     |> AdminRepo.all()
-    |> Enum.each(&ApiKeyCache.invalidate_cluster/1)
+    |> invalidate_key_cache_by_hashes()
+  end
+
+  @doc """
+  Busts the api-key cache entry for each `key_hash` in `hashes`, cluster-wide.
+
+  The zero-round-trip counterpart to `invalidate_key_cache_by_ids/1`: cascade
+  writers that revoke keys via `update_all` can select the `key_hash`es back in
+  the SAME statement (`select: k.key_hash` / `returning`), so invalidation needs
+  NO second `AdminRepo` lookup on the very pool the cache exists to relieve.
+  Prefer this over `invalidate_key_cache_by_ids/1` whenever the hashes are
+  already in hand (US-33.3, finding-4 remediation).
+  """
+  @spec invalidate_key_cache_by_hashes([binary()]) :: :ok
+  def invalidate_key_cache_by_hashes(hashes) when is_list(hashes) do
+    Enum.each(hashes, &ApiKeyCache.invalidate_cluster/1)
   end
 
   @doc """
@@ -210,9 +225,21 @@ defmodule Loopctl.Auth do
   """
   @spec invalidate_tenant_key_cache(Ecto.UUID.t()) :: :ok
   def invalidate_tenant_key_cache(tenant_id) when is_binary(tenant_id) do
-    from(ak in ApiKey, where: ak.tenant_id == ^tenant_id, select: ak.key_hash)
+    # Only ACTIVE keys are ever cached: `verify_api_key/1` caches solely positive
+    # resolutions, and `load_active_api_key/1` excludes revoked/expired rows. So
+    # scope the fan-out to `is_nil(revoked_at)` — invalidating a revoked key_hash
+    # is pure waste (a generation bump no live entry references), and in Epic 33's
+    # dispatch pattern revoked ephemeral keys accumulate per tenant without bound,
+    # which would otherwise fan one `invalidate_cluster` cast + PubSub broadcast
+    # out over tens of thousands of dead hashes on every tenant mutation
+    # (US-33.3, finding-2 remediation). Strictly correct: a revoked key is never
+    # cached, so it never needs busting.
+    from(ak in ApiKey,
+      where: ak.tenant_id == ^tenant_id and is_nil(ak.revoked_at),
+      select: ak.key_hash
+    )
     |> AdminRepo.all()
-    |> Enum.each(&ApiKeyCache.invalidate_cluster/1)
+    |> invalidate_key_cache_by_hashes()
   end
 
   @doc """

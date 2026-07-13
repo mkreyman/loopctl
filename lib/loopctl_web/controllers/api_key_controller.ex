@@ -195,16 +195,35 @@ defmodule LoopctlWeb.ApiKeyController do
       agent_id: old_key.agent_id
     }
 
-    Loopctl.AdminRepo.transaction(fn ->
-      expires_at = DateTime.add(DateTime.utc_now(), grace_hours * 3600, :second)
+    result =
+      Loopctl.AdminRepo.transaction(fn ->
+        expires_at = DateTime.add(DateTime.utc_now(), grace_hours * 3600, :second)
 
-      with {:ok, {raw_key, new_key}} <- Auth.generate_api_key(new_attrs),
-           {:ok, updated_old} <- Auth.expire_api_key(old_key, expires_at) do
-        {raw_key, new_key, updated_old}
-      else
-        {:error, reason} -> Loopctl.AdminRepo.rollback(reason)
-      end
-    end)
+        with {:ok, {raw_key, new_key}} <- Auth.generate_api_key(new_attrs),
+             {:ok, updated_old} <- Auth.expire_api_key(old_key, expires_at) do
+          {raw_key, new_key, updated_old}
+        else
+          {:error, reason} -> Loopctl.AdminRepo.rollback(reason)
+        end
+      end)
+
+    # SECURITY (US-33.3): `generate_api_key`/`expire_api_key` bust the cache
+    # in-band, but here that runs INSIDE the transaction (pre-commit). A
+    # concurrent `verify_api_key/1` of the OLD key can, on a separate pooled
+    # connection under READ COMMITTED, still read the not-yet-committed active old
+    # row and repopulate the cache stamped with the pre-commit generation — which
+    # would then authenticate the just-rotated-out key until the TTL (acute when
+    # grace <= 0 expires it immediately). Re-invalidate BOTH key_hashes AFTER the
+    # transaction commits so any such stale repopulation is rejected on the very
+    # next request (mirrors the post-commit invalidation in `Dispatches.revoke/2`).
+    case result do
+      {:ok, {_raw, new_key, updated_old}} ->
+        Auth.invalidate_key_cache_by_ids([new_key.id, updated_old.id])
+        result
+
+      _ ->
+        result
+    end
   end
 
   defp creation_json(raw_key, api_key) do
