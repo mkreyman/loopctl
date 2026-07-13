@@ -19,6 +19,15 @@ capacity (this already distorted the #172 fix, which avoided a per-request
 transaction to dodge starvation). Splitting them onto separate physical pools
 removes that coupling and gives US-27.4/27.6b a clean pool-level lever.
 
+**US-33.6 (re-derived, no rebalance shipped):** a Repo 10 -> 7 / AdminRepo 3 -> 6
+shift was investigated on the premise that the auth hot path runs ~5 AdminRepo
+queries/request while Repo sits idle. That premise no longer holds: US-33.3's ETS
+read-through api-key cache + US-33.4's debounced touch-writes already make the auth
+hot path net ZERO AdminRepo statements per request, and the Repo pool is shared with
+Oban's 38-wide queue concurrency, so it is not idle either. The defaults above are
+UNCHANGED from US-27.11 pending real US-33.1 checkout-wait data — do not assume a
+rebalance landed just because the story is closed.
+
 ### `HEAVY_READ_POOL_SIZE` (K) — sizing rationale (AC-27.11.1)
 
 Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while

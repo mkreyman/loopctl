@@ -22,12 +22,18 @@ defmodule Loopctl.DbCapacity do
 
   # Production default pool sizes = the env-var defaults in config/runtime.exs.
   #
-  # US-33.6: rebalanced toward the AdminRepo hot path (every authenticated request runs
-  # ~5 AdminRepo queries, 2 writes, on this BYPASSRLS pool) while the RLS Repo pool sat
-  # nearly idle. Conservative, budget-neutral shift: AdminRepo 3 -> 6, Repo 10 -> 7 (cedes
-  # idle headroom), HeavyReadRepo untouched. per_node_total/peak_total/max_supported_nodes
-  # are unchanged (21/67/3) — see the sizing comment in config/runtime.exs.
-  @prod_pool_sizes %{repo: 7, admin_repo: 6, heavy_read_repo: 8}
+  # US-33.6 (re-derived — no rebalance shipped): a Repo 10 -> 7 / AdminRepo 3 -> 6
+  # rebalance was proposed on the premise that "every authenticated request runs ~5
+  # AdminRepo queries on the hot path while Repo sits idle." That premise does not
+  # hold against the current codebase: US-33.3's ETS read-through api-key cache
+  # (`Loopctl.Auth.ApiKeyCache`) plus US-33.4's debounced touch-writes
+  # (`Loopctl.TouchBuffer`) already make the auth hot path net ZERO AdminRepo
+  # statements per request, and the Repo pool is NOT idle — Oban's 38-wide queue
+  # concurrency (`Loopctl.ObanConfig`) shares it alongside web RLS traffic. With
+  # US-33.1's checkout-wait metrics not yet conclusively populated in prod, sizes
+  # stay at their US-27.11 defaults pending real data — see the full rationale in
+  # the sizing comment in config/runtime.exs.
+  @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
 
   # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s reads + a reserve for long-held
   # streamed-export checkouts (US-27.16). fast + reserve == the pool size.
