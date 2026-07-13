@@ -124,7 +124,15 @@ config :loopctl, :heavy_read_statement_timeout_overrides, %{
   # aggressive 250ms pool default under parallel contention AND avoids a successful
   # low-timeout SET LOCAL persisting into the enclosing sandbox transaction. No test
   # asserts a :memory_recall timeout, so this cannot mask a real one.
-  memory_recall: 5_000
+  memory_recall: 5_000,
+  # US-34.6: the GET /knowledge/ingestion-jobs COUNT + list over the Oban-owned
+  # oban_jobs table (Loopctl.HeavyRead.opts(:ingestion_jobs)). Sub-ms on the small
+  # sandbox dataset, but a generous 5s override keeps it off the aggressive 250ms
+  # pool default under parallel contention AND avoids a successful low-timeout SET
+  # LOCAL persisting into the enclosing sandbox transaction (same rationale as
+  # :llm_usage/:memory_recall). No test asserts an :ingestion_jobs timeout, so this
+  # cannot mask a real one.
+  ingestion_jobs: 5_000
 }
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).

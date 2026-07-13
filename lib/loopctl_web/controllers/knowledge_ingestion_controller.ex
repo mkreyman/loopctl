@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.HeavyRead
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
@@ -575,10 +576,28 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
     base = if since, do: where(base, [j], j.inserted_at > ^since), else: base
 
-    total =
-      base |> select([j], count(j.id)) |> Loopctl.Repo.one()
+    # Route the COUNT + paginated list through HeavyRead so each query runs under a
+    # per-read `SET LOCAL statement_timeout` on the dedicated heavy-read pool (US-34.6):
+    # a pathological seq-scan COUNT over the ever-growing Oban-owned `oban_jobs` table
+    # can't run unbounded on the request path. Mirrors the `Loopctl.Llm` usage-summary
+    # pattern (a heavy count + paginated rows over a large table). The `oban_jobs` source
+    # is the SCHEMALESS string table `from(j in "oban_jobs")` (schema `nil` → HeavyRead's
+    # structural guard classifies it as `:other` and passes WITHOUT a tenant-equality
+    # check), and `oban_jobs` carries no RLS policy. So on this BYPASSRLS read path
+    # tenant scoping rests ENTIRELY on the `args->>'tenant_id' = ^tenant_id` fragment in
+    # `base` — there is no structural or RLS backstop. Do NOT weaken/parameterize that
+    # fragment. The regression guard for it is the tenant-isolation test in
+    # knowledge_ingestion_controller_test.exs ("tenant isolation" describe), which inserts
+    # BOTH tenants' rows directly and asserts the caller sees only its own; keep it green.
+    total_query = select(base, [j], count(j.id))
+    total = HeavyRead.one(tenant_id, total_query, HeavyRead.opts(:ingestion_jobs)) || 0
 
-    rows =
+    # The ORDER BY matches the trailing columns of the composite partial index
+    # oban_jobs_ingestion_tenant_idx ((args->>'tenant_id'), inserted_at DESC, id DESC)
+    # WHERE worker = ContentIngestionWorker (migration 20260713020000), so after the
+    # equality-matched tenant column the planner answers this ordered page with an ordered
+    # Index Scan feeding Limit — NO full Sort, even for a tenant with a large history.
+    rows_query =
       base
       |> order_by([j], desc: j.inserted_at, desc: j.id)
       |> limit(^limit)
@@ -591,7 +610,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         completed_at: j.completed_at,
         errors: j.errors
       })
-      |> Loopctl.Repo.all()
+
+    rows = HeavyRead.all(tenant_id, rows_query, HeavyRead.opts(:ingestion_jobs))
 
     %{data: rows, meta: %{limit: limit, offset: offset, total_count: total}}
   end

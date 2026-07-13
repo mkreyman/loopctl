@@ -692,7 +692,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
     end
 
     test "paginates with limit/offset + meta, and never caps or rejects (no hard 50)",
-         %{conn: conn} do
+         %{conn: _conn} do
       tenant = keyed_tenant()
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
@@ -700,6 +700,10 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # timing dependence) with distinct inserted_at so paging order is stable.
       now = DateTime.utc_now()
 
+      # Insert via AdminRepo: the count/list is routed through HeavyRead, which in
+      # tests reads on AdminRepo (config/test.exs), so the setup rows must share that
+      # sandbox transaction (same path every fixture uses). In prod both repos hit the
+      # same DB, so Repo-written Oban jobs are visible to the heavy-read pool.
       for n <- 1..3 do
         %Oban.Job{
           worker: "Loopctl.Workers.ContentIngestionWorker",
@@ -708,7 +712,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           args: %{"tenant_id" => tenant.id, "source_type" => "newsletter", "n" => n},
           inserted_at: DateTime.add(now, -n, :second)
         }
-        |> Loopctl.Repo.insert!()
+        |> Loopctl.AdminRepo.insert!()
       end
 
       page1 =
@@ -763,21 +767,40 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
   # --- Tenant isolation ---
 
   describe "tenant isolation" do
+    # LOAD-BEARING SCOPING REGRESSION GUARD (US-34.6). The COUNT + list run on the
+    # BYPASSRLS heavy-read pool via HeavyRead.one/all, and the base query's source is
+    # the SCHEMALESS `from(j in "oban_jobs")` string table — so HeavyRead's structural
+    # tenant-guard classifies it `:other` and auto-passes WITHOUT a tenant-equality
+    # check, and `oban_jobs` carries no RLS policy. Tenant isolation therefore rests
+    # ENTIRELY on the `args->>'tenant_id' = ^tenant_id` fragment in `list_ingestion_jobs/2`
+    # (controller). This test (and its `total_count` sibling below) is the ONLY mechanism
+    # that would catch a future edit weakening/parameterizing that fragment — keep it
+    # inserting BOTH tenants' rows directly so it fails if the predicate ever leaks.
     test "tenant A cannot see tenant B's ingestion jobs", %{conn: conn} do
       tenant_a = keyed_tenant()
       tenant_b = keyed_tenant()
       {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
-      {raw_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})
 
-      # Create job for tenant B
-      build_conn()
-      |> auth_conn(raw_key_b)
-      |> post(~p"/api/v1/knowledge/ingest", %{
-        content: "Content for tenant B",
-        source_type: "newsletter"
-      })
+      now = DateTime.utc_now()
 
-      # Tenant A should not see tenant B's jobs
+      # Insert ingestion-job rows for BOTH tenants directly via AdminRepo. `testing:
+      # :inline` (config/test.exs) runs the worker synchronously and persists NO
+      # oban_jobs row, so a POST /ingest would leave the table empty and make this
+      # assertion vacuous — insert deterministic rows on the same sandbox connection
+      # HeavyRead reads from (AdminRepo in tests) instead.
+      for {tenant, count} <- [{tenant_a, 2}, {tenant_b, 3}], n <- 1..count do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "source_type" => "newsletter", "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      # Tenant A should not see ANY of tenant B's jobs, even though B's 3 rows exist
+      # in the same table on the BYPASSRLS read connection.
       conn =
         conn
         |> auth_conn(raw_key_a)
@@ -791,6 +814,158 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         end)
 
       assert tenant_b_jobs == []
+      # A sees exactly its own 2 rows — not the 5 total on the connection.
+      assert length(body["data"]) == 2
+      assert body["meta"]["total_count"] == 2
+    end
+
+    test "total_count reflects ONLY the caller's tenant (deterministic direct-insert)",
+         %{conn: conn} do
+      tenant_a = keyed_tenant()
+      tenant_b = keyed_tenant()
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      now = DateTime.utc_now()
+
+      # 2 ingestion jobs for A, 3 for B — inserted directly for a deterministic count
+      # (the HeavyRead-routed COUNT now runs on AdminRepo, which shares the sandbox
+      # connection, so these rows are visible).
+      for {tenant, count} <- [{tenant_a, 2}, {tenant_b, 3}], n <- 1..count do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key_a)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs")
+        |> json_response(200)
+
+      # A sees ONLY its own 2 jobs — never the 5 total — proving the
+      # `args->>'tenant_id' = caller` scoping holds through the HeavyRead-routed COUNT
+      # and list (B's 3 rows are present in the same table but excluded).
+      assert body["meta"]["total_count"] == 2
+      assert length(body["data"]) == 2
+    end
+  end
+
+  # --- Partial index backing the COUNT/list (AC-34.6.1) ---
+
+  describe "oban_jobs_ingestion_tenant_idx partial index (AC-34.6.1)" do
+    test "the composite partial expression index exists with the expected predicate" do
+      %{rows: rows} =
+        Loopctl.AdminRepo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = $1",
+          ["oban_jobs_ingestion_tenant_idx"]
+        )
+
+      assert [[indexdef]] = rows,
+             "expected oban_jobs_ingestion_tenant_idx to exist; migration did not run"
+
+      # Indexes the args->>'tenant_id' expression, partial to the ingestion worker.
+      assert indexdef =~ "args ->> 'tenant_id'"
+      assert indexdef =~ "Loopctl.Workers.ContentIngestionWorker"
+
+      # COMPOSITE shape (migration 20260713020000): the ORDER BY columns follow the
+      # equality-matched tenant column so the ordered list is answered by an ordered
+      # index scan (no full Sort). Pins the shape so a regression to the single-column
+      # index — which would reintroduce the sort-heavy ordered list — fails here.
+      assert indexdef =~ "inserted_at DESC"
+      assert indexdef =~ "id DESC"
+    end
+
+    test "the planner chooses the partial index for the real ingestion COUNT predicate" do
+      tenant = keyed_tenant()
+      now = DateTime.utc_now()
+
+      for n <- 1..5 do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      # On the tiny sandbox dataset the planner prefers a seq scan purely on row count,
+      # so an unqualified EXPLAIN can't assert plan shape (the AC-34.6.1 gap the raw
+      # finding flagged). Disable seq scan for THIS transaction so the assertion tests
+      # index ELIGIBILITY — does the partial index actually back the real predicate
+      # (`worker = 'Loopctl.Workers.ContentIngestionWorker' AND args->>'tenant_id' = $1`)?
+      # If the index were dropped or its expression/predicate no longer matched, the
+      # planner would fall back to a seq scan even with it disabled and this would fail.
+      Loopctl.AdminRepo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Loopctl.AdminRepo.query!(
+          """
+          EXPLAIN (FORMAT TEXT)
+          SELECT count(id) FROM oban_jobs
+          WHERE worker = 'Loopctl.Workers.ContentIngestionWorker'
+            AND args->>'tenant_id' = $1
+          """,
+          [tenant.id]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "oban_jobs_ingestion_tenant_idx",
+             "expected EXPLAIN to use the partial index, got:\n#{plan}"
+    end
+
+    test "the composite index answers the ordered list page without a full Sort" do
+      tenant = keyed_tenant()
+      now = DateTime.utc_now()
+
+      for n <- 1..5 do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      # Same eligibility technique as the COUNT test: on the tiny sandbox dataset the
+      # planner would seq-scan + Sort purely on row count, so disable seq scan for THIS
+      # transaction and assert the composite partial index oban_jobs_ingestion_tenant_idx
+      # ((args->>'tenant_id'), inserted_at DESC, id DESC) can SUPPLY the ORDER BY — the
+      # ordered page is an Index Scan feeding Limit with NO Sort node. If the index
+      # regressed to single-column (no ordering columns), the planner would need a full
+      # Sort even with seq scan disabled and this would fail — the regression guard for
+      # US-34.6's "ordered list stays a range scan, not a sort" finding.
+      Loopctl.AdminRepo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Loopctl.AdminRepo.query!(
+          """
+          EXPLAIN (FORMAT TEXT)
+          SELECT id, state, args, inserted_at, completed_at, errors FROM oban_jobs
+          WHERE worker = 'Loopctl.Workers.ContentIngestionWorker'
+            AND args->>'tenant_id' = $1
+          ORDER BY inserted_at DESC, id DESC
+          LIMIT 20 OFFSET 0
+          """,
+          [tenant.id]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "oban_jobs_ingestion_tenant_idx",
+             "expected the ordered list EXPLAIN to use the composite index, got:\n#{plan}"
+
+      refute plan =~ "Sort",
+             "expected the composite index to supply the ORDER BY (no Sort node), got:\n#{plan}"
     end
   end
 end
