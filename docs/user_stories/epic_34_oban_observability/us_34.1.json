@@ -1,0 +1,52 @@
+{
+  "id": "US-34.1",
+  "title": "Oban queue/state gauges + :executing orphan gauge (Prometheus); add Reindexer, pin Stager",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "The measurement layer — nothing currently exports ANY Oban queue/state/orphan metric. Prerequisite for US-34.2 (health) and US-34.3 (alerts).",
+  "background": {
+    "reference": "GH #349. config/config.exs:276-329 (Oban: Cron + Lifeline + Pruner present; no Stager pinned, no Reindexer). No Oban metrics exist — ScaleMetrics.scale_metrics/0 (lib/loopctl/telemetry/scale_metrics.ex:111-214) has 7 metrics, none Oban. periodic_measurements/0 (lib/loopctl_web/telemetry.ex:152-157) has one poller (refresh_tenant_label_gate).",
+    "includes": "Lifeline RESCUES orphaned :executing jobs but nothing MEASURES them; there is no per-queue depth or per-state count. A stalled queue is invisible until an incident. The 17-day/110-orphan stall was undetectable for days."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "export per-queue / per-state Oban job counts and an :executing-older-than-N-minutes orphan gauge to Prometheus, and pin Stager + add the Reindexer plugin",
+    "so_that": "a stalled queue, a growing backlog, or an orphan pile-up is visible on a dashboard within one poll interval instead of surfacing days later as an outage"
+  },
+  "rationale": "Oban's own state lives in oban_jobs, but loopctl exports none of it, so the exact failure that motivated Lifeline (jobs stuck :executing) is still invisible to monitoring. A cheap periodic GROUP BY poll plus an orphan-age gauge turns the queue into an observable system; adding Reindexer keeps the oban_jobs indexes from bloating under churn, and pinning Stager removes reliance on the implicit default.",
+  "acceptance_criteria": [
+    { "id": "AC-34.1.1", "description": "A periodic poller (added to telemetry periodic_measurements or a supervised GenServer) runs `SELECT state, count(*) FROM oban_jobs GROUP BY state` (and optionally by queue) on a bounded interval and emits a telemetry measurement; ScaleMetrics exports it as a per-state (and/or per-queue) gauge. Tag cardinality is bounded (state is a small fixed set; queue is a small fixed set) — NEVER tenant/args-derived tags.", "status": "pending" },
+    { "id": "AC-34.1.2", "description": "An orphan gauge counts jobs in state `executing` whose `attempted_at` is older than N minutes (config, e.g. > the Lifeline rescue_after window) — the signal that Lifeline is falling behind or a job is wedged. Exported as a gauge.", "status": "pending" },
+    { "id": "AC-34.1.3", "description": "The poll uses a single lightweight query on a bounded interval (config), runs on a read path (HeavyRead or Repo with a short timeout) so it can't itself saturate a pool, and is defensive (a poll error logs + skips, never crashes the poller).", "status": "pending" },
+    { "id": "AC-34.1.4", "description": "`{Oban.Plugins.Reindexer, ...}` is added to the Oban plugins list (default schedule) so oban_jobs indexes are periodically rebuilt; Stager is explicitly listed (or a comment documents the default is intentionally relied upon). No change to Lifeline/Pruner/Cron.", "status": "pending" },
+    { "id": "AC-34.1.5", "description": "Purely additive observability + plugin config; no job semantics change. Metrics are global infra (not tenant-scoped); a cardinality test asserts bounded tags.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.1.1", "name": "per-state gauge is emitted", "type": "integration",
+      "preconditions": ["oban_jobs rows in a couple of states (available, completed) via fixtures/inserts"],
+      "steps": ["invoke the poller measurement fn"],
+      "expected_results": ["a telemetry measurement/gauge reflects the per-state counts; the metric is defined in metrics/0 with bounded tags"], "status": "pending" },
+    { "id": "TC-34.1.2", "name": "orphan gauge counts stuck executing jobs", "type": "integration",
+      "preconditions": ["one oban_jobs row state=executing, attempted_at older than the orphan threshold; one recent executing"],
+      "steps": ["invoke the orphan measurement"],
+      "expected_results": ["orphan gauge = 1 (only the stale one)"], "status": "pending" },
+    { "id": "TC-34.1.3", "name": "poller is defensive on query error", "type": "unit",
+      "preconditions": ["simulate the poll query raising"],
+      "steps": ["invoke the poller"],
+      "expected_results": ["logs + returns without crashing; no metric corruption"], "status": "pending" },
+    { "id": "TC-34.1.4", "name": "Reindexer present in plugins", "type": "unit",
+      "preconditions": [],
+      "steps": ["read the Oban plugins config"],
+      "expected_results": ["Oban.Plugins.Reindexer is configured; Lifeline+Pruner unchanged"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Files: lib/loopctl/telemetry/scale_metrics.ex (metric defs), lib/loopctl_web/telemetry.ex (periodic_measurements / poller), config/config.exs (plugins).",
+    "Query oban_jobs directly (it's not an Ecto schema) via a raw fragment; run on HeavyRead or Repo with SET LOCAL statement_timeout (per-query, never a startup :parameter — pgbouncer-safe).",
+    "Bounded tags only (state, queue). Cardinality is the multi-tenant risk — test it.",
+    "Config-based DI for intervals/thresholds; no Application.put_env in tests.",
+    "Reindexer default schedule is fine; document the choice."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 300000
+}

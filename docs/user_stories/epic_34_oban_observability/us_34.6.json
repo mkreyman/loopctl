@@ -1,0 +1,47 @@
+{
+  "id": "US-34.6",
+  "title": "Bound GET /knowledge/ingestion-jobs: index the args->>'tenant_id' COUNT + route through HeavyRead with a statement_timeout",
+  "epic": { "id": "epic_34", "name": "Oban Resilience, Retention & Observability" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "An unbounded COUNT(*) over unindexed JSONB on the growing oban_jobs table, on the request path — a slow query that worsens with history.",
+  "background": {
+    "reference": "GH #349. LoopctlWeb.KnowledgeIngestionController.list_ingestion_jobs/2 (lib/loopctl_web/controllers/knowledge_ingestion_controller.ex:562-597): `from(j in \"oban_jobs\", where: worker == ContentIngestionWorker and args->>'tenant_id' = ^tenant_id)` then `select count(j.id) |> Repo.one` over ALL matching history (since_days defaults nil). No oban_jobs index exists (grep of priv/repo/migrations → none). Runs on Repo, no HeavyRead, no statement_timeout.",
+    "includes": "Every ingestion-jobs list call seq-scans oban_jobs filtering by a JSONB field with no supporting index and COUNTs the entire matching history — a per-request cost that grows unbounded as oban_jobs grows (bounded only by Pruner's 7-day terminal retention)."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "back the ingestion-jobs count with a supporting index and run it through HeavyRead with a statement_timeout",
+    "so_that": "the endpoint uses an index range scan with a hard time bound instead of an unbounded seq-scan COUNT that degrades as oban_jobs grows"
+  },
+  "rationale": "The endpoint's COUNT(*) over an unindexed JSONB predicate on the ever-growing oban_jobs table is a classic slow-query-on-the-request-path that gets worse over time and can tie up a connection. An expression/partial index matching the exact predicate turns it into a range scan, and routing through HeavyRead with a bounded statement_timeout caps the worst case so a heavy history can't stall a request pool.",
+  "acceptance_criteria": [
+    { "id": "AC-34.6.1", "description": "An online (CONCURRENTLY, @disable_ddl_transaction) expression/partial index supports the query predicate — e.g. an index on oban_jobs over ((args->>'tenant_id')) filtered to worker = 'Loopctl.Workers.ContentIngestionWorker' (partial), so both the filter and count use it. EXPLAIN shows an index scan, not a seq scan. (Alternatively, a dedicated ingestion_jobs projection table — but prefer the index for minimal blast radius.)", "status": "pending" },
+    { "id": "AC-34.6.2", "description": "The count/list query is routed through HeavyRead (or Repo) with a per-query SET LOCAL statement_timeout so a pathological count can't run unbounded; on timeout it fails closed with a clean error (not a 500 that leaks), or returns a bounded/approximate result documented as such.", "status": "pending" },
+    { "id": "AC-34.6.3", "description": "Tenant isolation preserved: the query still filters to the caller's tenant_id (via args->>'tenant_id' with the caller's tenant); no cross-tenant job leakage. pgbouncer-safe: statement_timeout is a per-query SET LOCAL, never a startup :parameter.", "status": "pending" },
+    { "id": "AC-34.6.4", "description": "Response shape/pagination unchanged (limit/offset + meta, no hard 50 cap — matching the existing tested contract); only the query cost characteristics change.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-34.6.1", "name": "ingestion-jobs list still returns the tenant's jobs, paginated", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "several ContentIngestionWorker oban_jobs with args tenant_id = tenant.id"],
+      "steps": ["GET /api/v1/knowledge/ingestion-jobs with limit/offset"],
+      "expected_results": ["returns the tenant's jobs with correct pagination + meta; count reflects the tenant's jobs"], "status": "pending" },
+    { "id": "TC-34.6.2", "name": "tenant isolation", "type": "integration",
+      "preconditions": ["tenant_a and tenant_b each with ingestion jobs"],
+      "steps": ["GET ingestion-jobs as tenant_a"],
+      "expected_results": ["only tenant_a's jobs/count; tenant_b never appears"], "status": "pending" },
+    { "id": "TC-34.6.3", "name": "index supports the predicate", "type": "integration",
+      "preconditions": ["the partial/expression index migrated"],
+      "steps": ["EXPLAIN the count query (test asserts behavior parity; index usage is a planner concern verified via EXPLAIN in the migration/PR)"],
+      "expected_results": ["query returns correct counts; index exists"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Controller: lib/loopctl_web/controllers/knowledge_ingestion_controller.ex:562-597. Migration: new online migration (CONCURRENTLY, @disable_ddl_transaction, DROP INDEX CONCURRENTLY IF EXISTS before CREATE) adding the partial/expression index on oban_jobs.",
+    "Index note: oban_jobs is Oban-owned; a partial index on ((args->>'tenant_id')) WHERE worker='Loopctl.Workers.ContentIngestionWorker' is low-risk and reversible. Confirm it doesn't conflict with Oban's own indexes.",
+    "HeavyRead + SET LOCAL statement_timeout per query (pgbouncer-safe); the config_pgbouncer_safe_parameters guard must still pass.",
+    "Preserve the existing 'no hard 50 cap' pagination contract (there is a test for it).",
+    "This is the one migration in Epic 34 — keep it online; oban_jobs is a hot table."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 280000
+}
