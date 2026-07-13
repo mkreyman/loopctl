@@ -582,8 +582,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
     # can't run unbounded on the request path. Mirrors the `Loopctl.Llm` usage-summary
     # pattern (a heavy count + paginated rows over a large table). The `oban_jobs` source
     # is the SCHEMALESS string table `from(j in "oban_jobs")` (schema `nil` → HeavyRead's
-    # structural guard classifies it as `:other` and passes); tenant scoping is enforced
-    # by the `args->>'tenant_id' = ^tenant_id` fragment in `base`, exactly as before.
+    # structural guard classifies it as `:other` and passes WITHOUT a tenant-equality
+    # check), and `oban_jobs` carries no RLS policy. So on this BYPASSRLS read path
+    # tenant scoping rests ENTIRELY on the `args->>'tenant_id' = ^tenant_id` fragment in
+    # `base` — there is no structural or RLS backstop. Do NOT weaken/parameterize that
+    # fragment. The regression guard for it is the tenant-isolation test in
+    # knowledge_ingestion_controller_test.exs ("tenant isolation" describe), which inserts
+    # BOTH tenants' rows directly and asserts the caller sees only its own; keep it green.
     total_query = select(base, [j], count(j.id))
     total = HeavyRead.one(tenant_id, total_query, HeavyRead.opts(:ingestion_jobs)) || 0
 
