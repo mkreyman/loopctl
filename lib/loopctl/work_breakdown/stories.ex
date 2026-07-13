@@ -17,6 +17,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
@@ -268,6 +269,13 @@ defmodule Loopctl.WorkBreakdown.Stories do
   - `:epic_id` -- filter to a specific epic within the project
   - `:limit` -- max stories to return (default 100, max 500)
   - `:offset` -- how many stories to skip (default 0)
+  - `:strategy` -- read-path selector, `:admin` | `:rls` (US-33.7 pilot). This is a
+    SECURITY-PATH selector: `:admin` reads through the BYPASSRLS `AdminRepo`,
+    `:rls` reads through the RLS `Repo` via `Repo.with_tenant/2`. It exists so the
+    release-gate tests can exercise BOTH paths without `Application.put_env`. When
+    OMITTED (the normal caller contract), the path is resolved from the default-OFF
+    `:rls_reroute_list_stories_by_project` flag at call time — production callers
+    should NOT pass `:strategy` and let the flag decide.
 
   ## Returns
 
@@ -285,24 +293,107 @@ defmodule Loopctl.WorkBreakdown.Stories do
     limit = opts |> Keyword.get(:limit, 100) |> max(1) |> min(500)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
-    base_query =
-      Story
-      |> where([s], s.tenant_id == ^tenant_id)
-      |> scope_by_project(project_id)
-      |> apply_project_filters(opts)
+    # US-33.7 pilot: pick the read path. Default is the BYPASSRLS `AdminRepo`
+    # (today's behavior). The `:strategy` opt is an explicit selector so both
+    # branches can be exercised in-test without `Application.put_env`; when it is
+    # absent the strategy is resolved from the default-OFF config flag at call time.
+    strategy = Keyword.get(opts, :strategy, default_list_stories_strategy())
+
+    list_stories_by_project(strategy, tenant_id, project_id, opts, limit, offset)
+  end
+
+  # Resolves the default `list_stories_by_project/3` read strategy from the
+  # default-OFF `:rls_reroute_list_stories_by_project` pilot flag (US-33.7).
+  #
+  # Public + `@doc false` so the resolution can be asserted directly: the
+  # flag-ON -> `:rls` branch is the ACTUAL production trigger (flag flipped on,
+  # caller passes no `:strategy`), yet every RLS release-gate test passes an
+  # explicit `strategy: :rls`, so without this seam that branch — and a
+  # config-key desync between config/config.exs and the `get_env` key below —
+  # would stay green while the prod flag silently no-ops on the AdminRepo path.
+  # The `no Application.put_env` constraint rules out flipping the live flag in a
+  # test, so the branch logic is factored into the pure, both-branch-testable
+  # `list_stories_strategy_for_flag/1`.
+  @doc false
+  @spec default_list_stories_strategy() :: :admin | :rls
+  def default_list_stories_strategy do
+    :loopctl
+    |> Application.get_env(:rls_reroute_list_stories_by_project, false)
+    |> list_stories_strategy_for_flag()
+  end
+
+  # Maps the `:rls_reroute_list_stories_by_project` pilot flag to a read strategy.
+  # Extracted so BOTH resolution branches are unit-testable without
+  # `Application.put_env` (config-based DI; the flag default lives in
+  # config/config.exs, the prod runtime override in config/runtime.exs).
+  @doc false
+  @spec list_stories_strategy_for_flag(boolean()) :: :admin | :rls
+  def list_stories_strategy_for_flag(true), do: :rls
+  def list_stories_strategy_for_flag(false), do: :admin
+
+  # AdminRepo path (default) — BYPASSRLS pool, unchanged from before the pilot.
+  defp list_stories_by_project(:admin, tenant_id, project_id, opts, limit, offset) do
+    base_query = project_stories_query(tenant_id, project_id, opts)
 
     total = AdminRepo.aggregate(base_query, :count, :id)
-
-    stories =
-      base_query
-      # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
-      # never skips or duplicates rows sharing a sort_key.
-      |> order_by([s], asc: s.sort_key, asc: s.id)
-      |> limit(^limit)
-      |> offset(^offset)
-      |> AdminRepo.all()
+    stories = base_query |> paginate_project_stories(limit, offset) |> AdminRepo.all()
 
     {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+  end
+
+  # RLS path fail-closed guard (AC-33.7.3 / TC-33.7.3): a missing or blank tenant
+  # context yields ZERO rows, never cross-tenant rows and never a leaking error.
+  # `Repo.with_tenant/2` guards `is_binary(tenant_id)`, and building the base query
+  # with a blank `tenant_id` against the `:binary_id` column would raise a
+  # CastError — so short-circuit BEFORE constructing or executing anything.
+  defp list_stories_by_project(:rls, tenant_id, _project_id, _opts, limit, offset)
+       when not is_binary(tenant_id) or tenant_id == "" do
+    {:ok, %{data: [], total: 0, limit: limit, offset: offset}}
+  end
+
+  # RLS path (US-33.7 pilot) — RLS `Repo` pool via `with_tenant/2`. RLS is the
+  # primary enforcement (`tenant_id = current_tenant_id()`); the explicit
+  # `where s.tenant_id == ^tenant_id` predicate in `project_stories_query/3` is kept
+  # as defense-in-depth (mirrors `ContextRetriever.Executor`). Both count and page
+  # run inside ONE tenant-scoped transaction.
+  #
+  # DB-error semantics: this fun never calls `Repo.rollback/1`, so `with_tenant/2`
+  # (a `Repo.transaction/1`) always returns `{:ok, {total, stories}}` on the happy
+  # path. A DB error inside `Repo.aggregate/2` or `Repo.all/1` RAISES `Postgrex.Error`,
+  # which rolls back and RE-RAISES out of the transaction — it propagates as a 500,
+  # exactly like the `:admin` path's uncaught `AdminRepo` calls. We deliberately do
+  # NOT swallow that into an empty page: masking a DB failure as "zero rows" would
+  # hide the error and could look like a (wrong) fail-closed. Fail LOUD, at parity
+  # with the AdminRepo path; RLS/tenant fail-closed is handled by the guard clause
+  # above and by RLS itself, not by catching DB errors here.
+  defp list_stories_by_project(:rls, tenant_id, project_id, opts, limit, offset) do
+    base_query = project_stories_query(tenant_id, project_id, opts)
+    page_query = paginate_project_stories(base_query, limit, offset)
+
+    {:ok, {total, stories}} =
+      Repo.with_tenant(tenant_id, fn ->
+        total = Repo.aggregate(base_query, :count, :id)
+        stories = Repo.all(page_query)
+        {total, stories}
+      end)
+
+    {:ok, %{data: stories, total: total, limit: limit, offset: offset}}
+  end
+
+  defp project_stories_query(tenant_id, project_id, opts) do
+    Story
+    |> where([s], s.tenant_id == ^tenant_id)
+    |> scope_by_project(project_id)
+    |> apply_project_filters(opts)
+  end
+
+  defp paginate_project_stories(query, limit, offset) do
+    query
+    # asc: s.id is a unique, deterministic tiebreaker so OFFSET pagination
+    # never skips or duplicates rows sharing a sort_key.
+    |> order_by([s], asc: s.sort_key, asc: s.id)
+    |> limit(^limit)
+    |> offset(^offset)
   end
 
   # --- Private helpers ---
