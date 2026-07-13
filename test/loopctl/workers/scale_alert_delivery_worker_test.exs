@@ -23,6 +23,13 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorkerTest do
 
   defp job(args), do: %Oban.Job{args: args}
 
+  describe "timeout/1 (review fix)" do
+    test "enforces the same 30s wall-clock cap as the sibling WebhookDeliveryWorker" do
+      assert ScaleAlertDeliveryWorker.timeout(job(%{"url" => @url, "payload" => @payload})) ==
+               :timer.seconds(30)
+    end
+  end
+
   describe "perform/1" do
     test "successful delivery returns :ok and delivers the exact JSON payload + headers" do
       expect(Loopctl.MockDelivery, :deliver, fn url, body, headers ->

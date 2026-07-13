@@ -408,6 +408,84 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
   end
 
+  describe "a dropped enqueue does not silence re-notify (review fix)" do
+    # Uses the `insert_fn` test seam (mirrors the existing `webhook_url`/`now_fn`
+    # per-instance overrides) to simulate `Oban.insert/1` itself failing or raising —
+    # distinct from the worker's OWN `perform/1` failing after a successful insert
+    # (covered by the "durable delivery via Oban" describe block above).
+    test "an Oban.insert {:error, _} keeps the breach 'due'; the very next evaluate retries" do
+      test_pid = self()
+
+      # Fail exactly the FIRST insert attempt, then delegate to the real Oban.insert/1.
+      failed_once? = :counters.new(1, [])
+
+      insert_fn = fn job ->
+        if :counters.get(failed_once?, 1) == 0 do
+          :counters.add(failed_once?, 1, 1)
+          {:error, %Ecto.Changeset{valid?: false}}
+        else
+          Oban.insert(job)
+        end
+      end
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+        send(test_pid, {:delivered, Jason.decode!(body)["metric"]})
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      table = :"scale_alerts_dropped_enqueue_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_dropped_enqueue_srv_#{System.unique_integer([:positive])}"
+
+      _pid =
+        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+          id: name
+        )
+
+      # Edge fire: the enqueue is dropped -> nothing is ever delivered for this tick, and
+      # (the bug this finding describes) `last_notified_at` must NOT have been stamped.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      refute_received {:delivered, _}
+
+      # Sustained breach, very next tick: with the fix, a `nil` last_notified_at while
+      # breaching means "never successfully notified" -> retried immediately (NOT after
+      # waiting out a full `renotify_interval_ms`, which defaults to 15 minutes). This
+      # time the insert succeeds and the alert is genuinely delivered.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      assert_received {:delivered, "db_statement_timeout_rate"}
+    end
+
+    test "an insert_fn that raises (DB unavailable) does not crash the GenServer" do
+      test_pid = self()
+
+      insert_fn = fn _job ->
+        raise DBConnection.ConnectionError, "connection not available"
+      end
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      table = :"scale_alerts_raise_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_raise_srv_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+          id: name
+        )
+
+      emit_timeout(6)
+      # The call itself must complete normally (not crash/timeout) — proving `deliver/3`
+      # rescued the raise instead of letting it propagate out of `handle_call(:evaluate)`.
+      assert :ok = ScaleAlerts.evaluate(name)
+
+      assert Process.alive?(pid)
+      refute_received :unexpected_delivery
+    end
+  end
+
   describe "bounded periodic re-notify while a breach is sustained (AC-34.5.2)" do
     test "re-fires once the re-notify interval elapses, stays silent before it, re-arms on clear" do
       test_pid = self()

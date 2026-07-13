@@ -68,7 +68,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   (US-34.5, AC-34.5.1): the payload is enqueued through Oban's `:webhooks` queue rather
   than POSTed synchronously in-process, so a transient failure retries with Oban's
   backoff instead of being logged-and-dropped. The worker resolves the SAME
-  `:webhook_delivery` DI (`Application.get_env(:loopctl, :webhook_delivery,
+  `:webhook_delivery` DI (`Application.compile_env(:loopctl, :webhook_delivery,
   Loopctl.Webhooks.ReqDelivery)`) the webhook worker uses. **No tenant content,
   vectors, bodies, params, or SQL ever appears in the payload.** When the URL is `nil`
   alerting is OFF (opt-in): the breach is logged at `:warning` synchronously and
@@ -308,6 +308,12 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
        # interval, same pattern as `webhook_url`/`now_fn` — lets a test cross the
        # interval quickly. Defaults to the (floored) configured value.
        renotify_interval_ms: Keyword.get(opts, :renotify_interval_ms, renotify_interval_ms()),
+       # Test seam (same pattern as `webhook_url`/`now_fn`): the function used to durably
+       # enqueue a `ScaleAlertDeliveryWorker` job. Defaults to `Oban.insert/1`. Lets a test
+       # deterministically simulate an enqueue failure (`{:error, _}`) or a raised
+       # connection error WITHOUT touching the real DB pool, to prove `last_notified_at`
+       # is only advanced on a genuine `{:ok, _}` enqueue (review fix, US-34.5).
+       insert_fn: Keyword.get(opts, :insert_fn, &Oban.insert/1),
        # Per-metric breach state for the edge-triggered fire + bounded re-notify
        # (US-34.5): `breaching?` false = armed; `last_notified_at` is the clock value
        # (per `now_fn`) of the last delivered notification, `nil` while armed.
@@ -406,7 +412,8 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
            breaching: breaching,
            webhook_url: url,
            now_fn: now_fn,
-           renotify_interval_ms: renotify_interval
+           renotify_interval_ms: renotify_interval,
+           insert_fn: insert_fn
          } = state
        ) do
     window = read_and_reset(table)
@@ -422,16 +429,25 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
     breaching =
       breaching
-      |> step(:timeout, timeout_rate, timeout_rate_threshold(), url, now, renotify_interval)
+      |> step(
+        :timeout,
+        timeout_rate,
+        timeout_rate_threshold(),
+        url,
+        now,
+        renotify_interval,
+        insert_fn
+      )
       |> step(
         :under_fill,
         under_fill_rate,
         under_fill_rate_threshold(),
         url,
         now,
-        renotify_interval
+        renotify_interval,
+        insert_fn
       )
-      |> step_p95(p95, p95_latency_threshold(), url, now, renotify_interval)
+      |> step_p95(p95, p95_latency_threshold(), url, now, renotify_interval, insert_fn)
 
     %{state | breaching: breaching}
   end
@@ -441,7 +457,15 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # notification (AC-34.5.2), otherwise stay debounced. Re-arms (clears
   # `last_notified_at`) on the transition back under threshold (AC-34.5.3: WHICH
   # breaches fire is unchanged — only the sustained-breach behavior is new).
-  defp step(breaching, metric, value, threshold, url, now, renotify_interval) do
+  #
+  # Review fix (US-34.5): `fire/5` only returns `true` when the alert was ACTUALLY
+  # delivered/durably enqueued (`deliver/3` -> `:ok`). A dropped enqueue (Oban.insert
+  # returns `{:error, _}` or raises) must NOT be recorded as a successful notification —
+  # doing so would advance `last_notified_at` to `now` and silence the sustained breach
+  # for a full `renotify_interval` even though nobody was actually paged. Instead we keep
+  # the PRIOR `last_notified_at` (via `notify/6`'s `fallback`) so the very next `:evaluate`
+  # retries the enqueue rather than waiting out the interval.
+  defp step(breaching, metric, value, threshold, url, now, renotify_interval, insert_fn) do
     %{breaching?: was_breaching?, last_notified_at: last_notified_at} =
       Map.fetch!(breaching, metric)
 
@@ -449,12 +473,12 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
     cond do
       over? and not was_breaching? ->
-        fire(metric, value, threshold, url)
-        Map.put(breaching, metric, %{breaching?: true, last_notified_at: now})
+        last_notified_at = notify(metric, value, threshold, url, insert_fn, now, nil)
+        Map.put(breaching, metric, %{breaching?: true, last_notified_at: last_notified_at})
 
       over? and renotify_due?(last_notified_at, now, renotify_interval) ->
-        fire(metric, value, threshold, url)
-        Map.put(breaching, metric, %{breaching?: true, last_notified_at: now})
+        last_notified_at = notify(metric, value, threshold, url, insert_fn, now, last_notified_at)
+        Map.put(breaching, metric, %{breaching?: true, last_notified_at: last_notified_at})
 
       over? ->
         # sustained breach, re-notify interval not yet elapsed — debounced
@@ -465,20 +489,27 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
     end
   end
 
-  defp renotify_due?(nil, _now, _renotify_interval), do: false
+  # `nil` while still breaching means the metric was NEVER successfully notified (its
+  # edge-trigger or a prior renotify attempt had its enqueue dropped) — retry on the very
+  # NEXT evaluate rather than waiting out a full interval that was never actually served.
+  defp renotify_due?(nil, _now, _renotify_interval), do: true
 
   defp renotify_due?(last_notified_at, now, renotify_interval),
     do: now - last_notified_at >= renotify_interval
 
   # p95 is `nil` when below the sample floor — treat as "not breaching" and re-arm so a
   # quiet window clears the breach state (a later busy window can fire again).
-  defp step_p95(breaching, nil, _threshold, _url, _now, _renotify_interval),
+  defp step_p95(breaching, nil, _threshold, _url, _now, _renotify_interval, _insert_fn),
     do: Map.put(breaching, :p95, %{breaching?: false, last_notified_at: nil})
 
-  defp step_p95(breaching, p95, threshold, url, now, renotify_interval),
-    do: step(breaching, :p95, p95, threshold, url, now, renotify_interval)
+  defp step_p95(breaching, p95, threshold, url, now, renotify_interval, insert_fn),
+    do: step(breaching, :p95, p95, threshold, url, now, renotify_interval, insert_fn)
 
-  defp fire(metric, value, threshold, url) do
+  # Fires the alert and stamps `last_notified_at` to `now` ONLY on a genuine successful
+  # delivery/enqueue; otherwise keeps `fallback` (either `nil` for a never-notified edge
+  # fire, or the previous notification's timestamp for a failed renotify attempt) so the
+  # breach stays "due" and is retried on the next tick instead of going silent.
+  defp notify(metric, value, threshold, url, insert_fn, now, fallback) do
     payload = %{
       alert: "scale_degradation",
       metric: Map.fetch!(@metrics, metric),
@@ -488,12 +519,12 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
-    deliver(payload, url)
+    if deliver(payload, url, insert_fn) == :ok, do: now, else: fallback
   end
 
   # AC-34.5.4: no URL configured → alerting is OFF. This stays a SYNCHRONOUS log-only
   # no-op — never enqueue when the URL is nil (US-32.4 readiness guard unchanged).
-  defp deliver(payload, nil) do
+  defp deliver(payload, nil, _insert_fn) do
     Logger.warning(
       "scale alert (no webhook configured): #{payload.metric}=#{payload.value} " <>
         "> threshold #{payload.threshold} over #{payload.window_seconds}s"
@@ -505,8 +536,20 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # AC-34.5.1: durable delivery — enqueue through Oban's `:webhooks` queue instead of
   # POSTing synchronously in-process, so a transient failure retries with Oban's
   # backoff (`ScaleAlertDeliveryWorker`) rather than being logged-and-dropped.
-  defp deliver(payload, url) when is_binary(url) do
-    case %{url: url, payload: payload} |> ScaleAlertDeliveryWorker.new() |> Oban.insert() do
+  #
+  # Review fix: `insert_fn.(job)` (default `Oban.insert/1`, `Repo.insert/1` underneath)
+  # can RAISE (e.g. `DBConnection.ConnectionError` on pool exhaustion / DB down) rather
+  # than returning `{:error, _}` — it only returns an error tuple for changeset
+  # validation failures. `do_evaluate/1` runs inside `handle_call(:evaluate)` /
+  # `handle_info(:tick)`, which are NOT rescue-wrapped (unlike the request-path
+  # `handle_event/4` telemetry handlers), so an unrescued raise here would crash the
+  # GenServer and discard all breach/re-notify state on restart. Rescue here, log, and
+  # report `:error` like any other dropped enqueue — the caller (`notify/6`) already
+  # treats that as "not notified" and retries on the next tick.
+  defp deliver(payload, url, insert_fn) when is_binary(url) do
+    job = %{url: url, payload: payload} |> ScaleAlertDeliveryWorker.new()
+
+    case insert_fn.(job) do
       {:ok, _job} ->
         Logger.info("scale alert enqueued for delivery: #{payload.metric}=#{payload.value}")
         :ok
@@ -516,8 +559,15 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
           "scale alert enqueue failed (#{inspect(reason)}): #{payload.metric}=#{payload.value}"
         )
 
-        :ok
+        :error
     end
+  rescue
+    e ->
+      Logger.error(
+        "scale alert enqueue raised (#{Exception.message(e)}): #{payload.metric}=#{payload.value}"
+      )
+
+      :error
   end
 
   # --- Counter table helpers ---

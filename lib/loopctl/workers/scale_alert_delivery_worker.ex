@@ -26,6 +26,16 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
   Resolves `:webhook_delivery` via `Application.compile_env/3` — the SAME config key
   `ScaleAlerts` and `WebhookDeliveryWorker` use, mockable in tests via
   `Loopctl.MockDelivery` (config/test.exs).
+
+  ## Wall-clock timeout (review fix)
+
+  This worker shares the `:webhooks` queue with `Loopctl.Workers.WebhookDeliveryWorker`,
+  which deliberately enforces `timeout(_job), do: :timer.seconds(30)` as a backstop ON
+  TOP of Req's `receive_timeout` — a slow/hostile target must not pin a shared
+  `:webhooks` slot indefinitely (see GHSA-jh42-wf7g-f5rg). `ReqDelivery`'s `10s`
+  `receive_timeout` bounds awaiting a response but not a slow-drip connection or a
+  connect stall, so this worker enforces the SAME 30s cap to keep every occupant of the
+  shared queue under one hard ceiling.
   """
 
   use Oban.Worker, queue: :webhooks, max_attempts: 6
@@ -37,6 +47,11 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
                      :webhook_delivery,
                      Loopctl.Webhooks.ReqDelivery
                    )
+
+  # Hard per-job wall-clock cap — mirrors `WebhookDeliveryWorker.timeout/1` (same
+  # shared `:webhooks` queue, same rationale: ie-02 / GHSA-jh42-wf7g-f5rg).
+  @impl Oban.Worker
+  def timeout(_job), do: :timer.seconds(30)
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"url" => url, "payload" => payload}}) do
