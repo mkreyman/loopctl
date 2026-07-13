@@ -1,20 +1,20 @@
 {
   "id": "US-33.5",
-  "title": "Reuse batch_attach_spend on the token-usage budget-threshold path (kill the N+1)",
+  "title": "Reuse batch_attach_spend on the token-usage budget-threshold path (consolidate onto one spend path)",
   "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
   "priority": "medium",
   "phase": "scalability",
-  "priority_note": "Collapses the per-report N (1-3) get_scope_spend queries into the existing batched aggregate — reduces AdminRepo fan-out on every token report.",
+  "priority_note": "Routes the per-report threshold check through the SAME batched aggregate list_budgets already uses, retiring a divergent per-budget get_scope_spend loop. NOTE: this is a consolidation onto one spend path, NOT a query-count reduction on this path — find_applicable_budgets yields at most one budget per scope_type (composite unique index), so #batched-queries == #applicable-budgets (1-3), the same count the loop issued. The value is a single source of truth for countable spend, not fewer AdminRepo round-trips here.",
   "background": {
     "reference": "GH #348. TokenUsage.check_budget_thresholds/2 (lib/loopctl/token_usage.ex:938-942) calls get_scope_spend/3 (:896, AdminRepo.one) ONCE PER applicable budget (story/epic/project → up to 3 queries). batch_attach_spend/2 (:1339) already batches spend into ≤3 queries (one AdminRepo.all per scope_type via batch_spend_query/3 :1361) — but it is only used by list_budgets/2 (:744), NOT on the report/threshold hot path.",
-    "includes": "Every token-usage report (POST /api/v1/token-usage and Progress.report_story) triggers check_budget_thresholds, which fans out 1 get_scope_spend query per applicable budget on the 3-connection AdminRepo pool — an N+1 that the already-tested batch_attach_spend eliminates."
+    "includes": "Every token-usage report (POST /api/v1/token-usage and Progress.report_story) triggers check_budget_thresholds, which computes spend once per applicable budget via a second, divergent implementation (get_scope_spend). CAVEAT: because find_applicable_budgets returns at most one budget per scope_type, this is NOT an N+1 that batch_attach_spend reduces — the query count is unchanged (1-3 either way). The refactor's value is eliminating the second spend implementation, not cutting fan-out."
   },
   "story": {
     "as_a": "loopctl platform",
-    "i_want_to": "compute per-budget spend on the threshold-check path via the existing batched batch_attach_spend/batch_spend_query instead of one get_scope_spend query per budget",
-    "so_that": "each token report issues O(scopes) spend queries instead of O(applicable budgets), cutting AdminRepo fan-out with no change to threshold decisions"
+    "i_want_to": "compute per-budget spend on the threshold-check path via the existing batched batch_attach_spend/batch_spend_query instead of a second, divergent get_scope_spend loop",
+    "so_that": "the threshold path shares one batched spend implementation (a single source of truth for countable spend) with list_budgets, with no change to threshold decisions — and no query-count regression (still O(distinct scope_types), i.e. the same 1-3 AdminRepo queries)"
   },
-  "rationale": "The batched spend aggregate already exists and is proven by list_budgets, but the hotter threshold path re-implements it as a per-budget loop, multiplying AdminRepo queries on every report. Routing the threshold check through the same batched query is a behavior-preserving consolidation: the same spend numbers, the same threshold crossings, fewer round-trips on the scarce pool.",
+  "rationale": "The batched spend aggregate already exists and is proven by list_budgets, but the threshold path re-implements spend as a separate per-budget loop (get_scope_spend). Routing the threshold check through the same batched query is a behavior-preserving consolidation: the same spend numbers, the same threshold crossings, one shared countable-spend implementation instead of two. It is NOT a fan-out reduction on this path — find_applicable_budgets yields at most one budget per scope_type, so the batched path issues the same 1-3 AdminRepo queries the loop did; the benefit is a single source of truth, not fewer round-trips.",
   "acceptance_criteria": [
     { "id": "AC-33.5.1", "description": "check_budget_thresholds/2 obtains each applicable budget's spend via batch_attach_spend/2 (or batch_spend_query/3) in ≤ O(distinct scope_types) AdminRepo queries, replacing the per-budget get_scope_spend/3 calls. The spend value used for each threshold comparison is identical to the current per-budget computation (same countable_reports/exclude_stranded_corrections rules).", "status": "pending" },
     { "id": "AC-33.5.2", "description": "Threshold-crossing behavior is byte-for-byte unchanged: the same budgets cross the same thresholds, the same claim_budget_threshold CAS + emit_threshold_crossed + fire_budget_event + WebhookEvent + Oban side effects fire, in the same conditions.", "status": "pending" },
@@ -26,10 +26,10 @@
       "preconditions": ["tenant + project/epic/story budgets set", "prior reports pushing spend near a threshold"],
       "steps": ["create a report that crosses a threshold"],
       "expected_results": ["the same threshold-crossed event/webhook/Oban side effects fire as before; spend value matches the per-budget computation"], "status": "pending" },
-    { "id": "TC-33.5.2", "name": "fewer spend queries per report", "type": "integration",
+    { "id": "TC-33.5.2", "name": "spend computed via the batched grouped-aggregate form, not the per-budget single-row loop", "type": "integration",
       "preconditions": ["a report applying to 3 budgets (story+epic+project)"],
       "steps": ["create the report"],
-      "expected_results": ["spend is computed in ≤ O(scope_types) AdminRepo queries (assert via query count/telemetry), not 3 separate get_scope_spend calls"], "status": "pending" },
+      "expected_results": ["spend is computed via exactly one grouped GROUP BY aggregate per distinct scope_type (assert via query telemetry) and NEVER via the per-budget single-row get_scope_spend select — guards the query FORM, not a query-count reduction (the count is unchanged at 1-3)"], "status": "pending" },
     { "id": "TC-33.5.3", "name": "no threshold crossing when under budget", "type": "integration",
       "preconditions": ["budgets with spend well under thresholds"],
       "steps": ["create a report"],
@@ -43,8 +43,8 @@
     "Module: lib/loopctl/token_usage.ex. Reuse batch_attach_spend/2 (:1339) / batch_spend_query/3 (:1361); the per-budget path is get_scope_spend/3 (:896) inside check_budget_thresholds (:938-942).",
     "Preserve countable_reports/1 + Report.exclude_stranded_corrections (report.ex:174) so the numbers match exactly.",
     "This is a hot path reached by both POST /token-usage and Progress.report_story/4 — keep all side effects (CAS claim, audit, webhook, Oban) identical.",
-    "AdminRepo stays (token_usage is AdminRepo-based); this reduces the NUMBER of AdminRepo queries, not the repo.",
-    "Add a query-count assertion (TC-33.5.2) to lock in the reduction."
+    "AdminRepo stays (token_usage is AdminRepo-based); the query COUNT on this path is unchanged (1-3 either way) — the change unifies two spend implementations into one, it does not cut fan-out here.",
+    "Add a query-FORM assertion (TC-33.5.2) to lock in the batched grouped-aggregate shape (exactly one GROUP BY aggregate per distinct scope_type, never the per-budget single-row get_scope_spend select) — this is an anti-regression guard on form, not a verification of a query-count reduction."
   ],
   "dependencies": [],
   "estimated_tokens": 300000
