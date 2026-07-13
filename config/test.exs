@@ -248,6 +248,11 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 # coverage). Default stub in DataCase delegates to the real config_status/0.
 config :loopctl, :scale_alerts_config_checker, Loopctl.MockScaleAlertsConfigChecker
 
+# US-34.2: Oban orphan-count DI (Loopctl.HealthCheck.Default's oban_orphans
+# degraded-branch coverage). Default stub in DataCase delegates to the real
+# ScaleMetrics.count_oban_executing_orphans/0.
+config :loopctl, :oban_orphan_count_checker, Loopctl.MockObanOrphanCountChecker
+
 # DI: Use mock rate limiter in tests
 config :loopctl, :rate_limiter, Loopctl.MockRateLimiter
 

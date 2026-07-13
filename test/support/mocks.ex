@@ -51,6 +51,16 @@ Mox.defmock(Loopctl.MockScaleAlertsConfigChecker,
   for: Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour
 )
 
+# US-34.2: Oban orphan-count DI. Lets `Loopctl.HealthCheck.Default`'s degraded
+# branch (checks.oban_orphans == "error", reasons attached, ready == false) be
+# exercised via Mox.expect/3 without inserting real `oban_jobs` rows. The
+# DataCase default stub delegates to the real
+# `Loopctl.Telemetry.ScaleMetrics.count_oban_executing_orphans/0` so every
+# existing health-check test (no orphans present) keeps passing unchanged.
+Mox.defmock(Loopctl.MockObanOrphanCountChecker,
+  for: Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour
+)
+
 # US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by

@@ -110,6 +110,25 @@ defmodule LoopctlWeb.HealthControllerTest do
       assert conn.status == 200
       assert json_response(conn, 200)["status"] == "ok"
     end
+
+    test "stays 200 even when readiness (Oban orphan backlog) is false — a queue backlog must not depool a node (AC-34.2.2)",
+         %{conn: conn} do
+      expect(Loopctl.MockHealthChecker, :check, fn ->
+        {:ok,
+         %{
+           status: "ok",
+           ready: false,
+           version: "0.1.0",
+           checks: %{database: "ok", oban: "ok", scale_alerts: "ok", oban_orphans: "error"},
+           reasons: %{oban_orphans: "oban executing-orphan count 11 exceeds threshold 10"}
+         }}
+      end)
+
+      conn = get(conn, "/health")
+
+      assert conn.status == 200
+      assert json_response(conn, 200)["status"] == "ok"
+    end
   end
 
   describe "GET /health/ready (US-32.4)" do
@@ -149,6 +168,27 @@ defmodule LoopctlWeb.HealthControllerTest do
       body = json_response(conn, 503)
       assert body["ready"] == false
       assert body["reasons"]["scale_alerts"] =~ "SCALE_ALERT_WEBHOOK_URL"
+    end
+
+    test "returns 503 when the Oban orphan backlog exceeds its threshold even though liveness is ok (AC-34.2.2)",
+         %{conn: conn} do
+      expect(Loopctl.MockHealthChecker, :check, fn ->
+        {:ok,
+         %{
+           status: "ok",
+           ready: false,
+           version: "0.1.0",
+           checks: %{database: "ok", oban: "ok", scale_alerts: "ok", oban_orphans: "error"},
+           reasons: %{oban_orphans: "oban executing-orphan count 11 exceeds threshold 10"}
+         }}
+      end)
+
+      conn = get(conn, "/health/ready")
+
+      assert conn.status == 503
+      body = json_response(conn, 503)
+      assert body["ready"] == false
+      assert body["reasons"]["oban_orphans"] =~ "exceeds threshold"
     end
 
     test "returns 503 when the underlying liveness is degraded too", %{conn: conn} do

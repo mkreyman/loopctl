@@ -18,6 +18,7 @@ defmodule Loopctl.DataCase do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Telemetry.ScaleAlerts
+  alias Loopctl.Telemetry.ScaleMetrics
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -79,6 +80,13 @@ defmodule Loopctl.DataCase do
     # degraded-branch test overrides this with Mox.expect/3.
     Mox.stub(Loopctl.MockScaleAlertsConfigChecker, :config_status, fn ->
       ScaleAlerts.config_status()
+    end)
+
+    # US-34.2: default delegates to the real count_oban_executing_orphans/0 so the
+    # healthy path (no orphans present) is exercised unchanged. The degraded-branch
+    # test overrides this with Mox.expect/3.
+    Mox.stub(Loopctl.MockObanOrphanCountChecker, :count_oban_executing_orphans, fn ->
+      ScaleMetrics.count_oban_executing_orphans()
     end)
 
     Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit ->

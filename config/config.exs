@@ -366,6 +366,17 @@ config :loopctl, Oban,
 config :loopctl, :oban_metrics_poll_statement_timeout_ms, 2_000
 config :loopctl, :oban_metrics_orphan_threshold_minutes, 45
 
+# US-34.2: the COUNT threshold that trips `Loopctl.HealthCheck.Default`'s
+# `oban_orphans` readiness sub-check into "error" — distinct from the AGE
+# threshold above (`oban_metrics_orphan_threshold_minutes`: WHICH jobs count as
+# orphans). This one decides HOW MANY of those orphans must pile up before the
+# node reports degraded readiness. Default 10 is safe even though modest: the
+# age threshold already restricts the count to jobs stuck in `executing` for
+# 45+ minutes, so a normal transient backlog (a few slow jobs mid-retry) never
+# reaches double digits and won't flap readiness — but the sustained 17-day/
+# 110-orphan stall this story addresses trips it immediately.
+config :loopctl, :oban_orphan_health_threshold, 10
+
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
 # The actual cipher is set in config/runtime.exs (prod) or config/test.exs (test).

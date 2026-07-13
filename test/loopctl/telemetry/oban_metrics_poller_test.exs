@@ -255,6 +255,61 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     end
   end
 
+  describe "count_oban_executing_orphans/0 (US-34.2, AC-34.2.3 — extracted for reuse by the health check)" do
+    test "returns the orphan count directly (not just via telemetry), counting only the stale executing job" do
+      threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
+      now = DateTime.utc_now()
+
+      insert_job(
+        state: "executing",
+        queue: "default",
+        attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
+      )
+
+      insert_job(
+        state: "executing",
+        queue: "default",
+        attempted_at: DateTime.add(now, -1, :second)
+      )
+
+      assert ScaleMetrics.count_oban_executing_orphans() == 1
+    end
+
+    test "returns 0 when there are no stale executing jobs" do
+      assert ScaleMetrics.count_oban_executing_orphans() == 0
+    end
+
+    test "poll_oban_executing_orphans/0 still emits the SAME count this function computes (unchanged behavior after the extraction)" do
+      threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
+      now = DateTime.utc_now()
+
+      insert_job(
+        state: "executing",
+        queue: "default",
+        attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
+      )
+
+      test_pid = self()
+      handler_id = "test-oban-orphan-reuse-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :jobs, :executing_orphan, :count],
+        fn _event, measurements, _metadata, _config ->
+          send(test_pid, {:oban_orphan, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      direct_count = ScaleMetrics.count_oban_executing_orphans()
+      assert ScaleMetrics.poll_oban_executing_orphans() == :ok
+
+      assert_receive {:oban_orphan, %{count: ^direct_count}}, 1000
+    end
+  end
+
   describe "poller defensiveness (AC-34.1.3, TC-34.1.3)" do
     # DataCase's setup checks Repo out in :shared mode (this whole file is
     # async: false), under which EVERY process — including this test process for

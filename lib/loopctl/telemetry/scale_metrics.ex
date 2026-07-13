@@ -347,6 +347,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   import Telemetry.Metrics
 
+  @behaviour Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour
+
   require Logger
 
   alias Loopctl.Repo
@@ -989,46 +991,73 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   @doc """
   Counts `oban_jobs` rows stuck in state `executing` whose `attempted_at` is older
-  than the configured orphan threshold, and emits a single (untagged) telemetry
-  measurement (US-34.1, AC-34.1.2).
+  than the configured orphan AGE threshold (`oban_metrics_orphan_threshold_minutes/0`).
 
-  Same defensive/bounded-interval contract as `poll_oban_queue_state/0` — a single
-  `SET LOCAL statement_timeout`-wrapped `Loopctl.Repo` query (review finding —
-  moved off the tiny `AdminRepo` pool alongside the other poller), catch-all
-  rescue, `Logger.warning` + poll-failure counter + `:ok` on failure, never
-  crashing the shared poller. The age comparison (`attempted_at < now() - N
-  minutes`) is done IN SQL, not in Elixir, so only genuinely stale rows are
-  counted. Always returns `:ok`.
+  Extracted from `poll_oban_executing_orphans/0` (US-34.2, AC-34.2.3) so
+  `Loopctl.HealthCheck.Default`'s `check_oban_orphans/0` health sub-check can reuse
+  the EXACT same bounded, tz-correct query rather than duplicating it —
+  `poll_oban_executing_orphans/0` below calls this too, unchanged behavior.
+
+  Implements the `Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour` callback.
+  Deliberately does NOT rescue here: `poll_oban_executing_orphans/0` keeps its own
+  catch-all rescue around this call (US-34.1 behavior, unchanged), and the health
+  check wraps its own call with its own defensive rescue (AC-34.2.3) — a shared
+  rescue here would hide which caller actually needs to degrade vs. skip-a-cycle.
+
+  Post-review (US-34.2): `Loopctl.HealthCheck.Default.check_oban_orphans/0` calls
+  this from `check/0`, which backs BOTH the continuous `/health` liveness probe and
+  `/health/ready`. `statement_timeout` (set via `SET LOCAL` below) only bounds the
+  query AFTER a connection is checked out — under pool pressure the checkout wait
+  itself would fall back to the Ecto pool's default (~15s), a heavier and
+  less-strictly-bounded DB wait than its liveness sibling `check_database/0` (which
+  passes an explicit `timeout: 5_000`). The `:timeout` option below bounds
+  `Repo.transaction/2`'s checkout-and-run the same way, so this shares the same
+  bound as `check_database/0` instead of falling back to the pool default.
   """
-  @spec poll_oban_executing_orphans() :: :ok
-  def poll_oban_executing_orphans do
+  @impl true
+  @spec count_oban_executing_orphans() :: non_neg_integer()
+  def count_oban_executing_orphans do
     timeout_ms = oban_metrics_poll_statement_timeout_ms()
     threshold_minutes = oban_metrics_orphan_threshold_minutes()
 
+    # `:timeout` bounds this transaction's checkout-and-run the same way
+    # `check_database/0` bounds its `SQL.query/4` call with `timeout: 5_000` — see
+    # the moduledoc above. `statement_timeout` (SET LOCAL below) only bounds the
+    # query itself, AFTER a connection is already checked out.
     {:ok, count} =
-      Repo.transaction(fn ->
-        Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
+      Repo.transaction(
+        fn ->
+          Repo.query!("SET LOCAL statement_timeout = #{timeout_ms}")
 
-        # `attempted_at` is a `timestamp without time zone` column populated by
-        # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
-        # with no tz attached. `now()` is `timestamptz`; comparing it directly
-        # against a naive column implicitly casts `now()` using the CONNECTION's
-        # `TimeZone` GUC (e.g. Fly Postgres defaults can be non-UTC), which skews
-        # the comparison by that offset. `now() AT TIME ZONE 'UTC'` converts to a
-        # naive UTC wall-clock timestamp first, matching what's actually stored.
-        %{rows: [[count]]} =
-          Repo.query!(
-            """
-            SELECT count(*)
-            FROM oban_jobs
-            WHERE state = 'executing'
-              AND attempted_at < (now() AT TIME ZONE 'UTC') - ($1 * interval '1 minute')
-            """,
-            [threshold_minutes]
-          )
+          # `attempted_at` is a `timestamp without time zone` column populated by
+          # Ecto's `:utc_datetime_usec` dump — i.e. it holds a UTC wall-clock reading
+          # with no tz attached. `now()` is `timestamptz`; comparing it directly
+          # against a naive column implicitly casts `now()` using the CONNECTION's
+          # `TimeZone` GUC (e.g. Fly Postgres defaults can be non-UTC), which skews
+          # the comparison by that offset. `now() AT TIME ZONE 'UTC'` converts to a
+          # naive UTC wall-clock timestamp first, matching what's actually stored.
+          %{rows: [[count]]} =
+            Repo.query!(
+              """
+              SELECT count(*)
+              FROM oban_jobs
+              WHERE state = 'executing'
+                AND attempted_at < (now() AT TIME ZONE 'UTC') - ($1 * interval '1 minute')
+              """,
+              [threshold_minutes]
+            )
 
-        count
-      end)
+          count
+        end,
+        timeout: 5_000
+      )
+
+    count
+  end
+
+  @spec poll_oban_executing_orphans() :: :ok
+  def poll_oban_executing_orphans do
+    count = count_oban_executing_orphans()
 
     :telemetry.execute([:loopctl, :oban, :jobs, :executing_orphan, :count], %{count: count}, %{})
 

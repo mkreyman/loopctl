@@ -10,11 +10,15 @@ defmodule LoopctlWeb.HealthController do
   `Loopctl.HealthCheck.Default`'s moduledoc: a benign config-only issue must never
   depool an otherwise-healthy node).
 
-  GET /health/ready — READINESS (US-32.4). Same underlying check, but the HTTP code
-  is driven by `result.ready`, which additionally folds in the scale-alerts
-  config-guard (`:scale_alerts_enabled` true with no `SCALE_ALERT_WEBHOOK_URL`). This
-  is the deploy-time smoke gate an operator or deploy pipeline polls explicitly — it
-  is deliberately NOT wired into `fly.toml`'s continuous check.
+  GET /health/ready — READINESS (US-32.4, extended by US-34.2). Same underlying check,
+  but the HTTP code is driven by `result.ready`, which additionally folds in the
+  scale-alerts config-guard (`:scale_alerts_enabled` true with no
+  `SCALE_ALERT_WEBHOOK_URL`) AND (US-34.2) the Oban `:executing`-orphan backlog guard
+  (`checks.oban_orphans`) — a queue backlog is a readiness signal, not a liveness one,
+  so it never depools a node from Fly's LB even though a node with a stalled queue
+  can't finish background work. This is the deploy-time smoke gate an operator or
+  deploy pipeline polls explicitly — it is deliberately NOT wired into `fly.toml`'s
+  continuous check.
 
   Both endpoints are unauthenticated so external probes (nginx, monitoring systems,
   deploy scripts) can reach them without an API key.
@@ -59,10 +63,11 @@ defmodule LoopctlWeb.HealthController do
   end
 
   operation(:ready,
-    summary: "Readiness check (US-32.4)",
+    summary: "Readiness check (US-32.4, US-34.2)",
     description:
       "Deploy-time smoke gate distinct from the /health liveness probe. Fails when " <>
-        "scale alerts are enabled but no webhook URL is configured, in addition to " <>
+        "scale alerts are enabled but no webhook URL is configured, or when the Oban " <>
+        "`:executing`-orphan backlog exceeds its configured threshold, in addition to " <>
         "the database/oban checks. Not wired into Fly's continuous load-balancer check.",
     security: [],
     responses: %{
