@@ -1,0 +1,43 @@
+{
+  "id": "US-32.1",
+  "title": "Partial index on dispatches(expires_at) WHERE revoked_at IS NULL for the revoke sweep",
+  "epic": { "id": "epic_32", "name": "Scalability Quick Wins" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "S-effort, high-impact: turns a per-minute seq scan on a growing table into an index range scan. Down-payment on Epic 3 (#350).",
+  "background": {
+    "reference": "GH #354 quick win 3; #350 Epic 3. Worker: lib/loopctl/workers/revoke_expired_dispatches_worker.ex; schema: lib/loopctl/dispatches/dispatch.ex; existing indexes in priv/repo/migrations/20260411234856_create_dispatches.exs.",
+    "includes": "RevokeExpiredDispatchesWorker runs every 60s with a tenant-AGNOSTIC query `from(d in Dispatch, where: is_nil(d.revoked_at) and d.expires_at < ^now)`. The only expiry index is composite `[:tenant_id, :expires_at]`, whose leading column (tenant_id) is absent from the predicate, so Postgres cannot use it — the sweep seq-scans the whole dispatches table each minute as it grows."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "add a partial index on dispatches(expires_at) filtered to non-revoked rows",
+    "so_that": "the every-minute expired-dispatch revoke sweep uses an index range scan instead of a full sequential scan on a continuously growing table"
+  },
+  "rationale": "The revoke sweep is unavoidably tenant-agnostic (it must find expired dispatches across all tenants), so it can never use the tenant-leading composite index. As the dispatches table grows with every agent dispatch, the per-minute seq scan becomes a steadily worsening fixed cost on the shared primary. A partial index matching the exact predicate makes the sweep O(expired rows), not O(table).",
+  "acceptance_criteria": [
+    { "id": "AC-32.1.1", "description": "A new migration adds `create index(:dispatches, [:expires_at], where: \"revoked_at IS NULL\")`. Because dispatches is a hot, actively-written table, the index is built online: `@disable_ddl_transaction true`, `@disable_migration_lock true`, and `create index(..., concurrently: true)`, preceded by `drop index(..., if_exists: true, concurrently: true)` so a prior failed/invalid index is rebuilt rather than skipped-by-name.", "status": "pending" },
+    { "id": "AC-32.1.2", "description": "After migration, `EXPLAIN` of the worker's query (`WHERE revoked_at IS NULL AND expires_at < now()`) shows an Index Scan / Index-Only Scan using the new partial index, not a Seq Scan.", "status": "pending" },
+    { "id": "AC-32.1.3", "description": "RevokeExpiredDispatchesWorker behavior is UNCHANGED — the story adds only an index; the query, revoke semantics, and audit/cascade to api_keys are untouched.", "status": "pending" },
+    { "id": "AC-32.1.4", "description": "The migration follows loopctl RLS conventions: dispatches already has RLS enabled; adding an index does not alter RLS. No BYPASSRLS/ownership change.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-32.1.1", "name": "revoke sweep still revokes expired non-revoked dispatches", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "expired = fixture(:dispatch, tenant: tenant, expires_at: past, revoked_at: nil)", "active = fixture(:dispatch, tenant: tenant, expires_at: future, revoked_at: nil)"],
+      "steps": ["perform RevokeExpiredDispatchesWorker (all-tenants sweep)"],
+      "expected_results": ["expired.revoked_at is set", "active.revoked_at stays nil", "linked api_keys of expired are revoked (behavior parity)"], "status": "pending" },
+    { "id": "TC-32.1.2", "name": "already-revoked dispatches are not touched again (partial-index exclusion holds)", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "old = fixture(:dispatch, tenant: tenant, expires_at: past, revoked_at: earlier_timestamp)"],
+      "steps": ["capture old.revoked_at", "perform the sweep"],
+      "expected_results": ["old.revoked_at unchanged (row excluded by revoked_at IS NULL)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Migration only — no app-code change. Place in priv/repo/migrations with a timestamp after existing dispatch migrations.",
+    "Online index pattern (loopctl convention for hot tables): @disable_ddl_transaction true + @disable_migration_lock true + concurrently: true; DROP INDEX CONCURRENTLY IF EXISTS before CREATE to self-heal a prior INVALID index.",
+    "Verify with EXPLAIN (ANALYZE off in test) against the worker predicate; a data-shape test asserting behavior parity is the ExUnit guard since index usage is a planner concern.",
+    "Do NOT drop or alter the existing [:tenant_id, :expires_at] index — other per-tenant lookups may use it.",
+    "Tests use Loopctl.Fixtures.fixture/2; include a tenant-isolation-safe setup (sweep is cross-tenant by design — assert it only revokes expired rows, regardless of tenant)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 130000
+}

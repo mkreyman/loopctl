@@ -1,0 +1,47 @@
+{
+  "id": "US-32.5",
+  "title": "STH all-tenants fanout uses Oban.insert_all with scheduled jitter",
+  "epic": { "id": "epic_32", "name": "Scalability Quick Wins" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "S-effort; cuts N per-minute round-trips to one and de-spikes the fanout. Down-payment on Epic 3 (#350).",
+  "background": {
+    "reference": "GH #354 quick win 7; #350 Epic 3. Worker: lib/loopctl/workers/compute_sth_worker.ex; cron: config/config.exs `{\"* * * * *\", Loopctl.Workers.ComputeSthWorker, args: %{\"mode\" => \"all_tenants\"}}`.",
+    "includes": "The all_tenants mode does `for tenant_id <- tenants do %{\"tenant_id\" => tenant_id} |> __MODULE__.new() |> Oban.insert() end` — N separate single-row inserts every minute, all scheduled at the same :00 instant (a zero-jitter thundering herd against the :audit queue and the primary)."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "enqueue the per-tenant STH jobs in a single batched insert spread across the minute with jitter",
+    "so_that": "the per-minute fanout is one DB round-trip instead of N and the per-tenant STH jobs don't all fire simultaneously and spike the audit queue and primary"
+  },
+  "rationale": "The fanout currently pays a DB insert per active tenant every minute and releases them all at the same instant, which both wastes round-trips and creates a synchronized load spike that worsens with tenant count. Batching to a single insert_all and staggering execution with schedule_in jitter flattens the spike and cuts the cost to O(1) inserts — a safe, self-contained down-payment on the larger STH redesign (Epic 3) without changing the per-tenant STH computation itself.",
+  "acceptance_criteria": [
+    { "id": "AC-32.5.1", "description": "The all_tenants branch builds one list of `ComputeSthWorker.new(%{\"tenant_id\" => id}, schedule_in: jitter)` changesets and enqueues them via a single `Oban.insert_all/1` (or `Oban.insert_all/2`), replacing the per-tenant `Oban.insert/1` loop.", "status": "pending" },
+    { "id": "AC-32.5.2", "description": "Each per-tenant job gets a bounded, deterministic-per-run jitter `schedule_in` in [0, 55] seconds (stay within the 1-minute cadence) derived per index/tenant so the jobs spread across the minute rather than all at :00. No use of :rand at module level that would break Oban unique/dedup.", "status": "pending" },
+    { "id": "AC-32.5.3", "description": "Behavior parity: still enqueues exactly one job per ACTIVE tenant (status == :active), and the per-tenant branch (sth_needed? / sign_and_store_tree_head) is UNCHANGED. If Oban unique options are present, insert_all respects them (no duplicate storms).", "status": "pending" },
+    { "id": "AC-32.5.4", "description": "Empty tenant list is handled (insert_all of [] is a no-op, returns :ok, no crash).", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-32.5.1", "name": "one job enqueued per active tenant via batch", "type": "integration",
+      "preconditions": ["3 active tenants + 1 inactive tenant (fixtures)", "Oban testing mode captures enqueued jobs"],
+      "steps": ["perform ComputeSthWorker with args mode=all_tenants"],
+      "expected_results": ["exactly 3 ComputeSthWorker jobs enqueued (one per active tenant)", "inactive tenant gets none", "each job has a schedule_in within [0,55]s"], "status": "pending" },
+    { "id": "TC-32.5.2", "name": "no active tenants is a no-op", "type": "integration",
+      "preconditions": ["no active tenants"],
+      "steps": ["perform the all-tenants fanout"],
+      "expected_results": [":ok, zero jobs enqueued, no error"], "status": "pending" },
+    { "id": "TC-32.5.3", "name": "per-tenant STH computation unchanged", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant) with audit chain growth"],
+      "steps": ["perform ComputeSthWorker with args tenant_id"],
+      "expected_results": ["signs + stores STH exactly as before (parity with pre-change behavior)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Oban.insert_all takes a list of Oban.Job changesets (Worker.new/2); build them with schedule_in: seconds.",
+    "Jitter without Math.random at compile time: derive from rem(:erlang.phash2(tenant_id), 56) or the enumeration index — stable within a run, spreads across the minute, and won't interfere with Oban :unique keys.",
+    "Preserve any existing unique/replace options on ComputeSthWorker.new; if the worker is @unique, insert_all still honors it.",
+    "This is a fanout-only change; do NOT touch AuditChain.sth_needed?/sign_and_store_tree_head (incremental Merkle is Epic 3).",
+    "Oban testing: config/test.exs uses testing: :inline — assert enqueued jobs with Oban.Testing helpers (all_enqueued/assert_enqueued) rather than relying on execution timing."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 180000
+}

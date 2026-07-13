@@ -1,0 +1,48 @@
+{
+  "id": "US-32.2",
+  "title": "Move Oban queue concurrencies into runtime.exs env vars",
+  "epic": { "id": "epic_32", "name": "Scalability Quick Wins" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "S-effort; prerequisite for Epic 4 (#351) per-tenant fairness (operators must be able to retune queue widths without a deploy).",
+  "background": {
+    "reference": "GH #354 quick win 4; #351 Epic 4. Oban config: config/config.exs (config :loopctl, Oban, queues: [...]); runtime resolution: config/runtime.exs; test override: config/test.exs (Oban testing: :inline).",
+    "includes": "Queue concurrencies are hardcoded at compile time in config/config.exs: default:10, webhooks:5, cleanup:2, analytics:3, maintenance:2, embeddings:5, knowledge:5, memory:3, audit:3. Relieving a backlog (or throttling a noisy queue) today requires a code change + full deploy."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "drive each Oban queue's concurrency from an environment variable, defaulting to the current value",
+    "so_that": "I can retune queue widths against the real DB pool budget during an incident without a code change and deploy"
+  },
+  "rationale": "During a saturation incident the fastest safe lever is reducing a hot queue's concurrency (or raising a starved one). Hardcoded compile-time widths force a full deploy for that, which is exactly the wrong latency during an incident. Env-driven widths make it a `fly secrets set` + restart, and are the necessary substrate for Epic 4's per-tenant fairness work.",
+  "acceptance_criteria": [
+    { "id": "AC-32.2.1", "description": "In config/runtime.exs, the Oban `queues` list is set from env vars — one per queue, e.g. `OBAN_QUEUE_DEFAULT`, `OBAN_QUEUE_EMBEDDINGS`, `OBAN_QUEUE_KNOWLEDGE`, etc. — each parsed as a positive integer, defaulting to the CURRENT hardcoded value when unset. A small helper (e.g. `queue_size(env, default)`) parses/validates (String.to_integer with a positive-int guard; invalid → raise at boot with a clear message, never silently 0).", "status": "pending" },
+    { "id": "AC-32.2.2", "description": "The runtime.exs Oban config merges with (overrides) the compile-time config/config.exs queues so the full plugin/cron config is preserved and only queue widths become env-driven. No queue is dropped and no plugin config is lost.", "status": "pending" },
+    { "id": "AC-32.2.3", "description": "With no env vars set, effective queue widths are byte-for-byte the current defaults (default:10, webhooks:5, cleanup:2, analytics:3, maintenance:2, embeddings:5, knowledge:5, memory:3, audit:3).", "status": "pending" },
+    { "id": "AC-32.2.4", "description": "config/test.exs continues to force `testing: :inline` (jobs run synchronously) — the env-var wiring must not disturb the inline test mode or require env vars in CI.", "status": "pending" },
+    { "id": "AC-32.2.5", "description": "The sum of default queue widths still fits the documented DB pool budget; a comment in runtime.exs cross-references POOL_SIZE / DbCapacity so operators don't set widths that exceed connections.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-32.2.1", "name": "defaults preserved when env unset", "type": "unit",
+      "preconditions": ["no OBAN_QUEUE_* env vars set"],
+      "steps": ["read the resolved Oban queues config"],
+      "expected_results": ["each queue equals its documented default width"], "status": "pending" },
+    { "id": "TC-32.2.2", "name": "env override applies", "type": "unit",
+      "preconditions": ["a test-visible resolver function queue_size/2 (pure, testable without mutating global env)"],
+      "steps": ["call queue_size(\"20\", 5)", "call queue_size(nil, 5)"],
+      "expected_results": ["returns 20", "returns 5"], "status": "pending" },
+    { "id": "TC-32.2.3", "name": "invalid value fails loud", "type": "unit",
+      "preconditions": [],
+      "steps": ["call queue_size(\"0\", 5) / queue_size(\"-3\", 5) / queue_size(\"abc\", 5)"],
+      "expected_results": ["raises ArgumentError with a clear message (never returns 0 or the default silently)"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "runtime.exs runs at boot in prod; keep the parsing helper pure and unit-testable (extract to a tiny module fn rather than inline anonymous logic so TC-32.2.2/3 can call it).",
+    "Ecto/Oban: setting `config :loopctl, Oban, queues: [...]` in runtime.exs replaces the queues key; re-list ALL queues from env-or-default so none is dropped.",
+    "Do NOT move plugins/cron into runtime.exs in this story — scope is queue widths only (Lifeline/Pruner already landed in config.exs).",
+    "No DB/migration. No tenant data touched — but note in the PR that queue widths are global (per-node), not per-tenant; per-tenant fairness is Epic 4.",
+    "Guard against total width > pool: document the relationship; do not enforce a hard cap here (operators own the tradeoff)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 160000
+}
