@@ -4,8 +4,14 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   (`Loopctl.Telemetry.ScaleMetrics.poll_oban_queue_state/0` and
   `poll_oban_executing_orphans/0`):
 
-    * TC-34.1.1 — rows in a couple of states (`available`, `completed`) → the
-      per-{state, queue} telemetry measurement reflects the actual counts.
+    * TC-34.1.1 — rows in a couple of NON-TERMINAL states (`available`,
+      `retryable`) → the per-{state, queue} telemetry measurement reflects the
+      actual counts.
+    * TC-34.1.1a — terminal states (`completed`/`discarded`/`cancelled`) are
+      EXCLUDED from the poll/zero-fill matrix entirely (review finding: a bare
+      `GROUP BY state, queue` over all 8 states forces a full Seq Scan once the
+      terminal partitions dominate under the pruner's 7-day retention) — a
+      `completed` row never produces ANY measurement, not even a `count: 0`.
     * TC-34.1.1b — zero-fill: a `{state, queue}` pair with NO rows still emits an
       explicit `count: 0` measurement every poll (review finding fix — a
       `last_value/2` gauge has no expiry, so without an explicit zero-fill a
@@ -19,24 +25,30 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     * TC-34.1.2 — one stale `executing` row (attempted_at older than the orphan
       threshold) + one recent `executing` row → the orphan gauge counts ONLY the
       stale one.
-    * TC-34.1.3 — the poll query raising is logged and swallowed; no telemetry is
-      emitted on failure (no metric corruption).
+    * TC-34.1.3 — the poll query raising is logged and swallowed (via a
+      CATCH-ALL rescue — review finding, broadened from a narrow DB-fault-only
+      rescue since `telemetry_poller` permanently drops a raising measurement
+      from its rotation rather than crashing); no gauge measurement is emitted on
+      failure (no metric corruption), and the poll-failure counter
+      (`loopctl.oban.poll.error.count`) fires instead.
 
-  `oban_jobs` is a GLOBAL table (no `tenant_id` column) and both pollers touch it
-  directly via `Loopctl.AdminRepo` raw SQL (the `Loopctl.IndexHealth` precedent —
-  `Loopctl.HeavyRead` structurally rejects a query with no tenant predicate).
-  Rows are inserted through `AdminRepo` too, on the SAME sandboxed connection/
-  transaction the pollers query — the standard cross-repo-visibility fix already
-  used by `knowledge_ingestion_controller_test.exs`'s tenant-isolation tests.
+  `oban_jobs` is a GLOBAL table (no `tenant_id` column). Both pollers now query
+  it via `Loopctl.Repo` (review finding — moved off the tiny 3-connection
+  `Loopctl.AdminRepo` pool, since `oban_jobs` has no RLS policy so the RLS-role
+  `Repo` reads it exactly as well). Rows are inserted through `Loopctl.Repo` too,
+  on the SAME sandboxed connection/transaction the pollers query — the standard
+  cross-repo-visibility fix already used by
+  `knowledge_ingestion_controller_test.exs`'s tenant-isolation tests (write and
+  read must share a Repo module to be visible to each other under Sandbox).
 
   Tests use a REAL configured queue name (from `ScaleMetrics.oban_queues/0`)
   rather than an ad-hoc `"test_queue_N"` string: `poll_oban_queue_state/0` now
-  zero-fills and emits ONLY the fixed `oban_states/0` x `oban_queues/0` matrix,
-  so an unconfigured queue name would never produce ANY measurement (by design —
-  AC-34.1.5). Sandbox isolation (each async test owns its own transaction/
-  connection) is what actually prevents cross-test interference, not the queue
-  name — the old per-test-unique name was defensive belt-and-suspenders, not a
-  correctness requirement.
+  zero-fills and emits ONLY the fixed `oban_active_states/0` x `oban_queues/0`
+  matrix, so an unconfigured queue name would never produce ANY measurement (by
+  design — AC-34.1.5). Sandbox isolation (each async test owns its own
+  transaction/connection) is what actually prevents cross-test interference, not
+  the queue name — the old per-test-unique name was defensive
+  belt-and-suspenders, not a correctness requirement.
 
   `async: false`: the executing_orphan gauge is UNTAGGED (a single global telemetry
   channel + Prometheus series), and `:telemetry.attach/4` registers by EVENT NAME
@@ -46,7 +58,6 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   use Loopctl.DataCase, async: false
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.Telemetry.ScaleMetrics
 
   describe "poll_oban_queue_state/0 (AC-34.1.1, TC-34.1.1)" do
@@ -68,12 +79,39 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
 
       insert_job(state: "available", queue: queue)
       insert_job(state: "available", queue: queue)
-      insert_job(state: "completed", queue: queue)
+      insert_job(state: "retryable", queue: queue)
 
       assert ScaleMetrics.poll_oban_queue_state() == :ok
 
       assert_receive {:oban_queue_state, %{state: "available", queue: ^queue}, %{count: 2}}, 1000
-      assert_receive {:oban_queue_state, %{state: "completed", queue: ^queue}, %{count: 1}}, 1000
+      assert_receive {:oban_queue_state, %{state: "retryable", queue: ^queue}, %{count: 1}}, 1000
+    end
+
+    test "terminal states (completed/discarded/cancelled) are excluded entirely — no measurement, not even zero-fill (TC-34.1.1a, review finding)" do
+      test_pid = self()
+      handler_id = "test-oban-terminal-excluded-#{System.unique_integer([:positive])}"
+      queue = configured_queue()
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :jobs, :count],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:oban_queue_state, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      insert_job(state: "completed", queue: queue)
+      insert_job(state: "discarded", queue: queue)
+      insert_job(state: "cancelled", queue: queue)
+
+      assert ScaleMetrics.poll_oban_queue_state() == :ok
+
+      refute_receive {:oban_queue_state, %{state: "completed"}, _measurements}, 300
+      refute_receive {:oban_queue_state, %{state: "discarded"}, _measurements}, 300
+      refute_receive {:oban_queue_state, %{state: "cancelled"}, _measurements}, 300
     end
 
     test "zero-fills: a {state, queue} pair with no rows still emits count: 0 (TC-34.1.1b)" do
@@ -93,9 +131,10 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       # Only ONE row exists at all: {available, queue_a}. Every other pair in the
-      # matrix — including {available, queue_b} and {completed, queue_a} — has NO
-      # backing row, so the GROUP BY never returns them, yet the poller must still
-      # emit an explicit count: 0 for each (the fix under test).
+      # active-state matrix — including {available, queue_b} and
+      # {scheduled, queue_a} — has NO backing row, so the GROUP BY never returns
+      # them, yet the poller must still emit an explicit count: 0 for each (the
+      # fix under test).
       insert_job(state: "available", queue: queue_a)
 
       assert ScaleMetrics.poll_oban_queue_state() == :ok
@@ -106,7 +145,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       assert_receive {:oban_queue_state, %{state: "available", queue: ^queue_b}, %{count: 0}},
                      1000
 
-      assert_receive {:oban_queue_state, %{state: "completed", queue: ^queue_a}, %{count: 0}},
+      assert_receive {:oban_queue_state, %{state: "scheduled", queue: ^queue_a}, %{count: 0}},
                      1000
     end
 
@@ -133,7 +172,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       assert_receive {:oban_queue_state, %{state: "available", queue: ^queue}, %{count: 1}}, 1000
 
       # Drain the queue entirely (simulates Oban completing/removing the job).
-      AdminRepo.delete_all(from(j in Oban.Job, where: j.id == ^job_id))
+      Repo.delete_all(from(j in Oban.Job, where: j.id == ^job_id))
 
       assert ScaleMetrics.poll_oban_queue_state() == :ok
 
@@ -217,7 +256,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   end
 
   describe "poller defensiveness (AC-34.1.3, TC-34.1.3)" do
-    # DataCase's setup checks AdminRepo out in :shared mode (this whole file is
+    # DataCase's setup checks Repo out in :shared mode (this whole file is
     # async: false), under which EVERY process — including this test process for
     # any FURTHER call — routes to the same shared connection regardless of
     # per-process ownership, so a plain `checkin` doesn't disconnect anything.
@@ -225,11 +264,11 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     # without touching the dedicated owner process DataCase started, so THIS
     # test process (which never explicitly checked out its own connection — it
     # was only riding the shared one) has no ownership at all afterward: its
-    # very next AdminRepo call raises a genuine `DBConnection.OwnershipError` — a
+    # very next Repo call raises a genuine `DBConnection.OwnershipError` — a
     # REAL DB fault, not a stub. Self-contained: the NEXT test's `setup` calls
     # `start_owner!(shared: true)` again, which re-establishes shared mode fresh.
     setup do
-      Sandbox.mode(Loopctl.AdminRepo, :manual)
+      Sandbox.mode(Loopctl.Repo, :manual)
       :ok
     end
 
@@ -276,7 +315,56 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
 
       refute_receive {:unexpected_emit, _event, _measurements, _metadata}, 200
     end
+
+    test "the poll-failure counter fires from both pollers on a DB fault (review finding)" do
+      test_pid = self()
+      handler_id = "test-oban-poll-error-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :oban, :poll, :error],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:oban_poll_error, metadata, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        ScaleMetrics.poll_oban_queue_state()
+      end)
+
+      assert_receive {:oban_poll_error, %{poller: :queue_state, exception: exception},
+                      %{count: 1}},
+                     500
+
+      assert exception.__struct__ in [DBConnection.OwnershipError, Postgrex.Error]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        ScaleMetrics.poll_oban_executing_orphans()
+      end)
+
+      assert_receive {:oban_poll_error, %{poller: :executing_orphans, exception: exception2},
+                      %{count: 1}},
+                     500
+
+      assert exception2.__struct__ in [DBConnection.OwnershipError, Postgrex.Error]
+    end
   end
+
+  # The catch-all `rescue e ->` clause (review finding — broadened from a narrow
+  # DB-fault-only rescue) has NO type restriction, so the SAME code path proven
+  # above via `DBConnection.OwnershipError` (a real DB fault, simulated via
+  # Sandbox mode rather than any `Application.put_env` config mutation) also
+  # covers a non-DB exception class (e.g. an `ArgumentError` from an invalid
+  # config tunable, or the `FunctionClauseError` `oban_queues/0` itself now
+  # guards against). The classification of NON-DB exceptions into the bounded
+  # `error_class` tag (`"config_error"`/`"other"`) is unit-tested directly via
+  # `oban_poll_error_tags/1` in `scale_metrics_test.exs`, and the config
+  # validators themselves (`validate_positive_poll_timeout!/1`,
+  # `queues_from_config/1`) are exposed as pure functions there too — so neither
+  # needs an `Application.put_env` integration test here.
 
   defp insert_job(attrs) do
     attrs
@@ -284,6 +372,6 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     |> Map.put_new(:worker, "Loopctl.Workers.IdempotencyCleanupWorker")
     |> Map.put_new(:args, %{})
     |> then(&struct(Oban.Job, &1))
-    |> AdminRepo.insert!()
+    |> Repo.insert!()
   end
 end

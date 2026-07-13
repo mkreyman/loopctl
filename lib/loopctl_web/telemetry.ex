@@ -148,11 +148,19 @@ defmodule LoopctlWeb.Telemetry do
   # where the metric DEFINITIONS and poller FUNCTIONS were each tested in
   # isolation but nothing asserted either was actually wired into the 10s tick.
   def periodic_measurements do
-    # NOTE: `telemetry_poller` runs every measurement in its OWN process and does NOT
-    # isolate them — an uncaught raise in any measurement crashes the shared poller (and
-    # with it the gate refresh). So EVERY measurement added here MUST be self-rescuing.
-    # `refresh_tenant_label_gate/0` guards its only raising op (the DB count) with
-    # try/rescue (fail-soft to a bounded gate); keep that invariant for future additions.
+    # NOTE: `telemetry_poller` runs every measurement through its OWN try/catch
+    # (`make_measurements_and_filter_misbehaving/1`, verified against the vendored
+    # telemetry_poller 1.3.0 source) — an uncaught raise does NOT crash the shared
+    # poller or the other measurements (including the gate refresh). What it DOES do
+    # is worse for the raising measurement specifically: telemetry_poller logs the
+    # raise once and PERMANENTLY DROPS that MFA from the poll rotation until the next
+    # app restart — the gauge/effect goes dark forever, silently. So EVERY measurement
+    # added here MUST still be self-rescuing (a catch-all rescue, not just the DB-fault
+    # classes) so it is never itself the one that goes dark. `refresh_tenant_label_gate/0`
+    # guards its only raising op (the DB count) with try/rescue (fail-soft to a bounded
+    # gate); the two Oban pollers below use a catch-all rescue (US-34.1, review finding)
+    # plus a poll-failure counter so a stale gauge is detectable. Keep that invariant
+    # for future additions.
     [
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
@@ -160,8 +168,9 @@ defmodule LoopctlWeb.Telemetry do
       {ScaleMetrics, :refresh_tenant_label_gate, []},
 
       # US-34.1 (AC-34.1.1/.3): per-{state, queue} poll of the GLOBAL `oban_jobs`
-      # table, feeding the `loopctl.oban.jobs.count` gauge. Self-rescuing (narrow
-      # DB-fault classes only) per the note above.
+      # table, feeding the `loopctl.oban.jobs.count` gauge. Self-rescuing
+      # (catch-all rescue, per the note above) and reports failures via the
+      # `loopctl.oban.poll.error.count` counter.
       {ScaleMetrics, :poll_oban_queue_state, []},
 
       # US-34.1 (AC-34.1.2/.3): the `:executing`-older-than-N-min orphan poll,
