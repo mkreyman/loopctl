@@ -172,6 +172,13 @@ defmodule Loopctl.AgentsTest do
       initial = agent.last_seen_at
       now = DateTime.utc_now()
 
+      # touch_last_seen records into the process-wide singleton buffer; drop this
+      # agent's entry on exit so the shared singleton does not accumulate stale
+      # keys across the async suite.
+      on_exit(fn ->
+        :ets.delete(Loopctl.TouchBuffer.table_name(), {:agent, agent.id})
+      end)
+
       # Records into the buffer and returns :ok (no AdminRepo SELECT/UPDATE).
       assert :ok = Agents.touch_last_seen(tenant.id, agent.id, now)
 

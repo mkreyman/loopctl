@@ -17,6 +17,11 @@ defmodule LoopctlWeb.Plugs.UpdateLastSeenTest do
       agent = fixture(:agent, %{tenant_id: tenant.id, name: "seen-agent"})
       initial_last_seen = agent.last_seen_at
 
+      # The real request path (record_agent) writes the process-wide singleton
+      # buffer; drop this agent's entry on exit so the shared singleton does not
+      # accumulate stale keys across the async suite.
+      on_exit(fn -> :ets.delete(TouchBuffer.table_name(), {:agent, agent.id}) end)
+
       {raw_key, _api_key} =
         fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
 

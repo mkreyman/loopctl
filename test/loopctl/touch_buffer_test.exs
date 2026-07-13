@@ -139,6 +139,65 @@ defmodule Loopctl.TouchBufferTest do
     test "flush over an empty buffer is a no-op", %{table: table} do
       assert :ok = TouchBuffer.flush(table)
     end
+
+    # Guards the batched flush against Postgres' 65,535 bound-param cap. At
+    # epic_33 scale a single flush interval can accumulate tens of thousands of
+    # active ids; each entry emits 2 bound params, so an UNCHUNKED UPDATE over
+    # ~40k entries (~80k params) is rejected by AdminRepo.query!. Because
+    # drain/1 has already :ets.take'd the window and do_flush swallows the
+    # raise, an over-limit statement would SILENTLY lose the whole window —
+    # including the real agent's touch. Chunking keeps every statement bounded,
+    # so the real row still advances.
+    test "flush handles a batch far larger than the bind-param cap without losing touches",
+         %{table: table} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      ts = DateTime.add(DateTime.utc_now(), 30, :second)
+
+      # One real agent whose row MUST actually advance...
+      assert :ok = TouchBuffer.record(table, {:agent, agent.id}, ts)
+
+      # ...buried among 40_000 buffered ids (80_000 bound params) — well past
+      # the 65_535 cap, so a single unbounded UPDATE would raise. Non-existent
+      # UUIDs match no row (harmless); they only inflate the param count.
+      for _ <- 1..40_000 do
+        :ok = TouchBuffer.record(table, {:agent, Ecto.UUID.generate()}, ts)
+      end
+
+      assert :ok = TouchBuffer.flush(table)
+
+      {:ok, reloaded} = Agents.get_agent(tenant.id, agent.id)
+      assert DateTime.compare(reloaded.last_seen_at, ts) == :eq
+    end
+
+    # Cross-target isolation: drain/1 :ets.take's BOTH targets up front, so a
+    # raise while flushing the FIRST target (agents, ordered before api_keys in
+    # @targets) must NOT swallow the second target's already-drained window. A
+    # malformed agent id forces build_values -> Ecto.UUID.dump! to raise for the
+    # agents UPDATE; the api_key row must still advance. Without per-target
+    # isolation a deterministic agents failure would starve last_used_at every
+    # interval.
+    test "one target's flush failure does not swallow the sibling target's window",
+         %{table: table} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      ts = DateTime.add(DateTime.utc_now(), 30, :second)
+
+      # A valid api_key touch (the sibling that MUST still flush)...
+      assert :ok = TouchBuffer.record(table, {:api_key, key.id}, ts)
+
+      # ...and a MALFORMED agent entry inserted directly into ETS (bypassing
+      # record/3's is_binary UUID guard) so the agents UPDATE raises in
+      # build_values. The agents target fails; the api_keys target must survive.
+      :ets.insert(table, {{:agent, "not-a-valid-uuid"}, ts})
+
+      assert :ok = TouchBuffer.flush(table)
+
+      # Sibling target advanced despite the agents-target raise.
+      {:ok, k} = Auth.get_api_key(tenant.id, key.id)
+      assert DateTime.compare(k.last_used_at, ts) == :eq
+    end
   end
 
   describe "graceful shutdown" do
