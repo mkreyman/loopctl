@@ -936,11 +936,24 @@ defmodule Loopctl.TokenUsage do
   # When a single report pushes spend past both thresholds (e.g., from 50%
   # to 120%), both the warning AND exceeded events fire independently.
   defp check_budget_thresholds(tenant_id, report) do
+    # Compute spend for ALL applicable budgets up front through the SAME batched
+    # spend path `list_budgets/2` uses (`batch_attach_spend/2` → one grouped
+    # GROUP BY AdminRepo query per distinct scope_type), replacing a divergent
+    # second spend implementation: a per-budget `get_scope_spend/3` single-row
+    # select loop. This is a behaviour-preserving CONSOLIDATION onto a single
+    # source of truth for countable spend — NOT a query-count reduction on this
+    # path: `find_applicable_budgets/2` yields at most one budget per scope_type
+    # (the `token_budgets(tenant_id, scope_type, scope_id)` composite unique index
+    # guarantees it), so #distinct-scope_types == #applicable-budgets and the
+    # batched path issues the same 1-3 AdminRepo round-trips the loop did. The win
+    # is the unified code path: both build on the same `countable_reports/1`
+    # (tenant + not-deleted + exclude-stranded-corrections) and
+    # `coalesce(sum(...), 0)` → missing scopes yield 0 identically.
     budgets = find_applicable_budgets(tenant_id, report)
 
-    Enum.each(budgets, fn budget ->
-      spend = get_scope_spend(tenant_id, budget.scope_type, budget.scope_id)
-
+    tenant_id
+    |> batch_attach_spend(budgets)
+    |> Enum.each(fn %{budget: budget, current_spend_millicents: spend} ->
       utilization_pct =
         if budget.budget_millicents > 0, do: div(spend * 100, budget.budget_millicents), else: 0
 
@@ -1334,8 +1347,13 @@ defmodule Loopctl.TokenUsage do
     |> select([report: r], coalesce(sum(r.cost_millicents), 0))
   end
 
-  # Batch computes spend for all budgets in at most 3 queries (one per scope type)
-  # instead of N individual queries (N+1 pattern).
+  # Batch computes spend for all budgets in one grouped GROUP BY query per
+  # distinct scope_type (at most 3: story/epic/project) instead of one query per
+  # budget. This genuinely collapses the query count only when multiple budgets
+  # share a scope_type — the `list_budgets/2` path can list many story budgets at
+  # once. On the threshold path, where `find_applicable_budgets/2` yields at most
+  # one budget per scope_type, it degenerates to a 1:1 consolidation (same query
+  # count as the old per-budget loop), not a reduction.
   defp batch_attach_spend(tenant_id, budgets) do
     spend_map =
       budgets
