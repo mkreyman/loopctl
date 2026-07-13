@@ -1,0 +1,49 @@
+{
+  "id": "US-32.3",
+  "title": "ETS-cache resolved tenant LLM settings, busted on set_llm_config",
+  "epic": { "id": "epic_32", "name": "Scalability Quick Wins" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "S/M-effort; removes a DB read + Cloak decrypt from every provider call. Down-payment on Epic 5 (#352).",
+  "background": {
+    "reference": "GH #354 quick win 5; #352 Epic 5. Settings: lib/loopctl/llm/tenant_llm_settings.ex, lib/loopctl/llm.ex, set via set_llm_config. Sibling ETS-owner pattern to mirror: lib/loopctl/knowledge/embedding_circuit_breaker.ex and Loopctl.Knowledge.ExportConcurrency (public named_table owned by a supervised GenServer in the app tree).",
+    "includes": "Every embedding/completion provider call re-reads the tenant's LLM settings from the DB and Cloak-decrypts the API key. Under a fast-looping agent this is a per-call DB hit + decrypt on the hot path."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "cache each tenant's resolved, decrypted LLM settings in a supervised ETS table and invalidate the entry when the tenant's config changes",
+    "so_that": "provider calls stop paying a DB read plus a Cloak decrypt on every request while never serving stale credentials"
+  },
+  "rationale": "LLM settings change rarely but are read on every provider call, so an ETS read-through cache converts a per-call DB+decrypt into a per-change one. Correctness hinges on invalidation: set_llm_config must bust the entry so a rotated key or changed provider is honored immediately. loopctl already owns two ETS tables via supervised owners, so this follows an established, crash-safe pattern rather than inventing one.",
+  "acceptance_criteria": [
+    { "id": "AC-32.3.1", "description": "A supervised ETS owner (GenServer in the app supervision tree, mirroring EmbeddingCircuitBreaker/ExportConcurrency) owns a `:public`, `:named_table`, read-concurrency ETS table keyed by tenant_id holding the resolved+decrypted settings struct. The table survives caller processes (owned by the stable GenServer, not the request process).", "status": "pending" },
+    { "id": "AC-32.3.2", "description": "Settings resolution is read-through: on cache miss, load from DB, decrypt via Cloak, store in ETS, return; on hit, return the cached struct with no DB/decrypt. The public API (e.g. Loopctl.LLM.get_settings(tenant_id) or equivalent) keeps its existing signature and return shape.", "status": "pending" },
+    { "id": "AC-32.3.3", "description": "set_llm_config (and any other settings mutation path) invalidates the tenant's cache entry (delete or overwrite) within the same call, so the next read reflects the change — verified by a rotate-then-read test.", "status": "pending" },
+    { "id": "AC-32.3.4", "description": "Tenant isolation: a cache entry for tenant A is never returned for tenant B; keys are tenant_id-scoped and there is a test proving A's rotation does not affect B's cached entry and vice-versa.", "status": "pending" },
+    { "id": "AC-32.3.5", "description": "Decrypted secrets live only in ETS memory (never logged, never in telemetry tags); the cache is not persisted. A cold start / GenServer restart yields an empty table that repopulates read-through.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-32.3.1", "name": "cache hit avoids second DB read", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "fixture(:tenant_llm_settings, tenant: tenant, ...)"],
+      "steps": ["call get_settings(tenant.id) twice"],
+      "expected_results": ["both return the same decrypted struct", "second call served from ETS (assert via a DB-call counter/telemetry or by mutating the row directly in the DB and confirming the cached value is still returned until invalidation)"], "status": "pending" },
+    { "id": "TC-32.3.2", "name": "set_llm_config busts the cache", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "settings cached via a prior get_settings"],
+      "steps": ["call set_llm_config(tenant.id, new_api_key/provider)", "call get_settings(tenant.id)"],
+      "expected_results": ["returns the NEW settings (not the stale cached ones)"], "status": "pending" },
+    { "id": "TC-32.3.3", "name": "tenant isolation of cache entries", "type": "integration",
+      "preconditions": ["tenant_a = fixture(:tenant); tenant_b = fixture(:tenant)", "both have distinct llm settings, both cached"],
+      "steps": ["set_llm_config(tenant_a) to rotate A", "get_settings(tenant_b)"],
+      "expected_results": ["tenant_b still returns its own unchanged settings", "tenant_a returns rotated settings"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Mirror lib/loopctl/knowledge/embedding_circuit_breaker.ex: a supervised GenServer creates the :public :named_table in init/1 so the table outlives request processes; readers hit ETS directly.",
+    "Config-based DI conventions: no Application.put_env in tests; async:true; verify_on_exit!.",
+    "Cloak decrypt happens once per (tenant, config-version); store the decrypted struct, not the ciphertext.",
+    "Invalidation must be in the SAME transaction/call as the settings write path (set_llm_config) — a delete after commit; consider a fallback TTL only if a mutation path could bypass the API (document if so).",
+    "Never log the decrypted key; keep it out of telemetry tags and error messages.",
+    "Add the GenServer to lib/loopctl/application.ex children after the Repo(s) and alongside the sibling ETS owners."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 320000
+}

@@ -1,0 +1,48 @@
+{
+  "id": "US-32.4",
+  "title": "Fail loud when scale alerts are enabled but SCALE_ALERT_WEBHOOK_URL is unset",
+  "epic": { "id": "epic_32", "name": "Scalability Quick Wins" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "S-effort; prerequisite for trusting Epic 2 (#349) observability — a silently-dead alert path is worse than none.",
+  "background": {
+    "reference": "GH #354 quick win 6; #349 Epic 2. config/runtime.exs: :scale_alerts_enabled (true in prod) + :scale_alert_webhook_url (System.get_env('SCALE_ALERT_WEBHOOK_URL'), nil when unset). Alert sender lives in the scale-alerts module (lib/loopctl/scale*/).",
+    "includes": "Today scale_alerts_enabled is true in prod but the webhook URL is only read from env; when unset, breaches are logged and nothing is POSTed — the alerting path is silently inert with no signal that it's dead. An operator believes alerts are on when they are not."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "have the app refuse to come up healthy when scale alerts are enabled but no webhook URL is configured",
+    "so_that": "a misconfigured alert pipeline is caught at deploy time instead of discovered during the incident it was supposed to warn me about"
+  },
+  "rationale": "An alerting system that fails silently gives false confidence — the worst failure mode, because you only learn it's broken when a real breach goes unannounced. Making the misconfiguration loud at startup (or via readiness) converts a latent silent gap into an immediate, visible deploy-time failure, which is the whole point of the observability epic that follows.",
+  "acceptance_criteria": [
+    { "id": "AC-32.4.1", "description": "When `:scale_alerts_enabled` is true and `:scale_alert_webhook_url` is nil/blank, the app fails loud: either raise at boot in runtime.exs with a clear message naming SCALE_ALERT_WEBHOOK_URL, OR flip a readiness flag so /health (or the readiness endpoint) reports NOT-ready/degraded with that reason. Choose the readiness-flag approach if a hard boot-raise would risk an outage on the live system; document the choice.", "status": "pending" },
+    { "id": "AC-32.4.2", "description": "When alerts are enabled AND the URL is set, startup/readiness is unaffected (no false positive).", "status": "pending" },
+    { "id": "AC-32.4.3", "description": "When `:scale_alerts_enabled` is false, the URL is not required and no failure/degradation is signaled (opt-out stays clean).", "status": "pending" },
+    { "id": "AC-32.4.4", "description": "The check does not change alert DELIVERY behavior for the healthy case; it only adds the missing-config guard. Existing scale-alert tests still pass.", "status": "pending" },
+    { "id": "AC-32.4.5", "description": "No secret is logged; the message names the env var, not any value.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-32.4.1", "name": "enabled + missing url is caught", "type": "unit",
+      "preconditions": ["config: scale_alerts_enabled true, scale_alert_webhook_url nil"],
+      "steps": ["run the validation function (extracted, pure/testable)"],
+      "expected_results": ["returns {:error, reason} / raises with a message naming SCALE_ALERT_WEBHOOK_URL (per chosen mechanism)"], "status": "pending" },
+    { "id": "TC-32.4.2", "name": "enabled + url present is ok", "type": "unit",
+      "preconditions": ["scale_alerts_enabled true, scale_alert_webhook_url set"],
+      "steps": ["run the validation function"],
+      "expected_results": [":ok / readiness true"], "status": "pending" },
+    { "id": "TC-32.4.3", "name": "disabled needs no url", "type": "unit",
+      "preconditions": ["scale_alerts_enabled false, scale_alert_webhook_url nil"],
+      "steps": ["run the validation function"],
+      "expected_results": [":ok / readiness true"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Extract the enabled+url check into a pure function so it is unit-testable without booting the app or mutating global env (no Application.put_env in tests — pass config in).",
+    "Prefer the readiness-flag path over a hard boot-raise for a LIVE system: a boot-raise on a bad deploy could take the fleet down; a readiness=degraded signal fails the deploy's smoke/health gate without killing running nodes. Document the decision in the PR.",
+    "If using readiness: wire it into the existing /health degraded path (same place Oban/DB degradation is surfaced).",
+    "blank check: treat empty string as unset (String.trim == '').",
+    "Scope: config-guard only — do NOT build the new alert signals here (that is Epic 2)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 150000
+}
