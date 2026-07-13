@@ -19,6 +19,22 @@ capacity (this already distorted the #172 fix, which avoided a per-request
 transaction to dodge starvation). Splitting them onto separate physical pools
 removes that coupling and gives US-27.4/27.6b a clean pool-level lever.
 
+**US-33.6 (re-derived, no rebalance shipped — an explicit scope decision):** a
+Repo 10 -> 7 / AdminRepo 3 -> 6 shift was investigated on the premise that the auth
+hot path runs ~5 AdminRepo queries/request while Repo sits idle. That premise no
+longer holds, but NOT down to zero: US-33.3's ETS read-through api-key cache +
+US-33.4's debounced touch-writes drop the per-request AdminRepo cost from ~5
+statements to ~1 cheap indexed STH SELECT — the `ValidateWitnessHeader` auth plug
+still issues one uncached `AdminRepo` query per well-formed request
+(`AuditChain.get_sth_at_position/2`), plus cold-cache miss load on a node during a
+rolling deploy. **If you're reading this during a DB incident: AdminRepo is NOT
+zero-load** — check `loopctl.admin_repo.checkout.queue_time` before ruling it out.
+The Repo pool is shared with Oban's 38-wide queue concurrency, so it is not idle
+either. The defaults above are UNCHANGED from US-27.11 pending real US-33.1
+checkout-wait data — do not assume a rebalance landed just because the story is
+closed; revisit with a real rebalance once that telemetry populates and points in a
+specific direction.
+
 ### `HEAVY_READ_POOL_SIZE` (K) — sizing rationale (AC-27.11.1)
 
 Default **8** supports **K ≈ 6** concurrent sub-2s heavy reads while

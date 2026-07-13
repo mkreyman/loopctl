@@ -127,6 +127,43 @@ if config_env() == :prod do
   # vs the live fly mpg max_connections = 100 (runbook re-verifies post-deploy):
   #   per-node: Repo 10 + AdminRepo 3 + HeavyReadRepo 8 = 21; peak during a rolling
   #   deploy at 2 nodes = 42 + 21 (overlap node) + 4 ops = 67 < 100 (max ~3 nodes).
+  #
+  # US-33.6 (re-derived — no rebalance shipped): the AdminRepo/Repo split above is
+  # UNCHANGED from US-27.11. The original rebalance candidate ("every authenticated
+  # request runs ~5 AdminRepo queries on the 3-conn BYPASSRLS pool while Repo sits
+  # idle, so shift Repo 10 -> 7 / AdminRepo 3 -> 6") does NOT hold against the
+  # CURRENT codebase and was reverted before merge:
+  #   * US-33.3 (`Loopctl.Auth.ApiKeyCache`, ETS read-through api-key cache) + US-33.4
+  #     (`Loopctl.TouchBuffer`, debounced last_used_at writes) already landed on this
+  #     branch's base and together cut the auth hot path's per-request AdminRepo cost
+  #     from ~5 statements down to ~1 — NOT to zero. The `:authenticated` pipeline's
+  #     `ValidateWitnessHeader` plug still issues one uncached, cheap indexed STH
+  #     SELECT per well-formed request (`AuditChain.get_sth_at_position/2` ->
+  #     `AdminRepo.one/1`); ApiKeyCache's "net ZERO" moduledoc claim is scoped to the
+  #     api-key TOUCH path only, not the whole pipeline. A cold-cache node (mid rolling
+  #     deploy) additionally hits AdminRepo on every api-key-cache miss until warm —
+  #     precisely the peak-budget overlap window this comment sizes against. So
+  #     AdminRepo still carries real per-request load; watch
+  #     `loopctl.admin_repo.checkout.queue_time` before trusting that 3 conns has
+  #     headroom to spare.
+  #   * The Repo pool is NOT idle: `Loopctl.ObanConfig` queue widths sum to 38 (see
+  #     the comment above) and Oban checks out from THIS pool (`config/config.exs`
+  #     `repo: Loopctl.Repo`), on top of web RLS traffic — cutting it 10 -> 7 would
+  #     have tightened an already Oban-shared pool for no measured benefit.
+  # US-33.1's per-pool checkout-wait telemetry
+  # (loopctl.repo.checkout.queue_time / loopctl.admin_repo.checkout.queue_time) is
+  # live but not yet conclusively populated in prod, so — per the story's own
+  # guidance to resize from data, not guesswork — sizes are left at their US-27.11
+  # defaults.
+  #
+  # EXPLICIT SCOPE DECISION (US-33.6 closes with zero pool-size change): re-derived;
+  # no rebalance warranted against the CURRENT codebase. Residual AdminRepo load is
+  # ~1 cheap indexed STH SELECT/request (not zero — see above) plus cold-cache
+  # api-key-miss load during deploys; Repo is provably not idle (Oban's 38-wide
+  # queue concurrency shares it). This is a deliberate re-scope of the story's
+  # "rebalance" premise, not an automatic by-design close — revisit with a real
+  # rebalance once US-33.1's checkout-wait telemetry populates in prod and points
+  # in a specific direction.
   # K (HeavyReadRepo, default 8): ~6 concurrent sub-2s heavy vector reads + ~2 reserved
   # for long-held streamed-export checkouts (US-27.16), a different profile than fast reads.
   # Parse to an integer so a garbage/typo value (e.g. "10s", "10,000") fails LOUDLY at boot

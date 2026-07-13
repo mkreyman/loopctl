@@ -21,6 +21,25 @@ defmodule Loopctl.DbCapacity do
   require Logger
 
   # Production default pool sizes = the env-var defaults in config/runtime.exs.
+  #
+  # US-33.6 (re-derived — no rebalance shipped, an explicit scope decision): a
+  # Repo 10 -> 7 / AdminRepo 3 -> 6 rebalance was proposed on the premise that
+  # "every authenticated request runs ~5 AdminRepo queries on the hot path while
+  # Repo sits idle." That premise does not hold against the current codebase, but
+  # NOT down to zero: US-33.3's ETS read-through api-key cache
+  # (`Loopctl.Auth.ApiKeyCache`) plus US-33.4's debounced touch-writes
+  # (`Loopctl.TouchBuffer`) cut the auth hot path's per-request AdminRepo cost from
+  # ~5 statements to ~1 cheap indexed STH SELECT (`ValidateWitnessHeader` ->
+  # `AuditChain.get_sth_at_position/2` -> `AdminRepo.one/1`, uncached, issued on
+  # every well-formed request) — plus cold-cache miss load on a node during a
+  # rolling deploy. ApiKeyCache's own "net ZERO" moduledoc claim is scoped to the
+  # api-key TOUCH path only, not the whole pipeline. The Repo pool is NOT idle
+  # either — Oban's 38-wide queue concurrency (`Loopctl.ObanConfig`) shares it
+  # alongside web RLS traffic. With US-33.1's checkout-wait metrics not yet
+  # conclusively populated in prod, sizes stay at their US-27.11 defaults pending
+  # real data (watch `loopctl.admin_repo.checkout.queue_time` before trusting 3
+  # conns has headroom) — see the full rationale in the sizing comment in
+  # config/runtime.exs.
   @prod_pool_sizes %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
 
   # HEAVY_READ_POOL_SIZE (K) splits into fast sub-2s reads + a reserve for long-held
@@ -175,7 +194,14 @@ defmodule Loopctl.DbCapacity do
     e -> Logger.warning("DbCapacity boot check skipped: #{Exception.message(e)}")
   end
 
-  defp expected_app_nodes do
+  @doc """
+  The expected app node count (env `EXPECTED_APP_NODES`, default 2) used as the
+  default `nodes` argument to `warn_if_over_budget/1`. Public so tests (and any
+  other caller wanting the SAME env-derived node count) don't have to
+  hand-duplicate the parsing/default.
+  """
+  @spec expected_app_nodes() :: pos_integer()
+  def expected_app_nodes do
     case System.get_env("EXPECTED_APP_NODES") do
       nil -> 2
       v -> String.to_integer(v)
