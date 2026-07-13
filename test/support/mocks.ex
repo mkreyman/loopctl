@@ -42,6 +42,15 @@ Mox.defmock(Loopctl.MockDelivery, for: Loopctl.Webhooks.DeliveryBehaviour)
 # ingestion tests pass; DNS-rebinding tests override it to return a private address.
 Mox.defmock(Loopctl.MockDnsResolver, for: Loopctl.Net.DnsResolver.Behaviour)
 
+# US-32.4: scale-alerts config-guard DI. Lets `Loopctl.HealthCheck.Default`'s degraded
+# branch (checks.scale_alerts == "error", reasons attached, ready == false) be exercised
+# via Mox.expect/3 without `Application.put_env`. The DataCase default stub delegates to
+# the real `Loopctl.Telemetry.ScaleAlerts.config_status/0` so every existing health-check
+# test (config: scale_alerts_enabled false) keeps passing unchanged.
+Mox.defmock(Loopctl.MockScaleAlertsConfigChecker,
+  for: Loopctl.Telemetry.ScaleAlerts.ConfigStatusBehaviour
+)
+
 # US-27.3: the DBErrorBackstop test seam is a REAL plug (Loopctl.Test.BackstopRouter,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by

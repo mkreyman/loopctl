@@ -28,7 +28,8 @@ Total wall time stays well under 30 s.
 
 | # | Check | Asserts | Budget | Why |
 |---|-------|---------|--------|-----|
-| 1 | `GET /health` | 200 **and** `.checks.database == "ok"`; Oban-only degradation is a WARN (pass) | 5 s | App up + DB healthy |
+| 1 | `GET /health` | 200 **and** `.checks.database == "ok"`; Oban-only degradation is a WARN (pass) | 5 s | App up + DB healthy (liveness only — never depooled by the scale-alerts config-guard) |
+| 1.5 | `GET /health/ready` | 200, `.ready == true` (falls back to `.status=="ok"` for an implementation that omits `ready`) | 5 s | **US-32.4 readiness gate**: fails loud (hard RED, not a warn) if scale alerts are enabled but `SCALE_ALERT_WEBHOOK_URL` is unset — the automated consumer of the readiness signal so the misconfig is caught at deploy time instead of during the incident it should have warned about |
 | 2 | `GET /api/v1/knowledge/count` (authed) | 200, `.count` int > 1000 | 5 s | KB not wiped (prod baseline ~83k) |
 | 3a | `GET /api/v1/knowledge/search?q=elixir&mode=keyword&limit=3` (authed) | 200, `.data` non-empty | 5 s | **Keyword retrieval floor** (deterministic DB path, no embedding) |
 | 3b | `GET /api/v1/knowledge/search?q=elixir&limit=3` (authed, combined) | 200, `.data` non-empty **and** `.meta.fallback != true` | 8 s | **Semantic retrieval healthy** — fails if the embedding provider is down (combined silently keyword-falls-back otherwise) |
@@ -49,6 +50,11 @@ Exit code is non-zero if ANY check fails. A WARN (⚠) does not fail the run.
   EITHER the DB or the Oban `:default` queue check fails. A transient Oban blip
   with a healthy DB + KB is **not** a rollback trigger, so the script warns and
   passes. Only a DB failure or a non-200 is a hard FAIL on check 1.
+- **1.5 RED (`/health/ready` 503 or `.ready == false`)** — this is a **config**
+  problem, not a code regression: `:scale_alerts_enabled` is true but
+  `SCALE_ALERT_WEBHOOK_URL` is unset (or blank) on the deployed release. Fix is
+  to set the Fly secret/env var, not to roll back the code. `.reasons.scale_alerts`
+  in the response body names the missing env var (never a value).
 - **2 RED (count ≤ 1000)** — see the visibility invariant below; a wiped corpus or
   a changed smoke-key tenant both show up here.
 
