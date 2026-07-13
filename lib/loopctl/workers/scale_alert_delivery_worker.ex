@@ -15,11 +15,28 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
   Job args round-trip through JSON, so `perform/1` pattern-matches STRING keys (atom
   keys never survive Oban's JSON encode/decode):
 
-      %{"url" => url, "payload" => payload}
+      %{"payload" => payload}
 
   `payload` is the SAME id-only alert map `ScaleAlerts` already built (`%{alert,
   metric, value, threshold, window_seconds, at}`) — no tenant content, vectors, SQL, or
   request bodies are ever enqueued.
+
+  ## No URL in args (secrets-at-rest review fix)
+
+  The webhook URL is deliberately NOT carried in job args. `ScaleAlerts` treats it as
+  resolve-once operator config (`ScaleAlerts.webhook_url/0`, read once at `init/1`);
+  Oban persists job args as cleartext JSON in `oban_jobs` with no encryption plugin
+  configured, and `Oban.Plugins.Pruner` retains terminal jobs for 7 days. A scale-alert
+  webhook URL is commonly secret-bearing (Slack incoming-webhook / PagerDuty routing
+  tokens), so persisting it in args would leak it into the DB, every backup, the Oban
+  Web dashboard, and any Oban telemetry/APM consumer. Instead `perform/1` re-resolves the
+  URL at run time via `ScaleAlerts.webhook_url/0` — behaviorally equivalent since the URL
+  is static operator config, but keeps the secret out of the database. This mirrors the
+  sibling `Loopctl.Workers.WebhookDeliveryWorker`, which stores only IDs in args and
+  re-resolves URL + signing secret from the DB. If the URL is unset by the time the job
+  runs (a config typo / race), the job logs a warning and completes as a no-op `:ok`
+  rather than erroring — alerting is opt-in, so an unconfigured URL is not a delivery
+  failure.
 
   ## Delivery DI
 
@@ -42,6 +59,8 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
 
   require Logger
 
+  alias Loopctl.Telemetry.ScaleAlerts
+
   @delivery_client Application.compile_env(
                      :loopctl,
                      :webhook_delivery,
@@ -54,7 +73,27 @@ defmodule Loopctl.Workers.ScaleAlertDeliveryWorker do
   def timeout(_job), do: :timer.seconds(30)
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"url" => url, "payload" => payload}}) do
+  def perform(%Oban.Job{args: %{"payload" => payload}}) do
+    deliver_or_skip(payload, ScaleAlerts.webhook_url())
+  end
+
+  @doc false
+  # Takes the resolved URL as an ARG (rather than reading `ScaleAlerts.webhook_url/0`
+  # internally) so both branches are unit-testable without `Application.put_env` —
+  # mirrors `ScaleAlerts.config_status/2`'s "config as args" idiom.
+  @spec deliver_or_skip(map(), String.t() | nil) :: :ok | {:error, term()}
+  def deliver_or_skip(payload, nil) do
+    Logger.warning(
+      "ScaleAlertDeliveryWorker: scale_alert_webhook_url is unset at delivery time, " <>
+        "skipping (alert already logged when enqueued): #{payload["metric"]}=#{payload["value"]}"
+    )
+
+    :ok
+  end
+
+  def deliver_or_skip(payload, url) when is_binary(url), do: deliver(url, payload)
+
+  defp deliver(url, payload) do
     body = Jason.encode!(payload)
     headers = [{"content-type", "application/json"}]
 

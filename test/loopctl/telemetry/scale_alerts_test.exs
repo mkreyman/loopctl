@@ -486,6 +486,77 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
   end
 
+  describe "no secret persisted in the enqueued job (review fix)" do
+    # Uses the `insert_fn` test seam to capture the EXACT job `deliver/3` builds, before
+    # it reaches Oban, and proves the webhook URL (potentially secret-bearing) is never
+    # part of the args that would be JSON-serialized into `oban_jobs.args`.
+    test "the job enqueued for delivery carries only :payload — never the webhook url" do
+      test_pid = self()
+
+      insert_fn = fn job ->
+        send(test_pid, {:captured_job_args, job.changes.args})
+        Oban.insert(job)
+      end
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      table = :"scale_alerts_no_url_in_args_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_no_url_in_args_srv_#{System.unique_integer([:positive])}"
+
+      _pid =
+        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+          id: name
+        )
+
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+
+      assert_received {:captured_job_args, args}
+      assert Map.keys(args) == [:payload]
+      refute Map.has_key?(args, :url)
+    end
+  end
+
+  describe "malformed webhook url config does not crash the GenServer (review fix)" do
+    # A non-nil, non-binary `:scale_alert_webhook_url` (e.g. a charlist/atom from a
+    # config typo) must be treated as a delivery error, not raise past `deliver/3` and
+    # crash the un-rescued `handle_call(:evaluate)`.
+    test "a non-binary configured url logs, reports :error, and keeps the GenServer alive" do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
+        send(test_pid, :unexpected_delivery)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      table = :"scale_alerts_bad_url_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_bad_url_srv_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, webhook_url: :not_a_url},
+          id: name
+        )
+
+      emit_timeout(6)
+      # Must complete normally (not crash/timeout) — proving the catch-all `deliver/3`
+      # clause handled the malformed config instead of raising FunctionClauseError.
+      assert :ok = ScaleAlerts.evaluate(name)
+
+      assert Process.alive?(pid)
+      refute_received :unexpected_delivery
+
+      # Sustained breach on the very next tick still doesn't crash or deliver — the
+      # misconfiguration persists, so the metric legitimately never gets marked notified.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      assert Process.alive?(pid)
+      refute_received :unexpected_delivery
+    end
+  end
+
   describe "bounded periodic re-notify while a breach is sustained (AC-34.5.2)" do
     test "re-fires once the re-notify interval elapses, stays silent before it, re-arms on clear" do
       test_pid = self()

@@ -67,12 +67,17 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   window_seconds, at}` — JSON-encoded and delivered via `Loopctl.Workers.ScaleAlertDeliveryWorker`
   (US-34.5, AC-34.5.1): the payload is enqueued through Oban's `:webhooks` queue rather
   than POSTed synchronously in-process, so a transient failure retries with Oban's
-  backoff instead of being logged-and-dropped. The worker resolves the SAME
-  `:webhook_delivery` DI (`Application.compile_env(:loopctl, :webhook_delivery,
-  Loopctl.Webhooks.ReqDelivery)`) the webhook worker uses. **No tenant content,
-  vectors, bodies, params, or SQL ever appears in the payload.** When the URL is `nil`
-  alerting is OFF (opt-in): the breach is logged at `:warning` synchronously and
-  nothing is enqueued or POSTed — this path is unchanged by US-34.5.
+  backoff instead of being logged-and-dropped. **The enqueued job args carry ONLY the
+  id-only `payload` — never the webhook URL** (secrets-at-rest review fix): Oban
+  persists job args as cleartext JSON with no encryption plugin configured, and the
+  webhook URL is commonly secret-bearing (Slack/PagerDuty tokens), so the worker instead
+  re-resolves the URL at run time from `webhook_url/0`, mirroring the sibling
+  `WebhookDeliveryWorker`'s pattern of never persisting a secret in `args`. The worker
+  resolves the SAME `:webhook_delivery` DI (`Application.compile_env(:loopctl,
+  :webhook_delivery, Loopctl.Webhooks.ReqDelivery)`) the webhook worker uses. **No
+  tenant content, vectors, bodies, params, or SQL ever appears in the payload.** When the
+  URL is `nil` alerting is OFF (opt-in): the breach is logged at `:warning` synchronously
+  and nothing is enqueued or POSTed — this path is unchanged by US-34.5.
 
   ## Operator / system scope — NOT tenant-scoped
 
@@ -458,13 +463,14 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # `last_notified_at`) on the transition back under threshold (AC-34.5.3: WHICH
   # breaches fire is unchanged — only the sustained-breach behavior is new).
   #
-  # Review fix (US-34.5): `fire/5` only returns `true` when the alert was ACTUALLY
-  # delivered/durably enqueued (`deliver/3` -> `:ok`). A dropped enqueue (Oban.insert
-  # returns `{:error, _}` or raises) must NOT be recorded as a successful notification —
-  # doing so would advance `last_notified_at` to `now` and silence the sustained breach
-  # for a full `renotify_interval` even though nobody was actually paged. Instead we keep
-  # the PRIOR `last_notified_at` (via `notify/6`'s `fallback`) so the very next `:evaluate`
-  # retries the enqueue rather than waiting out the interval.
+  # Review fix (US-34.5): `notify/7` only returns `now` when the alert was ACTUALLY
+  # delivered/durably enqueued (`deliver/3` -> `:ok`); otherwise it returns `fallback`
+  # unchanged. A dropped enqueue (Oban.insert returns `{:error, _}` or raises) must NOT
+  # be recorded as a successful notification — doing so would advance `last_notified_at`
+  # to `now` and silence the sustained breach for a full `renotify_interval` even though
+  # nobody was actually paged. Instead we keep the PRIOR `last_notified_at` (via
+  # `notify/7`'s `fallback`) so the very next `:evaluate` retries the enqueue rather than
+  # waiting out the interval.
   defp step(breaching, metric, value, threshold, url, now, renotify_interval, insert_fn) do
     %{breaching?: was_breaching?, last_notified_at: last_notified_at} =
       Map.fetch!(breaching, metric)
@@ -537,6 +543,16 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # POSTing synchronously in-process, so a transient failure retries with Oban's
   # backoff (`ScaleAlertDeliveryWorker`) rather than being logged-and-dropped.
   #
+  # Review fix (secrets-at-rest): the job args carry ONLY the id-only `payload` — never
+  # `url`. The webhook URL is commonly secret-bearing (Slack/PagerDuty routing tokens),
+  # and Oban persists job args as cleartext JSON in `oban_jobs` with no encryption
+  # plugin configured; `Oban.Plugins.Pruner` then retains terminal jobs for 7 days. That
+  # would leak the URL into the DB, every backup, the Oban Web dashboard, and any Oban
+  # telemetry/APM consumer. `ScaleAlertDeliveryWorker.perform/1` re-resolves the URL from
+  # `ScaleAlerts.webhook_url/0` (the SAME resolve-once operator config this GenServer
+  # already reads at `init/1`) instead, mirroring the sibling `WebhookDeliveryWorker`
+  # pattern of never persisting a secret in `args`.
+  #
   # Review fix: `insert_fn.(job)` (default `Oban.insert/1`, `Repo.insert/1` underneath)
   # can RAISE (e.g. `DBConnection.ConnectionError` on pool exhaustion / DB down) rather
   # than returning `{:error, _}` — it only returns an error tuple for changeset
@@ -544,10 +560,10 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # `handle_info(:tick)`, which are NOT rescue-wrapped (unlike the request-path
   # `handle_event/4` telemetry handlers), so an unrescued raise here would crash the
   # GenServer and discard all breach/re-notify state on restart. Rescue here, log, and
-  # report `:error` like any other dropped enqueue — the caller (`notify/6`) already
+  # report `:error` like any other dropped enqueue — the caller (`notify/7`) already
   # treats that as "not notified" and retries on the next tick.
   defp deliver(payload, url, insert_fn) when is_binary(url) do
-    job = %{url: url, payload: payload} |> ScaleAlertDeliveryWorker.new()
+    job = %{payload: payload} |> ScaleAlertDeliveryWorker.new()
 
     case insert_fn.(job) do
       {:ok, _job} ->
@@ -568,6 +584,24 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       )
 
       :error
+  end
+
+  # Review fix: a non-nil, non-binary `:scale_alert_webhook_url` (e.g. a charlist/atom
+  # from a config typo) matched neither the `nil` clause above nor the `is_binary(url)`
+  # clause, so `notify/7` raised a `FunctionClauseError` OUTSIDE the `deliver/3` rescue —
+  # that raise then propagated out of `handle_call(:evaluate)`/`handle_info(:tick)`
+  # (neither rescue-wrapped) and crashed the GenServer, discarding breach/re-notify
+  # state. This mirrors the module's own defensive `blank?/1` catch-all (line ~263):
+  # treat a malformed URL as a config error, not an unset URL — log and report `:error`
+  # so `notify/7` keeps the prior `last_notified_at` and retries on the next tick,
+  # exactly like a dropped enqueue.
+  defp deliver(payload, url, _insert_fn) do
+    Logger.error(
+      "scale alert webhook url misconfigured (expected a string or nil, got #{inspect(url)}): " <>
+        "#{payload.metric}=#{payload.value} treated as a failed delivery"
+    )
+
+    :error
   end
 
   # --- Counter table helpers ---
