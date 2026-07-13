@@ -8,7 +8,10 @@ defmodule Loopctl.Workers.ComputeSthWorker do
   ## Scheduling
 
   Configured via Oban Cron to run every minute in `all_tenants` mode,
-  which enqueues individual per-tenant jobs.
+  which fans out individual per-tenant jobs via a single `Oban.insert_all/1`
+  batch. Each per-tenant job is scheduled with a small deterministic jitter
+  (see `jitter/1`) so the fanout doesn't thundering-herd the `:audit` queue
+  and the primary DB at the exact `:00` instant of the cron tick.
   """
 
   use Oban.Worker,
@@ -22,6 +25,10 @@ defmodule Loopctl.Workers.ComputeSthWorker do
   alias Loopctl.AuditChain
   alias Loopctl.Tenants.Tenant
 
+  # US-32.5: bounded jitter window (seconds) spread across the per-minute cron
+  # tick, so per-tenant fanout jobs don't all land at the same `:00` instant.
+  @jitter_window_seconds 56
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
     import Ecto.Query
@@ -30,11 +37,11 @@ defmodule Loopctl.Workers.ComputeSthWorker do
       from(t in Tenant, where: t.status == :active, select: t.id)
       |> AdminRepo.all()
 
-    for tenant_id <- tenants do
-      %{"tenant_id" => tenant_id}
-      |> __MODULE__.new()
-      |> Oban.insert()
-    end
+    tenants
+    |> Enum.map(fn tenant_id ->
+      __MODULE__.new(%{"tenant_id" => tenant_id}, schedule_in: jitter(tenant_id))
+    end)
+    |> Oban.insert_all()
 
     :ok
   end
@@ -60,4 +67,15 @@ defmodule Loopctl.Workers.ComputeSthWorker do
       :ok
     end
   end
+
+  # US-32.5 (AC-32.5.2): bounded, deterministic-per-tenant jitter in
+  # [0, @jitter_window_seconds - 1] seconds. Deliberately NOT `:rand` at the
+  # module level -- a random value here would make the enqueued job's
+  # `schedule_in` (and therefore `scheduled_at`) non-reproducible across
+  # retries/tests, and would fight `Oban.insert_all/1`'s ability to spread
+  # fanout evenly. `:erlang.phash2/1` is stable for a given tenant_id and
+  # independent of the `unique: [fields: [:worker, :args]]` dedup key (which
+  # only looks at worker + args, never `scheduled_at`), so jitter never
+  # collides with uniqueness.
+  defp jitter(tenant_id), do: rem(:erlang.phash2(tenant_id), @jitter_window_seconds)
 end
