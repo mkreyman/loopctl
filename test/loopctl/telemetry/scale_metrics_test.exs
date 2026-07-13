@@ -19,12 +19,19 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   defs.
 
   Mostly pure metric-definition / `tag_values` inspection — no DB. The US-33.1
-  queue_time "reporter round-trip" describe is the one exception: it boots a REAL,
-  privately-named `TelemetryMetricsPrometheus.Core` instance (never the app's
-  `:9568`-bound singleton) to prove the definitions/`tag_values`/measurement wiring
-  actually record and scrape correctly, rather than asserting `:telemetry.execute/3 ==
-  :ok` against zero attached handlers (which the framework guarantees regardless of
-  whether the code under test is correct).
+  queue_time "reporter round-trip" describe (and the US-34.4 one below it) are the
+  exceptions: they boot a REAL, privately-named `TelemetryMetricsPrometheus.Core`
+  instance (never the app's `:9568`-bound singleton) to prove the
+  definitions/`tag_values`/measurement wiring actually record and scrape correctly,
+  rather than asserting `:telemetry.execute/3 == :ok` against zero attached
+  handlers (which the framework guarantees regardless of whether the code under
+  test is correct).
+
+  US-34.4 adds ten counters wiring emitted-but-dead events (LLM/embedding-blocked,
+  index-health, secrets/witness/memory-promotion degradation signals) into
+  Prometheus — see `@allowed_tags`/`@scale_metric_names` below and
+  `Loopctl.Telemetry.ScaleMetrics`'s moduledoc "Wiring emitted-but-dead events" for
+  the full inventory, including the events deliberately left out of scope.
 
   `async: false` (R2 review): the cap-gate tests MUTATE the process-global
   `:persistent_term` gate (`{ScaleMetrics, :tenant_label?}`), which is shared across the
@@ -43,17 +50,32 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.knowledge.semantic_fallback.count",
     "loopctl.knowledge.hybrid_provenance.count",
     "loopctl.repo.checkout.queue_time",
-    "loopctl.admin_repo.checkout.queue_time"
+    "loopctl.admin_repo.checkout.queue_time",
+    "loopctl.llm.blocked.count",
+    "loopctl.embedding.skipped_no_key.count",
+    "loopctl.index_health.invalid.count",
+    "loopctl.secrets.orphan_cleanup_failed.count",
+    "loopctl.witness.divergence.count",
+    "loopctl.witness.bootstrap_already_consumed.count",
+    "loopctl.memory_promotion.failed.count",
+    "loopctl.memory_promotion.degraded.count",
+    "loopctl.memory_promotion.quota_exceeded.count",
+    "loopctl.memory_promotion.budget_exceeded.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
   # set — especially an unbounded `:article_id` or a raw vector/body — is a hard fail.
-  # `:reason` (#297 semantic-fallback counter) is a BOUNDED, sanitized tag set (never a
-  # key/body/query), so it is a safe dimension. `:provenance` (`"curated"`/`"retrieved"`)
-  # and `:hit` (`true`/`false`) — US-31.2's hybrid-provenance counter — are likewise
-  # small, fixed-cardinality dimensions. `:repo` (US-33.1) is a static, fixed 2-value
-  # tag ("repo"/"admin_repo") — the repo identity is encoded in the event name, not
-  # read from metadata.
+  # `:reason` (#297 semantic-fallback counter; US-34.4's witness-divergence counter) is
+  # a BOUNDED, sanitized tag set (never a key/body/query), so it is a safe dimension.
+  # `:provenance` (`"curated"`/`"retrieved"`) and `:hit` (`true`/`false`) — US-31.2's
+  # hybrid-provenance counter — are likewise small, fixed-cardinality dimensions.
+  # `:repo` (US-33.1) is a static, fixed 2-value tag ("repo"/"admin_repo") — the repo
+  # identity is encoded in the event name, not read from metadata. US-34.4 adds:
+  # `:operation`/`:provider` (llm.blocked — bounded 4-value op enum + 2-value
+  # provider), `:source` (embedding.skipped_no_key — "article"/"memory"), `:index`/
+  # `:purpose`/`:state` (index_health.invalid — three bounded fixed sets), `:op`
+  # (secrets.orphan_cleanup_failed — normalized `:delete`/`:restore`/`:unknown`), and
+  # `:stage` (memory_promotion.failed — bounded `:compile`/`:persist`/`:enqueue`).
   @allowed_tags MapSet.new([
                   :endpoint,
                   :mapped_code,
@@ -61,7 +83,15 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :reason,
                   :provenance,
                   :hit,
-                  :repo
+                  :repo,
+                  :operation,
+                  :provider,
+                  :source,
+                  :index,
+                  :purpose,
+                  :state,
+                  :op,
+                  :stage
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -433,8 +463,331 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     end
   end
 
+  describe "llm.blocked counter (US-34.4, AC-34.4.1, TC-34.4.1)" do
+    test "the counter is defined, tagged by operation and provider only" do
+      counter = metric("loopctl.llm.blocked.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :llm, :blocked]
+      assert MapSet.new(counter.tags) == MapSet.new([:operation, :provider])
+      refute :tenant_id in counter.tags
+    end
+
+    test "llm.blocked increments a counter (TC-34.4.1): :telemetry.execute runs the handler without error" do
+      reporter_name = :"llm_blocked_test_#{System.unique_integer([:positive])}"
+      counter = metric("loopctl.llm.blocked.count")
+
+      pid =
+        start_supervised!(
+          {TelemetryMetricsPrometheus.Core,
+           [metrics: [counter], name: reporter_name, start_async: false]}
+        )
+
+      :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{provider: "anthropic"})
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter_name)
+
+      assert scrape =~
+               ~s(loopctl_llm_blocked_count{operation="unknown",provider="anthropic"} 1)
+
+      assert Process.alive?(pid)
+    end
+
+    test "llm_blocked_tags/1 defaults missing operation/provider to \"unknown\", never tenant_id" do
+      assert ScaleMetrics.llm_blocked_tags(%{}) == %{operation: "unknown", provider: "unknown"}
+
+      assert ScaleMetrics.llm_blocked_tags(%{operation: :embedding, provider: "embedding"}) == %{
+               operation: :embedding,
+               provider: "embedding"
+             }
+
+      tags = ScaleMetrics.llm_blocked_tags(%{operation: :extraction, tenant_id: "t-1"})
+      refute Map.has_key?(tags, :tenant_id)
+    end
+  end
+
+  describe "embedding.skipped_no_key counter (US-34.4, AC-34.4.1, TC-34.4.2)" do
+    test "the counter is defined, tagged by source only" do
+      counter = metric("loopctl.embedding.skipped_no_key.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :embedding, :skipped_no_key]
+      assert counter.tags == [:source]
+    end
+
+    test "embedding_skipped_tags/1 defaults a missing source to \"unknown\", never tags ids/tenant_id" do
+      assert ScaleMetrics.embedding_skipped_tags(%{}) == %{source: "unknown"}
+      assert ScaleMetrics.embedding_skipped_tags(%{source: "article"}) == %{source: "article"}
+
+      tags =
+        ScaleMetrics.embedding_skipped_tags(%{
+          source: "memory",
+          tenant_id: "t-1",
+          memory_id: "m-1"
+        })
+
+      assert tags == %{source: "memory"}
+    end
+  end
+
+  describe "index_health.invalid counter (US-34.4, AC-34.4.1, TC-34.4.2)" do
+    test "the counter is defined, tagged by index/purpose/state" do
+      counter = metric("loopctl.index_health.invalid.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :index_health, :invalid]
+      assert MapSet.new(counter.tags) == MapSet.new([:index, :purpose, :state])
+    end
+
+    test "index_health_tags/1 passes through present keys and defaults missing ones to \"unknown\"" do
+      assert ScaleMetrics.index_health_tags(%{
+               index: "articles_embedding_idx",
+               purpose: "vector_search",
+               state: :invalid
+             }) == %{index: "articles_embedding_idx", purpose: "vector_search", state: :invalid}
+
+      assert ScaleMetrics.index_health_tags(%{}) == %{
+               index: "unknown",
+               purpose: "unknown",
+               state: "unknown"
+             }
+    end
+  end
+
+  describe "secrets.orphan_cleanup_failed counter (US-34.4, AC-34.4.2)" do
+    test "the counter is defined, tagged by op and reason only — never secret_name" do
+      counter = metric("loopctl.secrets.orphan_cleanup_failed.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :secrets, :orphan_cleanup_failed]
+      assert MapSet.new(counter.tags) == MapSet.new([:op, :reason])
+      refute :secret_name in counter.tags
+    end
+
+    test "secrets_orphan_cleanup_tags/1 normalizes op and CLASSIFIES reason (never raw free-text)" do
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{
+               op: :restore,
+               reason: :old_value_unavailable
+             }) == %{op: :restore, reason: "old_value_unavailable"}
+
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{op: :delete, reason: :fly_not_configured}) ==
+               %{op: :delete, reason: "fly_not_configured"}
+
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{op: :delete, reason: {:http_error, 503}}) ==
+               %{op: :delete, reason: "http_error"}
+
+      # A raw Fly GraphQL error payload is free-text — classified to a bounded
+      # sentinel, never passed through as a label.
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{
+               op: :restore,
+               reason: {:fly_api_error, [%{"message" => "arbitrary free text from Fly"}]}
+             }) == %{op: :restore, reason: "fly_api_error"}
+
+      # An unrecognized/unbounded shape (e.g. a raw transport-error struct) still
+      # collapses to the bounded "other" sentinel rather than ever leaking through.
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{
+               op: :delete,
+               reason: %{unexpected: "shape"}
+             }) == %{op: :delete, reason: "other"}
+
+      assert ScaleMetrics.secrets_orphan_cleanup_tags(%{}) == %{op: :unknown, reason: "unknown"}
+
+      # secret_name is never present in the returned tags even if it leaks into metadata.
+      tags =
+        ScaleMetrics.secrets_orphan_cleanup_tags(%{
+          op: :delete,
+          reason: :fly_not_configured,
+          secret_name: "tenant_audit_key_123"
+        })
+
+      refute Map.has_key?(tags, :secret_name)
+    end
+  end
+
+  describe "witness.divergence counter (US-34.4, AC-34.4.2)" do
+    test "the counter is defined, tagged by reason ONLY — never tenant_id/position" do
+      counter = metric("loopctl.witness.divergence.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :witness, :divergence]
+      assert counter.tags == [:reason]
+    end
+
+    test "witness_divergence_tags/1 defaults a missing reason to \"unknown\", never tags tenant_id/position" do
+      assert ScaleMetrics.witness_divergence_tags(%{reason: "prefix_mismatch"}) == %{
+               reason: "prefix_mismatch"
+             }
+
+      assert ScaleMetrics.witness_divergence_tags(%{}) == %{reason: "unknown"}
+
+      tags =
+        ScaleMetrics.witness_divergence_tags(%{
+          reason: "future_position",
+          tenant_id: "t-1",
+          position: 42
+        })
+
+      assert tags == %{reason: "future_position"}
+    end
+  end
+
+  describe "witness.bootstrap_already_consumed counter (US-34.4, AC-34.4.2)" do
+    test "the counter is defined, UNTAGGED — its only metadata (tenant_id) is never a label" do
+      counter = metric("loopctl.witness.bootstrap_already_consumed.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :witness, :bootstrap_already_consumed]
+      assert counter.tags == []
+    end
+  end
+
+  describe "memory_promotion.{failed,degraded,quota_exceeded,budget_exceeded} counters (US-34.4, AC-34.4.2)" do
+    test "the :failed counter is tagged by :stage ONLY" do
+      counter = metric("loopctl.memory_promotion.failed.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :memory_promotion, :failed]
+      assert counter.tags == [:stage]
+    end
+
+    test "the :degraded, :quota_exceeded, and :budget_exceeded counters are UNTAGGED" do
+      for {name, event} <- [
+            {"loopctl.memory_promotion.degraded.count", [:loopctl, :memory_promotion, :degraded]},
+            {"loopctl.memory_promotion.quota_exceeded.count",
+             [:loopctl, :memory_promotion, :quota_exceeded]},
+            {"loopctl.memory_promotion.budget_exceeded.count",
+             [:loopctl, :memory_promotion, :budget_exceeded]}
+          ] do
+        counter = metric(name)
+
+        assert %Telemetry.Metrics.Counter{} = counter
+        assert counter.event_name == event
+        assert counter.tags == []
+      end
+    end
+
+    test "memory_promotion_failed_tags/1 defaults a missing stage to \"unknown\", never tags tenant_id" do
+      assert ScaleMetrics.memory_promotion_failed_tags(%{stage: :compile}) == %{stage: :compile}
+      assert ScaleMetrics.memory_promotion_failed_tags(%{}) == %{stage: "unknown"}
+
+      tags =
+        ScaleMetrics.memory_promotion_failed_tags(%{
+          stage: :enqueue,
+          tenant_id: "t-1",
+          subject_id: "s-1",
+          session_id: "sess-1"
+        })
+
+      assert tags == %{stage: :enqueue}
+    end
+  end
+
+  describe "US-34.4 reporter round-trip — real Prometheus scrape, not a no-handler no-op" do
+    setup do
+      reporter_name = :"scale_metrics_us_34_4_test_#{System.unique_integer([:positive])}"
+
+      metrics = [
+        metric("loopctl.embedding.skipped_no_key.count"),
+        metric("loopctl.index_health.invalid.count"),
+        metric("loopctl.secrets.orphan_cleanup_failed.count"),
+        metric("loopctl.witness.divergence.count"),
+        metric("loopctl.witness.bootstrap_already_consumed.count"),
+        metric("loopctl.memory_promotion.failed.count"),
+        metric("loopctl.memory_promotion.degraded.count"),
+        metric("loopctl.memory_promotion.quota_exceeded.count"),
+        metric("loopctl.memory_promotion.budget_exceeded.count")
+      ]
+
+      pid =
+        start_supervised!(
+          {TelemetryMetricsPrometheus.Core,
+           [metrics: metrics, name: reporter_name, start_async: false]}
+        )
+
+      %{reporter: reporter_name, reporter_pid: pid}
+    end
+
+    test "each new counter records and scrapes end to end", %{
+      reporter: reporter,
+      reporter_pid: pid
+    } do
+      :telemetry.execute(
+        [:loopctl, :embedding, :skipped_no_key],
+        %{count: 1},
+        %{tenant_id: "t-1", article_id: "a-1", source: "article"}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :index_health, :invalid],
+        %{count: 1},
+        %{index: "articles_embedding_idx", purpose: "vector_search", state: :invalid}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :secrets, :orphan_cleanup_failed],
+        %{count: 1},
+        %{op: :restore, secret_name: "k", reason: :old_value_unavailable}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :witness, :divergence],
+        %{count: 1},
+        %{tenant_id: "t-1", position: 1, reason: "prefix_mismatch"}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :witness, :bootstrap_already_consumed],
+        %{count: 1},
+        %{tenant_id: "t-1"}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :memory_promotion, :failed],
+        %{count: 1},
+        %{tenant_id: "t-1", subject_id: "s-1", session_id: "sess-1", stage: :compile}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :memory_promotion, :degraded],
+        %{count: 1},
+        %{tenant_id: "t-1", subject_id: "s-1", session_id: "sess-1"}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :memory_promotion, :quota_exceeded],
+        %{count: 1},
+        %{tenant_id: "t-1", subject_id: "s-1", session_id: "sess-1"}
+      )
+
+      :telemetry.execute(
+        [:loopctl, :memory_promotion, :budget_exceeded],
+        %{count: 1},
+        %{tenant_id: "t-1", subject_id: "s-1", session_id: "sess-1"}
+      )
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter)
+
+      assert scrape =~ ~s(loopctl_embedding_skipped_no_key_count{source="article"} 1)
+
+      assert scrape =~
+               ~s(loopctl_index_health_invalid_count{index="articles_embedding_idx",purpose="vector_search",state="invalid"} 1)
+
+      assert scrape =~
+               ~s(loopctl_secrets_orphan_cleanup_failed_count{op="restore",reason="old_value_unavailable"} 1)
+
+      assert scrape =~ ~s(loopctl_witness_divergence_count{reason="prefix_mismatch"} 1)
+      assert scrape =~ ~s(loopctl_witness_bootstrap_already_consumed_count 1)
+      assert scrape =~ ~s(loopctl_memory_promotion_failed_count{stage="compile"} 1)
+      assert scrape =~ ~s(loopctl_memory_promotion_degraded_count 1)
+      assert scrape =~ ~s(loopctl_memory_promotion_quota_exceeded_count 1)
+      assert scrape =~ ~s(loopctl_memory_promotion_budget_exceeded_count 1)
+
+      assert Process.alive?(pid)
+    end
+  end
+
   describe "metrics/0 wiring + test-env reporter guard" do
-    test "LoopctlWeb.Telemetry.metrics/0 includes the three scale metrics" do
+    test "LoopctlWeb.Telemetry.metrics/0 includes all scale metrics" do
       names = Enum.map(LoopctlWeb.Telemetry.metrics(), &Enum.join(&1.name, "."))
       for scale_name <- @scale_metric_names, do: assert(scale_name in names)
     end

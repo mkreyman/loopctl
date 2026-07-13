@@ -18,10 +18,18 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   `queue_time` (native time spent WAITING for a pooled connection) on every query
   telemetry event; before this branch only `heavy_read_repo.query.duration` was
   scraped, so there was no way to see where checkout contention lands between the
-  two pools. See "Per-pool checkout queue_time (US-33.1)" below. `scale_metrics/0`
-  now returns 7 metrics total.
+  two pools. See "Per-pool checkout queue_time (US-33.1)" below. US-34.4 adds TEN
+  more, purely-additive counters: several `:telemetry.execute/3` calls already fire
+  at the right code sites (LLM/embedding BYO-key blocks, a nightly index-health
+  check, secret-rotation cleanup failures, witness-header divergence, and the
+  Epic 29 memory-promotion pipeline) but had no `Telemetry.Metrics` definition
+  consuming them, so the signal terminated in a no-op handler-less event — invisible
+  to Prometheus/dashboards despite already being emitted. See "Wiring emitted-but-dead
+  events (US-34.4)" below for the full inventory, including the events deliberately
+  left OUT of scope with a cited reason. `scale_metrics/0` now returns 17 metrics
+  total.
 
-  ## The metrics (7 total)
+  ## The metrics (17 total)
 
     1. **Timeout / DB-error counter** — `loopctl.db.error.count`, keyed by
        `[:endpoint, :mapped_code]` (+ a cap-gated `:tenant_id`). `mapped_code`
@@ -48,6 +56,43 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
     7. **AdminRepo-pool checkout `queue_time` distribution** (US-33.1) —
        `loopctl.admin_repo.checkout.queue_time`, with a static `[:repo]` tag (no cap
        gate needed). Sourced from `[:loopctl, :admin_repo, :query]`.
+    8. **LLM/embedding blocked counter** (US-34.4, AC-34.4.1/.3) —
+       `loopctl.llm.blocked.count`, keyed by `[:operation, :provider]` (NEVER
+       `:tenant_id`). Sourced from `[:loopctl, :llm, :blocked]` (`Loopctl.Llm.record_blocked/2`).
+    9. **Embedding-skipped-no-key counter** (US-34.4, AC-34.4.1) —
+       `loopctl.embedding.skipped_no_key.count`, keyed by `[:source]` (`"article"` /
+       `"memory"`). Sourced from `[:loopctl, :embedding, :skipped_no_key]`
+       (`ArticleEmbeddingWorker` / `MemoryEmbeddingWorker`).
+    10. **Index-health-invalid counter** (US-34.4, AC-34.4.1) —
+        `loopctl.index_health.invalid.count`, keyed by `[:index, :purpose, :state]`
+        (all three bounded, fixed sets). Sourced from `[:loopctl, :index_health, :invalid]`
+        (`Loopctl.IndexHealth.emit/3`).
+    11. **Secret-orphan-cleanup-failed counter** (US-34.4, AC-34.4.2) —
+        `loopctl.secrets.orphan_cleanup_failed.count`, keyed by `[:op, :reason]` —
+        `reason` is CLASSIFIED into a bounded set (never the raw, potentially
+        free-text Fly API error term). Sourced from
+        `[:loopctl, :secrets, :orphan_cleanup_failed]` (`Loopctl.Tenants`).
+    12. **Witness-divergence counter** (US-34.4, AC-34.4.2) —
+        `loopctl.witness.divergence.count`, keyed by `[:reason]` ONLY (never
+        `:tenant_id`/`:position`, both unbounded). Sourced from
+        `[:loopctl, :witness, :divergence]` (`ValidateWitnessHeader.resync_required/5`).
+    13. **Witness-bootstrap-already-consumed counter** (US-34.4, AC-34.4.2) —
+        `loopctl.witness.bootstrap_already_consumed.count`, UNTAGGED (the only
+        metadata is `tenant_id`, which is never a label). Sourced from
+        `[:loopctl, :witness, :bootstrap_already_consumed]`.
+    14. **Memory-promotion-failed counter** (US-34.4, AC-34.4.2) —
+        `loopctl.memory_promotion.failed.count`, keyed by `[:stage]` (a bounded
+        3-value enum: `:compile`/`:persist`/`:enqueue`). Sourced from
+        `[:loopctl, :memory_promotion, :failed]`.
+    15. **Memory-promotion-degraded counter** (US-34.4, AC-34.4.2) —
+        `loopctl.memory_promotion.degraded.count`, UNTAGGED. Sourced from
+        `[:loopctl, :memory_promotion, :degraded]`.
+    16. **Memory-promotion-quota-exceeded counter** (US-34.4, AC-34.4.2) —
+        `loopctl.memory_promotion.quota_exceeded.count`, UNTAGGED. Sourced from
+        `[:loopctl, :memory_promotion, :quota_exceeded]`.
+    17. **Memory-promotion-budget-exceeded counter** (US-34.4, AC-34.4.2) —
+        `loopctl.memory_promotion.budget_exceeded.count`, UNTAGGED. Sourced from
+        `[:loopctl, :memory_promotion, :budget_exceeded]`.
 
   ## Bounded cardinality (AC-27.15.3) — the no-leak contract
 
@@ -85,6 +130,101 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   gated keeps the series shape stable AND pins the tenant dimension's cardinality to
   exactly 1 when over the cap. Below the cap the cardinality is bounded by the cap
   itself (≤ #{1000} by default).
+
+  ## Wiring emitted-but-dead events (US-34.4)
+
+  Producer code already fires `:telemetry.execute/3` at seven distinct code sites
+  (AC-34.4.2's full inventory below); this story does NOT change what is emitted
+  (with the two narrow, documented metadata additions noted per-event below) — it
+  is PURELY additive metric-definition work that gives each event a consumer.
+
+    * `[:loopctl, :llm, :blocked]` (metric 8) — `Loopctl.Llm.record_blocked/2`
+      already carried `tenant_id` + `operation`; this story adds ONE bounded
+      metadata key, `provider` (`"embedding"` or `"anthropic"`, derived from the
+      same 2-way split `blocked_credential/1` already uses), so the counter can be
+      windowed by provider. **IMPORTANT — this is NOT a provider-error signal.**
+      `record_blocked/2` fires ONLY when a tenant has no BYO API/embedding key
+      configured (a missing-credential CONFIG state, checked before any provider
+      call is made); `provider` here is the credential TYPE (`"embedding"` /
+      `"anthropic"`), not the LLM vendor. There is currently NO runtime
+      provider-error telemetry event anywhere in the codebase —
+      `Loopctl.Llm.ProviderError` only sanitizes error terms for logging/discard
+      reasons and emits nothing. **AC-34.4.3 coordination with US-34.3 (unwritten
+      as of this story)**: US-34.3's "provider-error rate" signal must NOT window
+      this counter as a proxy for provider throttling — a tenant that simply
+      never configured a key would inflate the signal (false paging on a
+      non-incident), while an actual 429/5xx/transport-error storm (key present,
+      so `llm.blocked` never fires at all) would go completely undetected — the
+      exact incident class this epic exists to catch. US-34.3 must instead either
+      (a) introduce its own genuine provider-error event (e.g. from the
+      transient branch of `Loopctl.Llm.permanent_provider_error?/1`) and window
+      THAT, or (b) if it chooses to consume `llm.blocked` anyway, scope its
+      language to mean "missing-key blocks" explicitly rather than "provider
+      errors". Should a future handler attach to `[:loopctl, :llm, :blocked]`
+      for the missing-key case specifically, it would do so independently via
+      telemetry fan-out (this counter's handler does not re-emit the event, so
+      no double-count) — but that remains a DIFFERENT signal than "provider
+      error" and must be named accordingly wherever it is consumed.
+    * `[:loopctl, :embedding, :skipped_no_key]` (metric 9) — both emit sites
+      (`ArticleEmbeddingWorker`, `MemoryEmbeddingWorker`) already carried
+      `tenant_id` + an unbounded id (`article_id`/`memory_id`); this story adds ONE
+      bounded metadata key, `source` (`"article"`/`"memory"`), at each site so the
+      counter can distinguish the two without ever tagging the id. **Known overlap
+      with metric 8**: both emit sites also call `Llm.record_blocked/2`
+      immediately afterward, so a single missing-embedding-key skip increments
+      BOTH `loopctl.embedding.skipped_no_key.count{source=...}` AND
+      `loopctl.llm.blocked.count{operation="embedding"}`. This is intentional —
+      the two counters answer different questions ("embedding work skipped" vs
+      "LLM operation blocked for a key") — but an operator building a single
+      "blocked operations" panel that sums across both series will double-count
+      this one condition; do not sum them without accounting for the overlap.
+    * `[:loopctl, :index_health, :invalid]` (metric 10) — wired AS-IS; `index`,
+      `purpose`, and `state` are already three bounded, fixed sets (no metadata
+      change needed).
+    * `[:loopctl, :secrets, :orphan_cleanup_failed]` (metric 11) — wired, but NOT
+      as-is: `reason` here is `{:error, term()}` from `Loopctl.Secrets.Behaviour`
+      and can carry a raw Fly GraphQL error payload (`{:fly_api_error, errors}` —
+      free text) or an arbitrary transport-error struct, so this story does NOT
+      trust it as a label directly. `secrets_orphan_cleanup_tags/1` CLASSIFIES it
+      into a small fixed set (`"fly_not_configured"`, `"http_error"`,
+      `"fly_api_error"`, `"old_value_unavailable"`, `"other"`) before it ever
+      reaches a tag — the same "mapped_code" classification precedent as the
+      original DB-error counter. `secret_name` (unbounded) is never tagged.
+    * `[:loopctl, :witness, :divergence]` (metric 12) — wired by `reason` ONLY
+      (`"prefix_mismatch"` / `"future_position"`, a genuinely fixed 2-value set);
+      `tenant_id` and `position` are dropped from the tag set (both unbounded).
+    * `[:loopctl, :witness, :bootstrap_already_consumed]` (metric 13) — wired
+      UNTAGGED. Its only metadata is `tenant_id`; rather than skip it, this story
+      counts total occurrences with zero labels (cardinality exactly 1) — still
+      useful trend data (how often fresh clients consume the one-time bootstrap
+      grace) without ever exposing the tenant dimension.
+    * `[:loopctl, :memory_promotion, *]` (`Loopctl.Memory.PromotionTelemetry`,
+      11 possible event names) — a SUBSET is wired (metrics 14-17): the four
+      DEGRADATION/failure signals an operator would actually want to alert on —
+      `:failed` (tagged by the bounded `:stage` enum, present on every `:failed`
+      emission), `:degraded`, `:quota_exceeded`, and `:budget_exceeded` (all three
+      untagged — their only metadata besides the `:count` measurement is
+      per-tenant/session identifiers, which are never tagged). **Explicitly
+      OUT OF SCOPE, no silent omission**: `:swept`, `:skipped`, `:compiled`,
+      `:promoted`, `:superseded`, `:gated_out`, and `:eval` are routine
+      steady-state VOLUME/quality telemetry, not degradation signals — wiring all
+      eleven sub-events would triple this module's metric count for observability
+      value this story's scope does not need (a future story can extend the
+      subset; the events remain available via `:telemetry.attach` in the
+      meantime).
+    * `[:loopctl, :knowledge, :keyset_byte_truncated]` — **explicitly OUT OF
+      SCOPE, no silent omission**. Its ONLY metadata is `tenant_id`; there is no
+      bounded dimension available to key a useful counter by (unlike
+      `bootstrap_already_consumed` above, byte-truncation volume without ANY
+      breakdown is not actionable trend data on its own), so wiring it would add
+      a metric definition purely to avoid an omission rather than to serve
+      observability. Cites the bounded-cardinality rule (AC-27.15.3): a metric
+      whose only non-fixed dimension is `tenant_id` either drops the dimension
+      (as `bootstrap_already_consumed` does, where the RAW event-name volume is
+      itself the signal an operator watches) or stays unwired; this event's
+      truncation volume is expected to correlate with the already-instrumented
+      `loopctl.knowledge.vector_search.under_fill.count`/hybrid-provenance
+      signals rather than needing its own series.
   """
 
   import Telemetry.Metrics
@@ -103,9 +243,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @default_tenant_label_cap 1_000
 
   @doc """
-  All 7 scale metrics: the original US-27.15 trio, #297's semantic-fallback
-  counter, US-31.2's hybrid-provenance counter, and US-33.1's two per-pool
-  checkout `queue_time` distributions. Appended to `LoopctlWeb.Telemetry.metrics/0`.
+  All 17 scale metrics: the original US-27.15 trio, #297's semantic-fallback
+  counter, US-31.2's hybrid-provenance counter, US-33.1's two per-pool checkout
+  `queue_time` distributions, and US-34.4's ten emitted-but-dead-event counters
+  (LLM/embedding-blocked, index-health, secrets/witness/memory-promotion
+  degradation signals). Appended to `LoopctlWeb.Telemetry.metrics/0`.
   """
   @spec scale_metrics() :: [Telemetry.Metrics.t()]
   def scale_metrics do
@@ -209,6 +351,119 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         reporter_options: [
           buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1_000]
         ]
+      ),
+
+      # 8. LLM/embedding blocked counter (US-34.4, AC-34.4.1/.3). `operation` is the
+      #    existing bounded 4-value enum (`Loopctl.Llm.operation()`); `provider` is the
+      #    ONE bounded metadata tag this story adds at the `record_blocked/2` emit
+      #    site. NEVER `tenant_id`. NOTE: this is a MISSING-BYO-KEY config gate, NOT
+      #    a runtime provider-error (429/5xx/transport) signal — no such event exists
+      #    today. See moduledoc "AC-34.4.3 coordination" for why US-34.3 must not
+      #    window this counter as a provider-error-rate proxy.
+      counter("loopctl.llm.blocked.count",
+        event_name: [:loopctl, :llm, :blocked],
+        measurement: :count,
+        description:
+          "Tenant LLM/embedding operations blocked for a missing BYO key, by operation and provider.",
+        tags: [:operation, :provider],
+        tag_values: &llm_blocked_tags/1
+      ),
+
+      # 9. Embedding-skipped-no-key counter (US-34.4, AC-34.4.1). `source`
+      #    ("article"/"memory") is the ONE bounded metadata tag this story adds at
+      #    both emit sites; the unbounded `article_id`/`memory_id` is never tagged.
+      counter("loopctl.embedding.skipped_no_key.count",
+        event_name: [:loopctl, :embedding, :skipped_no_key],
+        measurement: :count,
+        description:
+          "Article/memory embedding generation skipped for a missing BYO embedding key, by source.",
+        tags: [:source],
+        tag_values: &embedding_skipped_tags/1
+      ),
+
+      # 10. Index-health-invalid counter (US-34.4, AC-34.4.1). `index`, `purpose`,
+      #     and `state` are already three bounded, fixed sets in `Loopctl.IndexHealth`
+      #     — wired as-is, no metadata change needed.
+      counter("loopctl.index_health.invalid.count",
+        event_name: [:loopctl, :index_health, :invalid],
+        measurement: :count,
+        description:
+          "Index-health check results, by index, purpose, and state (valid/invalid/missing).",
+        tags: [:index, :purpose, :state],
+        tag_values: &index_health_tags/1
+      ),
+
+      # 11. Secret-orphan-cleanup-failed counter (US-34.4, AC-34.4.2). `reason` is
+      #     CLASSIFIED into a bounded set (never the raw `{:error, term()}`, which
+      #     can carry a free-text Fly API error payload) — see
+      #     `secrets_orphan_cleanup_tags/1`. `secret_name` is never tagged.
+      counter("loopctl.secrets.orphan_cleanup_failed.count",
+        event_name: [:loopctl, :secrets, :orphan_cleanup_failed],
+        measurement: :count,
+        description:
+          "Compensating audit-key secret delete/restore failures, by op and classified reason.",
+        tags: [:op, :reason],
+        tag_values: &secrets_orphan_cleanup_tags/1
+      ),
+
+      # 12. Witness-divergence counter (US-34.4, AC-34.4.2). `reason` is a genuinely
+      #     fixed 2-value set (`"prefix_mismatch"`/`"future_position"`); `tenant_id`
+      #     and `position` are dropped (both unbounded).
+      counter("loopctl.witness.divergence.count",
+        event_name: [:loopctl, :witness, :divergence],
+        measurement: :count,
+        description:
+          "Client-reported witness-header divergence (resync, not custody halt), by reason.",
+        tags: [:reason],
+        tag_values: &witness_divergence_tags/1
+      ),
+
+      # 13. Witness-bootstrap-already-consumed counter (US-34.4, AC-34.4.2).
+      #     UNTAGGED — the only metadata is `tenant_id`, which is never a label; the
+      #     raw occurrence count is still useful trend data.
+      counter("loopctl.witness.bootstrap_already_consumed.count",
+        event_name: [:loopctl, :witness, :bootstrap_already_consumed],
+        measurement: :count,
+        description: "One-time witness bootstrap grace already consumed (412, retryable).",
+        tags: []
+      ),
+
+      # 14. Memory-promotion-failed counter (US-34.4, AC-34.4.2). `stage` is a
+      #     bounded 3-value enum (`:compile`/`:persist`/`:enqueue`) present on every
+      #     `:failed` emission.
+      counter("loopctl.memory_promotion.failed.count",
+        event_name: [:loopctl, :memory_promotion, :failed],
+        measurement: :count,
+        description: "Memory-promotion compile/persist/enqueue failures, by stage.",
+        tags: [:stage],
+        tag_values: &memory_promotion_failed_tags/1
+      ),
+
+      # 15. Memory-promotion-degraded counter (US-34.4, AC-34.4.2). UNTAGGED — only
+      #     per-tenant/session metadata besides the measurement, none of it bounded.
+      counter("loopctl.memory_promotion.degraded.count",
+        event_name: [:loopctl, :memory_promotion, :degraded],
+        measurement: :count,
+        description: "Memory-promotion runs snoozed for degraded (unavailable) embeddings.",
+        tags: []
+      ),
+
+      # 16. Memory-promotion-quota-exceeded counter (US-34.4, AC-34.4.2). UNTAGGED.
+      counter("loopctl.memory_promotion.quota_exceeded.count",
+        event_name: [:loopctl, :memory_promotion, :quota_exceeded],
+        measurement: :count,
+        description:
+          "Memory-promotion runs terminally discarded for hitting the subject memory quota.",
+        tags: []
+      ),
+
+      # 17. Memory-promotion-budget-exceeded counter (US-34.4, AC-34.4.2). UNTAGGED.
+      counter("loopctl.memory_promotion.budget_exceeded.count",
+        event_name: [:loopctl, :memory_promotion, :budget_exceeded],
+        measurement: :count,
+        description:
+          "Memory-promotion enqueues refused for hitting the tenant compiles/hour budget.",
+        tags: []
       )
     ]
   end
@@ -290,6 +545,97 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   """
   @spec queue_time_tags_admin_repo(map()) :: map()
   def queue_time_tags_admin_repo(_metadata), do: %{repo: "admin_repo"}
+
+  @doc """
+  `tag_values` for the LLM/embedding blocked counter (US-34.4). Returns ONLY
+  `operation` (`Loopctl.Llm`'s existing bounded 4-value enum) and `provider`
+  (the ONE bounded metadata tag this story adds at the `Loopctl.Llm.record_blocked/2`
+  emit site) — NEVER `tenant_id`, even if one leaks into metadata. Both default to
+  `"unknown"` so a direct `:telemetry.execute/3` missing either key (e.g. TC-34.4.1)
+  never raises and never emits a blank label.
+  """
+  @spec llm_blocked_tags(map()) :: map()
+  def llm_blocked_tags(metadata) do
+    %{
+      operation: Map.get(metadata, :operation) || "unknown",
+      provider: Map.get(metadata, :provider) || "unknown"
+    }
+  end
+
+  @doc """
+  `tag_values` for the embedding-skipped-no-key counter (US-34.4). Returns ONLY the
+  bounded `source` label (`"article"`/`"memory"`, the ONE bounded metadata tag this
+  story adds at both emit sites) — NEVER the unbounded `article_id`/`memory_id`,
+  and NEVER `tenant_id`. Defaults a missing `source` to `"unknown"`.
+  """
+  @spec embedding_skipped_tags(map()) :: map()
+  def embedding_skipped_tags(metadata) do
+    %{source: Map.get(metadata, :source) || "unknown"}
+  end
+
+  @doc """
+  `tag_values` for the index-health-invalid counter (US-34.4). `index`, `purpose`,
+  and `state` are already three bounded, fixed sets in `Loopctl.IndexHealth` — this
+  is wired as-is (no metadata change), defaulting any missing key to `"unknown"`.
+  """
+  @spec index_health_tags(map()) :: map()
+  def index_health_tags(metadata) do
+    %{
+      index: Map.get(metadata, :index) || "unknown",
+      purpose: Map.get(metadata, :purpose) || "unknown",
+      state: Map.get(metadata, :state) || "unknown"
+    }
+  end
+
+  @doc """
+  `tag_values` for the secret-orphan-cleanup-failed counter (US-34.4). `op` is
+  normalized to the bounded `:delete`/`:restore` set. `reason` is CLASSIFIED (never
+  passed through raw) — `Loopctl.Secrets.Behaviour`'s `{:error, term()}` can carry a
+  free-text Fly GraphQL error payload (`{:fly_api_error, errors}`) or an arbitrary
+  transport-error struct, so `secrets_reason_class/1` collapses anything outside
+  the known bounded shapes to `"other"` rather than ever emitting raw error content
+  as a label (the same "mapped_code" classification precedent as the DB-error
+  counter). `secret_name` is never tagged (unbounded).
+  """
+  @spec secrets_orphan_cleanup_tags(map()) :: map()
+  def secrets_orphan_cleanup_tags(metadata) do
+    %{
+      op: normalize_secrets_op(Map.get(metadata, :op)),
+      reason: secrets_reason_class(Map.get(metadata, :reason))
+    }
+  end
+
+  defp normalize_secrets_op(op) when op in [:delete, :restore], do: op
+  defp normalize_secrets_op(_other), do: :unknown
+
+  defp secrets_reason_class(:fly_not_configured), do: "fly_not_configured"
+  defp secrets_reason_class(:old_value_unavailable), do: "old_value_unavailable"
+  defp secrets_reason_class({:http_error, _status}), do: "http_error"
+  defp secrets_reason_class({:fly_api_error, _errors}), do: "fly_api_error"
+  defp secrets_reason_class(nil), do: "unknown"
+  defp secrets_reason_class(_other), do: "other"
+
+  @doc """
+  `tag_values` for the witness-divergence counter (US-34.4). Returns ONLY the
+  bounded `reason` label (`"prefix_mismatch"`/`"future_position"`, a genuinely
+  fixed 2-value set) — NEVER `tenant_id`/`position` (both unbounded). Defaults a
+  missing reason to `"unknown"`.
+  """
+  @spec witness_divergence_tags(map()) :: map()
+  def witness_divergence_tags(metadata) do
+    %{reason: Map.get(metadata, :reason) || "unknown"}
+  end
+
+  @doc """
+  `tag_values` for the memory-promotion-failed counter (US-34.4). Returns ONLY the
+  bounded `stage` label (`:compile`/`:persist`/`:enqueue`, present on every
+  `:failed` emission) — NEVER `tenant_id`/`subject_id`/`session_id`. Defaults a
+  missing stage to `"unknown"`.
+  """
+  @spec memory_promotion_failed_tags(map()) :: map()
+  def memory_promotion_failed_tags(metadata) do
+    %{stage: Map.get(metadata, :stage) || "unknown"}
+  end
 
   # The cap gate read on the hot path: a lock-free O(1) persistent_term lookup,
   # defaulting to `false` (aggregate) if unseeded — an un-warmed boot can never emit
