@@ -4,6 +4,17 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHalt do
   operations are halted due to witness divergence.
 
   Mounted after SetTenant in the :authenticated pipeline.
+
+  US-33.2: The halt decision reuses the fully-loaded `current_tenant` struct
+  that `ResolveApiKey` already preloaded (`Auth.verify_api_key/1` uses
+  `preload: [:tenant]`), instead of issuing a redundant AdminRepo SELECT via
+  `Tenants.get_tenant/1`. This drops the authenticated request from 5→4
+  AdminRepo queries with zero behavior change. Freshness: `custody_halted_at`
+  now reflects its value at api-key resolution time (microseconds earlier, same
+  request). This is acceptable — both reads are within the same request, and a
+  halt set mid-request is enforced on the very next request. A defensive DB
+  fallback (`refetch_and_check/2`) preserves the old behavior when no tenant is
+  in assigns (unauthenticated/edge paths).
   """
 
   @behaviour Plug
@@ -11,6 +22,7 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHalt do
   import Plug.Conn
 
   alias Loopctl.Tenants
+  alias Loopctl.Tenants.Tenant
 
   @impl true
   def init(opts), do: opts
@@ -56,7 +68,20 @@ defmodule LoopctlWeb.Plugs.CheckCustodyHalt do
 
   defp memory_oversight_path?(_conn), do: false
 
+  # US-33.2: Prefer the tenant already loaded by ResolveApiKey/Impersonate and
+  # assigned to `current_tenant`. Under impersonation, `current_tenant` is the
+  # impersonated tenant (matching `current_api_key.tenant_id`), while
+  # `current_api_key.tenant` is the superadmin's original preloaded assoc — so
+  # `current_tenant` is the correct source, not `current_api_key.tenant`.
+  # Fall back to a DB fetch only when no tenant struct is in assigns.
   defp check_tenant_halt(conn, tenant_id) do
+    case conn.assigns[:current_tenant] do
+      %Tenant{} = tenant -> maybe_block(conn, tenant)
+      _ -> refetch_and_check(conn, tenant_id)
+    end
+  end
+
+  defp refetch_and_check(conn, tenant_id) do
     case Tenants.get_tenant(tenant_id) do
       {:ok, tenant} -> maybe_block(conn, tenant)
       _ -> conn
