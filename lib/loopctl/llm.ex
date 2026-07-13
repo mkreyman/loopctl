@@ -83,13 +83,16 @@ defmodule Loopctl.Llm do
   READ-THROUGH CACHED (US-32.3): the resolved+decrypted struct (or `nil`) is served
   from a supervised ETS cache keyed by `tenant_id`, converting a per-call DB read +
   Cloak decrypt into a per-change one. On a miss it loads from the DB, caches, and
-  returns; `upsert_settings/2` invalidates the entry so a read never serves stale
-  credentials. Signature and return shape are unchanged.
+  returns; `upsert_settings/2` invalidates the entry. Signature and return shape are
+  unchanged.
 
   The cache generation is captured BEFORE the DB load and passed to `put/3`, so a
   concurrent rotation that invalidates during the load bumps the generation and the
   (now-possibly-stale) repopulation is rejected at the next `fetch/1` — closing the
-  read-through repopulation race (AC-32.3.3, never serve stale).
+  intra-node read-through repopulation race (AC-32.3.3). Staleness bounds are
+  layered: exact on the writing node, prompt cross-node via a PubSub invalidation
+  broadcast, and capped by a bounded per-entry TTL for the dropped-broadcast /
+  crash-window cases. See `Loopctl.Llm.SettingsCache` for the full guarantee.
   """
   @spec get_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
   def get_settings(tenant_id) when is_binary(tenant_id) do
@@ -157,9 +160,12 @@ defmodule Loopctl.Llm do
     |> case do
       {:ok, %{settings: settings}} ->
         # Invalidate AFTER commit so the next read repopulates read-through with the
-        # fresh row — never serves stale credentials (US-32.3, AC-32.3.3). This is
-        # the sole settings-mutation path, so it is the only cache-busting point.
-        SettingsCache.invalidate(tenant_id)
+        # fresh row (US-32.3, AC-32.3.3). This is the sole settings-mutation path, so
+        # it is the only cache-busting point. Use the CLUSTER variant: the ETS table
+        # is node-local, so we bust this node synchronously AND broadcast so peer
+        # nodes bust their node-local entries within a PubSub hop (the bounded TTL
+        # backstops a dropped broadcast or a crash in this post-commit gap).
+        SettingsCache.invalidate_cluster(tenant_id)
         {:ok, settings}
 
       {:error, :settings, changeset, _} ->

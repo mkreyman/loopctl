@@ -20,6 +20,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
   alias Loopctl.Memory.Memory
@@ -1298,11 +1299,21 @@ defmodule Loopctl.Fixtures do
     data = build(:tenant_llm_settings, Map.delete(attrs, :tenant_id))
     api_key = Map.get(data, :api_key)
 
-    %TenantLlmSettings{tenant_id: tenant_id}
-    |> TenantLlmSettings.models_changeset(data)
-    |> TenantLlmSettings.put_api_key(api_key)
-    |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
-    |> AdminRepo.insert!()
+    settings =
+      %TenantLlmSettings{tenant_id: tenant_id}
+      |> TenantLlmSettings.models_changeset(data)
+      |> TenantLlmSettings.put_api_key(api_key)
+      |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+      |> AdminRepo.insert!()
+
+    # This fixture inserts DIRECTLY (not via `Llm.upsert_settings/2`), so it bypasses
+    # the cache-busting write path. `Llm.get_settings/1` negative-caches `nil`, so a
+    # test that read this tenant's settings BEFORE inserting here would otherwise keep
+    # serving the stale cached `nil`. Bust the node-local entry so the next read
+    # reflects the freshly-inserted row.
+    SettingsCache.invalidate(tenant_id)
+
+    settings
   end
 
   # Inserts an llm_usage_events row (auto-creating a tenant if needed).
