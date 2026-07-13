@@ -2,6 +2,12 @@ defmodule Loopctl.ObanConfigTest do
   @moduledoc """
   US-32.2: Oban queue widths are env-driven, defaulting to the current hardcoded
   values. Pure module — no DB needed, so this uses plain ExUnit.Case (not DataCase).
+
+  Tests that need a REAL `OBAN_QUEUE_*` env var override run it in a subprocess
+  (via `mix run --no-start -e`) rather than `System.put_env/2` in this process.
+  `System.put_env/2` mutates BEAM-global OS env for every process, which conflicts
+  with `async: true` (a global mutation any other async test could observe) —
+  a subprocess's env is scoped to that child process only, so it's async-safe.
   """
   use ExUnit.Case, async: true
 
@@ -22,27 +28,27 @@ defmodule Loopctl.ObanConfigTest do
              ]
     end
 
-    test "TC-32.2.4: OBAN_QUEUE_<NAME> env var overrides the matching queue's width" do
-      System.put_env("OBAN_QUEUE_DEFAULT", "42")
+    @tag :tmp_dir
+    test "TC-32.2.4: OBAN_QUEUE_<NAME> env var overrides only the matching queue (subprocess-scoped env)",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          """
+          queues = Loopctl.ObanConfig.queues()
 
-      try do
-        assert Keyword.get(ObanConfig.queues(), :default) == 42
-      after
-        System.delete_env("OBAN_QUEUE_DEFAULT")
-      end
-    end
+          result = %{
+            webhooks: Keyword.get(queues, :webhooks),
+            default: Keyword.get(queues, :default),
+            audit: Keyword.get(queues, :audit)
+          }
+          """,
+          [{"OBAN_QUEUE_WEBHOOKS", "99"}]
+        )
 
-    test "TC-32.2.4: unrelated queues stay at their default while one is overridden" do
-      System.put_env("OBAN_QUEUE_WEBHOOKS", "99")
-
-      try do
-        queues = ObanConfig.queues()
-        assert Keyword.get(queues, :webhooks) == 99
-        assert Keyword.get(queues, :default) == 10
-        assert Keyword.get(queues, :audit) == 3
-      after
-        System.delete_env("OBAN_QUEUE_WEBHOOKS")
-      end
+      assert result.webhooks == 99
+      assert result.default == 10
+      assert result.audit == 3
     end
   end
 
@@ -61,5 +67,106 @@ defmodule Loopctl.ObanConfigTest do
     test "TC-32.2.3: non-integer suffix (e.g. 10s) also fails loud" do
       assert_raise ArgumentError, ~r/positive integer/, fn -> ObanConfig.queue_size("10s", 5) end
     end
+  end
+
+  describe "release boot safety (Config.Provider.validate_compile_env/1)" do
+    @tag :tmp_dir
+    test "TC-32.2.5: no compile_env dependency on :loopctl, Oban — an override must never abort release boot",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          """
+          app_file = Application.app_dir(:loopctl, "ebin/loopctl.app")
+          {:ok, [{:application, :loopctl, props}]} = :file.consult(app_file)
+          compile_env = Keyword.get(props, :compile_env, [])
+
+          has_oban_entry? =
+            Enum.any?(compile_env, fn {app, path, _} ->
+              app == :loopctl and List.starts_with?(path, [Oban])
+            end)
+
+          # This is EXACTLY what `Config.Provider.validate_compile_env/1` runs at
+          # release boot, fed the real recorded compile_env for this build, with a
+          # real OBAN_QUEUE_DEFAULT override active. Before the fix this recorded a
+          # dependency on the whole `Oban` key (which runtime.exs reassigns) and
+          # `boot_result` would be `{:error, ...}` — aborting the release the instant
+          # an operator set any OBAN_QUEUE_* env var. It must be `:ok`.
+          boot_result = Config.Provider.validate_compile_env(compile_env)
+
+          result = %{has_oban_compile_env_entry?: has_oban_entry?, boot_result: boot_result}
+          """,
+          [{"OBAN_QUEUE_DEFAULT", "20"}]
+        )
+
+      refute result.has_oban_compile_env_entry?,
+             "compile_env must not record a dependency on :loopctl, Oban — that key is " <>
+               "reassigned by config/runtime.exs, and recording it would abort release " <>
+               "boot the moment an operator sets any OBAN_QUEUE_* env var"
+
+      assert result.boot_result == :ok
+    end
+
+    @tag :tmp_dir
+    test "TC-32.2.6: regression proof — a compile_env entry covering the whole Oban key would abort boot",
+         %{tmp_dir: tmp_dir} do
+      result =
+        run_elixir_script(
+          tmp_dir,
+          """
+          runtime_oban = Application.fetch_env!(:loopctl, Oban)
+
+          # Reconstruct the pre-fix `@default_queues Application.compile_env(:loopctl, Oban)[:queues]`
+          # dependency: it recorded the WHOLE Oban key as it stood at compile time (default
+          # queue widths), not just `:queues`.
+          legacy_compile_time_value =
+            Keyword.put(runtime_oban, :queues,
+              default: 10,
+              webhooks: 5,
+              cleanup: 2,
+              analytics: 3,
+              maintenance: 2,
+              embeddings: 5,
+              knowledge: 5,
+              memory: 3,
+              audit: 3
+            )
+
+          legacy_entry = {:loopctl, [Oban], {:ok, legacy_compile_time_value}}
+          boot_result = Config.Provider.validate_compile_env([legacy_entry])
+
+          result = %{boot_result: boot_result}
+          """,
+          [{"OBAN_QUEUE_DEFAULT", "20"}]
+        )
+
+      assert {:error, message} = result.boot_result
+      assert message =~ "has a different value set"
+      assert message =~ "during runtime compared to compile time"
+    end
+  end
+
+  # Runs `script` (must bind a `result` variable) in a fresh `mix run --no-start`
+  # subprocess with `env` applied ONLY to that child process, then reads back the
+  # term `script` wrote to `result_path` via :erlang.term_to_binary/1. Keeps this
+  # async: true test file free of any global (System.put_env/Application.put_env)
+  # mutation while still exercising a REAL env-var-driven boot path.
+  defp run_elixir_script(tmp_dir, script, env) do
+    result_path = Path.join(tmp_dir, "result.bin")
+
+    full_script = """
+    #{script}
+    File.write!(#{inspect(result_path)}, :erlang.term_to_binary(result))
+    """
+
+    {output, exit_code} =
+      System.cmd("mix", ["run", "--no-start", "-e", full_script],
+        env: [{"MIX_ENV", "test"} | env],
+        stderr_to_stdout: true
+      )
+
+    assert exit_code == 0, "subprocess script failed (exit #{exit_code}):\n#{output}"
+
+    result_path |> File.read!() |> :erlang.binary_to_term()
   end
 end

@@ -16,11 +16,33 @@ defmodule Loopctl.ObanConfig do
   than silently falling back to its compile-time (non-tunable) width.
   """
 
-  # Default widths are derived directly from config/config.exs's compile-time
-  # `config :loopctl, Oban, queues: [...]` (AC-32.2.3) rather than hand-copied, so
-  # adding/removing/resizing a queue there flows here automatically with zero drift
-  # risk. Sum = 38 (10+5+2+3+2+5+5+3+3).
-  @default_queues Application.compile_env(:loopctl, Oban)[:queues]
+  # Default widths are a literal, hand-maintained mirror of config/config.exs's
+  # compile-time `config :loopctl, Oban, queues: [...]` (AC-32.2.3). Sum = 38
+  # (10+5+2+3+2+5+5+3+3). Keep the two lists in sync when adding/removing/resizing
+  # a queue (`TC-32.2.1` in oban_config_test.exs asserts they match).
+  #
+  # MUST NOT be `Application.compile_env(:loopctl, Oban)[:queues]`. That recorded a
+  # compile-time consistency dependency on the WHOLE `[:loopctl, Oban]` app-env key,
+  # and `config/runtime.exs` reassigns that exact key to `Loopctl.ObanConfig.queues()`
+  # (deep-merged). At release boot, `Config.Provider.validate_compile_env/1` (on by
+  # default; not disabled in `mix.exs` `releases/0`) compares the compile-time and
+  # runtime values for every recorded key and ABORTS the node when they differ —
+  # i.e. the instant an operator sets ANY `OBAN_QUEUE_*` env var (exactly the lever
+  # this module exists to provide), the release refuses to boot. Reading a
+  # runtime-overridden key at compile time defeats the entire feature; hardcoding
+  # (or reading via `Application.get_env/2` at call time) avoids recording that
+  # dependency in the first place.
+  @default_queues [
+    default: 10,
+    webhooks: 5,
+    cleanup: 2,
+    analytics: 3,
+    maintenance: 2,
+    embeddings: 5,
+    knowledge: 5,
+    memory: 3,
+    audit: 3
+  ]
 
   @doc """
   Resolves the full Oban `queues` keyword list from `OBAN_QUEUE_<NAME>` env vars,
