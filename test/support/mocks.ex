@@ -55,3 +55,11 @@ Mox.defmock(Loopctl.MockScaleAlertsConfigChecker,
 # wired via config/test.exs), NOT a Mox mock — so the production router stays on
 # the hot path for every request and the catch/log/sanitize path is exercised by
 # an opt-in `x-test-raise-db-error` request header rather than a global mock.
+
+# US-34.1: the Oban `oban_jobs` observability poll's DI seam. The DataCase default
+# stub delegates both callbacks to the real `Loopctl.Telemetry.ObanStats`, so every
+# integration test exercises the genuine raw-SQL read against the sandbox
+# connection; the dedicated poller-resilience test (TC-34.1.3) overrides a callback
+# with `Mox.expect/3` to raise, proving `dispatch_oban_stats/0` logs + skips instead
+# of crashing the shared `telemetry_poller`.
+Mox.defmock(Loopctl.MockObanStats, for: Loopctl.Telemetry.ObanStatsBehaviour)

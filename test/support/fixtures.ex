@@ -1645,6 +1645,36 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # US-34.1: inserts a raw `oban_jobs` row with an arbitrary `state`/`queue`/
+  # `attempted_at`, bypassing Oban's public `new/2` API (which only ever produces an
+  # `available`/`scheduled` job) so tests can seed the full state space the
+  # observability poll (`Loopctl.Telemetry.ObanStats`) reads.
+  #
+  # `oban_jobs` is a GLOBAL infra table with NO `tenant_id` and NO RLS policy, so —
+  # unlike every other fixture in this module — this inserts via `Loopctl.Repo`
+  # (never `AdminRepo`), matching the connection `Loopctl.Telemetry.ObanStats` itself
+  # reads through. Accepted attrs: `:state` (default `"available"`), `:queue`
+  # (default `"default"`), `:worker` (default a fake string — never resolved/run),
+  # `:attempted_at` (default `nil`).
+  def fixture(:oban_job, attrs) do
+    attrs = Enum.into(attrs, %{})
+    now = DateTime.utc_now()
+
+    %Oban.Job{}
+    |> Ecto.Changeset.change(%{
+      state: Map.get(attrs, :state, "available"),
+      queue: Map.get(attrs, :queue, "default"),
+      worker: Map.get(attrs, :worker, "Loopctl.Test.FakeWorker"),
+      args: Map.get(attrs, :args, %{}),
+      attempt: Map.get(attrs, :attempt, 0),
+      max_attempts: Map.get(attrs, :max_attempts, 20),
+      inserted_at: now,
+      scheduled_at: now,
+      attempted_at: Map.get(attrs, :attempted_at)
+    })
+    |> Loopctl.Repo.insert!()
+  end
+
   @doc """
   Generates a fresh binary UUID for use in tests.
   """

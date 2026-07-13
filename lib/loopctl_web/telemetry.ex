@@ -11,6 +11,10 @@ defmodule LoopctlWeb.Telemetry do
   # `[metrics]` block). Tunable via `:metrics_port`.
   @default_metrics_port 9568
 
+  # US-34.1: default cadence for the Oban `oban_jobs` poll's OWN `telemetry_poller`
+  # instance — see `oban_poll_interval_ms/0`.
+  @default_oban_poll_interval_ms 10_000
+
   def start_link(arg) do
     Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
   end
@@ -21,7 +25,30 @@ defmodule LoopctlWeb.Telemetry do
       [
         # Telemetry poller will execute the given period measurements
         # every 10_000ms. Learn more here: https://hexdocs.pm/telemetry_metrics
-        {:telemetry_poller, measurements: periodic_measurements(), period: 10_000}
+        Supervisor.child_spec(
+          {:telemetry_poller,
+           measurements: periodic_measurements(), period: 10_000, name: :loopctl_telemetry_poller},
+          id: :loopctl_telemetry_poller
+        ),
+        # US-34.1: the Oban `oban_jobs` poll runs on its OWN `telemetry_poller`
+        # instance, with an INDEPENDENTLY configurable interval
+        # (`:oban_metrics_poll_interval_ms`, default 10s) rather than inheriting the
+        # tenant-label-gate poller's cadence above (AC-34.1.3 calls for a "bounded
+        # interval (config)"). Two `:telemetry_poller` instances can coexist under one
+        # Supervisor as long as each has a distinct `:name` (registered by
+        # `:telemetry_poller`'s own `start_link/1`) and a distinct Supervisor child
+        # `:id` (both default to `:telemetry_poller` otherwise, which would collide) —
+        # `Supervisor.child_spec/2` overrides the id for exactly that reason. This also
+        # shrinks the blast radius from the shared-poller crash risk documented on
+        # `ScaleMetrics.dispatch_oban_stats/0`: a raise here can no longer take down
+        # `refresh_tenant_label_gate/0`'s poller (still self-rescued regardless).
+        Supervisor.child_spec(
+          {:telemetry_poller,
+           measurements: oban_periodic_measurements(),
+           period: oban_poll_interval_ms(),
+           name: :loopctl_oban_telemetry_poller},
+          id: :loopctl_oban_telemetry_poller
+        )
       ] ++ reporter_children() ++ scale_alerts_children()
 
     Supervisor.init(children, strategy: :one_for_one)
@@ -145,15 +172,42 @@ defmodule LoopctlWeb.Telemetry do
 
   defp periodic_measurements do
     # NOTE: `telemetry_poller` runs every measurement in its OWN process and does NOT
-    # isolate them — an uncaught raise in any measurement crashes the shared poller (and
-    # with it the gate refresh). So EVERY measurement added here MUST be self-rescuing.
-    # `refresh_tenant_label_gate/0` guards its only raising op (the DB count) with
-    # try/rescue (fail-soft to a bounded gate); keep that invariant for future additions.
+    # isolate them — an uncaught raise in any measurement crashes ITS poller. So EVERY
+    # measurement added here MUST be self-rescuing. `refresh_tenant_label_gate/0`
+    # guards its only raising op (the DB count) with try/rescue (fail-soft to a
+    # bounded gate); keep that invariant for future additions to THIS poller.
     [
       # US-27.15: refresh the metrics tenant-label cardinality gate (Tenants.count()
       # <= cap), caching the boolean in :persistent_term so the per-emit tag_values
       # path needs no DB hit. This is the ONLY DB read in the gating mechanism.
       {ScaleMetrics, :refresh_tenant_label_gate, []}
     ]
+  end
+
+  # US-34.1: split onto its OWN `telemetry_poller` instance (see `init/1`) so its
+  # cadence is independently configurable and a raise here can never crash the
+  # tenant-label-gate poller above. `dispatch_oban_stats/0` is fully self-rescuing
+  # regardless (a poll error logs + skips rather than crashing this poller).
+  defp oban_periodic_measurements do
+    [
+      # US-34.1: poll oban_jobs for per-(state, queue) counts + the :executing orphan
+      # count, emitting the two gauges ScaleMetrics.scale_metrics/0 defines.
+      {ScaleMetrics, :dispatch_oban_stats, []}
+    ]
+  end
+
+  # The Oban poll's OWN configurable interval (`:oban_metrics_poll_interval_ms`,
+  # default `@default_oban_poll_interval_ms`) — see `config/config.exs` for the
+  # full rationale. Falls back to the default for any non-positive-integer value
+  # rather than crashing supervisor init on a bad config.
+  defp oban_poll_interval_ms do
+    case Application.get_env(
+           :loopctl,
+           :oban_metrics_poll_interval_ms,
+           @default_oban_poll_interval_ms
+         ) do
+      ms when is_integer(ms) and ms > 0 -> ms
+      _ -> @default_oban_poll_interval_ms
+    end
   end
 end

@@ -43,7 +43,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.knowledge.semantic_fallback.count",
     "loopctl.knowledge.hybrid_provenance.count",
     "loopctl.repo.checkout.queue_time",
-    "loopctl.admin_repo.checkout.queue_time"
+    "loopctl.admin_repo.checkout.queue_time",
+    "loopctl.oban.jobs.count",
+    "loopctl.oban.executing_orphans.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -53,7 +55,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   # and `:hit` (`true`/`false`) — US-31.2's hybrid-provenance counter — are likewise
   # small, fixed-cardinality dimensions. `:repo` (US-33.1) is a static, fixed 2-value
   # tag ("repo"/"admin_repo") — the repo identity is encoded in the event name, not
-  # read from metadata.
+  # read from metadata. `:state` (Oban's fixed 7-value enum) and `:queue` (the fixed
+  # 9-queue set, `Loopctl.ObanConfig`) — US-34.1's Oban job-count gauge — are likewise
+  # bounded, fixed-cardinality dimensions (AC-34.1.5).
   @allowed_tags MapSet.new([
                   :endpoint,
                   :mapped_code,
@@ -61,7 +65,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :reason,
                   :provenance,
                   :hit,
-                  :repo
+                  :repo,
+                  :state,
+                  :queue
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -322,6 +328,58 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     end
   end
 
+  describe "Oban job-count gauge (US-34.1, AC-34.1.1)" do
+    test "loopctl.oban.jobs.count is a last_value gauge tagged by state and queue" do
+      gauge = metric("loopctl.oban.jobs.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :jobs]
+      assert gauge.measurement == :count
+      assert MapSet.new(gauge.tags) == MapSet.new([:state, :queue])
+    end
+  end
+
+  describe "Oban :executing orphan gauge (US-34.1, AC-34.1.2)" do
+    test "loopctl.oban.executing_orphans.count is an UNTAGGED last_value gauge" do
+      gauge = metric("loopctl.oban.executing_orphans.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :orphans]
+      assert gauge.measurement == :count
+      assert gauge.tags == []
+    end
+  end
+
+  describe "oban_job_tags/1 — bounded, defaults never blank (US-34.1, AC-34.1.5)" do
+    test "reads :state and :queue straight through when present" do
+      assert ScaleMetrics.oban_job_tags(%{state: "executing", queue: "webhooks"}) == %{
+               state: "executing",
+               queue: "webhooks"
+             }
+    end
+
+    test "defaults a missing state or queue to \"unknown\" (never blank)" do
+      assert ScaleMetrics.oban_job_tags(%{}) == %{state: "unknown", queue: "unknown"}
+
+      assert ScaleMetrics.oban_job_tags(%{state: nil, queue: nil}) == %{
+               state: "unknown",
+               queue: "unknown"
+             }
+    end
+
+    test "carries NO tenant_id even if one leaks into metadata" do
+      tags = ScaleMetrics.oban_job_tags(%{state: "available", queue: "default", tenant_id: "t-9"})
+      refute Map.has_key?(tags, :tenant_id)
+    end
+  end
+
+  describe "oban_orphan_threshold_minutes/0 (US-34.1, AC-34.1.2)" do
+    test "defaults to 40 (strictly above Oban.Plugins.Lifeline's 30-minute rescue_after)" do
+      assert ScaleMetrics.oban_orphan_threshold_minutes() == 40
+      assert ScaleMetrics.oban_orphan_threshold_minutes() > 30
+    end
+  end
+
   describe "queue_time reporter round-trip — a REAL Prometheus reporter, not a no-handler no-op (TC-33.1.2, raw finding #3)" do
     # R2 review: the prior version of this describe only asserted `:telemetry.execute/3
     # == :ok` with ZERO handlers attached in :test — that assertion holds even if the
@@ -471,6 +529,35 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       # The default ScaleAlerts ETS table is not owned by anyone in :test.
       assert :ets.info(:loopctl_scale_alerts) == :undefined
+    end
+
+    test "the Oban oban_jobs poll runs on its OWN telemetry_poller instance (US-34.1 review fix)" do
+      children = Supervisor.which_children(LoopctlWeb.Telemetry)
+      child_ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
+
+      # Two DISTINCT poller child ids — proves the Oban poll is no longer sharing the
+      # tenant-label-gate poller's process/cadence (a raise in one can't crash the other).
+      assert :loopctl_telemetry_poller in child_ids
+      assert :loopctl_oban_telemetry_poller in child_ids
+
+      # And each is a genuinely distinct, independently-registered, running process.
+      tenant_gate_pid = Process.whereis(:loopctl_telemetry_poller)
+      oban_pid = Process.whereis(:loopctl_oban_telemetry_poller)
+
+      assert is_pid(tenant_gate_pid)
+      assert is_pid(oban_pid)
+      assert tenant_gate_pid != oban_pid
+      assert Process.alive?(tenant_gate_pid)
+      assert Process.alive?(oban_pid)
+    end
+  end
+
+  describe "oban_metrics_poll_interval_ms config (US-34.1, AC-34.1.3: bounded interval (config))" do
+    test "the poll interval is an independently configurable positive integer, defaulting to 10s" do
+      interval = Application.get_env(:loopctl, :oban_metrics_poll_interval_ms, 10_000)
+
+      assert is_integer(interval)
+      assert interval > 0
     end
   end
 end

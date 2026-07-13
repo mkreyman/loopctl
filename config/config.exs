@@ -123,7 +123,31 @@ config :loopctl,
   scale_alert_check_interval_ms: 60_000,
   scale_alert_timeout_rate_per_min: 5,
   scale_alert_p95_latency_ms: 2_000,
-  scale_alert_under_fill_rate_per_min: 30
+  scale_alert_under_fill_rate_per_min: 30,
+  # US-34.1: the Oban `oban_jobs` observability poll (Loopctl.Telemetry.ScaleMetrics
+  # .dispatch_oban_stats/0), wired into its OWN independently-configurable
+  # `telemetry_poller` instance in LoopctlWeb.Telemetry (NOT the shared
+  # tenant-label-gate poller — a review finding flagged inheriting that cadence as a
+  # deviation from the AC's "bounded interval (config)" wording).
+  # - oban_metrics_poll_interval_ms: how often oban_jobs is polled. Kept at the same
+  #   10s default as the shared poller (no behavior change), but now a dedicated knob
+  #   so the cadence of this specific, heavier (unindexed GROUP BY aggregate) query
+  #   can be tuned independently of the cheap tenant-count gate refresh.
+  # - oban_metrics_query_timeout_ms: the per-query SERVER-SIDE `SET LOCAL
+  #   statement_timeout` (and matching client-side timeout) for both the per-(state,
+  #   queue) count query and the :executing orphan count query — keeps the poll from
+  #   being able to saturate the RLS Repo pool (AC-34.1.3) even if oban_jobs grows
+  #   large or a query plan degrades.
+  # - oban_metrics_orphan_threshold_minutes: how long a job may sit `executing`
+  #   before it counts as an orphan (AC-34.1.2). Deliberately set ABOVE (not equal to)
+  #   Oban.Plugins.Lifeline's `rescue_after` (30 min) below — a job that has merely
+  #   crossed 30 min is still awaiting Lifeline's next periodic sweep (normal), and
+  #   equating the threshold to rescue_after would conflate that steady state with
+  #   "Lifeline is falling behind / a job is wedged" (the actual alert condition this
+  #   gauge exists to signal, feeding US-34.3 alerting).
+  oban_metrics_poll_interval_ms: 10_000,
+  oban_metrics_query_timeout_ms: 5_000,
+  oban_metrics_orphan_threshold_minutes: 40
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
@@ -325,8 +349,21 @@ config :loopctl, Oban,
     {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
     # Prune terminal (completed/discarded/cancelled) jobs older than 7 days so the
     # oban_jobs table doesn't grow unbounded.
-    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7}
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+    # US-34.1: periodically REINDEX CONCURRENTLY the oban_jobs args/meta indexes so
+    # they don't accumulate bloat as jobs churn through Cron/Lifeline/Pruner. Default
+    # schedule (@midnight UTC) is fine — this is maintenance, not latency-critical.
+    Oban.Plugins.Reindexer
   ]
+
+# US-34.1: `Oban.Stager` is NOT a plugin in Oban 2.21 — it's a core, always-running
+# GenServer (`@moduledoc false`, deps/oban/lib/oban/stager.ex) controlled by the
+# top-level `:stage_interval` config, not the `plugins:` list (adding
+# `Oban.Stager` there would be a config error). The default `stage_interval`
+# (1s) is intentionally relied upon to promote `scheduled` jobs to `available` —
+# pinning it explicitly here documents that reliance rather than leaving it
+# implicit, without changing behavior.
+# stage_interval: :timer.seconds(1)
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()

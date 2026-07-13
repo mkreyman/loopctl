@@ -474,6 +474,12 @@ config :loopctl, :dns_resolve_timeout_ms, 2_000
 # ~200ms instead of the 5s production default. Config-based DI — no put_env.
 config :loopctl, :batch_item_validation_timeout_ms, 200
 
+# US-34.1: Oban `oban_jobs` observability poll DI. The DataCase default stub
+# delegates both callbacks to the real Loopctl.Telemetry.ObanStats so integration
+# tests exercise the genuine raw-SQL read against the sandbox connection; the
+# poller-resilience test overrides a callback with Mox.expect/3 to raise.
+config :loopctl, :oban_stats_query, Loopctl.MockObanStats
+
 # DI: swap ArticleLinkingWorker's similarity lookup for a Mox mock so the worker's
 # linking logic (relates_to / potential_conflict thresholds, dedup, audit, idempotency)
 # is unit-tested with deterministic candidate lists — never through the real pgvector kNN,

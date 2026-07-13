@@ -17,6 +17,7 @@ defmodule Loopctl.DataCase do
   use ExUnit.CaseTemplate
 
   alias Ecto.Adapters.SQL.Sandbox
+  alias Loopctl.Telemetry.ObanStats
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Webhooks.ReqDelivery
 
@@ -269,6 +270,18 @@ defmodule Loopctl.DataCase do
     # REAL plug wired via config/test.exs that delegates to LoopctlWeb.Router for
     # every request and only raises when an opt-in `x-test-raise-db-error` header
     # is present — so there is NO global router mock to stub here.
+
+    # US-34.1: the Oban `oban_jobs` observability poll's DI seam. Default delegates
+    # both callbacks to the real `Loopctl.Telemetry.ObanStats`, so every integration
+    # test exercises the genuine raw-SQL read against the sandbox connection; the
+    # poller-resilience test overrides a callback with `Mox.expect/3` to raise.
+    Mox.stub(Loopctl.MockObanStats, :job_state_counts, fn ->
+      ObanStats.job_state_counts()
+    end)
+
+    Mox.stub(Loopctl.MockObanStats, :executing_orphan_count, fn threshold_minutes ->
+      ObanStats.executing_orphan_count(threshold_minutes)
+    end)
   end
 
   @doc """
