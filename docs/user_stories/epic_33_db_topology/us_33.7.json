@@ -1,0 +1,54 @@
+{
+  "id": "US-33.7",
+  "title": "Flag-guarded RLS-Repo reroute pilot for one audited tenant-scoped read path",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "medium",
+  "phase": "scalability",
+  "priority_note": "HIGHEST RISK, runs LAST. A flag-guarded PILOT of the RLS reroute (not the blanket ~75-module rewrite), gated on US-33.1 metrics still showing AdminRepo pressure after 33.2-33.6.",
+  "background": {
+    "reference": "GH #348 (‘Route tenant OLTP through the RLS Repo’). Repo.with_tenant/2 (lib/loopctl/repo.ex:81) sets transaction-local app.current_tenant_id via set_config; RLS policy `tenant_id = current_tenant_id()`. Prod Repo connects as a non-BYPASSRLS role (repo.ex:112) — RLS relies on that role, there is NO SET LOCAL ROLE in prod. Almost all OLTP currently uses AdminRepo with explicit tenant predicates.",
+    "includes": "The blanket AdminRepo→RLS reroute across ~75 modules is a separate epic-sized, high-risk rewrite (per-op transaction+set_config overhead; correctness depends on the prod role genuinely lacking BYPASSRLS; each query's implicit-vs-explicit predicate must be audited). This story instead PILOTS the mechanism on ONE high-volume, well-audited tenant-scoped READ path behind a flag, to validate RLS parity + measure the effect before any broader move."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "route one high-volume tenant-scoped read path through Repo.with_tenant behind a default-off config flag, proving RLS parity with the AdminRepo version",
+    "so_that": "we validate the RLS-reroute mechanism safely and measure whether shifting load off AdminRepo helps, without a blanket rewrite or a risky live flip"
+  },
+  "rationale": "The roadmap's headline reroute is high-value but high-risk on a live system, and the earlier stories (33.2-33.5) may relieve AdminRepo enough to make a blanket reroute unnecessary. A flag-guarded pilot on a single audited read path de-risks the whole idea: it proves RLS isolation matches the explicit-predicate version, measures the AdminRepo relief via US-33.1's metric, and gives a reversible on/off — turning an all-or-nothing architectural gamble into a measured, incremental decision.",
+  "acceptance_criteria": [
+    { "id": "AC-33.7.1", "description": "PREREQUISITE GATE: implementation first checks US-33.1's per-pool queue_time metric (prod or load-test). If AdminRepo checkout-wait is already healthy after 33.2-33.6, the story documents that finding, ships the flag+pilot wiring with the flag OFF, and does not push a reroute live — the mechanism + parity proof is still delivered. If AdminRepo still saturates, the pilot is the justified next step.", "status": "pending" },
+    { "id": "AC-33.7.2", "description": "ONE selected tenant-scoped READ path (e.g. a list/read in token_usage or work_breakdown that has a clean explicit tenant predicate and no cross-tenant semantics) gains an alternate implementation using Repo.with_tenant/2, selected by a config flag (default: AdminRepo path). No write paths, no custody/audit paths, no cross-tenant/admin paths are rerouted.", "status": "pending" },
+    { "id": "AC-33.7.3", "description": "RLS-PARITY PROOF: a test proves the RLS path returns EXACTLY the same rows as the AdminRepo path for the same tenant, AND that tenant A running the RLS path can never see tenant B's rows (RLS actually enforces, not just the explicit predicate). A negative test confirms that with the flag on, a missing/incorrect tenant context yields zero rows (fail-closed), never cross-tenant rows.", "status": "pending" },
+    { "id": "AC-33.7.4", "description": "PROD-ROLE SAFETY: the story documents/verifies that the prod Repo DB role lacks BYPASSRLS (so RLS is actually enforced) — since dev/test use SET LOCAL ROLE loopctl_app but prod relies on the connection role. If this cannot be verified, the flag stays OFF in prod and that is stated explicitly.", "status": "pending" },
+    { "id": "AC-33.7.5", "description": "Reversible + observable: the flag flips the path with no deploy dependency beyond config; the US-33.1 metric shows AdminRepo vs Repo checkout-wait so the effect is measurable; a rollback is a config flip. The extra per-op transaction+set_config cost of with_tenant is measured and reported (it may offset the pool relief for a cheap single-statement read).", "status": "pending" },
+    { "id": "AC-33.7.6", "description": "The PR explicitly states that the BLANKET reroute of all OLTP remains out of scope (a separate future epic), with this pilot's parity + cost findings as the evidence base for that decision.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.7.1", "name": "RLS path returns identical rows to AdminRepo path (same tenant)", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant) with seeded rows for the chosen read path"],
+      "steps": ["run the read via the AdminRepo path (flag off) and via the RLS path (flag on)"],
+      "expected_results": ["identical row sets / ids"], "status": "pending" },
+    { "id": "TC-33.7.2", "name": "RLS path enforces tenant isolation (cannot see other tenant)", "type": "integration",
+      "preconditions": ["tenant_a and tenant_b each with rows"],
+      "steps": ["run the RLS-path read as tenant_a (with tenant_a context)"],
+      "expected_results": ["only tenant_a rows; tenant_b rows never returned — enforced by RLS via with_tenant, matching the AdminRepo explicit-predicate result"], "status": "pending" },
+    { "id": "TC-33.7.3", "name": "fail-closed on missing tenant context", "type": "integration",
+      "preconditions": ["RLS path selected"],
+      "steps": ["invoke the read with no/blank tenant context"],
+      "expected_results": ["zero rows (fail-closed), never cross-tenant rows or an error that leaks other tenants"], "status": "pending" },
+    { "id": "TC-33.7.4", "name": "flag default routes to the AdminRepo path unchanged", "type": "integration",
+      "preconditions": ["default config (flag off)"],
+      "steps": ["run the read"],
+      "expected_results": ["uses the existing AdminRepo path; behavior identical to today"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Repo.with_tenant/2 (repo.ex:81) wraps a transaction + set_config('app.current_tenant_id', …, true). Note the EXTRA round-trip + transaction per call — measure whether it's worth it for a single-statement read.",
+    "Config-based DI flag (config/*.exs), default AdminRepo; NEVER Application.put_env in tests — exercise both paths via config or a passed selector in the test.",
+    "Pick a READ-ONLY, single-table, clean-tenant-predicate path. Explicitly exclude: writes, custody/audit, cross-tenant admin, Tenants/Auth (no tenant_id column / pre-tenant lookups — must stay AdminRepo).",
+    "The RLS-parity + isolation + fail-closed tests are release gates — this is a security boundary change.",
+    "Verify the prod role lacks BYPASSRLS before enabling in prod; otherwise RLS silently no-ops and you'd lose isolation while removing the explicit predicate. If unverified → flag stays OFF, documented.",
+    "This story deliberately does NOT reroute broadly; it establishes the pattern + evidence."
+  ],
+  "dependencies": ["US-33.1"],
+  "estimated_tokens": 400000
+}

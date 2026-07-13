@@ -1,0 +1,48 @@
+{
+  "id": "US-33.1",
+  "title": "Per-pool checkout queue_time telemetry for Repo and AdminRepo",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "MEASURE FIRST. Prerequisite for US-33.6 (pool rebalance) and US-33.7 (reroute decision) — do not resize pools blind.",
+  "background": {
+    "reference": "GH #348. Ecto emits [:loopctl, :repo, :query] / [:loopctl, :admin_repo, :query] with queue_time/query_time/total_time; only heavy_read_repo is currently wired into a metric (lib/loopctl/telemetry/scale_metrics.ex, LoopctlWeb.Telemetry.metrics/0). No per-pool checkout-wait metric exists for Repo or AdminRepo.",
+    "includes": "The auth hot path runs 5 AdminRepo queries (2 writes) per request on a 3-connection pool while the RLS Repo pool of 10 is nearly idle. There is no metric proving where checkout contention actually lands, so any pool resize would be guesswork."
+  },
+  "story": {
+    "as_a": "loopctl operator",
+    "i_want_to": "export per-pool connection-checkout queue_time (p95/p99) for Repo and AdminRepo to Prometheus",
+    "so_that": "I can empirically confirm the AdminRepo pool is the checkout bottleneck and re-derive pool sizing from data instead of guessing"
+  },
+  "rationale": "Ecto already measures queue_time (time spent waiting for a pooled connection) on every query, but it's only surfaced for HeavyReadRepo. Without a Repo/AdminRepo checkout-wait metric, the roadmap's central claim — that the 3-connection AdminRepo pool saturates while the 10-connection Repo idles — is unverified, and US-33.6's pool resize would be blind. This is a pure-add observability story that de-risks every later story in the epic.",
+  "acceptance_criteria": [
+    { "id": "AC-33.1.1", "description": "ScaleMetrics attaches to the Ecto query telemetry events for `Loopctl.Repo` and `Loopctl.AdminRepo` and exports a `queue_time` distribution (or summary) metric per repo, tagged by repo name, into LoopctlWeb.Telemetry.metrics/0 (Prometheus at :9568/metrics). Reuse the existing heavy_read_repo pattern.", "status": "pending" },
+    { "id": "AC-33.1.2", "description": "Tag cardinality is bounded — the metric is keyed by repo (and optionally a small fixed source label), NEVER by tenant_id or query text, to avoid Prometheus cardinality blowup. Follow the existing tenant-label cap gate discipline in scale_metrics.ex.", "status": "pending" },
+    { "id": "AC-33.1.3", "description": "`queue_time` is converted to the metric's unit consistently (Ecto emits native time units; convert to milliseconds) matching the existing heavy_read_repo.query.duration convention.", "status": "pending" },
+    { "id": "AC-33.1.4", "description": "Purely additive: no query, transaction, or request behavior changes; the telemetry handler is a lightweight :telemetry.attach that does no DB work and cannot raise into the query path (handler is defensive).", "status": "pending" },
+    { "id": "AC-33.1.5", "description": "No new hot-path cost: attaching a telemetry handler must not add per-query DB round-trips; it only reads measurements already emitted by Ecto.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.1.1", "name": "queue_time metric is defined for both pools", "type": "unit",
+      "preconditions": [],
+      "steps": ["read LoopctlWeb.Telemetry.metrics/0 (or ScaleMetrics.scale_metrics/0)"],
+      "expected_results": ["a queue_time distribution/summary metric exists for Repo and for AdminRepo, tagged by repo, in milliseconds"], "status": "pending" },
+    { "id": "TC-33.1.2", "name": "handler records a queue_time measurement without error", "type": "unit",
+      "preconditions": ["the telemetry handler attached"],
+      "steps": ["execute :telemetry.execute([:loopctl, :admin_repo, :query], %{queue_time: 1_000_000, query_time: 500_000, total_time: 1_500_000}, %{})"],
+      "expected_results": ["handler runs without raising; no DB call is made by the handler"], "status": "pending" },
+    { "id": "TC-33.1.3", "name": "tag cardinality is bounded (no tenant/query tags)", "type": "unit",
+      "preconditions": [],
+      "steps": ["inspect the metric's :tags"],
+      "expected_results": ["tags contain only bounded labels (repo, maybe a small fixed set); no tenant_id, no query string"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Module: lib/loopctl/telemetry/scale_metrics.ex; metric list merged in LoopctlWeb.Telemetry.metrics/0.",
+    "Ecto telemetry: config the repos' telemetry_prefix is [:loopctl, :repo] / [:loopctl, :admin_repo]; the :query event measurement `queue_time` is the connection-checkout wait. Convert native → :millisecond.",
+    "Prefer Telemetry.Metrics.distribution or summary with reporter_options for Prometheus buckets consistent with heavy_read_repo.query.duration.",
+    "DI/config conventions: no Application.put_env in tests; async:true; the handler must be idempotent and defensive (rescue) so a telemetry error never propagates into a query.",
+    "No tenant data is read; this is global infra telemetry. Still add a test asserting bounded tags (cardinality is the multi-tenant risk here)."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 180000
+}

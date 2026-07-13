@@ -1,0 +1,60 @@
+{
+  "id": "US-33.3",
+  "title": "ETS read-through cache for API-key resolution (revoke/rotate-invalidated, bounded TTL)",
+  "epic": { "id": "epic_33", "name": "DB Connection Topology & AdminRepo Hot Path" },
+  "priority": "high",
+  "phase": "scalability",
+  "priority_note": "Highest single hot-path win (removes SELECT+preload from every request) AND the most security-sensitive — a stale cache must NEVER authenticate a revoked/rotated key.",
+  "background": {
+    "reference": "GH #348. Auth.verify_api_key/1 (lib/loopctl/auth.ex:83) does AdminRepo.one(SELECT api_keys by key_hash + preload: [:tenant]) then update_last_used (auth.ex:197, UPDATE) on EVERY authenticated request. Mirror the supervised ETS-owner pattern from US-32.3 (SettingsCache) / EmbeddingCircuitBreaker.",
+    "includes": "The api-key SELECT+preload is the single most-repeated query in the system (every authenticated request). It is on the 3-connection AdminRepo pool. Caching it by key_hash removes that read from the hot path — but auth caching is a security boundary: revocation and rotation MUST invalidate immediately."
+  },
+  "story": {
+    "as_a": "loopctl platform",
+    "i_want_to": "resolve API keys through a short-TTL ETS read-through cache keyed by key_hash, invalidated the instant a key is revoked or rotated",
+    "so_that": "the per-request api-key SELECT+preload leaves the AdminRepo hot path without ever letting a revoked or rotated key authenticate from stale cache"
+  },
+  "rationale": "Because every authenticated request re-reads the same api_keys row, a read-through cache keyed by key_hash converts a per-request DB SELECT into a per-change one — the largest hot-path reduction available. The entire risk is correctness of invalidation: a cached entry for a key that is later revoked or rotated must not authenticate. The design therefore pairs a short bounded TTL (defense-in-depth) with explicit invalidation on every revoke/rotate path, so a compromised or retired key is rejected immediately, not after a TTL.",
+  "acceptance_criteria": [
+    { "id": "AC-33.3.1", "description": "A supervised ETS-owner (GenServer in the app tree, mirroring US-32.3 SettingsCache) owns a `:public`, `:named_table`, read-concurrency table keyed by key_hash, storing the resolved api_key struct WITH its :tenant preloaded and a stored expiry timestamp. verify_api_key becomes read-through: on hit-and-fresh, return the cached struct with NO AdminRepo SELECT; on miss/expired, load from AdminRepo, preload :tenant, store, return.", "status": "pending" },
+    { "id": "AC-33.3.2", "description": "SECURITY — invalidate on revoke: every path that sets api_keys.revoked_at (single revoke, RevokeExpiredDispatchesWorker cascade auth.ex/dispatches, tenant audit-key rotation, break-glass) deletes the cache entry for that key_hash within the same operation. A revoked key returns unauthorized on the very next request (test-proven), not after the TTL.", "status": "pending" },
+    { "id": "AC-33.3.3", "description": "SECURITY — invalidate on rotate/mutate: creating, rotating, or otherwise mutating a key (any change to hash/role/scopes/expiry) invalidates the affected key_hash entries so a rotated secret or a role/scope change takes effect immediately.", "status": "pending" },
+    { "id": "AC-33.3.4", "description": "Defense-in-depth bounded TTL: cached entries carry a short max lifetime (config, e.g. default 30-60s) after which they are re-validated against the DB even absent an explicit invalidation — so any missed invalidation path self-heals within the TTL rather than persisting. TTL is checked on read (lazy expiry); no unbounded staleness.", "status": "pending" },
+    { "id": "AC-33.3.5", "description": "The cache stores the AUTHORIZATION-relevant fields (revoked_at, expires_at, role, scopes, tenant with custody_halted_at). verify_api_key still enforces revoked_at/expires_at from the cached struct (a cached-but-now-expired-by-wallclock key is rejected the same as an uncached one). Never cache across tenants incorrectly — key_hash is globally unique so entries are self-scoped.", "status": "pending" },
+    { "id": "AC-33.3.6", "description": "The per-request last_used_at UPDATE (auth.ex:197) is NOT part of this story's cache read path decision (it is addressed by US-33.4's write debounce); this story only removes the SELECT. If US-33.4 has not merged, the UPDATE still fires — the SELECT removal is independently correct.", "status": "pending" },
+    { "id": "AC-33.3.7", "description": "Cold start / GenServer restart yields an empty table that repopulates read-through; secrets/hashes are never logged or put in telemetry tags.", "status": "pending" }
+  ],
+  "test_cases": [
+    { "id": "TC-33.3.1", "name": "second request for the same key skips the DB SELECT", "type": "integration",
+      "preconditions": ["tenant = fixture(:tenant)", "{key,_} = fixture(:api_key, tenant_id: tenant.id, role: :agent)"],
+      "steps": ["verify_api_key(key) twice within the TTL"],
+      "expected_results": ["both resolve the same api_key+tenant", "the second resolves from ETS (assert by mutating the DB row directly and confirming the cached value is returned until invalidation/TTL)"], "status": "pending" },
+    { "id": "TC-33.3.2", "name": "SECURITY: revoked key is rejected on the very next request (no TTL wait)", "type": "integration",
+      "preconditions": ["{key, ak} = fixture(:api_key, ...)", "verify_api_key(key) once to populate cache"],
+      "steps": ["revoke the key (set revoked_at via the revoke path)", "verify_api_key(key) again immediately"],
+      "expected_results": ["returns unauthorized/{:error,...} immediately (cache entry was invalidated by the revoke path), NOT the stale valid struct"], "status": "pending" },
+    { "id": "TC-33.3.3", "name": "SECURITY: rotated key hash change takes effect immediately", "type": "integration",
+      "preconditions": ["a key cached via a prior verify"],
+      "steps": ["rotate/mutate the key (role or hash change) via its mutation path", "verify_api_key with old vs new as applicable"],
+      "expected_results": ["the change is reflected immediately (old secret rejected / new role enforced), not after TTL"], "status": "pending" },
+    { "id": "TC-33.3.4", "name": "TTL self-heals a missed invalidation", "type": "integration",
+      "preconditions": ["a key cached; simulate a DB revoke WITHOUT calling the invalidation (to model a missed path) by expiring the entry"],
+      "steps": ["advance past TTL (inject clock or set a tiny TTL in test config)", "verify_api_key"],
+      "expected_results": ["entry is re-validated against the DB and the revoke is honored"], "status": "pending" },
+    { "id": "TC-33.3.5", "name": "tenant isolation of resolved keys", "type": "integration",
+      "preconditions": ["keys for tenant_a and tenant_b, both cached"],
+      "steps": ["revoke tenant_a's key", "verify tenant_b's key"],
+      "expected_results": ["tenant_b unaffected; tenant_a rejected"], "status": "pending" }
+  ],
+  "technical_notes": [
+    "Mirror US-32.3 SettingsCache / EmbeddingCircuitBreaker: supervised GenServer owns :public :named_table with read_concurrency in the app tree (lib/loopctl/application.ex), readers hit ETS directly.",
+    "Invalidation is the crux: audit EVERY revoked_at/rotation writer (Auth single-revoke, dispatches revoke cascade auth.ex:54, RevokeExpiredDispatchesWorker, tenant audit-key rotation, break-glass) and delete the key_hash entry in-band. A grep for `revoked_at` / `:revoke` writers is mandatory in implementation.",
+    "TTL is a hard backstop, NOT the primary invalidation — set a short default (30-60s) via config-based DI; make it test-overridable to a tiny value for TC-33.3.4 (config, not Application.put_env in test — use config/test.exs).",
+    "Store the tenant preload with custody_halted_at so it composes with US-33.2.",
+    "Never log key_hash or the raw key; keep them out of telemetry tags and error messages.",
+    "Chain-of-custody: this MUST NOT let a revoked implementer/reviewer key act — TC-33.3.2 is a release gate.",
+    "Consider cache size bound / eviction if key_hash space is large (LRU or periodic sweep) to cap memory; document the bound."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 420000
+}
