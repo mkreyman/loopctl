@@ -143,6 +143,12 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
         AdminRepo.transaction(fn ->
           AdminRepo.query!("SET LOCAL enable_seqscan = off")
           %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
+          # Re-enable seq scans before this savepoint commits. AdminRepo is
+          # sandboxed, so this transaction is a SAVEPOINT nested in the outer
+          # sandbox transaction; a `SET LOCAL` in a subtransaction that releases
+          # persists to the enclosing transaction (see config/test.exs:66-75).
+          # Resetting here keeps the planner override scoped to the EXPLAIN.
+          AdminRepo.query!("RESET enable_seqscan")
           Enum.map_join(rows, "\n", fn [line] -> line end)
         end)
 
