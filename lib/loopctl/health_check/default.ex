@@ -33,14 +33,28 @@ defmodule Loopctl.HealthCheck.Default do
   `check_oban/0` below is a GenServer liveness ping (`Oban.check_queue/1`) — it stays
   "ok" even when the `:default` queue is full of jobs wedged in `:executing` (the real
   17-day/110-orphan stall this story addresses). `check_oban_orphans/0` closes that
-  gap by counting `:executing` jobs older than the AGE threshold
-  (`Loopctl.Telemetry.ScaleMetrics.oban_metrics_orphan_threshold_minutes/0`) and
-  comparing against a separate COUNT threshold
-  (`:oban_orphan_health_threshold`, AC-34.2.4). Per AC-34.2.2, a queue backlog must
-  NOT depool a node from Fly's LB — a node with a backlog can still serve HTTP
-  requests — so `oban_orphans` is folded into `ready` (readiness) ONLY, exactly
-  mirroring how `scale_alerts` was wired in US-32.4. `status` (liveness) is
-  UNCHANGED by this story: still database/oban only.
+  gap by comparing the `:executing`-older-than-N-minutes orphan count against a
+  configurable COUNT threshold (`:oban_orphan_health_threshold`, AC-34.2.4). Per
+  AC-34.2.2, a queue backlog must NOT depool a node from Fly's LB — a node with a
+  backlog can still serve HTTP requests — so `oban_orphans` is folded into `ready`
+  (readiness) ONLY, exactly mirroring how `scale_alerts` was wired in US-32.4.
+  `status` (liveness) is UNCHANGED by this story: still database/oban only.
+
+  Post-review (request-amplification finding): `check_oban_orphans/0` does NOT run
+  its own DB query. Both `/health` (continuous, unauthenticated, hit by Fly's LB
+  every 10s AND reachable at any rate from the internet) and `/health/ready` share
+  this SAME `check/0`, so an unauthenticated caller flooding `/health` would
+  otherwise force a fresh `SELECT count(*) FROM oban_jobs` on every hit — pool
+  pressure that only ever benefits `ready`, which liveness `status` doesn't even
+  consult. Instead it reads the count US-34.1's `poll_oban_executing_orphans/0`
+  (a `telemetry_poller` measurement, already ticking every 10s) cached in
+  `:persistent_term` on its last successful poll
+  (`Loopctl.Telemetry.ScaleMetrics.cached_executing_orphan_count/0`) — exactly the
+  reuse this story's technical_notes preferred over a second bounded query. The
+  cached count and the configured threshold are never disclosed verbatim in the
+  public `reasons.oban_orphans` string (both endpoints are unauthenticated); the
+  exact figures are available via the `loopctl.oban.jobs.executing_orphan.count`
+  Prometheus gauge on the internal, non-public metrics port instead.
   """
 
   @behaviour Loopctl.HealthCheck.Behaviour
@@ -135,28 +149,53 @@ defmodule Loopctl.HealthCheck.Default do
   defp scale_alerts_config_checker,
     do: Application.get_env(:loopctl, :scale_alerts_config_checker, ScaleAlerts)
 
-  # US-34.2 (AC-34.2.1/.3): counts the same `:executing`-older-than-N-minutes orphan
-  # signal US-34.1 already polls, by calling the SAME bounded query function
-  # (`ScaleMetrics.count_oban_executing_orphans/0`) — only the QUERY CODE is shared,
-  # not a stored value: this executes a fresh `Repo.transaction` + `SELECT count(*)`
-  # against `oban_jobs` on every call (US-34.1's poller calls the identical function
-  # and only emits its result as telemetry; neither caller caches it). Reports
-  # "degraded" when the count exceeds the configurable COUNT threshold; below
-  # threshold it stays "ok". Folded
-  # into `ready` (readiness) ONLY — see the moduledoc's "Oban orphan backlog is a
-  # READINESS signal" section on why this must never flip liveness `status`.
+  # US-34.2 (AC-34.2.1/.3): reads the same `:executing`-older-than-N-minutes orphan
+  # SIGNAL US-34.1 already polls, from the CACHED value
+  # `ScaleMetrics.poll_oban_executing_orphans/0` writes to `:persistent_term` on its
+  # last successful 10s poll (`ScaleMetrics.cached_executing_orphan_count/0`) —
+  # NOT a fresh `Repo.transaction` + `SELECT count(*)` per call. Post-review
+  # (request-amplification finding): this `check/0` backs BOTH the continuous,
+  # unauthenticated `/health` liveness probe and `/health/ready`; an unauthenticated
+  # caller can hit `/health` at any rate, so a per-call DB round-trip here would be
+  # unbounded request-amplification pressure on the Ecto pool for a value that
+  # only ever feeds `ready` (liveness `status` never consults it — see the
+  # moduledoc). This mirrors the story's technical_notes, which explicitly prefer
+  # reuse ("avoid a second query") over a bounded query of its own.
+  #
+  # `:not_yet_polled` (the brief window between app boot and the poller's first
+  # tick — sub-second in practice, see `cached_executing_orphan_count/0`'s doc) is
+  # treated as "ok": there is no evidence of a backlog yet, and flapping readiness
+  # for that sub-second boot window would be worse than a brief false-healthy read
+  # the very next poll corrects.
+  #
+  # Reports "degraded" when the cached count exceeds the configurable COUNT
+  # threshold; below threshold it stays "ok". Folded into `ready` (readiness) ONLY
+  # — see the moduledoc's "Oban orphan backlog is a READINESS signal" section on
+  # why this must never flip liveness `status`.
+  #
+  # The reason string deliberately omits the exact count/threshold (review
+  # finding: both endpoints are unauthenticated, so any internet caller could
+  # otherwise read the live stuck-job count and the configured trip point off a
+  # 200 OR 503 body). Operators who need the exact figures already have them via
+  # the `loopctl.oban.jobs.executing_orphan.count` Prometheus gauge (metric 19,
+  # `ScaleMetrics`), scraped off the internal, non-public `:9568/metrics` port —
+  # not this public endpoint.
   #
   # Self-rescuing like its `check_database`/`check_oban`/`check_scale_alerts` siblings:
-  # any unexpected raise (a DB timeout, an unavailable checker) must degrade cleanly to
-  # an "error" check, never crash the whole endpoint into a 500 (AC-34.2.3).
+  # any unexpected raise (an unavailable checker) must degrade cleanly to an "error"
+  # check, never crash the whole endpoint into a 500 (AC-34.2.3).
   defp check_oban_orphans do
-    count = orphan_count_checker().count_oban_executing_orphans()
     threshold = oban_orphan_health_threshold()
 
-    if count > threshold do
-      {"error", "oban executing-orphan count #{count} exceeds threshold #{threshold}"}
-    else
-      {"ok"}
+    case orphan_count_checker().cached_executing_orphan_count() do
+      {:ok, count} when count > threshold ->
+        {"error", "oban executing-orphan count exceeds configured threshold"}
+
+      {:ok, _count} ->
+        {"ok"}
+
+      :not_yet_polled ->
+        {"ok"}
     end
   rescue
     _ -> {"error", "oban orphan count check raised unexpectedly"}
@@ -165,7 +204,9 @@ defmodule Loopctl.HealthCheck.Default do
   # DI seam (Loopctl.Telemetry.ScaleMetrics.OrphanCountBehaviour) so the degraded
   # branch above is exercisable in tests via Mox.expect/3 without inserting real
   # `oban_jobs` rows or the forbidden `Application.put_env`. Defaults to the real
-  # `ScaleMetrics` module (unchanged behavior in dev/prod).
+  # `ScaleMetrics` module (unchanged behavior in dev/prod) — the SAME process that
+  # already runs `poll_oban_executing_orphans/0`, so the cache it reads is always
+  # its own poller's output.
   defp orphan_count_checker,
     do: Application.get_env(:loopctl, :oban_orphan_count_checker, ScaleMetrics)
 

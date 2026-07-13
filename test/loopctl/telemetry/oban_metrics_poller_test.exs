@@ -32,6 +32,13 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       failure (no metric corruption), and the poll-failure counter
       (`loopctl.oban.poll.error.count`) fires instead.
 
+  Also covers `cached_executing_orphan_count/0` (US-34.2 review finding): the
+  `:persistent_term` cache `poll_oban_executing_orphans/0` writes on every
+  SUCCESSFUL poll, which `Loopctl.HealthCheck.Default.check_oban_orphans/0` reads
+  instead of issuing its own fresh query — `:not_yet_polled` before the first
+  poll, `{:ok, count}` after, and a FAILED poll leaving the prior cached value in
+  place (same staleness semantics as the `last_value/2` gauge it also feeds).
+
   `oban_jobs` is a GLOBAL table (no `tenant_id` column). Both pollers now query
   it via `Loopctl.Repo` (review finding — moved off the tiny 3-connection
   `Loopctl.AdminRepo` pool, since `oban_jobs` has no RLS policy so the RLS-role
@@ -307,6 +314,58 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       assert ScaleMetrics.poll_oban_executing_orphans() == :ok
 
       assert_receive {:oban_orphan, %{count: ^direct_count}}, 1000
+    end
+  end
+
+  describe "cached_executing_orphan_count/0 (US-34.2 review finding — health-check reuse of the poller's cache)" do
+    test "returns :not_yet_polled before any poll has ever completed" do
+      :persistent_term.erase({ScaleMetrics, :cached_executing_orphan_count})
+
+      assert ScaleMetrics.cached_executing_orphan_count() == :not_yet_polled
+    end
+
+    test "returns {:ok, count} reflecting the last successful poll, without issuing a fresh query" do
+      threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
+      now = DateTime.utc_now()
+
+      insert_job(
+        state: "executing",
+        queue: "default",
+        attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
+      )
+
+      assert ScaleMetrics.poll_oban_executing_orphans() == :ok
+      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
+    end
+
+    test "a FAILED poll leaves the prior cached value in place (same staleness semantics as the last_value gauge)" do
+      threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
+      now = DateTime.utc_now()
+
+      insert_job(
+        state: "executing",
+        queue: "default",
+        attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
+      )
+
+      assert ScaleMetrics.poll_oban_executing_orphans() == :ok
+      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
+
+      # Force the NEXT poll to fail (same technique as "poller defensiveness"
+      # below): drop this test process's sandbox ownership so its next Repo call
+      # raises a genuine DBConnection.OwnershipError.
+      Sandbox.mode(Loopctl.Repo, :manual)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert ScaleMetrics.poll_oban_executing_orphans() == :ok
+        end)
+
+      assert log =~ "Oban executing-orphan poll failed"
+
+      # The cache retains the last SUCCESSFUL value — never resets to 0/unknown
+      # just because a poll cycle failed.
+      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
     end
   end
 
