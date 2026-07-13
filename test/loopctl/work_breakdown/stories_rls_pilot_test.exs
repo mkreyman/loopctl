@@ -118,6 +118,17 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
     Enum.map(data, &{&1.number, &1.title, &1.sort_key})
   end
 
+  # `Stories.list_stories_by_project(..., strategy: :rls)` and raw `Repo.with_tenant/2`
+  # run `SET LOCAL ROLE <rls_role>`, which — because this suite shares one sandbox
+  # connection (async: false) — persists for the rest of the enclosing sandbox
+  # transaction once the inner savepoint releases. Reset to the owner role after
+  # every RLS-touching read so the sandbox connection is left clean and no
+  # later owner-role assertion in the same test silently runs as the non-owner
+  # `loopctl_app`. Uniform across ALL RLS-touching tests (including the fail-closed
+  # guard cases, where it is a harmless no-op) — no contradictory reset/no-reset
+  # split. Mirrors TC-33.7.5.
+  defp reset_role, do: Repo.query!("RESET ROLE")
+
   describe "TC-33.7.1 — RLS path returns identical rows to the AdminRepo path (same tenant)" do
     test "same tenant: RLS row set matches AdminRepo path and returns exactly its seeded ids" do
       story_specs = [
@@ -137,6 +148,8 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       assert {:ok, rls_page} =
                Stories.list_stories_by_project(rls_ids.tenant, rls_ids.project, strategy: :rls)
+
+      reset_role()
 
       # Identical totals and identical ordered logical row sets.
       assert admin_page.total == 3
@@ -176,6 +189,8 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
                  offset: 2
                )
 
+      reset_role()
+
       assert rls_page.total == 5
       assert admin_page.total == 5
       assert rls_page.limit == 2
@@ -195,6 +210,8 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(ids_a.tenant, ids_a.project, strategy: :rls)
 
+      reset_role()
+
       assert page.total == 1
       assert Enum.map(page.data, & &1.title) == ["Alpha only"]
       refute Enum.any?(page.data, &(&1.tenant_id == ids_b.tenant))
@@ -209,6 +226,8 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(ids_a.tenant, ids_b.project, strategy: :rls)
 
+      reset_role()
+
       assert page.total == 0
       assert page.data == []
     end
@@ -221,6 +240,10 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(nil, ids.project, strategy: :rls)
 
+      # No-op here (the app guard short-circuits before with_tenant sets a role);
+      # kept for uniform hygiene across all RLS-touching tests.
+      reset_role()
+
       assert page.total == 0
       assert page.data == []
     end
@@ -230,6 +253,10 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       assert {:ok, page} =
                Stories.list_stories_by_project("", ids.project, strategy: :rls)
+
+      # No-op here (blank tenant hits the app guard before any role switch);
+      # kept for uniform hygiene across all RLS-touching tests.
+      reset_role()
 
       assert page.total == 0
       assert page.data == []
@@ -261,6 +288,36 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
     end
   end
 
+  describe "config-driven default strategy resolution (the production trigger branch)" do
+    test "flag ON resolves to the :rls path — the real prod trigger" do
+      # The release-gate RLS tests all pass an explicit `strategy: :rls`, so without
+      # this direct assertion the flag-ON -> :rls resolution branch (stories.ex) —
+      # the branch that actually turns the pilot on in prod — would never be
+      # exercised. `no Application.put_env` rules out flipping the live flag here,
+      # so the branch logic is asserted through the pure mapping seam.
+      assert Stories.list_stories_strategy_for_flag(true) == :rls
+    end
+
+    test "flag OFF resolves to the :admin path" do
+      assert Stories.list_stories_strategy_for_flag(false) == :admin
+    end
+
+    test "default resolver reads the real config key and maps it consistently" do
+      # `fetch_env!` raises if the `:rls_reroute_list_stories_by_project` key is
+      # renamed/removed in config/config.exs — catching a config-vs-get_env desync
+      # that would otherwise leave the whole suite green while the prod flag
+      # silently no-ops on the AdminRepo path.
+      flag = Application.fetch_env!(:loopctl, :rls_reroute_list_stories_by_project)
+
+      # Default (test) config keeps the pilot OFF.
+      assert flag == false
+
+      # The resolver reads THAT key and maps it via the same pure function.
+      assert Stories.default_list_stories_strategy() ==
+               Stories.list_stories_strategy_for_flag(flag)
+    end
+  end
+
   describe "TC-33.7.5 — RLS itself enforces isolation, independent of the explicit predicate" do
     test "RLS alone filters cross-tenant rows when the query carries NO tenant predicate" do
       # Two tenants' rows on the SAME Repo connection the RLS path reads on.
@@ -285,7 +342,7 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       # `with_tenant/2`'s SET LOCAL ROLE persists for the rest of the sandbox
       # transaction; reset to the owner role so DataCase teardown is unaffected.
-      Repo.query!("RESET ROLE")
+      reset_role()
 
       assert Enum.map(rows, & &1.title) == ["Alpha only"]
       assert Enum.all?(rows, &(&1.tenant_id == ids_a.tenant))
@@ -310,7 +367,7 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
                  Repo.all(from(s in Story, where: s.project_id == ^ids.project))
                end)
 
-      Repo.query!("RESET ROLE")
+      reset_role()
 
       assert rows == []
     end

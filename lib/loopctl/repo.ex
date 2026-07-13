@@ -66,6 +66,20 @@ defmodule Loopctl.Repo do
   The SET LOCAL is transaction-scoped, so it automatically resets
   when the connection returns to the pool.
 
+  ## Must own its transaction — never nest inside an existing one
+
+  `with_tenant/2` MUST be the transaction owner. Its
+  `set_config('app.current_tenant_id', …, true)` and (dev/test) `SET LOCAL ROLE`
+  are TRANSACTION-scoped, NOT savepoint-scoped. If called from INSIDE an already
+  open `Loopctl.Repo` transaction, the inner `transaction/1` degrades to a
+  SAVEPOINT, and those `SET LOCAL` settings then persist PAST the inner
+  savepoint — overriding the OUTER transaction's tenant/role context for the
+  rest of its lifetime. That is a cross-tenant / role leak, exactly the failure
+  the RLS pattern exists to prevent. So this function fails loud (raises) when it
+  detects it is nested inside a Repo transaction, rather than silently leaking.
+  The check is skipped under the Ecto SQL sandbox, whose per-test transaction
+  legitimately makes `in_transaction?/0` return true.
+
   ## Examples
 
       Loopctl.Repo.with_tenant(tenant_id, fn ->
@@ -79,12 +93,32 @@ defmodule Loopctl.Repo do
   @spec with_tenant(Ecto.UUID.t(), (-> result)) :: {:ok, result} | {:error, term()}
         when result: term()
   def with_tenant(tenant_id, fun) when is_binary(tenant_id) and is_function(fun, 0) do
+    assert_not_nested!()
     put_tenant_id(tenant_id)
 
     transaction(fn ->
       set_rls_context(tenant_id)
       fun.()
     end)
+  end
+
+  # US-33.7 guard: `with_tenant/2` must own its transaction (see @doc above).
+  # Fails loud so the follow-on blanket-reroute epic cannot introduce a
+  # nested-transaction caller that silently leaks tenant/role context. No current
+  # caller nests. Skipped under the SQL sandbox, whose per-test transaction makes
+  # `in_transaction?/0` true by design.
+  defp assert_not_nested! do
+    if in_transaction?() and not sandbox_pool?() do
+      raise "Loopctl.Repo.with_tenant/2 called inside an existing Repo transaction. " <>
+              "It must own its transaction: SET LOCAL app.current_tenant_id / ROLE are " <>
+              "transaction-scoped and would leak past the inner savepoint into the outer " <>
+              "transaction's tenant/role context. Set the RLS context directly in the " <>
+              "enclosing transaction instead (see Loopctl.Repo.set_rls_context/1)."
+    end
+  end
+
+  defp sandbox_pool? do
+    Keyword.get(config(), :pool) == Ecto.Adapters.SQL.Sandbox
   end
 
   @doc """

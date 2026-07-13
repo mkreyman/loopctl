@@ -302,14 +302,34 @@ defmodule Loopctl.WorkBreakdown.Stories do
     list_stories_by_project(strategy, tenant_id, project_id, opts, limit, offset)
   end
 
-  # RLS path resolved from config unless the caller passed an explicit `:strategy`.
-  defp default_list_stories_strategy do
-    if Application.get_env(:loopctl, :rls_reroute_list_stories_by_project, false) do
-      :rls
-    else
-      :admin
-    end
+  # Resolves the default `list_stories_by_project/3` read strategy from the
+  # default-OFF `:rls_reroute_list_stories_by_project` pilot flag (US-33.7).
+  #
+  # Public + `@doc false` so the resolution can be asserted directly: the
+  # flag-ON -> `:rls` branch is the ACTUAL production trigger (flag flipped on,
+  # caller passes no `:strategy`), yet every RLS release-gate test passes an
+  # explicit `strategy: :rls`, so without this seam that branch — and a
+  # config-key desync between config/config.exs and the `get_env` key below —
+  # would stay green while the prod flag silently no-ops on the AdminRepo path.
+  # The `no Application.put_env` constraint rules out flipping the live flag in a
+  # test, so the branch logic is factored into the pure, both-branch-testable
+  # `list_stories_strategy_for_flag/1`.
+  @doc false
+  @spec default_list_stories_strategy() :: :admin | :rls
+  def default_list_stories_strategy do
+    :loopctl
+    |> Application.get_env(:rls_reroute_list_stories_by_project, false)
+    |> list_stories_strategy_for_flag()
   end
+
+  # Maps the `:rls_reroute_list_stories_by_project` pilot flag to a read strategy.
+  # Extracted so BOTH resolution branches are unit-testable without
+  # `Application.put_env` (config-based DI; the flag default lives in
+  # config/config.exs, the prod runtime override in config/runtime.exs).
+  @doc false
+  @spec list_stories_strategy_for_flag(boolean()) :: :admin | :rls
+  def list_stories_strategy_for_flag(true), do: :rls
+  def list_stories_strategy_for_flag(false), do: :admin
 
   # AdminRepo path (default) — BYPASSRLS pool, unchanged from before the pilot.
   defp list_stories_by_project(:admin, tenant_id, project_id, opts, limit, offset) do
