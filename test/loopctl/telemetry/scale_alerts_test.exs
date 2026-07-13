@@ -14,6 +14,11 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       `evaluate/0`; after the metric clears, a fresh breach fires again;
     * the bucketed p95 honors its sample floor and crosses at the right bucket.
 
+  US-34.5 extends this coverage: durable delivery via `Loopctl.Workers.ScaleAlertDeliveryWorker`
+  (AC-34.5.1 — a delivery failure is Oban's `:failure` state, not a logged-and-dropped
+  POST), bounded periodic re-notify while a breach stays sustained (AC-34.5.2), re-arm on
+  clear (AC-34.5.3), and the nil-url path still never enqueues (AC-34.5.4).
+
   `async: false`: the handlers attach GLOBAL `:telemetry` listeners on the three scale
   events, so a concurrent async test issuing a real heavy-read / db-error would pollute
   this instance's window counters. Running serially keeps the counts deterministic. It
@@ -32,6 +37,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.TelemetryEvents
+  alias Loopctl.Workers.ScaleAlertDeliveryWorker
 
   setup :set_mox_global
   setup :verify_on_exit!
@@ -284,7 +290,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   end
 
   describe "no webhook url configured (log-only opt-in)" do
-    test "with a nil url, a breach logs and does NOT POST" do
+    test "with a nil url, a breach logs and does NOT POST or enqueue (AC-34.5.4)" do
       test_pid = self()
 
       stub(Loopctl.MockDelivery, :deliver, fn _u, _b, _h ->
@@ -292,9 +298,26 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         {:ok, %{status: 200, body: "ok"}}
       end)
 
+      # A nil-url breach must never even reach Oban — assert no [:oban, :job, :start]
+      # (or any other oban job event) fires for our worker at all (US-34.5: the nil
+      # branch stays a SYNCHRONOUS log-only no-op, it must not enqueue).
+      handler_id = {:scale_alerts_nilurl_oban, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:oban, :job, :start],
+        fn _event, _measurements, meta, _config ->
+          send(test_pid, {:unexpected_oban_job, meta.job.worker})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       # Start a SEPARATE instance with the URL overridden to nil via a start opt (NO
       # put_env in the body — the override is instance config, restored automatically when
-      # this supervised process stops). A breach must log, not POST.
+      # this supervised process stops). A breach must log, not POST, and (US-34.5) must
+      # NOT enqueue a durable-delivery job either.
       table = :"scale_alerts_nilurl_#{System.unique_integer([:positive])}"
       name = :"scale_alerts_nilurl_srv_#{System.unique_integer([:positive])}"
 
@@ -310,6 +333,130 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
       assert :ok = ScaleAlerts.evaluate(name)
       refute_received :unexpected_delivery
+      refute_received {:unexpected_oban_job, _}
+    end
+  end
+
+  describe "durable delivery via Oban (AC-34.5.1)" do
+    # ScaleAlerts is a long-running GenServer, so `deliver/2`'s `Oban.insert/1` executes
+    # inside the SERVER process, not the test process — `Oban.Testing.with_testing_mode/2`
+    # is a process-dictionary override scoped to the CALLING process (the pattern used
+    # in `signup_test.exs`, where the enqueue happens via a plain context function call
+    # in the test process itself) and does not reach across that GenServer.call boundary.
+    # Instead we prove durability directly at Oban's own job-lifecycle telemetry: a
+    # `perform/1` failure must be classified `state: :failure` (Oban's retryable state,
+    # the trigger for its OWN backoff/retry scheduling) rather than being silently
+    # swallowed — i.e. the alert genuinely ran THROUGH Oban's Executor, not a bare
+    # logged-and-dropped POST. The worker-level test
+    # (`scale_alert_delivery_worker_test.exs`) covers the complementary unit proof that
+    # `perform/1` itself returns `{:error, _}` on failure and `:ok` on success.
+    test "a delivery failure is classified by Oban as a retryable failure, not dropped",
+         %{server: server} do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        {:error, "connection_refused"}
+      end)
+
+      handler_id = {:scale_alerts_oban_exception, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:oban, :job, :exception],
+        fn _event, _measurements, meta, _config ->
+          send(test_pid, {:oban_job_failed, meta.job.worker, meta.state})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # 6 timeouts in a 60s window = 6/min > the 5/min default threshold.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      expected_worker = inspect(ScaleAlertDeliveryWorker)
+      assert_received {:oban_job_failed, ^expected_worker, :failure}
+    end
+
+    test "a delivery success runs through the durable worker path (not a bare POST)",
+         %{server: server} do
+      test_pid = self()
+
+      handler_id = {:scale_alerts_oban_stop, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:oban, :job, :stop],
+        fn _event, _measurements, meta, _config ->
+          send(test_pid, {:oban_job_succeeded, meta.job.worker, meta.state})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      expect(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers ->
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(server)
+
+      expected_worker = inspect(ScaleAlertDeliveryWorker)
+      assert_received {:oban_job_succeeded, ^expected_worker, :success}
+    end
+  end
+
+  describe "bounded periodic re-notify while a breach is sustained (AC-34.5.2)" do
+    test "re-fires once the re-notify interval elapses, stays silent before it, re-arms on clear" do
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, body, _headers ->
+        send(test_pid, {:fired, Jason.decode!(body)["metric"]})
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # A mutable clock (Erlang :counters, no Application.put_env involved) injected as
+      # a per-instance `now_fn` override — mirrors the existing `webhook_url` seam — so
+      # the re-notify interval can be crossed deterministically without sleeping.
+      clock = :counters.new(1, [])
+      now_fn = fn -> :counters.get(clock, 1) end
+
+      table = :"scale_alerts_renotify_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_renotify_srv_#{System.unique_integer([:positive])}"
+
+      _pid =
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, now_fn: now_fn, renotify_interval_ms: 1_000},
+          id: name
+        )
+
+      # Edge fire: false -> true.
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      assert_received {:fired, "db_statement_timeout_rate"}
+
+      # Still breaching, interval NOT elapsed (500ms < 1_000ms) -> debounced, no 2nd fire.
+      :counters.add(clock, 1, 500)
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      refute_received {:fired, _}
+
+      # Advance PAST the interval, still breaching -> bounded re-notify fires (TC-34.5.2).
+      :counters.add(clock, 1, 600)
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      assert_received {:fired, "db_statement_timeout_rate"}
+
+      # Clear below threshold -> re-arms (no fire).
+      assert :ok = ScaleAlerts.evaluate(name)
+      refute_received {:fired, _}
+
+      # A later breach fires again immediately (TC-34.5.3: edge semantics preserved).
+      emit_timeout(6)
+      assert :ok = ScaleAlerts.evaluate(name)
+      assert_received {:fired, "db_statement_timeout_rate"}
     end
   end
 end

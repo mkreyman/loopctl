@@ -236,6 +236,13 @@ if config_env() == :prod do
          :scale_alert_under_fill_rate_per_min,
          String.to_integer(System.get_env("SCALE_ALERT_UNDER_FILL_RATE_PER_MIN") || "30")
 
+  # US-34.5 (AC-34.5.2): bounded periodic re-notify interval while a breach stays
+  # sustained. `ScaleAlerts.renotify_interval_ms/0` floors this at 60_000ms, so a
+  # misconfigured near-zero value can't turn re-notify into per-tick spam.
+  config :loopctl,
+         :scale_alert_renotify_interval_ms,
+         String.to_integer(System.get_env("SCALE_ALERT_RENOTIFY_INTERVAL_MS") || "900000")
+
   config :loopctl, Loopctl.HeavyReadRepo,
     url: admin_database_url,
     pool_size: String.to_integer(System.get_env("HEAVY_READ_POOL_SIZE") || "8"),

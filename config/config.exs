@@ -118,12 +118,21 @@ config :loopctl,
   # - the three thresholds (documented defaults): timeouts/min, p95 heavy-read ms,
   #   under-fill events/min. Edge-triggered debounce: an alert fires on the transition
   #   INTO breach, re-arming once the metric clears (no per-interval spam).
+  # - scale_alert_renotify_interval_ms (US-34.5, AC-34.5.2): while a breach remains
+  #   sustained, re-fire once this interval has elapsed since the last notification
+  #   instead of firing exactly once — an hours-long breach keeps paging. Floored at
+  #   60_000ms in `ScaleAlerts.renotify_interval_ms/0` so misconfiguration can't turn
+  #   this into per-tick spam. Delivery (US-34.5, AC-34.5.1) is durable: alerts are
+  #   enqueued through `Loopctl.Workers.ScaleAlertDeliveryWorker` (Oban `:webhooks`
+  #   queue) rather than POSTed synchronously, so a transient failure retries with
+  #   Oban's backoff instead of being logged-and-dropped.
   scale_alerts_enabled: false,
   scale_alert_webhook_url: nil,
   scale_alert_check_interval_ms: 60_000,
   scale_alert_timeout_rate_per_min: 5,
   scale_alert_p95_latency_ms: 2_000,
-  scale_alert_under_fill_rate_per_min: 30
+  scale_alert_under_fill_rate_per_min: 30,
+  scale_alert_renotify_interval_ms: 15 * 60_000
 
 # US-33.3: bounded TTL (ms) for the ETS read-through api-key cache. This is the
 # defense-in-depth backstop, NOT the primary invalidation — every revoke/rotate/
