@@ -1,0 +1,127 @@
+defmodule LoopctlWeb.Plugs.CheckCustodyHaltTest do
+  @moduledoc """
+  US-33.2 — CheckCustodyHalt reuses the tenant already preloaded by
+  ResolveApiKey (`current_tenant` assign) instead of issuing a redundant
+  AdminRepo SELECT via `Tenants.get_tenant/1`.
+
+  Covers: a custody-halted tenant is still blocked (503 tenant_halted), a
+  non-halted tenant still passes, per-tenant isolation drives the decision from
+  each request's own loaded tenant, and (telemetry proof) the redundant
+  `tenants` SELECT is gone — a halted request issues exactly ONE query against
+  the `tenants` source (the ResolveApiKey preload), not two.
+
+  Async: every path routes through `Loopctl.AdminRepo`, so all queries share the
+  one sandbox connection the fixtures insert through.
+  """
+  use LoopctlWeb.ConnCase, async: true
+
+  defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  # api_keys.agent_id is a FK to agents, so mint a real agent per agent key.
+  defp agent_key(tenant_id) do
+    agent = fixture(:agent, %{tenant_id: tenant_id})
+    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
+    raw
+  end
+
+  describe "custody halt enforcement (US-33.2)" do
+    test "TC-33.2.1: a custody-halted tenant's request is blocked (503 tenant_halted)", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      body =
+        conn
+        |> auth(raw)
+        |> get(~p"/api/v1/memory")
+        |> json_response(503)
+
+      assert body["error"]["code"] == "tenant_halted"
+    end
+
+    test "TC-33.2.2: a non-halted tenant's request proceeds normally (non-503)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+
+      conn
+      |> auth(raw)
+      |> get(~p"/api/v1/memory")
+      |> json_response(200)
+    end
+
+    test "TC-33.2.3: tenant isolation — tenant A halted is blocked, tenant B passes", %{
+      conn: conn
+    } do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      raw_a = agent_key(tenant_a.id)
+      raw_b = agent_key(tenant_b.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant_a.id)
+
+      blocked =
+        conn
+        |> auth(raw_a)
+        |> get(~p"/api/v1/memory")
+        |> json_response(503)
+
+      assert blocked["error"]["code"] == "tenant_halted"
+
+      base_conn()
+      |> auth(raw_b)
+      |> get(~p"/api/v1/memory")
+      |> json_response(200)
+    end
+
+    test "TC-33.2.4: no redundant tenants SELECT — halted request queries tenants exactly once",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      raw = agent_key(tenant.id)
+      {:ok, _} = Loopctl.Tenants.halt_custody(tenant.id)
+
+      # Scope the handler to THIS tenant's queries only — the handler is attached
+      # VM-globally and would otherwise catch parallel async tests' `tenants`
+      # SELECTs (flaky). Ecto dumps the UUID PK to a 16-byte binary in params.
+      {:ok, tenant_id_bin} = Ecto.UUID.dump(tenant.id)
+
+      test_pid = self()
+      ref = make_ref()
+      handler_id = "check-custody-halt-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :admin_repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:source] == "tenants" and
+               tenant_id_bin in List.wrap(metadata[:params]) do
+            send(test_pid, {ref, :tenants_query})
+          end
+        end,
+        nil
+      )
+
+      try do
+        body =
+          conn
+          |> auth(raw)
+          |> get(~p"/api/v1/memory")
+          |> json_response(503)
+
+        assert body["error"]["code"] == "tenant_halted"
+      after
+        :telemetry.detach(handler_id)
+      end
+
+      # Exactly one `tenants` SELECT (the ResolveApiKey preload). The removed
+      # CheckCustodyHalt re-SELECT would make this two.
+      assert_receive {^ref, :tenants_query}
+      refute_receive {^ref, :tenants_query}
+    end
+  end
+
+  # A fresh conn carrying the witness STH header (ConnCase adds it to the shared
+  # `conn`, but a second dispatched request needs its own conn).
+  defp base_conn,
+    do: put_req_header(build_conn(), "x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
+end
