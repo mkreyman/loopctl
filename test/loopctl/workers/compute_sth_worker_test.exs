@@ -61,9 +61,16 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
       for job <- tenant_jobs do
         tenant_id = job.args["tenant_id"]
         diff = DateTime.diff(job.scheduled_at, now)
+        expected = expected_jitter(tenant_id)
 
         assert diff in 0..55
-        assert diff == expected_jitter(tenant_id)
+        # `scheduled_at` is computed from `utc_now()` at build time (after
+        # `now` was captured above), and DateTime.diff truncates to whole
+        # seconds -- so diff normally equals `expected` but can be
+        # `expected + 1` if wall-clock time crosses a second boundary
+        # between capturing `now` and building the job. Tolerate that one
+        # second of build-time elapsed rather than asserting exact equality.
+        assert diff in expected..(expected + 1)
       end
     end
 
@@ -115,6 +122,13 @@ defmodule Loopctl.Workers.ComputeSthWorkerTest do
       |> Loopctl.AdminRepo.update!()
 
       assert :ok = ComputeSthWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # Guard against a storage-path regression: `:ok` alone is also
+      # returned on the sth_needed?==false and :empty_chain branches, so
+      # assert the STH was actually signed and persisted for this tenant.
+      sth = AuditChain.get_latest_sth(tenant.id)
+      assert %AuditChain.SignedTreeHead{} = sth
+      assert sth.chain_position == 0
     end
   end
 end

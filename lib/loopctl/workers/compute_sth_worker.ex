@@ -12,6 +12,21 @@ defmodule Loopctl.Workers.ComputeSthWorker do
   batch. Each per-tenant job is scheduled with a small deterministic jitter
   (see `jitter/1`) so the fanout doesn't thundering-herd the `:audit` queue
   and the primary DB at the exact `:00` instant of the cron tick.
+
+  ## `unique` does NOT apply to this fanout
+
+  This worker declares `unique: [fields: [:worker, :args], period: 30]`, but
+  Oban's bulk insert (`Oban.insert_all/1`, used above for fanout) only honors
+  `unique` on the Smart Engine (Oban Pro). On the Basic Engine (what this app
+  runs), `unique` is checked by `Oban.insert/2` (single-job inserts) and is
+  inert for `insert_all/1` -- see `Oban.insert_all/1`'s own docs. So the
+  fanout can, in principle, enqueue duplicate per-tenant jobs; this is safe
+  because `perform/1`'s `tenant_id` clause is idempotent via
+  `AuditChain.sth_needed?/1` below -- a duplicate job is a cheap no-op, not a
+  duplicate STH. Do not rely on `unique` as the dedup mechanism here; if
+  stronger duplicate-prevention is ever required, that means adopting the
+  Smart Engine or adding an explicit application-level guard, not assuming
+  this attribute already provides it.
   """
 
   use Oban.Worker,
@@ -73,9 +88,11 @@ defmodule Loopctl.Workers.ComputeSthWorker do
   # module level -- a random value here would make the enqueued job's
   # `schedule_in` (and therefore `scheduled_at`) non-reproducible across
   # retries/tests, and would fight `Oban.insert_all/1`'s ability to spread
-  # fanout evenly. `:erlang.phash2/1` is stable for a given tenant_id and
-  # independent of the `unique: [fields: [:worker, :args]]` dedup key (which
-  # only looks at worker + args, never `scheduled_at`), so jitter never
-  # collides with uniqueness.
+  # fanout evenly. `:erlang.phash2/1` is stable for a given tenant_id.
+  #
+  # Note this has nothing to do with the `unique: [fields: [:worker, :args]]`
+  # declaration above: that option is inert on this `insert_all/1` fanout
+  # path regardless of `scheduled_at` (see the moduledoc). Jitter's actual
+  # job is spreading fanout load, not participating in dedup.
   defp jitter(tenant_id), do: rem(:erlang.phash2(tenant_id), @jitter_window_seconds)
 end
