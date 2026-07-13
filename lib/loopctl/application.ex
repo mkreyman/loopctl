@@ -42,6 +42,14 @@ defmodule Loopctl.Application do
       # per-change one. Stable owner survives the request/Task/Oban process that
       # populated an entry; invalidated on the settings write path.
       Loopctl.Llm.SettingsCache,
+      # US-33.3: owns the ETS table caching resolved api_keys by key_hash so the
+      # authenticated hot path becomes read-through — a per-request AdminRepo
+      # SELECT becomes a per-change one. Stable owner survives the request/Task/
+      # Oban process that populated an entry; every revoke/rotate/mutate writer
+      # invalidates the key_hash entry (a bounded TTL backstops any missed path).
+      # After PubSub + AdminRepo: it subscribes in init and its values preload
+      # :tenant (custody_halted_at) for the CheckCustodyHalt plug (US-33.2).
+      Loopctl.Auth.ApiKeyCache,
       LoopctlWeb.Endpoint
     ]
 

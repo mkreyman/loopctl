@@ -20,6 +20,7 @@ defmodule Loopctl.Agents do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Audit
+  alias Loopctl.Auth
   alias Loopctl.Webhooks.EventGenerator
 
   @doc """
@@ -89,8 +90,16 @@ defmodule Loopctl.Agents do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{agent: agent}} ->
-        {:ok, agent}
+      {:ok, changes} ->
+        # US-33.3: binding an agent MUTATES the api_key (sets agent_id — a
+        # scope-relevant change, AC-33.3.3). Bust the cached entry so the next
+        # request sees the bound key (e.g. the "already has an agent" 409 guard),
+        # not the stale pre-bind snapshot. The `:link_api_key` Multi step already
+        # loaded+updated the api_key struct, so invalidate by its key_hash in hand
+        # — no second AdminRepo round-trip on the cache's own pool (US-33.3,
+        # finding-4 remediation). When no key was linked the step is absent.
+        changes |> linked_key_hashes() |> Auth.invalidate_key_cache_by_hashes()
+        {:ok, changes.agent}
 
       {:error, :agent, changeset, _changes} ->
         {:error, changeset}
@@ -238,4 +247,9 @@ defmodule Loopctl.Agents do
       Ecto.Changeset.change(api_key, %{agent_id: agent.id})
     end)
   end
+
+  # The `:link_api_key` step is only present when an api_key_id was passed; its
+  # value is the updated ApiKey struct, so its key_hash is already in memory.
+  defp linked_key_hashes(%{link_api_key: %{key_hash: key_hash}}), do: [key_hash]
+  defp linked_key_hashes(_changes), do: []
 end

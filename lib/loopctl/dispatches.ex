@@ -235,19 +235,32 @@ defmodule Loopctl.Dispatches do
       end)
       |> Multi.run(:revoke_keys, fn _repo, _ ->
         if key_ids != [] do
-          {count, _} =
-            from(k in ApiKey, where: k.id in ^key_ids and is_nil(k.revoked_at))
+          # Select the revoked key_hashes back in the SAME update statement so the
+          # post-commit cache invalidation needs no second AdminRepo lookup on the
+          # very 3-connection pool this cache exists to relieve (US-33.3, finding-4).
+          {_count, key_hashes} =
+            from(k in ApiKey,
+              where: k.id in ^key_ids and is_nil(k.revoked_at),
+              select: k.key_hash
+            )
             |> AdminRepo.update_all(set: [revoked_at: now])
 
-          {:ok, count}
+          {:ok, key_hashes}
         else
-          {:ok, 0}
+          {:ok, []}
         end
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{revoke_dispatches: count}} -> {:ok, count}
-      {:error, _step, reason, _} -> {:error, reason}
+      {:ok, %{revoke_dispatches: count, revoke_keys: key_hashes}} ->
+        # SECURITY (AC-33.3.2): the update_all cascade bypasses changesets, so bust
+        # the api-key cache explicitly for every revoked key_hash AFTER commit. The
+        # hashes came back from the revoke statement itself (no extra round-trip).
+        Loopctl.Auth.invalidate_key_cache_by_hashes(key_hashes)
+        {:ok, count}
+
+      {:error, _step, reason, _} ->
+        {:error, reason}
     end
   end
 
