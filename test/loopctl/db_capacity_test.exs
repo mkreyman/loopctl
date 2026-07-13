@@ -16,9 +16,11 @@ defmodule Loopctl.DbCapacityTest do
   alias Loopctl.Repo
 
   test "prod pool sizes match the runtime.exs env-var defaults" do
-    # US-33.6: re-derived, no rebalance shipped — the auth hot path is already net-zero
-    # AdminRepo statements per request (US-33.3/33.4), and the Repo pool is not idle
-    # (Oban's 38-wide queue concurrency shares it), so sizes stay at US-27.11 defaults.
+    # US-33.6: re-derived, no rebalance shipped (explicit scope decision) — US-33.3/33.4
+    # already cut the auth hot path's per-request AdminRepo cost from ~5 statements to
+    # ~1 (the ValidateWitnessHeader plug still issues one uncached STH SELECT per
+    # request — NOT net-zero), and the Repo pool is not idle (Oban's 38-wide queue
+    # concurrency shares it), so sizes stay at US-27.11 defaults.
     assert DbCapacity.prod_pool_sizes() == %{repo: 10, admin_repo: 3, heavy_read_repo: 8}
     assert DbCapacity.per_node_total() == 21
     assert DbCapacity.steady_total(2) == 42
@@ -37,11 +39,14 @@ defmodule Loopctl.DbCapacityTest do
   end
 
   test "TC-33.6.1: peak budget at EXPECTED_APP_NODES stays strictly under max_connections with margin" do
-    # Computed, not hand-asserted: US-33.6 re-derived the pool split and shipped no
-    # rebalance (see db_capacity.ex/runtime.exs rationale), so per-node total stays 21
-    # and peak(2) stays 67 with comfortable margin under the verified 100.
-    assert DbCapacity.peak_total(2) == 67
-    assert DbCapacity.peak_total(2) < DbCapacity.verified_live_max_connections()
+    # Reads EXPECTED_APP_NODES through DbCapacity.expected_app_nodes/0 — the SAME
+    # source warn_if_over_budget/0 defaults to — rather than hand-asserting a
+    # literal node count, so this actually exercises the env-derived node count
+    # the TC step calls for. No env override in CI/dev, so this is 2 today; the
+    # margin assertion (not a literal peak_total/67 equality, already covered by
+    # the "peak budget = steady + ..." test above) is the non-redundant coverage.
+    nodes = DbCapacity.expected_app_nodes()
+    assert DbCapacity.peak_total(nodes) < DbCapacity.verified_live_max_connections()
   end
 
   test "the PEAK budget fits within the LIVE max_connections and the verified value (TC-27.11.3)" do
