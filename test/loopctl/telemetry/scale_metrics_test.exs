@@ -60,7 +60,10 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.memory_promotion.failed.count",
     "loopctl.memory_promotion.degraded.count",
     "loopctl.memory_promotion.quota_exceeded.count",
-    "loopctl.memory_promotion.budget_exceeded.count"
+    "loopctl.memory_promotion.budget_exceeded.count",
+    "loopctl.oban.jobs.count",
+    "loopctl.oban.jobs.executing_orphan.count",
+    "loopctl.oban.poll.error.count"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -75,7 +78,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   # provider), `:source` (embedding.skipped_no_key — "article"/"memory"), `:index`/
   # `:purpose`/`:state` (index_health.invalid — three bounded fixed sets), `:op`
   # (secrets.orphan_cleanup_failed — normalized `:delete`/`:restore`/`:unknown`), and
-  # `:stage` (memory_promotion.failed — bounded `:compile`/`:persist`/`:enqueue`).
+  # `:stage` (memory_promotion.failed — bounded `:compile`/`:persist`/`:enqueue`). US-34.1
+  # adds `:poller` (oban.poll.error.count — bounded `:queue_state`/`:executing_orphans`)
+  # and `:error_class` (oban.poll.error.count — CLASSIFIED, never a raw exception).
   @allowed_tags MapSet.new([
                   :endpoint,
                   :mapped_code,
@@ -91,7 +96,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                   :purpose,
                   :state,
                   :op,
-                  :stage
+                  :stage,
+                  :state,
+                  :queue,
+                  :poller,
+                  :error_class
                 ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
@@ -782,6 +791,188 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert scrape =~ ~s(loopctl_memory_promotion_quota_exceeded_count 1)
       assert scrape =~ ~s(loopctl_memory_promotion_budget_exceeded_count 1)
 
+      assert Process.alive?(pid)
+    end
+  end
+
+  describe "Oban queue/state + executing_orphan gauges (US-34.1, AC-34.1.1/.2/.5)" do
+    test "loopctl.oban.jobs.count is a last_value GAUGE tagged by state and queue ONLY" do
+      gauge = metric("loopctl.oban.jobs.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :jobs, :count]
+      assert MapSet.new(gauge.tags) == MapSet.new([:state, :queue])
+      refute :tenant_id in gauge.tags
+    end
+
+    test "loopctl.oban.jobs.executing_orphan.count is a last_value GAUGE, UNTAGGED" do
+      gauge = metric("loopctl.oban.jobs.executing_orphan.count")
+
+      assert %Telemetry.Metrics.LastValue{} = gauge
+      assert gauge.event_name == [:loopctl, :oban, :jobs, :executing_orphan, :count]
+      assert gauge.tags == []
+    end
+
+    test "oban_queue_state_tags/1 passes through present state/queue, defaults missing to \"unknown\"" do
+      assert ScaleMetrics.oban_queue_state_tags(%{state: "available", queue: "default"}) == %{
+               state: "available",
+               queue: "default"
+             }
+
+      assert ScaleMetrics.oban_queue_state_tags(%{}) == %{state: "unknown", queue: "unknown"}
+    end
+
+    test "oban_queue_state_tags/1 never tags tenant_id even if one leaks into metadata" do
+      tags =
+        ScaleMetrics.oban_queue_state_tags(%{
+          state: "executing",
+          queue: "webhooks",
+          tenant_id: "t-1"
+        })
+
+      refute Map.has_key?(tags, :tenant_id)
+    end
+
+    test "poller config accessors default to the documented bounded values" do
+      assert ScaleMetrics.oban_metrics_poll_statement_timeout_ms() == 2_000
+      assert ScaleMetrics.oban_metrics_orphan_threshold_minutes() == 45
+    end
+
+    test "validate_positive_poll_timeout!/1 raises ArgumentError on a non-positive-integer value (review finding — unit-tested directly, never mutating global config)" do
+      for bad <- ["2000", -1, 0, nil] do
+        assert_raise ArgumentError,
+                     ~r/oban_metrics_poll_statement_timeout_ms/,
+                     fn -> ScaleMetrics.validate_positive_poll_timeout!(bad) end
+      end
+    end
+
+    test "validate_positive_poll_timeout!/1 passes through a positive integer unchanged" do
+      assert ScaleMetrics.validate_positive_poll_timeout!(5_000) == 5_000
+    end
+
+    test "oban_states/0 returns Oban.Job.states/0's full 8-value enum (review finding: was documented as 7)" do
+      assert ScaleMetrics.oban_states() == Oban.Job.states()
+      assert length(ScaleMetrics.oban_states()) == 8
+    end
+
+    test "oban_active_states/0 excludes only the terminal completed/discarded/cancelled states (review finding)" do
+      active = ScaleMetrics.oban_active_states()
+
+      assert length(active) == 5
+      assert :completed not in active
+      assert :discarded not in active
+      assert :cancelled not in active
+      assert :available in active
+      assert :scheduled in active
+      assert :executing in active
+      assert :retryable in active
+      assert :suspended in active
+    end
+
+    test "oban_queues/0 returns the configured queue names, resolved at call time" do
+      configured =
+        :loopctl
+        |> Application.get_env(Oban, [])
+        |> Keyword.get(:queues, [])
+        |> Keyword.keys()
+
+      assert ScaleMetrics.oban_queues() == configured
+      assert length(ScaleMetrics.oban_queues()) == 9
+    end
+
+    test "queues_from_config/1 resolves to [] instead of raising on the documented `queues: false` shape (review finding — unit-tested directly, never mutating global config)" do
+      assert ScaleMetrics.queues_from_config(false) == []
+      assert ScaleMetrics.queues_from_config(nil) == []
+    end
+
+    test "queues_from_config/1 passes a valid queues keyword through to its keys" do
+      assert ScaleMetrics.queues_from_config(default: 10, webhooks: 5) == [:default, :webhooks]
+    end
+
+    test "oban_poll_error_tags/1 CLASSIFIES the raw exception into a small bounded set (review finding — never the raw exception message/struct)" do
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %Postgrex.Error{}
+             }) == %{poller: :queue_state, error_class: "db_error"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %DBConnection.ConnectionError{}
+             }) == %{poller: :queue_state, error_class: "db_error"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %DBConnection.OwnershipError{}
+             }) == %{poller: :queue_state, error_class: "db_error"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %ArgumentError{}
+             }) == %{poller: :queue_state, error_class: "config_error"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :executing_orphans,
+               exception: %FunctionClauseError{}
+             }) == %{poller: :executing_orphans, error_class: "config_error"}
+
+      assert ScaleMetrics.oban_poll_error_tags(%{
+               poller: :queue_state,
+               exception: %RuntimeError{}
+             }) == %{poller: :queue_state, error_class: "other"}
+    end
+
+    test "oban_poll_error_tags/1 defaults missing keys to \"unknown\", never raises" do
+      assert ScaleMetrics.oban_poll_error_tags(%{}) == %{
+               poller: "unknown",
+               error_class: "unknown"
+             }
+    end
+
+    test "loopctl.oban.poll.error.count is a COUNTER tagged by poller and error_class (review finding)" do
+      counter = metric("loopctl.oban.poll.error.count")
+
+      assert %Telemetry.Metrics.Counter{} = counter
+      assert counter.event_name == [:loopctl, :oban, :poll, :error]
+      assert MapSet.new(counter.tags) == MapSet.new([:poller, :error_class])
+    end
+
+    # The DB-backed zero-fill / drain-to-zero behavior of poll_oban_queue_state/0
+    # itself is covered in oban_metrics_poller_test.exs (TC-34.1.1b/c), which uses
+    # `Loopctl.DataCase` for `Loopctl.Repo` sandbox isolation — this file is
+    # intentionally pure/no-DB (see moduledoc), so it only covers the fixed
+    # matrix inputs (`oban_states/0`/`oban_active_states/0`/`oban_queues/0`) here.
+
+    test "the reporter round-trip: both gauges record and scrape end to end" do
+      reporter_name = :"scale_metrics_oban_gauges_test_#{System.unique_integer([:positive])}"
+
+      metrics = [
+        metric("loopctl.oban.jobs.count"),
+        metric("loopctl.oban.jobs.executing_orphan.count")
+      ]
+
+      pid =
+        start_supervised!(
+          {TelemetryMetricsPrometheus.Core,
+           [metrics: metrics, name: reporter_name, start_async: false]}
+        )
+
+      :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: 3}, %{
+        state: "available",
+        queue: "default"
+      })
+
+      :telemetry.execute(
+        [:loopctl, :oban, :jobs, :executing_orphan, :count],
+        %{count: 1},
+        %{}
+      )
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter_name)
+
+      # TelemetryMetricsPrometheus renders tags in ALPHABETICAL order, not
+      # declaration order — `queue` before `state`.
+      assert scrape =~ ~s(loopctl_oban_jobs_count{queue="default",state="available"} 3)
+      assert scrape =~ ~s(loopctl_oban_jobs_executing_orphan_count 1)
       assert Process.alive?(pid)
     end
   end

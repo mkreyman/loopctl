@@ -334,8 +334,37 @@ config :loopctl, Oban,
     {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
     # Prune terminal (completed/discarded/cancelled) jobs older than 7 days so the
     # oban_jobs table doesn't grow unbounded.
-    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7}
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+    # US-34.1 (AC-34.1.4): periodically REINDEX CONCURRENTLY the oban_jobs indexes
+    # (default: oban_jobs_args_index + oban_jobs_meta_index, once daily at midnight
+    # UTC) so index bloat from this table's high churn (state transitions on every
+    # job) doesn't silently degrade the queries the new US-34.1 gauges themselves
+    # depend on. Purely additive — no job semantics change.
+    Oban.Plugins.Reindexer
   ]
+
+# US-34.1 (AC-34.1.4): Stager is NOT a `plugins:` entry in this Oban version
+# (2.21) — it was absorbed into Oban's core engine and is now configured via the
+# top-level `:stage_interval` key (default 1s, unset here so Oban's own default
+# applies). Documenting this explicitly rather than silently relying on it: an
+# older Oban release configured `{Oban.Stager, ...}` as a plugin, so a reader
+# coming from that era would otherwise wonder why it's missing from the list
+# above. No change intended here — the default staging interval is fine.
+
+# US-34.1 (AC-34.1.2/.3): tunables for the two Oban queue/state/orphan telemetry
+# pollers (`Loopctl.Telemetry.ScaleMetrics.poll_oban_queue_state/0` and
+# `poll_oban_executing_orphans/0`), wired into `LoopctlWeb.Telemetry`'s shared
+# `telemetry_poller` (every 10s).
+#
+# - poll_statement_timeout_ms: the per-query SET LOCAL statement_timeout each poll
+#   applies — short and bounded, so a slow poll can never itself saturate the
+#   AdminRepo pool.
+# - orphan_threshold_minutes: how old an `executing` job's `attempted_at` must be to
+#   count as an orphan. Deliberately ABOVE the Lifeline `rescue_after` window (30
+#   min, above) so a non-zero reading means Lifeline is genuinely falling behind or
+#   a job is wedged past Lifeline's own rescue point.
+config :loopctl, :oban_metrics_poll_statement_timeout_ms, 2_000
+config :loopctl, :oban_metrics_orphan_threshold_minutes, 45
 
 # Cloak Vault — key configured per environment
 # Generate a key: :crypto.strong_rand_bytes(32) |> Base.encode64()
