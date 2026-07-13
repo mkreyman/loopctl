@@ -263,7 +263,8 @@ defmodule Loopctl.Llm do
 
     :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{
       tenant_id: tenant_id,
-      operation: operation
+      operation: operation,
+      provider: blocked_credential_provider(operation)
     })
 
     Audit.create_log_entry(tenant_id, %{
@@ -288,6 +289,14 @@ defmodule Loopctl.Llm do
   # (review MED #3). The structured audit already carries the exact operation.
   defp blocked_credential(:embedding), do: "embedding API key"
   defp blocked_credential(_anthropic_op), do: "Anthropic API key"
+
+  # US-34.4 (AC-34.4.4): the ONE bounded metadata tag added to this emit site — a
+  # `provider` label for the `[:loopctl, :llm, :blocked]` counter
+  # (`Loopctl.Telemetry.ScaleMetrics`). Mirrors `blocked_credential/1`'s existing
+  # bounded 2-way split (embedding vs Anthropic) rather than introducing a new
+  # dimension, so the label stays a fixed, small set.
+  defp blocked_credential_provider(:embedding), do: "embedding"
+  defp blocked_credential_provider(_anthropic_op), do: "anthropic"
 
   @doc """
   A safe view of the tenant's settings for API responses: the model choices,

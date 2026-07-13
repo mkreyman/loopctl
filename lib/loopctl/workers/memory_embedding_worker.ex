@@ -131,7 +131,11 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
     :telemetry.execute(
       [:loopctl, :embedding, :skipped_no_key],
       %{count: 1},
-      %{tenant_id: tenant_id, memory_id: memory_id}
+      # `source: "memory"` is the ONE bounded metadata tag US-34.4 (AC-34.4.4) adds at
+      # this emit site — mirrors `ArticleEmbeddingWorker`'s addition so the
+      # `loopctl.embedding.skipped_no_key.count` counter can distinguish article vs
+      # memory skips without tagging the unbounded `memory_id`.
+      %{tenant_id: tenant_id, memory_id: memory_id, source: "memory"}
     )
 
     Llm.record_blocked(tenant_id, :embedding)
