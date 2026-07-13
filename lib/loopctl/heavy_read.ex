@@ -79,7 +79,9 @@ defmodule Loopctl.HeavyRead do
   `:distant_pairs_bridge` (the slower `bridge_path=true` branch — its own key so its
   statement_timeout/slow-query telemetry are distinct), `:novelty`, `:enumeration`,
   `:change_feed`, `:vector_search` (the shared kNN helper path), `:memory_recall`
-  (the US-28.2 agent-memory HNSW recall via `all_memory/4`).
+  (the US-28.2 agent-memory HNSW recall via `all_memory/4`), `:ingestion_jobs`
+  (the US-34.6 `GET /knowledge/ingestion-jobs` COUNT + list over the Oban-owned
+  `oban_jobs` table, bounded by a partial expression index).
   """
   @spec opts(atom()) :: keyword()
   def opts(endpoint) when is_atom(endpoint) do

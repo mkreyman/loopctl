@@ -700,6 +700,10 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
       # timing dependence) with distinct inserted_at so paging order is stable.
       now = DateTime.utc_now()
 
+      # Insert via AdminRepo: the count/list is routed through HeavyRead, which in
+      # tests reads on AdminRepo (config/test.exs), so the setup rows must share that
+      # sandbox transaction (same path every fixture uses). In prod both repos hit the
+      # same DB, so Repo-written Oban jobs are visible to the heavy-read pool.
       for n <- 1..3 do
         %Oban.Job{
           worker: "Loopctl.Workers.ContentIngestionWorker",
@@ -708,7 +712,7 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
           args: %{"tenant_id" => tenant.id, "source_type" => "newsletter", "n" => n},
           inserted_at: DateTime.add(now, -n, :second)
         }
-        |> Loopctl.Repo.insert!()
+        |> Loopctl.AdminRepo.insert!()
       end
 
       page1 =
@@ -791,6 +795,41 @@ defmodule LoopctlWeb.KnowledgeIngestionControllerTest do
         end)
 
       assert tenant_b_jobs == []
+    end
+
+    test "total_count reflects ONLY the caller's tenant (deterministic direct-insert)",
+         %{conn: conn} do
+      tenant_a = keyed_tenant()
+      tenant_b = keyed_tenant()
+      {raw_key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :orchestrator})
+
+      now = DateTime.utc_now()
+
+      # 2 ingestion jobs for A, 3 for B — inserted directly for a deterministic count
+      # (the HeavyRead-routed COUNT now runs on AdminRepo, which shares the sandbox
+      # connection, so these rows are visible).
+      for {tenant, count} <- [{tenant_a, 2}, {tenant_b, 3}], n <- 1..count do
+        %Oban.Job{
+          worker: "Loopctl.Workers.ContentIngestionWorker",
+          queue: "default",
+          state: "completed",
+          args: %{"tenant_id" => tenant.id, "n" => n},
+          inserted_at: DateTime.add(now, -n, :second)
+        }
+        |> Loopctl.AdminRepo.insert!()
+      end
+
+      body =
+        conn
+        |> auth_conn(raw_key_a)
+        |> get(~p"/api/v1/knowledge/ingestion-jobs")
+        |> json_response(200)
+
+      # A sees ONLY its own 2 jobs — never the 5 total — proving the
+      # `args->>'tenant_id' = caller` scoping holds through the HeavyRead-routed COUNT
+      # and list (B's 3 rows are present in the same table but excluded).
+      assert body["meta"]["total_count"] == 2
+      assert length(body["data"]) == 2
     end
   end
 end

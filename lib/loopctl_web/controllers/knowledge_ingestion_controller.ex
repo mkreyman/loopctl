@@ -12,6 +12,7 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
   require Logger
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.HeavyRead
   alias Loopctl.Llm
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Workers.ContentIngestionWorker
@@ -575,10 +576,18 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
 
     base = if since, do: where(base, [j], j.inserted_at > ^since), else: base
 
-    total =
-      base |> select([j], count(j.id)) |> Loopctl.Repo.one()
+    # Route the COUNT + paginated list through HeavyRead so each query runs under a
+    # per-read `SET LOCAL statement_timeout` on the dedicated heavy-read pool (US-34.6):
+    # a pathological seq-scan COUNT over the ever-growing Oban-owned `oban_jobs` table
+    # can't run unbounded on the request path. Mirrors the `Loopctl.Llm` usage-summary
+    # pattern (a heavy count + paginated rows over a large table). The `oban_jobs` source
+    # is the SCHEMALESS string table `from(j in "oban_jobs")` (schema `nil` → HeavyRead's
+    # structural guard classifies it as `:other` and passes); tenant scoping is enforced
+    # by the `args->>'tenant_id' = ^tenant_id` fragment in `base`, exactly as before.
+    total_query = select(base, [j], count(j.id))
+    total = HeavyRead.one(tenant_id, total_query, HeavyRead.opts(:ingestion_jobs)) || 0
 
-    rows =
+    rows_query =
       base
       |> order_by([j], desc: j.inserted_at, desc: j.id)
       |> limit(^limit)
@@ -591,7 +600,8 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
         completed_at: j.completed_at,
         errors: j.errors
       })
-      |> Loopctl.Repo.all()
+
+    rows = HeavyRead.all(tenant_id, rows_query, HeavyRead.opts(:ingestion_jobs))
 
     %{data: rows, meta: %{limit: limit, offset: offset, total_count: total}}
   end
