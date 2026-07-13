@@ -13,10 +13,18 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       `scale_tags/1` collapses `tenant_id` to the fixed `:_aggregated` sentinel
       (cardinality 1); with it ON (≤ cap), the real `tenant_id` is included.
 
-  It also pins the test-env contract that the Prometheus reporter is NOT a started
-  child in `:test` (no `:9568` bind) while `metrics/0` still returns the scale defs.
+  It also pins the test-env contract that the APP's Prometheus reporter
+  (`Loopctl.Telemetry.MetricsReporter` / the `:prometheus_metrics` singleton) is NOT a
+  started child in `:test` (no `:9568` bind) while `metrics/0` still returns the scale
+  defs.
 
-  Pure metric-definition / `tag_values` inspection — no DB, no running server.
+  Mostly pure metric-definition / `tag_values` inspection — no DB. The US-33.1
+  queue_time "reporter round-trip" describe is the one exception: it boots a REAL,
+  privately-named `TelemetryMetricsPrometheus.Core` instance (never the app's
+  `:9568`-bound singleton) to prove the definitions/`tag_values`/measurement wiring
+  actually record and scrape correctly, rather than asserting `:telemetry.execute/3 ==
+  :ok` against zero attached handlers (which the framework guarantees regardless of
+  whether the code under test is correct).
 
   `async: false` (R2 review): the cap-gate tests MUTATE the process-global
   `:persistent_term` gate (`{ScaleMetrics, :tenant_label?}`), which is shared across the
@@ -33,7 +41,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.heavy_read_repo.query.duration",
     "loopctl.knowledge.vector_search.under_fill.count",
     "loopctl.knowledge.semantic_fallback.count",
-    "loopctl.knowledge.hybrid_provenance.count"
+    "loopctl.knowledge.hybrid_provenance.count",
+    "loopctl.repo.checkout.queue_time",
+    "loopctl.admin_repo.checkout.queue_time"
   ]
 
   # The ONLY labels any scale metric may ever carry (AC-27.15.3). Anything outside this
@@ -41,8 +51,18 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   # `:reason` (#297 semantic-fallback counter) is a BOUNDED, sanitized tag set (never a
   # key/body/query), so it is a safe dimension. `:provenance` (`"curated"`/`"retrieved"`)
   # and `:hit` (`true`/`false`) — US-31.2's hybrid-provenance counter — are likewise
-  # small, fixed-cardinality dimensions.
-  @allowed_tags MapSet.new([:endpoint, :mapped_code, :tenant_id, :reason, :provenance, :hit])
+  # small, fixed-cardinality dimensions. `:repo` (US-33.1) is a static, fixed 2-value
+  # tag ("repo"/"admin_repo") — the repo identity is encoded in the event name, not
+  # read from metadata.
+  @allowed_tags MapSet.new([
+                  :endpoint,
+                  :mapped_code,
+                  :tenant_id,
+                  :reason,
+                  :provenance,
+                  :hit,
+                  :repo
+                ])
 
   defp scale_metrics, do: ScaleMetrics.scale_metrics()
 
@@ -238,6 +258,160 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
                :_aggregated
 
       assert ScaleMetrics.tenant_label_cap() == 1_000
+    end
+  end
+
+  describe "per-pool checkout queue_time distributions (US-33.1, TC-33.1.1)" do
+    test "the Repo pool queue_time distribution is defined, in milliseconds, tagged by repo" do
+      dist = metric("loopctl.repo.checkout.queue_time")
+
+      assert %Telemetry.Metrics.Distribution{} = dist
+      assert dist.event_name == [:loopctl, :repo, :query]
+      assert is_function(dist.measurement, 1)
+      assert dist.unit == :millisecond
+      assert dist.tags == [:repo]
+    end
+
+    test "the AdminRepo pool queue_time distribution is defined, in milliseconds, tagged by repo" do
+      dist = metric("loopctl.admin_repo.checkout.queue_time")
+
+      assert %Telemetry.Metrics.Distribution{} = dist
+      assert dist.event_name == [:loopctl, :admin_repo, :query]
+      assert is_function(dist.measurement, 1)
+      assert dist.unit == :millisecond
+      assert dist.tags == [:repo]
+    end
+
+    test "both distributions use the documented sub-second checkout-wait buckets" do
+      for name <- ["loopctl.repo.checkout.queue_time", "loopctl.admin_repo.checkout.queue_time"] do
+        dist = metric(name)
+
+        assert dist.reporter_options[:buckets] == [1, 5, 10, 25, 50, 100, 250, 500, 1_000]
+      end
+    end
+  end
+
+  describe "queue_time tag_values — static, defensive, bounded (TC-33.1.2/.3)" do
+    test "queue_time_tags_repo/1 always returns the static %{repo: \"repo\"} map" do
+      assert ScaleMetrics.queue_time_tags_repo(%{}) == %{repo: "repo"}
+
+      assert ScaleMetrics.queue_time_tags_repo(%{
+               tenant_id: "t-123",
+               query: "SELECT 1",
+               source: "stories"
+             }) == %{repo: "repo"}
+    end
+
+    test "queue_time_tags_admin_repo/1 always returns the static %{repo: \"admin_repo\"} map" do
+      assert ScaleMetrics.queue_time_tags_admin_repo(%{}) == %{repo: "admin_repo"}
+
+      assert ScaleMetrics.queue_time_tags_admin_repo(%{
+               tenant_id: "t-456",
+               query: "SELECT 1"
+             }) == %{repo: "admin_repo"}
+    end
+
+    test "tag cardinality is bounded to :repo only — no tenant/query tags (TC-33.1.3)" do
+      for name <- ["loopctl.repo.checkout.queue_time", "loopctl.admin_repo.checkout.queue_time"] do
+        dist = metric(name)
+
+        assert dist.tags == [:repo]
+        refute :tenant_id in dist.tags
+        refute :query in dist.tags
+      end
+    end
+  end
+
+  describe "queue_time reporter round-trip — a REAL Prometheus reporter, not a no-handler no-op (TC-33.1.2, raw finding #3)" do
+    # R2 review: the prior version of this describe only asserted `:telemetry.execute/3
+    # == :ok` with ZERO handlers attached in :test — that assertion holds even if the
+    # two distributions were deleted or `tag_values` raised, so it proved nothing about
+    # the reporter path it was named for. These tests boot a REAL
+    # `TelemetryMetricsPrometheus.Core` reporter (a private, uniquely-named instance —
+    # NOT the app's `:prometheus_metrics` singleton, so this never binds `:9568` or
+    # collides with `Loopctl.Telemetry.MetricsReporter`), attach the two queue_time
+    # distributions to it, emit REAL Ecto-shaped measurement maps, and assert the
+    # SCRAPE reflects the recorded value — proof the definitions, `tag_values` fns, and
+    # measurement wiring are all correct end to end, and that the reporter process
+    # survives both the present-value and the absent-value (dropped) path.
+    #
+    # `start_async: false` forces metric registration to happen synchronously inside
+    # `init/1` (the default `start_async: true` defers it to a `handle_info` message),
+    # so the handlers are guaranteed attached before `start_supervised!/2` returns —
+    # otherwise the very first `:telemetry.execute/3` below would race the async attach.
+    setup do
+      reporter_name = :"scale_metrics_queue_time_test_#{System.unique_integer([:positive])}"
+
+      metrics = [
+        metric("loopctl.repo.checkout.queue_time"),
+        metric("loopctl.admin_repo.checkout.queue_time")
+      ]
+
+      pid =
+        start_supervised!(
+          {TelemetryMetricsPrometheus.Core,
+           [metrics: metrics, name: reporter_name, start_async: false]}
+        )
+
+      %{reporter: reporter_name, reporter_pid: pid}
+    end
+
+    test "a Repo query WITH queue_time present is recorded and scraped, reporter survives",
+         %{reporter: reporter, reporter_pid: pid} do
+      :telemetry.execute(
+        [:loopctl, :repo, :query],
+        %{queue_time: 5_000_000, query_time: 1_000_000, total_time: 6_000_000},
+        %{}
+      )
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter)
+
+      # 5_000_000 native ticks -> 5.0ms, landing (cumulatively) in the le="5" bucket and
+      # every bucket above it, +Inf included — this is the ACTUAL aggregation output,
+      # not a framework no-op.
+      assert scrape =~ ~s(loopctl_repo_checkout_queue_time_bucket{repo="repo",le="1"} 0)
+      assert scrape =~ ~s(loopctl_repo_checkout_queue_time_bucket{repo="repo",le="5"} 1)
+      assert scrape =~ ~s(loopctl_repo_checkout_queue_time_bucket{repo="repo",le="+Inf"} 1)
+      assert scrape =~ ~s(loopctl_repo_checkout_queue_time_sum{repo="repo"} 5.0)
+      assert scrape =~ ~s(loopctl_repo_checkout_queue_time_count{repo="repo"} 1)
+
+      assert Process.alive?(pid)
+    end
+
+    test "an AdminRepo query WITHOUT queue_time (in-transaction hot path) is dropped, not raised — reporter survives (raw finding #5)",
+         %{reporter: reporter, reporter_pid: pid} do
+      # This is the shape Ecto emits for every query AFTER the first inside
+      # `AdminRepo.transaction/1` (the connection is already checked out, so `queue_time`
+      # is OMITTED entirely from measurements) — precisely the 5-AdminRepo-query auth hot
+      # path US-33.1 targets. `get_measurement/3` returns `{:measurement_not_found,
+      # :queue_time}`, which `handle_event/4` routes to `Logger.debug` and drops (no
+      # crash, no sample recorded).
+      :telemetry.execute(
+        [:loopctl, :admin_repo, :query],
+        %{query_time: 500_000, total_time: 500_000},
+        %{}
+      )
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(reporter)
+
+      # No sample was ever recorded for this metric, so the Exporter emits NOTHING for
+      # it (not even the HELP/TYPE header) — distinct, explicit proof of the drop, not
+      # merely "no crash".
+      refute scrape =~ "loopctl_admin_repo_checkout_queue_time"
+
+      assert Process.alive?(pid)
+
+      # The Repo distribution (a different metric on the SAME reporter) is unaffected by
+      # the AdminRepo drop — proves the drop is isolated to the one series, not a
+      # reporter-wide failure.
+      :telemetry.execute(
+        [:loopctl, :repo, :query],
+        %{queue_time: 1_000_000, query_time: 100_000, total_time: 1_100_000},
+        %{}
+      )
+
+      assert TelemetryMetricsPrometheus.Core.scrape(reporter) =~
+               ~s(loopctl_repo_checkout_queue_time_count{repo="repo"} 1)
     end
   end
 
