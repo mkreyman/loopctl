@@ -114,8 +114,20 @@ defmodule Loopctl.Llm.AnthropicTest do
       :telemetry.attach(
         handler_id,
         [:loopctl, :llm, :provider_error],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:provider_error_emitted, measurements, metadata})
+        fn
+          # Forward ONLY this provider's events. `[:loopctl, :llm, :provider_error]`
+          # is a VM-GLOBAL telemetry event, so under `async: true` a concurrent
+          # embedding-path test (Knowledge.generate_embedding / the US-37.1
+          # embedding worker tests) emitting it with provider="embedding" would
+          # otherwise leak into THIS test's mailbox and fail the
+          # `assert_received {:provider_error_emitted, ...}` (received "embedding",
+          # expected "anthropic"). Filtering at the handler makes the assertion
+          # deterministic regardless of test scheduling.
+          _event, measurements, %{provider: "anthropic"} = metadata, _config ->
+            send(test_pid, {:provider_error_emitted, measurements, metadata})
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )
@@ -200,8 +212,15 @@ defmodule Loopctl.Llm.AnthropicTest do
       :telemetry.attach(
         handler_id,
         [:loopctl, :llm, :provider_error],
-        fn _event, _measurements, _metadata, _config ->
-          send(test_pid, :unexpected_provider_error)
+        fn
+          # Filter to this provider — the event is VM-global, so a concurrent
+          # embedding-path emission must NOT be mistaken for this test's call
+          # emitting a provider_error on a successful 200.
+          _event, _measurements, %{provider: "anthropic"}, _config ->
+            send(test_pid, :unexpected_provider_error)
+
+          _event, _measurements, _metadata, _config ->
+            :ok
         end,
         nil
       )
@@ -217,6 +236,56 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:ok, "ok"} = run(tenant)
       refute_received :unexpected_provider_error
+    end
+  end
+
+  describe "US-37.1: per-(tenant, provider) admission gate (#352)" do
+    test "empty bucket → {:error, :rate_limited_local}, NO provider call, NO record_provider_error" do
+      tenant = tenant_with_key()
+      test_pid = self()
+
+      # Empty node-local bucket for the anthropic provider.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:deny, 0} end)
+
+      # A provider_error emission or an HTTP call would signal the short-circuit ran
+      # too late (after building/sending the request or after the error branches).
+      handler_id = {:anthropic_admission_test, System.unique_integer([:positive])}
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :llm, :provider_error],
+        fn _event, _measurements, _metadata, _config ->
+          send(test_pid, :unexpected_provider_error)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        send(test_pid, :unexpected_http_call)
+        Req.Test.json(conn, %{"content" => [%{"type" => "text", "text" => "ok"}]})
+      end)
+
+      assert {:error, :rate_limited_local} = run(tenant)
+      refute_received :unexpected_http_call
+      refute_received :unexpected_provider_error
+    end
+
+    test "token available → the request is issued and the success path is unchanged" do
+      tenant = tenant_with_key()
+
+      # Default permissive stub already allows, but assert explicitly for clarity.
+      stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:allow, 1} end)
+
+      Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
+        Req.Test.json(conn, %{
+          "content" => [%{"type" => "text", "text" => "ok"}],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        })
+      end)
+
+      assert {:ok, "ok"} = run(tenant)
     end
   end
 end

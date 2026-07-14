@@ -31,6 +31,7 @@ defmodule Loopctl.Llm.Anthropic do
 
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Provider.Admission
 
   @base_url "https://api.anthropic.com/v1"
   @anthropic_version "2023-06-01"
@@ -57,6 +58,7 @@ defmodule Loopctl.Llm.Anthropic do
   @spec message(Ecto.UUID.t(), Llm.operation(), (String.t() -> map()), usage_meta(), keyword()) ::
           {:ok, String.t()}
           | {:error, :no_api_key}
+          | {:error, :rate_limited_local}
           | {:error, {:api_error, integer(), term()}}
           | {:error, {:request_failed, term()}}
   def message(tenant_id, operation, body_fun, usage_meta \\ %{}, req_opts \\ [])
@@ -86,6 +88,7 @@ defmodule Loopctl.Llm.Anthropic do
           keyword()
         ) ::
           {:ok, String.t()}
+          | {:error, :rate_limited_local}
           | {:error, {:api_error, integer(), term()}}
           | {:error, {:request_failed, term()}}
   def call(tenant_id, operation, api_key, model, body_fun, usage_meta \\ %{}, req_opts \\ [])
@@ -95,6 +98,18 @@ defmodule Loopctl.Llm.Anthropic do
   end
 
   defp post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
+    # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
+    # node-local bucket, short-circuit with `{:error, :rate_limited_local}` BEFORE
+    # building/sending the request — and crucially BEFORE the `record_provider_error/1`
+    # branches below, so a local rate-limit never inflates the
+    # `[:loopctl, :llm, :provider_error]` storm signal (parallel to the breaker
+    # exemption in AC-37.1.3).
+    with :ok <- Admission.admit(tenant_id, :anthropic) do
+      do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts)
+    end
+  end
+
+  defp do_post(tenant_id, operation, model, body, usage_meta, api_key, req_opts) do
     opts =
       [
         json: body,

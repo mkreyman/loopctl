@@ -7,5 +7,7 @@ defmodule Loopctl.RateLimiter.Behaviour do
   """
 
   @callback check_rate(String.t(), non_neg_integer(), non_neg_integer()) ::
-              {:allow, non_neg_integer()} | {:deny, non_neg_integer()}
+              {:allow, non_neg_integer()}
+              | {:deny, non_neg_integer()}
+              | {:error, term()}
 end

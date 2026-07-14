@@ -10,6 +10,7 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
   use Loopctl.DataCase, async: true
 
   import ExUnit.CaptureLog
+  import Mox
 
   alias Loopctl.Knowledge.EmbeddingClient
   alias Loopctl.Llm
@@ -37,6 +38,25 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
     end)
 
     assert {:error, :no_api_key} = EmbeddingClient.generate_embedding(tenant.id, "hello")
+    refute_received :unexpected_http_call
+  end
+
+  test "US-37.1: empty admission bucket → {:error, :rate_limited_local}, NO provider call" do
+    tenant = fixture(:tenant)
+    test_pid = self()
+    set_embedding_key(tenant, "test-openai-key-GATED")
+
+    # Empty node-local bucket for the embedding provider.
+    stub(Loopctl.MockRateLimiter, :check_rate, fn _bucket, _window, _limit -> {:deny, 0} end)
+
+    # If the client wrongly issued an HTTP request despite the empty bucket, this
+    # stub would fire.
+    Req.Test.stub(EmbeddingClient, fn conn ->
+      send(test_pid, :unexpected_http_call)
+      Req.Test.json(conn, %{"data" => [%{"embedding" => [0.0]}]})
+    end)
+
+    assert {:error, :rate_limited_local} = EmbeddingClient.generate_embedding(tenant.id, "hello")
     refute_received :unexpected_http_call
   end
 

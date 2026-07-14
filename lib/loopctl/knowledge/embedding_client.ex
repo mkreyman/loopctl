@@ -34,6 +34,7 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
 
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Provider.Admission
   alias Loopctl.SystemConfig
 
   @default_base_url "https://api.openai.com/v1"
@@ -51,6 +52,17 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
   end
 
   defp post(tenant_id, api_key, model, text) do
+    # US-37.1: per-(tenant, provider) token-bucket admission gate. On an empty
+    # node-local bucket, fast-fail WITHOUT building/sending the request so the
+    # caller degrades cheaply (interactive search → keyword fallback; embedding
+    # jobs → snooze/retry). This return is breaker-EXEMPT (see Knowledge's
+    # `breaker_countable?/1`).
+    with :ok <- Admission.admit(tenant_id, :embedding) do
+      do_post(tenant_id, api_key, model, text)
+    end
+  end
+
+  defp do_post(tenant_id, api_key, model, text) do
     base_url = provider_config()[:base_url] || @default_base_url
 
     # Kept STRICTLY BELOW `Knowledge`'s Task.yield budget (review #10): a single

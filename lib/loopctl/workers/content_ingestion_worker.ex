@@ -59,6 +59,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Net.UrlGuard
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider.Admission
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.ArticleEmbeddingWorker
 
@@ -289,19 +290,34 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
     acc0 = %{inserted: 0, persisted: 0, attempted: 0, errors: [], seen_titles: MapSet.new()}
 
-    processable
-    |> Enum.with_index()
-    |> Enum.reduce_while(acc0, fn {chunk, chunk_index}, acc ->
-      remaining = @max_articles - acc.inserted
+    result =
+      processable
+      |> Enum.with_index()
+      |> Enum.reduce_while(acc0, fn {chunk, chunk_index}, acc ->
+        remaining = @max_articles - acc.inserted
 
-      if remaining <= 0 do
-        # Article cap reached — stop early; we have the full @max_articles set.
-        {:halt, acc}
-      else
-        reduce_chunk(ctx, chunk, chunk_index, remaining, acc)
-      end
-    end)
-    |> finalize_ingest(chunk_count, dropped)
+        if remaining <= 0 do
+          # Article cap reached — stop early; we have the full @max_articles set.
+          {:halt, acc}
+        else
+          reduce_chunk(ctx, chunk, chunk_index, remaining, acc)
+        end
+      end)
+
+    case result do
+      # US-37.1 (AC-37.1.4): a chunk hit the node-local provider admission gate
+      # (`{:error, :rate_limited_local}`). This is loss-free backpressure, NOT a
+      # failure to classify: snooze the WHOLE job (no Oban attempt consumed, never
+      # a discard) rather than routing it through finalize_errors' transient-retry
+      # path, which would burn max_attempts under sustained provider backpressure.
+      # Already-persisted chunks committed in their own transactions and are
+      # idempotent, so the re-run resumes without re-billing them.
+      {:rate_limited_local, _acc} ->
+        {:snooze, Admission.snooze_seconds()}
+
+      acc ->
+        finalize_ingest(acc, chunk_count, dropped)
+    end
   end
 
   defp reduce_chunk(ctx, chunk, chunk_index, remaining, acc) do
@@ -347,6 +363,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
              persisted: acc.persisted + 1,
              seen_titles: seen_titles
          }}
+
+      {:error, :rate_limited_local} ->
+        # US-37.1 (AC-37.1.4): node-local provider admission backpressure. Halt the
+        # reduce and signal the caller to snooze the whole job loss-free — the gate
+        # is shut, so re-attempting the remaining chunks now would just re-hit it.
+        {:halt, {:rate_limited_local, acc}}
 
       {:error, reason} ->
         # Persist what earlier chunks produced; record the error and keep going —

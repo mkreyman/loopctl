@@ -454,6 +454,41 @@ defmodule Loopctl.Workers.MemoryPromotionWorkerTest do
       assert watermark(scope, "s1") == nil
       assert all_promoted(scope) == []
     end
+
+    test "US-37.1 (AC-37.1.4): a node-local admission rate-limit SNOOZES loss-free — even AT the attempt cap (never discards)" do
+      scope = fixture(:memory_scope, subject_id: "A")
+      stub_embeddings(& &1)
+      attach_telemetry([:failed], scope.tenant_id)
+      seed_turns(scope, "s1", ["one", "two"])
+
+      # The provider admission gate is shut -> compile returns {:error, :rate_limited_local}.
+      # This is loss-free backpressure, NOT a compile failure: it must snooze WITHOUT
+      # routing through compile_failure_result/2 (which would terminally discard at the cap).
+      stub(Loopctl.MockPromoterLLM, :extract, fn _t, _c, _o -> {:error, :rate_limited_local} end)
+
+      # Default attempt (0) snoozes.
+      assert {:snooze, seconds} = run(scope, "s1")
+      assert is_integer(seconds) and seconds > 0
+
+      # AT/above the compile-attempt cap it STILL snoozes (the medium-finding regression:
+      # rate-limited-local must never be discarded like a real compile failure would be).
+      job_at_cap = %Oban.Job{
+        attempt: 2,
+        args: %{
+          "tenant_id" => scope.tenant_id,
+          "subject_id" => scope.subject_id,
+          "project_id" => scope.project_id,
+          "session_id" => "s1"
+        }
+      }
+
+      assert {:snooze, _} = MemoryPromotionWorker.perform(job_at_cap)
+
+      # Not counted/logged as a compile failure, and no watermark advance / no rows.
+      refute_received {:telemetry, :failed, _, _}
+      assert watermark(scope, "s1") == nil
+      assert all_promoted(scope) == []
+    end
   end
 
   # ---------------------------------------------------------------------------

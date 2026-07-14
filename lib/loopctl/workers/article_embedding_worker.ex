@@ -51,6 +51,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider.Admission
   alias Loopctl.Workers.ArticleLinkingWorker
 
   # Longer Task.yield budget than the interactive query path: a background embed can
@@ -109,6 +110,13 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
       {:error, :no_api_key} ->
         skip_no_embedding_key(tenant_id, article_id)
+
+      {:error, :rate_limited_local} ->
+        # US-37.1 (AC-37.1.4): a node-local provider admission rate-limit is
+        # loss-free backpressure, NOT a failure. Snooze the slot (no attempt
+        # consumed, never a discard) — mirrors the FairShare.gate snooze pattern —
+        # so the embed is retried once local demand subsides.
+        {:snooze, Admission.snooze_seconds()}
 
       {:error, reason} ->
         # Classify on the raw reason, but the term that becomes an Oban discard/error

@@ -6311,6 +6311,7 @@ defmodule Loopctl.Knowledge do
 
     * `:no_api_key` → `"no_embedding_key"`
     * `:circuit_open` → `"embedding_circuit_open"`
+    * `:rate_limited_local` → `"embedding_rate_limited_local"` (US-37.1 admission gate)
     * `:timeout` → `"embedding_timeout"`
     * `{:api_error, status, _}` → `"embedding_provider_error_<status>"` (status only)
     * `{:request_failed, _}` → `"embedding_request_failed"`
@@ -6349,6 +6350,7 @@ defmodule Loopctl.Knowledge do
 
   defp reason_to_tag(:no_api_key), do: "no_embedding_key"
   defp reason_to_tag(:circuit_open), do: "embedding_circuit_open"
+  defp reason_to_tag(:rate_limited_local), do: "embedding_rate_limited_local"
   defp reason_to_tag(:timeout), do: "embedding_timeout"
 
   defp reason_to_tag({:api_error, status, _}) when is_integer(status),
@@ -7416,6 +7418,12 @@ defmodule Loopctl.Knowledge do
   defp breaker_countable?({:embedding_crash, _}), do: true
   defp breaker_countable?(:timeout), do: true
   defp breaker_countable?(:circuit_open), do: false
+  # US-37.1 (AC-37.1.3): a node-local admission rate-limit is a self-imposed,
+  # defensive fast-fail — NOT a provider failure. It must never count toward the
+  # circuit breaker NOR the `[:loopctl, :llm, :provider_error]` storm signal
+  # (both gate on `breaker_countable?/1`); otherwise our own backpressure would
+  # trip the breaker and degrade every tenant.
+  defp breaker_countable?(:rate_limited_local), do: false
   # Unknown/other transport-ish failures: count (conservative — a real outage).
   defp breaker_countable?(_), do: true
 

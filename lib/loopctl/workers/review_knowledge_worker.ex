@@ -43,6 +43,7 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Oban.FairShare
+  alias Loopctl.Provider.Admission
 
   @extractor Application.compile_env(
                :loopctl,
@@ -130,6 +131,13 @@ defmodule Loopctl.Workers.ReviewKnowledgeWorker do
     # title-collision insert) must NOT retry 3x — each retry burns the TENANT's
     # paid Anthropic call (review #3). Mirror ContentIngestionWorker.permanent_error?/1.
     classify_result(result)
+  end
+
+  defp classify_result({:error, :rate_limited_local}) do
+    # US-37.1 (AC-37.1.4): node-local provider admission backpressure is loss-free —
+    # snooze (no Oban attempt consumed, never a discard) rather than burning a retry
+    # against the TENANT's paid Anthropic call under sustained provider backpressure.
+    {:snooze, Admission.snooze_seconds()}
   end
 
   defp classify_result({:error, reason}) do

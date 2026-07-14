@@ -167,5 +167,18 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorkerTest do
 
       assert {:error, _} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
     end
+
+    test "US-37.1 (AC-37.1.4): a node-local rate-limit snoozes (never discards)" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      memory = fixture(:memory, %{tenant_id: tenant.id, subject_id: "s", text: "rate limited"})
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:error, :rate_limited_local}
+      end)
+
+      assert {:snooze, seconds} = MemoryEmbeddingWorker.perform(job(memory.id, tenant.id))
+      assert is_integer(seconds) and seconds > 0
+    end
   end
 end
