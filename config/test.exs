@@ -227,6 +227,14 @@ config :logger, :default_formatter,
 # Oban: inline testing mode (jobs execute synchronously in tests)
 config :loopctl, Oban, testing: :inline
 
+# US-35.2: keep the boot SthEnqueuer singleton from subscribing to the audit-chain
+# firehose in the test suite. It runs in the app supervision tree (not a per-test
+# sandbox owner), so reacting to a test's `AuditChain.append/1` would fire an
+# `Oban.insert` without an owned Sandbox connection. Tests that exercise the live
+# subscriber start their OWN named instance with `subscribe: true`; production
+# leaves this unset (defaults true) so the tree child subscribes normally.
+config :loopctl, :sth_enqueuer_subscribe, false
+
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 
