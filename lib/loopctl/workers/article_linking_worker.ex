@@ -281,6 +281,25 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     end
 
     :ok
+  rescue
+    e ->
+      # AC-36.4.3 (US-36.4 review): the corpus-size count is PURELY observational — it must
+      # NEVER gate linking. `corpus_count/2` wraps its aggregate in a `SET LOCAL
+      # statement_timeout` transaction; a timeout raises `Postgrex.Error` (57014
+      # query_canceled), and because a raise inside `AdminRepo.transaction/1` RE-RAISES (it
+      # never becomes `{:error, _}`), an un-rescued count would abort `perform/1` BEFORE any
+      # candidate is fetched or link inserted. Worse, sampling is deterministic by
+      # `article_id`, so every one of the job's retries would re-sample, re-count, re-time-out,
+      # then discard — silently leaving that article unlinked forever (a regression vs the
+      # pre-US-36.4 count, which had no statement_timeout and so never crashed the job).
+      # Rescue here — mirroring `ScaleMetrics`' poll rescues — so a slow/failed count degrades
+      # only the optional corpus-size signal while the linking it merely observes proceeds.
+      Logger.warning(
+        "Article linking: corpus-size count failed (#{inspect(e.__struct__)}) for article " <>
+          "#{article.id}; skipping the observational corpus_size signal — linking proceeds"
+      )
+
+      :ok
   end
 
   # Deterministic-by-id sampling so the same article always makes the same decision (stable
@@ -355,29 +374,34 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   #
   # FK-violation parity with the pre-US-36.4 row-by-row path (US-36.4 review): the old
   # `create_links/2` inserted each row via `AdminRepo.insert(changeset)` and SKIPPED any
-  # `{:error, changeset}` — so if a target article was HARD-deleted (soft deletes retain the
-  # row → FK stays valid; only a hard delete removes it) between the VectorSearch read and
-  # the insert, that one row was dropped and the job still succeeded. A batched `insert_all`
-  # would instead RAISE a `Postgrex.Error` (`:foreign_key_violation`, FK is `on_delete:
-  # :restrict`) that aborts the ENTIRE transaction — a strictly worse failure mode. Rescuing
-  # is not an option: once a statement errors inside a transaction Postgres aborts it, so any
-  # follow-up insert on that connection fails with "current transaction is aborted" (and under
-  # the test Sandbox the transaction is nested, poisoning the outer one too). Instead we
-  # PRE-FILTER to targets that still exist (`reject_vanished_targets/2`) right before the
-  # insert, reproducing the old "skip the vanished target, link the rest, no crash" behavior
-  # without an aborted transaction. This costs one cheap indexed `id = ANY(...)` lookup, and
-  # only when there is actual linking work. The residual window (a target hard-deleted between
-  # this pre-filter and the insert, same transaction) is far narrower than the original read→
-  # insert window; if it is ever hit the job crashes and Oban retries, and the retry's
-  # VectorSearch read no longer surfaces the deleted target, so it converges.
+  # `{:error, changeset}` — so if EITHER endpoint article was HARD-deleted (soft deletes
+  # retain the row → FK stays valid; only a hard delete removes it) between the VectorSearch
+  # read and the insert, that row was dropped and the job still succeeded. BOTH FKs
+  # (`source_article_id` and `target_article_id`) are `on_delete: :restrict`, so a batched
+  # `insert_all` against a vanished endpoint would instead RAISE a `Postgrex.Error`
+  # (`:foreign_key_violation`) that aborts the ENTIRE transaction — a strictly worse failure
+  # mode. Rescuing is not an option: once a statement errors inside a transaction Postgres
+  # aborts it, so any follow-up insert on that connection fails with "current transaction is
+  # aborted" (and under the test Sandbox the transaction is nested, poisoning the outer one
+  # too). Instead we PRE-FILTER to rows whose BOTH endpoints still exist
+  # (`reject_vanished_endpoints/2`), INSIDE the same `SET LOCAL statement_timeout` transaction
+  # as the insert (AC-36.4.4: reads on the path run under the per-query timeout) and right
+  # before it (shrinking the check→insert race window). The source guard matters precisely
+  # here: the article has no links yet, so `:restrict` does not block deleting it, and every
+  # row shares that one source — a vanished source would FK-violate all of them. This
+  # reproduces the old "skip the vanished endpoint, link the rest, no crash" behavior without
+  # an aborted transaction, for one cheap indexed `id = ANY(...)` lookup only when there is
+  # actual linking work. The residual window (an endpoint hard-deleted between this pre-filter
+  # and the insert, same transaction) is far narrower than the original read→insert window; if
+  # it is ever hit the job crashes and Oban retries, and the retry's `get_article_with_embedding`
+  # / VectorSearch read no longer surfaces the deleted endpoint, so it converges.
   defp create_links([], _tenant_id), do: 0
 
   defp create_links(links, tenant_id) do
     now = DateTime.utc_now()
 
     rows =
-      links
-      |> Enum.map(fn attrs ->
+      Enum.map(links, fn attrs ->
         %{
           tenant_id: tenant_id,
           source_article_id: attrs.source_article_id,
@@ -387,13 +411,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
           inserted_at: now
         }
       end)
-      |> reject_vanished_targets(tenant_id)
 
     {:ok, created} =
       AdminRepo.transaction(fn ->
         AdminRepo.query!("SET LOCAL statement_timeout = #{statement_timeout_ms()}")
 
         rows
+        |> reject_vanished_endpoints(tenant_id)
         |> Enum.chunk_every(insert_chunk_size())
         |> Enum.reduce(0, fn chunk, acc -> acc + insert_chunk(chunk) end)
       end)
@@ -401,26 +425,36 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     created
   end
 
-  # Drop any row whose TARGET article no longer exists — the pre-US-36.4 row-by-row path
-  # skipped these as `{:error, changeset}` FK failures and still succeeded; the batched
-  # `insert_all` would raise and abort the whole batch instead (see `create_links/2`). Scoped
-  # by `tenant_id` (all link targets are same-tenant candidates from `VectorSearch`). Returns
-  # the input untouched when nothing was filtered.
-  defp reject_vanished_targets([], _tenant_id), do: []
+  # Drop any row whose SOURCE or TARGET article no longer exists — the pre-US-36.4 row-by-row
+  # path skipped these as `{:error, changeset}` FK failures and still succeeded; the batched
+  # `insert_all` would raise and abort the whole batch instead (see `create_links/2`). Both
+  # endpoint FKs are `on_delete: :restrict`. All rows share ONE source (the article being
+  # linked, which has no links yet, so nothing blocks a concurrent hard-delete of it): if that
+  # source vanished, every row would FK-violate, so drop the whole batch (matching the old
+  # per-row path's "skip every row, return :ok/0"). Otherwise keep only rows whose target
+  # still lives. Scoped by `tenant_id` (all endpoints are same-tenant). Runs INSIDE the
+  # `create_links/2` statement-timeout transaction (AC-36.4.4). Returns the input untouched
+  # when both endpoints of every row still exist.
+  defp reject_vanished_endpoints([], _tenant_id), do: []
 
-  defp reject_vanished_targets(rows, tenant_id) do
+  defp reject_vanished_endpoints(rows, tenant_id) do
+    source_ids = rows |> Enum.map(& &1.source_article_id) |> Enum.uniq()
     target_ids = rows |> Enum.map(& &1.target_article_id) |> Enum.uniq()
 
     live =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
-        where: a.id in ^target_ids,
+        where: a.id in ^(source_ids ++ target_ids),
         select: a.id
       )
       |> AdminRepo.all()
       |> MapSet.new()
 
-    Enum.filter(rows, fn row -> MapSet.member?(live, row.target_article_id) end)
+    if Enum.all?(source_ids, &MapSet.member?(live, &1)) do
+      Enum.filter(rows, fn row -> MapSet.member?(live, row.target_article_id) end)
+    else
+      []
+    end
   end
 
   defp insert_chunk(chunk) do

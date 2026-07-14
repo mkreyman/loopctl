@@ -618,6 +618,36 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
       assert vanished_links == []
     end
+
+    test "drops the whole batch (no crash) when the SOURCE article vanishes before the insert" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      valid = create_published_article(tenant.id)
+
+      # The similarity lookup fires AFTER the source was fetched (get_article_with_embedding)
+      # but BEFORE create_links inserts. Hard-delete the source HERE to simulate a concurrent
+      # hard-delete in exactly that window — possible precisely because the source has no links
+      # yet, so its `on_delete: :restrict` FK does not block deletion. Every candidate row
+      # shares this source, so an unguarded insert_all would FK-violate on source_article_id
+      # and abort the whole transaction, crashing the job. The source guard in
+      # `reject_vanished_endpoints/2` drops the entire batch instead — matching the old
+      # row-by-row path's "skip every row, return :ok with 0 links".
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        AdminRepo.delete!(source)
+        [candidate(valid, 0.80)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      # No links created (source gone) and — the point of the guard — no crash / no aborted
+      # transaction. A `on_delete: :restrict` FK violation would have raised instead.
+      assert [] ==
+               from(l in ArticleLink, where: l.source_article_id == ^source.id)
+               |> AdminRepo.all()
+    end
   end
 
   describe "self-link guard (US-36.4 review — defense-in-depth)" do
