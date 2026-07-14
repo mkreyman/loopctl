@@ -132,7 +132,14 @@ config :loopctl, :heavy_read_statement_timeout_overrides, %{
   # LOCAL persisting into the enclosing sandbox transaction (same rationale as
   # :llm_usage/:memory_recall). No test asserts an :ingestion_jobs timeout, so this
   # cannot mask a real one.
-  ingestion_jobs: 5_000
+  ingestion_jobs: 5_000,
+  # US-35.1: the incremental-STH tail read and the keyset-paged full-rebuild read
+  # over audit_chain (Loopctl.HeavyRead.opts(:sth_incremental)). A few-hundred-row
+  # indexed range scan is sub-ms on the sandbox, but a generous 5s override keeps it
+  # off the aggressive 250ms pool default under parallel contention (same rationale
+  # as the endpoints above). No test asserts a :sth_incremental timeout, so this
+  # cannot mask a real one.
+  sth_incremental: 5_000
 }
 
 # US-27.6b: the over-fetch pool sizing knobs (`Loopctl.Knowledge.VectorSearch.pool_size/2`).

@@ -21,6 +21,8 @@ defmodule Loopctl.AuditChain do
   import Bitwise
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry
@@ -178,21 +180,24 @@ defmodule Loopctl.AuditChain do
   ahead of the head, wrong peak count, non-32-byte peak) degrades to a correct
   root, never a wrong one.
 
-  ## Trust boundary — the cache has no content-integrity check
+  ## Trust boundary — checkpoint peaks are re-derived against the signed STH
 
-  Validation (`valid_checkpoint?/2`) is STRUCTURAL only. Unlike `entry_hash`
-  values — which are hash-CHAINED to `prev_entry_hash` and therefore
-  self-verifying against the source of truth — the cached peak VALUES link to
-  nothing verifiable and are NOT re-derived from `entry_hashes`. A checkpoint
-  with the right peak count and 32-byte peaks but WRONG bytes (bit-rot, a bad
-  write, or a tampered `audit_sth_checkpoints` row) passes validation and would
-  be folded into the signed root; the next incremental sign folds those corrupt
-  peaks into new peaks, so the taint could propagate forward. The cache's
-  integrity therefore rests on the invariant that its row is only ever written by
-  the trusted, same-transaction `sign_and_store_tree_head/1` path and never
-  silently corrupted at rest — NOT on a self-check here. A divergent-STH signal
-  (an incremental root that disagrees with an independent full recompute) is the
-  L6 byzantine/custody-halt condition, detected out-of-band, not by this fold.
+  Validation is two-layered. `valid_checkpoint?/2` first rejects a STRUCTURALLY
+  impossible checkpoint (position ahead of the head, wrong peak count, non-32-byte
+  peak). Then `checkpoint_root_matches_sth?/2` performs a CHEAP EXACT
+  content-integrity check IN-BAND before the peaks are ever folded into a signed
+  root: the checkpoint at `cp_pos` is always co-written with the STH at `cp_pos`
+  (whose `merkle_root` is retained in `audit_signed_tree_heads`), so we rehydrate
+  the cached peaks, bag them, and require the result to equal that stored,
+  independently-derived root. A checkpoint with the right peak count and 32-byte
+  peaks but WRONG bytes (bit-rot, a bad write, or a direct write to
+  `audit_sth_checkpoints` by anyone WITHOUT the tenant signing key) therefore
+  FAILS this check and degrades to a correct full rebuild — the legitimate signer
+  never signs a wrong root off a corrupt cache. This upholds the "never emit a
+  wrong root" invariant in-band; it does NOT replace the out-of-band L6
+  divergent-STH byzantine/custody-halt detection, which still guards against a
+  corruption of the STH root itself. The check costs one indexed STH lookup plus
+  O(log n) hashing — still O(Δ), dominated by the tail read it precedes.
 
   ## Returns
 
@@ -236,34 +241,69 @@ defmodule Loopctl.AuditChain do
     {:ok, root, %{chain_position: latest_pos, peaks: peak_hashes(peaks)}}
   end
 
+  # Whole-chain rebuild page size. Each keyset page is ONE bounded HeavyRead
+  # statement, so no single statement's cost grows with total chain length.
+  @rebuild_page_size 10_000
+
   # Fallback: rebuild from the whole chain. `root` is the oracle
   # `merkle_tree/2` construction (byte-identical guarantee); the peaks are folded
   # from the same load so a fresh checkpoint can be persisted for next time.
   #
   # This is the O(n) whole-chain read that fires for EVERY tenant on its first STH
   # after deploy (no checkpoint yet) and on any checkpoint loss/corruption — the
-  # heaviest read on this path. It is routed through `HeavyRead` for the SAME
-  # per-query `SET LOCAL statement_timeout` protection the incremental tail read
-  # gets (AC-35.1.6: "Reads run on a read path with a per-query statement_timeout"),
-  # so the fleet-wide unbounded read GH #350 / epic 35 exist to guard can never run
-  # untimed on the BYPASSRLS admin pool. Its `where` is conjunctively tenant-scoped,
-  # so it passes the HeavyRead structural guard.
+  # heaviest read on this path. It is KEYSET-PAGED (`load_all_hashes_paged/2`): each
+  # page is a separate bounded, tenant-scoped, `SET LOCAL statement_timeout`-guarded
+  # `HeavyRead` statement of at most `@rebuild_page_size` rows, so a very large chain
+  # can NEVER trip a self-reinforcing STH lockout — the failure mode where a single
+  # unbounded whole-chain read exceeds the pool statement_timeout, aborts the sign
+  # job forever, and so never persists the first checkpoint that would shrink the
+  # read. (On master this read went un-timed via `AdminRepo` and always completed;
+  # routing it through the timed `HeavyRead` path without paging would reintroduce
+  # exactly that lockout for the large-chain tenant #350 / epic 35 exist to help.)
+  # Paging across transactions is safe because `audit_chain` is append-only and
+  # immutable (DB triggers forbid update/delete), so the [0..latest_pos] prefix is a
+  # stable, gap-free snapshot regardless of how many statements read it.
   defp full_rebuild_root(tenant_id, latest_pos) do
-    # Bounded by `latest_pos` (the head read a moment ago) so a concurrent append
-    # can't pull leaves beyond the position we're about to sign — the loaded set
-    # is a consistent snapshot of [0..latest_pos].
-    query =
-      from(e in Entry,
-        where: e.tenant_id == ^tenant_id and e.chain_position <= ^latest_pos,
-        order_by: [asc: e.chain_position],
-        select: e.entry_hash
-      )
-
-    hashes = HeavyRead.all(tenant_id, query, HeavyRead.opts(:sth_incremental))
+    hashes = load_all_hashes_paged(tenant_id, latest_pos)
 
     root = merkle_tree(hashes)
     peaks = mmr_append_all([], hashes)
     {:ok, root, %{chain_position: latest_pos, peaks: peak_hashes(peaks)}}
+  end
+
+  # Reads entry_hashes for [0..latest_pos] ascending in bounded keyset pages, each a
+  # single `HeavyRead` statement (tenant-scoped, timeout-guarded). Bounded by
+  # `latest_pos` (the head read a moment ago) so a concurrent append can't pull
+  # leaves beyond the position we're about to sign.
+  defp load_all_hashes_paged(tenant_id, latest_pos) do
+    load_all_hashes_paged(tenant_id, latest_pos, -1, [])
+  end
+
+  defp load_all_hashes_paged(tenant_id, latest_pos, after_pos, acc) do
+    query =
+      from(e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.chain_position > ^after_pos and
+            e.chain_position <= ^latest_pos,
+        order_by: [asc: e.chain_position],
+        limit: ^@rebuild_page_size,
+        select: {e.chain_position, e.entry_hash}
+      )
+
+    case HeavyRead.all(tenant_id, query, HeavyRead.opts(:sth_incremental)) do
+      [] ->
+        Enum.reverse(acc)
+
+      rows ->
+        {last_pos, _} = List.last(rows)
+        acc = Enum.reduce(rows, acc, fn {_pos, hash}, a -> [hash | a] end)
+
+        if length(rows) < @rebuild_page_size do
+          Enum.reverse(acc)
+        else
+          load_all_hashes_paged(tenant_id, latest_pos, last_pos, acc)
+        end
+    end
   end
 
   # Bounded, tenant-scoped tail read: entries strictly above the checkpoint
@@ -289,12 +329,58 @@ defmodule Loopctl.AuditChain do
   # Loads the tenant's checkpoint and validates it against the actual chain
   # head. Returns `{:ok, checkpoint}` only when it is safe to fold onto;
   # otherwise `:fallback` so the caller does a full recompute (AC-35.1.5).
+  #
+  # Two gates, cheapest first: (1) STRUCTURAL — position not ahead of the head,
+  # right peak count, 32-byte peaks; then (2) EXACT CONTENT — the cached peaks,
+  # bagged, must equal the `merkle_root` of the STH co-written at `cp_pos`. Gate 2
+  # catches right-shape/wrong-bytes corruption (bit-rot / bad or unauthorized
+  # write to `audit_sth_checkpoints`) that gate 1 cannot, so a corrupt cache
+  # degrades to a correct rebuild instead of being folded into a signed root.
   defp load_valid_checkpoint(tenant_id, latest_pos) do
     checkpoint =
       from(c in SthCheckpoint, where: c.tenant_id == ^tenant_id)
       |> AdminRepo.one()
 
-    if valid_checkpoint?(checkpoint, latest_pos), do: {:ok, checkpoint}, else: :fallback
+    if valid_checkpoint?(checkpoint, latest_pos) and
+         checkpoint_root_matches_sth?(tenant_id, checkpoint) do
+      {:ok, checkpoint}
+    else
+      :fallback
+    end
+  end
+
+  # EXACT content-integrity check: rehydrate the cached peaks, bag them, and require
+  # the result to byte-match the `merkle_root` of the STH signed at the checkpoint's
+  # own position (co-written in `sign_and_store_tree_head/1`, retained forever in
+  # `audit_signed_tree_heads`). If no such STH row exists we cannot prove the cache
+  # is authentic, so we conservatively reject it and full-rebuild. One indexed
+  # lookup + O(log n) hashing — O(Δ), dominated by the tail read it precedes.
+  defp checkpoint_root_matches_sth?(tenant_id, %SthCheckpoint{
+         chain_position: cp_pos,
+         peaks: cp_peaks
+       }) do
+    case sth_at_exact_position(tenant_id, cp_pos) do
+      %SignedTreeHead{merkle_root: stored_root} when is_binary(stored_root) ->
+        rebuilt =
+          cp_peaks
+          |> peaks_with_heights(cp_pos + 1)
+          |> bag_peaks()
+
+        rebuilt == stored_root
+
+      _ ->
+        false
+    end
+  end
+
+  # The STH at EXACTLY this position (not `>=`, unlike `get_sth_at_position/2`) —
+  # the one co-written with the checkpoint at `cp_pos`.
+  defp sth_at_exact_position(tenant_id, position) do
+    from(s in SignedTreeHead,
+      where: s.tenant_id == ^tenant_id and s.chain_position == ^position,
+      limit: 1
+    )
+    |> AdminRepo.one()
   end
 
   # A checkpoint is usable iff:
@@ -344,36 +430,85 @@ defmodule Loopctl.AuditChain do
           signature: signature
         })
 
-      checkpoint_changeset =
-        %SthCheckpoint{tenant_id: tenant_id}
-        |> SthCheckpoint.changeset(%{chain_position: position, peaks: peaks})
-
-      # US-35.1: the STH insert and the checkpoint upsert happen in ONE logical
-      # operation, so the persisted peaks are always consistent with a signed STH.
-      multi =
-        Multi.new()
-        |> Multi.insert(:sth, sth_changeset,
-          on_conflict: {:replace, [:merkle_root, :signed_at, :signature]},
-          conflict_target: [:tenant_id, :chain_position]
-        )
-        |> Multi.insert(:checkpoint, checkpoint_changeset,
-          on_conflict: {:replace, [:chain_position, :peaks, :updated_at]},
-          conflict_target: [:tenant_id]
-        )
-
-      case AdminRepo.transaction(multi) do
-        {:ok, %{sth: stored_sth}} ->
+      # US-35.1: the STH (source of truth) is committed FIRST and ON ITS OWN; the
+      # checkpoint (a pure performance cache) is upserted best-effort AFTERWARD.
+      # This deliberately does NOT share a transaction with the STH insert so a
+      # cache-write fault (FK, serialization/lock under the concurrent per-tenant
+      # fanout, disk error, a future constraint) can never roll back the
+      # custody-critical STH signing (priority inversion). AC-35.1.3's atomicity
+      # requirement is about the DANGEROUS direction — a checkpoint AHEAD of any
+      # signed STH — which STH-first ordering makes impossible: the checkpoint at
+      # `position` only ever appears after the STH at `position` has committed. A
+      # lost checkpoint write merely makes the NEXT sign do a (correct) full
+      # rebuild; `sth_needed?/1` re-fires so nothing is lost.
+      case AdminRepo.insert(sth_changeset,
+             on_conflict: {:replace, [:merkle_root, :signed_at, :signature]},
+             conflict_target: [:tenant_id, :chain_position]
+           ) do
+        {:ok, stored_sth} ->
+          upsert_checkpoint_best_effort(tenant_id, position, peaks)
           # US-26.5.1: broadcast STH to PubSub subscribers
           ChainPubSub.broadcast_sth(tenant_id, stored_sth)
           {:ok, stored_sth}
 
-        {:error, _step, reason, _changes} ->
+        {:error, reason} ->
           {:error, reason}
       end
     else
       {:ok, nil, nil} -> {:error, :empty_chain}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Best-effort, MONOTONIC checkpoint cache upsert (US-35.1). Runs AFTER the STH
+  # commit and never raises into the caller — a cache write is not allowed to fail
+  # the sign.
+  #
+  # `on_conflict` replaces the row only when the incoming `chain_position` is
+  # STRICTLY GREATER than the stored one, so a slower concurrent sign job that
+  # computed at an earlier position can never regress the checkpoint backward
+  # (the per-tenant fanout is not `unique`-deduped on the Basic Engine, so two
+  # sign jobs can race). When the guard holds (incoming position not newer),
+  # Postgres updates nothing and RETURNING is empty, which Ecto surfaces as
+  # `Ecto.StaleEntryError`; that is the EXPECTED monotonic no-op — a newer
+  # checkpoint already won — so we swallow it silently.
+  defp upsert_checkpoint_best_effort(tenant_id, position, peaks) do
+    changeset =
+      %SthCheckpoint{tenant_id: tenant_id}
+      |> SthCheckpoint.changeset(%{chain_position: position, peaks: peaks})
+
+    case AdminRepo.insert(changeset,
+           on_conflict: monotonic_checkpoint_on_conflict(),
+           conflict_target: [:tenant_id]
+         ) do
+      {:ok, _checkpoint} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "AuditChain: STH signed for tenant #{tenant_id} at position #{position} but " <>
+            "checkpoint cache write failed (#{inspect(reason)}); next sign will full-rebuild"
+        )
+
+        :ok
+    end
+  rescue
+    Ecto.StaleEntryError -> :ok
+  end
+
+  # DO UPDATE ... WHERE the stored position is older than the incoming one — the
+  # monotonic guard. `EXCLUDED.*` is the row we tried to insert.
+  defp monotonic_checkpoint_on_conflict do
+    from(c in SthCheckpoint,
+      update: [
+        set: [
+          chain_position: fragment("EXCLUDED.chain_position"),
+          peaks: fragment("EXCLUDED.peaks"),
+          updated_at: fragment("EXCLUDED.updated_at")
+        ]
+      ],
+      where: c.chain_position < fragment("EXCLUDED.chain_position")
+    )
   end
 
   @doc """

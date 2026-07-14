@@ -14,6 +14,7 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.AuditChain.SignedTreeHead
   alias Loopctl.AuditChain.SthCheckpoint
   alias Loopctl.AuditChain.Verifier
 
@@ -92,6 +93,32 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
     )
   end
 
+  # Inserts an STH row at `chain_position` with the given root (signature is a
+  # placeholder — these tests don't re-verify the signature here).
+  defp put_sth(tenant_id, chain_position, merkle_root) do
+    %SignedTreeHead{tenant_id: tenant_id}
+    |> SignedTreeHead.changeset(%{
+      chain_position: chain_position,
+      merkle_root: merkle_root,
+      signed_at: DateTime.utc_now(),
+      signature: <<0::512>>
+    })
+    |> AdminRepo.insert!(
+      on_conflict: {:replace, [:merkle_root, :signed_at, :signature]},
+      conflict_target: [:tenant_id, :chain_position]
+    )
+  end
+
+  # Co-writes a checkpoint AND the matching STH at its position, mirroring
+  # `sign_and_store_tree_head/1` — the checkpoint's bagged root equals the signed
+  # STH root (both are `oracle_root(prefix)`). This is what makes the incremental
+  # fold path's EXACT content-integrity check pass, so tests that want the
+  # incremental path (not a silent fallback) exercise it for real.
+  defp put_valid_checkpoint(tenant_id, prefix, count) do
+    put_sth(tenant_id, count - 1, oracle_root(prefix))
+    put_checkpoint(tenant_id, count - 1, expected_peaks(prefix, count))
+  end
+
   defp get_checkpoint(tenant_id) do
     import Ecto.Query
     AdminRepo.one(from(c in SthCheckpoint, where: c.tenant_id == ^tenant_id))
@@ -139,7 +166,7 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
         # fallback test below.
         for p <- 1..(n - 1)//1 do
           {prefix, _tail} = Enum.split(hashes, p)
-          put_checkpoint(tenant.id, p - 1, expected_peaks(prefix, p))
+          put_valid_checkpoint(tenant.id, prefix, p)
 
           assert {:ok, root, %{chain_position: pos, peaks: _}} =
                    AuditChain.compute_merkle_root_incremental(tenant.id)
@@ -175,7 +202,7 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
         # checkpoint carries multiple peaks and there is a real tail to fold.
         p = div(n, 3) * 2
         {prefix, _tail} = Enum.split(hashes, p)
-        put_checkpoint(tenant.id, p - 1, expected_peaks(prefix, p))
+        put_valid_checkpoint(tenant.id, prefix, p)
 
         assert {:ok, root, %{chain_position: pos, peaks: _}} =
                  AuditChain.compute_merkle_root_incremental(tenant.id)
@@ -196,8 +223,11 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
       hashes = entry_hashes(tenant.id)
       expected = oracle_root(hashes)
 
-      # checkpoint covers ALL leaves — no tail to fold, peaks bagged directly
-      put_checkpoint(tenant.id, n - 1, expected_peaks(hashes, n))
+      # checkpoint covers ALL leaves — no tail to fold, peaks bagged directly.
+      # A matching STH at the head makes the exact-content check pass, so the root
+      # comes purely from bagging the CACHED peaks (no entries folded) — proving
+      # the cache path is active, not a silent full rebuild.
+      put_valid_checkpoint(tenant.id, hashes, n)
 
       assert {:ok, ^expected, %{chain_position: 32}} =
                AuditChain.compute_merkle_root_incremental(tenant.id)
@@ -329,6 +359,32 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
       assert {:ok, root, _} = AuditChain.compute_merkle_root_incremental(tenant.id)
       assert root == full
     end
+
+    test "right shape but WRONG peak bytes (a signed STH pins the position) → full rebuild, correct root" do
+      tenant = fixture(:tenant)
+      :ok = build_chain(tenant.id, 9)
+      {:ok, full} = AuditChain.compute_merkle_root(tenant.id)
+
+      hashes = entry_hashes(tenant.id)
+
+      # A genuine, consistent checkpoint + signed STH at position 4 (5 leaves ⇒ 2
+      # peaks) …
+      put_valid_checkpoint(tenant.id, Enum.take(hashes, 5), 5)
+
+      # … then corrupt ONLY the cached peaks to right-COUNT, right-SIZE, WRONG
+      # bytes — the exact kind of at-rest / unauthorized-write corruption the
+      # STRUCTURAL check cannot see (2 32-byte peaks == popcount(5)).
+      corrupt = [:crypto.strong_rand_bytes(32), :crypto.strong_rand_bytes(32)]
+      put_checkpoint(tenant.id, 4, corrupt)
+
+      # The EXACT content check (bag(peaks) != the STH's signed root at pos 4)
+      # rejects the corrupt cache and full-rebuilds, so the signer never signs a
+      # wrong root off it.
+      assert {:ok, root, %{chain_position: 8}} =
+               AuditChain.compute_merkle_root_incremental(tenant.id)
+
+      assert root == full
+    end
   end
 
   # --- TC-35.1.5 — tenant isolation (AC-35.1.6) ---
@@ -346,9 +402,9 @@ defmodule Loopctl.AuditChain.SthCheckpointTest do
       {:ok, full_a} = AuditChain.compute_merkle_root(tenant_a.id)
       {:ok, full_b} = AuditChain.compute_merkle_root(tenant_b.id)
 
-      # both tenants carry a checkpoint at an intermediate split
-      put_checkpoint(tenant_a.id, 3, expected_peaks(Enum.take(hashes_a, 4), 4))
-      put_checkpoint(tenant_b.id, 1, expected_peaks(Enum.take(hashes_b, 2), 2))
+      # both tenants carry a checkpoint (+ matching STH) at an intermediate split
+      put_valid_checkpoint(tenant_a.id, Enum.take(hashes_a, 4), 4)
+      put_valid_checkpoint(tenant_b.id, Enum.take(hashes_b, 2), 2)
 
       assert {:ok, root_a, %{chain_position: 6}} =
                AuditChain.compute_merkle_root_incremental(tenant_a.id)
